@@ -1833,6 +1833,11 @@ fn rpc_caps() -> Vec<String> {
     if cfg!(feature = "external-access") {
         caps.push(RpcCap::ExternalSession);
     }
+    // FR-100 P1b — this build signs its session answer with its device key
+    // when the offer asks (a nonce). A property of the BUILD, in every build:
+    // an enrollment that could not keep a key says so with an empty
+    // `peer_auth_key` on its hello, and signs nothing.
+    caps.push(RpcCap::PeerAuth);
     // FR-19 — advertise the org-relay SERVER only when this device has opted
     // in (`relay_server_enabled`, gate 4). The server never installs a session
     // on a device that does not advertise this, so a device that has not opted
@@ -2297,6 +2302,13 @@ mod tests {
             cfg!(feature = "external-access"),
             "external-session must be advertised exactly when the external-access \
              stack is built"
+        );
+
+        // FR-100 P1b — `peer-auth` in every build: the signing needs no
+        // feature, only a device key, and the hello says whether there is one.
+        assert!(
+            advertised.iter().any(|v| v == RpcCap::PeerAuth.wire()),
+            "peer-auth must be advertised by every build"
         );
     }
 

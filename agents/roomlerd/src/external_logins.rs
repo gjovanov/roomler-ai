@@ -206,24 +206,17 @@ pub enum BindingError {
 /// peer connection normally repeats the same certificate's fingerprint; an SDP
 /// with two different ones is either broken or crafted so that the MAC covers
 /// one certificate while DTLS negotiates the other.
+///
+/// FR-100 P1b moved the rule itself to
+/// `roomler_ai_remote_control::signaling::sdp_dtls_fingerprint`, unchanged:
+/// the device's answer signature covers the same fingerprints in every build,
+/// and two copies of one normalisation are two chances to disagree.
 pub fn sdp_fingerprint(sdp: &str) -> Result<String, BindingError> {
-    let mut found: Option<String> = None;
-    for line in sdp.lines() {
-        let Some(value) = line.trim().strip_prefix("a=fingerprint:") else {
-            continue;
-        };
-        let mut parts = value.split_whitespace();
-        let (Some(hash), Some(hex), None) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(BindingError::AmbiguousFingerprint);
-        };
-        let normalised = format!("{} {}", hash.to_ascii_lowercase(), hex.to_ascii_uppercase());
-        match &found {
-            None => found = Some(normalised),
-            Some(seen) if *seen == normalised => {}
-            Some(_) => return Err(BindingError::AmbiguousFingerprint),
-        }
-    }
-    found.ok_or(BindingError::NoFingerprint)
+    use roomler_ai_remote_control::signaling::{SdpFingerprintError, sdp_dtls_fingerprint};
+    sdp_dtls_fingerprint(sdp).map_err(|e| match e {
+        SdpFingerprintError::Missing => BindingError::NoFingerprint,
+        SdpFingerprintError::Ambiguous => BindingError::AmbiguousFingerprint,
+    })
 }
 
 /// The label that scopes the transport MAC. Part of the wire.

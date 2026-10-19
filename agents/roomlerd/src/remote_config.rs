@@ -78,6 +78,10 @@ pub struct RemoteConfigServices {
     /// throttle another's.
     #[cfg(feature = "external-access")]
     external_logins: Arc<crate::external_logins::ExternalLogins>,
+    /// FR-100 P1b — what signing each session's answer needs, gathered as its
+    /// frames pass through the daemon. Here for `external_logins`' reason:
+    /// one per daemon, never a static the integration tests' agents share.
+    peer_auth_offers: Arc<crate::peer_auth::PendingOffers>,
 }
 
 /// FR-52 P4 — the device's own terms for an external session, as stored.
@@ -105,7 +109,14 @@ impl RemoteConfigServices {
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
             #[cfg(feature = "external-access")]
             external_logins: Arc::new(crate::external_logins::ExternalLogins::new()),
+            peer_auth_offers: Arc::new(crate::peer_auth::PendingOffers::default()),
         }
+    }
+
+    /// FR-100 P1b — the daemon's table of what each session's answer will be
+    /// signed against (see the field).
+    pub fn peer_auth_offers(&self) -> &crate::peer_auth::PendingOffers {
+        &self.peer_auth_offers
     }
 
     /// The config file this daemon runs from. #2293 — the removal's sentinel

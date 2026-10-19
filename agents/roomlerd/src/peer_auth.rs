@@ -66,6 +66,239 @@ impl DeviceKey {
     pub fn public_b64(&self) -> String {
         STANDARD.encode(self.pair.public_key().as_ref())
     }
+
+    /// FR-100 P1b — `message` signed: ECDSA P-256 over SHA-256, the fixed
+    /// 64-byte `r ‖ s` that WebCrypto verifies. `None` only if the system's
+    /// randomness fails, and then nothing is signed.
+    pub fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
+        self.pair
+            .sign(&SystemRandom::new(), message)
+            .ok()
+            .map(|sig| sig.as_ref().to_vec())
+    }
+}
+
+/// FR-100 P1b — what the daemon needs to sign a session's answer, gathered as
+/// the session's frames pass through it: the controller from `rc:request`,
+/// then the offer's DTLS fingerprint and nonce from `rc:sdp.offer`.
+///
+/// Kept in the DAEMON, and held by `RemoteConfigServices` (one per daemon,
+/// cloned into every org's loop), not in a static, so the many agents an
+/// integration test runs in one process never see each other's sessions. The
+/// daemon is also where the key is: a GUI worker that built the answer
+/// (FR-43) never holds it, so the daemon signs what it relays.
+#[derive(Default)]
+pub struct PendingOffers {
+    table: Mutex<Table>,
+}
+
+#[derive(Default)]
+struct Table {
+    sessions: HashMap<bson::oid::ObjectId, Pending>,
+    /// Noting order, for evicting the oldest past the cap: a clock read in a
+    /// tight loop can tie, an increment cannot.
+    next_seq: u64,
+}
+
+struct Pending {
+    user_id: bson::oid::ObjectId,
+    /// `(offer fingerprint, nonce)` while an offer that asked is unanswered.
+    asked: Option<(String, String)>,
+    noted_at: std::time::Instant,
+    seq: u64,
+}
+
+/// Sessions noted at once. A session that is never answered or ended is
+/// forgotten by age or by this cap, so the table cannot grow without bound.
+const MAX_PENDING: usize = 64;
+const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl PendingOffers {
+    /// An in-org session's request reached this daemon: remember who asked.
+    /// An external session is never noted: FR-52's own MAC binds it.
+    pub fn note_request(&self, session_id: bson::oid::ObjectId, user_id: bson::oid::ObjectId) {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        table
+            .sessions
+            .retain(|_, p| now.duration_since(p.noted_at) < PENDING_TTL);
+        if table.sessions.len() >= MAX_PENDING
+            && !table.sessions.contains_key(&session_id)
+            && let Some(oldest) = table
+                .sessions
+                .iter()
+                .min_by_key(|(_, p)| p.seq)
+                .map(|(id, _)| *id)
+        {
+            table.sessions.remove(&oldest);
+        }
+        let seq = table.next_seq;
+        table.next_seq += 1;
+        table.sessions.insert(
+            session_id,
+            Pending {
+                user_id,
+                asked: None,
+                noted_at: now,
+                seq,
+            },
+        );
+    }
+
+    /// The session's offer reached this daemon. One that asks (a nonce) is
+    /// remembered with its fingerprint, to sign the answer against; one that
+    /// does not ask clears an earlier ask, so a re-offer that did not ask is
+    /// never answered with a signature made for another offer.
+    pub fn note_offer(
+        &self,
+        session_id: bson::oid::ObjectId,
+        offer_sdp: &str,
+        ask: Option<&roomler_ai_remote_control::signaling::PeerAuthOffer>,
+    ) {
+        use roomler_ai_remote_control::signaling::{
+            peer_auth_nonce_is_well_formed, sdp_dtls_fingerprint,
+        };
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pending) = table.sessions.get_mut(&session_id) else {
+            if ask.is_some() {
+                tracing::info!(%session_id, "peer-auth: an offer asked for a signed answer, but no in-org request for it reached this process; it will be answered unsigned");
+            }
+            return;
+        };
+        pending.asked = None;
+        let Some(ask) = ask else {
+            return;
+        };
+        if !peer_auth_nonce_is_well_formed(&ask.nonce) {
+            tracing::warn!(%session_id, len = ask.nonce.len(), "peer-auth: the offer's nonce is not well formed; its answer goes unsigned");
+            return;
+        }
+        match sdp_dtls_fingerprint(offer_sdp) {
+            Ok(fingerprint) => pending.asked = Some((fingerprint, ask.nonce.clone())),
+            Err(why) => {
+                tracing::warn!(%session_id, ?why, "peer-auth: the offer names no single DTLS fingerprint; its answer goes unsigned");
+            }
+        }
+    }
+
+    /// The session ended: nothing more to sign for it.
+    pub fn forget(&self, session_id: bson::oid::ObjectId) {
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .remove(&session_id);
+    }
+
+    /// What signing this offer's answer needs, consumed: one answer per
+    /// offer. The controller stays noted for a re-offer.
+    fn take(&self, session_id: bson::oid::ObjectId) -> Option<Asked> {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = table.sessions.get_mut(&session_id)?;
+        let (offer_fingerprint, nonce) = pending.asked.take()?;
+        Some(Asked {
+            user_id: pending.user_id,
+            offer_fingerprint,
+            nonce,
+        })
+    }
+}
+
+/// An offer that asked for a signed answer, taken from the table to sign.
+struct Asked {
+    user_id: bson::oid::ObjectId,
+    offer_fingerprint: String,
+    nonce: String,
+}
+
+/// FR-100 P1b — the device's signature for `session_id`'s answer, when its
+/// offer asked for one and this enrollment has a key it keeps: the transcript
+/// (`peer_auth_transcript`, role `answer`) signed with the device key. `None`
+/// otherwise, and the answer goes out unsigned, which is exactly what an offer
+/// that did not ask expects.
+pub fn sign_answer(
+    offers: &PendingOffers,
+    config_path: &Path,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: bson::oid::ObjectId,
+    answer_sdp: &str,
+) -> Option<roomler_ai_remote_control::signaling::PeerAuthAnswer> {
+    let asked = offers.take(session_id)?;
+    let signed = signed_answer(
+        config_path,
+        tenant_id,
+        agent_id,
+        session_id,
+        &asked,
+        answer_sdp,
+    );
+    match signed {
+        Ok(answer) => {
+            tracing::info!(%session_id, "peer-auth: answer signed with this enrollment's device key");
+            Some(answer)
+        }
+        Err(why) => {
+            tracing::warn!(%session_id, %why, "peer-auth: the offer asked for a signed answer, but it goes unsigned");
+            None
+        }
+    }
+}
+
+/// [`sign_answer`]'s work, with the reason it could not be done.
+fn signed_answer(
+    config_path: &Path,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: bson::oid::ObjectId,
+    asked: &Asked,
+    answer_sdp: &str,
+) -> Result<roomler_ai_remote_control::signaling::PeerAuthAnswer, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use roomler_ai_remote_control::signaling::{
+        PeerAuthAnswer, peer_auth_transcript, sdp_dtls_fingerprint,
+    };
+    let answer_fingerprint = sdp_dtls_fingerprint(answer_sdp)
+        .map_err(|why| format!("the answer names no single DTLS fingerprint ({why:?})"))?;
+    let transcript = peer_auth_transcript(
+        "answer",
+        &session_id.to_hex(),
+        agent_id,
+        &asked.user_id.to_hex(),
+        &asked.offer_fingerprint,
+        &answer_fingerprint,
+        &asked.nonce,
+    )
+    .ok_or("a transcript field is too long to frame")?;
+    let key = device_key(config_path, tenant_id)?;
+    let sig = key.sign(&transcript).ok_or("signing failed")?;
+    Ok(PeerAuthAnswer {
+        key: key.public_b64(),
+        sig: URL_SAFE_NO_PAD.encode(sig),
+    })
+}
+
+/// FR-100 P1b — sign `msg` in place if it is an answer: the choke point for
+/// answers this process did not build itself (a GUI worker's, relayed up by
+/// the delegation host). Whatever the worker put in `peer_auth` is not the
+/// daemon's to vouch for, so it is replaced by the daemon's own signature, or
+/// by none.
+pub fn sign_outbound(
+    offers: &PendingOffers,
+    config_path: &Path,
+    tenant_id: &str,
+    agent_id: &str,
+    msg: &mut roomler_ai_remote_control::signaling::ClientMsg,
+) {
+    if let roomler_ai_remote_control::signaling::ClientMsg::SdpAnswer {
+        session_id,
+        sdp,
+        peer_auth,
+        ..
+    } = msg
+    {
+        *peer_auth = sign_answer(offers, config_path, tenant_id, agent_id, *session_id, sdp);
+    }
 }
 
 /// What reading a key file found.
@@ -397,5 +630,217 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    // ─── P1b — signing the answer ───────────────────────────────────────
+
+    use bson::oid::ObjectId;
+    use roomler_ai_remote_control::signaling::{
+        ClientMsg, PeerAuthAnswer, PeerAuthOffer, peer_auth_transcript, peer_auth_verify,
+    };
+
+    const OFFER_SDP: &str = "v=0\r\na=fingerprint:sha-256 aa:bb:cc\r\n";
+    const ANSWER_SDP: &str = "v=0\r\na=fingerprint:sha-256 dd:ee:ff\r\n";
+    const AGENT: &str = "66f0c0ffee00000000000d01";
+
+    /// A browser's nonce: bytes 0 to 15, base64url without padding. Built,
+    /// not written as a literal: a secret scanner cannot tell a counting
+    /// sequence from a key.
+    fn nonce() -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            (0u8..16).collect::<Vec<u8>>(),
+        )
+    }
+
+    fn ask() -> PeerAuthOffer {
+        PeerAuthOffer { nonce: nonce() }
+    }
+
+    /// The transcript the browser would rebuild for this session's answer.
+    fn transcript_for(session: ObjectId, user: ObjectId) -> Vec<u8> {
+        peer_auth_transcript(
+            "answer",
+            &session.to_hex(),
+            AGENT,
+            &user.to_hex(),
+            "sha-256 AA:BB:CC",
+            "sha-256 DD:EE:FF",
+            &nonce(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_asked_answer_is_signed_over_the_sessions_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let (session, user) = (ObjectId::new(), ObjectId::new());
+        offers.note_request(session, user);
+        offers.note_offer(session, OFFER_SDP, Some(&ask()));
+        let signed = sign_answer(&offers, &cfg, TENANT_A, AGENT, session, ANSWER_SDP)
+            .expect("an asked answer is signed");
+        // The key that signed is this enrollment's, the one its hello offers.
+        assert_eq!(signed.key, hello_key(&cfg, TENANT_A));
+        assert!(peer_auth_verify(
+            &signed.key,
+            &transcript_for(session, user),
+            &signed.sig
+        ));
+        // …and over that session's transcript only: another controller's
+        // would not verify.
+        assert!(!peer_auth_verify(
+            &signed.key,
+            &transcript_for(session, ObjectId::new()),
+            &signed.sig
+        ));
+        // One answer per offer; a re-offer that asks is answered again, the
+        // controller having stayed noted.
+        assert!(sign_answer(&offers, &cfg, TENANT_A, AGENT, session, ANSWER_SDP).is_none());
+        offers.note_offer(session, OFFER_SDP, Some(&ask()));
+        assert!(sign_answer(&offers, &cfg, TENANT_A, AGENT, session, ANSWER_SDP).is_some());
+    }
+
+    #[test]
+    fn an_answer_nobody_asked_to_sign_goes_unsigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let (session, user) = (ObjectId::new(), ObjectId::new());
+        let sign = |offers: &PendingOffers, session| {
+            sign_answer(offers, &cfg, TENANT_A, AGENT, session, ANSWER_SDP)
+        };
+        offers.note_request(session, user);
+
+        offers.note_offer(session, OFFER_SDP, None);
+        assert!(sign(&offers, session).is_none(), "the offer did not ask");
+        let bad = PeerAuthOffer {
+            nonce: "too-short".into(),
+        };
+        offers.note_offer(session, OFFER_SDP, Some(&bad));
+        assert!(
+            sign(&offers, session).is_none(),
+            "a nonce that is not well formed"
+        );
+        offers.note_offer(session, "v=0\r\n", Some(&ask()));
+        assert!(
+            sign(&offers, session).is_none(),
+            "an offer with no fingerprint"
+        );
+        offers.note_offer(session, OFFER_SDP, Some(&ask()));
+        offers.note_offer(session, OFFER_SDP, None);
+        assert!(
+            sign(&offers, session).is_none(),
+            "a re-offer that did not ask"
+        );
+        offers.note_offer(session, OFFER_SDP, Some(&ask()));
+        offers.forget(session);
+        assert!(sign(&offers, session).is_none(), "an ended session");
+
+        // A session whose request never reached this process: an outsider's
+        // (bound by FR-52 instead), or one another daemon admitted.
+        let stranger = ObjectId::new();
+        offers.note_offer(stranger, OFFER_SDP, Some(&ask()));
+        assert!(sign(&offers, stranger).is_none());
+    }
+
+    #[test]
+    fn an_enrollment_without_a_kept_key_signs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(DIR_NAME), b"in the way").unwrap();
+        let offers = PendingOffers::default();
+        let (session, user) = (ObjectId::new(), ObjectId::new());
+        offers.note_request(session, user);
+        offers.note_offer(session, OFFER_SDP, Some(&ask()));
+        assert!(
+            sign_answer(
+                &offers,
+                &config_in(&dir),
+                TENANT_A,
+                AGENT,
+                session,
+                ANSWER_SDP
+            )
+            .is_none()
+        );
+    }
+
+    /// The FR-43 choke point: a worker's answer leaves signed by the daemon,
+    /// and whatever the worker claimed is never passed on.
+    #[test]
+    fn a_workers_answer_is_signed_by_the_daemon_and_its_own_claim_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(&dir);
+        let offers = PendingOffers::default();
+        let (session, user) = (ObjectId::new(), ObjectId::new());
+        offers.note_request(session, user);
+        offers.note_offer(session, OFFER_SDP, Some(&ask()));
+        let forged = || {
+            Some(PeerAuthAnswer {
+                key: "a worker's key".into(),
+                sig: "a worker's signature".into(),
+            })
+        };
+        let mut msg = ClientMsg::SdpAnswer {
+            session_id: session,
+            sdp: ANSWER_SDP.into(),
+            extauth_mac: None,
+            peer_auth: forged(),
+        };
+        sign_outbound(&offers, &cfg, TENANT_A, AGENT, &mut msg);
+        let ClientMsg::SdpAnswer {
+            peer_auth: Some(signed),
+            ..
+        } = msg
+        else {
+            panic!("the daemon signs the worker's answer");
+        };
+        assert!(peer_auth_verify(
+            &signed.key,
+            &transcript_for(session, user),
+            &signed.sig
+        ));
+
+        // Nothing noted for this one: the worker's claim is dropped, not kept.
+        let mut msg = ClientMsg::SdpAnswer {
+            session_id: ObjectId::new(),
+            sdp: ANSWER_SDP.into(),
+            extauth_mac: None,
+            peer_auth: forged(),
+        };
+        sign_outbound(&offers, &cfg, TENANT_A, AGENT, &mut msg);
+        assert!(matches!(
+            msg,
+            ClientMsg::SdpAnswer {
+                peer_auth: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_table_forgets_its_oldest_session_past_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let offers = PendingOffers::default();
+        let first = ObjectId::new();
+        offers.note_request(first, ObjectId::new());
+        for _ in 0..MAX_PENDING {
+            offers.note_request(ObjectId::new(), ObjectId::new());
+        }
+        assert_eq!(offers.table.lock().unwrap().sessions.len(), MAX_PENDING);
+        offers.note_offer(first, OFFER_SDP, Some(&ask()));
+        assert!(
+            sign_answer(
+                &offers,
+                &config_in(&dir),
+                TENANT_A,
+                AGENT,
+                first,
+                ANSWER_SDP
+            )
+            .is_none(),
+            "the oldest session was forgotten"
+        );
     }
 }

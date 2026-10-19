@@ -97,7 +97,7 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3032`](../crates/localapi/src/lib.rs#L3032)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:8866`](../crates/remote_control/src/models.rs#L8866)). A server that could set it could
+  push it ([`models.rs:8895`](../crates/remote_control/src/models.rs#L8895)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:519`](../agents/roomlerd/src/display_match.rs#L519)
   `set_device_policy`).

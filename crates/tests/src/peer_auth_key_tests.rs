@@ -14,6 +14,10 @@
 //!
 //! And one test runs the REAL agent: its hello carries a well-formed key that
 //! it keeps beside its config, in one file per enrollment.
+//!
+//! P1b — and the real agent signs the answer an offer asked for (a nonce),
+//! with the key on its row, over that session's transcript, while an offer
+//! that did not ask is answered exactly as before.
 
 use std::time::Duration;
 
@@ -239,55 +243,10 @@ async fn the_real_agent_says_hello_with_a_key_it_keeps_beside_its_config() {
     let agent_id = cfg.agent_id.clone();
     let tenant_id = cfg.tenant_id.clone();
     let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let agent = {
-        let config_path = config_path.clone();
-        tokio::spawn(async move {
-            let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
-            let broker = roomlerd::consent::ConsentBroker::new(
-                roomlerd::consent::Mode::AutoGrant,
-                std::env::temp_dir().join(format!("roomler-device-key-consent-{}", cfg.agent_id)),
-            )
-            .expect("consent broker init");
-            let _ = signaling::run(
-                signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
-                    cfg.agent_token.clone(),
-                )),
-                roomlerd::delegate::Delegation::Off,
-                cfg,
-                EncoderPreference::Software,
-                stop_rx,
-                connected,
-                view_tx,
-                Default::default(),
-                broker,
-                roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
-                // The one thing this test varies: a config path WITH a
-                // directory, which is where the key file goes.
-                roomlerd::remote_config::RemoteConfigServices::new(
-                    config_path,
-                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                    false,
-                    false,
-                ),
-                roomlerd::rc_sessions::RcSessionRegistry::new(),
-            )
-            .await;
-        })
-    };
+    let agent = spawn_keyed_agent(cfg, dir.path().join("config.toml"), stop_rx);
 
-    let mut key = None;
-    for _ in 0..100 {
-        key = stored_key(&app, &agent_id).await;
-        if key.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let key = key.expect("the real agent's hello carried a device key");
+    let key = wait_for_any_key(&app, &agent_id).await;
     assert!(peer_auth_key_is_well_formed(&key), "{key}");
     let file = dir
         .path()
@@ -302,6 +261,222 @@ async fn the_real_agent_says_hello_with_a_key_it_keeps_beside_its_config() {
         shown(&app, &seeded, &agent_id).await,
         (json!(key), json!(peer_auth_fingerprint(&key).unwrap()))
     );
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), agent).await;
+}
+
+/// The real agent's signalling loop, with a config path in a directory of its
+/// own: the one thing these tests vary, because that is where its key goes.
+fn spawn_keyed_agent(
+    cfg: AgentConfig,
+    config_path: std::path::PathBuf,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
+        let broker = roomlerd::consent::ConsentBroker::new(
+            roomlerd::consent::Mode::AutoGrant,
+            std::env::temp_dir().join(format!("roomler-device-key-consent-{}", cfg.agent_id)),
+        )
+        .expect("consent broker init");
+        let _ = signaling::run(
+            signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+                cfg.agent_token.clone(),
+            )),
+            roomlerd::delegate::Delegation::Off,
+            cfg,
+            EncoderPreference::Software,
+            stop_rx,
+            connected,
+            view_tx,
+            Default::default(),
+            broker,
+            roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            roomlerd::remote_config::RemoteConfigServices::new(
+                config_path,
+                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                false,
+            ),
+            roomlerd::rc_sessions::RcSessionRegistry::new(),
+        )
+        .await;
+    })
+}
+
+/// The key the row holds once the agent's hello lands.
+async fn wait_for_any_key(app: &TestApp, agent_id: &str) -> String {
+    for _ in 0..100 {
+        if let Some(key) = stored_key(app, agent_id).await {
+            return key;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the real agent's hello carried no device key");
+}
+
+// ─── P1b — the device signs its answer ──────────────────────────────────
+
+/// A browser's nonce: bytes 0 to 15, base64url without padding. Built, not
+/// written as a literal: a secret scanner cannot tell a counting sequence
+/// from a key.
+fn nonce() -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        (0u8..16).collect::<Vec<u8>>(),
+    )
+}
+
+/// Ask the real agent for a session as the admin and, once it is ready, send
+/// a real webrtc-rs offer, with `nonce` as its `peer_auth` when given. Returns
+/// the controller's socket, the session id, the offer's SDP, the answer frame
+/// and the browser's peer connection, which the caller closes (dropping one
+/// frees none of its sockets).
+async fn offer_and_answer(
+    app: &TestApp,
+    token: &str,
+    agent_id: &str,
+    nonce: Option<&str>,
+) -> (
+    Ws,
+    String,
+    String,
+    Value,
+    std::sync::Arc<webrtc::peer_connection::RTCPeerConnection>,
+) {
+    use crate::rc_idle_limit_tests::next_of;
+    use webrtc::api::APIBuilder;
+    use webrtc::api::media_engine::MediaEngine;
+    use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
+
+    let mut me = MediaEngine::default();
+    me.register_default_codecs().unwrap();
+    let api = APIBuilder::new().with_media_engine(me).build();
+    let pc = std::sync::Arc::new(
+        api.new_peer_connection(RTCConfiguration::default())
+            .await
+            .unwrap(),
+    );
+    let _dc = pc
+        .create_data_channel("control", Some(RTCDataChannelInit::default()))
+        .await
+        .unwrap();
+    let offer = pc.create_offer(None).await.unwrap();
+    pc.set_local_description(offer.clone()).await.unwrap();
+
+    let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
+    let (mut ctl, _) = connect_async(&url).await.expect("controller ws");
+    ctl.send(Message::Text(
+        json!({
+            "t": "rc:session.request",
+            "agent_id": agent_id,
+            "permissions": "VIEW | INPUT",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let created = next_of(&mut ctl, "rc:session.created", Duration::from_secs(10))
+        .await
+        .expect("rc:session.created");
+    let sid = created["session_id"].as_str().unwrap().to_string();
+    next_of(&mut ctl, "rc:ready", Duration::from_secs(10))
+        .await
+        .expect("rc:ready (the agent auto-grants)");
+    let mut frame = json!({ "t": "rc:sdp.offer", "session_id": sid, "sdp": offer.sdp });
+    if let Some(nonce) = nonce {
+        frame["peer_auth"] = json!({ "nonce": nonce });
+    }
+    ctl.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+    let answer = next_of(&mut ctl, "rc:sdp.answer", Duration::from_secs(10))
+        .await
+        .expect("the agent's answer");
+    (ctl, sid, offer.sdp, answer, pc)
+}
+
+/// An offer that asks gets an answer signed with the key on the device's
+/// row, over THIS session's transcript (its id, the device, the admin who
+/// asked, both DTLS fingerprints, the nonce): what a browser that pinned the
+/// key will check. An offer that does not ask, the shape every browser sends
+/// before P2, gets no signature and is answered exactly as before.
+#[tokio::test]
+async fn the_real_agent_signs_the_answer_an_offer_asked_for() {
+    use roomler_ai_remote_control::signaling::{
+        peer_auth_transcript, peer_auth_verify, sdp_dtls_fingerprint,
+    };
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("peerauth-answer").await;
+    let cfg = crate::rc_idle_limit_tests::enrol(&app, &seeded, "peer-auth-answer").await;
+    let agent_id = cfg.agent_id.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let agent = spawn_keyed_agent(cfg.clone(), dir.path().join("config.toml"), stop_rx);
+    crate::rc_idle_limit_tests::wait_online(&app, &seeded, &cfg).await;
+    let key = wait_for_any_key(&app, &agent_id).await;
+    let token = &seeded.admin.access_token;
+    let nonce = nonce();
+
+    let (mut ctl, sid, offer_sdp, answer, pc) =
+        offer_and_answer(&app, token, &agent_id, Some(nonce.as_str())).await;
+    let signed = &answer["peer_auth"];
+    assert_eq!(
+        signed["key"],
+        json!(key),
+        "signed by the key on the row: {answer}"
+    );
+    let transcript = peer_auth_transcript(
+        "answer",
+        &sid,
+        &agent_id,
+        &seeded.admin.id,
+        &sdp_dtls_fingerprint(&offer_sdp).unwrap(),
+        &sdp_dtls_fingerprint(answer["sdp"].as_str().unwrap()).unwrap(),
+        &nonce,
+    )
+    .unwrap();
+    assert!(
+        peer_auth_verify(&key, &transcript, signed["sig"].as_str().unwrap()),
+        "the signature verifies over this session's transcript: {answer}"
+    );
+    // Over this session's only: the member, who did not ask, is not who it
+    // was signed for.
+    let theirs = peer_auth_transcript(
+        "answer",
+        &sid,
+        &agent_id,
+        &seeded.member.id,
+        &sdp_dtls_fingerprint(&offer_sdp).unwrap(),
+        &sdp_dtls_fingerprint(answer["sdp"].as_str().unwrap()).unwrap(),
+        &nonce,
+    )
+    .unwrap();
+    assert!(!peer_auth_verify(
+        &key,
+        &theirs,
+        signed["sig"].as_str().unwrap()
+    ));
+    ctl.send(Message::Text(
+        json!({ "t": "rc:terminate", "session_id": sid, "reason": "controller_hangup" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let _ = pc.close().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (_ctl, _sid, _offer, answer, pc) = offer_and_answer(&app, token, &agent_id, None).await;
+    assert!(
+        answer.get("peer_auth").is_none(),
+        "an offer that did not ask is answered unsigned: {answer}"
+    );
+    let _ = pc.close().await;
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), agent).await;
