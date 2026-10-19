@@ -1494,6 +1494,18 @@ sequenceDiagram
 > one stops at **key changed** until the person trusts the new one. That is the point: from the browser's side,
 > a reinstalled device and an impostor look the same until a person compares the fingerprints.
 
+**What uninstall leaves.** The key lives in the config dir, so it leaves with it.
+
+| Path | The key file |
+|---|---|
+| `install.sh --uninstall`, Linux and macOS | removed with the config trees: `/etc/roomler`, the caller's and root's. Another account's tree is listed, not removed, and its key with it |
+| `install.sh --uninstall --keep-config` | kept |
+| Windows: the MSI, or `install.ps1 -Uninstall` | kept, exactly as they keep `config.toml` with the agent's credential |
+
+A re-enrollment that finds the key keeps every browser's pin valid. One that had to make a new key reads as **key
+changed** in every browser that pinned the old one, even when the server revives the same device row: a wiped
+machine is a new identity until a person says otherwise.
+
 ### 11.5 The host's Disconnect (FR-27 P10)
 
 The person at the device can end a session from their own screen — the
