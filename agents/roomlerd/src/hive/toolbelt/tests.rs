@@ -2124,9 +2124,9 @@ async fn vault_connect_serves_mongodb_on_a_loopback_port() {
 }
 
 /// P3-5d-2 — a toolbelt for an HTTP endpoint's call, with `values` in its
-/// vault: on Linux a run whose commands run as this daemon, on Windows the
+/// vault: on Unix a run whose commands run as this daemon, on Windows the
 /// session's account as the toolbelt holds it.
-#[cfg(all(feature = "vault", target_os = "linux"))]
+#[cfg(all(feature = "vault", unix))]
 fn http_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, ObjectId) {
     exec_belt(dir, values)
 }
@@ -2157,7 +2157,7 @@ fn http_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, Obj
 
 /// P3-5d-2 — one HTTP response on `s`, within 10 s, read whole: its head,
 /// then its body by its `content-length`.
-#[cfg(all(feature = "vault", any(target_os = "linux", windows)))]
+#[cfg(feature = "vault")]
 async fn http_response<S: AsyncRead + Unpin>(s: &mut S) -> String {
     use tokio::io::AsyncReadExt;
     let read = async {
@@ -2193,7 +2193,7 @@ async fn http_response<S: AsyncRead + Unpin>(s: &mut S) -> String {
 /// The answer names the endpoint and git's way through it, never the value;
 /// a request with no credential reaches the upstream with the secret's
 /// token; and the connection ends with its lease.
-#[cfg(all(feature = "vault", any(target_os = "linux", windows)))]
+#[cfg(feature = "vault")]
 #[tokio::test]
 async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     use crate::vault_proxy::testing::{fake_http, made};
@@ -2273,7 +2273,7 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
 /// P3-5d-2 — a value `Authorization` cannot carry is refused at the call,
 /// before any endpoint is served, and its lease let go: here a token with a
 /// space. The refusal names no value.
-#[cfg(all(feature = "vault", any(target_os = "linux", windows)))]
+#[cfg(feature = "vault")]
 #[tokio::test]
 async fn a_value_authorization_cannot_carry_is_refused_at_the_call() {
     use crate::vault_proxy::testing::made;
@@ -2309,7 +2309,7 @@ async fn a_value_authorization_cannot_carry_is_refused_at_the_call() {
 /// `git ls-remote <upstream>/<repo>` lists the repository's refs, and the
 /// upstream saw git's request carry the secret's user and password, which
 /// git never had.
-#[cfg(all(feature = "vault", any(target_os = "linux", windows)))]
+#[cfg(feature = "vault")]
 #[tokio::test]
 async fn git_goes_through_an_http_endpoint_by_its_env() {
     use base64::Engine as _;
@@ -2377,10 +2377,11 @@ async fn git_goes_through_an_http_endpoint_by_its_env() {
 }
 
 /// P3-5d-2 — on Linux, a loopback connection from any account but the
-/// session's is refused, read from the kernel's table of sockets. Here the
-/// session's account is another's, so this test's own connection is the one
-/// refused: closed, answered nothing, and nothing sent upstream.
-#[cfg(all(feature = "vault", target_os = "linux"))]
+/// session's is refused, read from the kernel's table of sockets; on macOS
+/// (P3-5d-3), from the descriptors each process holds. Here the session's
+/// account is another's, so this test's own connection is the one refused:
+/// closed, answered nothing, and nothing sent upstream.
+#[cfg(all(feature = "vault", unix))]
 #[tokio::test]
 async fn an_http_connection_from_another_account_is_refused() {
     use crate::vault_proxy::testing::{fake_http, made};
@@ -2445,34 +2446,6 @@ async fn an_http_connection_from_another_account_is_refused() {
     assert!(ended.is_ok(), "the connection was closed");
     assert!(rest.is_empty(), "and answered nothing: {rest:?}");
     assert!(saw.try_recv().is_err(), "nothing reached the upstream");
-}
-
-/// P3-5d-2 — macOS cannot yet say who connects to a loopback port, so it
-/// serves no HTTP endpoint, and asks the vault for nothing.
-#[cfg(all(feature = "vault", target_os = "macos"))]
-#[tokio::test]
-async fn vault_connect_serves_no_http_endpoint_where_nothing_says_who_connects() {
-    let dir = tempfile::tempdir().unwrap();
-    let (b, vault, _sid) = exec_belt(dir.path(), &[("git/bot#token", b"t")]);
-    let mut c = Client::connect(&b).await;
-    let refused = connect_answer(
-        &mut c,
-        1,
-        json!({
-            "handle": "git/bot",
-            "engine": "http",
-            "upstream": "https://github.com",
-            "auth": "bearer",
-        }),
-    )
-    .await
-    .unwrap_err();
-    assert!(refused.contains("P3-5d-3"), "{refused}");
-    assert!(
-        vault.asked().is_empty(),
-        "nothing leased: {:?}",
-        vault.asked()
-    );
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the
