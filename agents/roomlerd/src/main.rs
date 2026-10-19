@@ -876,10 +876,18 @@ enum OrgAction {
     /// WS loop for it on the next daemon start).
     Disable { label: String },
     /// Swap a secondary enrollment into the PRIMARY slot (and the current
-    /// primary into `[[orgs]]` under the given secondary's old label). The
-    /// primary drives machine-wide effects: self-update source, attention
-    /// sentinels, the (P1) overlay TUN, and declared tunnel routes.
-    SetPrimary { label: String },
+    /// primary into `[[orgs]]`, under `--demoted-label` or else the given
+    /// secondary's old label). The primary drives machine-wide effects:
+    /// self-update source, attention sentinels, and declared tunnel routes.
+    /// Each enrollment keeps its place on the mesh where it maps exactly
+    /// (#2540); the output says what it could not keep.
+    SetPrimary {
+        label: String,
+        /// The label the current primary takes in `[[orgs]]`. Default: the
+        /// promoted org's old label.
+        #[arg(long)]
+        demoted_label: Option<String>,
+    },
     /// FR-49 — put a secondary enrollment on (or off) that org's overlay mesh.
     ///
     /// Before this the only way was to hand-edit `config.toml` — the file that
@@ -2913,14 +2921,41 @@ fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
         }
         OrgAction::Enable { label } => set_org_enabled(&mut cfg, &label, true)?,
         OrgAction::Disable { label } => set_org_enabled(&mut cfg, &label, false)?,
-        OrgAction::SetPrimary { label } => {
-            config::promote_org_to_primary(&mut cfg, &label)?;
+        OrgAction::SetPrimary {
+            label,
+            demoted_label,
+        } => {
+            let done = config::promote_org_to_primary(&mut cfg, &label, demoted_label.as_deref())?;
+            let demoted = &done.demoted_label;
             println!(
-                "Org {label:?} is now the PRIMARY enrollment; the previous primary \
-                 moved into [[orgs]] under the label {label:?}. Overlay participation \
-                 for the new primary starts OFF — re-enable with `roomler config set \
-                 overlay_enabled true` if wanted. Restart the daemon to apply."
+                "Org {label:?} is now the PRIMARY enrollment; the previous primary moved \
+                 into [[orgs]] as {demoted:?}."
             );
+            println!(
+                "Mesh: the primary is {}; {demoted:?} is {}.",
+                if done.primary_on {
+                    "on (its own OS TUN)"
+                } else {
+                    "off"
+                },
+                done.demoted_mode.wire()
+            );
+            if done.primary_was_netstack {
+                println!(
+                    "  {label:?} was on the mesh through the userspace netstack, which a \
+                     primary cannot take from config: `roomler config set overlay_enabled \
+                     true` puts it on its own OS TUN instead."
+                );
+            }
+            if done.demoted_lost_mesh {
+                println!(
+                    "  {demoted:?} was on the mesh as the primary and cannot stay on it as \
+                     `tun` (that needs `overlay_multi_org` and the primary's control plane): \
+                     `roomlerd org overlay {demoted} netstack` keeps it on through the \
+                     userspace stack."
+                );
+            }
+            println!("Restart the daemon to apply.");
         }
         OrgAction::Overlay { label, mode } => {
             roomlerd::org_join::set_org_overlay(&mut cfg, &label, &mode)?
