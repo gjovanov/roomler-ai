@@ -23,8 +23,8 @@
 //! database clients on Windows, and git and most HTTP clients everywhere. Any
 //! process on the device can connect to one; only one running as the
 //! session's account is served. Linux reads who connected from
-//! `/proc/net/tcp`, Windows from its connection table. macOS cannot yet
-//! (P3-5d-3), so it serves no HTTP endpoint.
+//! `/proc/net/tcp`, Windows from its connection table, and macOS (P3-5d-3)
+//! from the descriptors each process holds.
 
 use std::sync::Arc;
 
@@ -444,6 +444,264 @@ mod proc_net {
             _ => return None,
         };
         Some(SocketAddrV4::new(ip, port))
+    }
+}
+
+/// P3-5d-3 — macOS: whether a TCP connection's client end is an account's,
+/// from the kernel's view of each process's descriptors (`libproc`). macOS
+/// has no table of sockets with an owner in it, as Linux's `/proc/net/tcp`
+/// is, nor says who made a socket (its `soi_stat` is never filled); it does
+/// say which descriptors each process holds.
+#[cfg(target_os = "macos")]
+// The SDK's structs are mirrored whole, every field held for its place in
+// the layout; only some are read.
+#[allow(dead_code)]
+mod libproc {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
+    use std::os::raw::c_int;
+
+    /// `proc_listpids`: every process; those whose effective uid is the one
+    /// asked.
+    const PROC_ALL_PIDS: u32 = 1;
+    const PROC_UID_ONLY: u32 = 4;
+    /// `proc_pidfdinfo`: a socket's description.
+    const PROC_PIDFDSOCKETINFO: c_int = 3;
+    /// `socket_info.soi_kind`: a TCP socket.
+    const SOCKINFO_TCP: c_int = 2;
+    /// `in_sockinfo.insi_vflag`: which family its addresses are in.
+    const INI_IPV4: u8 = 0x1;
+    const INI_IPV6: u8 = 0x2;
+
+    // `<sys/proc_info.h>`, as the SDK lays it out: the part read here.
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SockbufInfo {
+        sbi_cc: u32,
+        sbi_hiwat: u32,
+        sbi_mbcnt: u32,
+        sbi_mbmax: u32,
+        sbi_lowat: u32,
+        sbi_flags: i16,
+        sbi_timeo: i16,
+    }
+
+    /// `struct in4in6_addr`: an IPv4 address in the last four bytes.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct In4In6Addr {
+        pad32: [u32; 3],
+        addr4: [u8; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union InAddr46 {
+        ina_46: In4In6Addr,
+        ina_6: [u8; 16],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InSockInfo {
+        /// The ports, each as the stack holds it: network order.
+        insi_fport: c_int,
+        insi_lport: c_int,
+        insi_gencnt: u64,
+        insi_flags: u32,
+        insi_flow: u32,
+        insi_vflag: u8,
+        insi_ip_ttl: u8,
+        rfu_1: u32,
+        insi_faddr: InAddr46,
+        insi_laddr: InAddr46,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SocketInfo {
+        /// Left zeroed by the kernel for a socket (`fill_socketinfo` never
+        /// sets it): held for its place only.
+        soi_stat: libc::vinfo_stat,
+        soi_so: u64,
+        soi_pcb: u64,
+        soi_type: c_int,
+        soi_protocol: c_int,
+        soi_family: c_int,
+        soi_options: i16,
+        soi_linger: i16,
+        soi_state: i16,
+        soi_qlen: i16,
+        soi_incqlen: i16,
+        soi_qlimit: i16,
+        soi_timeo: i16,
+        soi_error: u16,
+        soi_oobmark: u32,
+        soi_rcv: SockbufInfo,
+        soi_snd: SockbufInfo,
+        soi_kind: c_int,
+        rfu_1: u32,
+        /// A union in the SDK; a TCP socket's starts with its `in_sockinfo`.
+        soi_proto: InSockInfo,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SocketFdInfo {
+        pfi: ProcFileInfo,
+        psi: SocketInfo,
+    }
+
+    // The SDK's offsets, so a mistake in the layout above fails the build.
+    const _: () = assert!(std::mem::size_of::<libc::vinfo_stat>() == 136);
+    const _: () = assert!(std::mem::offset_of!(SocketInfo, soi_kind) == 232);
+    const _: () = assert!(std::mem::offset_of!(SocketInfo, soi_proto) == 240);
+    const _: () = assert!(std::mem::offset_of!(InSockInfo, insi_faddr) == 32);
+    const _: () = assert!(std::mem::offset_of!(SocketFdInfo, psi) == 24);
+
+    /// What the kernel fills: the whole `socket_fdinfo`, whose protocol
+    /// union is larger than the part read here.
+    #[repr(C, align(8))]
+    struct Buf([u8; 2048]);
+
+    /// Whether the socket at `client` connected to `server` is held, and
+    /// held only, by processes running as `uid`: one held by any other
+    /// account's process too is not the account's. The kernel never fills a
+    /// socket's own `soi_stat`, so who made it cannot be read; who holds it
+    /// can.
+    pub(crate) fn held_by(client: SocketAddrV4, server: SocketAddrV4, uid: u32) -> bool {
+        let theirs: std::collections::HashSet<c_int> =
+            pids(PROC_UID_ONLY, uid).into_iter().collect();
+        let mut held = false;
+        for pid in pids(PROC_ALL_PIDS, 0) {
+            let holds = socket_fds(pid).into_iter().any(|fd| {
+                tcp_ends(pid, fd).is_some_and(|(local, remote)| local == client && remote == server)
+            });
+            if holds {
+                if !theirs.contains(&pid) {
+                    return false;
+                }
+                held = true;
+            }
+        }
+        held
+    }
+
+    /// The pids `proc_listpids` names for `kind` (and its `info`).
+    fn pids(kind: u32, info: u32) -> Vec<c_int> {
+        let size = std::mem::size_of::<c_int>();
+        // SAFETY: a size query, with no buffer.
+        let bytes = unsafe { libc::proc_listpids(kind, info, std::ptr::null_mut(), 0) };
+        let Ok(bytes) = usize::try_from(bytes) else {
+            return Vec::new();
+        };
+        // Room for processes started since the query.
+        let mut pids = vec![0 as c_int; bytes / size + 32];
+        let room = c_int::try_from(pids.len() * size).unwrap_or(c_int::MAX);
+        // SAFETY: the buffer holds `room` bytes.
+        let filled = unsafe { libc::proc_listpids(kind, info, pids.as_mut_ptr().cast(), room) };
+        let Ok(filled) = usize::try_from(filled) else {
+            return Vec::new();
+        };
+        pids.truncate(filled / size);
+        pids.retain(|p| *p > 0);
+        pids
+    }
+
+    /// The descriptors of `pid` that are sockets.
+    fn socket_fds(pid: c_int) -> Vec<c_int> {
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        // SAFETY: a size query, with no buffer.
+        let bytes =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        let Ok(bytes) = usize::try_from(bytes) else {
+            return Vec::new();
+        };
+        // Room for descriptors opened since the query.
+        let mut fds = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            bytes / size + 32
+        ];
+        let room = c_int::try_from(fds.len() * size).unwrap_or(c_int::MAX);
+        // SAFETY: the buffer holds `room` bytes.
+        let filled = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), room)
+        };
+        let Ok(filled) = usize::try_from(filled) else {
+            return Vec::new();
+        };
+        fds.truncate(filled / size);
+        fds.into_iter()
+            .filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+            .map(|f| f.proc_fd)
+            .collect()
+    }
+
+    /// What `pid`'s TCP sockets connect, as libproc tells it: for a test to
+    /// show when an end is not found.
+    #[cfg(test)]
+    pub(crate) fn ends_of(pid: c_int) -> Vec<(SocketAddrV4, SocketAddrV4)> {
+        socket_fds(pid)
+            .into_iter()
+            .filter_map(|fd| tcp_ends(pid, fd))
+            .collect()
+    }
+
+    /// A TCP socket's two ends: `None` for any other socket, or one that is
+    /// gone.
+    fn tcp_ends(pid: c_int, fd: c_int) -> Option<(SocketAddrV4, SocketAddrV4)> {
+        let mut buf = Buf([0; 2048]);
+        let room = c_int::try_from(buf.0.len()).ok()?;
+        // SAFETY: the buffer holds `room` bytes.
+        let filled = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd,
+                PROC_PIDFDSOCKETINFO,
+                buf.0.as_mut_ptr().cast(),
+                room,
+            )
+        };
+        if usize::try_from(filled).ok()? < std::mem::size_of::<SocketFdInfo>() {
+            return None;
+        }
+        // SAFETY: the kernel filled at least this much, and every field is
+        // plain data, valid at any value.
+        let info: SocketFdInfo = unsafe { std::ptr::read(buf.0.as_ptr().cast()) };
+        let si = info.psi;
+        if si.soi_kind != SOCKINFO_TCP {
+            return None;
+        }
+        let ini = si.soi_proto;
+        let ip = |a: InAddr46| -> Option<Ipv4Addr> {
+            // SAFETY: both of the union's arms are plain bytes.
+            if ini.insi_vflag & INI_IPV4 != 0 {
+                Some(Ipv4Addr::from(unsafe { a.ina_46 }.addr4))
+            } else if ini.insi_vflag & INI_IPV6 != 0 {
+                Ipv6Addr::from(unsafe { a.ina_6 }).to_ipv4_mapped()
+            } else {
+                None
+            }
+        };
+        // Each port as the stack holds it, in network order.
+        let port = |p: c_int| u16::from_be(p as u16);
+        Some((
+            SocketAddrV4::new(ip(ini.insi_laddr)?, port(ini.insi_lport)),
+            SocketAddrV4::new(ip(ini.insi_faddr)?, port(ini.insi_fport)),
+        ))
     }
 }
 
@@ -1099,16 +1357,17 @@ mod endpoint {
     /// P3-5b-4, P3-5d-2 — a loopback port, for a client that cannot dial a
     /// Unix socket: every endpoint on Windows, whose database clients mostly
     /// cannot, and an HTTP one everywhere, since git cannot. Each
-    /// connection's account is read from the system's table of connections,
-    /// and only the session's is served.
+    /// connection's account is read from the system (its table of
+    /// connections; on macOS the descriptors each process holds), and only
+    /// the session's is served.
     ///
     /// ⚠️ Any process on the device can connect to the port; only the
     /// session's account is served. The port cannot be taken over by another
     /// account's socket. Windows makes a bound port shareable only where its
     /// first socket asked for that (`SO_REUSEADDR`), which this one does not,
     /// and SYSTEM is the only exception. Linux shares one only between
-    /// sockets of one owner that both set `SO_REUSEPORT`, which this one
-    /// does not.
+    /// sockets of one owner that both set `SO_REUSEPORT`, and macOS only
+    /// between sockets that all set it, which this one does not.
     mod loopback {
         use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -1119,8 +1378,9 @@ mod endpoint {
 
         /// Whether this system can say which account a loopback connection
         /// comes from: Windows by its connection table, Linux by
-        /// `/proc/net/tcp`. macOS cannot yet (P3-5d-3).
-        const IDENTIFIES: bool = cfg!(any(windows, target_os = "linux"));
+        /// `/proc/net/tcp`, macOS (P3-5d-3) by the descriptors each process
+        /// holds.
+        const IDENTIFIES: bool = cfg!(any(windows, target_os = "linux", target_os = "macos"));
 
         /// A bound endpoint: its listener, its address, and the one account a
         /// connection is taken from.
@@ -1180,8 +1440,22 @@ mod endpoint {
                 }
             }
 
+            /// macOS (P3-5d-3): the connection's client end is held, and held
+            /// only, by processes running as the session's account.
+            #[cfg(target_os = "macos")]
+            fn account(&self, client: SocketAddrV4) -> Result<(), String> {
+                if super::super::libproc::held_by(client, self.addr, self.peer) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "a client end not held by processes of uid {} alone",
+                        self.peer
+                    ))
+                }
+            }
+
             /// Elsewhere: nothing says who connected, so nobody is served.
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
             fn account(&self, _client: SocketAddrV4) -> Result<(), String> {
                 Err(format!(
                     "this system cannot say which account connected (uid {} is served)",
@@ -1266,8 +1540,8 @@ mod endpoint {
                 Ok(())
             } else {
                 Err(
-                    "this device cannot yet tell which account connects to a loopback port, so \
-                     it serves no endpoint there (an HTTP upstream on macOS is P3-5d-3)"
+                    "this device cannot tell which account connects to a loopback port, so it \
+                     serves no endpoint there"
                         .into(),
                 )
             }

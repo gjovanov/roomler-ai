@@ -35,7 +35,8 @@ People use it too.
 > which sends a client's requests on to one upstream with the secret's
 > credential added; and P3-5d-2, `vault_connect` serving it, git through
 > `insteadOf`, on a loopback port whose every connection's account Linux
-> reads from the kernel (§19).** No released
+> reads from the kernel; and P3-5d-3, macOS reading it from the
+> descriptors each process holds (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -1297,7 +1298,7 @@ sequenceDiagram
 - one upstream connection for a client connection's requests, until the upstream closes it;
 - a refused client told why.
 
-### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2, P3-5d-2)
+### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2, P3-5d-2, P3-5d-3)
 
 `vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
 secret's fields toward the upstream (`user` and `password`, or for `bearer`
@@ -1339,7 +1340,7 @@ sequenceDiagram
     M->>G: git clone https://git.example/org/repo, with env
     Note over G: insteadOf: https://git.example/<br/>is http://127.0.0.1:port/
     G->>E: GET /org/repo/info/refs, no credential
-    Note over E: Linux: /proc/net/tcp names the owner of<br/>the client's socket: the session's account, or closed
+    Note over E: the client's socket is the session account's:<br/>Linux /proc/net/tcp, macOS libproc, Windows its table<br/>(or the connection is closed)
     E->>U: TLS verified, Authorization: the secret's
     U-->>G: the refs, then the pack, through E
 ```
@@ -1347,13 +1348,13 @@ sequenceDiagram
 | Step | What holds | Where |
 |---|---|---|
 | the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, or (P3-5d-2) `http`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port), or for `http` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443). `auth`: `http`'s, and required there: `basic` (the secret's `user` and `password`) or `bearer` (its `token`), sent as `Authorization`; refused for a database. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM). `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:220`, `vault_connect.rs:140`, `vault_connect.rs:188` |
-| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:487` |
-| the leases | the secret's `user` and `password` (for `bearer`, its `token`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:665` |
-| the values | read once to check them (a user the database takes; a value `Authorization` can carry: a user with no colon, a token of visible ASCII; a CA that parses), then again from the leases as each connection starts, never kept by the endpoint | `vault_connect.rs:708`, `vault_connect.rs:577` |
-| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). Every endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2), since git cannot dial a Unix socket: `127.0.0.1`, on a port the system picks. macOS serves no HTTP endpoint yet (P3-5d-3): the call is refused before anything is leased | `vault_connect.rs:1043`, `vault_connect.rs:1279`, `vault_connect.rs:1264` |
-| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode. At most 16 at once, one engine session each | `vault_connect.rs:969`, `vault_connect.rs:1145`, `vault_connect.rs:400`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
-| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket or port and every connection it holds. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:788`, `vault_connect.rs:908`, `vault_connect.rs:365` |
-| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once | `vault_connect.rs:827`, `vault_connect.rs:1213` |
+| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:745` |
+| the leases | the secret's `user` and `password` (for `bearer`, its `token`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:923` |
+| the values | read once to check them (a user the database takes; a value `Authorization` can carry: a user with no colon, a token of visible ASCII; a CA that parses), then again from the leases as each connection starts, never kept by the endpoint | `vault_connect.rs:966`, `vault_connect.rs:835` |
+| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). Every endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2; macOS from P3-5d-3), since git cannot dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:1301`, `vault_connect.rs:1553`, `vault_connect.rs:1538` |
+| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:1227`, `vault_connect.rs:1405`, `vault_connect.rs:400`, `vault_connect.rs:582`, `vault_connect.rs:665`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
+| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket or port and every connection it holds. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1046`, `vault_connect.rs:1166`, `vault_connect.rs:365` |
+| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once | `vault_connect.rs:1085`, `vault_connect.rs:1487` |
 
 > [!WARNING]
 > - **The settings ASK for every call.** `vault_connect` hands the session no
@@ -1369,12 +1370,13 @@ sequenceDiagram
 >   clients mostly cannot dial a Unix socket, and git cannot anywhere, so
 >   those endpoints are loopback TCP, and who connected is read from the
 >   system: Windows' connection table and the process's token, Linux's
->   `/proc/net/tcp`. The port cannot be taken over by another account's
+>   `/proc/net/tcp`, macOS's descriptors of each process (P3-5d-3). The
+>   port cannot be taken over by another account's
 >   socket. Windows shares a bound port only where its first socket asked
 >   for that (`SO_REUSEADDR`), which this one does not, and the daemon's own
 >   account (SYSTEM) is the only exception. Linux shares one only between
->   sockets of one owner that all set `SO_REUSEPORT`, which this one does
->   not.
+>   sockets of one owner that all set `SO_REUSEPORT`, and macOS only
+>   between sockets that all set it, which this one does not.
 > - **A refusal speaks the engine's wire** (P3-5c-2). A Postgres client is
 >   sent a fatal error; a MongoDB client, which speaks first, has its first
 >   message answered with the reason, as a server answers it; an HTTP client
@@ -1455,7 +1457,6 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5d-3 | the macOS HTTP endpoint: each loopback connection's account read from `libproc` |
 | P3-5e, P3-5f | `proxy` mode's last engines: the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
