@@ -46,7 +46,7 @@ pub async fn status(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         print_status(&status);
-        print_other_daemon_hint();
+        print_other_daemon_hint().await;
     }
     Ok(())
 }
@@ -61,8 +61,8 @@ pub async fn status(json: bool) -> Result<()> {
 ///
 /// Only printed in human mode: `--json` output is parsed, and a stray line
 /// would be a breaking change for anything consuming it.
-fn print_other_daemon_hint() {
-    if let Some(other) = localapi::other_daemon_socket() {
+async fn print_other_daemon_hint() {
+    if let Some(other) = localapi::other_daemon_socket().await {
         eprintln!();
         eprintln!(
             "note: a second roomler daemon is running on this host ({}).",
@@ -275,7 +275,7 @@ pub async fn peers(args: PeersArgs) -> Result<()> {
     if names.is_empty() {
         print_dark_orgs(&orgs, &peers);
     }
-    print_other_daemon_hint();
+    print_other_daemon_hint().await;
     Ok(())
 }
 
@@ -629,7 +629,7 @@ pub async fn why(peer: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     print_why(p);
-    print_other_daemon_hint();
+    print_other_daemon_hint().await;
     Ok(())
 }
 
