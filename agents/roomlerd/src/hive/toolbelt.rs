@@ -918,28 +918,33 @@ fn vault_tools() -> Vec<Value> {
     tools.push(json!({
         "name": "vault_connect",
         "description": "Opens an endpoint on this device that signs in to a database (Postgres or \
-                        MongoDB) as a Roomler vault secret's user, or that presents a secret's \
+                        MongoDB) as a Roomler vault secret's user; that presents a secret's \
                         credential on every request it sends on to an HTTP upstream (an API, a \
-                        git server) or a Kubernetes API server, and answers how to connect to \
-                        it. A database client connects with the answer's uri (or host and port), \
-                        with any user name and no password; an HTTP client sends its requests to \
-                        the uri with no credential, and git takes the answer's env and the \
-                        upstream's own URLs; kubectl takes the answer's kubeconfig, written to a \
-                        file of your own and named in KUBECONFIG. Nothing it answers holds the \
-                        secret's value. handle names a structured secret: user and password \
-                        fields (a database, or auth basic), a token field (auth bearer), or cert \
-                        and key fields (auth client-cert, PEM). upstream is exactly as the \
-                        secret's audiences name it: the database's host:port, or for http and \
-                        kubernetes an origin, https://host or https://host:port. ca names a \
-                        secret holding the upstream's CA certificate (PEM) when the system does \
-                        not trust it. The endpoint closes with its lease (ttl_s, 30 to 900 \
-                        seconds). A person approves every call.",
+                        git server) or a Kubernetes API server; or that is an SSH agent holding \
+                        a secret's key, which signs ssh in to one host; and answers how to \
+                        connect to it. A database client connects with the answer's uri (or \
+                        host and port), with any user name and no password; an HTTP client sends \
+                        its requests to the uri with no credential, and git takes the answer's \
+                        env and the upstream's own URLs; kubectl takes the answer's kubeconfig, \
+                        written to a file of your own and named in KUBECONFIG; ssh (OpenSSH 8.9 \
+                        or later) takes the answer's env, SSH_AUTH_SOCK, and its known_hosts, \
+                        written to a file of your own and named in -o UserKnownHostsFile. \
+                        Nothing it answers holds the secret's value. handle names a structured \
+                        secret: user and password fields (a database, or auth basic), a token \
+                        field (auth bearer), cert and key fields (auth client-cert, PEM), or key \
+                        and host_keys fields (ssh: an OpenSSH private key, and the host's public \
+                        keys). upstream is exactly as the secret's audiences name it: the \
+                        database's host:port; for http and kubernetes an origin, https://host or \
+                        https://host:port; for ssh, ssh://host, ssh://host:port or \
+                        ssh://user@host. ca names a secret holding the upstream's CA certificate \
+                        (PEM) when the system does not trust it. The endpoint closes with its \
+                        lease (ttl_s, 30 to 900 seconds). A person approves every call.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "handle": {"type": "string", "description": "a structured secret: a path or rrn:<org>:secret:<path>, with no #field"},
-                "engine": {"type": "string", "enum": ["postgres", "mongodb", "http", "kubernetes"]},
-                "upstream": {"type": "string", "description": "a database's host:port, such as db.internal:5432; for http and kubernetes an origin, such as https://github.com or https://k8s.internal:6443"},
+                "engine": {"type": "string", "enum": ["postgres", "mongodb", "http", "kubernetes", "ssh"]},
+                "upstream": {"type": "string", "description": "a database's host:port, such as db.internal:5432; for http and kubernetes an origin, such as https://github.com or https://k8s.internal:6443; for ssh, such as ssh://git@github.com or ssh://deploy@build.internal:2222"},
                 "auth": {"type": "string", "enum": ["basic", "bearer", "client-cert"], "description": "http and kubernetes: the secret's user and password (basic, http only) or its token (bearer), sent as Authorization, or its cert and key (client-cert), presented in the TLS handshake"},
                 "database": {"type": "string", "description": "the database to name in the connection string"},
                 "ca": {"type": "string", "description": "a secret whose value is the upstream's CA certificate, PEM"},
@@ -957,9 +962,10 @@ fn vault_tools() -> Vec<Value> {
                         lease's id and how long it lasts, never a value. mode is exec (for \
                         vault_exec, audience the program's bare name), file (for vault_render, \
                         audience the file's bare name) or proxy (for vault_connect, audience the \
-                        upstream as it names it, a database's host:port or an origin for http \
-                        and kubernetes, one lease per field it signs in with: #user and \
-                        #password, #token, or #cert and #key). A later use that names the same \
+                        upstream as it names it, a database's host:port, an origin for http \
+                        and kubernetes, or an ssh:// host, one lease per field it signs in \
+                        with: #user and #password, #token, #cert and #key, or #key and \
+                        #host_keys). A later use that names the same \
                         secret toward the same \
                         audience takes this lease instead of asking again, while it lasts \
                         (ttl_s, 30 to 900 seconds). Each of those calls still asks a person.",
@@ -968,7 +974,7 @@ fn vault_tools() -> Vec<Value> {
             "properties": {
                 "handle": {"type": "string", "description": "a secret: a path or rrn:<org>:secret:<path>, with #<field> for a structured secret's field"},
                 "mode": {"type": "string", "enum": ["exec", "file", "proxy"]},
-                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port, or for http its origin, such as https://github.com"},
+                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port, for http and kubernetes its origin, such as https://github.com, or for ssh its host, such as ssh://git@github.com"},
                 "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
             },
             "required": ["handle", "mode", "audience"],
