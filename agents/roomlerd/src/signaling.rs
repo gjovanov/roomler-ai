@@ -1570,6 +1570,10 @@ async fn connect_once(
         // enrollment's connection only, and only while the owner's
         // `vault_enabled` is on.
         vault_key: crate::vault::hello_key(cfg.vault_enabled, ctx.is_primary),
+        // FR-100 P1a — THIS enrollment's device key, on every org's
+        // connection (one key per org, never shared): made on the first
+        // hello, kept beside the config, and offered only once it is on disk.
+        peer_auth_key: crate::peer_auth::hello_key(remote_cfg.config_path(), &cfg.tenant_id),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't

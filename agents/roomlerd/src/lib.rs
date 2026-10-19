@@ -126,6 +126,9 @@ pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
 pub mod peer;
+/// FR-100 P1a — this enrollment's device key: made here, kept in its own file
+/// beside the config, only its public half on the hello.
+pub mod peer_auth;
 /// FR-27 P11 — the person-at-the-device socket of a Linux system install.
 #[cfg(target_os = "linux")]
 pub mod person_socket;

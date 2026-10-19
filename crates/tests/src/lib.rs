@@ -179,6 +179,10 @@ mod overlay_tests;
 mod pagination_tests;
 #[cfg(test)]
 mod pdf_export_tests;
+/// FR-100 P1a — a device's identity key as the fleet stores and shows it, and
+/// the real agent's hello carrying one it keeps beside its config.
+#[cfg(test)]
+mod peer_auth_key_tests;
 #[cfg(test)]
 mod peer_relay_mint_tests;
 #[cfg(test)]

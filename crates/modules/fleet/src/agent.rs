@@ -732,6 +732,15 @@ pub struct AgentResponse {
     /// no rotation was ever ordered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_rotation: Option<KeyRotationView>,
+    /// FR-100 P1a — the public half of the device key this enrollment last
+    /// said hello with (a P-256 point, standard base64), and its fingerprint
+    /// as a person reads it. Both absent until the device sends a key: an
+    /// agent that predates it, or one that could not keep it on disk. A hint
+    /// for a browser's first pin, never an authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_auth_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_auth_fingerprint: Option<String>,
 }
 
 /// FR-40 — one device's overlay-key rotation as the dashboard reads it:
@@ -1685,6 +1694,14 @@ fn to_agent_response(
     );
     let overlay_public_key = a.overlay_identity.as_ref().map(|i| i.public_key.clone());
     let overlay_key_epoch = a.overlay_identity.as_ref().map(|i| i.key_epoch);
+    // FR-100 P1a — the socket stores a key only when it is well formed, so
+    // the fingerprint exists exactly when the key does. Derived here rather
+    // than stored, so it can never disagree with the key.
+    let peer_auth_fingerprint =
+        roomler_ai_remote_control::signaling::peer_auth_fingerprint(&a.peer_auth_key);
+    let peer_auth_key = peer_auth_fingerprint
+        .is_some()
+        .then(|| a.peer_auth_key.clone());
     AgentResponse {
         presence,
         id,
@@ -1721,6 +1738,8 @@ fn to_agent_response(
         overlay_public_key,
         overlay_key_epoch,
         key_rotation,
+        peer_auth_key,
+        peer_auth_fingerprint,
     }
 }
 
