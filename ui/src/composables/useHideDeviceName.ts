@@ -69,6 +69,22 @@ export function useHideDeviceName(
 }
 
 /**
+ * The name a person knows a device by: its display name when an admin set
+ * one, else the machine-reported name. Every surface that names a device to a
+ * person reads it here, so a device is never "Build Server" on one page and
+ * `build-01` on the next.
+ *
+ * ⚠️ Not for anything a machine reads back — a MagicDNS label, an
+ * `overlay_exit_node = "…"` config line, a CLI selector: those take the
+ * technical `name`.
+ */
+export function deviceLabel(
+  device: { name?: string | null; display_name?: string | null } | null | undefined,
+): string {
+  return device?.display_name || device?.name || ''
+}
+
+/**
  * The machine-reported name to show BESIDE a device's display name, or null
  * when there is nothing to add: no display name (the name already IS the
  * title), a display name equal to the name, or the viewer hides it.
