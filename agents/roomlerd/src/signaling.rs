@@ -1510,7 +1510,7 @@ async fn connect_once(
     }
 
     // Say hello.
-    let mut hello_caps = stub_caps(cfg.overlay_multi_org);
+    let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
     // FR-90 P2c-3 — copies are held for the primary organization only: a
     // secondary org's connection never offers them, so its placement never
     // picks this device.
@@ -2180,7 +2180,7 @@ async fn connect_once(
                     // worker's permissions substituted: codecs and encoders
                     // stay OURS, because we are the half that answers
                     // `rc:session.request` (the P2b-3 lesson).
-                    let mut c = stub_caps(cfg.overlay_multi_org);
+                    let mut c = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
                     if !ctx.is_primary {
                         strip_replica_verbs(&mut c.rpc);
                     }
@@ -6751,12 +6751,20 @@ fn stub_displays() -> Vec<DisplayInfo> {
     crate::displays::enumerate()
 }
 
-fn stub_caps(multi_org_tun: bool) -> AgentCaps {
+fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
     // Real probe via encode::caps; replaces the empty-vec stub. The
     // resulting AgentCaps populates the rc:agent.hello payload, which
     // the server persists into the agents collection and surfaces in
     // the admin UI (2A.2).
     let mut caps = crate::encode::caps::detect();
+    // FR-67 P7 — whether this enrollment acts on a pushed `rc:agent.update`
+    // (`self`), ignores it (`primary_org`, a secondary enrollment) or drops it
+    // (`off`, auto-update off), so the server refuses the push, and says why,
+    // rather than counting a frame the `UpdateNow` arm will not act on as an
+    // update delivered. Stamped HERE, at every announcement: a heartbeat's
+    // re-announce REPLACES the stored caps, so a hello-only word would be gone
+    // at the first login.
+    caps.update_mode = Some(crate::updater::update_mode(is_primary).to_string());
     // `detect()` is memoized and config-blind, so the one capability that
     // depends on the host's config gets appended here: `tun` says "this
     // daemon's TUN is already muxed — a second org can join the mesh

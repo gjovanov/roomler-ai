@@ -168,7 +168,8 @@
                   <v-list-item
                     prepend-icon="mdi-update"
                     title="Update now"
-                    :disabled="updateBusy === item.id"
+                    :subtitle="updateBlockedText(agentFor(item))"
+                    :disabled="updateBusy === item.id || !!updateBlockedText(agentFor(item))"
                     @click="triggerUpdate(agentFor(item)!)"
                   />
                   <v-list-item
@@ -718,11 +719,15 @@
                 variant="text"
                 color="primary"
                 class="ml-1"
-                :disabled="updateBusy === a.id"
+                :disabled="updateBusy === a.id || !!updateBlockedText(a)"
                 :loading="updateBusy === a.id"
                 @click="triggerUpdate(a)"
                 :aria-label="`Update agent ${a.name} now`"
-                title="Update agent now"
+                :title="
+                  updateBlockedText(a)
+                    ? `Not updated from here: ${updateBlockedText(a)}`
+                    : 'Update agent now'
+                "
               />
               <v-spacer />
               <v-chip
@@ -942,7 +947,8 @@
                   <v-list-item
                     prepend-icon="mdi-update"
                     title="Update now"
-                    :disabled="updateBusy === a.id"
+                    :subtitle="updateBlockedText(a)"
+                    :disabled="updateBusy === a.id || !!updateBlockedText(a)"
                     @click="triggerUpdate(a)"
                   />
                   <v-list-item
@@ -1381,6 +1387,14 @@
         Each agent downloads the latest release, installs it, and restarts —
         active remote-control sessions on updating agents will drop for a few
         seconds. Offline agents update on their next periodic check.
+        <div v-if="wontUpdateHere.length > 0" class="mt-3">
+          {{ wontUpdateHere.length }} will not take it from here:
+          <ul class="ml-4">
+            <li v-for="x in wontUpdateHere" :key="x.a.id">
+              <strong>{{ x.a.name }}</strong> — {{ refusalShort(x.code) }}
+            </li>
+          </ul>
+        </div>
       </v-card-text>
       <v-card-actions>
         <v-spacer />
@@ -1653,6 +1667,7 @@ import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
 import { credentialChip } from '@/utils/credentialExpiry'
 import { updateStallChip } from '@/utils/updateStall'
+import { refusalShort, updateRefusal } from '@/utils/updateRefusal'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
@@ -2325,13 +2340,39 @@ async function triggerUpdate(a: Agent) {
   }
 }
 
+// FR-67 P7 — devices that will not act on an update ordered from here, from
+// their hellos: named in the dialog BEFORE the click, and greyed out on their
+// own "Update now". The server refuses those pushes anyway (the source of
+// truth); this only stops the dashboard promising what will not happen.
+const wontUpdateHere = computed(() =>
+  agentStore.agents
+    .map((a) => ({ a, code: updateRefusal(a.capabilities) }))
+    .filter((x) => x.code !== null),
+)
+
+function updateBlockedText(a: Agent | undefined | null): string | undefined {
+  const code = updateRefusal(a?.capabilities)
+  return code ? refusalShort(code) : undefined
+}
+
 async function doUpdateAll() {
   updatingAll.value = true
   try {
     const res = await agentStore.triggerUpdateAll(props.tenantId)
-    updateNotice.value =
+    const names = new Map(agentStore.agents.map((a) => [a.id, a.name]))
+    const skipped = res.results.filter((r) => r.refused_code)
+    let notice =
       `Update pushed to ${res.delivered} of ${res.requested} agents — ` +
       `offline agents update on their next periodic check.`
+    if (skipped.length > 0) {
+      notice +=
+        ` ${skipped.length} not updated from here: ` +
+        skipped
+          .map((r) => `${names.get(r.agent_id) ?? r.agent_id} (${refusalShort(r.refused_code)})`)
+          .join(', ') +
+        '.'
+    }
+    updateNotice.value = notice
     updateAllDialogOpen.value = false
   } catch (e) {
     agentStore.error = (e as Error).message

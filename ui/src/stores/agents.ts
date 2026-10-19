@@ -94,6 +94,19 @@ export interface AccessPolicy {
   lock_on_end?: LockOnEnd | null
 }
 
+/** S1a / FR-2 / FR-67 P7 — the bulk update's answer: one row per target. */
+export interface BulkUpdateResponse {
+  requested: number
+  delivered: number
+  refused: number
+  results: Array<{
+    agent_id: string
+    delivered: boolean
+    refused?: string
+    refused_code?: string
+  }>
+}
+
 /** Codec + HW backend availability advertised by the agent in its
  *  rc:agent.hello payload. AgentsSection renders these as chips so
  *  operators can spot which agents support H.265 / AV1 etc. without
@@ -102,6 +115,11 @@ export interface AccessPolicy {
  *  Defaults to empty arrays for agents that haven't reconnected since
  *  the 2A.1 schema landed (server back-fills `Default::default()`). */
 export interface AgentCapabilities {
+  /** FR-67 P7 — whether this enrollment acts on an update ordered from this
+   *  organization: 'self' (it does), 'primary_org' (a secondary enrollment:
+   *  only the machine's primary drives its updater), 'off' (auto-update off
+   *  on the device). Absent on older agents. See utils/updateRefusal.ts. */
+  update_mode?: string
   /** mime-style codec names: 'h264', 'h265', 'av1'. */
   codecs: string[]
   /** Descriptive backend labels: 'openh264-sw', 'mf-h264-hw', 'mf-h265-hw',
@@ -1110,14 +1128,11 @@ export const useAgentStore = defineStore('agents', () => {
   }
 
   /** S1a — push an immediate self-update to every agent in the tenant
-   *  (or a selected subset via `agent_ids`). MANAGE_AGENTS. */
-  async function triggerUpdateAll(
-    tenantId: string,
-  ): Promise<{ requested: number; delivered: number }> {
-    return api.post<{ requested: number; delivered: number }>(
-      `/tenant/${tenantId}/agent/update`,
-      {},
-    )
+   *  (or a selected subset via `agent_ids`). MANAGE_AGENTS. A row the server
+   *  did not push carries `refused` (a sentence) and `refused_code`:
+   *  `pin_downgrade` (FR-2), `primary_org` or `auto_update_off` (FR-67 P7). */
+  async function triggerUpdateAll(tenantId: string): Promise<BulkUpdateResponse> {
+    return api.post<BulkUpdateResponse>(`/tenant/${tenantId}/agent/update`, {})
   }
 
   /** Multi-org — the organizations this device could be added to: every org
