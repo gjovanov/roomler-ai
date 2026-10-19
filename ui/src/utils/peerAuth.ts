@@ -389,3 +389,151 @@ export function trustChangedKey(judged: PeerAuthJudgement | null, pins: PeerAuth
   pins.set(judged.userId, judged.agentId, judged.verdict.key)
   return true
 }
+
+// ─── FR-100 P2b — the browser signs its offer ──────────────────────────────
+
+/**
+ * Where this browser keeps its own key pairs, one per user. `add` never
+ * replaces: when two tabs make a key at once, the first one kept wins and the
+ * other reads it back, so the browser still has ONE key.
+ */
+export interface ControllerKeyBackend {
+  read(userId: string): Promise<CryptoKeyPair | undefined>
+  add(userId: string, pair: CryptoKeyPair): Promise<void>
+}
+
+function isKeyPair(v: unknown): v is CryptoKeyPair {
+  return !!v && typeof v === 'object' && 'privateKey' in v && 'publicKey' in v
+}
+
+/**
+ * This user's key pair in this browser: read, or made and kept. The private
+ * half is made NON-extractable: the page can sign with it while it runs, and
+ * nothing can read it out afterwards. `null` when the browser cannot keep a
+ * key: one made per page would reach the device as a new browser on every
+ * visit, and push out the keys it should remember.
+ */
+export async function controllerKeyFor(
+  userId: string,
+  backend: ControllerKeyBackend | null,
+): Promise<CryptoKeyPair | null> {
+  if (!backend) return null
+  try {
+    const existing = await backend.read(userId)
+    if (isKeyPair(existing)) return existing
+    const made = (await subtle().generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, [
+      'sign',
+      'verify',
+    ])) as CryptoKeyPair
+    try {
+      await backend.add(userId, made)
+    } catch {
+      // Another tab kept one first: the read below finds it.
+    }
+    const kept = await backend.read(userId)
+    return isKeyPair(kept) ? kept : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The keys in this origin's IndexedDB (`roomler-peer-auth` / `controller-keys`,
+ * keyed by user id), or `null` where there is none: a CryptoKey is stored as
+ * itself, non-extractable as it was made.
+ */
+export function indexedDbKeyBackend(idb?: IDBFactory): ControllerKeyBackend | null {
+  let factory: IDBFactory | undefined = idb
+  if (!factory) {
+    try {
+      factory = globalThis.indexedDB ?? undefined
+    } catch {
+      factory = undefined
+    }
+  }
+  if (!factory) return null
+  const db = factory
+  const STORE = 'controller-keys'
+  const open = () =>
+    new Promise<IDBDatabase>((resolve, reject) => {
+      const req = db.open('roomler-peer-auth', 1)
+      req.onupgradeneeded = () => req.result.createObjectStore(STORE)
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+      req.onblocked = () => reject(new Error('the key store is blocked by another tab'))
+    })
+  const run = <T>(mode: IDBTransactionMode, ask: (s: IDBObjectStore) => IDBRequest<T>) =>
+    open().then(
+      (conn) =>
+        new Promise<T>((resolve, reject) => {
+          const tx = conn.transaction(STORE, mode)
+          const req = ask(tx.objectStore(STORE))
+          tx.oncomplete = () => {
+            conn.close()
+            resolve(req.result)
+          }
+          tx.onerror = () => {
+            conn.close()
+            reject(tx.error ?? req.error)
+          }
+          tx.onabort = () => {
+            conn.close()
+            reject(tx.error ?? new Error('the key store transaction was aborted'))
+          }
+        }),
+    )
+  return {
+    read: (userId) => run('readonly', (s) => s.get(userId)) as Promise<CryptoKeyPair | undefined>,
+    add: (userId, pair) => run('readwrite', (s) => s.add(pair, userId)).then(() => undefined),
+  }
+}
+
+/** `pair`'s public half in the device key's shape: standard base64 of the 65-byte point. */
+export async function controllerPublicKey(pair: CryptoKeyPair): Promise<string> {
+  const raw = new Uint8Array(await subtle().exportKey('raw', pair.publicKey))
+  let bin = ''
+  for (const b of raw) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+/**
+ * The offer's `peer_auth`: the nonce, and, with a key at hand, the key and its
+ * signature over the transcript with role `offer` and an EMPTY answer
+ * fingerprint (none exists yet). Without a key, or when signing fails, the
+ * nonce alone, which the device reads as `absent`: the offer still asks the
+ * device to sign its answer either way.
+ */
+export async function offerAsk(args: {
+  nonce: string
+  sessionId: string
+  agentId: string
+  userId: string
+  offerFingerprint: string
+  pair: CryptoKeyPair | null
+}): Promise<{ nonce: string; key?: string; sig?: string }> {
+  const ask = { nonce: args.nonce }
+  if (!args.pair) return ask
+  const transcript = peerAuthTranscript(
+    'offer',
+    args.sessionId,
+    args.agentId,
+    args.userId,
+    args.offerFingerprint,
+    '',
+    args.nonce,
+  )
+  if (!transcript) return ask
+  try {
+    const sig = new Uint8Array(
+      await subtle().sign({ name: 'ECDSA', hash: 'SHA-256' }, args.pair.privateKey, transcript),
+    )
+    return { nonce: args.nonce, key: await controllerPublicKey(args.pair), sig: toBase64Url(sig) }
+  } catch {
+    return ask
+  }
+}
+
+/** `p`, or `null` once `ms` have passed: a key store that hangs must not hold an offer back. */
+export function withinMs<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  return Promise.race([p, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))])
+}
