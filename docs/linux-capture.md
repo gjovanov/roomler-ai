@@ -365,16 +365,27 @@ flowchart TD
     D --> G{"the seat guard, every frame:<br/>that session on screen, unlocked?"}
     G -- yes --> R["the scanout is read, input injected,<br/>and P6g's notice says who is viewing"]
     G -- locked --> W1["nothing read, nothing injected:<br/>screen_unlock"]
-    G -- "the greeter, another person" --> W2["nothing read, nothing injected:<br/>session_away"]
+    G -- "the greeter, another person,<br/>a logout (closing)" --> W2["nothing read, nothing injected:<br/>session_away"]
 ```
 
 The capture is **bound** to the session that was on screen when it opened
 (`capture/seat_guard.rs`). The guard watches logind's D-Bus for the seat's
-active session and its `LockedHint`. It reads `PropertiesChanged` as it
+active session, its `LockedHint` and its `State`. It reads `PropertiesChanged` as it
 arrives, and reads the seat again every second anyway. A capture whose guard
 is closed asks the DRM worker for nothing (`DrmCapture::guarded`), so the
 greeter's and the lock screen's pixels never leave the card. The controller is
 told `screen_unlock` or `session_away`, in a system install's own words.
+
+⚠️ **A logout is away from the moment logind marks the session `closing`**
+(FR-113 P4). logind keeps a logged-out session as the seat's active one,
+class `user`, unlocked, until every process in it has ended, and that can take
+until systemd's stop timeout. **Measured** (FR-113 AC3, 0.4.144, GDM on Xorg
+with auto-login, 2026-10-19): GDM's own session worker ignored SIGTERM, so
+the seat showed no greeter for **90 s** after `loginctl terminate-session`,
+while the X server was gone at once. A guard that read only the id, the class
+and `LockedHint` stayed open. The DRM capture kept reading the bare scanout
+(`frames_captured` 72 → 144), and the viewer showed a black screen with
+nothing said. Read with `State`, the same logout is `session_away`.
 
 ⚠️ **Input follows the guard, and never falls back to XTest behind a lock.**
 The automatic `uinput` is the injector whenever an automatic capture is
@@ -438,13 +449,16 @@ flowchart TD
 | who counts | `person_on_screen`: logind class `user`, `Type=wayland` | the same, `Type=x11` |
 | capture | DRM: the scanout, below the compositor | DRM: the scanout, below the X server. Neither `DISPLAY` nor an Xauthority is needed, which a root daemon has neither of |
 | input | `uinput`, below the compositor | `uinput`: Xorg picks the device up through libinput, as a compositor does |
-| the seat guard | logind: the session id, its class, `LockedHint` | unchanged: it reads only logind, so the plan switches on only for a desktop that sets `LockedHint`: GNOME Shell or KDE's `ksmserver` running for the person (`lock_reporting_shell`, D4) |
+| the seat guard | logind: the session id, its class, `LockedHint`, `State` (a `closing` session is away, FR-113 P4) | unchanged: it reads only logind, so the plan switches on only for a desktop that sets `LockedHint`: GNOME Shell or KDE's `ksmserver` running for the person (`lock_reporting_shell`, D4) |
 | an idle desktop | the compositor flips: buffer + 32 rows (§3.2) | the X server draws in place: rows alone, one every 8 (§3.2) |
 | nothing captured | `wayland_not_enabled` | `x11_not_enabled` (FR-113 P2) |
 
 ⚠️ **The guard knows a lock only by `LockedHint`, so an X11 desktop must
 report it (D4).** GNOME Shell sets it on Xorg as on Wayland, and KDE's
-`ksmserver` drives kscreenlocker, which sets it. Most other X11 lockers do
+`ksmserver` drives kscreenlocker, which sets it. **Measured** (FR-113 AC2,
+2026-10-19): on Ubuntu 24.04's Plasma 5.27 X11 session under SDDM,
+`kscreenlocker_greet` set `LockedHint=yes` within 1 s of
+`loginctl lock-session`, and cleared it on `unlock-session`. Most other X11 lockers do
 not: xscreensaver, i3lock, slock, and xfce4-screensaver (measured on
 Ubuntu 24.04's 4.18.3: `LockedHint` stayed `no` through
 `loginctl lock-session`). With one of
