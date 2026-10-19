@@ -1015,6 +1015,7 @@ async fn the_backfill_reads_stripe_once() {
         webhook_secret: SECRET.into(),
         price_pro: PRICE_PRO.into(),
         price_business: PRICE_BIZ.into(),
+        ..Default::default()
     });
 
     assert!(billing::last_backfill(&app.db).await.unwrap().is_none());
@@ -1130,6 +1131,7 @@ async fn a_backfill_that_records_nothing_says_it_ran() {
         webhook_secret: SECRET.into(),
         price_pro: PRICE_PRO.into(),
         price_business: PRICE_BIZ.into(),
+        ..Default::default()
     });
     let now = DateTime::now();
     let r = stripe

@@ -385,6 +385,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/stripe/change-plan",
+      "methods": "POST"
+    },
+    {
       "path": "/api/stripe/checkout",
       "methods": "POST"
     },
@@ -395,6 +399,10 @@
     {
       "path": "/api/stripe/portal",
       "methods": "POST"
+    },
+    {
+      "path": "/api/stripe/summary",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/stripe/webhook",

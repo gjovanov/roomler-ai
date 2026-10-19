@@ -125,10 +125,23 @@
             >
               <v-chip v-if="plan.id === 'pro'" color="primary" size="small" class="mb-4 align-self-start">Most Popular</v-chip>
               <h3 class="text-h5 font-weight-bold">{{ plan.name }}</h3>
+              <v-chip
+                v-if="plan.id === 'free' && plan.commercial_use !== false"
+                color="success"
+                size="small"
+                variant="tonal"
+                class="mt-2 align-self-start"
+                data-testid="landing-commercial-use"
+              >
+                Free for commercial use
+              </v-chip>
               <div class="my-4">
                 <span class="text-h3 font-weight-bold">${{ plan.price_cents / 100 }}</span>
-                <span v-if="plan.price_cents > 0" class="text-body-2 landing-muted">/user/mo</span>
+                <span v-if="plan.price_cents > 0" class="text-body-2 landing-muted">
+                  / €{{ plan.price_cents / 100 }} per user / month
+                </span>
                 <span v-else class="text-body-2 landing-muted">forever</span>
+                <div v-if="annualLine(plan)" class="text-body-2 landing-muted">{{ annualLine(plan) }}</div>
               </div>
               <v-divider class="mb-4" />
               <v-list density="compact" class="flex-grow-1 bg-transparent">
@@ -221,7 +234,7 @@ import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
 import { BRAND_LOGO_LIGHT } from '@/composables/useBrand'
 import { installCards } from '@/utils/enrollCommands'
-import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, VIDEO_TOUR, type Plan } from '@/utils/landing'
+import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, VIDEO_TOUR, annualLine, type Plan } from '@/utils/landing'
 import { FEATURED_VIDEO_ID } from '@/utils/videos'
 import VideoFacade from '@/components/common/VideoFacade.vue'
 import videoTourPoster from '@/assets/tutorial/video-C1YdfmhbAKM.jpg'

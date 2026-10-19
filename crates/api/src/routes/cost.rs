@@ -65,6 +65,12 @@ fn cost_of(meter: &str, total: f64, c: &RelayCosts) -> Option<f64> {
 /// seats. The one formula — the cost view and FR-102's digest both read
 /// it, so neither can drift into "billed" by accident. It ignores
 /// discounts, annual terms, trials and proration (see the module docs).
+///
+/// FR-115 — until then checkout billed ONE unit per org whatever its size,
+/// so this × seats figure overstated every multi-member org; checkout now
+/// bills one unit per seat and the two agree. An annual subscription costs
+/// ten months for twelve, so for it this is an upper bound — the billed
+/// figure (`growth::revenue`, from invoices) is the one that knows.
 pub(crate) fn mrr_estimate_cents(plan: &Plan, seats: f64) -> f64 {
     f64::from(plan.price_monthly_cents()) * seats
 }

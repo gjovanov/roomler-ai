@@ -132,6 +132,10 @@ impl Module for SaasState {
         // read once and warned about loudly if on. Spawned, bounded, never
         // blocks the boot; nothing without a SendGrid key.
         sendgrid::spawn_tracking_check(&core);
+        // FR-115 P2 — keep each subscription's quantity equal to its org's
+        // seats (every 15 minutes, one pod per tick). Nothing without a
+        // Stripe key, or with `stripe.seat_sync` off.
+        stripe::spawn_seat_sync(core.clone());
         let sendgrid_events =
             sendgrid::verifier_from_settings(&settings.newsletter.event_webhook_public_key)
                 .map(Arc::new);
@@ -163,7 +167,11 @@ impl Module for SaasState {
         let stripe = Router::new()
             .route("/plans", get(stripe::get_plans))
             .route("/checkout", post(stripe::create_checkout))
-            .route("/portal", post(stripe::create_portal));
+            .route("/portal", post(stripe::create_portal))
+            // FR-115 — a plan change on a live subscription (never a second
+            // checkout), and the billing page's view of the org.
+            .route("/change-plan", post(stripe::change_plan))
+            .route("/summary", get(stripe::summary));
 
         // FR-58 — the newsletter sending program's admin surface. Platform-
         // admin gated, 404 on miss; `platform_admins` unset ⇒ the whole

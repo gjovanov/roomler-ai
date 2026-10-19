@@ -29,6 +29,8 @@ use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use roomler_ai_db::models::tenant::BillingInterval;
+
 use crate::dao::billing_event::{BillingEvent, BillingKind, BillingSource};
 
 /// A day in milliseconds.
@@ -251,21 +253,62 @@ pub fn subscription_price(sub: &Value) -> Option<String> {
         .and_then(|i| id_of(i.get("price")).or_else(|| id_of(i.get("plan"))))
 }
 
-/// Our plan for a Stripe price id: the configured `price_pro` /
-/// `price_business`, else `None` (a price this server does not sell).
-pub fn plan_for_price(
-    price: Option<&str>,
-    price_pro: &str,
-    price_business: &str,
-) -> Option<String> {
-    let p = price?;
-    if !price_pro.is_empty() && p == price_pro {
-        Some("pro".into())
-    } else if !price_business.is_empty() && p == price_business {
-        Some("business".into())
-    } else {
-        None
+/// FR-115 — the Stripe Price ids this server sells, per plan and interval.
+/// An empty id is a price it does not sell (annual is off until its Prices
+/// are configured). Each Price carries both currencies (`currency_options`),
+/// so the currency is not part of the key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PriceIds<'a> {
+    pub pro: &'a str,
+    pub business: &'a str,
+    pub pro_annual: &'a str,
+    pub business_annual: &'a str,
+}
+
+impl<'a> PriceIds<'a> {
+    pub fn of(s: &'a roomler_ai_config::StripeSettings) -> Self {
+        Self {
+            pro: s.price_pro.trim(),
+            business: s.price_business.trim(),
+            pro_annual: s.price_pro_annual.trim(),
+            business_annual: s.price_business_annual.trim(),
+        }
     }
+
+    fn table(&self) -> [(&'a str, &'static str, BillingInterval); 4] {
+        [
+            (self.pro, "pro", BillingInterval::Month),
+            (self.business, "business", BillingInterval::Month),
+            (self.pro_annual, "pro", BillingInterval::Year),
+            (self.business_annual, "business", BillingInterval::Year),
+        ]
+    }
+
+    /// The plan id and interval of a price this server sells.
+    pub fn lookup(&self, price: &str) -> Option<(&'static str, BillingInterval)> {
+        let price = price.trim();
+        if price.is_empty() {
+            return None;
+        }
+        self.table()
+            .into_iter()
+            .find(|(id, _, _)| !id.is_empty() && *id == price)
+            .map(|(_, plan, interval)| (plan, interval))
+    }
+
+    /// The price for a plan id and interval, when this server sells it.
+    pub fn price_for(&self, plan: &str, interval: BillingInterval) -> Option<&'a str> {
+        self.table()
+            .into_iter()
+            .find(|(id, p, i)| *p == plan && *i == interval && !id.is_empty())
+            .map(|(id, _, _)| id)
+    }
+}
+
+/// Our plan for a Stripe price id: one of the configured prices (monthly or
+/// annual), else `None` (a price this server does not sell).
+pub fn plan_for_price(price: Option<&str>, prices: &PriceIds) -> Option<String> {
+    prices.lookup(price?).map(|(plan, _)| plan.to_string())
 }
 
 /// The six Stripe event types §3g records, and the kind each becomes.
@@ -299,8 +342,7 @@ pub fn parse(
     obj: &Value,
     event_id: Option<&str>,
     event_created: Option<i64>,
-    price_pro: &str,
-    price_business: &str,
+    prices: &PriceIds,
     now: DateTime,
 ) -> Option<Parsed> {
     let stripe_id = s_str(obj, &["id"])?;
@@ -344,7 +386,7 @@ pub fn parse(
                 row.period_start = at(r.period_start);
                 row.period_end = at(r.period_end);
                 row.interval_months = r.interval_months;
-                row.plan = plan_for_price(r.price_id.as_deref(), price_pro, price_business);
+                row.plan = plan_for_price(r.price_id.as_deref(), prices);
             }
             row.reason = s_str(obj, &["billing_reason"]);
             row.status = s_str(obj, &["status"]);
@@ -361,12 +403,8 @@ pub fn parse(
             row.period_start = at(start);
             row.period_end = at(end);
             row.seats = subscription_seats(obj);
-            row.plan = plan_for_price(
-                subscription_price(obj).as_deref(),
-                price_pro,
-                price_business,
-            )
-            .or_else(|| s_str(obj, &["metadata", "plan"]));
+            row.plan = plan_for_price(subscription_price(obj).as_deref(), prices)
+                .or_else(|| s_str(obj, &["metadata", "plan"]));
             row.status = s_str(obj, &["status"]);
             row.cancel_at_period_end = s(obj, &["cancel_at_period_end"]).and_then(Value::as_bool);
             if kind == BillingKind::TrialWillEnd {
@@ -1014,16 +1052,66 @@ mod tests {
     }
 
     fn parsed(kind: BillingKind, obj: &Value) -> Parsed {
+        let prices = PriceIds {
+            pro: PRO,
+            business: BIZ,
+            pro_annual: PRO_YEAR,
+            business_annual: "",
+        };
         parse(
             kind,
             obj,
             Some("evt_1"),
             Some(1_760_000_050),
-            PRO,
-            BIZ,
+            &prices,
             now(),
         )
         .unwrap()
+    }
+
+    const PRO_YEAR: &str = "price_pro_year_test";
+
+    /// FR-115 — the annual Prices map to their plan too, and a price this
+    /// server does not sell (or an unconfigured, empty one) maps to none.
+    #[test]
+    fn annual_prices_map_to_their_plan_and_interval() {
+        let prices = PriceIds {
+            pro: PRO,
+            business: BIZ,
+            pro_annual: PRO_YEAR,
+            business_annual: "",
+        };
+        assert_eq!(prices.lookup(PRO), Some(("pro", BillingInterval::Month)));
+        assert_eq!(
+            prices.lookup(PRO_YEAR),
+            Some(("pro", BillingInterval::Year))
+        );
+        assert_eq!(
+            prices.lookup(BIZ),
+            Some(("business", BillingInterval::Month))
+        );
+        assert_eq!(prices.lookup(""), None, "an empty id never matches");
+        assert_eq!(prices.lookup("price_someone_else"), None);
+        assert_eq!(
+            prices.price_for("pro", BillingInterval::Year),
+            Some(PRO_YEAR)
+        );
+        assert_eq!(
+            prices.price_for("business", BillingInterval::Year),
+            None,
+            "annual Business is not configured here"
+        );
+        assert_eq!(
+            plan_for_price(Some(PRO_YEAR), &prices).as_deref(),
+            Some("pro")
+        );
+
+        let mut sub = classic_invoice();
+        sub["lines"]["data"][0]["price"]["id"] = json!(PRO_YEAR);
+        assert_eq!(
+            parsed(BillingKind::InvoicePaid, &sub).row.plan.as_deref(),
+            Some("pro")
+        );
     }
 
     /// Billed, not listed: the invoice's recurring line after the coupon,

@@ -45,18 +45,30 @@ async fn get_plans_free_plan_has_correct_data() {
 
     assert_eq!(free["name"], "Free");
     assert_eq!(free["price_cents"], 0);
+    // FR-115 — commercial use allowed, said by the plan itself.
+    assert_eq!(free["commercial_use"], true);
+    assert_eq!(free["per_seat"], false);
+    assert_eq!(free["features"][0], "Free for commercial use");
     assert_eq!(free["limits"]["max_members"], 10);
-    assert_eq!(free["limits"]["max_channels"], 5);
-    assert_eq!(free["limits"]["video_max_participants"], 4);
+    assert_eq!(free["limits"]["max_channels"], u64::from(u32::MAX));
+    assert_eq!(free["limits"]["max_message_history"], -1);
+    assert_eq!(free["limits"]["video_max_participants"], 10);
+    assert_eq!(free["limits"]["meeting_max_minutes"], 60);
     assert_eq!(free["limits"]["cloud_integrations"], false);
     assert_eq!(free["limits"]["recordings"], false);
-    // S5 pivot — fleet limits lead the matrix.
-    assert_eq!(free["limits"]["max_devices"], 3);
-    assert_eq!(free["limits"]["max_tunnel_clients"], 3);
+    assert_eq!(free["limits"]["storage_bytes"], 1024_u64 * 1024 * 1024);
+    // FR-115 — the network is given away: 100 devices, MagicDNS.
+    assert_eq!(free["limits"]["max_devices"], 100);
+    assert_eq!(free["limits"]["max_tunnel_clients"], 100);
     assert_eq!(free["limits"]["overlay_mesh"], true);
     assert_eq!(free["limits"]["exit_nodes"], false);
-    assert_eq!(free["limits"]["magic_dns"], false);
+    assert_eq!(free["limits"]["magic_dns"], true);
     assert_eq!(free["limits"]["max_concurrent_sessions"], 1);
+    assert_eq!(free["limits"]["relay_bytes_per_month"], 10_000_000_000_u64);
+    // Monthly only (no annual Prices configured on a test server), both
+    // currencies, zero.
+    let prices = free["prices"].as_array().unwrap();
+    assert!(prices.iter().all(|p| p["unit_amount"] == 0));
 }
 
 #[tokio::test]
@@ -78,14 +90,33 @@ async fn get_plans_pro_plan_has_correct_data() {
 
     assert_eq!(pro["name"], "Pro");
     assert_eq!(pro["price_cents"], 800);
-    assert_eq!(pro["limits"]["video_max_participants"], 10);
+    // FR-115 — per seat; one seat's numbers are what the plan publishes.
+    assert_eq!(pro["per_seat"], true);
+    assert_eq!(pro["limits"]["per_seat"], true);
+    assert_eq!(pro["limits"]["video_max_participants"], 50);
+    assert_eq!(pro["limits"]["meeting_max_minutes"], u64::from(u32::MAX));
     assert_eq!(pro["limits"]["cloud_integrations"], true);
     assert_eq!(pro["limits"]["recordings"], false);
-    assert_eq!(pro["limits"]["max_devices"], 30);
-    assert_eq!(pro["limits"]["max_tunnel_clients"], 30);
+    assert_eq!(pro["limits"]["max_devices"], 1000);
+    assert_eq!(pro["limits"]["max_tunnel_clients"], 1000);
     assert_eq!(pro["limits"]["exit_nodes"], true);
     assert_eq!(pro["limits"]["magic_dns"], true);
-    assert_eq!(pro["limits"]["max_concurrent_sessions"], 5);
+    assert_eq!(pro["limits"]["max_concurrent_sessions"], 1);
+    assert_eq!(pro["limits"]["relay_bytes_per_month"], 25_000_000_000_u64);
+    assert_eq!(pro["limits"]["storage_bytes"], 10 * 1024_u64 * 1024 * 1024);
+    let prices = pro["prices"].as_array().unwrap();
+    for currency in ["usd", "eur"] {
+        assert!(
+            prices.iter().any(|p| p["interval"] == "month"
+                && p["currency"] == currency
+                && p["unit_amount"] == 800),
+            "{currency} monthly price missing: {prices:?}"
+        );
+    }
+    assert!(
+        prices.iter().all(|p| p["interval"] == "month"),
+        "annual is offered only once its Prices are configured: {prices:?}"
+    );
 }
 
 #[tokio::test]
@@ -107,13 +138,27 @@ async fn get_plans_business_plan_has_correct_data() {
 
     assert_eq!(biz["name"], "Business");
     assert_eq!(biz["price_cents"], 1600);
+    assert_eq!(biz["per_seat"], true);
     assert_eq!(biz["limits"]["video_max_participants"], 100);
     assert_eq!(biz["limits"]["cloud_integrations"], true);
     assert_eq!(biz["limits"]["recordings"], true);
-    assert_eq!(biz["limits"]["max_devices"], 300);
-    assert_eq!(biz["limits"]["max_tunnel_clients"], 300);
+    assert_eq!(biz["limits"]["max_devices"], 5000);
+    assert_eq!(biz["limits"]["max_tunnel_clients"], 5000);
     assert_eq!(biz["limits"]["exit_nodes"], true);
     assert_eq!(biz["limits"]["magic_dns"], true);
+    assert_eq!(
+        biz["limits"]["max_concurrent_sessions"],
+        u64::from(u32::MAX)
+    );
+    assert_eq!(biz["limits"]["relay_bytes_per_month"], 100_000_000_000_u64);
+    // AI recognition was deleted in FR-32 and must not be sold.
+    assert!(
+        biz["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| !f.as_str().unwrap_or_default().contains("AI"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -830,15 +875,19 @@ async fn agent_enroll_enforces_free_plan_device_cap() {
         }
     };
 
-    // Free plan allows 3 devices.
-    for i in 1..=3 {
-        let resp = enroll(format!("cap-mach-{i}")).await;
-        assert_eq!(resp.status().as_u16(), 200, "device {i} should enroll");
-    }
+    // FR-115 — Free allows 100 devices. One real enrollment, then the tenant
+    // is seeded to 99 directly (enrolling 100 for real would make this the
+    // slowest test in the suite for no extra coverage), then the 100th
+    // enrolls and the 101st is refused.
+    let resp = enroll("cap-mach-1".to_string()).await;
+    assert_eq!(resp.status().as_u16(), 200, "device 1 should enroll");
+    seed_rows(&app, "agents", &seeded.tenant_id, "cap-seed", 98).await;
+    let resp = enroll("cap-mach-100".to_string()).await;
+    assert_eq!(resp.status().as_u16(), 200, "device 100 should enroll");
 
-    // The 4th NEW machine is over the cap.
-    let resp = enroll("cap-mach-4".to_string()).await;
-    assert_eq!(resp.status().as_u16(), 403, "4th device must hit the cap");
+    // The 101st NEW machine is over the cap.
+    let resp = enroll("cap-mach-101".to_string()).await;
+    assert_eq!(resp.status().as_u16(), 403, "101st device must hit the cap");
     let body = resp.text().await.unwrap();
     assert!(
         body.contains("Device limit"),
@@ -892,7 +941,9 @@ async fn tunnel_enroll_enforces_free_plan_cap() {
         }
     };
 
-    for i in 1..=3 {
+    // FR-115 — Free allows 100 tunnel clients: two real, 98 seeded, then the
+    // 101st is refused.
+    for i in 1..=2 {
         let resp = enroll(format!("tcap-mach-{i}")).await;
         assert_eq!(
             resp.status().as_u16(),
@@ -900,11 +951,12 @@ async fn tunnel_enroll_enforces_free_plan_cap() {
             "tunnel client {i} should enroll"
         );
     }
-    let resp = enroll("tcap-mach-4".to_string()).await;
+    seed_rows(&app, "tunnel_clients", &seeded.tenant_id, "tcap-seed", 98).await;
+    let resp = enroll("tcap-mach-101".to_string()).await;
     assert_eq!(
         resp.status().as_u16(),
         403,
-        "4th tunnel client must hit the cap"
+        "101st tunnel client must hit the cap"
     );
     let resp = enroll("tcap-mach-2".to_string()).await;
     assert_eq!(
@@ -912,4 +964,566 @@ async fn tunnel_enroll_enforces_free_plan_cap() {
         200,
         "re-enroll rehydrates, never capped"
     );
+}
+
+/// Insert `n` live device-shaped rows (`agents` or `tunnel_clients`) for a
+/// tenant — what a count gate reads — without enrolling each one.
+async fn seed_rows(app: &TestApp, collection: &str, tenant_id: &str, prefix: &str, n: usize) {
+    use bson::{Bson, doc, oid::ObjectId};
+    let tid = ObjectId::parse_str(tenant_id).unwrap();
+    let now = bson::DateTime::now();
+    let docs: Vec<bson::Document> = (0..n)
+        .map(|i| {
+            doc! {
+                "tenant_id": tid,
+                "machine_id": format!("{prefix}-{i}"),
+                "name": format!("{prefix}-{i}"),
+                "created_at": now,
+                "updated_at": now,
+                "deleted_at": Bson::Null,
+            }
+        })
+        .collect();
+    app.db
+        .collection::<bson::Document>(collection)
+        .insert_many(docs)
+        .await
+        .expect("seeding rows failed");
+}
+
+// ---------------------------------------------------------------------------
+// FR-115 — per-seat billing, against a fake Stripe that records every call
+// ---------------------------------------------------------------------------
+
+mod fr115 {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Router,
+        extract::{Form, Path, State},
+        routing::{get, post},
+    };
+    use bson::{Bson, doc, oid::ObjectId};
+    use roomler_ai_services::stripe::StripeService;
+
+    const SECRET: &str = "whsec_test_secret_for_billing_tests";
+    const PRICE_PRO: &str = "price_fr115_pro_month";
+    const PRICE_BIZ: &str = "price_fr115_biz_month";
+    const PRICE_PRO_YEAR: &str = "price_fr115_pro_year";
+    const PRICE_BIZ_YEAR: &str = "price_fr115_biz_year";
+
+    /// One request the fake received: method, path, form fields.
+    #[derive(Debug, Clone)]
+    struct Call {
+        method: &'static str,
+        path: String,
+        form: Vec<(String, String)>,
+    }
+
+    impl Call {
+        fn field(&self, k: &str) -> Option<&str> {
+            self.form
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Fake {
+        calls: Arc<Mutex<Vec<Call>>>,
+        /// The subscription's item: (price, quantity).
+        item: Arc<Mutex<(String, u32)>>,
+    }
+
+    impl Fake {
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn record(&self, method: &'static str, path: String, form: Vec<(String, String)>) {
+            self.calls.lock().unwrap().push(Call { method, path, form });
+        }
+        fn subscription(&self, id: &str) -> serde_json::Value {
+            let (price, quantity) = self.item.lock().unwrap().clone();
+            serde_json::json!({
+                "id": id, "object": "subscription", "status": "active",
+                "customer": "cus_fake", "currency": "eur",
+                "cancel_at_period_end": false,
+                "items": { "data": [ {
+                    "id": "si_fake", "quantity": quantity,
+                    "price": { "id": price, "recurring": { "interval": "month" } },
+                    "current_period_end": 1_900_000_000,
+                } ] },
+            })
+        }
+    }
+
+    /// A Stripe that answers the calls FR-115 makes and records each one.
+    async fn fake_stripe(fake: Fake) -> String {
+        let app = Router::new()
+            .route(
+                "/v1/customers",
+                post(|State(f): State<Fake>, Form(form): Form<Vec<(String, String)>>| async move {
+                    f.record("POST", "/v1/customers".into(), form);
+                    axum::Json(serde_json::json!({ "id": "cus_fake" }))
+                }),
+            )
+            .route(
+                "/v1/checkout/sessions",
+                post(|State(f): State<Fake>, Form(form): Form<Vec<(String, String)>>| async move {
+                    f.record("POST", "/v1/checkout/sessions".into(), form);
+                    axum::Json(serde_json::json!({ "id": "cs_fake", "url": "https://checkout.example/cs_fake" }))
+                }),
+            )
+            .route(
+                "/v1/subscriptions/{id}",
+                get(|State(f): State<Fake>, Path(id): Path<String>| async move {
+                    f.record("GET", format!("/v1/subscriptions/{id}"), vec![]);
+                    axum::Json(f.subscription(&id))
+                })
+                .post(
+                    |State(f): State<Fake>,
+                     Path(id): Path<String>,
+                     Form(form): Form<Vec<(String, String)>>| async move {
+                        if let Some(p) = form.iter().find(|(k, _)| k == "items[0][price]") {
+                            f.item.lock().unwrap().0 = p.1.clone();
+                        }
+                        f.record("POST", format!("/v1/subscriptions/{id}"), form);
+                        axum::Json(f.subscription(&id))
+                    },
+                ),
+            )
+            .route(
+                "/v1/subscription_items/{id}",
+                post(
+                    |State(f): State<Fake>,
+                     Path(id): Path<String>,
+                     Form(form): Form<Vec<(String, String)>>| async move {
+                        if let Some(q) = form.iter().find(|(k, _)| k == "quantity") {
+                            f.item.lock().unwrap().1 = q.1.parse().unwrap_or(1);
+                        }
+                        f.record("POST", format!("/v1/subscription_items/{id}"), form);
+                        axum::Json(serde_json::json!({ "id": id }))
+                    },
+                ),
+            )
+            .with_state(fake);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn configure(s: &mut roomler_ai_config::Settings, base: &str, annual: bool) {
+        s.stripe.secret_key = "sk_test_fr115_fake".into();
+        s.stripe.webhook_secret = SECRET.into();
+        s.stripe.price_pro = PRICE_PRO.into();
+        s.stripe.price_business = PRICE_BIZ.into();
+        if annual {
+            s.stripe.price_pro_annual = PRICE_PRO_YEAR.into();
+            s.stripe.price_business_annual = PRICE_BIZ_YEAR.into();
+        }
+        s.stripe.api_base = base.into();
+    }
+
+    /// Bring the tenant to exactly `seats` accepted members, plus one
+    /// PENDING invite that must never count as a seat.
+    async fn set_seats(app: &TestApp, tenant_id: &str, seats: u64) {
+        let tid = ObjectId::parse_str(tenant_id).unwrap();
+        let members = app.db.collection::<bson::Document>("tenant_members");
+        let now = bson::DateTime::now();
+        let have = members
+            .count_documents(doc! { "tenant_id": tid, "is_pending": { "$ne": true } })
+            .await
+            .unwrap();
+        for i in have..seats {
+            members
+                .insert_one(doc! {
+                    "tenant_id": tid, "user_id": ObjectId::new(), "role_ids": [],
+                    "joined_at": now, "is_pending": false, "is_muted": false,
+                    "created_at": now, "updated_at": now, "nickname": Bson::Null,
+                    "notification_override": Bson::Null, "invited_by": Bson::Null,
+                    "last_seen_at": Bson::Null, "_fr115": i as i64,
+                })
+                .await
+                .unwrap();
+        }
+        members
+            .insert_one(doc! {
+                "tenant_id": tid, "user_id": ObjectId::new(), "role_ids": [],
+                "joined_at": now, "is_pending": true, "is_muted": false,
+                "created_at": now, "updated_at": now, "nickname": Bson::Null,
+                "notification_override": Bson::Null, "invited_by": Bson::Null,
+                "last_seen_at": Bson::Null,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Give the tenant a live subscription on `price`, as the webhook would.
+    async fn subscribe(app: &TestApp, tenant_id: &str, plan: &str) {
+        let tid = ObjectId::parse_str(tenant_id).unwrap();
+        app.db
+            .collection::<bson::Document>("tenants")
+            .update_one(
+                doc! { "_id": tid },
+                doc! { "$set": {
+                    "plan": plan,
+                    "billing": {
+                        "customer_id": "cus_fake", "subscription_id": "sub_fake",
+                        "current_period_end": Bson::Null, "status": "active",
+                        "cancel_at_period_end": false, "seats": 1_i64,
+                        "interval": "month", "currency": "eur",
+                    },
+                } },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn billing_of(app: &TestApp, tenant_id: &str) -> bson::Document {
+        let tid = ObjectId::parse_str(tenant_id).unwrap();
+        app.db
+            .collection::<bson::Document>("tenants")
+            .find_one(doc! { "_id": tid })
+            .await
+            .unwrap()
+            .expect("tenant")
+    }
+
+    async fn checkout(
+        app: &TestApp,
+        t: &crate::fixtures::seed::SeededTenant,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        let mut b = serde_json::json!({
+            "tenant_id": t.tenant_id,
+            "success_url": "http://localhost/ok",
+            "cancel_url": "http://localhost/cancel",
+        });
+        for (k, v) in body.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        app.auth_post("/api/stripe/checkout", &t.admin.access_token)
+            .json(&b)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn send_webhook(app: &TestApp, payload: serde_json::Value) {
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let ts = now_ts();
+        let sig = compute_hmac_sha256(SECRET, &format!("{ts}.{}", String::from_utf8_lossy(&bytes)));
+        let resp = app
+            .client
+            .post(app.url("/api/stripe/webhook"))
+            .header("Content-Type", "application/json")
+            .header("stripe-signature", format!("t={ts},v1={sig}"))
+            .body(bytes)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "webhook refused");
+    }
+
+    /// AC3 — one unit per seat, in the currency and interval asked for; a
+    /// pending invite is not a seat. Before FR-115 the quantity was always 1.
+    #[tokio::test]
+    async fn checkout_bills_one_unit_per_seat_in_the_chosen_currency() {
+        let fake = Fake::default();
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, true)).await;
+        let t = app.seed_tenant("fr115-checkout").await;
+        set_seats(&app, &t.tenant_id, 3).await;
+
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "interval": "year", "currency": "eur" }),
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{}",
+            resp.text().await.unwrap_or_default()
+        );
+
+        let calls = fake.calls();
+        let session = calls
+            .iter()
+            .find(|c| c.path == "/v1/checkout/sessions")
+            .expect("no checkout session was created");
+        assert_eq!(
+            session.field("line_items[0][quantity]"),
+            Some("3"),
+            "{session:?}"
+        );
+        assert_eq!(session.field("line_items[0][price]"), Some(PRICE_PRO_YEAR));
+        assert_eq!(session.field("currency"), Some("eur"));
+        assert_eq!(session.field("metadata[seats]"), Some("3"));
+        assert_eq!(session.field("metadata[interval]"), Some("year"));
+        assert_eq!(
+            session.field("subscription_data[metadata][tenant_id]"),
+            Some(t.tenant_id.as_str())
+        );
+    }
+
+    /// Annual is offered only once its Prices are configured: refused with
+    /// a 503 naming it, before any Stripe call.
+    #[tokio::test]
+    async fn annual_checkout_is_refused_when_not_configured() {
+        let fake = Fake::default();
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("fr115-noannual").await;
+
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "interval": "year" }),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 503);
+        assert!(resp.text().await.unwrap().contains("annual"));
+        assert!(fake.calls().is_empty(), "nothing may reach Stripe");
+    }
+
+    /// The double-billing bug: "Switch to Business" used to run a second
+    /// checkout and start a second subscription. A live subscription now
+    /// refuses checkout with a 409; the change goes through change-plan.
+    #[tokio::test]
+    async fn a_second_checkout_is_refused_for_a_live_subscription() {
+        let fake = Fake::default();
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("fr115-twice").await;
+        subscribe(&app, &t.tenant_id, "pro").await;
+
+        let resp = checkout(&app, &t, serde_json::json!({ "plan": "business" })).await;
+        assert_eq!(resp.status().as_u16(), 409);
+        assert!(
+            fake.calls()
+                .iter()
+                .all(|c| c.path != "/v1/checkout/sessions"),
+            "no second subscription may be started"
+        );
+    }
+
+    /// A plan change moves the ONE item to the new price, keeps its
+    /// quantity, prorates, and the org's plan follows.
+    #[tokio::test]
+    async fn change_plan_moves_the_item_price_with_proration() {
+        let fake = Fake::default();
+        *fake.item.lock().unwrap() = (PRICE_PRO.into(), 2);
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("fr115-change").await;
+        subscribe(&app, &t.tenant_id, "pro").await;
+
+        let resp = app
+            .auth_post("/api/stripe/change-plan", &t.admin.access_token)
+            .json(&serde_json::json!({ "tenant_id": t.tenant_id, "plan": "business", "interval": "month" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{}",
+            resp.text().await.unwrap_or_default()
+        );
+
+        let calls = fake.calls();
+        let update = calls
+            .iter()
+            .find(|c| c.method == "POST" && c.path == "/v1/subscriptions/sub_fake")
+            .expect("the subscription was not updated");
+        assert_eq!(update.field("items[0][id]"), Some("si_fake"));
+        assert_eq!(update.field("items[0][price]"), Some(PRICE_BIZ));
+        assert_eq!(
+            update.field("items[0][quantity]"),
+            Some("2"),
+            "quantity kept"
+        );
+        assert_eq!(
+            update.field("proration_behavior"),
+            Some("create_prorations")
+        );
+        assert_eq!(
+            billing_of(&app, &t.tenant_id)
+                .await
+                .get_str("plan")
+                .unwrap(),
+            "business"
+        );
+    }
+
+    /// AC4 — the seat reconcile moves Stripe's quantity to the member count
+    /// with a proration, and does nothing when they already agree.
+    #[tokio::test]
+    async fn seat_sync_moves_the_quantity_to_the_member_count() {
+        let fake = Fake::default();
+        *fake.item.lock().unwrap() = (PRICE_PRO.into(), 1);
+        let base = fake_stripe(fake.clone()).await;
+        let mut settings = None;
+        let app = TestApp::spawn_with_settings(|s| {
+            configure(s, &base, false);
+            settings = Some(s.stripe.clone());
+        })
+        .await;
+        let t = app.seed_tenant("fr115-seats").await;
+        subscribe(&app, &t.tenant_id, "pro").await;
+        set_seats(&app, &t.tenant_id, 4).await;
+
+        let stripe = StripeService::new(settings.as_ref().unwrap());
+        let r = stripe.reconcile_seats(&app.db).await.unwrap();
+        assert_eq!((r.orgs, r.changed, r.failed), (1, 1, 0));
+        let calls = fake.calls();
+        let set = calls
+            .iter()
+            .find(|c| c.path == "/v1/subscription_items/si_fake")
+            .expect("the quantity was not moved");
+        assert_eq!(set.field("quantity"), Some("4"));
+        assert_eq!(set.field("proration_behavior"), Some("create_prorations"));
+        let tenant = billing_of(&app, &t.tenant_id).await;
+        assert_eq!(
+            tenant
+                .get_document("billing")
+                .unwrap()
+                .get_i64("seats")
+                .unwrap(),
+            4
+        );
+
+        // Again: they agree, so Stripe is read and not written.
+        let r = stripe.reconcile_seats(&app.db).await.unwrap();
+        assert_eq!((r.orgs, r.changed), (1, 0));
+        let writes = fake
+            .calls()
+            .iter()
+            .filter(|c| c.path == "/v1/subscription_items/si_fake")
+            .count();
+        assert_eq!(writes, 1, "an agreeing quantity must not be rewritten");
+    }
+
+    /// The webhook records seats, interval, currency and the plan a price
+    /// names — a plan changed in Stripe's portal reaches the org, which the
+    /// status-only handler never did. `created` may arrive before
+    /// `checkout.session.completed`: the org is found by the metadata.
+    #[tokio::test]
+    async fn the_webhook_records_seats_interval_currency_and_plan() {
+        let base = fake_stripe(Fake::default()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, true)).await;
+        let t = app.seed_tenant("fr115-webhook").await;
+
+        // `created` first, before the checkout event: found by metadata.
+        send_webhook(
+            &app,
+            serde_json::json!({
+                "id": "evt_fr115_1", "type": "customer.subscription.created",
+                "data": { "object": {
+                    "id": "sub_hook", "object": "subscription", "status": "active",
+                    "customer": "cus_hook", "currency": "eur",
+                    "metadata": { "tenant_id": t.tenant_id },
+                    "items": { "data": [ { "id": "si_hook", "quantity": 3,
+                        "price": { "id": PRICE_PRO, "recurring": { "interval": "month" } } } ] },
+                } },
+            }),
+        )
+        .await;
+        let doc = billing_of(&app, &t.tenant_id).await;
+        assert_eq!(doc.get_str("plan").unwrap(), "pro");
+        let b = doc.get_document("billing").unwrap();
+        assert_eq!(b.get_str("subscription_id").unwrap(), "sub_hook");
+        assert_eq!(b.get_i64("seats").unwrap(), 3);
+        assert_eq!(b.get_str("interval").unwrap(), "month");
+        assert_eq!(b.get_str("currency").unwrap(), "eur");
+
+        // The portal moves it to annual Business with 5 seats.
+        send_webhook(
+            &app,
+            serde_json::json!({
+                "id": "evt_fr115_2", "type": "customer.subscription.updated",
+                "data": { "object": {
+                    "id": "sub_hook", "object": "subscription", "status": "active",
+                    "customer": "cus_hook", "currency": "eur",
+                    "items": { "data": [ { "id": "si_hook", "quantity": 5,
+                        "price": { "id": PRICE_BIZ_YEAR, "recurring": { "interval": "year" } } } ] },
+                } },
+            }),
+        )
+        .await;
+        let doc = billing_of(&app, &t.tenant_id).await;
+        assert_eq!(doc.get_str("plan").unwrap(), "business");
+        let b = doc.get_document("billing").unwrap();
+        assert_eq!(b.get_i64("seats").unwrap(), 5);
+        assert_eq!(b.get_str("interval").unwrap(), "year");
+
+        // A price this server does not sell leaves the plan where it is.
+        send_webhook(
+            &app,
+            serde_json::json!({
+                "id": "evt_fr115_3", "type": "customer.subscription.updated",
+                "data": { "object": {
+                    "id": "sub_hook", "object": "subscription", "status": "active",
+                    "items": { "data": [ { "id": "si_hook", "quantity": 5,
+                        "price": { "id": "price_someone_else" } } ] },
+                } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            billing_of(&app, &t.tenant_id)
+                .await
+                .get_str("plan")
+                .unwrap(),
+            "business"
+        );
+    }
+
+    /// The summary the billing page reads: seats now (pending invites
+    /// excluded), billed seats, subscribed.
+    #[tokio::test]
+    async fn the_summary_counts_accepted_members_only() {
+        let base = fake_stripe(Fake::default()).await;
+        let app = TestApp::spawn_with_settings(|s| configure(s, &base, false)).await;
+        let t = app.seed_tenant("fr115-summary").await;
+        set_seats(&app, &t.tenant_id, 6).await;
+
+        let s: Value = app
+            .auth_get(
+                &format!("/api/stripe/summary?tenant_id={}", t.tenant_id),
+                &t.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(s["plan"], "free");
+        assert_eq!(s["seats_now"], 6, "the pending invite is not a seat");
+        assert_eq!(s["subscribed"], false);
+
+        subscribe(&app, &t.tenant_id, "pro").await;
+        let s: Value = app
+            .auth_get(
+                &format!("/api/stripe/summary?tenant_id={}", t.tenant_id),
+                &t.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(s["subscribed"], true);
+        assert_eq!(s["seats_billed"], 1);
+        assert_eq!(s["currency"], "eur");
+    }
 }
