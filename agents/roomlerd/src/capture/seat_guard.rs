@@ -64,6 +64,9 @@ pub(crate) struct OnScreen {
     pub class: String,
     /// `LockedHint`, which GNOME and KDE set while their lock screen is up.
     pub locked: bool,
+    /// logind's `State` is `closing`: the person logged out, and the session
+    /// is still the seat's active one only while its processes end.
+    pub closing: bool,
 }
 
 /// The guard as a pure function. `on_screen` is the seat's active session,
@@ -71,10 +74,18 @@ pub(crate) struct OnScreen {
 ///
 /// ⚠️ Matched on the session id, never the user: a second login of the same
 /// person is a different session, told nothing.
+///
+/// ⚠️ A bound session that is `closing` is away. The person logged out, and
+/// logind keeps the session as the seat's active one until every process in
+/// it has ended, which can take until systemd's stop timeout. Measured on
+/// GDM's Xorg autologin (FR-113 AC3, 2026-10-19): its session worker ignored
+/// SIGTERM, so the seat showed no greeter for 90 s after the logout, while
+/// the X server was already gone. Read as open, that scanout reached the
+/// viewer as a black screen with nothing said.
 pub(crate) fn guard(bound: &str, on_screen: Option<&OnScreen>) -> Guard {
     match on_screen {
-        Some(s) if s.id == bound && s.class == "user" && s.locked => Guard::Locked,
-        Some(s) if s.id == bound && s.class == "user" => Guard::Open,
+        Some(s) if s.id == bound && s.class == "user" && !s.closing && s.locked => Guard::Locked,
+        Some(s) if s.id == bound && s.class == "user" && !s.closing => Guard::Open,
         _ => Guard::Away,
     }
 }
@@ -93,6 +104,7 @@ fn store(on_screen: Option<OnScreen>) {
             session = on_screen.as_ref().map_or("-", |s| s.id.as_str()),
             class = on_screen.as_ref().map_or("-", |s| s.class.as_str()),
             locked = on_screen.as_ref().is_some_and(|s| s.locked),
+            closing = on_screen.as_ref().is_some_and(|s| s.closing),
             "seat guard: on screen now (FR-95 P2)"
         );
     }
@@ -203,6 +215,7 @@ fn read_loginctl() -> Option<OnScreen> {
         id: s.id,
         class: s.class,
         locked: s.locked,
+        closing: s.state == "closing",
     })
 }
 
@@ -307,7 +320,18 @@ mod dbus {
             Value::Bool(b) => *b,
             other => anyhow::bail!("LockedHint: not a boolean: {other:?}"),
         };
-        Ok(Some(OnScreen { id, class, locked }))
+        // `online`, `active` or `closing`: only the last tells a logout that
+        // is still the seat's active session (see `guard`).
+        let closing = match &*get(conn, &path, SESSION, "State")? {
+            Value::Str(s) => s.as_str() == "closing",
+            other => anyhow::bail!("State: not a string: {other:?}"),
+        };
+        Ok(Some(OnScreen {
+            id,
+            class,
+            locked,
+            closing,
+        }))
     }
 }
 
@@ -320,6 +344,7 @@ mod tests {
             id: id.into(),
             class: class.into(),
             locked,
+            closing: false,
         }
     }
 
@@ -334,6 +359,27 @@ mod tests {
         assert_eq!(guard("3", Some(&s("7", "user", false))), Guard::Away);
         assert_eq!(guard("3", Some(&s("3", "lock-screen", false))), Guard::Away);
         assert_eq!(guard("3", None), Guard::Away);
+    }
+
+    /// FR-113 P4 (AC3) — a logout is away from the moment logind marks the
+    /// bound session `closing`, though the seat still names it as its active
+    /// session, unlocked, while the session's processes end. Measured on GDM's
+    /// Xorg autologin: 90 s of a bare scanout reached the viewer with nothing
+    /// said.
+    #[test]
+    fn a_closing_session_is_away_even_while_still_on_the_seat() {
+        let logging_out = OnScreen {
+            closing: true,
+            ..s("3", "user", false)
+        };
+        assert_eq!(guard("3", Some(&logging_out)), Guard::Away);
+        let locked_and_logging_out = OnScreen {
+            closing: true,
+            ..s("3", "user", true)
+        };
+        assert_eq!(guard("3", Some(&locked_and_logging_out)), Guard::Away);
+        // The same session before the logout: open, as ever.
+        assert_eq!(guard("3", Some(&s("3", "user", false))), Guard::Open);
     }
 
     /// The controller is told why the picture stopped.
