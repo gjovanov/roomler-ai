@@ -356,8 +356,9 @@ async fn a_loopback_connection_is_owned_by_whoever_opened_it() {
 }
 
 /// P3-5d-3 — macOS: a live loopback connection's client end is held by this
-/// test's own process, a socket made under its uid. Another account's
-/// processes hold none of it, and a pair no connection is, nobody.
+/// test's own process, and by processes of its uid alone. For another uid it
+/// is not, since a process of this one holds it; and a pair no connection
+/// is, nobody holds.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_loopback_connection_is_held_by_the_account_that_made_it() {
@@ -375,10 +376,15 @@ async fn a_loopback_connection_is_held_by_the_account_that_made_it() {
     };
     // SAFETY: geteuid reads our own credentials.
     let me = unsafe { libc::geteuid() };
-    assert!(libproc::held_by(from, to, me), "the test's own connection");
+    let mine = libproc::ends_of(i32::try_from(std::process::id()).unwrap());
+    assert!(
+        libproc::held_by(from, to, me),
+        "the test's own connection, {from} to {to}; this process's TCP ends, as libproc tells \
+         them: {mine:?}"
+    );
     assert!(
         !libproc::held_by(from, to, me.wrapping_add(4242)),
-        "another account's processes hold none of it"
+        "not another account's: this test's own process holds it"
     );
     let other = std::net::SocketAddrV4::new(*to.ip(), to.port().wrapping_add(1));
     assert!(!libproc::held_by(from, other, me), "no such connection");

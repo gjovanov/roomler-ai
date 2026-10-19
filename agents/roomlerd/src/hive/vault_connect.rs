@@ -450,8 +450,8 @@ mod proc_net {
 /// P3-5d-3 — macOS: whether a TCP connection's client end is an account's,
 /// from the kernel's view of each process's descriptors (`libproc`). macOS
 /// has no table of sockets with an owner in it, as Linux's `/proc/net/tcp`
-/// is; it does say which descriptors each process holds, and who made each
-/// socket.
+/// is, nor says who made a socket (its `soi_stat` is never filled); it does
+/// say which descriptors each process holds.
 #[cfg(target_os = "macos")]
 // The SDK's structs are mirrored whole, every field held for its place in
 // the layout; only some are read.
@@ -460,7 +460,9 @@ mod libproc {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
     use std::os::raw::c_int;
 
-    /// `proc_listpids`: the processes whose effective uid is the one asked.
+    /// `proc_listpids`: every process; those whose effective uid is the one
+    /// asked.
+    const PROC_ALL_PIDS: u32 = 1;
     const PROC_UID_ONLY: u32 = 4;
     /// `proc_pidfdinfo`: a socket's description.
     const PROC_PIDFDSOCKETINFO: c_int = 3;
@@ -528,7 +530,8 @@ mod libproc {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct SocketInfo {
-        /// `vst_uid` is the uid of the credential the socket was made with.
+        /// Left zeroed by the kernel for a socket (`fill_socketinfo` never
+        /// sets it): held for its place only.
         soi_stat: libc::vinfo_stat,
         soi_so: u64,
         soi_pcb: u64,
@@ -571,25 +574,34 @@ mod libproc {
     #[repr(C, align(8))]
     struct Buf([u8; 2048]);
 
-    /// Whether a process running as `uid` holds the socket at `client`
-    /// connected to `server`, and that socket was made under `uid`'s own
-    /// credential: a socket another account made and handed over is not
-    /// the account's.
+    /// Whether the socket at `client` connected to `server` is held, and
+    /// held only, by processes running as `uid`: one held by any other
+    /// account's process too is not the account's. The kernel never fills a
+    /// socket's own `soi_stat`, so who made it cannot be read; who holds it
+    /// can.
     pub(crate) fn held_by(client: SocketAddrV4, server: SocketAddrV4, uid: u32) -> bool {
-        pids(uid).into_iter().any(|pid| {
-            socket_fds(pid).into_iter().any(|fd| {
-                tcp_ends(pid, fd).is_some_and(|(local, remote, made_by)| {
-                    local == client && remote == server && made_by == uid
-                })
-            })
-        })
+        let theirs: std::collections::HashSet<c_int> =
+            pids(PROC_UID_ONLY, uid).into_iter().collect();
+        let mut held = false;
+        for pid in pids(PROC_ALL_PIDS, 0) {
+            let holds = socket_fds(pid).into_iter().any(|fd| {
+                tcp_ends(pid, fd).is_some_and(|(local, remote)| local == client && remote == server)
+            });
+            if holds {
+                if !theirs.contains(&pid) {
+                    return false;
+                }
+                held = true;
+            }
+        }
+        held
     }
 
-    /// The pids of the processes whose effective uid is `uid`.
-    fn pids(uid: u32) -> Vec<c_int> {
+    /// The pids `proc_listpids` names for `kind` (and its `info`).
+    fn pids(kind: u32, info: u32) -> Vec<c_int> {
         let size = std::mem::size_of::<c_int>();
         // SAFETY: a size query, with no buffer.
-        let bytes = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, std::ptr::null_mut(), 0) };
+        let bytes = unsafe { libc::proc_listpids(kind, info, std::ptr::null_mut(), 0) };
         let Ok(bytes) = usize::try_from(bytes) else {
             return Vec::new();
         };
@@ -597,8 +609,7 @@ mod libproc {
         let mut pids = vec![0 as c_int; bytes / size + 32];
         let room = c_int::try_from(pids.len() * size).unwrap_or(c_int::MAX);
         // SAFETY: the buffer holds `room` bytes.
-        let filled =
-            unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), room) };
+        let filled = unsafe { libc::proc_listpids(kind, info, pids.as_mut_ptr().cast(), room) };
         let Ok(filled) = usize::try_from(filled) else {
             return Vec::new();
         };
@@ -639,9 +650,19 @@ mod libproc {
             .collect()
     }
 
-    /// A TCP socket's two ends, and the uid it was made under: `None` for
-    /// any other socket, or one that is gone.
-    fn tcp_ends(pid: c_int, fd: c_int) -> Option<(SocketAddrV4, SocketAddrV4, u32)> {
+    /// What `pid`'s TCP sockets connect, as libproc tells it: for a test to
+    /// show when an end is not found.
+    #[cfg(test)]
+    pub(crate) fn ends_of(pid: c_int) -> Vec<(SocketAddrV4, SocketAddrV4)> {
+        socket_fds(pid)
+            .into_iter()
+            .filter_map(|fd| tcp_ends(pid, fd))
+            .collect()
+    }
+
+    /// A TCP socket's two ends: `None` for any other socket, or one that is
+    /// gone.
+    fn tcp_ends(pid: c_int, fd: c_int) -> Option<(SocketAddrV4, SocketAddrV4)> {
         let mut buf = Buf([0; 2048]);
         let room = c_int::try_from(buf.0.len()).ok()?;
         // SAFETY: the buffer holds `room` bytes.
@@ -680,7 +701,6 @@ mod libproc {
         Some((
             SocketAddrV4::new(ip(ini.insi_laddr)?, port(ini.insi_lport)),
             SocketAddrV4::new(ip(ini.insi_faddr)?, port(ini.insi_fport)),
-            si.soi_stat.vst_uid,
         ))
     }
 }
@@ -1420,16 +1440,15 @@ mod endpoint {
                 }
             }
 
-            /// macOS (P3-5d-3): a process running as the session's account
-            /// holds the connection's client end, a socket made under that
-            /// account's own credential.
+            /// macOS (P3-5d-3): the connection's client end is held, and held
+            /// only, by processes running as the session's account.
             #[cfg(target_os = "macos")]
             fn account(&self, client: SocketAddrV4) -> Result<(), String> {
                 if super::super::libproc::held_by(client, self.addr, self.peer) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "a client end no process of uid {} holds as its own",
+                        "a client end not held by processes of uid {} alone",
                         self.peer
                     ))
                 }
