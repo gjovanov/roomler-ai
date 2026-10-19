@@ -69,6 +69,7 @@ pub async fn handle_agent_socket(
             supports_relay_regions,
             ssh_host_pubkey,
             vault_key,
+            peer_auth_key,
         }) => (
             machine_name,
             os,
@@ -78,8 +79,7 @@ pub async fn handle_agent_socket(
             caps,
             advertised_routes,
             supports_relay_regions,
-            ssh_host_pubkey,
-            vault_key,
+            (ssh_host_pubkey, vault_key, peer_auth_key),
         ),
         other => {
             warn!(?other, "agent opened WS without rc:agent.hello — closing");
@@ -95,8 +95,7 @@ pub async fn handle_agent_socket(
         caps,
         advertised_routes,
         supports_relay_regions,
-        ssh_host_pubkey,
-        vault_key,
+        (ssh_host_pubkey, vault_key, peer_auth_key),
     ) = hello;
     // FR-90 P3-3a — a vault key is stored only as one the vault can seal to;
     // anything else is stored as none, so the device takes no leases until a
@@ -113,6 +112,22 @@ pub async fn handle_agent_socket(
         );
         String::new()
     };
+    // FR-100 P1a — likewise a device key: stored only in its one canonical
+    // shape, so a browser's first pin never starts from a key no browser can
+    // import. A hint either way (the browser pins what signed), so this
+    // checks a device's bug, not an attacker.
+    let peer_auth_key = if peer_auth_key.is_empty()
+        || roomler_ai_remote_control::signaling::peer_auth_key_is_well_formed(&peer_auth_key)
+    {
+        peer_auth_key
+    } else {
+        warn!(
+            %agent_id,
+            len = peer_auth_key.len(),
+            "agent hello carried a malformed device key — storing none"
+        );
+        String::new()
+    };
 
     // Persist: mark online, update hello fields on the Mongo row. Best-effort —
     // signaling still works if Mongo lags.
@@ -126,6 +141,7 @@ pub async fn handle_agent_socket(
             &advertised_routes,
             &ssh_host_pubkey,
             &vault_key,
+            &peer_auth_key,
             &arch,
             arch_emulated,
         )

@@ -366,6 +366,16 @@
               >
                 · desktop v{{ companionSkew(item) }}
               </span>
+              <!-- FR-100 P1a — the device's own key, as a person reads it, so
+                   what a browser pins can be checked against this list. Absent
+                   until the device sends one. -->
+              <span
+                v-if="item.kind === 'agent' && agentFor(item)?.peer_auth_fingerprint"
+                class="ml-1 font-mono"
+                :title="`Device key fingerprint: ${agentFor(item)!.peer_auth_fingerprint}`"
+              >
+                · key {{ agentFor(item)!.peer_auth_fingerprint!.slice(0, 9) }}…
+              </span>
             </div>
           </template>
           <template #item.kind="{ item }">

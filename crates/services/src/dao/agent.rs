@@ -151,6 +151,9 @@ impl AgentDao {
             ssh_host_pubkey: String::new(),
             // FR-90 P3-3a — the same: only a running daemon holds a vault key.
             vault_key: String::new(),
+            // FR-100 P1a — and the device key is made on the device, at its
+            // first hello.
+            peer_auth_key: String::new(),
             agent_token_hash,
             // FR-103 — a new row starts at generation 0; only a removal
             // advances it.
@@ -464,6 +467,7 @@ impl AgentDao {
         advertised_routes: &[String],
         ssh_host_pubkey: &str,
         vault_key: &str,
+        peer_auth_key: &str,
         arch: &str,
         arch_emulated: bool,
     ) -> DaoResult<bool> {
@@ -484,6 +488,10 @@ impl AgentDao {
             // the daemon makes a new vault key at each start, so a key left
             // standing would name a process that is gone.
             "vault_key": vault_key,
+            // FR-100 P1a — on every hello, the empty string included, for
+            // the host key's reason: a rollback to a build without a device
+            // key must not leave browsers expecting its signature.
+            "peer_auth_key": peer_auth_key,
             "status": bson::to_bson(&AgentStatus::Online).unwrap(),
             "last_seen_at": DateTime::now(),
         };
