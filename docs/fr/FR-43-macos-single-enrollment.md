@@ -51,7 +51,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
   the launchd analogue of `spawn_in_session`. Console-user changes (login, logout, fast
   user switch) drive respawn, mirroring `decide_spawn`'s session-change handling.
 - **Transport**: the LocalAPI unix socket, which already solves exactly this addressing
-  problem — `crates/localapi/src/lib.rs:1958-1875` documents `/var/run/roomler` as the
+  problem — `crates/localapi/src/lib.rs:1966-1875` documents `/var/run/roomler` as the
   root daemon's well-known socket precisely because "a per-user path cannot serve a root
   daemon … that is the trap the macOS LaunchDaemon split walks into".
 - **Division**: signalling + consent + policy in the daemon; the rc session's WebRTC
@@ -126,8 +126,8 @@ session setup and then nothing.
 ### The transport problem, stated honestly
 
 LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
-answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1649`); `TailLog`'s
-own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1043`). There is no server
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1657`); `TailLog`'s
+own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1051`). There is no server
 push, and delegation needs it in both directions — trickle ICE arrives whenever the network
 decides, not when someone asks.
 
@@ -154,7 +154,7 @@ screen appears".
 ⚠️ `RcAttach` must be **daemon-only**, not something any local process can call: it would
 otherwise let any user-session process on the box volunteer to serve remote-control
 sessions. The socket's own ACL is the trust boundary today
-(`lib.rs:1810-1820` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
+(`lib.rs:1818-1828` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
 because the worker is an ordinary user process and so is an attacker's. The attach must
 carry the one-shot secret the daemon passed to the worker in its spawn environment, and the
 daemon must accept exactly one attached worker at a time.

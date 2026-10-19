@@ -2399,10 +2399,18 @@ fn print_status(s: &NodeStatus) {
     // overlay published it). "resolver down" / "OS steer failed" are the two
     // states worth an operator's eye.
     if let Some(dns) = &s.dns {
+        // FR-97 P3h — a steer the host's own resolver never asks is not
+        // "active", so it is named, and why on the line below.
+        let bypassed = dns
+            .os_steer_bypassed
+            .as_deref()
+            .filter(|_| dns.resolver_bound && dns.os_steer_active);
         let health = if !dns.resolver_bound {
             "resolver DOWN"
         } else if !dns.os_steer_active {
             "resolver up, OS steer FAILED"
+        } else if bypassed.is_some() {
+            "steered but BYPASSED"
         } else {
             "active"
         };
@@ -2415,6 +2423,9 @@ fn print_status(s: &NodeStatus) {
             "  magicdns    {} ({health}, {aaaa}, upstream {})",
             dns.magic_domain, dns.upstream
         );
+        if let Some(why) = bypassed {
+            println!("              ⚠️ {why}: this host's own lookups never reach the steer");
+        }
     }
 
     // FR-33 — a captured LAN prefix is the other single most useful answer to

@@ -68,8 +68,8 @@ cut one since 0.4.48, which shipped without macOS (`skip_macos`, before Apple si
 | Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:166-168` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
 | swallowed errors | `agents/roomler-desktop/src/commands.rs:1007-1011`, `:1052-1057` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
-| pipe server | `crates/localapi/src/lib.rs:1883-1865` | ONE listening instance; the next is created only after `connect()` returns |
-| pipe client | `crates/localapi/src/lib.rs:2210-2137` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
+| pipe server | `crates/localapi/src/lib.rs:1891-1865` | ONE listening instance; the next is created only after `connect()` returns |
+| pipe client | `crates/localapi/src/lib.rs:2218-2137` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
 | settings list | `crates/agent-core/src/config_surface.rs:44-820` | 150 `(key, kind, description)` tuples, no grouping; `restart_required` hard-coded `true` (`:21, :827, :841`) |
 | live keys | `agents/roomler-desktop/src/front/settings.js:60-63` | a hand-kept `LIVE_KEYS` list the daemon does not know about |
 | restart | — | nothing in the desktop or on the LocalAPI can restart the daemon |

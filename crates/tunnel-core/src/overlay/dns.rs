@@ -376,6 +376,9 @@ pub struct DnsOsGuard {
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     link: String,
     active: bool,
+    /// FR-97 P3h — the steer took, but the host's own resolver never asks it
+    /// ([`resolver_bypass`]); where it asks instead. Linux only.
+    bypassed: Option<String>,
 }
 
 impl DnsOsGuard {
@@ -383,6 +386,12 @@ impl DnsOsGuard {
     /// desktop's DNS section + `roomler status`.)
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// FR-97 P3h — set when the steer took but the host's resolver bypasses
+    /// it (rendered beside [`Self::active`]).
+    pub fn bypassed(&self) -> Option<&str> {
+        self.bypassed.as_deref()
     }
 }
 
@@ -403,11 +412,74 @@ pub async fn configure_os(
     if active {
         info!(%resolver_ip, domain = %magic_domain, link = %link_owned, "magicdns: OS split-DNS configured");
     }
+    // FR-97 P3h — a steer that took is not yet a steer anyone asks.
+    let bypassed = if active { os_resolver_bypass() } else { None };
+    if let Some(why) = &bypassed {
+        warn!(
+            domain = %magic_domain,
+            "magicdns: the OS steer is in place, but this host's resolver bypasses it ({why}); \
+             names resolve only if that resolver forwards the domain"
+        );
+    }
     DnsOsGuard {
         magic_domain: magic_domain.to_string(),
         link: link_owned,
         active,
+        bypassed,
     }
+}
+
+/// FR-97 P3h — does a Linux host's own resolver reach systemd-resolved, where
+/// the MagicDNS steer lives? `None` = it does: nsswitch's `hosts` line has
+/// `resolve`, or the first `nameserver` in `/etc/resolv.conf` is resolved's
+/// stub, `127.0.0.53`. `Some(why)` = the steer is installed and never asked,
+/// as on WSL, which writes its own `resolv.conf` naming the Windows host's DNS
+/// proxy and whose nsswitch has no `resolve` (the fleet census, 2026-10-19).
+/// `resolv_target` is where `/etc/resolv.conf` leads, for the message.
+pub fn resolver_bypass(nsswitch: &str, resolv_conf: &str, resolv_target: &str) -> Option<String> {
+    let nss_resolve = nsswitch
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("hosts:"))
+        .is_some_and(|sources| sources.split_whitespace().any(|w| w == "resolve"));
+    if nss_resolve {
+        return None;
+    }
+    let first_nameserver = resolv_conf.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        (words.next() == Some("nameserver"))
+            .then(|| words.next())
+            .flatten()
+    });
+    match first_nameserver {
+        Some("127.0.0.53") => None,
+        Some(ns) => Some(format!(
+            "{resolv_target} asks {ns}, and nsswitch has no `resolve`"
+        )),
+        None => Some(format!(
+            "{resolv_target} names no nameserver, and nsswitch has no `resolve`"
+        )),
+    }
+}
+
+/// [`resolver_bypass`] on this host. An unreadable `/etc/resolv.conf` claims
+/// nothing: the report says only what it measured.
+#[cfg(target_os = "linux")]
+fn os_resolver_bypass() -> Option<String> {
+    let resolv_conf = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    let nsswitch = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+    let target = std::fs::canonicalize("/etc/resolv.conf")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/etc/resolv.conf".into());
+    resolver_bypass(&nsswitch, &resolv_conf, &target)
+}
+
+/// Windows (NRPT) and macOS (SCDynamicStore) configure the resolver the
+/// system's own lookups go through. The split this checks for, between
+/// resolved and the file glibc reads, is Linux's.
+#[cfg(not(target_os = "linux"))]
+fn os_resolver_bypass() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -918,6 +990,65 @@ mod scdns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-97 P3h — which hosts' resolvers reach systemd-resolved, from the
+    /// files the fleet census read (2026-10-19).
+    #[test]
+    fn a_resolver_that_never_asks_resolved_is_named() {
+        let ubuntu_nss =
+            "passwd: files systemd\nhosts:          files mdns4_minimal [NOTFOUND=return] dns\n";
+        let fedora_nss = "hosts:      files myhostname resolve [!UNAVAIL=return] dns\n";
+        let stub = "# This is /run/systemd/resolve/stub-resolv.conf\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n";
+
+        // Ubuntu: nsswitch has no `resolve`, but resolv.conf is resolved's stub.
+        assert_eq!(
+            resolver_bypass(ubuntu_nss, stub, "/run/systemd/resolve/stub-resolv.conf"),
+            None
+        );
+        // Fedora: nss-resolve asks resolved whatever resolv.conf says.
+        assert_eq!(
+            resolver_bypass(fedora_nss, "nameserver 192.0.2.1\n", "/etc/resolv.conf"),
+            None
+        );
+
+        // WSL: its own generated file, the Windows host's DNS proxy.
+        let wsl = "# This file was automatically generated by WSL.\nnameserver 10.255.255.254\nsearch lan\n";
+        assert_eq!(
+            resolver_bypass(ubuntu_nss, wsl, "/mnt/wsl/resolv.conf").as_deref(),
+            Some("/mnt/wsl/resolv.conf asks 10.255.255.254, and nsswitch has no `resolve`")
+        );
+        // resolved's non-stub file lists the upstreams themselves: bypassed too.
+        assert!(
+            resolver_bypass(
+                ubuntu_nss,
+                "nameserver 192.0.2.53\n",
+                "/run/systemd/resolve/resolv.conf"
+            )
+            .is_some()
+        );
+        // The FIRST nameserver is the one glibc asks.
+        assert!(
+            resolver_bypass(
+                ubuntu_nss,
+                "nameserver 192.0.2.1\nnameserver 127.0.0.53\n",
+                "/etc/resolv.conf"
+            )
+            .is_some()
+        );
+        // Comments never count, on either side.
+        assert!(
+            resolver_bypass(
+                "#hosts: files resolve\nhosts: files dns\n",
+                "# nameserver 127.0.0.53\nnameserver 192.0.2.1\n",
+                "/etc/resolv.conf"
+            )
+            .is_some()
+        );
+        assert_eq!(
+            resolver_bypass("", "", "/etc/resolv.conf").as_deref(),
+            Some("/etc/resolv.conf names no nameserver, and nsswitch has no `resolve`")
+        );
+    }
 
     /// Build a minimal A/IN query for `name` (labels, no compression).
     fn query_for(name: &str, qtype: u16) -> Vec<u8> {

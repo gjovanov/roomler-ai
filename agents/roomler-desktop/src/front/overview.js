@@ -95,11 +95,14 @@
     }
     label.hidden = false;
     dd.hidden = false;
+    // FR-97 P3h — a steer the host's own resolver never asks is not active.
     const health = !dns.resolver_bound
       ? 'resolver DOWN'
       : !dns.os_steer_active
         ? 'OS steer failed'
-        : 'active';
+        : dns.os_steer_bypassed
+          ? 'steered but bypassed: ' + dns.os_steer_bypassed
+          : 'active';
     dd.textContent =
       dns.magic_domain + ' · ' + health + (dns.answer_aaaa ? '' : ' · AAAA off');
   }
