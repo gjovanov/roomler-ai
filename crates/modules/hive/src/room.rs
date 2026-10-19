@@ -15,7 +15,9 @@
 
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::{Binding, NotificationSource, NotificationType};
+use roomler_ai_mod_chat::bound::BoundChat;
 use roomler_ai_remote_control::hive::{HiveApprovalStatus, HiveTurnStatus};
+use roomler_core::Core;
 use roomler_core::notify::{NotifyParams, PushTo};
 use tracing::{debug, warn};
 
@@ -644,14 +646,75 @@ pub(crate) async fn withdraw_approvals(state: &HiveState, s: &AgentSession) {
     }
 }
 
+/// FR-90 P3-4e — an approval card another module keeps in a session's room
+/// (the vault's, for a policy that asks for a person's yes): authored by the
+/// session, bound to that module's own `{module, ref}`, and pushed to the
+/// session's drivers as hive's own approvals are. Its room and message, or
+/// `None` when the session has no room or the post failed (logged).
+pub async fn post_approval_card(
+    core: &Core,
+    s: &AgentSession,
+    binding: Binding,
+    text: String,
+) -> Option<(ObjectId, ObjectId)> {
+    let (Some(sid), Some(room)) = (s.id, s.room_id) else {
+        return None;
+    };
+    let chat = BoundChat::new(core);
+    match chat
+        .post_agent_message(s.tenant_id, room, sid, s.author_display(), binding, text)
+        .await
+    {
+        Ok(message_id) => {
+            notify_approval_with(core, &chat, s, sid, room).await;
+            Some((room, message_id))
+        }
+        Err(e) => {
+            warn!(session = %sid, %e, "hive: another module's approval card was not posted");
+            None
+        }
+    }
+}
+
+/// FR-90 P3-4e — the card [`post_approval_card`] posted, as it now stands.
+/// Best-effort, like every stub.
+pub async fn edit_approval_card(
+    core: &Core,
+    s: &AgentSession,
+    room: ObjectId,
+    message_id: ObjectId,
+    text: String,
+) {
+    match BoundChat::new(core)
+        .update_agent_message(s.tenant_id, room, message_id, text)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => debug!(message = %message_id, "hive: another module's approval card is gone"),
+        Err(e) => {
+            warn!(message = %message_id, %e, "hive: another module's approval card was not updated")
+        }
+    }
+}
+
 /// Tell the session's drivers that it waits for them — each one still in its
 /// room (P1c: one who left it answers nothing). By web push too, wherever
 /// they are: a desk with the app open is not a phone in a pocket. It names
 /// the session, never the call.
 async fn notify_approval(state: &HiveState, s: &AgentSession, sid: ObjectId, room: ObjectId) {
+    notify_approval_with(&state.core, &state.chat, s, sid, room).await;
+}
+
+async fn notify_approval_with(
+    core: &Core,
+    chat: &BoundChat,
+    s: &AgentSession,
+    sid: ObjectId,
+    room: ObjectId,
+) {
     let mut drivers = Vec::new();
     for d in s.all_drivers() {
-        if matches!(state.chat.is_member(s.tenant_id, room, d).await, Ok(true)) {
+        if matches!(chat.is_member(s.tenant_id, room, d).await, Ok(true)) {
             drivers.push(d);
         }
     }
@@ -671,7 +734,7 @@ async fn notify_approval(state: &HiveState, s: &AgentSession, sid: ObjectId, roo
         },
         ws_type_label: "approval_request",
     };
-    roomler_core::notify::notify_users(&state.core, &params, &drivers, PushTo::Everyone).await;
+    roomler_core::notify::notify_users(core, &params, &drivers, PushTo::Everyone).await;
 }
 
 /// The approval's stub as markdown: THAT the session waits for a driver, and
@@ -742,8 +805,9 @@ fn format_duration(ms: u64) -> String {
 /// Escape what markdown would read as syntax, so a display name or a
 /// device's words render as the text they are — never as a link, an image or
 /// emphasis that changes what the note says. (The renderer's sanitiser is the
-/// XSS boundary; this is about the note saying what it means.)
-pub(crate) fn md_escape(text: &str) -> String {
+/// XSS boundary; this is about the note saying what it means.) Public for
+/// the vault's cards (P3-4e), which say what a session asked for.
+pub fn md_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_control() {

@@ -6093,7 +6093,7 @@ async fn handle_server_msg(
                 debug!(%lease_id, "rc:vault.leased ignored — this build takes no leases");
             }
         }
-        ServerMsg::VaultRefused { req_id, reason } => {
+        ServerMsg::VaultRefused { req_id, reason, .. } => {
             #[cfg(feature = "vault")]
             if ctx.is_primary {
                 crate::vault::on_refused(&req_id, &reason);

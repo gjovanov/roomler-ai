@@ -4279,7 +4279,14 @@ pub enum ServerMsg {
     /// FR-90 P3-3b — the vault refused a lease, in one word from
     /// [`crate::vault::LeaseRefusal`]. Never says which policy decided.
     #[serde(rename = "rc:vault.refused")]
-    VaultRefused { req_id: String, reason: String },
+    VaultRefused {
+        req_id: String,
+        reason: String,
+        /// P3-4e — with `awaiting_approval`, the approval whose card waits
+        /// in the session's room; no other word carries one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_id: Option<String>,
+    },
 
     /// FR-90 P3-3c — the vault took these leases back, for one reason
     /// ([`crate::vault::RevokeReason`]): the device drops each, whatever the
@@ -5096,6 +5103,48 @@ mod tests {
             ClientMsg::VaultActivity {
                 exit_code: None,
                 timed_out: false,
+                ..
+            }
+        ));
+    }
+
+    /// FR-90 P3-4e — a refusal is one word, and only `awaiting_approval`
+    /// names an approval: every other refusal is exactly the frame it was,
+    /// and one from before the field reads back without it.
+    #[test]
+    fn vault_refused_wire_shape_is_locked() {
+        let denied = ServerMsg::VaultRefused {
+            req_id: "r1".into(),
+            reason: crate::vault::LeaseRefusal::Denied.wire().into(),
+            approval_id: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&denied).unwrap(),
+            serde_json::json!({"t": "rc:vault.refused", "req_id": "r1", "reason": "denied"})
+        );
+        let awaiting = ServerMsg::VaultRefused {
+            req_id: "r2".into(),
+            reason: crate::vault::LeaseRefusal::AwaitingApproval.wire().into(),
+            approval_id: Some("a1".into()),
+        };
+        let v = serde_json::to_value(&awaiting).unwrap();
+        assert_eq!(v["reason"], "awaiting_approval");
+        assert_eq!(v["approval_id"], "a1");
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::VaultRefused {
+                approval_id: Some(ref a),
+                ..
+            } if a == "a1"
+        ));
+        let before: ServerMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:vault.refused", "req_id": "r3", "reason": "busy",
+        }))
+        .unwrap();
+        assert!(matches!(
+            before,
+            ServerMsg::VaultRefused {
+                approval_id: None,
                 ..
             }
         ));

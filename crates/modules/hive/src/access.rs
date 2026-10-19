@@ -26,6 +26,8 @@
 //! reached yet.
 
 use bson::oid::ObjectId;
+use roomler_ai_mod_chat::bound::BoundChat;
+use roomler_core::Core;
 
 use crate::HiveState;
 use crate::model::{AgentSession, SessionOrigin};
@@ -36,22 +38,37 @@ use crate::model::{AgentSession, SessionOrigin};
 /// out of their own session. A session from before rooms (P0b/P0c) is its
 /// owner's alone.
 pub(crate) async fn may_read(state: &HiveState, s: &AgentSession, user: ObjectId) -> bool {
+    may_read_with(&state.core, &state.chat, s, user).await
+}
+
+/// [`may_read`], for a caller holding the core rather than hive's state.
+async fn may_read_with(core: &Core, chat: &BoundChat, s: &AgentSession, user: ObjectId) -> bool {
     if s.purged.is_some() {
         return false;
     }
-    if !matches!(state.tenants.is_member(s.tenant_id, user).await, Ok(true)) {
+    if !matches!(core.tenants.is_member(s.tenant_id, user).await, Ok(true)) {
         return false;
     }
     if s.owner_id == user {
         return true;
     }
     match s.room_id {
-        Some(room) => matches!(
-            state.chat.is_member(s.tenant_id, room, user).await,
-            Ok(true)
-        ),
+        Some(room) => matches!(chat.is_member(s.tenant_id, room, user).await, Ok(true)),
         None => false,
     }
+}
+
+/// FR-90 P3-4e — [`may_read`], for a module that keeps its own cards in the
+/// session's room (the vault): who sees one of them at all.
+pub async fn may_read_session(core: &Core, s: &AgentSession, user: ObjectId) -> bool {
+    may_read_with(core, &BoundChat::new(core), s, user).await
+}
+
+/// FR-90 P3-4e — may `user` answer such a card NOW? This table's rule, the
+/// one hive's own approvals are answered by: a driver who reads the session,
+/// while it is live.
+pub async fn may_answer(core: &Core, s: &AgentSession, user: ObjectId) -> bool {
+    drives_now(s, user) && may_read_session(core, s, user).await
 }
 
 /// May `user` — already known to READ `s` ([`may_read`]: a driver who left

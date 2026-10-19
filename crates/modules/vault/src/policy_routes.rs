@@ -693,8 +693,16 @@ pub async fn simulate(
                     "ttl_s must be 1 to {MAX_TTL_S}"
                 )));
             }
+            // P3-4e — the approver in the groups they hold, as a lease
+            // decides them.
             let approver = match &body.approver_id {
-                Some(raw) => Some(parse_user(raw, "approver_id")?),
+                Some(raw) => {
+                    let id = parse_user(raw, "approver_id")?;
+                    Some(policy::Approver {
+                        id,
+                        groups: groups_of_member(&state, tid, id).await?,
+                    })
+                }
                 None => None,
             };
             let slug = org_slug(&state, tid).await?;

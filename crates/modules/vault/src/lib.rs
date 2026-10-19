@@ -15,7 +15,9 @@
 //! value. Roles and Cedar policies (P3-2), a device's leases (P3-3) and the
 //! session's tools (P3-4) are built on it. A device's own report of using a
 //! lease (P3-4d) is kept apart, in `vault_activity`: a claim, never one of
-//! the vault's decisions.
+//! the vault's decisions. A policy may ask for a person's yes before a value
+//! is released (P3-4e, [`approval`]): a card in the session's room, answered
+//! by one of its drivers.
 //!
 //! The module's switch defaults OFF (`[modules] vault`), and a
 //! `vault.tenants` list both switches it on and limits it to the
@@ -33,6 +35,7 @@ use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique, index_unique_partial};
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx};
 
+pub mod approval;
 pub mod crypto;
 pub mod dao;
 pub mod gate;
@@ -71,6 +74,8 @@ pub struct VaultState {
     /// session's reports per minute on its device.
     pub activity: Arc<dao::VaultActivityDao>,
     pub activity_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
+    /// P3-4e — the approvals policies asked for, and their answers.
+    pub approvals: Arc<dao::VaultApprovalDao>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
     /// The KEK, or why there is none: read once at boot.
@@ -123,6 +128,7 @@ impl Module for VaultState {
             revoker: Arc::new(revoke::Revoker::default()),
             activity: Arc::new(dao::VaultActivityDao::new(db)),
             activity_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
+            approvals: Arc::new(dao::VaultApprovalDao::new(db)),
             scope: Arc::new(scope),
             kek,
             core,
@@ -190,6 +196,11 @@ impl Module for VaultState {
             .route("/tenant/{tenant_id}/vault/audit", get(routes::audit))
             // P3-4d — what devices report doing with their leases.
             .route("/tenant/{tenant_id}/vault/activity", get(routes::activity))
+            // P3-4e — an approval a policy asked for, and a driver's answer.
+            .route(
+                "/tenant/{tenant_id}/vault/approval/{approval_id}",
+                get(approval::get).post(approval::answer),
+            )
             .route(
                 "/tenant/{tenant_id}/vault/schema",
                 get(policy_routes::schema),
@@ -313,6 +324,24 @@ impl Module for VaultState {
                     index(bson::doc! { "tenant_id": 1, "session_id": 1, "at": -1 }),
                     index(bson::doc! { "lease_ids": 1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // P3-4e — approvals: one pending card per request (the index
+            // arbitrates two asks at once); a request's own, newest first;
+            // kept 90 days, like the decisions they lifted.
+            IndexSet {
+                collection: model::VaultApproval::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique_partial(
+                        bson::doc! {
+                            "session_id": 1, "fence": 1, "device_id": 1, "secret_id": 1,
+                            "field": 1, "mode": 1, "audience": 1,
+                        },
+                        bson::doc! { "status": "pending" },
+                    ),
+                    index(bson::doc! { "session_id": 1, "secret_id": 1, "requested_at": -1 }),
+                    index_ttl(bson::doc! { "requested_at": 1 }, 90 * 24 * 60 * 60),
                 ],
             },
         ]
