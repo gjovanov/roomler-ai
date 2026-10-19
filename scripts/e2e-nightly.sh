@@ -122,6 +122,37 @@ note "runner: $POD/pwrunner"
 curl_in_pod() { kubectl -n "$NS" exec "$POD" -c pwrunner -- curl -sf -o /dev/null -m 8 "$1"; }
 curl_in_pod http://127.0.0.1/health || fail_hard "the app is not answering inside its own pod"
 
+# ── 3b. the agent-e2e harness (FR-114) ───────────────────────────────
+# Its six specs skip without E2E_AGENT_E2E_TENANT_ID. When the harness's
+# StatefulSet is there, find its tenant BY SLUG from inside the runner (this
+# host has no route to the pod network) and hand it to both runs below; when
+# it is not, they skip as before and this log says why. Never a pinned id: a
+# wiped e2e DB gets a fresh tenant and the lookup still finds it. The admin's
+# credentials come from the harness's own Secret, the one the agents use.
+AGENT_ENV=""
+if kubectl -n "$NS" get statefulset agent-e2e >/dev/null 2>&1; then
+  ae_secret() { kubectl -n "$NS" get secret agent-e2e-bootstrap -o jsonpath="{.data.$1}" 2>/dev/null | base64 -d 2>/dev/null; }
+  AE_EMAIL=$(ae_secret admin_email)
+  AE_PASS=$(ae_secret admin_password)
+  AE_TID=""
+  if printf '%s%s' "$AE_EMAIL" "$AE_PASS" | grep -qE '^[A-Za-z0-9@._+-]+$'; then
+    AE_TOKEN=$(kubectl -n "$NS" exec "$POD" -c pwrunner -- curl -fsS -m 10 -X POST http://127.0.0.1/api/auth/login \
+      -H 'content-type: application/json' -d "{\"email\":\"$AE_EMAIL\",\"password\":\"$AE_PASS\"}" 2>/dev/null \
+      | grep -oE '"access_token":"[^"]+"' | cut -d'"' -f4)
+    [ -n "$AE_TOKEN" ] && AE_TID=$(kubectl -n "$NS" exec "$POD" -c pwrunner -- curl -fsS -m 10 http://127.0.0.1/api/tenant \
+      -H "authorization: Bearer $AE_TOKEN" 2>/dev/null \
+      | grep -oE '\{[^{}]*"slug":"agent-e2e"[^{}]*\}' | grep -oE '"id":"[0-9a-f]{24}"' | head -1 | cut -d'"' -f4)
+  fi
+  if [ -n "$AE_TID" ]; then
+    AGENT_ENV="E2E_AGENT_E2E_TENANT_ID=$AE_TID E2E_AGENT_E2E_ADMIN_EMAIL=$AE_EMAIL E2E_AGENT_E2E_ADMIN_PASSWORD=$AE_PASS"
+    note "agent-e2e harness: tenant $AE_TID, $(kubectl -n "$NS" get statefulset agent-e2e -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0) agent(s) ready — its specs run"
+  else
+    note "agent-e2e harness present, but its tenant did not resolve (has the seed Job run?) — its specs skip"
+  fi
+else
+  note "no agent-e2e harness in $NS — its specs skip"
+fi
+
 # ── 4. run the suite ─────────────────────────────────────────────────
 WORK="$OUT/ui-work"
 rsync -a --delete --exclude node_modules --exclude dist --exclude test-results   --exclude playwright-report --exclude e2e/video "$REPO/ui/" "$WORK/"
@@ -130,7 +161,7 @@ kubectl -n "$NS" exec "$POD" -c pwrunner -- rm -rf /work
 kubectl -n "$NS" cp "$WORK" "$POD":/work -c pwrunner >/dev/null 2>&1   || fail_hard "could not copy the spec tree into the runner"
 kubectl -n "$NS" exec "$POD" -c pwrunner -- bash -lc "
   cd /work && npm i --no-audit --no-fund --loglevel=error >/dev/null 2>&1 &&
-  CI=1 E2E_BASE_URL=http://127.0.0.1 E2E_API_URL=http://127.0.0.1   E2E_MAILPIT_URL=http://mailpit:8025   npx playwright test --reporter=line --timeout=60000 --retries=3" >> "$LOG" 2>&1
+  CI=1 E2E_BASE_URL=http://127.0.0.1 E2E_API_URL=http://127.0.0.1   E2E_MAILPIT_URL=http://mailpit:8025 $AGENT_ENV  npx playwright test --reporter=line --timeout=60000 --retries=3" >> "$LOG" 2>&1
 RC=$?
 
 
@@ -167,7 +198,7 @@ if [ -n "$UNEXPECTED" ]; then
   kubectl -n "$NS" exec "$POD" -c pwrunner -- bash -lc "
     cd /work &&
     CI=1 E2E_BASE_URL=http://127.0.0.1 E2E_API_URL=http://127.0.0.1 \
-    E2E_MAILPIT_URL=http://mailpit:8025 \
+    E2E_MAILPIT_URL=http://mailpit:8025 $AGENT_ENV \
     npx playwright test $VSPECS --reporter=line --timeout=60000 --retries=3" > "$VLOG" 2>&1
   VCLEAN=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$VLOG" | tr '\r' '\n')
   VFAILED=$(echo "$VCLEAN" \
