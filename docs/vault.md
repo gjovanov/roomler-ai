@@ -37,8 +37,9 @@ People use it too.
 > `insteadOf`, on a loopback port whose every connection's account Linux
 > reads from the kernel; P3-5d-3, macOS reading it from the descriptors
 > each process holds; P3-5e-1, what the HTTP engine carries for a
-> Kubernetes API server; and P3-5e-2, `vault_connect` serving one, a
-> kubeconfig with no credential in its answer (§19).** No released
+> Kubernetes API server; P3-5e-2, `vault_connect` serving one, a
+> kubeconfig with no credential in its answer; and P3-5f-1, the SSH agent,
+> which signs only a sign-in to a host the secret names (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -1317,6 +1318,83 @@ sequenceDiagram
   plain endpoint, nor to `h2c`; the tunnel ended with its session;
 - impersonation dropped for Kubernetes, and passed on by a plain endpoint.
 
+### The SSH agent (P3-5f-1)
+
+The fourth engine, in `agents/roomlerd/src/vault_proxy/ssh_agent.rs`: one
+client connection on the endpoint, answered as an SSH agent that holds the
+secret's one key (the spec's §3e, "P3-5f, the SSH agent, as designed"). It
+relays nothing. The session's own `ssh` connects to the host; the agent only
+signs, and only a sign-in to a host the secret names. P3-5f-2 serves it from
+`vault_connect`.
+
+```mermaid
+sequenceDiagram
+    participant S as ssh (OpenSSH 8.9 or later)
+    participant A as the agent (roomlerd)
+    participant H as the host (sshd)
+    S->>H: the key exchange
+    H-->>S: its host key, and its signature over the session identifier
+    S->>A: session-bind@openssh.com: that key, the identifier,<br/>that signature, not for forwarding
+    Note over A: the key one of the secret's host_keys,<br/>the signature checked with it
+    A-->>S: SUCCESS
+    S->>A: REQUEST_IDENTITIES
+    A-->>S: the one key, under the handle's name
+    S->>A: SIGN_REQUEST: the key, a sign-in's data
+    Note over A: a sign-in for the bound session,<br/>with the key, as the audience's user
+    A-->>S: the signature
+    S->>H: the sign-in, signed
+    H-->>S: in
+```
+
+| Step | What the engine does | Where |
+|---|---|---|
+| the secret's `key` | one OpenSSH private key, unencrypted (`PROTOCOL.key`: `openssh-key-v1`, cipher and KDF `none`, its two check words equal, its padding `1, 2, 3, …`, the public half it lists its own), Ed25519 or ECDSA on P-256 or P-384. A key of any other type is refused for its type, an encrypted one for its passphrase | `agents/roomlerd/src/vault_proxy/ssh_agent.rs:483`, `ssh_agent.rs:501`, `ssh_agent.rs:535`, `ssh_agent.rs:568` |
+| the secret's `host_keys` | one key per line, `<type> <base64>`: Ed25519, ECDSA on P-256 or P-384, or RSA. A line with host names before the key, as `known_hosts` writes one, is refused rather than read past | `ssh_agent.rs:576` |
+| `REQUEST_IDENTITIES` | the one key, under the handle's name; no key on a connection whose binding was refused | `ssh_agent.rs:173` |
+| `session-bind@openssh.com` | taken once per connection, and never for forwarding: the session identifier 1 to 128 bytes, the host's key one of `host_keys`, its signature over the identifier checked with that key. Any other binding refuses the connection, and nothing more is listed or signed on it | `ssh_agent.rs:288`, `ssh_agent.rs:314` |
+| a host's signature | checked by `ring`: `ssh-ed25519`; `ecdsa-sha2-nistp256` and `-nistp384`; RSA as `rsa-sha2-256` or `rsa-sha2-512`, never `ssh-rsa`'s SHA-1 | `ssh_agent.rs:415`, `ssh_agent.rs:452` |
+| `SIGN_REQUEST` | signed only on a bound connection, and only a sign-in (RFC 4252 §7): `SSH_MSG_USERAUTH_REQUEST` for the bound session, service `ssh-connection`, method `publickey` or `publickey-hostbound-v00@openssh.com` (its host key the bound one), a signature to follow, the key's own algorithm and key, nothing after; as the audience's user, where it names one | `ssh_agent.rs:186`, `ssh_agent.rs:351` |
+| the signature | Ed25519 (RFC 8709), or ECDSA with its curve's hash, the two halves as `mpint`s (RFC 5656) | `ssh_agent.rs:222` |
+| everything else | `SSH_AGENT_FAILURE`: adding or removing keys, `LOCK`, smartcards, every other extension. A message over 256 KiB, OpenSSH's own agent's limit, or an empty one, ends the connection | `ssh_agent.rs:275`, `ssh_agent.rs:629` |
+
+> [!WARNING]
+> - **A connection that never binds is signed nothing.** OpenSSH 8.9 and
+>   later binds each agent connection before it signs, so a signature is
+>   good for one SSH session with a host the secret names: OpenSSH's own
+>   destination constraint (`ssh-add -h`), made the only mode. An older
+>   `ssh`, `libssh2` and Paramiko do not bind, and get no signature.
+> - **Only a sign-in is signed.** An `SSHSIG` (`ssh-keygen -Y sign`, git's
+>   commit signing), a challenge, anything else a session hands over as
+>   data would be the key's signature on the session's say-so, good
+>   wherever the key is trusted.
+> - **No forwarding.** A binding for forwarding (`ssh -A` from the session)
+>   is refused, so no host the session reaches can sign through it.
+> - **The key never crosses the endpoint.** Its bytes are zeroized where
+>   the engine holds them; `ring`'s key pair, which holds the key while the
+>   connection lasts, is not zeroed when it is dropped.
+
+**Tested** against a client that asks as OpenSSH's `ssh` asks, with every key
+made for the test:
+- each key type the agent signs with, to a host of each type, in both
+  sign-in methods, each signature checked by `ring`;
+- nothing signed on a connection never bound; each bad binding refused, and
+  the connection with it; a second binding refused;
+- on a bound connection, each wrong sign-in refused (another session,
+  service, method, algorithm, key or host; bytes after it; an `SSHSIG`), and
+  the right one signed after them; the audience's user alone;
+- everything else refused; a message past its bound, or an empty one, ending
+  the connection;
+- the secret's `key` and `host_keys` read strictly, a refusal naming no byte
+  of the key;
+- `ssh-keygen`'s own keys: Ed25519, P-256 and P-384 read; RSA and P-521
+  refused for their type, an encrypted one for its passphrase; an RSA host
+  it made, bound by `rsa-sha2-512` and `-256` but not by `ssh-rsa`;
+  `ssh-add` listing the one key, and unable to remove it;
+- **OpenSSH's own `ssh` signing in through the agent**, for each key type, to
+  a host in the test (russh, on Linux, where the `ssh-server` feature builds
+  it), its log saying it bound the agent; and refused for a host the secret
+  does not name.
+
 ### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2, P3-5d-2, P3-5d-3, P3-5e-2)
 
 `vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
@@ -1496,6 +1574,6 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5f | `proxy` mode's last engine: the SSH agent |
+| P3-5f-2, P3-5f-3 | `vault_connect` serving the SSH agent (`engine: "ssh"`, its socket on Linux and macOS, `SSH_AUTH_SOCK` and `known_hosts` in the answer), then its Windows named pipe |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

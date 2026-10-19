@@ -1939,6 +1939,23 @@ the design document's §7 and §8; what follows binds it to the code as it stand
     writes it where it likes. A file the daemon wrote would need a directory the session's account
     can read, and Windows' endpoint has none.
 
+  ⚠️ **As built (P3-5f-1): P3-5f split, the agent first; the binding proven against OpenSSH
+  itself.**
+  - **The split.** P3-5f-1 is the agent alone, with no caller. `vault_connect` serving it
+    (`engine: "ssh"`, the socket on Linux and macOS) is P3-5f-2, and Windows' named pipe P3-5f-3.
+  - **No new crate.** `ring`, which `roomlerd` links already, signs with Ed25519 and ECDSA and
+    checks a host's Ed25519, ECDSA and RSA signatures. The engine reads the key file itself
+    (`PROTOCOL.key`, unencrypted).
+  - **Stricter than OpenSSH's own agent in two places.** A second binding refuses the connection
+    rather than keeping the first, and a binding for forwarding is refused rather than chained:
+    `ssh` sends neither on a connection it signs on.
+  - **A refused binding hides the key.** The connection lists no key after it, as OpenSSH's agent
+    does after a failed bind, so `ssh` moves on to its other methods instead of a refusal.
+  - **Tested against OpenSSH itself.** Its own `ssh` signs in through the agent to a host in the
+    test (russh, where the `ssh-server` feature builds it), its log saying it bound the agent,
+    and is refused for a host the secret does not name; keys `ssh-keygen` writes are read, and
+    `ssh-add` lists the one key.
+
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
 session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
@@ -1995,8 +2012,7 @@ holds it (AC12).
   carries no `speculativeAuthenticate`, and every byte after it is relayed. One host at first (a
   single node or a `mongos`): SRV discovery and replica-set failover come later.
 - **Engines with no proxy** (MySQL, SQL Server, Redis) take `short-lived` (P3-6). HTTP named
-  upstreams are P3-5d and the Kubernetes API P3-5e, each designed below; the SSH agent follows
-  (P3-5f), with a design note of its own when it starts.
+  upstreams are P3-5d, the Kubernetes API P3-5e and the SSH agent P3-5f, each designed below.
 
 **P3-5d, HTTP named upstreams, as designed.** A session reaches an HTTP API or a git server through
 an endpoint that adds the secret's credential to every request it sends on. Design §8.5 sketched
@@ -2041,6 +2057,31 @@ streams over, and what the endpoint will not forward.
 - **Not in P3-5e:** a kubeconfig the daemon writes, or one rendered from knowhow's cluster entity
   (P4); `exec` credential plugins; HTTP/2 to the API server; a `TokenRequest` minted for the
   session (`short-lived`, P3-6).
+
+**P3-5f, the SSH agent, as designed.** A session reaches an SSH host with a key the vault holds,
+through an agent its daemon serves: `ssh` and `git` ask it to sign, and the key stays in daemon
+memory. It is the one `proxy` engine that relays nothing. The session's own `ssh` connects to the
+host; the endpoint only signs, and only a sign-in to that host.
+
+| Piece | Design |
+|---|---|
+| the upstream | `ssh://[<user>@]<host>[:<port>]`, the port written only where it is not 22: the lease's audience, held to the secret's `audiences` exactly by `proxy-only-named-audiences`, in a spelling no database or HTTP audience has. A user in it is the one account the key signs in as; with none, the host's own `authorized_keys` decide |
+| the value | a structured secret: `key`, an OpenSSH private key, unencrypted (the format `ssh-keygen` writes; the vault is its encryption), Ed25519 or ECDSA on P-256 or P-384; and `host_keys`, the host's public keys, one per line (`<type> <base64>`, as `known_hosts` holds them after the host names) |
+| the endpoint | a Unix socket, as for the databases (P3-5b-2): in the session's runtime directory, handed to the session's account at `0600`, each connection's peer uid checked against it. The answer's `env` names it in `SSH_AUTH_SOCK` |
+| what it answers | `REQUEST_IDENTITIES`, with the one key under the handle's name; `SIGN_REQUEST`, for a sign-in only (below); and the `session-bind@openssh.com` extension. Everything else is `SSH_AGENT_FAILURE`: adding or removing keys, `LOCK`, smartcards, every other extension. A message over 256 KiB, the limit OpenSSH's own agent keeps, closes the connection |
+| what it signs | an SSH sign-in only (RFC 4252 §7): `SSH_MSG_USERAUTH_REQUEST`, service `ssh-connection`, method `publickey` or `publickey-hostbound-v00@openssh.com`, the key its own, nothing after it; and only on a connection bound to one of the secret's hosts. OpenSSH 8.9 and later binds each agent connection before it signs (`session-bind@openssh.com`): it sends the host's key, the session identifier, and the host's signature over that identifier from the key exchange. The endpoint verifies that signature, requires the key to be one of `host_keys`, and signs only a sign-in whose session identifier is the bound one (and whose host key, for `publickey-hostbound`, is the bound key). So a signature is good for one SSH session with that host and nowhere else; it is OpenSSH's own destination constraint (`ssh-add -h`), made the only mode |
+| what it refuses | a connection that never binds (an `ssh` older than 8.9, `libssh2`, Paramiko); one bound for forwarding (`ssh -A` from the session, so the next hop would sign through it); a second binding; a binding whose signature does not verify, or whose host key the secret does not name; and any data that is not a sign-in, an `SSHSIG` among it (`ssh-keygen -Y sign`, git's commit signing). A refused binding leaves the connection listing no key, as OpenSSH's agent does, so `ssh` moves on to its other methods |
+| the cryptography | `ring`, which `roomlerd` links already: Ed25519 and ECDSA to sign; Ed25519, ECDSA (P-256, P-384) and RSA (`rsa-sha2-256`, `rsa-sha2-512`) to check a host's signature. No new crate. A secret's key that is RSA or P-521 is refused at the call: `ring` has no P-521, and signing with an RSA key from its OpenSSH form needs arithmetic `ring` does not expose |
+| the lifetime | as for the other engines: the values read from their leases as each connection starts, and the socket and its connections closed when the first lease is let go. The key's own bytes are zeroized; `ring`'s key pair, which holds the key while its connection lasts, is not zeroed when dropped |
+| the answer | the socket, `env` (`SSH_AUTH_SOCK`), and `known_hosts`, the upstream's host keys under its name, for the session to write to a file of its own and name in `UserKnownHostsFile`. So `ssh` checks the host by the same keys the endpoint binds to |
+| Windows | Win32-OpenSSH reads `SSH_AUTH_SOCK` as a named pipe. A later step serves one there, its DACL the session's account's SID, each client's token checked. The `ssh` Windows ships is older than 8.9 on many builds (8.1 on Windows 10), so it does not bind, and a session there needs a newer Win32-OpenSSH |
+
+- **What `proxy` cannot promise here.** The endpoint proves to the host that the session holds the
+  key, and the host lets the session in; what the session does once signed in is the host's to
+  limit. The key never leaves daemon memory, and no signature it makes is good for another host.
+- **Not in P3-5f:** host certificates (a CA in `host_keys`); RSA and P-521 keys; a key encrypted
+  under a passphrase; agent forwarding; `SSHSIG`, for git's commit signing; a `ProxyJump` whose jump
+  host takes the same key; and Windows, the step after.
 
 **Audit.** `vault_audit` holds every decision the server makes, allow and deny, with the 90-day TTL
 of the network module's audits (`crates/modules/network/src/lib.rs:748`). `vault_activity` is the
@@ -2092,7 +2133,9 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 | P3-5d-3 | the macOS endpoint: each connection's account read from `libproc` | device `vault_enabled = false` | — |
 | P3-5e-1 | the HTTP engine's half for Kubernetes: a client certificate in the TLS handshake, an upgrade relayed and joined (for `kubernetes` only), `Impersonate-*` dropped; no caller yet | the `vault` feature in no release build | — |
 | P3-5e-2 | `vault_connect` serving it: `engine: "kubernetes"`, `auth` `bearer` or `client-cert`, the kubeconfig answer | device `vault_enabled = false`; per-secret `disabled` | — |
-| P3-5f | the SSH agent | the same | — |
+| P3-5f-1 | P3-5f's design, and the SSH agent engine: the agent protocol, the key and its signatures in `ring`, a sign-in signed only on a connection bound to one of the secret's hosts; no caller yet | the `vault` feature in no release build | — |
+| P3-5f-2 | `vault_connect` serving it: `engine: "ssh"`, the Unix socket on Linux and macOS, `SSH_AUTH_SOCK` and `known_hosts` in the answer; OpenSSH's own `ssh` and `sshd`, end to end | device `vault_enabled = false`; per-secret `disabled` | — |
+| P3-5f-3 | the Windows endpoint: a named pipe, its DACL the session's account's, each client's token checked | device `vault_enabled = false` | — |
 | P3-6 | `short-lived`: database users and GitHub App tokens first, then AWS STS and a Kubernetes `TokenRequest` | per provider | — |
 | P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
 | P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
@@ -2431,7 +2474,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-5d-2 | `vault_connect` serving the HTTP engine (`docs/vault.md` §19): `engine: "http"`, the upstream an origin (`https://host[:port]`, no path, user or `:443`), `auth` `basic` or `bearer`, required for `http` and refused for a database; the leases `#user` and `#password`, or `#token`, and the CA; a value `Authorization` cannot carry refused at the call; the endpoint served through one seam (`Place`), a socket for a database on Unix, a loopback port for `http` everywhere and for every engine on Windows; Linux's check of a loopback connection's account from `/proc/net/tcp` and `tcp6` (the client end's row, never one in TIME_WAIT or with no inode); macOS refused before anything is leased; the answer's `uri` the endpoint's origin, its `env` git's `insteadOf` and `GIT_TERMINAL_PROMPT=0`; `vault_request` asking ahead toward an origin; the engine's dead-code allowance gone | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2521 `4201988ca` |
 | P3-5d-3 | the macOS HTTP endpoint (`docs/vault.md` §19): each loopback connection's account read from `libproc` (`proc_listpids`, `PROC_PIDLISTFDS`, `PROC_PIDFDSOCKETINFO`), served only where its client end is held, and held only, by processes running as the session's account (the kernel never fills a socket's `soi_stat`, so who made it cannot be read); the SDK's socket structs mirrored, their offsets asserted at compile time; the HTTP endpoint's tests run on macOS too, and its refusal there goes | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2522 `db6cd18ce` |
 | P3-5e-1 | the HTTP engine's half for Kubernetes (`docs/vault.md` §19) and P3-5e's design (§3e "P3-5e, the Kubernetes API, as designed"), with no caller yet: `Flavor::Kubernetes`; `Credential::Handshake`, a client certificate presented by a connector made for the one connection (`tls::identity`, `tls::connector_for`, the roots read once by `tls::roots`); an upgrade to `websocket` or `SPDY/3.1` relayed on a connection of its own and the two ends joined on the API server's `101`, the tunnel carried within the client connection's session; `h2c` and every upgrade on a plain endpoint never relayed; every `Impersonate-*` header dropped | the `vault` feature in no release build | **merged** #2527 `61ac565c0` |
-| P3-5e-2 | `vault_connect` serving a Kubernetes API server (`docs/vault.md` §19): `engine: "kubernetes"`, an origin and `auth` as for `http`, `basic` refused for it; `auth: "client-cert"` for `kubernetes` and `http`, leasing the secret's `#cert` and `#key`, proven at the call by making a connector with them (the refusal naming no parser's words), then presented in each connection's own TLS over the roots the endpoint read once; the connections served with `Flavor::Kubernetes`; the answer's `kubeconfig` (one cluster whose `server` is the endpoint, one context, one user with no credential); the engine's dead-code allowances gone, `tls::connector` the tests' only | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
+| P3-5e-2 | `vault_connect` serving a Kubernetes API server (`docs/vault.md` §19): `engine: "kubernetes"`, an origin and `auth` as for `http`, `basic` refused for it; `auth: "client-cert"` for `kubernetes` and `http`, leasing the secret's `#cert` and `#key`, proven at the call by making a connector with them (the refusal naming no parser's words), then presented in each connection's own TLS over the roots the endpoint read once; the connections served with `Flavor::Kubernetes`; the answer's `kubeconfig` (one cluster whose `server` is the endpoint, one context, one user with no credential); the engine's dead-code allowances gone, `tls::connector` the tests' only | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2530 `95238f1b3` |
+| P3-5f-1 | the SSH agent (`docs/vault.md` §19) and P3-5f's design (§3e "P3-5f, the SSH agent, as designed"), with no caller yet: `vault_proxy::ssh_agent`, one key from the secret's `key` (OpenSSH's own format, unencrypted; Ed25519, or ECDSA on P-256 or P-384) and the hosts from its `host_keys`; `REQUEST_IDENTITIES` the one key under the handle's name, none after a refused binding; `session-bind@openssh.com` taken once and never for forwarding, the host's key one of `host_keys` and its signature over the session identifier checked by `ring` (Ed25519, ECDSA, `rsa-sha2-256` and `-512`); `SIGN_REQUEST` signed only for a sign-in (RFC 4252 §7, `publickey` or `publickey-hostbound-v00@openssh.com`) for the bound session, as the audience's user where it names one; everything else `SSH_AGENT_FAILURE` | the `vault` feature in no release build | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
