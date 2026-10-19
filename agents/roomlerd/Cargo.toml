@@ -221,6 +221,15 @@ hkdf = { version = "0.12", optional = true }
 # FR-52 P4 — the transport binding: HMAC-SHA256 over each side's DTLS
 # fingerprint under the verified login's key. In the graph via hkdf: +0 crates.
 hmac = { workspace = true, optional = true }
+# FR-90 P3-5b — the vault's proxies: TLS to an upstream (rustls on ring, as
+# the rest of the tree, so aws-lc-rs stays absent: no default features), the
+# system's roots (a corporate CA in the OS store is trusted, as the WS path's
+# is), and SCRAM-SHA-256 (PBKDF2 over HMAC-SHA256, SASLprep). Every crate
+# here is already in the lockfile.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+stringprep = { version = "0.1", optional = true }
 
 # ⚠️ NO direct `argon2` dependency, on purpose (FR-52 P3a). The KSF uses
 # `opaque_ke::argon2` — the crate opaque-ke's own hashing was written against —
@@ -720,7 +729,7 @@ hive-test-launcher = ["hive"]
 #
 # ⚠️ Not in `full` and in no release build yet: no tool asks for a lease before
 # P3-4c, and even compiled, `vault_enabled` is off by default.
-vault = ["hive", "dep:crypto_box", "dep:zeroize"]
+vault = ["hive", "dep:crypto_box", "dep:zeroize", "dep:tokio-rustls", "dep:rustls-native-certs", "dep:hmac", "dep:pbkdf2", "dep:stringprep"]
 # Everything needed for a full remote-control session, software only.
 full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture", "recording"]
 # Everything needed including the MF hardware encoder. Production
@@ -854,6 +863,9 @@ roomler-node-core = { path = "../../crates/agent-core", features = ["test-fixtur
 # File-DC integration test (tests/file_dc.rs) needs the zip crate
 # to unpack the agent's streaming-zip output and verify content.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# FR-90 P3-5b — a TLS upstream for the vault proxies' tests: a certificate made
+# per test run (ring, as the tree; already in the lockfile).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 # ---------------------------------------------------------------------------
 # Packaging metadata

@@ -1127,11 +1127,13 @@ jobs:
       # `proc_pidinfo`, which exists only here) and main.rs's `wind_down` arm.
       # Then the supervisor's own tests, which need nothing a Mac runner lacks:
       # a fake harness, a Unix socket and a loopback sidecar. Before this, the
-      # supervisor had never compiled for a Mac at all.
+      # supervisor had never compiled for a Mac at all. FR-90 P3-5b-1:
+      # `vault_proxy::`, the vault's proxy engines (the system's roots read
+      # from the Mac's keychain here), which `vault::` does not match.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault -- hive:: vault::
+          cargo test -p roomlerd --lib --features hive,vault -- hive:: vault:: vault_proxy::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
@@ -1303,12 +1305,15 @@ jobs:
       # report and its order against the supervisor), also in no lane before.
       # #2465: `win_service::orphan` — which roomlerd is an earlier host's
       # worker, and the reaper's reads through a real process handle.
+      # FR-90 P3-5b-1: `vault_proxy::` — the vault's proxy engines, against a
+      # fake upstream over real TLS. `proxy` is the only mode a session on
+      # Windows gets (decision 17), and `vault::` does not match the module.
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         if: ${{ !cancelled() }}
         # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
         # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault::
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy::
 
       # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
       # border and badge, the native consent panel, and the privacy curtain
