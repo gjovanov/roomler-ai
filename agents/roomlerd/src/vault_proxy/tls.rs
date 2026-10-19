@@ -16,15 +16,17 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName}
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 
 /// A connector that trusts the system's roots, and `ca` (PEM, one or more
-/// certificates) when the secret holds one.
+/// certificates) when the secret holds one: the tests' shorthand. The
+/// endpoint reads the roots once (`roots`) and makes its connectors over
+/// them (`connector_for`), since a client certificate needs one per
+/// connection (P3-5e-2).
+#[cfg(test)]
 pub(crate) fn connector(ca: Option<&str>) -> Result<TlsConnector, String> {
     connector_for(roots(ca)?, None)
 }
 
 /// P3-5e-1 — a client certificate's chain and its key, as TLS presents them
 /// to an upstream that asks for one (a Kubernetes API server, most often).
-// P3-5e-2's endpoint is the first to make one.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Identity {
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -32,7 +34,6 @@ pub(crate) struct Identity {
 
 /// An identity from the secret's `cert` (PEM: the certificate, then any
 /// intermediates) and `key` (PEM: PKCS#8, PKCS#1 or SEC1).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn identity(cert: &str, key: &str) -> Result<Identity, String> {
     let chain = CertificateDer::pem_slice_iter(cert.as_bytes())
         .collect::<Result<Vec<_>, _>>()
