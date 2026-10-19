@@ -1,11 +1,11 @@
 # FR-113: A system install on an X11 desktop shows it by default — FR-95's plan for X11 seats
 
-**Issue:** [#2458](https://github.com/gjovanov/roomler-ai/issues/2458) · **Status:** proposed 2026-10-18, spec and claim,
-on the operator's go-ahead (*"5. yes"*) from #2450. P1 + P2 written 2026-10-18 (with D1–D3 as recommended), docs in
-the same change, field-verified on the candidate, and **released in 0.4.144** (2026-10-19). The release run (§8) ticked
-AC1, AC2, AC4, AC5, AC6 and AC7. AC3 passed lock, unlock and both user switches. It failed the logout: the seat guard
-read a `closing` session as on screen, and the viewer showed a black screen with nothing said. **P4** fixes that. AC3
-ticks on the release that carries P4 · **Owner:** remote desktop (agent) · **Anchors:** master
+**Issue:** [#2458](https://github.com/gjovanov/roomler-ai/issues/2458) · **Status:** ✅ **closed 2026-10-19, every
+criterion ticked**. Proposed 2026-10-18, spec and claim, on the operator's go-ahead (*"5. yes"*) from #2450. P1 + P2
+(D1–D3 as recommended, docs in the same change) were **released in 0.4.144**, whose release run (§8) ticked AC1, AC2,
+AC4, AC5, AC6 and AC7. On 0.4.144 AC3 passed lock, unlock and both user switches but failed the logout, because the
+seat guard read a `closing` session as on screen. **P4** (#2516) fixed that, shipped in **0.4.145**, and AC3 passed
+there on the released bytes (§8) · **Owner:** remote desktop (agent) · **Anchors:** master
 `df4803f87` · **Builds on:** [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system plan, its seat guard),
 [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-93](FR-93-wayland-out-of-the-box.md) (the idle skip P3d, the desktop
 brief P2b), FR-80 (the reason codes)
@@ -85,7 +85,7 @@ flowchart LR
 | **P1** | the plan for X11 seats (DRM + `uinput`), the seat guard on X11, DRM's idle skip on X11 seats (`IdleSkip::InPlace`) | `x11_auto_system = false` | ✅ candidate `c1ea719ab`; ✅ **the release 0.4.144** on GNOME/Xorg and SDDM/Plasma X11 cells (§8) | M |
 | **P2** | the true reason when the plan cannot capture an X11 seat (`x11_not_enabled`) | `x11_auto_system = false` (back to `no_display`) | ✅ the candidate; ✅ the release 0.4.144: `x11_not_enabled` and its hint on prod's viewer (§8) | S |
 | **P3** | docs: `docs/linux-capture.md` (§1.2.2 the X11 half, §1.1 the reason, §3.2 the idle skip and its measurement, §7 the switch), the `docs/README.md` index row | — | ✅ in P1's change | S |
-| **P4** | the seat guard reads logind's `State`: a bound session that is `closing` (a logout whose processes are still ending) is away (`capture/seat_guard.rs`), plus `linux-capture.md` §1.2.1 | — (it can only close the guard, never open it) | 🔴 the release 0.4.144: 90 s of a black scanout reached the viewer after a logout, with nothing said (§8). ✅ candidate `73539996e` (§8): the guard closed 29 ms after `terminate-session`, before Xorg exited; nothing was read after; the reason was named in 2.5 s; after the typed login a new viewer session had picture and input. ⏳ the release that carries it | S |
+| **P4** | the seat guard reads logind's `State`: a bound session that is `closing` (a logout whose processes are still ending) is away (`capture/seat_guard.rs`), plus `linux-capture.md` §1.2.1 | — (it can only close the guard, never open it) | 🔴 the release 0.4.144: 90 s of a black scanout reached the viewer after a logout, with nothing said (§8). ✅ candidate `73539996e` (§8): the guard closed 29 ms after `terminate-session`, before Xorg exited; nothing was read after; the reason was named in 2.5 s; after the typed login a new viewer session had picture and input. ✅ **the release 0.4.145** (§8): the same on a fresh served install of the release (`closing=true` at the logout's second, named +2.6 s), the regression 7/7 | S |
 
 ## 5. Acceptance criteria
 
@@ -111,7 +111,7 @@ flowchart LR
     guard closed. A new viewer session after the unlock had picture and input again.
   - ⚠️ **A fresh Plasma locks an idle session after 5 min**, so the first try met a lock nobody asked for. The guard
     read it correctly, and the controller was told it was waiting on the host.
-- [ ] **AC3** — The greeter and a locked screen are never streamed: lock, unlock, logout, login and a user switch on
+- [x] **AC3** — The greeter and a locked screen are never streamed: lock, unlock, logout, login and a user switch on
   an X11 seat, each recovering within 10 s or naming its reason (FR-93 AC7's harness).
   ✅ **On the candidate, the lock and the unlock** (§8). GNOME's lock set `LockedHint`, and the guard read nothing
   more (`guard=Locked`). The viewer named the lock 2.8 s after the guard closed. After the unlock, a new picture came
@@ -145,7 +145,19 @@ flowchart LR
     the person who was told. A new viewer session bound itself to the new session (`session="136"`), with 34/34
     samples with a picture and the pointer going (100, 100) → (716, 448).
 
-  ⏳ Logout and login tick on the release that carries P4.
+  ✅ **On the release 0.4.145** (2026-10-19, §8). Every AC3 event passed on the released bytes.
+  - **The cell:** a fresh vmtest cell installed the published release through the served installer, the lane's
+    eleven checks green. GDM was switched to Xorg with auto-login, so GDM's 90 s worker hang was in play, and the
+    daemon was re-enrolled on a DEFAULT config. The binary was `07412c9f…`.
+  - **The bytes:** the candidate field-tested before the tag is bit-identical to the published `.deb` (sha256
+    `8027436957b5dd33`).
+  - **The logout:** the guard logged `closing=true` at 13:02:09.734, the logout's second, and the viewer named the
+    reason at +2.6 s. Nothing new reached it through the hang or the greeter.
+  - **The typed login** (session 36): the old viewer kept its reason, and a new viewer bound to the new session had
+    picture and input (100,100) → (716,448).
+  - **The regression,** with the probe: 7/7 PASS. Lock named +2.9 s, unlock live +2.0 s, switch-user named +3.0 s,
+    switch-back live +1.9 s, lock-switch named +2.9 s, switch-back (locked) named +0.0 s, unlock live +2.2 s. No new
+    picture inside any lock or greeter window.
 - [x] **AC4** — Explicit keys win, and `x11_auto_system = false` gives back 0.4.143's behaviour exactly; Wayland hosts
   are unchanged.
   ✅ **On the candidate** (§8). `ROOMLERD_X11_AUTO_SYSTEM=0` logged exactly what 0.4.143 did: no picture,
@@ -214,4 +226,6 @@ flowchart LR
 | 2026-10-19 08:58Z | the same, GDM back on Wayland, the drop-in removed | the release | AC4: Wayland unchanged; #2473 on Wayland | ✅ FR-95's plan, `idle_skip=Flips`, 64/64 samples with a picture; the brief `kind=wayland capture_arm=drm input_reach=full` |
 | 2026-10-19 09:04–09:10Z | the GNOME cell back on Xorg (auto-login), the release kept as `/usr/bin/roomlerd.rel` | **candidate `73539996e` (P4)**, the release's Linux features minus `ffmpeg-encoder`, sha256 `17463b8a…`, re-enrolled on defaults | AC3: logout, then a typed login; then a new viewer session | ✅ `verdict.py` PASS 2/2. The guard: `closing=true` 29 ms after `terminate-session`, before Xorg exited; nothing read after (the encoder's last window ended 09:05:49.15); named +2.5 s; one black transition frame from those 29 ms. GDM hung 90 s again, and the viewer said why throughout. The typed login went through once the greeter was up; a new viewer session bound to it: 34/34 samples with a picture, the pointer (100,100) → (716,448) |
 | 2026-10-19 09:10–09:14Z | the same, the new login, the probe restarted | the same | AC3 regression: lock, unlock, both user switches | ✅ 7/7 PASS: lock named +2.5 s, unlock live +2.1 s, switch-user named +2.9 s, switch-back live +1.9 s, lock-switch named +2.9 s, switch-back (still locked) named +0.0 s, unlock live +2.2 s; no new picture inside any lock or greeter window |
+| 2026-10-19 12:22–12:30Z | a fresh kept GNOME/Xorg cell (auto-login), cloned after deploy#44 (a guest `sudo` no longer costs 15 s) | **the 0.4.145 candidate** (run 39248610025, the `.deb` `8027436957b5dd33`, binary `07412c9f…`), re-enrolled on defaults | AC3 before the tag: logout, typed login, a new viewer, the regression | ✅ logout + login `verdict.py` PASS (`closing=true` at the logout's second, named +2.4 s); a new viewer on the new login: (100,100) → (716,448); the regression 7/7 PASS |
+| 2026-10-19 13:00–13:09Z | a fresh cell the lane installed **the published 0.4.145** on (served installer, its eleven checks green), GDM switched to Xorg with auto-login, re-enrolled on defaults | **the release 0.4.145** (binary `07412c9f…`; its `.deb` bit-identical to the candidate's) | AC3 on the release | ✅ logout: `closing=true` at 13:02:09.734, named +2.6 s, nothing new through GDM's 90 s hang or its greeter; typed login (session 36): a new viewer with picture and input (100,100) → (716,448); the regression 7/7 PASS (named +2.9 / +3.0 / +2.9 / +0.0 s, live +2.0 / +1.9 / +2.2 s) |
 | — | wrong turns, recorded | — | — | Three harness errors, each voided a run before it was caught: (1) every guest `sudo` took **15 s** (the cell's hostname is not in `/etc/hosts`): an action ran 15 s after its timestamp, and `switch-user` read FAIL twice, blamed on ssh and then on GDM, until the guest's own `sudo[…] COMMAND=` line showed it; (2) the first AC5 run wrote its drop-in into a directory that did not exist, so it measured the defaults: the `env` step now creates the dir and prints the unit's environment names; (3) a switch-back to an unchanged desktop is invisible to the verdict without the probe |
