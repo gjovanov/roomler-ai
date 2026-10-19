@@ -39,7 +39,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`release-agent.yml:2211-2234`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
-  (`ui/src/composables/useRemoteControl.ts:1880-1893`).
+  (`ui/src/composables/useRemoteControl.ts:1908-1893`).
 
 ### The size question, measured
 
