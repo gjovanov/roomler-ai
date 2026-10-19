@@ -756,6 +756,19 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" tarball_owner
 
+      - name: Received files on a Linux system install (FR-97 P3d) — as root, born the person's
+        # FR-97 P3d. A root daemon writes a received file into the person's
+        # folder with the thread's fsuid, fsgid and groups switched to theirs,
+        # and a link planted in that folder gets only their rights (the test's
+        # control shows root's own rights go straight through it). Only root
+        # can take on another identity, so the lib test binary runs under sudo,
+        # and ROOMLERD_TEST_REQUIRE_ROOT turns the tests' skip into a failure.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/p3d.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/p3d.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" files::seat_user_tests
+
       - name: The Linux user unit's sandbox (FR-85 P2c) — it starts on a fresh host, and the recorder writes ~/Videos
         # FR-85 P2c. `roomler.service` (the per-user install; what
         # `install.sh --role daemon` enables without `--system`) runs the

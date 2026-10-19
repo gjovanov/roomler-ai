@@ -40,14 +40,16 @@ in the session.
 
 ## What the far end sees
 
-Files land in the remote machine's download location for the account the agent
-runs as.
+Files land in the **Downloads folder of the person signed in at the remote
+machine's screen**, unless its owner chose another folder (the desktop app's
+**Incoming files** card). A file with the same name as one already there gets a
+numbered copy instead of replacing it.
 
-:::tip The agent's identity is what matters, not yours
-On a machine where the agent runs as a system service, transferred files arrive
-owned by that service account rather than by a logged-in user. If a file appears
-to be "missing", it is usually in the service account's location rather than the
-desktop user's.
+:::tip Nobody at the screen
+On a machine whose agent runs as a system service, with nobody signed in at the
+screen, a file lands in the service's own folder instead. On Linux, a file sent
+while someone is signed in at the screen belongs to them, exactly as if they had
+saved it themselves.
 :::
 
 ## When you want a file path rather than a session
