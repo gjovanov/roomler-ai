@@ -2,8 +2,10 @@
 
 **Issue:** [#2458](https://github.com/gjovanov/roomler-ai/issues/2458) · **Status:** proposed 2026-10-18, spec and claim,
 on the operator's go-ahead (*"5. yes"*) from #2450. P1 + P2 written 2026-10-18 (with D1–D3 as recommended), docs in
-the same change, and field-verified on the candidate on a vmtest GNOME/Xorg cell (§8): AC1, AC4, AC5 and AC6 green
-there, AC3's lock and unlock. Each ticks on the release; AC2 and the rest of AC3 owed · **Owner:** remote desktop (agent) · **Anchors:** master
+the same change, field-verified on the candidate, and **released in 0.4.144** (2026-10-19). The release run (§8) ticked
+AC1, AC2, AC4, AC5, AC6 and AC7. AC3 passed lock, unlock and both user switches. It failed the logout: the seat guard
+read a `closing` session as on screen, and the viewer showed a black screen with nothing said. **P4** fixes that. AC3
+ticks on the release that carries P4 · **Owner:** remote desktop (agent) · **Anchors:** master
 `df4803f87` · **Builds on:** [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system plan, its seat guard),
 [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-93](FR-93-wayland-out-of-the-box.md) (the idle skip P3d, the desktop
 brief P2b), FR-80 (the reason codes)
@@ -79,48 +81,100 @@ flowchart LR
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P0** | measure the population: system installs whose desktop brief reads `kind=x11` with no picture (the server's count, FR-93 P2b) | — | ⏳ | S |
-| **P1** | the plan for X11 seats (DRM + `uinput`), the seat guard on X11, DRM's idle skip on X11 seats (`IdleSkip::InPlace`) | `x11_auto_system = false` | ✅ candidate `c1ea719ab` on a vmtest GNOME/Xorg cell (§8): picture and input, the lock and the unlock, 5.5 % idle; the release run owed | M |
-| **P2** | the true reason when the plan cannot capture an X11 seat (`x11_not_enabled`) | `x11_auto_system = false` (back to `no_display`) | ✅ the same candidate: `x11_not_enabled`, and its hint on prod's viewer (§8); the release run owed | S |
+| **P0** | measure the population: system installs whose desktop brief reads `kind=x11` with no picture (the server's count, FR-93 P2b) | — | ✅ 2026-10-19, prod: of 30 Linux devices with a brief, 3 read `kind=x11`. Two are this FR's release cells (`capture_arm=drm`, `input_reach=full`, 0.4.144) and one is an offline 0.4.140 per-user install (`capture_arm=x11`). No live device sat in #2450's state, so the change is prospective: new installs on Xorg desktops | S |
+| **P1** | the plan for X11 seats (DRM + `uinput`), the seat guard on X11, DRM's idle skip on X11 seats (`IdleSkip::InPlace`) | `x11_auto_system = false` | ✅ candidate `c1ea719ab`; ✅ **the release 0.4.144** on GNOME/Xorg and SDDM/Plasma X11 cells (§8) | M |
+| **P2** | the true reason when the plan cannot capture an X11 seat (`x11_not_enabled`) | `x11_auto_system = false` (back to `no_display`) | ✅ the candidate; ✅ the release 0.4.144: `x11_not_enabled` and its hint on prod's viewer (§8) | S |
 | **P3** | docs: `docs/linux-capture.md` (§1.2.2 the X11 half, §1.1 the reason, §3.2 the idle skip and its measurement, §7 the switch), the `docs/README.md` index row | — | ✅ in P1's change | S |
+| **P4** | the seat guard reads logind's `State`: a bound session that is `closing` (a logout whose processes are still ending) is away (`capture/seat_guard.rs`), plus `linux-capture.md` §1.2.1 | — (it can only close the guard, never open it) | 🔴 the release 0.4.144: 90 s of a black scanout reached the viewer after a logout, with nothing said (§8). ✅ candidate `73539996e` (§8): the guard closed 29 ms after `terminate-session`, before Xorg exited; nothing was read after; the reason was named in 2.5 s; after the typed login a new viewer session had picture and input. ⏳ the release that carries it | S |
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1** — A system install on its defaults on GNOME/Xorg shows the desktop to the viewer, with input. Red first
+- [x] **AC1** — A system install on its defaults on GNOME/Xorg shows the desktop to the viewer, with input. Red first
   on 0.4.143 (#2450).
-  ✅ **On the candidate** (`c1ea719ab`, 2026-10-18, §8). The red first, on the same cell and config: the released
+  ✅ **On the candidate** (`c1ea719ab`, 2026-10-18, §8). The red came first, on the same cell and config: the released
   0.4.143 sent `no_display`, and no picture. The candidate showed a picture in 62 of 62 samples, switched on by
   itself (`backend=drm … FR-95 P2, FR-113 P1 … idle_skip=InPlace`), with the automatic `uinput`. The input was read
   in the person's own X session (`xdotool getmouselocation`): the pointer, parked at (100, 100), stood at
   **(716, 448)** after the viewer's move to 0.56, 0.56 of the frame (exactly 716.8, 448 on 1280×800).
-  ⏳ Ticks on the release.
-- [ ] **AC2** — The same on a second X11 display manager and desktop (LightDM/XFCE, or SDDM/Plasma on X11).
-  ⏳ Owed: a cell with a second display manager. D4 is measured there too.
+  ✅ **On the release 0.4.144** (2026-10-19, a fresh cell the lane installed it on, re-enrolled on a DEFAULT config):
+  35 of 35 samples with a picture, `backend=drm, switched on by itself`, `idle_skip=InPlace`, the automatic
+  `uinput`, and the pointer went (100, 100) → **(716, 448)**.
+- [x] **AC2** — The same on a second X11 display manager and desktop (LightDM/XFCE, or SDDM/Plasma on X11).
+  ✅ **On the release 0.4.144** (2026-10-19, §8). The cell was Ubuntu 24.04 with `kde-plasma-desktop` + `sddm`: Plasma
+  5.27's X11 session (`plasma`), SDDM auto-login, session `Desktop=KDE`, with `ksmserver` and `kwin_x11` running for
+  the person. The daemon was the release's `.deb` (sha256 `4bacb16e…`), re-enrolled on a DEFAULT config.
+  - **Picture and input:** 28 of 28 samples with a picture, and the pointer went (100, 100) → **(716, 448)**.
+  - **D4, measured:** `kscreenlocker_greet` set `LockedHint=yes` within 1 s of `loginctl lock-session`, and cleared
+    it on unlock.
+  - **Lock and unlock under a viewer:** the guard closed 0.31 s after the lock command. The one new frame in that
+    window was the desktop (8×5 thumbnail difference 0.1), not the lock screen. The lock was named 2.5 s after the
+    guard closed. A new viewer session after the unlock had picture and input again.
+  - ⚠️ **A fresh Plasma locks an idle session after 5 min**, so the first try met a lock nobody asked for. The guard
+    read it correctly, and the controller was told it was waiting on the host.
 - [ ] **AC3** — The greeter and a locked screen are never streamed: lock, unlock, logout, login and a user switch on
   an X11 seat, each recovering within 10 s or naming its reason (FR-93 AC7's harness).
-  ⏳ **On the candidate, the lock and the unlock** (§8). GNOME's lock set `LockedHint`, and the guard read nothing
-  more (`guard=Locked`). The viewer named the lock 2.8 s after the guard closed; after the unlock, a new picture came
-  0.6 s later and the notice was gone at 1.1 s. One new frame arrived 2.1 s *before* the guard closed, likely the lock
-  shield's first frame: the transition FR-95 measured on Wayland, where `LockedHint` is set once the shield is up.
-  Owed: logout, login and a user switch.
-- [ ] **AC4** — Explicit keys win, and `x11_auto_system = false` gives back 0.4.143's behaviour exactly; Wayland hosts
+  ✅ **On the candidate, the lock and the unlock** (§8). GNOME's lock set `LockedHint`, and the guard read nothing
+  more (`guard=Locked`). The viewer named the lock 2.8 s after the guard closed. After the unlock, a new picture came
+  0.6 s later, and the notice was gone at 1.1 s.
+  ✅ **On the release 0.4.144, lock, unlock and both user switches** (2026-10-19, §8, `verdict.py`).
+  - **Setup:** the lifecycle verdict, with the lab's probe (`wlab-probe --x11`, a counter ticking every 250 ms)
+    on the person's desktop, so a recovery shows as a live picture rather than an unchanged one.
+  - **Result:** 7 of 7 events PASS.
+    - lock, named at +2.7 s;
+    - unlock, live at +2.3 s;
+    - switch-user (GDM's transient Xorg greeter), named at +2.6 s;
+    - switch-back, live at +1.6 s;
+    - GNOME's lock, then switch, named at +2.6 s;
+    - switch-back to the locked session, named at +0.2 s;
+    - unlock, live at +2.3 s.
+  - **Never streamed:** the lock, the greeter and the lock-then-greeter windows each brought **no** new picture.
+  🔴 **On the release 0.4.144, the logout failed.** After `loginctl terminate-session`:
+  - the viewer showed **black with nothing said** for 90 s, and the typed login could not happen (no greeter);
+  - GDM's auto-login session worker ignored SIGTERM, so logind kept the session `closing`, and still the seat's
+    active session, until systemd's 90 s stop timeout;
+  - the guard read it as on screen, and the DRM capture kept reading the bare scanout.
+  → **P4**.
+  ✅ **On the P4 candidate `73539996e`** (2026-10-19, the same cell and setup, §8). Logout and login: `verdict.py` PASS.
+  - **The logout:** `terminate-session` ran at 09:05:49.541, and the guard logged `closing=true` and closed at .570.
+    Xorg exited at .598, after that. The encoder's last frame window ended at 09:05:49.15, and nothing was read
+    after the close. The viewer named the reason (*showing another session / the login screen*) at +2.5 s.
+    - It showed one black frame, captured in those 29 ms as Xorg's teardown blanked the screen. That is FR-95's
+      transition frame, and it carries no content.
+  - **Through GDM's 90 s hang and its greeter (c10):** no new picture.
+  - **The typed login:** it worked once the greeter was up. The old viewer kept the reason, since it was bound to
+    the person who was told. A new viewer session bound itself to the new session (`session="136"`), with 34/34
+    samples with a picture and the pointer going (100, 100) → (716, 448).
+
+  ⏳ Logout and login tick on the release that carries P4.
+- [x] **AC4** — Explicit keys win, and `x11_auto_system = false` gives back 0.4.143's behaviour exactly; Wayland hosts
   are unchanged.
   ✅ **On the candidate** (§8). `ROOMLERD_X11_AUTO_SYSTEM=0` logged exactly what 0.4.143 did: no picture,
   `code="no_display"`, reach `none`. The same cell switched back to Wayland was captured as before: FR-95's plan,
   `idle_skip=Flips`, 56 of 56 samples with a picture. Explicit keys are `capture_keys_set`, unchanged, and are pinned
-  by unit tests. ⏳ Ticks on the release.
-- [ ] **AC5** — A plan that cannot capture an X11 seat names the X11 session and the key, never `no_display`.
+  by unit tests.
+  ✅ **On the release 0.4.144** (2026-10-19). Each switch was proven applied in the unit's environment (names only).
+  - With `ROOMLERD_X11_AUTO_SYSTEM`: no picture, `code="no_display"`, reach `none`, and `no_display` on prod's viewer.
+  - Back on Wayland with the drop-in removed: FR-95's plan, `idle_skip=Flips`, 64 of 64 samples with a picture.
+- [x] **AC5** — A plan that cannot capture an X11 seat names the X11 session and the key, never `no_display`.
   ✅ **On the candidate** (§8). With `ROOMLERD_VIEWING_NOTICE=0` nobody could be told, and the agent sent
   `code="x11_not_enabled"`, detail *logind shows an X11 session on this seat, and this daemon has no display of its
   own…*. Prod's viewer showed the hint: *This computer is showing an X11 desktop, and it is not captured by itself
-  because nobody at the screen could be told they are being viewed…*. ⏳ Ticks on the release.
-- [ ] **AC6** — An idle X11 desktop through DRM costs within 2× of FR-29's X11 figure.
+  because nobody at the screen could be told they are being viewed…*.
+  ✅ **On the release 0.4.144** (2026-10-19). The switch was proven in the unit's environment. The result was
+  `code="x11_not_enabled"` with the same detail, and prod's viewer showed *This device cannot capture its screen* and
+  *This computer is showing an X11 desktop, and it is not captured by itself because nobody at the screen could be
+  told they are being viewed…*, with the code `x11_not_enabled`.
+- [x] **AC6** — An idle X11 desktop through DRM costs within 2× of FR-29's X11 figure.
   ✅ **On the candidate** (§8; `linux-capture.md` §3.2). An idle GNOME/Xorg desktop, two 60 s windows, every
   `roomlerd` process: **5.5 % and 5.5 %** of a core, inside 6.8 %. Every frame read (`ROOMLERD_DRM_IDLE_SKIP=0`)
-  costs 46.3 % and 46.5 %. ⏳ Ticks on the release.
-- [ ] **AC7** — Docs: `docs/linux-capture.md` updated in the house style, and the `docs/README.md` index row.
+  costs 46.3 % and 46.5 %.
+  ✅ **On the release 0.4.144** (2026-10-19, the release's full feature set, `ffmpeg-encoder` included):
+  **6.1 % and 6.1 %** of a core, inside 6.8 %. All 268 samples had a picture.
+- [x] **AC7** — Docs: `docs/linux-capture.md` updated in the house style, and the `docs/README.md` index row.
   ✅ In P1's change: §1.2.2 (the X11 half, a diagram and a table), §1.1 (the reason's rows), §3.2 (the idle skip and
-  its measurement), §7 (the switch). The index row already lists `linux-capture.md`.
+  its measurement), §7 (the switch). The index row already lists `linux-capture.md`. P4's change adds the
+  closing rule to §1.2.1 (the diagram's away edge, and a ⚠️ with the measurement) and the measured KDE locker to
+  §1.2.2.
 
 ## 6. Open decisions
 
@@ -150,3 +204,14 @@ flowchart LR
 | 2026-10-18 15:12Z | the same cell switched back to Wayland | the same, defaults | AC4: Wayland unchanged | ✅ FR-95's plan, `idle_skip=Flips`, the P3d line, 56/56 samples with a picture |
 | 2026-10-18 19:31Z | the same cell, back on Xorg (GNOME) | candidate `8be890c19` (D4, after the PR review) | AC1 again: `lock_reporting_shell` must find GNOME Shell | ✅ 64/64 samples with a picture, `InPlace`, the automatic `uinput`; the pointer (100,100) → (716,448) |
 | 2026-10-18 19:39Z | the same cell, the auto-login switched to **XFCE 4.18.3 on Xorg** (no `gnome-shell`, no `ksmserver`) | the same | D4: a desktop that does not report its lock | ✅ refused: no picture, no DRM read, `code="x11_not_enabled"`, and prod's viewer showed *…an X11 desktop whose screen locker does not report a lock to the system (GNOME and KDE do…)*. Measured: `loginctl lock-session` left `LockedHint` at `no` with `xfce4-screensaver` 4.18.3 running, which is exactly the case D4 exists for |
+| 2026-10-19 07:46–08:06Z | a fresh kept vmtest cell the lane installed **the release** on (GNOME 46, GDM switched to Xorg, auto-login), the system daemon re-enrolled on a DEFAULT config | **the release 0.4.144** | AC1, #2473 | ✅ 35/35 samples with a picture, `switched on by itself`, `idle_skip=InPlace`, the automatic `uinput`; the pointer (100,100) → (716,448); the brief `kind=x11 capture_arm=drm input_reach=full` |
+| 2026-10-19 07:35–07:59Z | a second kept cell: Ubuntu 24.04 + `kde-plasma-desktop` + `sddm`, Plasma 5.27's X11 session under SDDM auto-login (`Desktop=KDE`), 0.4.143 upgraded with the release's `.deb` (sha256 `4bacb16e…`) | the release 0.4.144 | AC2, D4 | ✅ `LockedHint=yes` 1 s after `lock-session`, `no` after `unlock-session`; 28/28 samples with a picture, the pointer (100,100) → (716,448); under a viewer the guard closed 0.31 s after the lock command (the one frame read in that window was the desktop, thumbnail difference 0.1), the lock named +2.5 s, picture and input again after the unlock. A fresh Plasma auto-locks an idle session after 5 min: switched off for the runs |
+| 2026-10-19 08:31–08:35Z | the GNOME cell | the release | AC3: lock, unlock, switch-user, switch-back, lock-switch, switch-back, unlock (`verdict.py`, with `wlab-probe --x11` ticking on the desktop) | ✅ 7/7 PASS: named +2.7 / +2.6 / +2.6 / +0.2 s, live (the probe's counter moving) +2.3 / +1.6 / +2.3 s; no new picture inside any lock or greeter window |
+| 2026-10-19 08:35–08:37Z | the same | the release | AC3: logout, then a typed login | 🔴 black, nothing said. `terminate-session`: GDM's auto-login session worker ignored SIGTERM (`session-26.scope: … SIGKILL … Failed with result 'timeout'` at +90 s), so logind kept the session `closing` and the seat's active one; the guard (id, class, `LockedHint`) stayed open and the DRM capture read on (`frames_captured` 72 → 144); no greeter for 90 s, so the typed login had nothing to type into → **P4** |
+| 2026-10-19 08:47–08:49Z | the same, back on Xorg | the release | AC6 | ✅ 6.1 %, 6.1 % of a core (268/268 samples with a picture) |
+| 2026-10-19 08:52Z | the same, `ROOMLERD_VIEWING_NOTICE=0` (proven in the unit's environment) | the release | AC5 | ✅ `code="x11_not_enabled"`, and the hint on prod's viewer |
+| 2026-10-19 08:56Z | the same, `ROOMLERD_X11_AUTO_SYSTEM=0` (proven) | the release | AC4: the kill switch | ✅ no picture, `code="no_display"`, reach `none` |
+| 2026-10-19 08:58Z | the same, GDM back on Wayland, the drop-in removed | the release | AC4: Wayland unchanged; #2473 on Wayland | ✅ FR-95's plan, `idle_skip=Flips`, 64/64 samples with a picture; the brief `kind=wayland capture_arm=drm input_reach=full` |
+| 2026-10-19 09:04–09:10Z | the GNOME cell back on Xorg (auto-login), the release kept as `/usr/bin/roomlerd.rel` | **candidate `73539996e` (P4)**, the release's Linux features minus `ffmpeg-encoder`, sha256 `17463b8a…`, re-enrolled on defaults | AC3: logout, then a typed login; then a new viewer session | ✅ `verdict.py` PASS 2/2. The guard: `closing=true` 29 ms after `terminate-session`, before Xorg exited; nothing read after (the encoder's last window ended 09:05:49.15); named +2.5 s; one black transition frame from those 29 ms. GDM hung 90 s again, and the viewer said why throughout. The typed login went through once the greeter was up; a new viewer session bound to it: 34/34 samples with a picture, the pointer (100,100) → (716,448) |
+| 2026-10-19 09:10–09:14Z | the same, the new login, the probe restarted | the same | AC3 regression: lock, unlock, both user switches | ✅ 7/7 PASS: lock named +2.5 s, unlock live +2.1 s, switch-user named +2.9 s, switch-back live +1.9 s, lock-switch named +2.9 s, switch-back (still locked) named +0.0 s, unlock live +2.2 s; no new picture inside any lock or greeter window |
+| — | wrong turns, recorded | — | — | Three harness errors, each voided a run before it was caught: (1) every guest `sudo` took **15 s** (the cell's hostname is not in `/etc/hosts`): an action ran 15 s after its timestamp, and `switch-user` read FAIL twice, blamed on ssh and then on GDM, until the guest's own `sudo[…] COMMAND=` line showed it; (2) the first AC5 run wrote its drop-in into a directory that did not exist, so it measured the defaults: the `env` step now creates the dir and prints the unit's environment names; (3) a switch-back to an unchanged desktop is invisible to the verdict without the probe |
