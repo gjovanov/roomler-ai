@@ -25,8 +25,10 @@ People use it too.
 > may ask for: a card in the session's room that one of its drivers
 > answers, a session's tools that wait for the answer, and the card's
 > buttons in the web app (§18); P3-5a, a secret's `audiences` held to for
-> `proxy` mode, the first step of the proxies (§7); and P3-5b-1, the
-> Postgres engine that a proxy endpoint will serve (§19).** No released
+> `proxy` mode, the first step of the proxies (§7); P3-5b-1, the Postgres
+> engine a proxy endpoint serves; and P3-5b-2, `vault_connect` and its
+> endpoint, which signs in to a database as a secret's user for the
+> session's account (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -633,6 +635,7 @@ sequenceDiagram
 | the lease's expiry passes | lets it go: checked at every use, and every 5 s |
 | `rc:vault.revoke` (§11) | lets go of every lease the frame names; an id it does not hold is ignored |
 | the session's run ends here | lets go of that run's leases, wherever the run stopped being live |
+| a lease is let go, whichever way | zeroes its value, removes every file written with it (P3-4c-2, §15), and stops everything served with it: a proxy endpoint and its connections (P3-5b-2, §19) |
 | one of these frames on a secondary org's connection | drops it unopened |
 
 > [!WARNING]
@@ -650,7 +653,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the client | [`vault.rs`](../agents/roomlerd/src/vault.rs): `Client` (`request`, `request_until_approved`, `on_leased`, `on_refused`, `on_revoke`, `drop_run`, `with_value`), `takes_leases`, `apply_word` |
+| the client | [`vault.rs`](../agents/roomlerd/src/vault.rs): `Client` (`request`, `request_until_approved`, `on_leased`, `on_refused`, `on_revoke`, `drop_run`, `with_value`, `attach`, `stop_with`), `takes_leases`, `apply_word` |
 | the frames | their arms in `handle_server_msg` ([`signaling.rs`](../agents/roomlerd/src/signaling.rs)), on the primary connection only |
 | a run's end | `Supervisor::unlive` ([`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs)), which every way a run stops being live passes through |
 
@@ -692,7 +695,7 @@ sequenceDiagram
 The toolbelt (FR-90 P1a, [`hive.md`](hive.md) §4) offers the two tools only
 where the device takes leases: its owner's `vault_enabled` on, a build with
 `vault`, the primary connection
-([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L387)). Wherever it
+([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L404)). Wherever it
 offers them, the session's settings allow them (`permissions.allow`,
 [`launch.rs:410`](../crates/hive-node/src/launch.rs#L410)), so no person is
 asked to approve each one: they only read, and their gate is the vault's own
@@ -713,7 +716,7 @@ no answer, and the daemon stops waiting for it.
 > - **Offered and allowed together.** The daemon decides once, at a run's
 >   launch, whether its toolbelt offers the tools, and writes the settings'
 >   allow from the same answer
->   ([`supervisor.rs:4200`](../agents/roomlerd/src/hive/supervisor.rs#L4200)).
+>   ([`supervisor.rs:4209`](../agents/roomlerd/src/hive/supervisor.rs#L4209)).
 >   It records whether the primary connection takes leases before it resumes
 >   any run ([`signaling.rs:1617`](../agents/roomlerd/src/signaling.rs#L1617)).
 
@@ -721,8 +724,8 @@ no answer, and the daemon stops waiting for it.
 |---|---|
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1262`](../crates/remote_control/src/signaling.rs#L1262)) and `rc:vault.listed` · `rc:vault.described` ([`:4308`](../crates/remote_control/src/signaling.rs#L4308)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:107`](../crates/modules/vault/src/meta.rs#L107)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:380`](../crates/modules/vault/src/policy.rs#L380)) |
-| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:458`](../agents/roomlerd/src/vault.rs#L458)) |
-| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:814`](../agents/roomlerd/src/hive/toolbelt.rs#L814)), answered by `vault_tool` ([`toolbelt.rs:924`](../agents/roomlerd/src/hive/toolbelt.rs#L924)) |
+| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:465`](../agents/roomlerd/src/vault.rs#L465)) |
+| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:835`](../agents/roomlerd/src/hive/toolbelt.rs#L835)), answered by `vault_tool` ([`toolbelt.rs:972`](../agents/roomlerd/src/hive/toolbelt.rs#L972)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
 
@@ -786,8 +789,8 @@ device share): a path could match nothing a device asks for.
 > **A person approves every use because the settings ASK for it.** Keeping
 > it out of the allow list is not enough. The session's settings list
 > `vault_exec` and `vault_render` under `permissions.ask`
-> ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L376), written
-> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4666)).
+> ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L390), written
+> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4675)).
 > - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
 >   FR-90 spec's open decision 7), and an allow there would skip the person.
 >   Claude Code reads deny, then ask, then allow, across every settings file,
@@ -800,9 +803,9 @@ device share): a path could match nothing a device asks for.
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_exec` in [`toolbelt.rs:847`](../agents/roomlerd/src/hive/toolbelt.rs#L847), offered with the reads where the device takes leases, and asked for in the settings |
-| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4234`](../agents/roomlerd/src/hive/supervisor.rs#L4234)); none on Windows |
-| letting go | `Client::release` ([`vault.rs:613`](../agents/roomlerd/src/vault.rs#L613)) |
+| the tool | `vault_exec` in [`toolbelt.rs:868`](../agents/roomlerd/src/hive/toolbelt.rs#L868), offered with the reads where the device takes leases, and asked for in the settings |
+| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4243`](../agents/roomlerd/src/hive/supervisor.rs#L4243)); none on Windows |
+| letting go | `Client::release` ([`vault.rs:621`](../agents/roomlerd/src/vault.rs#L621)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
 
@@ -833,9 +836,9 @@ sequenceDiagram
 | the leases | one per distinct secret, mode `file`, audience the file's name, all asked before anything is written; one refusal writes nothing and lets the others go | [`vault_render.rs:253`](../agents/roomlerd/src/hive/vault_render.rs#L253) |
 | the directory | `<runtime>/<session>/secrets/`, made by the daemon, its own, `0711`: the session's account opens a file whose name it knows, and lists nothing. A link or a file in its place is refused, never followed | [`vault_render.rs:170`](../agents/roomlerd/src/hive/vault_render.rs#L170) |
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
-| its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:198`](../agents/roomlerd/src/vault.rs#L198), [`:620`](../agents/roomlerd/src/vault.rs#L620) |
+| its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:202`](../agents/roomlerd/src/vault.rs#L202), [`:628`](../agents/roomlerd/src/vault.rs#L628) |
 | a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:725`](../agents/roomlerd/src/hive/supervisor.rs#L725), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
-| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4627`](../agents/roomlerd/src/hive/supervisor.rs#L4627) |
+| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4636`](../agents/roomlerd/src/hive/supervisor.rs#L4636) |
 
 > [!WARNING]
 > - **`file` is a materializing mode** (design §8.5). The session's account
@@ -850,7 +853,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_render` in [`toolbelt.rs:878`](../agents/roomlerd/src/hive/toolbelt.rs#L878), offered with the reads, and asked for in the settings as `vault_exec` is (§14) |
+| the tool | `vault_render` in [`toolbelt.rs:899`](../agents/roomlerd/src/hive/toolbelt.rs#L899), offered with the reads, and asked for in the settings as `vault_exec` is (§14) |
 | keeping the leases | `Releasing::keep` ([`vault_exec.rs:497`](../agents/roomlerd/src/hive/vault_exec.rs#L497)) |
 
 ## 16. A lease asked for ahead: `vault_request` (P3-4c-3)
@@ -882,11 +885,11 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a path or this org's RRN, `#field` for a field. `mode`: `exec` or `file`, the modes a use takes (`proxy` waits for P3-5). `audience`: a bare name, by the rule `exec_allow` holds; the program `vault_exec` will run, or the file `vault_render` will write. `ttl_s`: 30 to 900, default 300 | [`vault_request.rs:34`](../agents/roomlerd/src/hive/vault_request.rs#L34) |
-| the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:77`](../agents/roomlerd/src/hive/vault_request.rs#L77), [`vault.rs:149`](../agents/roomlerd/src/vault.rs#L149) |
-| its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:635`](../agents/roomlerd/src/vault.rs#L635), [`vault_exec.rs:448`](../agents/roomlerd/src/hive/vault_exec.rs#L448), [`vault_render.rs:271`](../agents/roomlerd/src/hive/vault_render.rs#L271) |
+| the call | `handle`: a path or this org's RRN, `#field` for a field. `mode`: `exec`, `file` or (P3-5b-2) `proxy`, the modes a use takes. `audience`: a bare name, by the rule `exec_allow` holds; the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to, `host:port` by that tool's own rule (§19). `ttl_s`: 30 to 900, default 300 | [`vault_request.rs:34`](../agents/roomlerd/src/hive/vault_request.rs#L34) |
+| the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:88`](../agents/roomlerd/src/hive/vault_request.rs#L88), [`vault.rs:149`](../agents/roomlerd/src/vault.rs#L149) |
+| its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:657`](../agents/roomlerd/src/vault.rs#L657), [`vault_exec.rs:448`](../agents/roomlerd/src/hive/vault_exec.rs#L448), [`vault_render.rs:271`](../agents/roomlerd/src/hive/vault_render.rs#L271) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
-| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4653`](../agents/roomlerd/src/hive/supervisor.rs#L4653) |
+| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4662`](../agents/roomlerd/src/hive/supervisor.rs#L4662) |
 
 > [!IMPORTANT]
 > **A use takes the lease by what it is, not by its id.** The design had the
@@ -903,8 +906,8 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_request` in [`toolbelt.rs:899`](../agents/roomlerd/src/hive/toolbelt.rs#L899), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L382)) |
-| finding the lease | `Client::find_ahead` ([`vault.rs:635`](../agents/roomlerd/src/vault.rs#L635)); how long one has left, `Client::left` ([`vault.rs:656`](../agents/roomlerd/src/vault.rs#L656)) |
+| the tool | `vault_request` in [`toolbelt.rs:946`](../agents/roomlerd/src/hive/toolbelt.rs#L946), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L399)) |
+| finding the lease | `Client::find_ahead` ([`vault.rs:657`](../agents/roomlerd/src/vault.rs#L657)); how long one has left, `Client::left` ([`vault.rs:678`](../agents/roomlerd/src/vault.rs#L678)) |
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
 
@@ -937,7 +940,7 @@ sequenceDiagram
 | Step | What holds | Where |
 |---|---|---|
 | the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:8847`](../crates/remote_control/src/models.rs#L8847) |
-| the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:337`](../agents/roomlerd/src/vault.rs#L337), [`vault_exec.rs:474`](../agents/roomlerd/src/hive/vault_exec.rs#L474), [`vault_render.rs:307`](../agents/roomlerd/src/hive/vault_render.rs#L307) |
+| the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:344`](../agents/roomlerd/src/vault.rs#L344), [`vault_exec.rs:474`](../agents/roomlerd/src/hive/vault_exec.rs#L474), [`vault_render.rs:307`](../agents/roomlerd/src/hive/vault_render.rs#L307) |
 | the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1297`](../crates/remote_control/src/signaling.rs#L1297), [`vault.rs:287`](../crates/remote_control/src/vault.rs#L287) |
 | the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:361`](../crates/modules/vault/src/lease.rs#L361) |
 | the check | every lease the report names was released to this device, for this session in this organization, in the use's mode (`exec` for `exec`, `file` for `render`) and toward its target. Otherwise, or for a kind this server cannot name or a target that is not a bare name, the report is dropped | [`lease.rs:385`](../crates/modules/vault/src/lease.rs#L385), [`dao.rs:570`](../crates/modules/vault/src/dao.rs#L570) |
@@ -1026,7 +1029,7 @@ owner.
 | the routes | `GET …/vault/approval/{id}`: the approval as the session's readers see it, with `may_answer` (the caller drives it now) and `may_approve` (and the policy would take their yes) for the caller. `POST …/vault/approval/{id}` `{answer: "approve" \| "deny"}` | [`approval.rs:595`](../crates/modules/vault/src/approval.rs#L595), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
 | one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:942`](../crates/modules/vault/src/lease.rs#L942), [`dao.rs:816`](../crates/modules/vault/src/dao.rs#L816) |
 | the windows | a card waits 10 min for an answer (`APPROVAL_ANSWER_SECS`); a yes is usable for 5 min from the answer (`APPROVAL_USE_SECS`) | [`vault.rs:75`](../crates/remote_control/src/vault.rs#L75) |
-| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:413`](../agents/roomlerd/src/vault.rs#L413), [`vault.rs:568`](../agents/roomlerd/src/vault.rs#L568), [`toolbelt.rs:400`](../agents/roomlerd/src/hive/toolbelt.rs#L400), [`toolbelt.rs:483`](../agents/roomlerd/src/hive/toolbelt.rs#L483) |
+| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:420`](../agents/roomlerd/src/vault.rs#L420), [`vault.rs:576`](../agents/roomlerd/src/vault.rs#L576), [`toolbelt.rs:417`](../agents/roomlerd/src/hive/toolbelt.rs#L417), [`toolbelt.rs:500`](../agents/roomlerd/src/hive/toolbelt.rs#L500) |
 | the web app (P3-4e-3) | under a message bound to `{module: "vault"}`, the approval as `GET …/vault/approval/{id}` gives it: where it stands, the deadline while it waits, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve`, else off with why). A refusal is shown in the server's words. The vault edits the card's message whenever the approval moves on, and the new `updated_at` reads it again. The buttons only reflect what the route says; every decision stays the server's | [`VaultApprovalCard.vue`](../ui/src/components/vault/VaultApprovalCard.vue), [`MessageBubble.vue`](../ui/src/components/chat/MessageBubble.vue) |
 | the row | `vault_approvals`, one per card: its request, its status (`pending` · `approved` · `denied` · `used` · `expired` · `withdrawn`), who answered and when, the lease that spent it, and the card's message. A unique index holds one pending card per request | [`model.rs:341`](../crates/modules/vault/src/model.rs#L341), [`lib.rs:333`](../crates/modules/vault/src/lib.rs#L333) |
 
@@ -1065,8 +1068,8 @@ with the leased value, so the session, its model and its transcript never
 hold the value (AC12). A secret's `audiences` say which upstreams it may
 reach (§7). The design is the spec's §3e, "P3-5, `proxy` mode, as designed".
 P3-5b-1 builds the first engine, Postgres's, in `roomlerd`'s module
-`vault_proxy` (`agents/roomlerd/src/vault_proxy/mod.rs`). Nothing calls it
-yet: P3-5b-2's endpoint and `vault_connect` tool will be its first caller.
+`vault_proxy` (`agents/roomlerd/src/vault_proxy/mod.rs`), and P3-5b-2 serves
+it: `vault_connect` and its endpoint, below.
 
 ```mermaid
 sequenceDiagram
@@ -1095,12 +1098,12 @@ sequenceDiagram
 | Step | What the engine does | Where |
 |---|---|---|
 | the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:100` |
-| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:288` |
-| its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:129` |
-| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:252`, `agents/roomlerd/src/vault_proxy/tls.rs:20` |
-| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts | `pg.rs:162`, `pg.rs:174`, `pg.rs:208` |
-| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:226`, `pg.rs:233` |
-| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:242` |
+| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:295` |
+| its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:136` |
+| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:259`, `agents/roomlerd/src/vault_proxy/tls.rs:20` |
+| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts | `pg.rs:169`, `pg.rs:181`, `pg.rs:215` |
+| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:233`, `pg.rs:240` |
+| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:249` |
 
 > ⚠️ **The client never authenticates.** The endpoint is its credential: a
 > socket only the session's account can reach (P3-5b-2). The client is never
@@ -1111,7 +1114,7 @@ sequenceDiagram
 
 | What | The refusal says |
 |---|---|
-| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:275`) |
+| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:282`) |
 | a certificate that no root and no `ca` vouches for | "TLS to *host*: …" |
 | a cleartext or MD5 password asked for, or Kerberos, GSSAPI or SSPI | "the upstream asked for …; the proxy authenticates with SCRAM-SHA-256 only" |
 | SASL without SCRAM-SHA-256 | "the upstream offers no SCRAM-SHA-256" |
@@ -1120,7 +1123,7 @@ sequenceDiagram
 | a client asking for a replication connection | refused before any upstream is dialled |
 
 The proxy's refusals reach the client as Postgres writes a fatal error
-(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:378`). An upstream's own
+(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:386`). An upstream's own
 error, such as a wrong password or an unknown database, is relayed as the
 upstream wrote it.
 
@@ -1164,6 +1167,61 @@ for each test:
 - a cancel;
 - the order of a negotiation and a notice;
 - RFC 7677's exchange, byte for byte.
+
+### The endpoint and `vault_connect` (P3-5b-2)
+
+`vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
+secret's `user` and `password` toward the upstream, serves the engine above on
+a socket only the session's account can reach, and answers how to connect,
+with no credential anywhere in the answer
+(`agents/roomlerd/src/hive/vault_connect.rs`).
+
+```mermaid
+sequenceDiagram
+    participant M as the session (Claude Code)
+    participant T as its toolbelt (roomlerd)
+    participant V as vault
+    participant E as the endpoint (roomlerd)
+    participant U as upstream (Postgres)
+    M->>T: vault_connect {handle, engine, upstream, ca?}
+    Note over M,T: asked of a person first, as every use is
+    T->>V: lease #user, #password (and the CA), proxy mode, toward host:port
+    Note over V: proxy-only-named-audiences:<br/>an upstream the secret names, exactly
+    V-->>T: the leases, sealed to the device's key
+    T->>E: bind proxies/<id>/.s.PGSQL.5432, the account's, 0600
+    T-->>M: host (the directory), port, uri, env, ttl_s: no value
+    M->>E: psql host=<directory>, any user, no password
+    Note over E: the peer's uid is the session account's
+    E->>U: TLS verified, SCRAM-SHA-256 with the values read from the leases now
+    E-->>M: AuthenticationOk, then a session as the secret's user
+    Note over E: the first lease let go closes the endpoint<br/>and every connection it holds
+```
+
+| Step | What holds | Where |
+|---|---|---|
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`. `upstream`: `host:port`, exactly as the secret's `audiences` names it (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port). `database`: optional, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:141`, `vault_connect.rs:99` |
+| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:293` |
+| the leases | the secret's `user` and `password`, and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:434` |
+| the values | read once to check them (a user Postgres takes; a CA that parses), then again from the leases as each connection starts, never kept by the endpoint | `vault_connect.rs:335` |
+| the endpoint | `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`: both directories the daemon's (`0711`), the socket handed to the session's account (`0600`). A Postgres client dials it as `host=<that directory>`, port 5432 | `vault_connect.rs:375` |
+| a connection | from the session's account only (its peer uid checked again, root's refused too), at most 16 at once, one engine session each | `vault_connect.rs:575` |
+| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket and every connection it holds. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:491`, `vault_connect.rs:613`, `vault_connect.rs:232` |
+| the answer | `host`, `port`, `database`, a `uri` (`postgresql:///<db>?host=<dir>&port=5432`) and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value | `vault_connect.rs:531` |
+
+> [!WARNING]
+> - **The settings ASK for every call.** `vault_connect` hands the session no
+>   value, but the endpoint acts as the secret's user, so it is asked for with
+>   the other uses (`permissions.ask`, §14), and a repository's own settings
+>   cannot allow it past the person.
+> - **What closes an endpoint is the lease client's own let-go.** The daemon's
+>   lease client cancels the stop token of every endpoint served with a lease
+>   whenever it lets that lease go (`stop_with`, §12), as it removes a rendered
+>   file (§15). A connection therefore never outlives its lease.
+> - **Windows serves no endpoint yet.** Its database clients mostly cannot dial
+>   a Unix socket, so a call there is refused before anything is leased.
+>   P3-5b-4 serves loopback TCP, each connection's process identified.
+> - **A use is not reported yet.** `vault_activity` (§17) takes `exec` and
+>   `render`; a `proxy` endpoint's opening is a later step's report.
 
 ## 20. Audit
 
@@ -1238,7 +1296,7 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5b-2 | the device's proxy endpoint and `vault_connect`, serving the Postgres engine (§19) for one lease |
+| P3-5b-4 | the Windows endpoint: loopback TCP, each connection's process identified and refused unless it runs as the session's account |
 | P3-5b-3 | SCRAM channel binding (`tls-server-end-point`) where the upstream offers `-PLUS` |
 | P3-5c to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): MongoDB, HTTP named upstreams, the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |

@@ -27,6 +27,15 @@ fn a_request_names_a_secret_a_mode_a_use_takes_and_its_audience() {
     )
     .unwrap();
     assert_eq!((file.mode, file.ttl), ("file", 900));
+    // P3-5b-2 — `proxy`, toward the upstream `vault_connect` will name.
+    let proxy = parse(
+        &json!({"handle": "db/main#password", "mode": "proxy", "audience": "db.internal:5432"}),
+    )
+    .unwrap();
+    assert_eq!(
+        (proxy.mode, proxy.audience.as_str()),
+        ("proxy", "db.internal:5432")
+    );
 }
 
 #[test]
@@ -34,8 +43,9 @@ fn a_request_no_use_could_take_is_refused() {
     for bad in [
         json!({"mode": "exec", "audience": "psql"}),
         json!({"handle": "", "mode": "exec", "audience": "psql"}),
-        // Only the modes a use tool takes: proxy waits for its own phase.
+        // A proxy's audience is an upstream, host:port; a bare name is not.
         json!({"handle": "db/main", "mode": "proxy", "audience": "psql"}),
+        json!({"handle": "db/main", "mode": "exec", "audience": "db.internal:5432"}),
         json!({"handle": "db/main", "mode": "env", "audience": "psql"}),
         json!({"handle": "db/main", "audience": "psql"}),
         json!({"handle": "db/main", "mode": "exec"}),

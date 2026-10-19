@@ -191,13 +191,20 @@ mod client {
         /// P3-4c-2 — files a tool wrote with this lease's value: removed
         /// whenever the lease is let go, however that happens.
         files: Vec<std::path::PathBuf>,
+        /// P3-5b-2 — what a tool serves with this lease's value (a proxy
+        /// endpoint): cancelled whenever the lease is let go.
+        stops: Vec<tokio_util::sync::CancellationToken>,
     }
 
     /// Let go of leases already taken out of the map: each value is zeroed as
-    /// it drops, and every file written with it is removed. Answers how many.
+    /// it drops, every file written with it is removed, and everything served
+    /// with it is stopped. Answers how many.
     fn let_go(gone: Vec<Held>) -> usize {
         let n = gone.len();
         for h in gone {
+            for s in &h.stops {
+                s.cancel();
+            }
             for f in &h.files {
                 match std::fs::remove_file(f) {
                     Ok(()) => {}
@@ -553,6 +560,7 @@ mod client {
                     until,
                     value,
                     files: Vec::new(),
+                    stops: Vec::new(),
                 },
             );
             if reply.send(Ok(info)).is_err() {
@@ -621,6 +629,20 @@ mod client {
             match lock(&self.held).get_mut(lease_id) {
                 Some(h) => {
                     h.files.push(path.to_path_buf());
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// P3-5b-2 — `stop` is cancelled when `lease_id` is let go, however
+        /// that happens: what a tool serves with the lease's value (a proxy
+        /// endpoint and its connections) ends with it. `false` when the
+        /// lease is not held (any more): the caller stops itself.
+        pub fn stop_with(&self, lease_id: &str, stop: tokio_util::sync::CancellationToken) -> bool {
+            match lock(&self.held).get_mut(lease_id) {
+                Some(h) => {
+                    h.stops.push(stop);
                     true
                 }
                 None => false,
@@ -1350,6 +1372,52 @@ mod tests {
                 !c.attach("gone", &dir.path().join("never")),
                 "a lease not held takes no file"
             );
+        }
+
+        /// P3-5b-2 — what is served with a lease's value stops whenever the
+        /// lease goes: at a revocation, a release, the run's end and its
+        /// expiry. A lease no longer held takes no stop, and one still held
+        /// stops nothing.
+        #[tokio::test]
+        async fn what_is_served_with_a_lease_stops_whenever_it_goes() {
+            use tokio_util::sync::CancellationToken;
+            let (c, mut rx) = connected();
+            let sid = ObjectId::new();
+            let served = |id: &str| {
+                let stop = CancellationToken::new();
+                assert!(c.stop_with(id, stop.clone()), "{id} is held");
+                stop
+            };
+
+            lease(&c, &mut rx, "R", sid, 1, in_ms(60_000)).await;
+            let revoked = served("R");
+            lease(&c, &mut rx, "K", sid, 1, in_ms(60_000)).await;
+            let kept = served("K");
+            c.on_revoke(&["R".to_string()], "value_changed");
+            assert!(revoked.is_cancelled(), "a revocation stops it");
+            assert!(!kept.is_cancelled(), "another lease's stays");
+
+            lease(&c, &mut rx, "S", sid, 1, in_ms(60_000)).await;
+            let released = served("S");
+            c.release(&["S".to_string()]);
+            assert!(released.is_cancelled(), "a release stops it");
+
+            lease(&c, &mut rx, "D", sid, 2, in_ms(60_000)).await;
+            let ended = served("D");
+            c.drop_run(sid, 2);
+            assert!(ended.is_cancelled(), "the run's end stops it");
+
+            lease(&c, &mut rx, "E", sid, 3, in_ms(1)).await;
+            let expired = served("E");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c.prune();
+            assert!(expired.is_cancelled(), "the expiry stops it");
+
+            assert!(
+                !c.stop_with("gone", CancellationToken::new()),
+                "a lease not held takes no stop"
+            );
+            assert!(!kept.is_cancelled());
         }
 
         /// P3-4c-3 — a lease asked for ahead is found only for exactly what

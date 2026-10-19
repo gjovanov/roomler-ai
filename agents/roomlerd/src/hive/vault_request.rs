@@ -4,9 +4,9 @@
 //!
 //! | Step | What holds |
 //! |---|---|
-//! | the call | `handle` (a path or this org's RRN, `#field` for a field), `mode` (`exec` or `file`, the modes a use takes), `audience` (a bare name: the program `vault_exec` will run, or the file `vault_render` will write), `ttl_s` (30 to 900, default 300) |
+//! | the call | `handle` (a path or this org's RRN, `#field` for a field), `mode` (`exec`, `file` or `proxy`, the modes a use takes), `audience` (a bare name: the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to, `host:port`), `ttl_s` (30 to 900, default 300) |
 //! | the lease | asked for once, decided by the vault's `secret:use` with its guardrails, recorded; held in daemon memory, never handed to the session |
-//! | its use | a later `vault_exec` or `vault_render` naming the same secret toward the same audience takes it, while it covers what that call needs, instead of asking again; every such call still asks a person |
+//! | its use | a later `vault_exec`, `vault_render` or `vault_connect` naming the same secret toward the same audience takes it, while it covers what that call needs, instead of asking again; every such call still asks a person |
 //! | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go |
 //!
 //! A use takes the lease by WHAT it is, not by its id: the call still names
@@ -25,7 +25,7 @@ const DEFAULT_TTL: u32 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AheadRequest {
     pub(crate) handle: Handle,
-    /// `exec` or `file`: the modes a use tool takes.
+    /// `exec`, `file` or `proxy`: the modes a use tool takes.
     pub(crate) mode: &'static str,
     pub(crate) audience: String,
     pub(crate) ttl: u32,
@@ -41,15 +41,26 @@ pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
     let mode = match args.get("mode").and_then(Value::as_str) {
         Some("exec") => "exec",
         Some("file") => "file",
-        _ => return Err("mode must be exec (for vault_exec) or file (for vault_render)".into()),
+        Some("proxy") => "proxy",
+        _ => {
+            return Err(
+                "mode must be exec (for vault_exec), file (for vault_render) or proxy (for \
+                 vault_connect)"
+                    .into(),
+            );
+        }
     };
     let audience = args
         .get("audience")
         .and_then(Value::as_str)
-        .ok_or("audience is required: the program's or the file's bare name")?;
-    // A bare name, by the one rule the vault holds `exec_allow` to, as the
-    // use that takes the lease will name it.
-    if !roomler_ai_remote_control::vault::program_name_ok(audience) {
+        .ok_or("audience is required: the program's or the file's bare name, or an upstream")?;
+    // P3-5b-2 — an upstream, as `vault_connect` will name it.
+    if mode == "proxy" {
+        super::vault_connect::upstream_of(audience)?;
+    }
+    // Otherwise a bare name, by the one rule the vault holds `exec_allow` to,
+    // as the use that takes the lease will name it.
+    else if !roomler_ai_remote_control::vault::program_name_ok(audience) {
         return Err(format!(
             "audience must be a bare name (letters, digits, `.`, `_`, `+` or `-`, not \
              starting with `.` or `-`): got {audience:?}"

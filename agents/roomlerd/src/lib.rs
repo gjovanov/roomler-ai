@@ -225,10 +225,11 @@ pub mod updater;
 /// everywhere; without the `vault` feature it makes nothing.
 pub mod vault;
 /// FR-90 P3-5 — the vault's proxies: an endpoint that authenticates upstream
-/// with a leased value. P3-5b-1 builds the engine; P3-5b-2's endpoint is its
-/// first caller, until which nothing outside its tests reaches it.
+/// with a leased value. P3-5b-1 builds the engine; P3-5b-2's endpoint
+/// (`hive::vault_connect`) serves it on Unix. Windows serves no endpoint yet
+/// (P3-5b-4), so nothing there reaches it outside its tests.
 #[cfg(feature = "vault")]
-#[allow(dead_code)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod vault_proxy;
 pub mod version_sweep;
 pub mod virtual_desktop;
