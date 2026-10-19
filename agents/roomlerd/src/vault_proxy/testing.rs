@@ -657,6 +657,27 @@ pub(crate) async fn fake_http() -> (String, u16, mpsc::UnboundedReceiver<HttpSaw
                                 resp.headers_mut()
                                     .insert("connection", "close".parse().unwrap());
                             }
+                            // P3-5d-2 — a git server's advertisement of one
+                            // repository's refs (smart HTTP, protocol v0).
+                            "/org/repo.git/info/refs" => {
+                                let pkt = |s: &str| format!("{:04x}{s}", s.len() + 4);
+                                let sha = "1".repeat(40);
+                                let refs = format!(
+                                    "{}0000{}{}0000",
+                                    pkt("# service=git-upload-pack\n"),
+                                    pkt(&format!(
+                                        "{sha} HEAD\0symref=HEAD:refs/heads/main agent=git/fake\n"
+                                    )),
+                                    pkt(&format!("{sha} refs/heads/main\n")),
+                                );
+                                *resp.body_mut() = Full::new(Bytes::from(refs));
+                                resp.headers_mut().insert(
+                                    "content-type",
+                                    "application/x-git-upload-pack-advertisement"
+                                        .parse()
+                                        .unwrap(),
+                                );
+                            }
                             _ => {}
                         }
                         Ok::<_, std::convert::Infallible>(resp)

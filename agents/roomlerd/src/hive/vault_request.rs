@@ -54,9 +54,18 @@ pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
         .get("audience")
         .and_then(Value::as_str)
         .ok_or("audience is required: the program's or the file's bare name, or an upstream")?;
-    // P3-5b-2 — an upstream, as `vault_connect` will name it.
+    // P3-5b-2 — an upstream, as `vault_connect` will name it: a database's
+    // `host:port`, or (P3-5d-2) an HTTP upstream's origin.
     if mode == "proxy" {
-        super::vault_connect::upstream_of(audience)?;
+        let named = super::vault_connect::upstream_of(audience).is_ok()
+            || super::vault_connect::origin_of(audience).is_ok();
+        if !named {
+            return Err(format!(
+                "a proxy's audience is its upstream, as vault_connect will name it: a database's \
+                 host:port (such as db.internal:5432), or an origin for http (such as \
+                 https://github.com): got {audience:?}"
+            ));
+        }
     }
     // Otherwise a bare name, by the one rule the vault holds `exec_allow` to,
     // as the use that takes the lease will name it.

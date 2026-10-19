@@ -36,6 +36,12 @@ fn a_request_names_a_secret_a_mode_a_use_takes_and_its_audience() {
         (proxy.mode, proxy.audience.as_str()),
         ("proxy", "db.internal:5432")
     );
+    // P3-5d-2 — or toward an HTTP upstream's origin.
+    let http = parse(
+        &json!({"handle": "git/bot#token", "mode": "proxy", "audience": "https://github.com"}),
+    )
+    .unwrap();
+    assert_eq!(http.audience, "https://github.com");
 }
 
 #[test]
@@ -45,6 +51,10 @@ fn a_request_no_use_could_take_is_refused() {
         json!({"handle": "", "mode": "exec", "audience": "psql"}),
         // A proxy's audience is an upstream, host:port; a bare name is not.
         json!({"handle": "db/main", "mode": "proxy", "audience": "psql"}),
+        // P3-5d-2 — an origin, as vault_connect names one: no path, no 443.
+        json!({"handle": "git/bot", "mode": "proxy", "audience": "https://github.com/"}),
+        json!({"handle": "git/bot", "mode": "proxy", "audience": "https://github.com:443"}),
+        json!({"handle": "git/bot", "mode": "proxy", "audience": "http://github.com"}),
         json!({"handle": "db/main", "mode": "exec", "audience": "db.internal:5432"}),
         json!({"handle": "db/main", "mode": "env", "audience": "psql"}),
         json!({"handle": "db/main", "audience": "psql"}),
