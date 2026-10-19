@@ -571,3 +571,58 @@ fn an_ssh_call_names_a_host_and_leases_a_key_and_its_hosts() {
         assert!(refused.contains(says), "{bad}: {refused}");
     }
 }
+
+/// P3-5f-3 — an SSH agent's pipe serves its peer's account alone. Granted to
+/// this test's own account but admitting another's (SYSTEM's), the test's own
+/// connection is refused by its SID, as any other account's would be; one
+/// admitting this account takes it.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_pipe_serves_its_peers_account_alone() {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    use super::endpoint::Place;
+    let own = crate::hive_win::own_sid().unwrap();
+    let elsewhere = super::endpoint::pipe::bind_as(&own, "S-1-5-18").unwrap();
+    let _client = ClientOptions::new().open(elsewhere.name()).unwrap();
+    let stream = elsewhere.accept().await.unwrap();
+    let refused = elsewhere.admits(&stream).unwrap_err();
+    assert!(refused.contains(&own), "refused by its SID: {refused}");
+
+    let here = super::endpoint::pipe::bind_as(&own, &own).unwrap();
+    let _client = ClientOptions::new().open(here.name()).unwrap();
+    let stream = here.accept().await.unwrap();
+    assert_eq!(here.admits(&stream), Ok(()));
+}
+
+/// P3-5f-3 — the agent pipe's grant lets the session's account open it as
+/// Win32-OpenSSH opens an agent, `GENERIC_READ | GENERIC_WRITE` (tokio's
+/// client asks for the same), where the toolbelt pipe's grant would refuse
+/// it. Each pipe here grants this test's account alone, its SYSTEM and
+/// Administrators grants taken out, so an elevated test cannot pass by them:
+/// a session's own token has its Administrators group deny-only.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_agent_pipe_opens_as_win32_openssh_opens_it() {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let own = crate::hive_win::own_sid().unwrap();
+    let alone = |sddl: String| sddl.replace("(A;;GA;;;SY)", "").replace("(A;;GA;;;BA)", "");
+    for (sddl, opens) in [
+        (alone(crate::hive_win::agent_pipe_sddl(&own)), true),
+        (alone(crate::hive_win::toolbelt_pipe_sddl(&own)), false),
+    ] {
+        assert!(!sddl.contains(";BA)") && !sddl.contains(";SY)"), "{sddl}");
+        let name = format!(
+            r"\\.\pipe\roomler-vault-test-{:016x}",
+            rand::random::<u64>()
+        );
+        let _server = super::super::toolbelt::pipe_instance(&name, &sddl, true).unwrap();
+        let opened = ClientOptions::new().open(&name);
+        match (opened, opens) {
+            (Ok(_), true) => {}
+            (Err(e), false) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{sddl}"),
+            (got, _) => panic!("{sddl}: {got:?}"),
+        }
+    }
+}

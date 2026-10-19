@@ -991,6 +991,23 @@ pub fn toolbelt_pipe_sddl(peer: &str) -> String {
     format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;{peer})S:(ML;;NW;;;ME)")
 }
 
+/// FR-90 P3-5f-3 — a vault SSH agent's pipe: SYSTEM's and Administrators', as
+/// the toolbelt pipe's, and the session's account's (`peer`) to open for
+/// reading and writing whole (`GRGW`), since that is how Win32-OpenSSH opens
+/// an agent (`GENERIC_READ | GENERIC_WRITE`, its `fileio_connect`). The
+/// toolbelt pipe's `0x12008b` leaves out `FILE_APPEND_DATA`,
+/// `FILE_WRITE_ATTRIBUTES` and `FILE_WRITE_EA`, so a session's `ssh.exe`, whose
+/// token's Administrators group is deny-only, would be refused.
+///
+/// ⚠️ `GENERIC_WRITE` carries `FILE_CREATE_PIPE_INSTANCE`: a process of that
+/// account could add an instance of its own and take the next `ssh`'s agent
+/// connection. Unlike on the toolbelt pipe, that gains it nothing it lacks: it
+/// can already connect to the agent as that account, and point its own `ssh`
+/// anywhere; the key never crosses the pipe.
+pub fn agent_pipe_sddl(peer: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{peer})S:(ML;;NW;;;ME)")
+}
+
 /// FR-97 P4c — the adopt pipe: the toolbelt pipe's grants, with every
 /// Interactive user (`IU`) in place of one session's account, since any person
 /// at this machine may adopt their own terminal sessions.

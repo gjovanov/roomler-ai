@@ -451,7 +451,7 @@ serves an HTTP upstream, adding a secret's credential to every request sent
 through, and git takes it by `insteadOf` from the answer's `env`; from P3-5e-2 a Kubernetes
 API server too, its answer a kubeconfig with no credential; and from P3-5f-2
 an SSH agent, which signs the session's own `ssh` in to one host, its answer
-`SSH_AUTH_SOCK` and that host's keys. The settings ASK for it
+`SSH_AUTH_SOCK` and that host's keys (on Windows, from P3-5f-3, a named pipe). The settings ASK for it
 with the uses: no value reaches the session, but the endpoint acts as the
 secret's user. From P3-4e-2, where the vault's
 policies ask for a person's approval of a lease, the vault posts its own card
@@ -471,7 +471,7 @@ the other end.
 | | Linux, macOS | Windows |
 |---|---|---|
 | the endpoint | `<runtime>/<session>/toolbelt.sock`, handed to the session's account, `0600`, in a directory only the daemon writes | `\\.\pipe\roomler-hive-<session>-<nonce>`, made with `FILE_FLAG_FIRST_PIPE_INSTANCE` so a name someone holds is refused, never joined; remote clients rejected |
-| who may connect | the kernel admits the account and root, and the daemon checks the peer's uid again on every connection | the DACL grants SYSTEM and Administrators, and the account `0x12008b`: read and write, but not `FILE_CREATE_PIPE_INSTANCE`, which would let it add an instance of its own and take the next connection. Each client's SID is checked again, and the relay opens the pipe with exactly that access, at the identification level ([`hive_win.rs:990`](../agents/roomlerd/src/hive_win.rs#L990), [`:1131`](../agents/roomlerd/src/hive_win.rs#L1131)) |
+| who may connect | the kernel admits the account and root, and the daemon checks the peer's uid again on every connection | the DACL grants SYSTEM and Administrators, and the account `0x12008b`: read and write, but not `FILE_CREATE_PIPE_INSTANCE`, which would let it add an instance of its own and take the next connection. Each client's SID is checked again, and the relay opens the pipe with exactly that access, at the identification level ([`hive_win.rs:990`](../agents/roomlerd/src/hive_win.rs#L990), [`:1148`](../agents/roomlerd/src/hive_win.rs#L1148)) |
 
 ⚠️ **It is deliberately not the LocalAPI socket.** On a root daemon that one is
 root-only, and most of its verbs trust the socket alone. A process running as the
@@ -510,7 +510,7 @@ sequenceDiagram
 | Only a driver's grant answers; a reader's `answer` is refused on the device | | device [`view.rs:1033`](../agents/roomlerd/src/hive/view.rs#L1033) |
 | Unanswered for 25 minutes is a denial that says so. Progress goes to Claude Code every 60 s while a person decides, and the tool-call timeout in the MCP config is 30 minutes | what the model reads is our answer, never a transport error | [`toolbelt.rs:102`](../agents/roomlerd/src/hive/toolbelt.rs#L102) |
 | At most 4 approvals are open per session, and a fifth is refused at once | Claude Code asks one at a time (measured), so more is not Claude Code | [`toolbelt.rs:108`](../agents/roomlerd/src/hive/toolbelt.rs#L108) |
-| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1278`](../agents/roomlerd/src/hive/toolbelt.rs#L1278) |
+| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1283`](../agents/roomlerd/src/hive/toolbelt.rs#L1283) |
 | A denial reaches the model as a failed tool result with our words verbatim, for example "Alice denied this: not now" | the model knows who said no, and why | |
 
 ---
@@ -761,7 +761,7 @@ sequenceDiagram
 |---|---|---|
 | The peer is the client's **token**, taken by impersonating it after its first line. Never its pid | the pipe takes any interactive user, so a client that ended (its handle passed to a process of its own) must never be named by whatever process took its pid | [`hive_win.rs:445`](../agents/roomlerd/src/hive_win.rs#L445) `pipe_peer` |
 | SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are refused (`root`) | Windows' counterparts of root, and a client that forbade identification | [`hive_win.rs:429`](../agents/roomlerd/src/hive_win.rs#L429) |
-| The pipe gives every interactive user `0x12008b` (read and write data), never `GENERIC_WRITE`. Only SYSTEM, Administrators and the daemon's own account may add an instance | `GENERIC_WRITE` carries `FILE_CREATE_PIPE_INSTANCE`, with which a person could add an instance of their own and take another person's next hook. The daemon's own account is there for an attended worker that could not be elevated | [`hive_win.rs:1010`](../agents/roomlerd/src/hive_win.rs#L1010) |
+| The pipe gives every interactive user `0x12008b` (read and write data), never `GENERIC_WRITE`. Only SYSTEM, Administrators and the daemon's own account may add an instance | `GENERIC_WRITE` carries `FILE_CREATE_PIPE_INSTANCE`, with which a person could add an instance of their own and take another person's next hook. The daemon's own account is there for an attended worker that could not be elevated | [`hive_win.rs:1027`](../agents/roomlerd/src/hive_win.rs#L1027) |
 | The first instance is the first (`first_pipe_instance`), retried loudly every 30 s while another process holds the name; remote clients are refused | a squatter keeps the daemon from serving, and gets nothing: each hook checks first | [`supervisor/adopt.rs:573`](../agents/roomlerd/src/hive/supervisor/adopt.rs#L573) |
 | The hook opens the pipe with exactly that mask, at identification level, and sends nothing unless the pipe is owned by SYSTEM, the Administrators group or the hook's own account: the owners the daemon's instances have. ⚠️ The pipe's **owner**, read through its own handle, not the server process's token, which a person may not open for a SYSTEM process: the first field run's check refused the real daemon | otherwise whoever took the name first would receive the person's transcript, and a person cannot make SYSTEM or Administrators the owner of a pipe they create | [`hive_adopt.rs:226`](../crates/localapi/src/hive_adopt.rs#L226) `server_is_trusted` |
 | A record keeps the account's SID where Unix keeps the uid; lines from another SID are `not_yours` | a local and a domain account may share a name, or a RID, never a SID | [`supervisor/adopt.rs:176`](../agents/roomlerd/src/hive/supervisor/adopt.rs#L176) `is_peer` |
@@ -831,9 +831,9 @@ other organization reads the 404.
 
 The store, `hosted.json` and each session's runtime files live in the service's
 machine-wide directory, `%ProgramData%\roomler\roomler\hive`
-([`hive_win.rs:1016`](../agents/roomlerd/src/hive_win.rs#L1016)), which both kinds of
+([`hive_win.rs:1033`](../agents/roomlerd/src/hive_win.rs#L1033)), which both kinds of
 worker reach. Every directory there is owned by Administrators with a protected DACL,
-set by [`dir_with_dacl`](../agents/roomlerd/src/hive_win.rs#L1084) as it is made, or
+set by [`dir_with_dacl`](../agents/roomlerd/src/hive_win.rs#L1101) as it is made, or
 again on one already there.
 
 | Directory | SDDL | Means |
@@ -1098,7 +1098,7 @@ The child gets 120 s ([`checkpointer.rs:313`](../agents/roomlerd/src/hive/checkp
 and may write at most the limits' sum. On Unix it is started through the session's
 privilege path ([`checkpointer.rs:603`](../agents/roomlerd/src/hive/checkpointer.rs#L603)).
 On Windows it runs as the user signed in at the console, whom `hive_accounts` must name
-([`hive_win.rs:1243`](../agents/roomlerd/src/hive_win.rs#L1243)), in a job of its own.
+([`hive_win.rs:1260`](../agents/roomlerd/src/hive_win.rs#L1260)), in a job of its own.
 
 ⚠️ **An ended checkpoint takes its `git` with it.** On Unix the child leads its own
 process group, and a timeout, too much output or an abandoned checkpoint signals the
@@ -1211,7 +1211,7 @@ feed then meets a closed pipe, which would otherwise be all that is said
 ([`child.rs:79`](../agents/roomlerd/src/hive/child.rs#L79)). On Unix the runner, its
 process group and its time limit are the ones `hive-checkpoint` uses. On Windows a
 thread of its own feeds the child's pipe
-([`hive_win.rs:1293`](../agents/roomlerd/src/hive_win.rs#L1293)).
+([`hive_win.rs:1310`](../agents/roomlerd/src/hive_win.rs#L1310)).
 
 The files are written `0600` because a checkpoint taken on Windows records mode 0,
 and restoring that on Linux would leave the account unable to read its own history.
@@ -3161,7 +3161,7 @@ sequenceDiagram
 | A `pack` is held to the want it answers: the same commit, thin only against commits the want named, and chunks that follow one another from offset 0, each a blob the stream carries. Otherwise the stream ends `bad_pack`, or `bad_blob` for a blob in the pack's place, and nothing is applied or kept | a source cannot make a target keep a substitute for a commit it did not ask about, or one its clone cannot resolve | [`stream.rs:385`](../crates/hive-node/src/stream.rs#L385) `check_pack` |
 | The target asks for the chunks with `need` and keeps them as blobs. Once every chunk is here it keeps the substitute, fetches the checkpoint's other blobs and applies the event. It never asks for the whole pack's own blobs | the store applies a checkpoint only with its blobs or a substitute for its pack (P2f-2a), and the materialize then reads the substitute | [`supervisor/stream.rs:1507`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1507) `take_event`, [`:1562`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1562) `fetch_blobs` |
 | On `no_pack`, or from a source whose hello did not say `packs`, the target takes the whole pack's blobs, as before | have and want only saves bytes. It never decides whether the copy moves | [`supervisor/stream.rs:1777`](../agents/roomlerd/src/hive/supervisor/stream.rs#L1777) |
-| `hive-pack` runs as the account wherever a session runs: a child fed its request on stdin, and on Windows a child in the console user's session, as `hive-checkpoint` runs | the daemon never opens a path in the account's tree | [`packer.rs:280`](../agents/roomlerd/src/hive/packer.rs#L280) `ask`, [`:417`](../agents/roomlerd/src/hive/packer.rs#L417) `pack_main`, [`hive_win.rs:1255`](../agents/roomlerd/src/hive_win.rs#L1255) `pack_command_line` |
+| `hive-pack` runs as the account wherever a session runs: a child fed its request on stdin, and on Windows a child in the console user's session, as `hive-checkpoint` runs | the daemon never opens a path in the account's tree | [`packer.rs:280`](../agents/roomlerd/src/hive/packer.rs#L280) `ask`, [`:417`](../agents/roomlerd/src/hive/packer.rs#L417) `pack_main`, [`hive_win.rs:1272`](../agents/roomlerd/src/hive_win.rs#L1272) `pack_command_line` |
 
 ⚠️ **Off by default.** `hive.teleport_have_want` stays off until the operator confirms
 decision 16. Until then a teleport's target takes the whole pack, as before. Turning it on
