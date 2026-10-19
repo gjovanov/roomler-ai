@@ -26,7 +26,7 @@ People use it too.
 > answers, a session's tools that wait for the answer, and the card's
 > buttons in the web app (§18); P3-5a, a secret's `audiences` held to for
 > `proxy` mode, the first step of the proxies (§7); P3-5b-1, the Postgres
-> engine a proxy endpoint serves; P3-5b-2, `vault_connect` and its
+> engine a proxy endpoint serves, and P3-5c-1 the MongoDB one; P3-5b-2, `vault_connect` and its
 > endpoint, which signs in to a database as a secret's user for the
 > session's account; P3-5b-3, the exchange bound to the certificate the
 > proxy verified; and P3-5b-4, the endpoint on Windows, a loopback port
@@ -1181,6 +1181,58 @@ for each test:
   certificates made in the test, none for Ed25519 or RSASSA-PSS, and SHA-1
   made SHA-256.
 
+### The MongoDB engine (P3-5c-1)
+
+The second engine, in `agents/roomlerd/src/vault_proxy/mongo.rs`: one
+client connection on the endpoint, one upstream connection the proxy signs
+in itself. Nothing calls it yet; P3-5c-2 serves it from `vault_connect`.
+
+```mermaid
+sequenceDiagram
+    participant C as client (mongosh, a driver)
+    participant P as the proxy (roomlerd)
+    participant U as upstream (mongod, mongos)
+    C->>P: its handshake: isMaster or hello, with its metadata
+    Note over P: held, not yet sent
+    P->>U: TCP, then TLS from the first byte, the certificate verified
+    P->>U: saslStart SCRAM-SHA-256, as the secret's user, in its auth database
+    U-->>P: the server's first message
+    P->>U: saslContinue: a proof, never the password
+    U-->>P: the server's signature
+    Note over P: the signature checked
+    P->>U: the client's handshake, the connection's first hello
+    U-->>C: its answer, then every byte both ways, through P
+```
+
+| Step | What the engine does | Where |
+|---|---|---|
+| the client's first message | read whole, at most 1 MiB: its handshake, `hello` or the legacy `isMaster`, as `OP_MSG` or `OP_QUERY`; held until the session starts | `mongo.rs:80`, `mongo.rs:50` |
+| the upstream | TCP, then TLS from its first byte, verified against the system's roots and the secret's `ca` | `mongo.rs:123` |
+| its authentication | SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user named in the exchange (MongoDB takes it from there, not from a startup), `skipEmptyExchange` asked for, and the empty exchange given to a server before 4.4 that still asks for it | `mongo.rs:145`, `mongo.rs:186` |
+| the server's signature | checked before a byte of the client's is sent: a server that cannot sign is refused | `mongo.rs:183` |
+| then | the client's first message, then every byte both ways | `mongo.rs:106` |
+| a refusal | answers the client's first message as a server would: an `OP_REPLY` to an `OP_QUERY`, an `OP_MSG` to an `OP_MSG`, `ok: 0` with the reason and the code of a failed sign-in (18) | `mongo.rs:357` |
+
+> [!WARNING]
+> - **The proxy sends no `hello` of its own.** A server takes client
+>   metadata only in the first `hello` a connection sees, and refuses it in
+>   any later one (`ClientMetadataCannotBeMutated`). The design had the
+>   proxy run `hello` first; it does not, so the client's handshake, sent
+>   after the sign-in, is the connection's first.
+> - **No channel binding.** MongoDB's SCRAM has none, so a MongoDB upstream
+>   relies on verified TLS alone.
+> - **One host.** The client connects with `directConnection=true`, so it
+>   never discovers another member to dial around the proxy. SRV discovery
+>   and replica-set failover come later.
+
+**Tested** against a fake MongoDB over real TLS: the whole road (signed in
+first, no `hello` of the proxy's own, the client's handshake with its
+metadata the connection's first, then a command); a wrong password's
+refusal answering the client's first message in each kind, which never
+reaches the upstream; a server that cannot sign; a server before 4.4 given
+its empty exchange; and a first message past its bound, and an upstream no
+root vouches for.
+
 ### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4)
 
 `vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
@@ -1314,6 +1366,7 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5c to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): MongoDB, HTTP named upstreams, the Kubernetes API and the SSH agent |
+| P3-5c-2 | `vault_connect` serving the MongoDB engine: `engine: "mongodb"`, its socket and its connection string |
+| P3-5d to P3-5f | `proxy` mode's other engines, as designed in the spec (§3e): HTTP named upstreams, the Kubernetes API and the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

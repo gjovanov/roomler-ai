@@ -10,10 +10,15 @@
 //! | [`scram`] | SCRAM-SHA-256, the client's half: a proof of the password, never the password |
 //! | [`tls`] | TLS to an upstream, always verified: the system's roots, and a CA the secret holds |
 //! | [`pg`] | one Postgres session: the client let in by the endpoint, the upstream by SCRAM |
+//! | [`mongo`] | one MongoDB session: the same, by SCRAM in `saslStart` and `saslContinue` (P3-5c-1) |
 //!
 //! P3-5b-1 builds these; P3-5b-2's endpoint (`hive::vault_connect`) serves
 //! them, one session per connection.
 
+/// P3-5c-1 builds the MongoDB engine; P3-5c-2's endpoint is its first
+/// caller, until which nothing outside its tests reaches it.
+#[allow(dead_code)]
+pub(crate) mod mongo;
 pub(crate) mod pg;
 pub(crate) mod scram;
 #[cfg(test)]
