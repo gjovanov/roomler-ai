@@ -4016,17 +4016,56 @@ pub async fn connect() -> std::io::Result<Client> {
 /// truthful about the process they reached and completely misleading about the
 /// machine, which reads as "the overlay is broken".
 ///
-/// Returns `Some(path)` only when BOTH exist, i.e. exactly when a caller could
-/// be looking at the wrong one.
+/// Returns `Some(path)` only when BOTH exist AND different processes answer
+/// them, i.e. exactly when a caller could be looking at the wrong one.
+///
+/// #2511 — both existing is not two daemons. A system daemon ALSO binds the
+/// legacy per-user path (`serve_unix`), so a root CLI on a host with one root
+/// daemon found both, and told its reader a second daemon ran and to use the
+/// sudo they already had: on every `roomler exec <linux host> -- roomler
+/// status`. Each socket is now asked who answers it, by the peer's PID. A PID
+/// that cannot be read keeps the note, because staying silent would hide a
+/// real second daemon.
 #[cfg(unix)]
-pub fn other_daemon_socket() -> Option<std::path::PathBuf> {
+pub async fn other_daemon_socket() -> Option<std::path::PathBuf> {
     let [user, system] = unix_socket_candidates();
-    (user.exists() && system.exists()).then_some(system)
+    let (user_exists, system_exists) = (user.exists(), system.exists());
+    let same_process = if user_exists && system_exists {
+        match (socket_peer_pid(&user).await, socket_peer_pid(&system).await) {
+            (Some(a), Some(b)) => Some(a == b),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    second_daemon(user_exists, system_exists, same_process).then_some(system)
+}
+
+/// The decision behind [`other_daemon_socket`]: a second daemon only when
+/// both sockets exist and they are not known to lead to one process.
+#[cfg(unix)]
+fn second_daemon(user_exists: bool, system_exists: bool, same_process: Option<bool>) -> bool {
+    user_exists && system_exists && same_process != Some(true)
+}
+
+/// The PID of whoever answers `path`, from its peer credentials (Linux's
+/// `SO_PEERCRED`, macOS's `LOCAL_PEEREPID`). `None` when nothing answers
+/// within half a second or the OS does not say.
+#[cfg(unix)]
+async fn socket_peer_pid(path: &std::path::Path) -> Option<tokio::net::unix::pid_t> {
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::UnixStream::connect(path),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    stream.peer_cred().ok()?.pid()
 }
 
 /// Windows runs a single daemon, so there is never another one to point at.
 #[cfg(windows)]
-pub fn other_daemon_socket() -> Option<std::path::PathBuf> {
+pub async fn other_daemon_socket() -> Option<std::path::PathBuf> {
     None
 }
 
@@ -4877,6 +4916,44 @@ pub struct LanCaptureStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2511 — one process behind both sockets is one daemon (the system
+    /// daemon's legacy per-user bind), and only that case goes quiet.
+    #[cfg(unix)]
+    #[test]
+    fn one_daemon_behind_both_sockets_is_not_a_second_daemon() {
+        assert!(!second_daemon(true, true, Some(true)), "the legacy bind");
+        assert!(second_daemon(true, true, Some(false)), "macOS's two halves");
+        assert!(second_daemon(true, true, None), "unknowable: keep the note");
+        assert!(
+            !second_daemon(true, false, None),
+            "only the per-user socket"
+        );
+        assert!(
+            !second_daemon(false, true, Some(false)),
+            "only the system socket"
+        );
+    }
+
+    /// #2511 — the PID the decision compares is the listener's: our own
+    /// process, for a listener this test holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_peer_pid_of_a_listener_is_its_process() {
+        let path = std::env::temp_dir().join(format!("roomler-2511-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind a test socket");
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let pid = socket_peer_pid(&path).await;
+        let _ = accept.await;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(pid, Some(std::process::id() as tokio::net::unix::pid_t));
+        assert_eq!(
+            socket_peer_pid(&path).await,
+            None,
+            "nothing answers a removed socket"
+        );
+    }
 
     /// FR-97 P0c-3 — WIRE SHAPE. An OS-TUN exit client's status is
     /// byte-identical to one from before the field existed, and a status from

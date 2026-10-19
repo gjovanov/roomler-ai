@@ -227,6 +227,13 @@ The **LocalAPI** (named pipe `\\.\pipe\roomler` on Windows, `$XDG_RUNTIME_DIR/ro
 elsewhere) is the on-host control surface all three clients share — status, peers,
 flows, routes, consent decisions. Protocol reference: [tunnels.md](tunnels.md).
 
+A **system** daemon listens at `/var/run/roomler/roomler.sock`, and also at the legacy
+per-user path, for CLIs that predate the split. On macOS a per-user half answers a socket
+of its own. So two existing paths are not two daemons. When both exist, the CLI asks each
+for its peer's PID, and adds "a second roomler daemon is running" only when two processes
+answer (#2511). One process behind both is the system daemon's legacy bind, which every
+root `roomler status` used to report as a second daemon.
+
 ## Request flow & auth
 
 ```
