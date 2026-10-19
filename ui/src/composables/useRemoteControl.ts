@@ -5,6 +5,21 @@ import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 import type { Agent } from '@/stores/agents'
 import { sdpFingerprint, transportMac, verifyTransportMac } from '@/utils/extauth'
+import {
+  applyPeerAuthVerdict,
+  browserStorage,
+  judgePeerAuth,
+  newPeerAuthNonce,
+  peerAuthAskDisabled,
+  peerAuthCanVerify,
+  peerAuthFingerprint,
+  shouldAskPeerAuth,
+  singleFingerprint,
+  storagePins,
+  trustChangedKey,
+  type PeerAuthJudgement,
+  type PeerAuthPins,
+} from '@/utils/peerAuth'
 import { friendlyExtauthRefusal } from './useExternalLogin'
 import {
   cellCodecOfTransport,
@@ -629,6 +644,24 @@ export const EXTERNAL_ANSWER_UNSEALED =
 /** Every automatic retry ends here for an external session (spec decision 10). */
 export const EXTERNAL_SESSION_ENDED =
   'The session ended. A session from outside the organization cannot resume on its own: connect again with the device password.'
+
+/**
+ * FR-100 P2a — the device answered with another identity key than the one
+ * this browser pinned for it. The two fingerprints are shown so a person can
+ * compare them with the device's own.
+ */
+export function peerAuthKeyChangedMessage(was: string | null, now: string | null): string {
+  const keys = was && now ? ` (this browser knows ${was}; the answer came from ${now})` : ''
+  return (
+    `This device answered with a different identity key than the one this browser knows for it${keys}, ` +
+    'so the session was not started. Nothing was shown or sent. If the device was reinstalled, ' +
+    'you can trust its new key and connect again. Otherwise, someone between you and the device ' +
+    'may be impersonating it.'
+  )
+}
+/** FR-100 P2a — the device's signature does not verify over this session. */
+export const PEER_AUTH_BAD_SIGNATURE =
+  "The device's answer carried a signature that does not verify for this session, so the session was not started. Nothing was shown or sent."
 
 /**
  * User-facing text for `rc:error` codes. Server prose can carry
@@ -4240,7 +4273,17 @@ export function filterCapsByPreference(
  * tests + older callers can omit it and `supportsResume` falls
  * back to false (legacy rc.18 fail-fast upload semantics).
  */
-export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: boolean }) {
+export function useRemoteControl(
+  agent?: Ref<Agent | null>,
+  opts?: {
+    external?: boolean
+    /**
+     * FR-100 P2a — the signed-in user's id, which the device's signature over
+     * its answer names. Without it this page never asks for one.
+     */
+    userId?: () => string | null
+  },
+) {
   const ws = useWsStore()
   const phase = ref<RcPhase>('idle')
 
@@ -4254,6 +4297,59 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
   function forgetExternalAuth() {
     externalAuth?.appKey.fill(0)
     externalAuth = null
+  }
+
+  // FR-100 P2a — the device's signature over its answer. `peerAuthPlan` is
+  // decided when the request goes out, for the agent THAT request names (a
+  // device switch can race it); `peerAuthAsked` is what the offer then asked,
+  // so the answer is judged against exactly that. Both live for one attempt.
+  let peerAuthPlan: { agentId: string; userId: string } | null = null
+  let peerAuthAsked: {
+    agentId: string
+    userId: string
+    sessionId: string
+    nonce: string
+    offerFingerprint: string
+  } | null = null
+  /**
+   * What this page concluded about the last answer it asked a device to sign:
+   * the verdict, whose (user, device) pin it concerns, and both keys'
+   * fingerprints. Kept across a failed attempt on purpose (the error view
+   * offers "trust the new key" from it); cleared when the next offer goes out.
+   */
+  const peerAuth = ref<PeerAuthJudgement | null>(null)
+  let peerAuthPinStore: PeerAuthPins | null = null
+  const peerAuthPins = (): PeerAuthPins => (peerAuthPinStore ??= storagePins(browserStorage()))
+
+  /**
+   * FR-100 P2a — ask the device this request names to sign its answer? Only
+   * when the page's agent IS that device (its row carries what it signs
+   * with), the user is known (the signature names them), this page can verify
+   * at all, and the shared rules hold (`shouldAskPeerAuth`).
+   */
+  function planPeerAuth(agentId: string): { agentId: string; userId: string } | null {
+    const row = agent?.value?.id === agentId ? agent.value : null
+    const userId = opts?.userId?.() ?? null
+    if (!row || !userId || !peerAuthCanVerify()) return null
+    const ask = shouldAskPeerAuth({
+      external: externalMode,
+      rpc: row.capabilities?.rpc,
+      peerAuthKey: row.peer_auth_key,
+      disabled: peerAuthAskDisabled(browserStorage()),
+    })
+    return ask ? { agentId, userId } : null
+  }
+
+  /**
+   * FR-100 P2a — the person chose to trust the device's NEW key after a
+   * `key-changed` refusal: pin it, so the next attempt proceeds. It trusts
+   * that key and nothing else: the next answer must still carry a signature
+   * that verifies under it, over its own session.
+   */
+  function trustPeerAuthKey(): boolean {
+    if (!trustChangedKey(peerAuth.value, peerAuthPins())) return false
+    peerAuth.value = null
+    return true
   }
 
   /**
@@ -7976,6 +8072,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
             sdpFingerprint(offer.sdp ?? ''),
           )
         }
+        // FR-100 P2a — an in-org session asks the device to SIGN its answer:
+        // a fresh nonce rides the offer, and what was asked is kept to judge
+        // the answer by. An offer naming no single certificate asks nothing;
+        // the device could not sign against it either.
+        peerAuthAsked = null
+        peerAuth.value = null
+        const askedSid = typeof msg.session_id === 'string' ? msg.session_id : sessionId.value
+        const offerFingerprint = peerAuthPlan ? singleFingerprint(offer.sdp ?? '') : null
+        if (peerAuthPlan && askedSid && offerFingerprint !== null) {
+          const nonce = newPeerAuthNonce()
+          peerAuthAsked = { ...peerAuthPlan, sessionId: askedSid, nonce, offerFingerprint }
+          offerFrame.peer_auth = { nonce }
+        }
         ws.sendRaw(offerFrame)
         markConnect('offer_sent')
       } catch (e) {
@@ -7985,6 +8094,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     on('rc:sdp.answer', async (msg) => {
       if (!pc) return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // The peer this answer is for. Checking the answer awaits, and a
+      // teardown (or a whole new attempt) can land meanwhile: an answer is
+      // applied only to the peer that made the offer it answers.
+      const answerPc = pc
       markConnect('answer')
       try {
         // FR-52 P4e — an external session's answer must carry the DEVICE's
@@ -8015,7 +8128,56 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
             return
           }
         }
-        if (!pc) return // torn down while the seal was being checked
+        // FR-100 P2a — when this page asked the device to sign its answer,
+        // judge the signature BEFORE the description is applied, as the
+        // external check above does: the key this browser pinned for the
+        // device, signing over THIS session, is what makes the answer the
+        // device's. A first key is pinned; another key, or a signature that
+        // does not verify, ends the attempt here. Unsigned proceeds, and says
+        // so: a pod from before the field existed drops it mid-roll.
+        if (peerAuthAsked) {
+          const asked = peerAuthAsked
+          peerAuthAsked = null
+          const pins = peerAuthPins()
+          const pinned = pins.get(asked.userId, asked.agentId)
+          const verdict = await judgePeerAuth({
+            asked,
+            sessionId: asked.sessionId,
+            agentId: asked.agentId,
+            userId: asked.userId,
+            answerFingerprint: singleFingerprint(String(msg.sdp ?? '')),
+            answerPeerAuth: msg.peer_auth,
+            pinned,
+          })
+          const signedBy = 'key' in verdict ? verdict.key : null
+          const judged: PeerAuthJudgement = {
+            verdict,
+            userId: asked.userId,
+            agentId: asked.agentId,
+            fingerprint: signedBy ? await peerAuthFingerprint(signedBy) : null,
+            pinnedFingerprint: pinned ? await peerAuthFingerprint(pinned) : null,
+          }
+          if (pc !== answerPc) return // torn down while the signature was checked
+          peerAuth.value = judged
+          if (applyPeerAuthVerdict(verdict, pins, asked.userId, asked.agentId) === 'refuse') {
+            console.warn('[rc] peer-auth: the device answer was refused:', verdict.kind)
+            if (sessionId.value) {
+              ws.sendRaw({
+                t: 'rc:terminate',
+                session_id: sessionId.value,
+                reason: 'controller_hangup',
+              })
+            }
+            failWith(
+              verdict.kind === 'key-changed'
+                ? peerAuthKeyChangedMessage(judged.pinnedFingerprint, judged.fingerprint)
+                : PEER_AUTH_BAD_SIGNATURE,
+            )
+            return
+          }
+        }
+        // Torn down while the seal or the signature was being checked.
+        if (!pc || pc !== answerPc) return
         await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
         remoteDescriptionSet = true
         // Flush any ICE that arrived early.
@@ -8441,6 +8603,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     hasMedia.value = false
     remoteDescriptionSet = false
     pendingRemoteIce.length = 0
+    // FR-100 P2a — what the next attempt asks is decided afresh. The verdict
+    // (`peerAuth`) stays: the error view reads it after a refusal.
+    peerAuthPlan = null
+    peerAuthAsked = null
     cursor.value = { pos: null, shapes: new Map() }
     mediaIntrinsicW.value = 0
     mediaIntrinsicH.value = 0
@@ -10172,6 +10338,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     // answered, and that answer is now OURS: the hub coalesces a same-socket,
     // same-agent request onto the live session. Stop the terminator first.
     abandonedRequests.disarm(agentId)
+    // FR-100 P2a — whether this attempt's offer asks the device to sign its
+    // answer, decided for the agent this request names.
+    peerAuthPlan = planPeerAuth(agentId)
     ws.sendRaw(requestPayload)
     requestSent = true
     markConnect('request_sent')
@@ -12589,6 +12758,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>, opts?: { external?: 
     privacyRefused,
     privacy,
     featuresRefused,
+    /** FR-100 P2a — the verdict on the last answer this page asked a device to sign. */
+    peerAuth,
+    trustPeerAuthKey,
     stats,
     quality,
     setQuality,

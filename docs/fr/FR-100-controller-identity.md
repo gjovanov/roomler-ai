@@ -1,7 +1,7 @@
 # FR-100: Controller identity — a stolen login or a hostile signalling plane can neither open nor sit inside a session to a pinned device
 
 **Issue:** [#2092](https://github.com/gjovanov/roomler-ai/issues/2092) · **Status:** in progress —
-P1a shipped (#2509): each enrollment's device key, made and kept on the device. P1b built: the device signs its answer over the session's transcript when the offer asks · **Owner:** the agent (the verifier, the pins), the viewer (the browser key), the hub (plumbing
+P1a and P1b shipped in 0.4.145 (#2509, #2517): each enrollment's device key, and the device's signature over its answer when the offer asks. P2a built: the viewer asks, verifies before applying the answer, and pins the device key · **Owner:** the agent (the verifier, the pins), the viewer (the browser key), the hub (plumbing
 only) · **Anchors:** master `6ca52ec6d` (re-derived 2026-10-19 for P1) · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 · **Builds on:**
 [FR-52](FR-52-cross-org-remote-access.md) (its `extauth_mac` binding, merged 2026-10-18),
@@ -100,7 +100,11 @@ defines the seam; the other plugs in.
   deny". The key is shown as a short emoji fingerprint. An unattended device follows
   `unknown_controller = deny | allow`.
 - **The browser pins the device key on first use** and shows an interstitial on a change. The server's copy
-  is a hint, never an authority.
+  is a hint, never an authority. Built in P2a: a change stops the attempt with both fingerprints, and only
+  the person's click trusts the new key. ⚠️ Until P3, an **unsigned** answer still proceeds (marked
+  **Unverified**), so an attacker in the signalling path who strips the nonce or the signature downgrades
+  the session instead of being refused. Refusing an unsigned answer from a pinned device belongs with
+  `enforce`.
 - ⚠️ **Never self-wedge.** `roomler rc pins list | reset` works locally, and enforce is never a default. A
   misfiring pin must cost a prompt, not the operator's access to their own machine.
 
@@ -120,9 +124,10 @@ TypeScript read **one shared test-vector file**, so the two sides cannot drift.
 |---|---|---|---|
 | P0 | This spec and the claim. The **red test**: on a throwaway loopback stack, a test-only signalling build substitutes the offer's fingerprint, and today's agent accepts it | docs only | spec merged (#2095); the red run is owed, and is AC1's first half |
 | P1a | **The device key.** One ECDSA P-256 key per org enrollment, made on the device at its first hello and kept in its own file beside the config (`peer-auth/<tenant>.json`, the config's protection; never `config.toml`). Only the public half leaves: `peer_auth_key` on the hello (an uncompressed point, standard base64), stored on the agent row only in that one shape, and shown on the device list with its fingerprint (the first 10 bytes of its SHA-256, the one definition every later surface shows). A key that cannot be kept on disk is never offered: a per-boot key would break every pin at every restart. A config path with no directory gets none. | nothing pins it before P2 | **shipped** (#2509 `518fcadc5`) |
-| P1b | **The wire and the device's signature.** Reordered ahead of the seam on 2026-10-19: the seam's verdicts mean nothing until there are signatures to verify, and the device's signature with the browser's pin (P2) is the first end-to-end protection. `peer-auth` in `AgentCaps.rpc`, in every build. A `peer_auth` binding on `rc:sdp.offer` (the browser's nonce; P2 adds its key and signature) and on `rc:sdp.answer` (the device's signature and the key that made it), relayed verbatim by the hub as `extauth_mac` is. The daemon signs the answer at the two places one leaves it ([`sign_answer`, `peer_auth.rs:219`](../../agents/roomlerd/src/peer_auth.rs#L219): its own offer handler, and a GUI worker's answer relayed up), against what it noted from the request and the offer, so a worker never holds the key. An offer that does not ask is answered exactly as before. `sdp_dtls_fingerprint` moved to the wire crate, unchanged, so the device's signature and FR-52's MAC share one normalisation. | none needed: the device signs only when an offer asks, and no browser asks before P2 | **built** |
+| P1b | **The wire and the device's signature.** Reordered ahead of the seam on 2026-10-19: the seam's verdicts mean nothing until there are signatures to verify, and the device's signature with the browser's pin (P2) is the first end-to-end protection. `peer-auth` in `AgentCaps.rpc`, in every build. A `peer_auth` binding on `rc:sdp.offer` (the browser's nonce; P2 adds its key and signature) and on `rc:sdp.answer` (the device's signature and the key that made it), relayed verbatim by the hub as `extauth_mac` is. The daemon signs the answer at the two places one leaves it ([`sign_answer`, `peer_auth.rs:219`](../../agents/roomlerd/src/peer_auth.rs#L219): its own offer handler, and a GUI worker's answer relayed up), against what it noted from the request and the offer, so a worker never holds the key. An offer that does not ask is answered exactly as before. `sdp_dtls_fingerprint` moved to the wire crate, unchanged, so the device's signature and FR-52's MAC share one normalisation. | none needed: the device signs only when an offer asks, and no browser asks before P2 | **shipped** (#2517 `366235b25`, in 0.4.145) |
 | P1c | **The seam and the policy.** `peer_auth::verify` → `Verified · Unknown · Mismatch · Absent`, with FR-52's `extauth_mac` as its first key source. `peer_auth = off · audit` (device-owned, default `audit`, absent from `DesiredConfig`); no `enforce` before P3, so nothing can self-wedge. The device's verdict reaches `remote_audit` for every session. The server's own `peer-auth` flag on `rc:request`, so that under enforce an older server reads as `server_lacks_peer_auth`, not as a mismatch. Until P2 every in-org session reads `Absent` and every outsider `Verified` or `Mismatch`. | `peer_auth=off` | — |
-| P2 | The controller key, its registration, the signed offer; the browser's pin of the device key | viewer knob; `peer_auth=off` | — |
+| P2a | **The browser checks the device.** Split from P2 on 2026-10-19: it protects the viewer on its own, with nothing new on the device. When the device advertises `peer-auth` and its row carries a key, an in-org session's offer carries a fresh 16-byte nonce, and the viewer verifies the answer's signature over this session's transcript **before** `setRemoteDescription` ([`judgePeerAuth`, `peerAuth.ts:267`](../../ui/src/utils/peerAuth.ts#L267)). The key is pinned on first use, per (user, device), in the browser's `localStorage`. A different key, or a signature that does not verify, ends the attempt before any media or input flows; a changed key is trusted only by the person's click, which pins that one key. An unsigned answer proceeds with an **Unverified** toolbar chip, because a pod from before the field existed drops it mid-roll. A page with no `crypto.subtle` (a non-secure origin) does not ask. Design and the verdict table: [`docs/remote-control.md` §11.4a](../remote-control.md#114a-the-device-proves-it-is-the-one-answering-fr-100-p1p2a) | `localStorage['roomler.peerAuth.ask'] = 'off'`, per browser | **built** |
+| P2b | The controller key (WebCrypto, non-extractable, in IndexedDB), its registration, and the signed offer, which the device checks through P1c's seam | viewer knob; `peer_auth=off` | — |
 | P3 | `enforce`: the PromptSurface approval, `unknown_controller`, `roomler rc pins` | `peer_auth=audit` (default) | — |
 | P4 | The short authentication string on the banner and in the viewer | the viewer toggle | — |
 | P5 | Docs and the field table | — | — |
@@ -181,7 +186,9 @@ weighed.
 
 | # | Date | Cell | Result |
 |---|---|---|---|
-| — | — | — | — |
+| 1 | 2026-10-19 | P1a, device side, on the published 0.4.145: Ubuntu (systemd, root) and Win11 (SYSTEM) | **Pass.** Linux: `/etc/roomler/peer-auth` 0700 root, the key file 0600 root (247 B). Windows: the file's ACL is SYSTEM and Administrators only. "made this enrollment's device key" logged once; sessions unchanged ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6268118628)) |
+| 2 | 2026-10-19 | P1a, server side, prod `hosted-20261019-dd59ede` (promoted 16:16:49Z) | **Pass.** A 0.4.145 row carries `peer_auth_key` and `peer_auth_fingerprint`; a 0.4.143 row carries neither; 19 of 20 live 0.4.145 rows were keyed (the 20th to re-read). The red holds by construction: no server before the roll stored the field ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6271891415)) |
+| 3 | 2026-10-19 | P1b, prod `hosted-20261019-dd59ede`, the agent-e2e lane with three 0.4.145 agents | **No regression.** The remote-session suite passed 7/7 through #2517's relay. This is not a signature crossing it: no browser asked before P2a ([#2092](https://github.com/gjovanov/roomler-ai/issues/2092#issuecomment-6271945686)) |
 
 ## 10. Related
 
