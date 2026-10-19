@@ -54,8 +54,8 @@
 - P3d, a received file on a Linux system install written as the person at seat0, merged (#2496): red on 0.4.143
   (`/tmp`, `root:root`), green on its branch and again on the 0.4.144 candidate (§8).
 - P3h's evidence is in (§8): no fleet host lacks systemd-resolved, and a WSL instance bypasses it, so P3h opens
-  with reporting that. P3h-1, the report, is in review: red on 0.4.144 (`active` while `getent` never reaches the
-  steer), green on its candidate (§8).
+  with reporting that. P3h-1, the report, merged (#2515) and shipped in 0.4.145: red on 0.4.144 (`active` while
+  `getent` never reaches the steer), green on its branch and on the 0.4.145 candidate (§8).
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -667,7 +667,7 @@ test of the SIGKILL property itself.
     domains through its own NRPT rules; without that host's daemon they would not.
   - So P3h starts with an honest report, not the NetworkManager path: `roomler status` says when `resolv.conf` does
     not lead to resolved, and names the file it leads to. NetworkManager waits for a host that needs it.
-  - *P3h-1 (built):* glibc reaches resolved when nsswitch's `hosts` line has `resolve`, or when the first
+  - *P3h-1 (merged #2515, in 0.4.145):* glibc reaches resolved when nsswitch's `hosts` line has `resolve`, or when the first
     `nameserver` is the stub, `127.0.0.53`. When neither holds, a steer that took is reported as
     `steered but BYPASSED`, with where lookups go instead (`crates/tunnel-core/src/overlay/dns.rs`,
     `resolver_bypass`), in `roomler status`, the desktop's overview and a warning at steer time. The status
@@ -932,7 +932,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |
 | **P3f** | uinput text on any layout | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
-| **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (built):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
+| **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
 | **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
 | **P4b** | Windows SFTP as `console_user`: `sftp-server` through `exec`'s console-user spawn, raw, in the person's profile (built) | `ROOMLERD_SFTP_AS_USER=0` | Win11 SystemContext, red on 0.4.142 | S–M |
@@ -1222,3 +1222,4 @@ one depends on it.
 | 2026-10-19 | released 0.4.144: the perMachine MSI with SystemContext (the run recorded `version 0.4.144`) | a throwaway vmtest Win11 guest on zeus, `vmtest` signed in, enrolled ephemeral with the overlay under `console_user` | 🟢 **AC18, Windows, on the release.** A command and the shell started in `C:\Users\vmtest` (as `vt0812018f0e10\vmtest`), and `sftp` in `/C:/Users/vmtest`; the daemon logged the sftp session `CreateProcessAsUserW … run_as="console_user"`. The guest was destroyed |
 | 2026-10-19 | released 0.4.144's `.pkg` | two throwaway tart Macs on the MacBook (macOS 15), `admin` at the GUI, the root daemon enrolled ephemeral with the overlay, once under `console_user`, once under `named:admin` | 🟢 **AC18, macOS, on the release.** Under both modes: exec `pwd=/Users/admin`, the pty `admin in /Users/admin`, `sftp` in `/Users/admin`, where a relative `put` landed owned `admin staff`. Both VMs were torn down |
 | 2026-10-19 | released 0.4.144, then the P3h-1 candidate (`41c204b08`, a release-profile build with `overlay-l3,overlay-netstack,ssh-server`) | the Linux AC18 guest afterwards, made WSL-shaped on purpose: `/etc/resolv.conf` a plain file naming the guest's upstream, nsswitch Ubuntu's (no `resolve`); each daemon under a fresh ephemeral enrollment with the overlay | 🔴→🟢 **P3h-1.** On the release, `roomler status` said `magicdns vmtest.roomler.ai (active, …)`, while `getent hosts` for the anchor's name returned nothing and `resolvectl query` answered it from `roomler0`: the steer was in place and unasked. On the candidate the same host said `(steered but BYPASSED, …)` and, below, `/etc/resolv.conf asks 10.10.120.1, and nsswitch has no resolve: this host's own lookups never reach the steer`; the daemon warned the same at steer time. The guest was destroyed |
+| 2026-10-19 | the 0.4.145 candidate (release run 39248610025 on `745ddb1e1`): its `.deb` (package `0.4.145-1`) over the served 0.4.144 | a throwaway vmtest Ubuntu 24.04 system guest on zeus, made WSL-shaped as above | 🔴→🟢 **P3h-1 on the release candidate.** 0.4.144: `magicdns vmtest.roomler.ai (active, …)` while `getent` returned nothing. The candidate: `(steered but BYPASSED, …)`, the reason line and the daemon's warning. The guest was destroyed. The published 0.4.145 carries the same binary (`07412c9f…`) |
