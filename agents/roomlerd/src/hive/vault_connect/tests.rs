@@ -354,3 +354,33 @@ async fn a_loopback_connection_is_owned_by_whoever_opened_it() {
     assert_eq!(proc_net::owner(from, other), None, "no such connection");
     drop(client);
 }
+
+/// P3-5d-3 — macOS: a live loopback connection's client end is held by this
+/// test's own process, a socket made under its uid. Another account's
+/// processes hold none of it, and a pair no connection is, nobody.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_loopback_connection_is_held_by_the_account_that_made_it() {
+    use std::net::SocketAddr;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    let (SocketAddr::V4(from), SocketAddr::V4(to)) = (
+        accepted.peer_addr().unwrap(),
+        accepted.local_addr().unwrap(),
+    ) else {
+        panic!("IPv4 loopback");
+    };
+    // SAFETY: geteuid reads our own credentials.
+    let me = unsafe { libc::geteuid() };
+    assert!(libproc::held_by(from, to, me), "the test's own connection");
+    assert!(
+        !libproc::held_by(from, to, me.wrapping_add(4242)),
+        "another account's processes hold none of it"
+    );
+    let other = std::net::SocketAddrV4::new(*to.ip(), to.port().wrapping_add(1));
+    assert!(!libproc::held_by(from, other, me), "no such connection");
+    drop(client);
+}
