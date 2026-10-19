@@ -71,6 +71,7 @@ fn a_call_names_a_secret_an_engine_and_an_upstream() {
             ca: None,
             auth_source: None,
             auth: None,
+            user: None,
             ttl: DEFAULT_TTL,
         }
     );
@@ -460,5 +461,113 @@ fn a_kubernetes_call_names_an_api_server_and_its_credential() {
         json!({"handle": "db/main", "engine": "postgres", "upstream": "db.internal:5432", "auth": "client-cert"}),
     ] {
         assert!(parse(&bad).is_err(), "{bad}");
+    }
+}
+
+/// P3-5f-2 — an SSH host, as an audience names one: `ssh://[user@]host`,
+/// the port only where it is not 22, and no path; the user in it is the one
+/// account the key signs in as.
+#[test]
+fn an_ssh_upstream_is_a_host_and_maybe_a_user_as_an_audience_names_them() {
+    for (raw, user, host, port) in [
+        ("ssh://github.com", None, "github.com", 22),
+        ("ssh://git@github.com", Some("git"), "github.com", 22),
+        (
+            "ssh://deploy@build.internal:2222",
+            Some("deploy"),
+            "build.internal",
+            2222,
+        ),
+        ("ssh://[fd00::5]", None, "fd00::5", 22),
+        (
+            "ssh://ops.svc@[fd00::5]:2200",
+            Some("ops.svc"),
+            "fd00::5",
+            2200,
+        ),
+        ("ssh://10.0.0.7:2022", None, "10.0.0.7", 2022),
+    ] {
+        assert_eq!(
+            ssh_of(raw),
+            Ok((user.map(str::to_string), host.to_string(), port)),
+            "{raw} is an ssh upstream"
+        );
+    }
+    for raw in [
+        "github.com",
+        "github.com:22",
+        "https://github.com",
+        "ssh://",
+        "ssh://github.com/org/repo",
+        "ssh://github.com?x",
+        "ssh://github.com#x",
+        "ssh://@github.com",
+        "ssh://a@b@github.com",
+        "ssh://-root@github.com",
+        "ssh://.hidden@github.com",
+        "ssh://us er@github.com",
+        "ssh://root;id@github.com",
+        "ssh://github.com:",
+        "ssh://github.com:0",
+        "ssh://github.com:022",
+        "ssh://github.com:65536",
+        "ssh://[fd00::5",
+        "ssh://-github.com",
+    ] {
+        assert!(ssh_of(raw).is_err(), "{raw} is no ssh upstream");
+    }
+    let named = ssh_of("ssh://git@github.com:22").unwrap_err();
+    assert!(named.contains("write ssh://git@github.com"), "{named}");
+    assert!(ssh_of(&format!("ssh://{}@github.com", "u".repeat(33))).is_err());
+}
+
+/// P3-5f-2 — an `ssh` call names an SSH host and leases the secret's `key`
+/// and `host_keys`; what is a database's, TLS's or HTTP's is refused in it,
+/// and a database never takes an `ssh://` upstream.
+#[test]
+fn an_ssh_call_names_a_host_and_leases_a_key_and_its_hosts() {
+    let field = |f: &str| Handle {
+        secret: "ssh/deploy".into(),
+        field: f.into(),
+    };
+    let req = parse(&json!({
+        "handle": "ssh/deploy",
+        "engine": "ssh",
+        "upstream": "ssh://git@github.com",
+    }))
+    .unwrap();
+    assert_eq!(
+        (
+            req.engine,
+            req.user.as_deref(),
+            req.host.as_str(),
+            req.port,
+            req.auth
+        ),
+        (Engine::Ssh, Some("git"), "github.com", 22, None)
+    );
+    assert_eq!(req.handles(), [field("key"), field("host_keys")]);
+    let ok = json!({"handle": "ssh/deploy", "engine": "ssh", "upstream": "ssh://git@github.com"});
+    let with = |k: &str, v: serde_json::Value| {
+        let mut call = ok.clone();
+        call[k] = v;
+        call
+    };
+    for (bad, says) in [
+        (with("upstream", json!("github.com:22")), "ssh://"),
+        (with("auth", json!("bearer")), "auth is http's"),
+        (with("ca", json!("pki/ca")), "ca is TLS's"),
+        (with("database", json!("main")), "database is a database's"),
+        (
+            with("auth_source", json!("admin")),
+            "auth_source is MongoDB's",
+        ),
+        (
+            json!({"handle": "db/main", "engine": "postgres", "upstream": "ssh://db.internal:5432"}),
+            "host:port",
+        ),
+    ] {
+        let refused = parse(&bad).unwrap_err();
+        assert!(refused.contains(says), "{bad}: {refused}");
     }
 }
