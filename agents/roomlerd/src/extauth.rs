@@ -298,6 +298,12 @@ mod imp {
     use crate::external_logins::{BindingError, ExternalLogins, Refusal};
     use crate::remote_config::RemoteConfigServices;
 
+    /// What an external session never holds, whatever was asked or allowed.
+    /// RECORD: §10 keeps recording an outsider's session out of scope.
+    /// PRIVACY (decision 13): a curtain would hide what a stranger does from
+    /// the person at the device.
+    const NEVER_FOR_AN_OUTSIDER: Permissions = Permissions::RECORD.union(Permissions::PRIVACY);
+
     /// `@serenity-kit/opaque`'s encoding, strictly: a padded or standard-alphabet
     /// blob is a client this protocol does not speak, and is refused as
     /// malformed before anything is answered or debited.
@@ -446,6 +452,16 @@ mod imp {
                 None => return Err("external_max_permissions names an unknown permission"),
             },
         };
+        // FR-52 decision 13 — an outsider's session is never recorded and
+        // never curtained. The hub strips both; this device strips them again
+        // so the server is not the only thing keeping them out. No ceiling an
+        // owner sets can let either back in. Before the empty check, so a
+        // request for nothing else is still refused.
+        let never = permissions & NEVER_FOR_AN_OUTSIDER;
+        if !never.is_empty() {
+            info!(%attempt_id, ?never, "extauth: stripped what an outsider never holds");
+        }
+        let permissions = permissions - NEVER_FOR_AN_OUTSIDER;
         if permissions.is_empty() {
             return Err("nothing the session asked for is within this device's ceiling");
         }
@@ -767,6 +783,43 @@ mod imp {
                     permissions: Permissions::VIEW,
                     consent: ExternalConsent::Auto,
                 }
+            );
+        }
+
+        /// FR-52 decision 13 — RECORD and PRIVACY never survive admission,
+        /// whatever the server sent and whatever this device's ceiling names:
+        /// the server is not the only gate keeping them out. A request for
+        /// nothing else is refused, never admitted empty.
+        #[tokio::test]
+        async fn an_outsider_is_never_granted_record_or_privacy() {
+            const SESSION_C: &str = "66f0c0ffee0000000000000c";
+            let logins = ExternalLogins::new();
+            let (dir, svc) = device(true, Some(&pw("right")));
+            let now = Instant::now();
+            let rest = Permissions::VIEW | Permissions::INPUT;
+            let asked = rest | Permissions::RECORD | Permissions::PRIVACY;
+
+            // No ceiling: the path that otherwise takes the grant as sent.
+            verified_login(&logins, &svc, "a1", now).await;
+            let admitted = admit_session(&logins, true, &svc, "a1", WHO, SESSION, asked, now)
+                .await
+                .unwrap();
+            assert_eq!(admitted.permissions, rest);
+
+            // A ceiling that names both lets neither back in.
+            set_terms(&dir, true, None, Some("VIEW | INPUT | RECORD | PRIVACY"));
+            verified_login(&logins, &svc, "a2", now).await;
+            let admitted = admit_session(&logins, true, &svc, "a2", WHO, SESSION_B, asked, now)
+                .await
+                .unwrap();
+            assert_eq!(admitted.permissions, rest);
+
+            verified_login(&logins, &svc, "a3", now).await;
+            let only = Permissions::RECORD | Permissions::PRIVACY;
+            assert!(
+                admit_session(&logins, true, &svc, "a3", WHO, SESSION_C, only, now)
+                    .await
+                    .is_err()
             );
         }
 

@@ -86,6 +86,8 @@ describe('the grant and the device', () => {
   it('explains a refusal, offers nothing where no curtain could ever be', () => {
     expect(showsPrivacyRefusal('device_not_opted_in')).toBe(true)
     expect(showsPrivacyRefusal('break_glass')).toBe(true)
+    expect(showsPrivacyRefusal('outside_the_org')).toBe(true)
+    expect(describePrivacyReason('outside_the_org')).toMatch(/outside the device's organization/)
     expect(showsPrivacyRefusal('something_new')).toBe(true)
     expect(showsPrivacyRefusal('device_cannot_curtain')).toBe(false)
     expect(showsPrivacyRefusal(null)).toBe(false)

@@ -142,7 +142,7 @@ words, and no viewer asks.
 | `Permissions::PRIVACY` | `crates/remote_control/src/permissions.rs` | Bit `0b0100_0000`. It is in `requires_consent_prompt`, never in the default grant |
 | `privacy-mode`, `privacy-available` | `RpcCap::PrivacyMode`, `RpcCap::PrivacyAvailable` (`crates/remote_control/src/models.rs`) | `privacy-mode`: the owner allowed it and the agent serves it. `privacy-available`: a curtain is possible, but the owner has not allowed it, so the viewer can explain rather than offer nothing (FR-85's `available` lesson). Equality-matched; neither is a prefix of the other |
 | `PrivacySupport` | `crates/modules/fleet/src/hub.rs` | `None` / `NotOptedIn` / `Serves`, read from those words per CONNECTION at the hello and on every caps re-announcement (`socket.rs`), so an owner's OFF stops the next grant without a reconnect |
-| `privacy_grant` | `hub.rs`, in `create_session_full` right after `record_grant` | Strips `PRIVACY` before `rc:request` is built. Reasons, first match wins: `device_cannot_curtain`, `break_glass`, `device_not_opted_in` |
+| `privacy_grant` | `hub.rs`, in `create_session_full` right after `record_grant` | Strips `PRIVACY` before `rc:request` is built. Reasons, first match wins: `device_cannot_curtain`, `break_glass`, `outside_the_org` (FR-52 decision 13, 2026-10-19), `device_not_opted_in` |
 | The reason, twice | `SessionCreated.privacy_refused` (`signaling.rs`), `SessionRequested.privacy_stripped` (the audit) | A strip is never silent. Both are additive fields, so an older viewer and an older pod read past them |
 
 - **Break-glass is the authz gate's `override_reason`.** The gate sets it only for a validated ADMINISTRATOR
@@ -496,7 +496,8 @@ weighed.
 1. **ADMINISTRATOR break-glass.** May a break-glass session turn privacy on? Recording is never allowed
    under break-glass. Recommended: the same rule. A break-glass session is audited and the owner notified,
    and covering the screen would hide it from the one person who could object. **Decided: no.** The hub
-   never grants `PRIVACY` under break-glass, as it never grants `RECORD`.
+   never grants `PRIVACY` under break-glass, as it never grants `RECORD`. The same reason later
+   kept it from a controller outside the organization: FR-52 decision 13 (2026-10-19), `outside_the_org`.
 2. **A whitelisted chord** besides Ctrl+Alt+Del, for the person to end privacy without the secure desktop.
    Recommended: no. `BlockInput` swallows it anyway, and Ctrl+Alt+Del is the one path that cannot be faked
    by software. **Decided: no.**

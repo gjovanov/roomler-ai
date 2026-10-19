@@ -401,11 +401,20 @@ impl PrivacySupport {
 /// mailed to the owner — and a curtain would hide it from the only person in
 /// a position to object. The same rule as RECORD.
 ///
+/// ⚠️ Nor does a session from OUTSIDE the organization (FR-52 decision 13,
+/// 2026-10-19). The person at the device let a stranger in on a password and
+/// a name the stranger chose, and is the only one placed to see what that
+/// stranger then does: a curtain would hide it from them. The same sessions
+/// are never recorded (`controller_not_allowed`, FR-52 §10). The device
+/// strips both again on its own terms (`roomlerd`'s `extauth::admit_session`),
+/// so this gate is not the only thing keeping them out.
+///
 /// A device that cannot curtain at all is named FIRST, as in
 /// [`record_grant`]: there is nothing there to allow or refuse.
 pub fn privacy_grant(
     permissions: Permissions,
     break_glass: bool,
+    external: bool,
     device: PrivacySupport,
 ) -> (Permissions, Option<&'static str>) {
     if !permissions.contains(Permissions::PRIVACY) {
@@ -419,6 +428,9 @@ pub fn privacy_grant(
     }
     if break_glass {
         return (permissions - Permissions::PRIVACY, Some("break_glass"));
+    }
+    if external {
+        return (permissions - Permissions::PRIVACY, Some("outside_the_org"));
     }
     if device != PrivacySupport::Serves {
         return (
@@ -1580,15 +1592,21 @@ impl Hub {
         let (permissions, record_refused) = record_grant(permissions, may_record, agent_records);
 
         // FR-99 — PRIVACY survives only on an agent that serves privacy mode
-        // (its owner opted in, so it advertises `privacy-mode`) and never
-        // under break-glass. The authz gate sets `override_reason` for a
-        // validated ADMINISTRATOR force and only then, so it IS the
-        // break-glass signal here — on this pod and on an owner pod the
-        // frame was relayed to alike, since the relay carries it. Anything
-        // else is stripped BEFORE `rc:request` is built: an agent that does
-        // not know the name would fail the whole frame.
-        let (permissions, privacy_refused) =
-            privacy_grant(permissions, override_reason.is_some(), agent_privacy);
+        // (its owner opted in, so it advertises `privacy-mode`), never under
+        // break-glass, and never for a controller from outside the org
+        // (FR-52). The authz gate sets `override_reason` for a validated
+        // ADMINISTRATOR force and only then, so it IS the break-glass signal
+        // here — on this pod and on an owner pod the frame was relayed to
+        // alike, since the relay carries it. `external` is set by the extauth
+        // relay alone, on whichever pod holds the device. Anything else is
+        // stripped BEFORE `rc:request` is built: an agent that does not know
+        // the name would fail the whole frame.
+        let (permissions, privacy_refused) = privacy_grant(
+            permissions,
+            override_reason.is_some(),
+            external.is_some(),
+            agent_privacy,
+        );
 
         // FR-101 P2 — clipboard, files and audio under the org's policy:
         // `off` is stripped for every controller, and `ask` survives only a
@@ -5008,38 +5026,73 @@ mod tests {
         use PrivacySupport::{None as NoCurtain, NotOptedIn, Serves};
         let want = Permissions::VIEW | Permissions::INPUT | Permissions::PRIVACY;
         let rest = Permissions::VIEW | Permissions::INPUT;
-        assert_eq!(privacy_grant(want, false, Serves), (want, None));
+        let member = false; // not external: FR-52's case has its own test
+        assert_eq!(privacy_grant(want, false, member, Serves), (want, None));
         assert_eq!(
-            privacy_grant(want, true, Serves),
+            privacy_grant(want, true, member, Serves),
             (rest, Some("break_glass"))
         );
         assert_eq!(
-            privacy_grant(want, false, NotOptedIn),
+            privacy_grant(want, false, member, NotOptedIn),
             (rest, Some("device_not_opted_in"))
         );
         // Both refusals: break-glass is named, as the controller's is for
         // RECORD.
         assert_eq!(
-            privacy_grant(want, true, NotOptedIn),
+            privacy_grant(want, true, member, NotOptedIn),
             (rest, Some("break_glass"))
         );
         for break_glass in [true, false] {
             assert_eq!(
-                privacy_grant(want, break_glass, NoCurtain),
+                privacy_grant(want, break_glass, member, NoCurtain),
                 (rest, Some("device_cannot_curtain"))
             );
         }
         // A grant that never asked passes untouched, with no reason.
         assert_eq!(
-            privacy_grant(Permissions::default(), true, NoCurtain),
+            privacy_grant(Permissions::default(), true, member, NoCurtain),
             (Permissions::default(), None)
         );
         // It strips PRIVACY alone — RECORD's own gate decides RECORD.
         let both = want | Permissions::RECORD;
         assert_eq!(
-            privacy_grant(both, true, Serves),
+            privacy_grant(both, true, member, Serves),
             (rest | Permissions::RECORD, Some("break_glass"))
         );
+    }
+
+    /// FR-52 decision 13 — a session from outside the org never holds
+    /// PRIVACY, even on a device whose owner allowed privacy mode, and the
+    /// strip is named. A device that cannot curtain is still named first.
+    #[test]
+    fn an_outsiders_session_never_holds_privacy() {
+        use PrivacySupport::{None as NoCurtain, NotOptedIn, Serves};
+        let want = Permissions::VIEW | Permissions::INPUT | Permissions::PRIVACY;
+        let rest = Permissions::VIEW | Permissions::INPUT;
+        let (member, outsider) = (false, true);
+        // The control: a member, same device, same ask, keeps it.
+        assert_eq!(privacy_grant(want, false, member, Serves), (want, None));
+        assert_eq!(
+            privacy_grant(want, false, outsider, Serves),
+            (rest, Some("outside_the_org"))
+        );
+        // Not opted in: the SESSION's reason is named, because the owner
+        // opting in would not change the answer.
+        assert_eq!(
+            privacy_grant(want, false, outsider, NotOptedIn),
+            (rest, Some("outside_the_org"))
+        );
+        assert_eq!(
+            privacy_grant(want, false, outsider, NoCurtain),
+            (rest, Some("device_cannot_curtain"))
+        );
+        // PRIVACY alone: RECORD is `record_grant`'s, and a grant that never
+        // asked passes untouched.
+        assert_eq!(
+            privacy_grant(want | Permissions::RECORD, false, outsider, Serves),
+            (rest | Permissions::RECORD, Some("outside_the_org"))
+        );
+        assert_eq!(privacy_grant(rest, false, outsider, Serves), (rest, None));
     }
 
     /// FR-99 — the `rpc` words, read by equality: `privacy-available` alone
@@ -5090,7 +5143,7 @@ mod tests {
             true,
             false,
         );
-        let mut ask = |hub: &Hub, override_reason: Option<&str>| {
+        let mut ask_as = |hub: &Hub, override_reason: Option<&str>, external: bool| {
             let (tx, mut rx) = mpsc::channel(8);
             hub.create_session_full(
                 agent_id,
@@ -5114,7 +5167,10 @@ mod tests {
                 None,
                 None,
                 None,
-                None, // external (FR-52 P4)
+                // FR-52 P4 — what the extauth relay passes for an outsider.
+                external.then(|| roomler_ai_remote_control::signaling::ExternalGrant {
+                    attempt_id: "a1".into(),
+                }),
             )
             .unwrap();
             let (granted, why) = match rx.try_recv().unwrap() {
@@ -5136,7 +5192,7 @@ mod tests {
         };
 
         // Nothing advertised: an agent that may not know the name at all.
-        let (p, why) = ask(&hub, None);
+        let (p, why) = ask_as(&hub, None, false);
         assert!(!p.contains(Permissions::PRIVACY));
         assert!(
             p.contains(Permissions::VIEW | Permissions::INPUT),
@@ -5145,12 +5201,12 @@ mod tests {
         assert_eq!(why.as_deref(), Some("device_cannot_curtain"));
 
         hub.set_agent_privacy_support(agent_id, PrivacySupport::NotOptedIn);
-        let (p, why) = ask(&hub, None);
+        let (p, why) = ask_as(&hub, None, false);
         assert!(!p.contains(Permissions::PRIVACY));
         assert_eq!(why.as_deref(), Some("device_not_opted_in"));
 
         hub.set_agent_privacy_support(agent_id, PrivacySupport::Serves);
-        let (p, why) = ask(&hub, None);
+        let (p, why) = ask_as(&hub, None, false);
         assert!(
             p.contains(Permissions::PRIVACY),
             "a serving device, no break-glass"
@@ -5158,14 +5214,24 @@ mod tests {
         assert_eq!(why, None);
 
         // Break-glass on a serving device: still never.
-        let (p, why) = ask(&hub, Some("server room fire"));
+        let (p, why) = ask_as(&hub, Some("server room fire"), false);
         assert!(!p.contains(Permissions::PRIVACY));
         assert_eq!(why.as_deref(), Some("break_glass"));
+
+        // FR-52 decision 13 — an outsider on the same serving device: never,
+        // and the agent is not sent the name either.
+        let (p, why) = ask_as(&hub, None, true);
+        assert!(!p.contains(Permissions::PRIVACY));
+        assert!(
+            p.contains(Permissions::VIEW | Permissions::INPUT),
+            "the rest survives"
+        );
+        assert_eq!(why.as_deref(), Some("outside_the_org"));
 
         // The owner switches it off while connected (the agent re-announces
         // `privacy-available` alone): the next grant drops it.
         hub.set_agent_privacy_support(agent_id, PrivacySupport::NotOptedIn);
-        let (p, why) = ask(&hub, None);
+        let (p, why) = ask_as(&hub, None, false);
         assert!(!p.contains(Permissions::PRIVACY));
         assert_eq!(why.as_deref(), Some("device_not_opted_in"));
     }

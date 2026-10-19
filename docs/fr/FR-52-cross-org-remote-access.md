@@ -375,7 +375,7 @@ does not advertise it cannot be gate-2 approved, which is what keeps §3's
 
 ### F1 — the hub keys controllers by `ObjectId`, so an anonymous principal forks everything
 
-`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1178`),
+`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1190`),
 `RemoteSession.controller_user_id: ObjectId` (`models.rs:5332`), the `remote_audit`
 rows and the TURN credential all key on a real user id. A synthetic principal would
 fork the session record, the audit, the credential and the rate limiter — and leave
@@ -402,7 +402,7 @@ P5, do not assume.**
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
 `is_overlay_relay_ip` (`crates/modules/fleet/src/hub.rs:63`) accepts any
-`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2036` hands it to the agent as a
+`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2054` hands it to the agent as a
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.
@@ -568,6 +568,21 @@ CAS. P6 follows it rather than inventing one.
     holds the header to `'wasm-unsafe-eval'` present and `'unsafe-eval'` absent, and the
     real-browser run proved the token both sufficient (the login and the viewer under
     the production `script-src`) and necessary (without it, no frame leaves the page).
+13. **May an outsider cover the screen (FR-99's `PRIVACY`)?** **Decided 2026-10-19
+    (operator): no, never.** The person at the device let a stranger in on a password
+    and a name the stranger chose (decision 8), and is the only one placed to see what
+    that stranger then does. A curtain would hide it from them, which is FR-99's reason
+    for refusing break-glass (its decision 1). Built as a strip, like RECORD (§10), in
+    two places. The hub's `privacy_grant` names it `outside_the_org`, after
+    `device_cannot_curtain` and before `device_not_opted_in`, so the audit row
+    (`privacy_stripped`) gives the session's reason rather than one the owner could
+    change. The device's `admit_session` strips `PRIVACY` and `RECORD` again
+    (`NEVER_FOR_AN_OUTSIDER`), after its own ceiling, so the server is not the only gate
+    and no `external_max_permissions` value lets either back in. The page never asks for
+    it (it reads no device caps), so neither strip changes what an honest page sees.
+    Locked by `an_outsiders_session_never_holds_privacy` (hub),
+    `the_hub_strips_privacy_before_the_agent_can_see_it` (the agent is never sent the
+    name) and `an_outsider_is_never_granted_record_or_privacy` (device).
 
 ## 10. Out of scope
 
@@ -580,6 +595,8 @@ CAS. P6 follows it rather than inventing one.
   `resolve_session_authz` for org members.
 - **Session recording of external sessions.** The `ssh_activity` reasoning applies:
   recording what an operator typed ships it off the host.
+- **Privacy mode for external sessions** (decision 13). An outsider never covers the
+  screen of the person who let them in.
 
 ## 11. Related
 
