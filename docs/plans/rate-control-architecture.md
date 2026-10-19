@@ -256,7 +256,7 @@ brings the old `100.65.0.5 ↔ 100.65.0.6` pair back.
 
 **C2 — #1237, the sibling route war (independent; do first).** Two facts from the design pass:
 each per-org adapter already holds a **narrowed** on-link `/(96+plen)` v6 address
-(`overlay.rs:668–670` → `tun.rs:3331–3346`), but `defend_self_route` (`tun.rs:2439–2456`) evicts and
+(`overlay.rs:673–675` → `tun.rs:3331–3346`), but `defend_self_route` (`tun.rs:2439–2456`) evicts and
 asserts the **whole /96** on every adapter — the damage is the route-change notification storm, not
 a routing hole; and the same missing notion of "own adapters" makes `non_overlay_v4_addrs`
 (`tun.rs:2287–2302`) count the sibling's address as a foreign CGNAT address, so the primary's

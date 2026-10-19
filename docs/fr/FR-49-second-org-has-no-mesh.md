@@ -123,8 +123,10 @@ five-minute fix and the two days this cost in the field.
 - [ ] `roomler status` shows it per org
 - [ ] `roomler peers` renders an overlay-off org **differently** from an org with
       an overlay and no peers — verified by producing both states on one device
-- [ ] `roomlerd org overlay <label> tun` puts the device on that org's mesh after
-      a restart, verified by a ping across it
+- [x] `roomlerd org overlay <label> tun` puts the device on that org's mesh after
+      a restart, verified by a ping across it *(FR-97 P1d, 2026-10-18 on
+      0.4.143: a Mac's secondary on a utun of its own, the org's anchor 5/5;
+      FR-97 §8)*
 - [ ] `enroll --overlay` into a second org enables **that** org, and leaves the
       primary's flag untouched
 - [ ] `enroll` without `--overlay` on an org that already had one does not turn
@@ -215,4 +217,36 @@ adjacent properties, and only that one catches the defect.
   exclusions. Real proof needs a release.
 - **`org overlay … tun` actually joining a mesh**, which needs a daemon restart
   on a two-org host.
+
+### After close: a netstack secondary joined nothing (#2493)
+
+FR-97 P1d ran this FR's own flow on 0.4.143 and found the gap. `enroll
+--overlay` into a second org picks `netstack`, and that org joined **no** mesh:
+`AgentConfig::for_org` turned a secondary's overlay on for `tun` only. The
+check dates from #340, and #381 kept it when it made netstack per-org.
+Meanwhile `status` read `overlay netstack`, the very "reports normally" this FR
+set out to end.
+
+`org overlay … tun` was verified on a Mac in the same run: a utun of its own,
+and the anchor answered 5/5 through it.
+
+The fix, with the operator's two decisions:
+1. A netstack secondary joins with its own port and key alone, so the
+   same-control-plane rule is dropped for it, since it opens no adapter.
+2. A missing port is picked free, at enroll, at `org overlay … netstack`, at
+   a pushed join, and at daemon start for an entry written before the fix.
+
+Detail: `docs/multi-org.md`, the netstack paragraph.
+
+Field red → green on Linux, 2026-10-19. The host was a throwaway `ubuntu:24.04` container on mars with one root
+daemon. Its primary was in an org with no overlay, and its secondary was enrolled into the anchor's org with
+`--overlay`. Both rows were standard enrollments, deleted afterwards.
+
+| build | the secondary's front, 45 s after start | `peers --org a` | through the front |
+|---|---|---|---|
+| 🔴 released 0.4.143 | the enroll left no port, so 10800 was set by hand; **nothing listened on it**, and `status` still said `overlay netstack` | no peers | `connect: Connection refused`, at the front itself |
+| 🟢 this fix (a release-profile build with `overlay-l3,overlay-netstack,ssh-server`) | the enroll picked 10800 and printed it; it listened | 9 peers, the anchor `direct` | a CONNECT to the anchor's `:22` was refused in 0 ms, a reset over the mesh, while an unassigned address in the block timed out after 15 s; the anchor's MagicDNS answered an A query for its own name with its overlay address |
+
+The front answers REP 4 for every failed connect, so the TIME is what tells a refusal from no path: the netstack
+fails at once only on a reset, and waits out its 15 s connect timeout otherwise.
 

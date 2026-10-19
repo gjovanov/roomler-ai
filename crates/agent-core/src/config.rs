@@ -1796,6 +1796,16 @@ pub struct AgentConfig {
     #[serde(skip)]
     pub derived_org: bool,
 
+    /// #2493 — True on a [`AgentConfig::for_org`] config whose org runs over
+    /// the userspace netstack: the overlay then opens that org's own stack
+    /// and loopback SOCKS5 front, never the per-org TUN that
+    /// `overlay_multi_org`, a device-wide flag, would otherwise choose. That
+    /// flag stays as the primary set it, because it is also what the org's
+    /// hello says about the DEVICE (`multi_org: tun`). `#[serde(skip)]`, as
+    /// [`Self::derived_org`].
+    #[serde(skip)]
+    pub derived_netstack: bool,
+
     /// Phase 3b: this node's persisted WireGuard Curve25519 secret key
     /// (base64). Generated on the first overlay-enabled startup in `main`;
     /// the public key is what the netmap distributes. `None` until then.
@@ -2058,15 +2068,21 @@ impl AgentConfig {
     /// operator knobs from `self`, enrollment identity + org-scoped fields
     /// from the entry.
     ///
-    /// Overlay participation for a secondary (P2c lifts the P1 force-off):
-    /// requires ALL of `overlay_multi_org` (the operator opt-in),
-    /// `overlay_mode = "tun"` on the entry, the SAME `server_url` as the
-    /// primary (one control plane — the shared TUN's demux is only decidable
-    /// against blocks one registry carved), and the org's OWN WG key (minted
-    /// at enroll-append; NEVER the primary's). Anything else keeps the P1
-    /// behaviour: overlay off for that org. Netstack mode for secondaries
-    /// stays unimplemented (the netstack statics are process-global), and
-    /// exit-node roles stay primary-only (split-defaults are host-global).
+    /// Overlay participation for a secondary, by its `overlay_mode`, and
+    /// always with the org's OWN WG key (minted at enroll-append; NEVER the
+    /// primary's):
+    /// - `tun`: `overlay_multi_org` (the operator opt-in) and the SAME
+    ///   `server_url` as the primary. Its adapter's routes share the host's
+    ///   table with every other org's, so its blocks must come from the one
+    ///   registry that carved theirs.
+    /// - `netstack` (#2493): the org's own `netstack_socks_port`, and nothing
+    ///   else. It opens no adapter and installs no route, so it needs neither
+    ///   the opt-in nor the primary's control plane. Until #2493 this mode was
+    ///   accepted everywhere and joined nothing, while every surface said
+    ///   `overlay netstack`.
+    /// - `off`: nothing.
+    ///
+    /// Exit-node roles stay primary-only (split-defaults are host-global).
     /// Declared tunnel routes are reconciled only by the primary-side
     /// reconciler.
     pub fn for_org(&self, org: &OrgEntry) -> AgentConfig {
@@ -2076,10 +2092,13 @@ impl AgentConfig {
         c.agent_token = org.agent_token.clone();
         c.agent_id = org.agent_id.clone();
         c.tenant_id = org.tenant_id.clone();
-        c.overlay_enabled = self.overlay_multi_org
+        let tun = self.overlay_multi_org
             && org.overlay_mode == OrgOverlayMode::Tun
-            && org.server_url == self.server_url
-            && org.overlay_wg_secret_key.is_some();
+            && org.server_url == self.server_url;
+        let netstack =
+            org.overlay_mode == OrgOverlayMode::Netstack && org.netstack_socks_port.is_some();
+        c.overlay_enabled = (tun || netstack) && org.overlay_wg_secret_key.is_some();
+        c.derived_netstack = netstack;
         c.overlay_wg_secret_key = org.overlay_wg_secret_key.clone();
         c.overlay_wg_key_epoch = org.overlay_wg_key_epoch;
         c.overlay_advertised_routes = org.overlay_advertised_routes.clone();
@@ -2770,6 +2789,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_multi_org: false,
         netstack_socks_port: None,
         derived_org: false,
+        derived_netstack: false,
         overlay_wg_secret_key: None,
         overlay_wg_key_epoch: 0,
         overlay_advertised_routes: Vec::new(),
@@ -3803,10 +3823,11 @@ tenant_id = "tid2"
         assert!(oc.orgs.is_empty(), "no recursive org table");
     }
 
-    /// P2c — the secondary-overlay gate lifts ONLY when every condition
-    /// holds: the operator flag, `overlay_mode = tun`, the primary's own
-    /// control plane, and the org's own WG key. Each missing leg keeps the
-    /// P1 behaviour for exactly that org.
+    /// P2c — a `tun` secondary's gate lifts ONLY when every condition holds:
+    /// the operator flag, `overlay_mode = tun`, the primary's own control
+    /// plane, and the org's own WG key. Each missing leg keeps the P1
+    /// behaviour for exactly that org. #2493 — a `netstack` one's gate is its
+    /// own port and its own key.
     #[test]
     fn for_org_lifts_overlay_only_under_the_p2c_gate() {
         let mut cfg = fixture();
@@ -3824,16 +3845,52 @@ tenant_id = "tid2"
         assert!(!cfg.for_org(&org).overlay_enabled, "no operator opt-in");
         cfg.overlay_multi_org = true;
 
-        // A foreign control plane can't ride the shared TUN (its blocks come
-        // from a different registry — the demux would be undecidable).
+        // A foreign control plane can't ride a tun adapter (its blocks come
+        // from a different registry).
         let mut foreign = org.clone();
         foreign.server_url = "https://other.invalid".into();
-        assert!(!cfg.for_org(&foreign).overlay_enabled, "foreign server");
+        assert!(
+            !cfg.for_org(&foreign).overlay_enabled,
+            "foreign server, tun"
+        );
+        assert!(
+            !cfg.for_org(&org).derived_netstack,
+            "a tun org takes its TUN"
+        );
 
-        // Netstack / off modes stay off (netstack statics are process-global).
+        // #2493 — netstack joins with a port of its own, on any control plane
+        // and without the opt-in, and stays off without a port or a key.
+        // Before the fix every one of these read OFF while `status` said
+        // `overlay netstack`.
         let mut ns = org.clone();
         ns.overlay_mode = OrgOverlayMode::Netstack;
-        assert!(!cfg.for_org(&ns).overlay_enabled, "netstack secondary");
+        ns.netstack_socks_port = None;
+        assert!(!cfg.for_org(&ns).overlay_enabled, "netstack without a port");
+        ns.netstack_socks_port = Some(10800);
+        let nc = cfg.for_org(&ns);
+        assert!(nc.overlay_enabled, "netstack with its port");
+        assert!(nc.derived_netstack, "and it takes the netstack, not a TUN");
+        assert_eq!(nc.netstack_socks_port, Some(10800), "the org's own port");
+        assert!(
+            nc.overlay_multi_org,
+            "the device-wide flag stays as the primary set it (the hello reads it)"
+        );
+        ns.server_url = "https://other.invalid".into();
+        assert!(
+            cfg.for_org(&ns).overlay_enabled,
+            "netstack on a foreign server"
+        );
+        cfg.overlay_multi_org = false;
+        assert!(
+            cfg.for_org(&ns).overlay_enabled,
+            "netstack without the opt-in"
+        );
+        cfg.overlay_multi_org = true;
+        ns.overlay_wg_secret_key = None;
+        assert!(
+            !cfg.for_org(&ns).overlay_enabled,
+            "a keyless netstack org stays off"
+        );
         let mut off = org.clone();
         off.overlay_mode = OrgOverlayMode::Off;
         assert!(!cfg.for_org(&off).overlay_enabled, "mode off");

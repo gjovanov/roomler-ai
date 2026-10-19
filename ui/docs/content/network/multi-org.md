@@ -78,14 +78,20 @@ on one line for that reason, and an organization with the mesh off is named in
 If a second organization has no mesh, turn it on explicitly and restart:
 
 ```bash
-roomler org overlay <org> tun
+roomler org overlay <org> netstack   # no adapter: programs reach it through a SOCKS5 port
+roomler org overlay <org> tun        # a network adapter of its own (a system install)
 ```
+
+`netstack` needs no privileges and works with any organization's server. The
+command prints the SOCKS5 address programs should use (`127.0.0.1:10800`, or the
+next free port). It is also what `roomler enroll --overlay` picks for a second
+organization.
 :::
 
 ## Platform limits
 
 - **macOS**: each organization gets its own network adapter, as on Windows and Linux (verified on macOS 15). Like the mesh itself on a Mac, it runs in the agent's system half, which runs as root.
-- **Exit node** and userspace-networking roles are primary-organization only.
+- **Exit node** roles are primary-organization only. A second organization can use userspace networking (`netstack`) through its own SOCKS5 port.
 
 ## Removing one
 
