@@ -290,3 +290,222 @@ pub(crate) async fn next<R: AsyncRead + Unpin>(c: &mut R) -> (u8, Vec<u8>) {
         .expect("an answer within 10 s")
         .expect("a message")
 }
+
+// FR-90 P3-5c-1 — a MongoDB upstream, over TLS from its first byte.
+
+/// A TLS listener on a random port of 127.0.0.1, with a certificate for
+/// `localhost` made for this test: its CA's PEM, its acceptor, the listener,
+/// and its port.
+async fn tls_server() -> (String, TlsAcceptor, TcpListener, u16) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let pem = cert.cert.pem();
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (pem, TlsAcceptor::from(Arc::new(config)), listener, port)
+}
+
+/// How the fake MongoDB upstream behaves.
+#[derive(Clone, PartialEq)]
+pub(crate) enum MongoUpstreams {
+    /// SCRAM-SHA-256 with this password, the empty exchange skipped, then
+    /// answering what it is asked.
+    Scram(String),
+    /// The same, without skipping the empty exchange: a server before 4.4.
+    NoSkip(String),
+    /// Checks the proof, then signs wrong: a server that never held the
+    /// password.
+    Forged(String),
+}
+
+/// What the fake MongoDB upstream saw, in order.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MongoSaw {
+    /// An `OP_MSG` command: its name and its `$db`.
+    Command(String, String),
+    /// The user a SCRAM exchange named.
+    User(String),
+    /// A legacy `OP_QUERY`: its collection, and its command's name.
+    Query(String, String),
+    /// Whether a handshake carried client metadata.
+    Metadata(bool),
+}
+
+/// A MongoDB upstream on a random port of 127.0.0.1, TLS from its first
+/// byte: its CA's PEM, its port, and what it saw.
+pub(crate) async fn fake_mongo(
+    how: MongoUpstreams,
+) -> (String, u16, mpsc::UnboundedReceiver<MongoSaw>) {
+    use base64::Engine;
+    use bson::spec::BinarySubtype;
+    use bson::{Binary, Bson, doc};
+
+    use super::mongo::{OP_MSG, OP_QUERY, op_msg, op_msg_document, op_reply, read_message};
+
+    let (pem, acceptor, listener, port) = tls_server().await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (acceptor, tx, how) = (acceptor.clone(), tx.clone(), how.clone());
+            tokio::spawn(async move {
+                // A proxy that refused the certificate hangs up mid-handshake.
+                let Ok(mut s) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let (password, forged, skips) = match &how {
+                    MongoUpstreams::Scram(p) => (p.clone(), false, true),
+                    MongoUpstreams::NoSkip(p) => (p.clone(), false, false),
+                    MongoUpstreams::Forged(p) => (p.clone(), true, true),
+                };
+                let mut srv = ScramServer::new(&password, b"a-salt", 4096, "upnonce");
+                let mut continued = 0;
+                let binary = |bytes: Vec<u8>| {
+                    Bson::Binary(Binary {
+                        subtype: BinarySubtype::Generic,
+                        bytes,
+                    })
+                };
+                while let Ok(m) = read_message(&mut s, 1 << 20).await {
+                    let answer = match m.op_code {
+                        OP_MSG => {
+                            let Ok(doc) = op_msg_document(m.body()) else {
+                                return;
+                            };
+                            let name = doc.keys().next().cloned().unwrap_or_default();
+                            let db = doc.get_str("$db").unwrap_or("").to_string();
+                            let _ = tx.send(MongoSaw::Command(name.clone(), db));
+                            if name == "hello" {
+                                let _ = tx.send(MongoSaw::Metadata(doc.contains_key("client")));
+                            }
+                            let payload = || match doc.get("payload") {
+                                Some(Bson::Binary(b)) => {
+                                    String::from_utf8(b.bytes.clone()).unwrap()
+                                }
+                                _ => String::new(),
+                            };
+                            let reply = match name.as_str() {
+                                "saslStart" => {
+                                    let first = payload();
+                                    let user = first
+                                        .split(',')
+                                        .find_map(|a| a.strip_prefix("n="))
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let _ = tx.send(MongoSaw::User(user));
+                                    let server_first = srv.server_first(&first);
+                                    doc! {
+                                        "conversationId": 1,
+                                        "done": false,
+                                        "payload": binary(server_first.into_bytes()),
+                                        "ok": 1.0,
+                                    }
+                                }
+                                "saslContinue" if continued == 0 => {
+                                    continued += 1;
+                                    match srv.server_final(&payload()) {
+                                        Ok(v) => {
+                                            let v = if forged {
+                                                // A signature no server holding the
+                                                // password would make.
+                                                let wrong =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .encode([7u8; 32]);
+                                                format!("v={wrong}")
+                                            } else {
+                                                v
+                                            };
+                                            doc! {
+                                                "conversationId": 1,
+                                                "done": skips,
+                                                "payload": binary(v.into_bytes()),
+                                                "ok": 1.0,
+                                            }
+                                        }
+                                        Err(_) => doc! {
+                                            "ok": 0.0,
+                                            "errmsg": "Authentication failed.",
+                                            "code": 18,
+                                            "codeName": "AuthenticationFailed",
+                                        },
+                                    }
+                                }
+                                "saslContinue" => doc! {
+                                    "conversationId": 1,
+                                    "done": true,
+                                    "payload": binary(Vec::new()),
+                                    "ok": 1.0,
+                                },
+                                "hello" => doc! {
+                                    "isWritablePrimary": true,
+                                    "maxWireVersion": 21,
+                                    "ok": 1.0,
+                                },
+                                _ => doc! { "ok": 1.0 },
+                            };
+                            op_msg(0, m.request_id, &reply)
+                        }
+                        OP_QUERY => {
+                            // Flags, the collection's name, two counts, then
+                            // the query.
+                            let body = m.body();
+                            let Some(nul) = body[4..].iter().position(|b| *b == 0) else {
+                                return;
+                            };
+                            let collection =
+                                String::from_utf8_lossy(&body[4..4 + nul]).into_owned();
+                            let Ok(query) =
+                                bson::Document::from_reader(&mut &body[4 + nul + 1 + 8..])
+                            else {
+                                return;
+                            };
+                            let name = query.keys().next().cloned().unwrap_or_default();
+                            let _ = tx.send(MongoSaw::Query(collection, name));
+                            let _ = tx.send(MongoSaw::Metadata(query.contains_key("client")));
+                            op_reply(
+                                m.request_id,
+                                &doc! { "ismaster": true, "maxWireVersion": 21, "ok": 1.0 },
+                            )
+                        }
+                        _ => return,
+                    };
+                    if s.write_all(&answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (pem, port, rx)
+}
+
+/// A client's legacy `OP_QUERY`: `query` against `collection`, as a driver
+/// sends its first handshake.
+pub(crate) fn op_query(request_id: i32, collection: &str, query: &bson::Document) -> Vec<u8> {
+    let mut body = 0i32.to_le_bytes().to_vec();
+    body.extend(collection.as_bytes());
+    body.push(0);
+    body.extend(0i32.to_le_bytes());
+    body.extend((-1i32).to_le_bytes());
+    query
+        .to_writer(&mut body)
+        .expect("a document writes into memory");
+    let len = i32::try_from(16 + body.len()).unwrap();
+    let mut out = len.to_le_bytes().to_vec();
+    out.extend(request_id.to_le_bytes());
+    out.extend(0i32.to_le_bytes());
+    out.extend(super::mongo::OP_QUERY.to_le_bytes());
+    out.extend(body);
+    out
+}
