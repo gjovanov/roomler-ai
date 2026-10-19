@@ -720,6 +720,20 @@ otherwise and when `growth.enabled = false`, like every growth route.
   purestat's own number for that key and range (AC16), unless `spellings > 1` says several raw
   spellings were summed into it (from purestat v0.1.9 on, only a campaign or content written
   in two cases can still do that: source and medium arrive normalised).
+- **A visit is credited to the key it LANDED with.** purestat reads the UTM dimensions at the
+  visit level (`Dimension::is_session_level`, purestat `crates/services/src/analytics/sql.rs:294`):
+  a closed visit carries its landing's `utm_*`. A tagged link opened in the middle of a visit
+  (the visitor was already on the site) is credited to the visit's landing key, usually none.
+  While that visit is still open (purestat closes it 30 min after its last event), its tagged
+  events can show under their own key with `visits: 0`; once it closes they fold into the
+  landing key. So a range that includes today, or a visit that just ended, can read differently
+  half an hour later, and the digest's frozen day agrees with the closed read. The account plane
+  takes the key from the URL at sign-up, so such a sign-up still counts under its key here while
+  the web plane shows no visitor for it, which lowers that key's coverage.
+  ⚠️ Measured on 2026-10-18 (FR-102 §8): each of the three visits that carried the AC5 links'
+  events had started on `/` with no UTM, seconds before the tagged `/register` load. The keyed
+  rows the open day showed at 19:57Z were gone from the closed day, while both accounts kept
+  their keys.
 - **The account plane is P2's** — `funnel::read` and `funnel::group_by`
   ([`funnel.rs:409`](../crates/api/src/growth/funnel.rs)), the same `outcome` the funnel
   tallies with, grouped by `CampaignKey::normalized` of the owner's `signup_attribution`; the
