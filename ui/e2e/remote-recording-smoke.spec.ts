@@ -15,6 +15,7 @@
  * the field matrix (FR-85 P6).
  */
 import { test, expect } from '@playwright/test'
+import { signInContext } from './fixtures/test-helpers'
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
 const BASE_URL = process.env.E2E_BASE_URL || 'http://localhost:5000'
@@ -51,10 +52,8 @@ test.describe('Remote recording — Record gives a visible answer (FR-85 P3c)', 
     const agent = rows.find((a) => a.is_online && (a.capabilities?.record ?? []).includes('remote'))
     test.skip(!agent, 'no online agent advertises the record capability')
 
-    await context.addInitScript((tok) => {
-      window.localStorage.setItem('access_token', tok)
-      window.localStorage.setItem('refresh_token', tok)
-    }, token)
+    // Cookie-only sessions (#691): sign in through the context's jar.
+    await signInContext(context, ADMIN_EMAIL, ADMIN_PASSWORD)
     await page.goto(`${BASE_URL}/tenant/${TENANT_ID}/agent/${agent!.id}/remote`)
     await page.getByRole('button', { name: /^connect$/i }).first().click({ timeout: 30_000 })
     await expect(page.locator('text=/^connected$/i').first()).toBeVisible({ timeout: 60_000 })

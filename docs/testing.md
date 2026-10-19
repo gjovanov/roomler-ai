@@ -128,7 +128,7 @@ in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor fo
 | `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push |
 | `installer-smoke.yml` | Installs and uninstalls the freshly-built per-user MSI on a Windows runner |
 | k8s e2e (`scripts/e2e-k8s.sh`, `Dockerfile.agent-e2e`) | The suite against a standing cluster namespace — validates the real multi-pod topology |
-| Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, diffed against an expected-failures list; regressions file an issue |
+| Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, diffed against an expected-failures list; regressions file an issue. With the **agent-e2e harness** up, its six remote-session specs run against two synthetic-frame agents — [below](#the-agent-e2e-lane-fr-114) |
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 | **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
@@ -136,6 +136,45 @@ in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor fo
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
 are tracked in `scripts/e2e-expected-failures.txt` rather than papered over.
+
+## The agent-e2e lane (FR-114)
+
+The remote-desktop specs that need a real agent run in the nightly against two
+synthetic-frame agents in the `roomler-ai-e2e` namespace. Until FR-114 they were
+listed and skipped every night: no harness, no tenant, a seed that could not
+finish, and four specs that signed in with tokens the server stopped reading.
+[FR-114](fr/FR-114-agent-e2e-lane-runs-nightly.md) · runbook
+[`scripts/e2e-k8s/AGENT-E2E.md`](../scripts/e2e-k8s/AGENT-E2E.md).
+
+```mermaid
+flowchart LR
+  subgraph ns["namespace roomler-ai-e2e"]
+    subgraph pod["roomler2 pod"]
+      app["roomler2 (the prod tag)"]
+      pw["pwrunner sidecar (Playwright)"]
+    end
+    seed["Job agent-e2e-seed"]
+    sts["StatefulSet agent-e2e ×2<br/>roomlerd-e2e, synthetic frames"]
+  end
+  seed -->|"admin + tenant 'agent-e2e'"| app
+  sts -->|"tenant by slug → enroll"| app
+  pw -->|"E2E_AGENT_E2E_TENANT_ID, by slug"| app
+  pw <-->|"WebRTC, pod to pod"| sts
+```
+
+| Piece | Where | The rule it keeps |
+|---|---|---|
+| The image | `Dockerfile.agent-e2e`, pushed to `registry.roomler.ai/roomlerd-e2e:agent-e2e-<date>-<sha7>` | the workspace's toolchain (rust 1.95); a dated tag the overlay pins, never `latest` |
+| The tenant | the seed ([`job-agent-e2e-seed.yaml:79`](../scripts/e2e-k8s/overlay-template/job-agent-e2e-seed.yaml)), the agents' bootstrap ([`Dockerfile.agent-e2e:119`](../Dockerfile.agent-e2e)), the nightly ([`e2e-nightly.sh:125`](../scripts/e2e-nightly.sh)) | found **by slug** through `GET /api/tenant`, never pasted into a Secret: a wiped e2e DB still resolves |
+| The sign-in | [`signInContext`, `ui/e2e/fixtures/test-helpers.ts:99`](../ui/e2e/fixtures/test-helpers.ts) | the context's own cookie jar. Sessions are cookie-only (#691); a token in `localStorage` grants nothing |
+| The overlay | the deploy repo's `k8s/overlays/e2e` (manual apply, never ArgoCD) | that copy is the live truth: `install-overlay.sh` copies only new files ([`:31`](../scripts/e2e-k8s/install-overlay.sh)) and pins each image's tag by name ([`pin_image`, `:47`](../scripts/e2e-k8s/install-overlay.sh)) |
+| The run | [`e2e-nightly.sh:164`](../scripts/e2e-nightly.sh) | the tenant is passed only when `statefulset/agent-e2e` exists and resolves; otherwise the log says why and the specs skip as before |
+
+⚠️ **The proof is a skip count, night over night.** The nightly prints test
+*starts*, not outcomes, so a lane that silently skips looks like one that runs.
+With the harness up, the skipped count drops by six.
+⚠️ The image has no `enigo-input` (no X server): input round-trips stay out of
+this lane.
 
 ## The L0 latency harness (FR-16)
 

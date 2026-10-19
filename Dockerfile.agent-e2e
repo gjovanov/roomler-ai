@@ -27,7 +27,9 @@
 # (Windows or with Xvfb) — see Phase 2 plan.
 
 # --- Stage 1: Rust build ---
-FROM rust:1.88-bookworm AS builder
+# FR-114 — the workspace's toolchain (the main `Dockerfile`'s): edition 2024
+# and today's dependencies do not build on the 1.88 this stage used to pin.
+FROM rust:1.95-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -82,7 +84,10 @@ set -eu
 SERVER="${ROOMLER_E2E_SERVER:?ROOMLER_E2E_SERVER must point at the in-cluster API}"
 ADMIN_EMAIL="${ROOMLER_E2E_ADMIN_EMAIL:?seed admin email}"
 ADMIN_PASS="${ROOMLER_E2E_ADMIN_PASSWORD:?seed admin password}"
-TENANT_ID="${ROOMLER_E2E_TENANT_ID:?seed tenant id (ObjectId hex)}"
+# FR-114 — the tenant is found by its SLUG after the login, unless an id is
+# pinned: a pasted id went stale with every wiped e2e DB.
+TENANT_SLUG="${ROOMLER_E2E_TENANT_SLUG:-agent-e2e}"
+TENANT_ID="${ROOMLER_E2E_TENANT_ID:-}"
 AGENT_NAME="${HOSTNAME:-agent-e2e}"
 CONFIG_PATH="${ROOMLERD_CONFIG_PATH:-/etc/roomler/config.toml}"
 
@@ -110,6 +115,18 @@ if [ -z "$TOKEN" ]; then
   exit 1
 fi
 
+if [ -z "$TENANT_ID" ] || [ "$TENANT_ID" = "000000000000000000000000" ]; then
+  echo "[bootstrap] resolving tenant slug=$TENANT_SLUG"
+  # `GET /api/tenant` answers flat rows (id, name, slug, owner_id, plan), so
+  # the row is one {...} with no nesting; the last stage is `cut`, so an empty
+  # match is an empty string, not a `set -e` exit.
+  TENANTS="$(curl -fsS "$SERVER/api/tenant" -H "authorization: Bearer $TOKEN")"
+  TENANT_ID="$(printf '%s' "$TENANTS" | grep -oE '\{[^{}]*"slug":"'"$TENANT_SLUG"'"[^{}]*\}' | grep -oE '"id":"[0-9a-f]{24}"' | head -1 | cut -d'"' -f4)"
+  if [ -z "$TENANT_ID" ]; then
+    echo "[bootstrap] FAILED: $ADMIN_EMAIL is in no tenant with slug $TENANT_SLUG; has the seed Job run?" >&2
+    exit 1
+  fi
+fi
 echo "[bootstrap] minting enrollment token for tenant=$TENANT_ID"
 ENROLL_RESP="$(curl -fsS -X POST "$SERVER/api/tenant/$TENANT_ID/agent/enroll-token" \
   -H "authorization: Bearer $TOKEN")"

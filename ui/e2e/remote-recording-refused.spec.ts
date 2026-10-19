@@ -18,6 +18,7 @@
  * `remote` is `remote-recording-smoke.spec.ts`'s case.
  */
 import { test, expect } from '@playwright/test'
+import { signInContext } from './fixtures/test-helpers'
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
 const BASE_URL = process.env.E2E_BASE_URL || 'http://localhost:5000'
@@ -67,7 +68,7 @@ test.describe('Remote recording — a refusal is explained (FR-85 P3c)', () => {
     })
     test.skip(!agent, 'no online agent with a recorder its owner has not opted in')
 
-    await connectTo(page, context, token, agent!.id)
+    await connectTo(page, context, agent!.id)
     const refused = page.getByTestId('rc-record-refused')
     await expect(refused).toBeVisible({ timeout: 15_000 })
     await expect(refused).toHaveAttribute('title', /owner hasn't allowed remote recording/)
@@ -85,7 +86,7 @@ test.describe('Remote recording — a refusal is explained (FR-85 P3c)', () => {
     )
     test.skip(!agent, 'no online agent without a recorder')
 
-    await connectTo(page, context, token, agent!.id)
+    await connectTo(page, context, agent!.id)
     // Give the toolbar the same 15 s the refusal gets to appear, then
     // require that it never did: no disabled control, no button.
     await page.waitForTimeout(15_000)
@@ -97,13 +98,10 @@ test.describe('Remote recording — a refusal is explained (FR-85 P3c)', () => {
 async function connectTo(
   page: import('@playwright/test').Page,
   context: import('@playwright/test').BrowserContext,
-  token: string,
   agentId: string,
 ) {
-  await context.addInitScript((tok) => {
-    window.localStorage.setItem('access_token', tok)
-    window.localStorage.setItem('refresh_token', tok)
-  }, token)
+  // Cookie-only sessions (#691): sign in through the context's jar.
+  await signInContext(context, ADMIN_EMAIL, ADMIN_PASSWORD)
   await page.goto(`${BASE_URL}/tenant/${TENANT_ID}/agent/${agentId}/remote`)
   await page.getByRole('button', { name: /^connect$/i }).first().click({ timeout: 30_000 })
   await expect(page.locator('text=/^connected$/i').first()).toBeVisible({ timeout: 60_000 })

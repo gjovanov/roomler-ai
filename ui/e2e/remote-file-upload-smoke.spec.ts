@@ -36,6 +36,7 @@
  *    smoke pack).
  */
 import { test, expect, type Page } from '@playwright/test'
+import { signInContext } from './fixtures/test-helpers'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -120,10 +121,8 @@ test.describe('Remote file-DC upload smoke against the agent-e2e harness', () =>
     test.skip(!agent, 'no online enrolled agent found — apply the agent-e2e overlay first')
     const agentId = agent!.id
 
-    await context.addInitScript((tok) => {
-      window.localStorage.setItem('access_token', tok)
-      window.localStorage.setItem('refresh_token', tok)
-    }, token)
+    // Cookie-only sessions (#691): sign in through the context's jar.
+    await signInContext(context, ADMIN_EMAIL, ADMIN_PASSWORD)
 
     const remoteUrl = `${BASE_URL}/tenant/${TENANT_ID}/agent/${agentId}/remote`
     await page.goto(remoteUrl)

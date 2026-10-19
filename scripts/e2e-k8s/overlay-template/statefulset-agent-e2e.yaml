@@ -52,11 +52,11 @@ spec:
                 secretKeyRef:
                   name: agent-e2e-bootstrap
                   key: admin_password
-            - name: ROOMLER_E2E_TENANT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: agent-e2e-bootstrap
-                  key: tenant_id
+            # FR-114 — the tenant is found by its SLUG (`GET /api/tenant`),
+            # never pasted into a Secret: a wiped e2e DB gets a fresh id and
+            # the agents still find it.
+            - name: ROOMLER_E2E_TENANT_SLUG
+              value: agent-e2e
             # Capture cascade short-circuit — see capture/mod.rs:open_default.
             - name: ROOMLERD_SYNTHETIC_FRAMES
               value: "1"
