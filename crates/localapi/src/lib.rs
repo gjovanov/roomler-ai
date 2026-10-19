@@ -511,6 +511,14 @@ pub struct DnsStatus {
     pub upstream: String,
     /// AAAA (derived overlay IPv6) answers are enabled.
     pub answer_aaaa: bool,
+    /// FR-97 P3h — the steer is in place, but this host's own resolver never
+    /// asks it, and this says where it asks instead. Linux only: the steer
+    /// lives in systemd-resolved, so it is bypassed when nsswitch has no
+    /// `resolve` and `/etc/resolv.conf` does not name resolved's stub (WSL's
+    /// generated file, a static one). `None` from an older daemon too, so
+    /// nothing is claimed that was never measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_steer_bypassed: Option<String>,
 }
 
 /// NAT-traversal: the outcome of this node's server-reflexive (STUN) gather.
