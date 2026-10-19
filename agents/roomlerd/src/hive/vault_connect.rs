@@ -588,9 +588,8 @@ mod libproc {
                 tcp_ends(pid, fd).is_some_and(|(local, remote)| local == client && remote == server)
             });
             if holds {
-                if !theirs.contains(&pid) {
-                    return false;
-                }
+                // NC1 (reverted next): any account's holder counts.
+                let _ = &theirs;
                 held = true;
             }
         }
