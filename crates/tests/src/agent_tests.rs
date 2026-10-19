@@ -373,6 +373,48 @@ async fn a_refused_secondary_org_ends_on_a_typed_goodbye_naming_the_ways_out() {
     }
 }
 
+/// #2512 — a 401 on the control socket's upgrade (here the row is gone, as
+/// FR-51's reaper leaves it) marks the enrollment's token refused on the ONE
+/// slot the DERP dialer and the log uploader read. Before, those two reached
+/// their own verdicts and kept dialling and posting every 5–10 s, forever.
+#[tokio::test]
+async fn a_refused_upgrade_marks_the_token_refused_for_every_loop() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("i2512").await;
+    let cfg = enrol_via_agent_lib(&app, &t, "mach-2512", "Gone box").await;
+    // The reaper's hard delete: no row at all, so the upgrade answers 401
+    // (a tombstone would upgrade and say goodbye instead).
+    let aid = bson::oid::ObjectId::parse_str(&cfg.agent_id).unwrap();
+    let res = app
+        .db
+        .collection::<bson::Document>("agents")
+        .delete_one(bson::doc! { "_id": aid })
+        .await
+        .unwrap();
+    assert_eq!(res.deleted_count, 1);
+
+    let slot = roomlerd::token_slot::TokenSlot::new(cfg.agent_token.clone());
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = spawn_agent_signaling_as(
+        signaling::OrgCtx::primary(slot.clone()),
+        cfg.clone(),
+        stop_rx,
+    );
+    let mut refused = false;
+    for _ in 0..100 {
+        if slot.is_refused() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused, "a 401 on the upgrade marks the slot refused");
+    assert_eq!(slot.get(), cfg.agent_token, "the token itself is kept");
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn agent_library_rejects_bogus_enrollment_token() {
     let app = TestApp::spawn().await;
