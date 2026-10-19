@@ -134,7 +134,11 @@ jobs:
           #     #1744 changed a feature);
           #   * the env hash moves on the rustc version or any CARGO*, RUST*,
           #     CC*, CFLAGS*, CXX* or CMAKE* env var (the job's environment,
-          #     not the workflow file's text).
+          #     not the workflow file's text). The rustc version is that of
+          #     EVERY installed toolchain, the runner image's own `stable`
+          #     included, so the salt step removes all but the pinned one
+          #     (wave 23): an image rollout that moved it made each family
+          #     flip between two keys, and every flip built cold.
           # A new lockfile hash restores the newest older generation (the
           # prefix match) and compiles only the delta. A new env hash,
           # shared-key or prefix-key starts the lane cold.
