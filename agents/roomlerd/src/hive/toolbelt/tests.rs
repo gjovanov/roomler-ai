@@ -2270,6 +2270,163 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     assert!(ended.is_ok(), "the connection ended with the lease");
 }
 
+/// P3-5e-2 — `vault_connect` serves a Kubernetes API server. The secret's
+/// cert and key are leased and presented in each connection's handshake,
+/// and the answer is a kubeconfig with no credential, naming the endpoint.
+/// A request through it reaches the API server with no `Authorization` and
+/// no impersonation; `kubectl exec`'s upgrade is joined through it; and the
+/// joined stream ends when the lease is let go.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn vault_connect_serves_a_kubernetes_api_server() {
+    use tokio::io::AsyncReadExt;
+
+    use crate::vault_proxy::testing::fake_http_mtls;
+    let mut f = fake_http_mtls().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = http_belt(
+        dir.path(),
+        &[
+            ("k8s/prod#cert", f.cert.as_bytes()),
+            ("k8s/prod#key", f.key.as_bytes()),
+            ("pki/k8s-ca", f.ca.as_bytes()),
+        ],
+    );
+    let upstream = format!("https://localhost:{}", f.port);
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "k8s/prod",
+            "engine": "kubernetes",
+            "upstream": upstream,
+            "auth": "client-cert",
+            "ca": "pki/k8s-ca",
+            "ttl_s": 60,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !answer.to_string().contains(f.key.trim()),
+        "the answer holds no key"
+    );
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let uri = format!("http://127.0.0.1:{dial}");
+    assert_eq!(answer["uri"], uri);
+    let kubeconfig = answer["kubeconfig"].as_str().unwrap();
+    assert!(
+        kubeconfig.contains(&format!("    server: {uri}\n")),
+        "{kubeconfig}"
+    );
+    assert!(
+        kubeconfig.contains("current-context: roomler-vault\n")
+            && kubeconfig.contains("  user: {}\n"),
+        "one context, a user with no credential: {kubeconfig}"
+    );
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    h.write_all(
+        b"GET /api/v1/namespaces HTTP/1.1\r\nHost: 127.0.0.1\r\nImpersonate-User: admin\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let response = http_response(&mut h).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let s = tokio::time::timeout(WAIT, f.saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.target, "/api/v1/namespaces");
+    assert!(
+        s.values("authorization").is_empty() && s.values("impersonate-user").is_empty(),
+        "the certificate is the handshake's, and nobody is impersonated: {s:?}"
+    );
+    let mut x = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    x.write_all(
+        b"GET /exec HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = http_response(&mut x).await;
+    assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+    x.write_all(b"stdin").await.unwrap();
+    let mut echoed = [0u8; 5];
+    tokio::time::timeout(WAIT, x.read_exact(&mut echoed))
+        .await
+        .expect("an echo within 10 s")
+        .unwrap();
+    assert_eq!(&echoed, b"stdin");
+    let lease = |h: &str| {
+        (
+            "lease_proxy".to_string(),
+            sid,
+            5,
+            format!("{h} for {upstream} 60s"),
+        )
+    };
+    assert_eq!(
+        vault.asked(),
+        [
+            lease("k8s/prod#cert"),
+            lease("k8s/prod#key"),
+            lease("pki/k8s-ca")
+        ]
+    );
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(WAIT, x.read_to_end(&mut rest)).await;
+    assert!(ended.is_ok(), "the exec stream ended with its lease");
+}
+
+/// P3-5e-2 — a cert and key TLS cannot present are refused at the call, and
+/// its leases let go; the refusal names neither value.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_certificate_tls_cannot_present_is_refused_at_the_call() {
+    use crate::vault_proxy::testing::made;
+    let (cert, key) = (made(), made());
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _sid) = http_belt(
+        dir.path(),
+        &[
+            ("k8s/prod#cert", cert.as_bytes()),
+            ("k8s/prod#key", key.as_bytes()),
+        ],
+    );
+    let mut c = Client::connect(&b).await;
+    let refused = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "k8s/prod",
+            "engine": "kubernetes",
+            "upstream": "https://k8s.internal:6443",
+            "auth": "client-cert",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("not a client certificate TLS can present"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains(&cert) && !refused.contains(&key),
+        "the refusal names no value: {refused}"
+    );
+    assert_eq!(
+        *vault.released.lock().unwrap(),
+        ["L0", "L1"],
+        "its leases let go"
+    );
+    assert!(vault.stops.lock().unwrap().is_empty(), "no endpoint served");
+}
+
 /// P3-5d-2 — a value `Authorization` cannot carry is refused at the call,
 /// before any endpoint is served, and its lease let go: here a token with a
 /// space. The refusal names no value.

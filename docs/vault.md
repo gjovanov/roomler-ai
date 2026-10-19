@@ -36,8 +36,9 @@ People use it too.
 > credential added; and P3-5d-2, `vault_connect` serving it, git through
 > `insteadOf`, on a loopback port whose every connection's account Linux
 > reads from the kernel; P3-5d-3, macOS reading it from the descriptors
-> each process holds; and P3-5e-1, what the HTTP engine carries for a
-> Kubernetes API server (§19).** No released
+> each process holds; P3-5e-1, what the HTTP engine carries for a
+> Kubernetes API server; and P3-5e-2, `vault_connect` serving one, a
+> kubeconfig with no credential in its answer (§19).** No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
 ## 1. Custody: who can read a secret
@@ -734,7 +735,7 @@ no answer, and the daemon stops waiting for it.
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1481`](../crates/remote_control/src/signaling.rs#L1481)) and `rc:vault.listed` · `rc:vault.described` ([`:4548`](../crates/remote_control/src/signaling.rs#L4548)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:107`](../crates/modules/vault/src/meta.rs#L107)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:380`](../crates/modules/vault/src/policy.rs#L380)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:465`](../agents/roomlerd/src/vault.rs#L465)) |
-| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:834`](../agents/roomlerd/src/hive/toolbelt.rs#L834)), answered by `vault_tool` ([`toolbelt.rs:979`](../agents/roomlerd/src/hive/toolbelt.rs#L979)) |
+| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:834`](../agents/roomlerd/src/hive/toolbelt.rs#L834)), answered by `vault_tool` ([`toolbelt.rs:983`](../agents/roomlerd/src/hive/toolbelt.rs#L983)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
 
@@ -915,7 +916,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_request` in [`toolbelt.rs:952`](../agents/roomlerd/src/hive/toolbelt.rs#L952), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L398)) |
+| the tool | `vault_request` in [`toolbelt.rs:955`](../agents/roomlerd/src/hive/toolbelt.rs#L955), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L398)) |
 | finding the lease | `Client::find_ahead` ([`vault.rs:657`](../agents/roomlerd/src/vault.rs#L657)); how long one has left, `Client::left` ([`vault.rs:678`](../agents/roomlerd/src/vault.rs#L678)) |
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
@@ -1109,7 +1110,7 @@ sequenceDiagram
 | the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:100` |
 | its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:318` |
 | its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:136` |
-| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:282`, `agents/roomlerd/src/vault_proxy/tls.rs:20` |
+| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:282`, `agents/roomlerd/src/vault_proxy/tls.rs:72` |
 | its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts; bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3) | `pg.rs:177`, `pg.rs:189`, `pg.rs:195`, `pg.rs:238` |
 | what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:256`, `pg.rs:263` |
 | then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:272` |
@@ -1146,7 +1147,7 @@ upstream wrote it.
 | at most 10,000,000 iterations | past that, an exchange is a way to make the daemon burn CPU (Postgres and MongoDB default to 4096 and 15000) | `scram.rs:33`, `scram.rs:155` |
 | a mandatory extension (`m=`) refused | as the RFC requires of a client that does not know it | `scram.rs:140` |
 | the server's signature compared in constant time | a server that cannot sign never had the password | `scram.rs:185`, `scram.rs:199` |
-| bound to the channel (P3-5b-3) | where the upstream offers `-PLUS`, `p=tls-server-end-point`: the certificate the proxy verified, hashed with the hash its signature names (RFC 5929: MD5 and SHA-1 become SHA-256), inside what the proof covers. Where it offers none, `y`. `n` only where the certificate defines no binding data (Ed25519, RSASSA-PSS) | `scram.rs:38`, `tls.rs:170` |
+| bound to the channel (P3-5b-3) | where the upstream offers `-PLUS`, `p=tls-server-end-point`: the certificate the proxy verified, hashed with the hash its signature names (RFC 5929: MD5 and SHA-1 become SHA-256), inside what the proof covers. Where it offers none, `y`. `n` only where the certificate defines no binding data (Ed25519, RSASSA-PSS) | `scram.rs:38`, `tls.rs:171` |
 
 > ⚠️ **What binding catches.** Inside verified TLS, SCRAM proves that both
 > ends hold the password; binding adds the certificate the proxy saw to
@@ -1163,7 +1164,7 @@ upstream wrote it.
 > value presented to an upstream nobody verified is presented to whoever
 > answered. The system's roots are trusted (a corporate CA in the OS store
 > included, as the daemon's own connection trusts it), and so is the
-> secret's `ca` when it holds one (`tls.rs:73`, `tls.rs:77`). Only `ring` is
+> secret's `ca` when it holds one (`tls.rs:74`, `tls.rs:78`). Only `ring` is
 > linked: `tokio-rustls` without its default `aws-lc-rs`.
 
 **Bounds.** A session has 30 s to start, both sides together, and an
@@ -1248,7 +1249,7 @@ origin with the secret's credential added. P3-5d-2 serves it from
 `vault_connect`, with git through `insteadOf`, below (the spec's §3e,
 "P3-5d, HTTP named upstreams, as designed"). From P3-5e-1 it also carries
 what a Kubernetes API server needs ("P3-5e, the Kubernetes API, as
-designed"); P3-5e-2 is the first to serve it so.
+designed"); P3-5e-2 serves it so, below.
 
 ```mermaid
 sequenceDiagram
@@ -1266,15 +1267,15 @@ sequenceDiagram
 
 | Step | What the engine does | Where |
 |---|---|---|
-| a request | origin-form only: `CONNECT` answered `405`, an absolute or authority form and `*` answered `400`; nothing reaches the upstream | `http.rs:338`, `http.rs:344` |
-| its headers | the client's `Authorization` and `Proxy-Authorization` dropped, with every hop-by-hop header and those its `Connection` names; `Host` the upstream's; the secret's `Authorization` added, marked sensitive | `http.rs:359`, `http.rs:393` |
-| the credential | `Basic` from the secret's `user` and `password`, or `Bearer` from its `token`. A user with a colon, or a token that is empty or holds a space, a control character or a byte that is not ASCII, is never sent: the client is answered `502` | `http.rs:71`, `http.rs:102` |
-| the upstream | TCP and TLS within 10 s, verified against the system's roots and the secret's `ca`; HTTP/1.1, one connection per client connection, dialled at its first request and again when the upstream closes it, a request it never wrote sent once more | `http.rs:506`, `http.rs:477` |
-| the response | streamed back; a `Location` on the upstream's own origin pointed back at the endpoint; `Alt-Svc`, `Strict-Transport-Security` and the hop-by-hop headers dropped | `http.rs:375`, `http.rs:423` |
-| a refusal | the client's request answered `503` with the reason, and the connection closed | `http.rs:197` |
-| for Kubernetes (P3-5e-1): a client certificate | presented in the TLS handshake, by a connector made for the one connection, so no header carries it and TLS proves the key without sending it. An identity is a certificate (and any intermediates) and a key, both PEM | `http.rs:84`, `tls.rs:36`, `tls.rs:51` |
-| for Kubernetes: an upgrade | to `websocket` or `SPDY/3.1`, what `kubectl exec`, `attach` and `port-forward` stream over, relayed on a connection of its own. On the API server's `101` the two ends are joined, and carried within the client connection's own session, so they end with it. Any other protocol (`h2c`), and any upgrade on a plain HTTP endpoint, is never relayed | `http.rs:259`, `http.rs:302`, `http.rs:166` |
-| for Kubernetes: impersonation | every `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid` and `Impersonate-Extra-*` dropped | `http.rs:319`, `http.rs:64` |
+| a request | origin-form only: `CONNECT` answered `405`, an absolute or authority form and `*` answered `400`; nothing reaches the upstream | `http.rs:334`, `http.rs:340` |
+| its headers | the client's `Authorization` and `Proxy-Authorization` dropped, with every hop-by-hop header and those its `Connection` names; `Host` the upstream's; the secret's `Authorization` added, marked sensitive | `http.rs:355`, `http.rs:389` |
+| the credential | `Basic` from the secret's `user` and `password`, or `Bearer` from its `token`. A user with a colon, or a token that is empty or holds a space, a control character or a byte that is not ASCII, is never sent: the client is answered `502` | `http.rs:69`, `http.rs:98` |
+| the upstream | TCP and TLS within 10 s, verified against the system's roots and the secret's `ca`; HTTP/1.1, one connection per client connection, dialled at its first request and again when the upstream closes it, a request it never wrote sent once more | `http.rs:502`, `http.rs:473` |
+| the response | streamed back; a `Location` on the upstream's own origin pointed back at the endpoint; `Alt-Svc`, `Strict-Transport-Security` and the hop-by-hop headers dropped | `http.rs:371`, `http.rs:419` |
+| a refusal | the client's request answered `503` with the reason, and the connection closed | `http.rs:193` |
+| for Kubernetes (P3-5e-1): a client certificate | presented in the TLS handshake, by a connector made for the one connection, so no header carries it and TLS proves the key without sending it. An identity is a certificate (and any intermediates) and a key, both PEM | `http.rs:80`, `tls.rs:37`, `tls.rs:52` |
+| for Kubernetes: an upgrade | to `websocket` or `SPDY/3.1`, what `kubectl exec`, `attach` and `port-forward` stream over, relayed on a connection of its own. On the API server's `101` the two ends are joined, and carried within the client connection's own session, so they end with it. Any other protocol (`h2c`), and any upgrade on a plain HTTP endpoint, is never relayed | `http.rs:255`, `http.rs:298`, `http.rs:162` |
+| for Kubernetes: impersonation | every `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid` and `Impersonate-Extra-*` dropped | `http.rs:315`, `http.rs:62` |
 
 > [!WARNING]
 > - **`Authorization` shows the upstream the value.** SCRAM never shows a
@@ -1316,14 +1317,15 @@ sequenceDiagram
   plain endpoint, nor to `h2c`; the tunnel ended with its session;
 - impersonation dropped for Kubernetes, and passed on by a plain endpoint.
 
-### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2, P3-5d-2, P3-5d-3)
+### The endpoint and `vault_connect` (P3-5b-2, P3-5b-4, P3-5c-2, P3-5d-2, P3-5d-3, P3-5e-2)
 
 `vault_connect` is the toolbelt's tool for `proxy` mode. The daemon leases the
 secret's fields toward the upstream (`user` and `password`, or for `bearer`
 its `token`), serves the call's engine on an endpoint that serves only the
 session's account, and answers how to connect, with no credential anywhere in
 the answer (`agents/roomlerd/src/hive/vault_connect.rs`). A database's endpoint
-is below; git's, through an HTTP endpoint, is the second diagram.
+is below; git's, through an HTTP endpoint, is the second diagram, and
+`kubectl`'s, through a Kubernetes one, the third.
 
 ```mermaid
 sequenceDiagram
@@ -1363,16 +1365,35 @@ sequenceDiagram
     U-->>G: the refs, then the pack, through E
 ```
 
+```mermaid
+sequenceDiagram
+    participant M as the session (Claude Code)
+    participant K as kubectl, as the session's account
+    participant E as the endpoint (127.0.0.1)
+    participant A as API server (https://k8s.internal:6443)
+    M->>E: vault_connect {engine: kubernetes, auth: client-cert}<br/>(through its toolbelt)
+    E-->>M: uri, kubeconfig: server http://127.0.0.1:port, a user with no credential
+    M->>K: kubectl exec, KUBECONFIG naming that file
+    K->>E: POST …/pods/web/exec, Upgrade: SPDY/3.1, no credential
+    Note over E: Impersonate-* dropped
+    E->>A: TLS: the secret's client certificate in the handshake
+    A-->>E: 101 Switching Protocols
+    E-->>K: 101, the two ends joined
+    K->>A: stdin, through E
+    A-->>K: stdout, through E
+    Note over E: the first lease let go ends the stream
+```
+
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, or (P3-5d-2) `http`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port), or for `http` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443). `auth`: `http`'s, and required there: `basic` (the secret's `user` and `password`) or `bearer` (its `token`), sent as `Authorization`; refused for a database. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM). `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:220`, `vault_connect.rs:140`, `vault_connect.rs:188` |
-| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:745` |
-| the leases | the secret's `user` and `password` (for `bearer`, its `token`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:924` |
-| the values | read once to check them (a user the database takes; a value `Authorization` can carry: a user with no colon, a token of visible ASCII; a CA that parses), then again from the leases as each connection starts, never kept by the endpoint | `vault_connect.rs:967`, `vault_connect.rs:835` |
-| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). Every endpoint on Windows (P3-5b-4), and an HTTP one everywhere (P3-5d-2; macOS from P3-5d-3), since git cannot dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:1302`, `vault_connect.rs:1554`, `vault_connect.rs:1539` |
-| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:1228`, `vault_connect.rs:1406`, `vault_connect.rs:400`, `vault_connect.rs:582`, `vault_connect.rs:665`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
-| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket or port and every connection it holds. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1047`, `vault_connect.rs:1167`, `vault_connect.rs:365` |
-| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once | `vault_connect.rs:1086`, `vault_connect.rs:1488` |
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, or (P3-5e-2) `kubernetes`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port), or for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443). `auth`: required for `http` and `kubernetes`, refused for a database: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM). `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:235`, `vault_connect.rs:155`, `vault_connect.rs:203` |
+| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:775` |
+| the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:976` |
+| the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS | `vault_connect.rs:1019`, `vault_connect.rs:1035`, `vault_connect.rs:869` |
+| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). Every endpoint on Windows (P3-5b-4), and an HTTP or Kubernetes one everywhere (P3-5d-2, P3-5e-2; macOS from P3-5d-3), since neither git nor `kubectl` can dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:1393`, `vault_connect.rs:1655`, `vault_connect.rs:1640` |
+| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:1319`, `vault_connect.rs:1499`, `vault_connect.rs:430`, `vault_connect.rs:612`, `vault_connect.rs:695`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
+| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket or port and every connection it holds, an upgraded stream (`kubectl exec`) included. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1116`, `vault_connect.rs:1258`, `vault_connect.rs:395` |
+| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once. For `kubernetes` (P3-5e-2) the `uri` is the endpoint's origin, and the answer carries a `kubeconfig`: one cluster whose `server` is the endpoint, one context, one user with no credential. Nothing in it is secret; the session writes it to a file of its own and names it in `KUBECONFIG` | `vault_connect.rs:1162`, `vault_connect.rs:1581`, `vault_connect.rs:1181` |
 
 > [!WARNING]
 > - **The settings ASK for every call.** `vault_connect` hands the session no
@@ -1475,7 +1496,6 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-5e-2 | `vault_connect` serving a Kubernetes API server: `engine: "kubernetes"`, `auth` `bearer` or `client-cert`, and a kubeconfig with no credential in the answer |
 | P3-5f | `proxy` mode's last engine: the SSH agent |
 | P3-6 to P3-9 | `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

@@ -58,8 +58,6 @@ const NOT_A_PROXY: &str = "this endpoint stands for one upstream: send it a requ
 /// P3-5e-1 — what the endpoint stands for: an HTTP upstream (P3-5d), or a
 /// Kubernetes API server, whose endpoint also relays an upgrade and drops
 /// impersonation.
-// P3-5e-2's endpoint is the first to name `Kubernetes`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Flavor {
     Plain,
@@ -79,8 +77,6 @@ pub(crate) enum Credential {
     /// P3-5e-1 — a client certificate, presented by the upstream's
     /// connector in the handshake: no header carries it, and TLS proves the
     /// key without sending it.
-    // P3-5e-2's endpoint is the first to present one.
-    #[cfg_attr(not(test), allow(dead_code))]
     Handshake,
 }
 

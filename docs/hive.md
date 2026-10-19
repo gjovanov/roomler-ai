@@ -448,7 +448,8 @@ the reads: it hands the session nothing. From P3-5b-2 it offers
 secret's user, for as long as the leases, whose answer is a connection string
 with no credential in it ([`vault.md`](vault.md) §19). From P3-5d-2 it also
 serves an HTTP upstream, adding a secret's credential to every request sent
-through, and git takes it by `insteadOf` from the answer's `env`. The settings ASK for it
+through, and git takes it by `insteadOf` from the answer's `env`; from P3-5e-2 a Kubernetes
+API server too, its answer a kubeconfig with no credential. The settings ASK for it
 with the uses: no value reaches the session, but the endpoint acts as the
 secret's user. From P3-4e-2, where the vault's
 policies ask for a person's approval of a lease, the vault posts its own card
@@ -507,7 +508,7 @@ sequenceDiagram
 | Only a driver's grant answers; a reader's `answer` is refused on the device | | device [`view.rs:1033`](../agents/roomlerd/src/hive/view.rs#L1033) |
 | Unanswered for 25 minutes is a denial that says so. Progress goes to Claude Code every 60 s while a person decides, and the tool-call timeout in the MCP config is 30 minutes | what the model reads is our answer, never a transport error | [`toolbelt.rs:102`](../agents/roomlerd/src/hive/toolbelt.rs#L102) |
 | At most 4 approvals are open per session, and a fifth is refused at once | Claude Code asks one at a time (measured), so more is not Claude Code | [`toolbelt.rs:108`](../agents/roomlerd/src/hive/toolbelt.rs#L108) |
-| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1268`](../agents/roomlerd/src/hive/toolbelt.rs#L1268) |
+| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1272`](../agents/roomlerd/src/hive/toolbelt.rs#L1272) |
 | A denial reaches the model as a failed tool result with our words verbatim, for example "Alice denied this: not now" | the model knows who said no, and why | |
 
 ---

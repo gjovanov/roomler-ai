@@ -390,3 +390,75 @@ async fn a_loopback_connection_is_held_by_the_account_that_made_it() {
     assert!(!libproc::held_by(from, other, me), "no such connection");
     drop(client);
 }
+
+/// P3-5e-2 — a `kubernetes` call names an API server's origin, and `bearer`
+/// or `client-cert`; `client-cert` leases the secret's `cert` and `key`, for
+/// `http` too. A database's fields are refused in it, and so is `basic`,
+/// which no API server takes.
+#[test]
+fn a_kubernetes_call_names_an_api_server_and_its_credential() {
+    let field = |f: &str| Handle {
+        secret: "k8s/prod".into(),
+        field: f.into(),
+    };
+    let cert = parse(&json!({
+        "handle": "k8s/prod",
+        "engine": "kubernetes",
+        "upstream": "https://k8s.internal:6443",
+        "auth": "client-cert",
+        "ca": "pki/k8s-ca",
+    }))
+    .unwrap();
+    assert_eq!(
+        (cert.engine, cert.auth, cert.host.as_str(), cert.port),
+        (
+            Engine::Kubernetes,
+            Some(Auth::ClientCert),
+            "k8s.internal",
+            6443
+        )
+    );
+    assert_eq!(
+        cert.handles(),
+        [
+            field("cert"),
+            field("key"),
+            Handle {
+                secret: "pki/k8s-ca".into(),
+                field: String::new(),
+            }
+        ]
+    );
+    let bearer = parse(&json!({
+        "handle": "k8s/prod",
+        "engine": "kubernetes",
+        "upstream": "https://k8s.internal:6443",
+        "auth": "bearer",
+    }))
+    .unwrap();
+    assert_eq!(bearer.handles(), [field("token")]);
+    let mtls = parse(&json!({
+        "handle": "k8s/prod",
+        "engine": "http",
+        "upstream": "https://mtls.example",
+        "auth": "client-cert",
+    }))
+    .unwrap();
+    assert_eq!(mtls.auth, Some(Auth::ClientCert));
+    let ok = json!({"handle": "k8s/prod", "engine": "kubernetes", "upstream": "https://k8s.internal:6443", "auth": "bearer"});
+    let with = |k: &str, v: serde_json::Value| {
+        let mut call = ok.clone();
+        call[k] = v;
+        call
+    };
+    for bad in [
+        json!({"handle": "k8s/prod", "engine": "kubernetes", "upstream": "https://k8s.internal:6443"}),
+        with("auth", json!("basic")),
+        with("upstream", json!("k8s.internal:6443")),
+        with("database", json!("default")),
+        with("auth_source", json!("admin")),
+        json!({"handle": "db/main", "engine": "postgres", "upstream": "db.internal:5432", "auth": "client-cert"}),
+    ] {
+        assert!(parse(&bad).is_err(), "{bad}");
+    }
+}
