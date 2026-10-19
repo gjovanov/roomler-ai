@@ -389,6 +389,41 @@ root and the LocalAPI admits any interactive user. The rules
 - The Status the companion shows is refreshed off the request path, so a Downloads folder
   redirected to an offline share cannot stall the 2 s poll.
 
+### 9.1 A Linux system install writes the file as the person at the screen (FR-97 P3d)
+
+A root daemon serves the session of whoever is at seat0, and "the active user's Downloads"
+used to mean root's own ladder: with no XDG Downloads for root, the file landed in **`/tmp`,
+owned `root:root`** (measured on 0.4.143, FR-97 §8). It now lands in the person's Downloads
+and is **born theirs**:
+
+```mermaid
+flowchart TD
+    B["files:begin"] --> Q{"root on Linux,<br/>and a person at seat0?"}
+    Q -- "yes" --> P["FsAs::Person<br/>(companion::seat0_user, uid 0 refused)"]
+    Q -- "no, or ROOMLERD_FILES_AS_SEAT_USER=0" --> D["FsAs::Daemon<br/>files_dir, or the ladder"]
+    P --> F["their files_dir (inside THEIR home),<br/>else XDG_DOWNLOAD_DIR, else ~/Downloads, else ~"]
+    F --> S["every path step on a blocking thread<br/>under their fsuid, fsgid and groups"]
+    S --> R["staging, data file, final rename,<br/>resume, cancel, orphan sweep"]
+```
+
+| What | Where (`agents/roomlerd/src/files.rs`) | Why |
+|---|---|---|
+| Who writes | `FsAs` (`:223-294`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:556-559`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
+| How | `FsAs::run` → `crate::fs_identity::FsIdentity` (FR-85's guard, moved out of `recording`) | Linux checks every open, create and unlink against the thread's fsuid, fsgid and groups; root's bypass capabilities leave with the fsuid |
+| Their folder | `person_downloads` / `xdg_download_dir` (`:310-343`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
+| The staging | `create_dir` and `create_new`, never reuse (`begin_as`) | a folder or a link planted where the staging goes refuses the begin |
+
+⚠️ **Never as root followed by a `chown`.** In a folder the person owns, a link they planted
+would be followed with root's rights, and the staging folder's `meta.json`, which a resume reads
+and whose `dest_dir` the final rename trusts, is theirs to edit. Under their identity, a tampered
+`meta.json` reaches nothing they could not write themselves. A root-only test
+(`seat_user_tests::as_root`, run under `sudo` in CI) plants a link into a `0700 root` folder and
+shows the begin refused, with a control proving root's own rights go straight through it.
+
+⚠️ "The person" is seat0's (`companion::seat0_user`, FR-97 P5a), never whoever asked: an xrdp
+session sits on no seat. With nobody at seat0, the daemon's own ladder applies, as before.
+Downloads and browsing (the host → viewer direction) still read as the daemon.
+
 ## 10. Starting after install, and the Welcome flow
 
 Every install path ends with the daemon starting, so the **daemon** opens the companion —

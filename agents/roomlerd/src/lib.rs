@@ -68,6 +68,10 @@ pub mod external_access;
 pub mod external_logins;
 pub mod files;
 pub mod fp16;
+/// A thread's filesystem identity: a root daemon's work in a person's folder,
+/// done as the person (FR-85's, shared with received files by FR-97 P3d).
+#[cfg(any(target_os = "linux", all(unix, feature = "recording")))]
+pub(crate) mod fs_identity;
 pub mod gpu_clock;
 /// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
 /// Linux, macOS and Windows (`cfg(hive_host)`, set by `build.rs`): elsewhere

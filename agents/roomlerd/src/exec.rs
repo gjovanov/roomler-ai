@@ -897,12 +897,12 @@ fn console_account() -> Result<String, String> {
     })
 }
 
-/// FR-90 — a Hive session's state lives under its account's home; the home
-/// comes from the same lookup that refuses uid 0. Gated to its one consumer.
-#[cfg(all(hive_host, unix))]
+/// FR-90 — a Hive session's state lives under its account's home, and FR-97 P3d's
+/// received file under the person's: the lookup that refuses uid 0 finds both.
+#[cfg(any(target_os = "linux", all(hive_host, unix)))]
 pub(crate) use unix_priv::account_home;
-/// The recorder's. FR-90 reads [`session_account_ids`] instead.
-#[cfg(all(target_os = "linux", feature = "recording"))]
+/// The recorder's and received files' (FR-97 P3d). FR-90 reads [`session_account_ids`] instead.
+#[cfg(target_os = "linux")]
 pub(crate) use unix_priv::account_ids;
 /// FR-90 decision 13 — an agent session's account as the session holds it,
 /// without its administrator groups: what the toolbelt's socket is handed to,
@@ -1259,7 +1259,7 @@ mod unix_priv {
 
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
     /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
-    #[cfg(all(target_os = "linux", feature = "recording"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn account_ids(
         account: &str,
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
@@ -1269,7 +1269,7 @@ mod unix_priv {
 
     /// FR-90 — an account's home directory, resolved as [`resolve`] resolves
     /// it (uid 0 refused, so a session can never be pointed at root's home).
-    #[cfg(hive_host)]
+    #[cfg(any(target_os = "linux", hive_host))]
     pub(crate) fn account_home(account: &str) -> Result<std::path::PathBuf, String> {
         Ok(std::path::PathBuf::from(resolve(account)?.home))
     }

@@ -46,9 +46,11 @@
   vmtest Ubuntu guest against 0.4.143's refusal, and the macOS stop's mechanism measured on a tart Mac (§8).
 - P8-1, every §2.8 doc correction but two, each re-checked against master first, merged (#2489). P8-2 follows
   0.4.144.
-- P1d, a Mac's per-org utun, is in review. Run once on the released 0.4.143 (§8): one root daemon in two orgs, each
-  on its own utun, and the secondary's mesh through its own. The stale warning is gone, and the port holder names
-  a Mac's listener.
+- P1d, a Mac's per-org utun, merged (#2492). Run once on the released 0.4.143 (§8): one root daemon in two orgs,
+  each on its own utun, and the secondary's mesh through its own. The stale warning is gone, and the port holder
+  names a Mac's listener.
+- P3d, a received file on a Linux system install written as the person at seat0, is in review: red on 0.4.143
+  (`/tmp`, `root:root`), green on a candidate (§8).
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -204,7 +206,7 @@ and the consent chain's fallbacks.
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none | P3g (with FR-93 D5/D6, FR-95) |
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2727-2646`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
-| D4 | Received files land as the signed-in user (system install) | ✅ | ❌ | ✅ | Root's home or `/tmp` (`files.rs:182-206`, `2483-2521`) | P3d |
+| D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
 | D6 | Hive: adopt a terminal session | 🟡 built (P4c) | ✅ | ✅ | Was: `hive_adopt` read off on Windows. P4c adopts through a named pipe (`hive/supervisor/adopt.rs:573`) | P4c |
 
@@ -623,12 +625,24 @@ test of the SIGKILL property itself.
     function (`audio_source::linux_route`) decides for the hello and for each session: a named device wins, then
     the kill switch, then the library, then root or not. The hello asks the disk, never the loader. The recorder's
     computer audio takes the same route, in its own process, since it already runs as the person.
-- **P3d, files on a system install.** Resolve the seat's user (`companion::graphical_session`) and write into their
-  Downloads *as that user*, the twin of `active_user_downloads_path` on Windows (`files.rs:2467-2480`).
-  ⚠️ Never as root followed by a `chown`: in a directory the user owns, a root path operation can be redirected
-  through a swapped-in symlink to any file root can reach. Do every path step on a thread switched with
-  `setfsuid`/`setfsgid`, the pattern FR-27 P11's person socket already uses (`crates/localapi/src/lib.rs:3817-3694`),
-  so the file is born theirs. ⚠️ "The user" is the seat owner, never whoever asked over the person socket.
+- **P3d, files on a system install (built).** Measured first, on 0.4.143 (§8): a file sent to a system install
+  with a person at seat0 landed in **`/tmp`, owned `root:root`**, because root has no XDG Downloads and the
+  ladder ends in the temp folder. Now the person at seat0 (`companion::seat0_user`, P5a's definition, rather
+  than `graphical_session`, which also names a seatless xrdp session) gets it in their Downloads, *as them*.
+  Detail: `docs/desktop-companion.md` §9.1.
+  - *The identity.* `files::FsAs` is chosen once per transfer and carried with it, and with each registered
+    partial (`PartialEntry`), so the end-time rename, a resume, a cancel and the orphan sweep act as whoever
+    staged it. Every path step runs on a blocking thread under `crate::fs_identity::FsIdentity`: FR-85's
+    fsuid / fsgid / groups guard, moved out of the `recording` feature so a file transfer can use it.
+  - ⚠️ Never as root followed by a `chown`: in a folder the person owns, a link they planted would be followed
+    with root's rights, and the staging `meta.json`, whose `dest_dir` a resume trusts, is theirs to edit.
+    Under their identity a tampered one reaches nothing they could not write themselves. The staging is
+    `create_dir` and `create_new`, so a planted folder or link refuses the begin.
+  - *Their folder.* Their `files_dir` when it passes for them (FR-84 D4's rule, with THEIR home active),
+    else `XDG_DOWNLOAD_DIR` from their own `user-dirs.dirs` when it names a folder inside their home, else
+    `~/Downloads`, else `~`. With nobody at seat0, the daemon's own ladder, as before.
+  - Kill switch `ROOMLERD_FILES_AS_SEAT_USER=0`. Not in scope: downloads and browsing (host → viewer) still
+    read as the daemon.
 - **P3e, X11 polish.** Layout (`XkbGetState` / `XkbLockGroup`; Wayland has no cross-compositor API, so refuse with a
   reason), display-match through RandR (`x11rb` is linked) with a restore guard, clipboard image watching (XFixes
   selection events, or a `TARGETS` poll) and `text/rtf`.
@@ -893,7 +907,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3a** | Linux cursor shape (X11, then PipeWire) | `ROOMLERD_CURSOR_CHANNEL=0` | the FR-93 lab, Xorg + Wayland | S → M |
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
-| **P3d** | Linux system-install files land as the seat user | `ROOMLERD_FILES_AS_SEAT_USER=0` | the lab | M |
+| **P3d** | Linux system-install files land as the seat user (built). *In review:* red on 0.4.143 (`/tmp`, `root:root`), green on a candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
 | **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |
 | **P3f** | uinput text on any layout | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
@@ -1173,3 +1187,5 @@ one depends on it.
 | 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/user`, kept), then the P6c candidate (`9cea44d8`, a default-feature release build, run from `/tmp`) | a throwaway Ubuntu 24.04 GNOME guest: the per-user unit running, the update helper's timer and path on, `roomlerd.service` shipped but disabled | 🔴 The release refused the verb: "`service install --as-service` is Windows-only", and `status --as-service` the same, both exit 1. 🟢 **P6c, Linux.** The candidate refused without root, then (as `--system`) without `/etc/roomler/config.toml`, printing the enroll command. After a root ephemeral enrollment it enabled and started `roomlerd.service` and warned "another roomlerd runs as uid 1000 … One daemon per machine". The update helper's timer and path stayed as they were. Status read `roomlerd.service: active, enabled` under both spellings, never `Roomler:`, and the root row appeared on the server. `stop --as-service` was a clean stop ("shutting down gracefully", then "ephemeral device unenrolled itself" 0.23 s later), and the row was gone at the first poll, 15 s after. `uninstall --as-service` disabled the unit and kept the config, a second run exited 0, and status read `inactive, disabled`. The per-user daemon ran throughout. The guest was destroyed |
 | 2026-10-18 | released 0.4.143's `.pkg`; one root daemon enrolled into two orgs with standard single-use tokens (org B the primary, org A the secondary `a`), `overlay_multi_org = true` set first, `a` switched to `tun`, then one start | a throwaway tart Mac (macOS 15.7.7), given a hostname of its own first, so a standard enroll could not revive an older clone's row | 🔴 `roomlerd org overlay a tun` still warned: "macOS has no multi-address TUN, so a secondary cannot join over the shared adapter. Use `netstack`." 🟢 **P1d: it can.** Two utuns were up within 6 s, each logged "per-org TUN device up" with its own tenant: org B's primary on `utun4`, org A's secondary on `utun5`. The anchor of org A routed through `utun5` (`route -n get`), the OS's own ping answered 5 of 5 (39–50 ms), and `roomler ping` 39 ms. MagicDNS bound org A's domain to `utun5`. `roomler status` read both enrollments connected with `overlay tun`, and the server had both rows online. A clean bootout left no process, utun or utun route. Both rows were new by the pre-enroll snapshots, and both were deleted |
 | 2026-10-18 | P1d's port-holder lookup by hand: `/usr/sbin/lsof -nP -b -w -t -sTCP:LISTEN -iTCP:<port>`, as the code runs it | a throwaway tart Mac (macOS 15.7.7), three runs | 🟢 **P1d's port holder, its source.** A root listener: its PID (32–51 ms warm; 1.7 s on one cold first call). A client's socket on the same port (CLOSE_WAIT) is not counted: the listener alone, while every TCP holder of the port read both. A parent and its child sharing one listener: both, the parent first. As the console user, a root listener reads empty, so `Unknown`; the user's own listener reads its PID as root and as the user. Nothing on the port: empty, exit 1. ❌ The first two runs' "connection open" case tested nothing: an `nc` client hung up at once (EOF on stdin), and a perl client that holds its connection replaced it. The image comes from `proc_pidpath`; the whole path runs on 0.4.144's candidate |
+| 2026-10-18 | released 0.4.143 (`vmtest` lane `ubuntu/script/system`, kept), the deployed viewer (Playwright on mars) | a throwaway Ubuntu 24.04 GNOME guest: `roomlerd.service` as root, the vmtest user at seat0 (session 2, Wayland, active) | 🔴 **P3d red.** One probe uploaded through the viewer's own file input ("Uploaded p3d-probe-red1.txt") landed at **`/tmp/p3d-probe-red1.txt`, `root:root` 644**: root has no XDG Downloads, so the ladder ends in the temp folder. The daemon's own startup line said the drop folder was "the active user's Downloads". The guest was destroyed |
+| 2026-10-19 | the P3d candidate (`8420fb51`, a default-feature release build of the branch) swapped into the same lane's kept guest under a fresh ephemeral enrollment, after the released daemon's clean stop; the deployed viewer | a throwaway Ubuntu 24.04 GNOME guest as in the red: `roomlerd.service` as root, the vmtest user at seat0 (session 2) | 🟢 **P3d green.** The same upload landed at **`/home/vmtest/Downloads/p3d-probe-green1.txt`, `vmtest:vmtest` 644**. It was the only copy, and nothing of the staging was left in the folder. The daemon logged `files: complete … path=/home/vmtest/Downloads/p3d-probe-green1.txt`. The guest was destroyed |
