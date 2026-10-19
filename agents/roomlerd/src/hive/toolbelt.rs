@@ -918,20 +918,26 @@ fn vault_tools() -> Vec<Value> {
     tools.push(json!({
         "name": "vault_connect",
         "description": "Opens an endpoint on this device that signs in to a database (Postgres or \
-                        MongoDB) as a Roomler vault secret's user, and answers how to connect to \
-                        it: a client connects with the answer's uri (or host and port), with any \
-                        user name and no password, and never sees the secret's value. handle names a structured \
-                        secret with user and password fields; upstream is the database's \
-                        host:port, exactly as the secret's audiences name it; ca names a secret \
-                        holding the database's CA certificate (PEM) when the system does not \
-                        trust it. The endpoint closes with its lease (ttl_s, 30 to 900 seconds). \
-                        A person approves every call.",
+                        MongoDB) as a Roomler vault secret's user, or that adds a secret's \
+                        credential to every request it sends on to an HTTP upstream (an API, or \
+                        a git server), and answers how to connect to it. A database client \
+                        connects with the answer's uri (or host and port), with any user name \
+                        and no password; an HTTP client sends its requests to the uri with no \
+                        credential, and git takes the answer's env and the upstream's own URLs. \
+                        Nothing it answers holds the secret's value. handle names a structured \
+                        secret: user and password fields (a database, or auth basic), or a token \
+                        field (auth bearer). upstream is exactly as the secret's audiences name \
+                        it: the database's host:port, or for http an origin, https://host or \
+                        https://host:port. ca names a secret holding the upstream's CA \
+                        certificate (PEM) when the system does not trust it. The endpoint closes \
+                        with its lease (ttl_s, 30 to 900 seconds). A person approves every call.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "handle": {"type": "string", "description": "a structured secret: a path or rrn:<org>:secret:<path>, with no #field"},
-                "engine": {"type": "string", "enum": ["postgres", "mongodb"]},
-                "upstream": {"type": "string", "description": "host:port, such as db.internal:5432"},
+                "engine": {"type": "string", "enum": ["postgres", "mongodb", "http"]},
+                "upstream": {"type": "string", "description": "a database's host:port, such as db.internal:5432; for http an origin, such as https://github.com"},
+                "auth": {"type": "string", "enum": ["basic", "bearer"], "description": "http: the secret's user and password (basic) or its token (bearer), sent as Authorization"},
                 "database": {"type": "string", "description": "the database to name in the connection string"},
                 "ca": {"type": "string", "description": "a secret whose value is the upstream's CA certificate, PEM"},
                 "auth_source": {"type": "string", "description": "mongodb: the database the secret's user is defined in (default admin)"},
@@ -948,8 +954,9 @@ fn vault_tools() -> Vec<Value> {
                         lease's id and how long it lasts, never a value. mode is exec (for \
                         vault_exec, audience the program's bare name), file (for vault_render, \
                         audience the file's bare name) or proxy (for vault_connect, audience the \
-                        upstream's host:port, one lease per field it signs in with: #user, \
-                        #password). A later use that names the same secret toward the same \
+                        upstream as it names it, a database's host:port or an http origin, one \
+                        lease per field it signs in with: #user and #password, or #token). A \
+                        later use that names the same secret toward the same \
                         audience takes this lease instead of asking again, while it lasts \
                         (ttl_s, 30 to 900 seconds). Each of those calls still asks a person.",
         "inputSchema": {
@@ -957,7 +964,7 @@ fn vault_tools() -> Vec<Value> {
             "properties": {
                 "handle": {"type": "string", "description": "a secret: a path or rrn:<org>:secret:<path>, with #<field> for a structured secret's field"},
                 "mode": {"type": "string", "enum": ["exec", "file", "proxy"]},
-                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port"},
+                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port, or for http its origin, such as https://github.com"},
                 "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
             },
             "required": ["handle", "mode", "audience"],

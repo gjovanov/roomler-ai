@@ -1865,6 +1865,24 @@ the design document's §7 and §8; what follows binds it to the code as it stand
   - **HTTP/1.1 to the upstream.** git and REST APIs speak it; HTTP/2 can come later if an upstream
     needs it.
 
+  ⚠️ **As built (P3-5d-2): one seam for where an endpoint listens; Linux asks the kernel who
+  connected.**
+  - **One seam, two kinds.** A database's endpoint on Unix is still a socket. An HTTP endpoint,
+    and every endpoint on Windows, is a loopback port. The endpoint is served through one seam
+    (`Place`): what it accepts on, and how it tells who connected.
+  - **Who connected, on Linux.** The kernel's `/proc/net/tcp` and `tcp6` hold a row for each
+    socket, with its owner's uid. The row whose local end is the connection's client names the
+    account. A row in TIME_WAIT, or with no inode, belongs to no process and is never believed. A
+    client on a dual-stack socket shows in `tcp6`, its address IPv4-mapped. No privilege is
+    needed: the file is the reading process's own network namespace.
+  - **macOS is refused before anything is leased.** Nothing there says who connected yet
+    (P3-5d-3).
+  - **git by environment.** The answer's `env` holds git's own configuration
+    (`GIT_CONFIG_COUNT`, one `url.<endpoint>/.insteadOf` for `<upstream>/`) and
+    `GIT_TERMINAL_PROMPT=0`. A session's git takes the upstream's URLs as they are, with no change
+    to its configuration. Tested with a real `git ls-remote` through the endpoint.
+  - **`vault_request`** asks ahead toward an origin, as it does toward a `host:port`.
+
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
 session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
@@ -1960,7 +1978,7 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
   (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
   owner.
 
-**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1144`):
+**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1151`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
 - `ssh_run`;
@@ -2332,7 +2350,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-5b-4 | the Windows endpoint (`docs/vault.md` §19): `127.0.0.1` on a port the system picks; each connection's process found in the connection table (`hive_win::tcp_client_pid`, `GetExtendedTcpTable` over the connections) and its token's SID (`hive_win::process_sid`, from `pipe_client_sid`) compared with the session's account as its toolbelt holds it; the answer's `uri` and `env` say `sslmode=disable` for the loopback leg; the endpoint's code shared by both systems, its socket, check and answer per system; the Windows-only dead-code allowances gone, the engine now used there | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2510 `29a7fd8ad` |
 | P3-5c-1 | the MongoDB engine (`docs/vault.md` §19): the client's first message held (at most 1 MiB, `OP_MSG` or `OP_QUERY`); TCP then TLS from the first byte, verified; SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user in the exchange, `skipEmptyExchange` asked for and the empty exchange given where a server still asks; the server's signature checked before a byte of the client's is sent; no `hello` of the proxy's own (`ClientMetadataCannotBeMutated`), the client's handshake the connection's first; a refusal answering the held message as a server would, code 18; no caller yet | the `vault` feature in no release build | **merged** #2514 `3a42d8274` |
 | P3-5c-2 | `vault_connect` serving the MongoDB engine (`docs/vault.md` §19): `engine: "mongodb"`, `auth_source` (default `admin`; refused for Postgres); on Unix the socket `mongodb-27017.sock`, dialled by its path, the `uri` `mongodb://<%-encoded path>/<db>?directConnection=true` (no `port`), on Windows `mongodb://127.0.0.1:<port>/<db>?directConnection=true`, `MONGODB_URI` in `env`; each connection's upstream built in the call's engine; a refusal in the engine's wire (a MongoDB client's first message answered, `mongo::refuse`) | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2518 `75af803b1` |
-| P3-5d-1 | the HTTP engine (`docs/vault.md` §19) and P3-5d's design (§3e "P3-5d, HTTP named upstreams, as designed"), with no caller yet (P3-5d-2's endpoint is the first): one client connection's requests sent on to one upstream origin over TLS verified as for the databases, HTTP/1.1, dialled at the first request and again when the upstream closes it; the secret's credential in `Authorization` alone, `Basic` (its `user` and `password`) or `Bearer` (its `token`), marked sensitive, and a value it cannot carry never sent; origin-form only (`CONNECT`, an absolute or authority form and `*` refused); the client's own `Authorization` and `Proxy-Authorization` and every hop-by-hop header dropped, `Host` the upstream's; bodies streamed both ways; a `Location` on the upstream's own origin pointed back at the endpoint, matched whole, and `Alt-Svc` and `Strict-Transport-Security` dropped; a refused client answered `503`; hyper's client half compiled in | the `vault` feature in no release build | **in review** |
+| P3-5d-1 | the HTTP engine (`docs/vault.md` §19) and P3-5d's design (§3e "P3-5d, HTTP named upstreams, as designed"), with no caller yet (P3-5d-2's endpoint is the first): one client connection's requests sent on to one upstream origin over TLS verified as for the databases, HTTP/1.1, dialled at the first request and again when the upstream closes it; the secret's credential in `Authorization` alone, `Basic` (its `user` and `password`) or `Bearer` (its `token`), marked sensitive, and a value it cannot carry never sent; origin-form only (`CONNECT`, an absolute or authority form and `*` refused); the client's own `Authorization` and `Proxy-Authorization` and every hop-by-hop header dropped, `Host` the upstream's; bodies streamed both ways; a `Location` on the upstream's own origin pointed back at the endpoint, matched whole, and `Alt-Svc` and `Strict-Transport-Security` dropped; a refused client answered `503`; hyper's client half compiled in | the `vault` feature in no release build | **merged** #2520 `85591be0c` |
+| P3-5d-2 | `vault_connect` serving the HTTP engine (`docs/vault.md` §19): `engine: "http"`, the upstream an origin (`https://host[:port]`, no path, user or `:443`), `auth` `basic` or `bearer`, required for `http` and refused for a database; the leases `#user` and `#password`, or `#token`, and the CA; a value `Authorization` cannot carry refused at the call; the endpoint served through one seam (`Place`), a socket for a database on Unix, a loopback port for `http` everywhere and for every engine on Windows; Linux's check of a loopback connection's account from `/proc/net/tcp` and `tcp6` (the client end's row, never one in TIME_WAIT or with no inode); macOS refused before anything is leased; the answer's `uri` the endpoint's origin, its `env` git's `insteadOf` and `GIT_TERMINAL_PROMPT=0`; `vault_request` asking ahead toward an origin; the engine's dead-code allowance gone | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |

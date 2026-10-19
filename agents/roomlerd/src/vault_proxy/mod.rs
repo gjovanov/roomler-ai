@@ -17,9 +17,6 @@
 //! one; the endpoint (`hive::vault_connect`) serves them, one session per
 //! connection.
 
-/// P3-5d-1 builds the HTTP engine; P3-5d-2's endpoint is its first caller,
-/// until which nothing outside its tests reaches it.
-#[allow(dead_code)]
 pub(crate) mod http;
 pub(crate) mod mongo;
 pub(crate) mod pg;
