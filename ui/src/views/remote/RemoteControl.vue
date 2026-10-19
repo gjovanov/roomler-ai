@@ -61,6 +61,23 @@
         </template>
         <template v-else>{{ rc.phase.value }}</template>
       </v-chip>
+      <!-- FR-100 P2a — the device proved the identity key this browser knows
+           for it, or one it met for the first time and now remembers. An
+           answer the device did not sign is said so, not hidden: the session
+           runs, but nothing vouched for the device. A refused answer never
+           gets here; the error view says why. -->
+      <v-chip
+        v-if="rc.phase.value === 'connected' && peerAuthBadgeShown"
+        size="small"
+        :color="peerAuthBadgeShown.color"
+        variant="tonal"
+        :prepend-icon="peerAuthBadgeShown.icon"
+        class="mr-2 d-none d-sm-inline-flex"
+        :title="peerAuthBadgeShown.title"
+        data-testid="rc-peer-auth"
+      >
+        {{ peerAuthBadgeShown.label }}
+      </v-chip>
       <!-- Host-locked indicator. Shown only during a live session
            when the agent has signalled (via the rc:host_locked
            control-DC message, agent 0.2.2+) that the input desktop
@@ -1121,6 +1138,23 @@
           @click="startSession"
         >
           Try again
+        </v-btn>
+        <!-- FR-100 P2a — the device answered with another key than the one
+             this browser knows. Trusting it is the person's call, made here
+             and nowhere else: it pins that one key, and the next answer must
+             still prove it. -->
+        <v-btn
+          v-if="rc.peerAuth.value?.verdict.kind === 'key-changed'"
+          color="warning"
+          variant="tonal"
+          size="small"
+          class="mt-3"
+          prepend-icon="mdi-key-change"
+          :disabled="!canConnect"
+          data-testid="rc-peer-auth-trust"
+          @click="trustNewKeyAndConnect"
+        >
+          Trust the new key and connect
         </v-btn>
       </div>
 
@@ -2202,6 +2236,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { takeExternalSession } from '@/composables/useExternalLogin'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
+import { peerAuthBadge } from '@/utils/peerAuth'
 import {
   useRemoteControl,
   nextDirPath,
@@ -2307,7 +2342,12 @@ const hideDeviceName = useHideDeviceName(() => `${authStore.user?.id ?? 'anon'}:
 // resumable upload pump. Agent doc is populated on mount;
 // useRemoteControl's `supportsResume` computed reactively
 // flips when the load lands.
-const rc = useRemoteControl(agent, { external: isExternal })
+// FR-100 P2a — the user id is what the device's signature over its answer
+// names, so the page asks for one only once it knows who is signed in.
+const rc = useRemoteControl(agent, {
+  external: isExternal,
+  userId: () => authStore.user?.id ?? null,
+})
 const { t } = useI18n()
 const { showSuccess, showError, showSnackbar } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
@@ -4805,6 +4845,14 @@ function startSession() {
   // PR-1: thread the agent's org so the pre-flight keys the signalling
   // socket to the right pod even when this view is hosted cross-org.
   rc.connect(agent.value.id, undefined, false, tenantId.value)
+}
+
+// FR-100 P2a — the toolbar's word on the device's identity key, and the one
+// way to accept a key that changed: the person's click, then a fresh attempt
+// that must prove it.
+const peerAuthBadgeShown = computed(() => peerAuthBadge(rc.peerAuth.value))
+function trustNewKeyAndConnect() {
+  if (rc.trustPeerAuthKey()) startSession()
 }
 
 // Phase 5 — admin break-glass. The reason is stashed on the composable and rides
