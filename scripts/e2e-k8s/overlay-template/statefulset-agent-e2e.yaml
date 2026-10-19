@@ -1,6 +1,6 @@
-# Phase 1 Chunk 1B — 2-replica StatefulSet of synthetic-frame agents
+# Phase 1 Chunk 1B — 3-replica StatefulSet of synthetic-frame agents
 # enrolled against the in-cluster API. StatefulSet (not Deployment)
-# so the Pod hostnames are deterministic — `agent-e2e-0`, `agent-e2e-1`
+# so the Pod hostnames are deterministic — `agent-e2e-0` … `agent-e2e-2`
 # — which become the `machine_name` in the rc:agent.hello payload.
 # Tests that drive a session need a stable `agent_id` map; the
 # deterministic name makes the look-up cheap.

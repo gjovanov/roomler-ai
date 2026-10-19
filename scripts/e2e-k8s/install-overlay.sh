@@ -34,30 +34,47 @@ for src in "$REPO_ROOT/scripts/e2e-k8s/overlay-template/"*.yaml; do
 done
 echo "copied $NEW_FILES new file(s)"
 
-# Auto-track the current prod image tag — the e2e overlay should
+# Auto-track the current prod image — the e2e overlay should
 # always validate the same image that's live on roomler.ai (per the
-# user's "pin to current prod tag" decision in the plan). Read the
-# tag from the prod overlay's kustomization.yaml and substitute it
-# into the freshly-copied e2e kustomization.yaml. Idempotent — re-
-# running the installer bumps the tag in place.
+# user's "pin to current prod tag" decision in the plan). Read it
+# from the prod overlay's kustomization.yaml and substitute it
+# into the e2e kustomization.yaml. Idempotent — re-running the
+# installer bumps the pin in place.
 #
-# FR-114 — pin ONE image's tag, never every `newTag:` line: the overlay pins
-# two images, and stamping the prod server's tag onto `roomlerd-e2e` would
-# point the agents at a tag that image never had.
+# FR-114 — pin ONE image, never every `newTag:` line: the overlay pins two
+# images, and stamping the prod server's tag onto `roomlerd-e2e` would point
+# the agents at a tag that image never had. And pin the NAME with the tag:
+# since FR-73 prod pulls from ghcr.io while the e2e copy still named
+# registry.roomler.ai, so a tag-only pin named a tag that registry never had —
+# the ImagePullBackOff `scripts/e2e-nightly.sh` §1b records (2026-09-06).
+# A line ending in \r (a Windows checkout read by a Linux awk, as under WSL)
+# still matches: the \r is ignored, then put back.
 pin_image() {
-  local name="$1" tag="$2" file="$DST/kustomization.yaml"
-  awk -v want="$name" -v tag="$tag" '
-    $0 ~ "- name: " want "$" { hit = 1 }
-    $0 ~ "- name: " && $0 !~ "- name: " want "$" { hit = 0 }
-    hit && /newTag:/ { sub(/newTag:.*/, "newTag: " tag); hit = 0 }
-    { print }' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+  local name="$1" tag="$2" new_name="${3:-}" file="$DST/kustomization.yaml"
+  awk -v want="$name" -v tag="$tag" -v nname="$new_name" '
+    { line = $0; cr = ""; if (sub(/\r$/, "", line)) cr = "\r" }
+    line ~ /^[^ \t#-]/ { hit = 0 }
+    line ~ /- name: / { hit = (line ~ ("- name: " want "$")) }
+    hit && nname != "" && line ~ /newName:/ { sub(/newName:.*/, "newName: " nname, line) }
+    hit && line ~ /newTag:/ { sub(/newTag:.*/, "newTag: " tag, line) }
+    { print line cr }' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 }
-PROD_TAG=$(awk '/newTag:/ { print $2; exit }' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
+# "<newName> <newTag>" of one image's entry in a kustomization, or nothing.
+read_pin() {
+  awk -v want="$2" '
+    { sub(/\r$/, "") }
+    /^[^ \t#-]/ { hit = 0 }
+    /- name: / { hit = ($0 ~ ("- name: " want "$")) }
+    hit && /newName:/ { n = $2 }
+    hit && /newTag:/ { t = $2 }
+    END { if (n != "" && t != "") print n, t }' "$1"
+}
+read -r PROD_NAME PROD_TAG <<<"$(read_pin "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml" gjovanov/roomler-ai)"
 if [ -n "$PROD_TAG" ]; then
-  pin_image gjovanov/roomler-ai "$PROD_TAG"
-  echo "Pinned e2e overlay to prod tag: $PROD_TAG"
+  pin_image gjovanov/roomler-ai "$PROD_TAG" "$PROD_NAME"
+  echo "Pinned e2e overlay to the prod image: $PROD_NAME:$PROD_TAG"
 else
-  echo "WARNING: could not auto-detect prod tag; edit $DST/kustomization.yaml manually" >&2
+  echo "WARNING: could not auto-detect the prod image; edit $DST/kustomization.yaml manually" >&2
 fi
 
 # FR-114 — the agent-e2e image is pinned to the dated tag that was pushed

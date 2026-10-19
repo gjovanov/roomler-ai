@@ -19,8 +19,10 @@ without operator setup.
     `tenant_id: 000…0` that MUST be rebaked after the first seed.**
   - `service-agent-e2e.yaml` — headless Service for predictable Pod
     DNS (`agent-e2e-0.agent-e2e.roomler-ai-e2e.svc.cluster.local`).
-  - `statefulset-agent-e2e.yaml` — 2-replica StatefulSet of the
-    synthetic-frame agents.
+  - `statefulset-agent-e2e.yaml` — 3-replica StatefulSet of the
+    synthetic-frame agents, one per recording state (FR-114):
+    `agent-e2e-0` records but is not opted in, `agent-e2e-1` is opted
+    in to remote recording, `agent-e2e-2` has no recorder.
   - `kustomization.yaml` — extended to include the 4 new files plus
     the new image rewrite (`gjovanov/roomlerd-e2e` →
     `<internal-registry>/roomlerd-e2e:latest`).
@@ -57,8 +59,15 @@ AGENT_E2E_TAG="$TAG" DEPLOY_REPO=<your deploy worktree> \
 # It WARNS for each agent-e2e resource the kept kustomization.yaml does not
 # list: add the four files under `resources:` and the `gjovanov/roomlerd-e2e`
 # entry under `images:` by hand, commit, open a deploy-repo PR.
+kubectl diff -k <your deploy worktree>/k8s/overlays/e2e/   # read it FIRST
 kubectl apply -k <your deploy worktree>/k8s/overlays/e2e/
 ```
+
+The diff should name only the agent-e2e objects. Anything else (roomler2's
+config, its secrets, the `pwrunner` sidecar) is drift between the deploy copy
+and the cluster: stop and find out who changed which side before applying. A
+full apply resets the e2e roomler2 to the overlay's image pin; the nightly
+sets it to prod's image again on its next run.
 
 ### 3. Nothing to rebake
 

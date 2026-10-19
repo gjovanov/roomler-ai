@@ -35,7 +35,7 @@ resources:
   - statefulset-minio.yaml
   # Phase 1 Chunk 1B — agent-e2e harness. The seed Job runs once per
   # namespace lifetime to create the admin + tenant; the StatefulSet
-  # runs 2 replicas of the synthetic-frame agent enrolled against
+  # runs 3 replicas of the synthetic-frame agent enrolled against
   # that tenant. The Secret holds the admin's credentials; the agents,
   # the seed and the nightly find the tenant by its slug (FR-114), so
   # nothing is rebaked after the first seed or a wiped DB.

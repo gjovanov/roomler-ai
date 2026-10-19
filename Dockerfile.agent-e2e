@@ -148,12 +148,25 @@ echo "[bootstrap] enrolling agent name=$AGENT_NAME"
 # whose owner opted in to remote recording, a recorder NOT opted in, and no
 # recorder at all (run-agent-e2e.sh). `record_remote_enabled` is device-owned
 # (the server cannot push it), so the opt-in is written here, for the
-# ordinals the StatefulSet names. A top-level key goes BEFORE any [table],
-# and prepending is always valid TOML.
+# ordinals the StatefulSet names.
+# ⚠️ REPLACE the root table's line, never add one: enroll already writes the
+# default (`= false`), TOML refuses a duplicate key, and the daemon refuses the
+# whole config — measured 2026-10-19, a prepended copy crash-looped the pod.
+# `0,/^\[/` is the root table (everything before the first [table]); a config
+# without the key gets it prepended, which is valid TOML for a root key.
 ORD="${AGENT_NAME##*-}"
 case " ${ROOMLER_E2E_RECORD_REMOTE_ORDINALS:-} " in
   *" $ORD "*)
-    sed -i '1i record_remote_enabled = true' "$CONFIG_PATH"
+    if sed -n '0,/^\[/p' "$CONFIG_PATH" | grep -qE '^[[:space:]]*record_remote_enabled[[:space:]]*='; then
+      sed -i -E '0,/^\[/ s/^[[:space:]]*record_remote_enabled[[:space:]]*=.*/record_remote_enabled = true/' "$CONFIG_PATH"
+    else
+      sed -i '1i record_remote_enabled = true' "$CONFIG_PATH"
+    fi
+    ROOT_KEY="$(sed -n '0,/^\[/p' "$CONFIG_PATH" | grep -E '^[[:space:]]*record_remote_enabled[[:space:]]*=' || true)"
+    if [ "$ROOT_KEY" != "record_remote_enabled = true" ]; then
+      echo "[bootstrap] FAILED to opt in to remote recording: the root table holds [$ROOT_KEY]" >&2
+      exit 1
+    fi
     echo "[bootstrap] remote recording opted in (ordinal $ORD)"
     ;;
 esac
