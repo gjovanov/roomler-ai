@@ -60,6 +60,18 @@ async function render(first: Record<string, unknown>, stamp = 's1') {
 
 const byTestId = (w: Awaited<ReturnType<typeof render>>, id: string) => w.find(`[data-testid="${id}"]`)
 
+/** The card's message edited: a new stamp.
+ *
+ *  ⚠️ `setProps`' argument is typed from the component, and where vue-tsc
+ *  resolves `.vue` through `env.d.ts`'s shim — the hosted image's build runs
+ *  it in `oven/bun`, which has no `node` — the shim's props are `object`.
+ *  An object literal naming a REAL prop then fails the excess-property check
+ *  there and nowhere else (CI and local builds type it from the SFC). The
+ *  prop is real; vitest exercises it at run time. */
+function restamp(w: Awaited<ReturnType<typeof render>>, stamp: string) {
+  return w.setProps({ stamp } as unknown as Parameters<typeof w.setProps>[0])
+}
+
 afterEach(() => {
   vi.clearAllMocks()
 })
@@ -120,14 +132,14 @@ describe('VaultApprovalCard (FR-90 P3-4e-3)', () => {
   it('reads the approval again when the card is edited, and shows nothing it cannot read', async () => {
     const w = await render({})
     hoisted.apiGet.mockResolvedValue(approval({ status: 'expired', may_answer: false }))
-    await w.setProps({ stamp: 's2' })
+    await restamp(w, 's2')
     await flushPromises()
     expect(hoisted.apiGet).toHaveBeenCalledTimes(2)
     expect(byTestId(w, 'vault-approval-status').text()).toBe('Expired')
     expect(byTestId(w, 'vault-approval-deadline').exists()).toBe(false)
 
     hoisted.apiGet.mockRejectedValue(new Error('Resource not found'))
-    await w.setProps({ stamp: 's3' })
+    await restamp(w, 's3')
     await flushPromises()
     expect(byTestId(w, 'vault-approval').exists()).toBe(false)
   })
