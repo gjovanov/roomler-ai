@@ -1,0 +1,253 @@
+# FR-116: Phone and tablet parity — the same facts and actions at 360 px as on desktop, details on demand
+
+**Issue:** [#2561](https://github.com/gjovanov/roomler-ai/issues/2561) · **Status:** proposed 2026-10-20, spec and
+claim. P1 (the Devices page) is built and in review · **Owner:** the web app (UI); P6 touches three server payloads ·
+**Anchors:** master `944a85224` · **Builds on:** [FR-12](FR-12-onboarding-tutorial.md) (the tour anchors),
+[FR-103](FR-103-device-credentials-renew-themselves.md) and [FR-106](FR-106-devices-say-when-not-updating.md) (the
+"needs a person" chips), [FR-111](FR-111-touch-controls.md) (touch control of the viewer, left as it is)
+
+## 1. Goal
+
+Every page of the web app works on a phone (360–430 px) and on a portrait tablet:
+
+- **the same facts and the same actions as on desktop** — nothing is named differently, and nothing is missing,
+  because of the screen's width;
+- **no sideways scroll of the page** — a wide table may scroll inside its own box, the page never does;
+- **details on demand** — policy controls, technical facts and long help text sit behind an expansion panel, a
+  menu or a dialog instead of being open on every row.
+
+The operator's report, 2026-10-19: the Devices page on a phone *"displays too much info (e.g. all DDLs and
+checkboxes visible — should be in expansion panel), has few inconsistencies with large screen (like real device
+name instead of display name)"*, and every page should be checked the same way.
+
+## 2. Evidence
+
+### 2.1 Production, the Devices page at 390 px (2026-10-19, read-only)
+
+Rendered in the operator's own browser, in a 390 px frame of the same origin, so the page computed its phone layout
+from real data:
+
+| what | measured |
+|---|---|
+| cards | 22, each **481–521 px** tall: four selects and two checkboxes open on every card |
+| page height | **11,895 px** of scrolling for 22 devices |
+| names | 16 of the 22 devices carry a display name; the phone card showed the **machine name for all 16**, where the desktop grid shows the display name |
+| menu | no "Edit name & tags"; "Overlay routes" and "Overlay ACL" pointed at **`/tenant//network/…`** — the tenant id lost (`AgentsSection.vue:1032`, `:1037`, since #738) |
+| finding a device | no search, no kind filter, no paging: every device, in one list |
+| tunnel clients | a separate 7-column `v-table` below the cards; its title row overflows the card and the table scrolls sideways |
+| "Update all" | `d-none d-sm-inline-flex` (`AgentsSection.vue:13`) with no phone fallback, against `docs/ui.md`'s own rule |
+| "needs a person" | the credential chip (FR-103), the ephemeral chip (FR-51) and the permission warnings were missing from the card, though `docs/ui.md` says the cards show them |
+| deep link | the dashboard's Tunnels tile (`/devices?type=tunnel`) filtered only the desktop grid |
+| tour | the Devices tour's steps 2 and 3 (`device-search`, `device-grid`) point at desktop-only anchors, so on a phone the tour shows 1 of 3, then ends and is marked seen |
+
+At 820 px (a portrait tablet) the same one-column cards stretched every select to 800 px.
+
+### 2.2 Every page: a 4 px sideways scroll
+
+The house padding is `pa-2` (8 px) on phones (`docs/ui.md` § Responsive page padding), and a default `v-row` pulls
+12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1227-1233`, `overflow-y: auto`), so it also scrolls
+**sideways by 4 px** on every page that has a row: measured on the tenant dashboard, the org list, Billing and
+Observability, and on the sign-in pages.
+
+### 2.3 Six read-only audits
+
+Six code audits, one per area, read every view and component and checked their claims with renders at 360–430 px
+(Vuetify 3.13, headless Chromium, and the operator's browser for §2.1). About 120 findings; the ones this FR
+commits to are in §4, by phase. The patterns behind most of them:
+
+| pattern | effect | where (examples) |
+|---|---|---|
+| a phone branch and a desktop branch of the same thing | they drift: different names, different actions | the Devices cards (§2.1); the room chat rendered three ways (`ChatView.vue:61-71`, `:125-133`, `ConferenceView.vue:133-156`) |
+| `v-card-title` / `v-card-subtitle` / `v-chip` never wrap | a title row pushes its own buttons off-screen | Overlay ACL's **New rule** clipped below 800 px (`OverlayAclSection.vue:5-33`); dialog titles push Close away (`DeviceConsoleDialog.vue:6-11`) |
+| a `d-flex` row of fields without `flex-wrap` | fields shrink to nothing | the Tunnel ACL host field renders **0 px** wide (`TunnelPoliciesSection.vue:289-345`) |
+| a horizontal `v-btn-toggle` in a narrow row | it scrolls inside itself, hiding options | ManagedSwitch hides **On** (`ManagedSwitch.vue:4-20`); Enrollment hides **This user only** (`EnrollmentDialog.vue:49-60`) |
+| hover-only facts and actions | nothing on a touch screen; invisible buttons that still take taps | message actions (`MessageBubble.vue:30-58`, `:309-316`: a tap can **pin a message for the whole room**); video tiles (`VideoTile.vue:73-111`) |
+| wide tables with no phone layout | the action column is off-screen | Members, Invites, Files, audit lists, ACL rules, Overlay routes (its **Save** is ~300 px off-screen) |
+| three meanings of "mobile" | branches disagree between 600 and 1280 px | Vuetify's `mobile` is &lt; 1280 px (no `mobileBreakpoint` in `plugins/vuetify.ts`); the Devices page used &lt; 960; `docs/ui.md`'s rule uses &lt; 600 |
+| the machine name where a person expects the display name | the same device is named two ways | audit pages, Overlay ACL and routes (a lossy DNS label), Tunnel ACL (id prefixes), analytics' uptime strip, usage, hive — three of these because the **server** sends only `name` |
+
+## 3. Design
+
+### 3.1 The rules (they go into `docs/ui.md`)
+
+1. **One source per concept, at every width.** A phone layout renders the same data, through the same menu and the
+   same controls, as the desktop layout. Two copies of a menu are a defect waiting to happen (§2.1).
+2. **Details on demand.** A card or row shows identity, state and what needs a person; settings and technical
+   facts open in an expansion panel whose title summarises what is inside, so a closed card still answers "how is
+   this set?".
+3. **A device is named by `deviceLabel()`** (`display_name || name`) wherever a person reads it; the technical
+   `name` only where a machine reads it back (MagicDNS, `overlay_exit_node = "…"`, a CLI selector).
+4. **The page never scrolls sideways**; a wide table scrolls in its own box, and has a phone layout when its
+   actions would be off-screen.
+5. **Breakpoint vocabulary:** `xs` (&lt; 600) for phone-only presentation and full-screen dialogs; `smAndDown`
+   (&lt; 960) for card layouts; Vuetify's `mobile` (&lt; 1280) only for the navigation drawer.
+6. **No hover-only information**: a fact in `title=` also has a tap path (a caption, `open-on-click`, a menu).
+
+### 3.2 P1 — the Devices page
+
+```mermaid
+flowchart LR
+    API["GET /tenant/{tid}/device<br/>search · kind · sort · page"] --> DS["deviceStore.items<br/>(DeviceRow)"]
+    AG["GET /tenant/{tid}/agent"] --> AS["agentStore<br/>(full Agent, by id)"]
+    DS --> W{"width"}
+    W -->|"≥ 960 px"| GRID["v-data-table-server<br/>(unchanged, pixel-identical)"]
+    W -->|"&lt; 960 px"| CARDS["cards: identity + chips<br/>Access ▸ (summary) · Details ▸<br/>1 column &lt; 600, 2 columns &lt; 960"]
+    AS -. agentFor(row) .-> GRID & CARDS
+    GRID & CARDS --> MENU["DeviceActionsMenu<br/>(one menu)"]
+    GRID & CARDS --> POL["DeviceAccessPolicyFields<br/>(one set of controls)"]
+    MENU -->|"action key"| DISP["onDeviceAction(row, action)<br/>→ the page's dialogs"]
+    POL -->|"consent · input · idle · lock · mesh"| PUT["PUT …/access-policy"]
+```
+
+| piece | what |
+|---|---|
+| `components/admin/DeviceActionsMenu.vue` (new) | the one action menu: emits an action key, never opens a dialog itself; links carry the tenant id |
+| `components/admin/DeviceAccessPolicyFields.vue` (new) | the six access-policy controls: `plain` in the grid cell, `outlined` and labelled in the card, with the `title=` hints spelled out on demand for touch |
+| `components/admin/devicePolicy.ts` (new) | the choices and hints (moved, byte-identical), and `policySummary()`: the consent mode always, then only what differs from the defaults |
+| `composables/useHideDeviceName.ts` | `deviceLabel()`, beside `secondaryDeviceName()` |
+| `components/admin/AgentsSection.vue` | one toolbar (search, kind, count) at every width; below 960 px the same rows as cards with Access and Details panels, every "needs a person" chip, tags, a pager; the tunnel-clients table removed (tunnels are rows of the same feed); "Update all" icon-only below 600 px; the tour's anchors on the cards too; every dialog and notice names the device by `deviceLabel()` |
+
+The desktop grid is untouched: screenshots of master and P1 at 1300 and 2400 px differ in **0 pixels** (§8).
+
+### 3.3 Later phases — what each commits to
+
+The high and medium findings, by phase; anchors at `944a85224`. Each phase lists its own low findings in its PR.
+
+**P2 — the shell**
+
+| finding | where | fix |
+|---|---|---|
+| the page scrolls sideways by 4 px (§2.2) | `AppLayout.vue:1227-1233` | `overflow-x: hidden` on `v-main`; `v-row dense` where a page needs edge-to-edge |
+| app bar overflow: with the unread and call buttons up, the avatar menu — and **Logout** — go off-screen | `AppLayout.vue:431-540` | a phone budget: `?` and the theme toggle into the avatar menu below 600 px, the text buttons icon-only with a badge |
+| a page opens at the previous page's scroll offset (`v-main` is the scroller, nothing resets it) | `AppLayout.vue:563-567` | reset on path change |
+| a running call leaves no visible controls once you leave its page | `AppLayout.vue:406-420`, `:703-707` | an in-call control in the app bar on phones (D5) |
+| other-org activity and the current org's name are drawer-only | `AppLayout.vue:57-65` | a dot on the nav icon |
+| dialogs never go full screen on a phone | 20+ dialogs | a `useResponsiveDialog()` (`fullscreen` on `xs`), with a toolbar close |
+| rail state from a wide window leaks into the phone drawer | `AppLayout.vue:49`, `:176`, `:271`, `:412` | `railActive = !mobile && rail` |
+
+**P3 — admin, network, audit, and the device dialogs**
+
+| finding | where | fix |
+|---|---|---|
+| Overlay ACL: **New rule** and Refresh clipped off the card title below 800 px — no rule can be created on a phone | `OverlayAclSection.vue:5-33` | a wrapping title, the caption as a `v-card-subtitle text-wrap` |
+| Tunnel ACL editor: the host field is 0 px, the match and proto selects show nothing | `TunnelPoliciesSection.vue:289-345` | `flex-wrap` rows, as the Overlay editor already has |
+| ManagedSwitch hides **On**, so On and Leave alone look the same | `ManagedSwitch.vue:4-20` | wrap, `flex-shrink-0` on the toggle |
+| Overlay routes: **Save** and the exit-node switch off-screen | `OverlaySubnetRoutesSection.vue:62-163` | a card per node below 600 px |
+| ACL rules, audit lists, Members, Invites, Files, enroll keys: the action column off-screen | the six tables | `mobile-breakpoint` or cards with a kebab menu |
+| devices named by machine name, DNS label or id prefix | `ExecAuditSection.vue:127-141`, `SshAuditSection.vue:128-142`, `SshActivitySection.vue:142-150`, `OverlayAclSection.vue:425-430`, `OverlaySubnetRoutesSection.vue:76`, `TunnelPoliciesSection.vue:184-254`, `:683-698` | `deviceLabel()` through the wire's FKs |
+| device console: the root/SYSTEM warning is one clipped line (desktop too) | `DeviceConsoleDialog.vue:19-33` | the alert out of `v-card-subtitle` |
+| agent logs: each message 1–9 characters wide | `AgentLogsDialog.vue:102-114`, `:300-331` | the message on its own line below 600 px |
+| Enrollment hides **This user only** | `EnrollmentDialog.vue:49-60` | a vertical toggle on `xs` |
+| Settings is ~6 screens of alerts and an embedded history table | `SettingsSection.vue:4-400` | one expansion panel per gate on `xs` |
+| Roles: what a role grants is hover-only; tapping a permission's label toggles it | `RolesSection.vue:86-93`, `:207-214` | grants as chips on tap; hints as `persistent-hint` |
+
+**P4 — chat and conference**
+
+| finding | where | fix |
+|---|---|---|
+| message actions are hover-only, and the invisible buttons still take taps (pin for the whole room) | `MessageBubble.vue:30-58`, `:309-316` | a ⋮ menu on touch; `pointer-events: none` while hidden |
+| rich-text mode clips Send, attach, emoji and GIF off-screen | `MessageEditor.vue:12-141` | the formatting row scrolls on its own; Send stays outside it |
+| the default composer has no Send button, and no line break on a soft keyboard | `MessageEditor.vue:129-140`, `:376-384` | Send in both modes |
+| an agent-session transcript covers the room on a phone and cannot be closed | `ChatView.vue:111`, `:233`, `:526-537`; `HiveTranscript.vue:16-39` | a close button; closed by default below 960 px |
+| the call's chat and files are fixed 320 px columns that squeeze or clip the video | `ConferenceView.vue:109-158`, `:671-677` | overlays below 960 px, one at a time |
+| a screen share gets ~72 px of width on a phone (Auto picks the sidebar layout) | `useConferenceLayout.ts:92`, `SidebarLayout.vue:91-99` | spotlight on narrow containers |
+| the mini-conference names people by a 6-character user-id prefix (desktop too) | `MiniConference.vue:45` | the participant's display name |
+| a long URL or token makes the whole message list scroll sideways | `MessageBubble.vue:10`, `:77` | `overflow-wrap: anywhere` |
+| screen share offered where the browser has no `getDisplayMedia` | `ConferenceView.vue:174-178` | hide it there |
+
+**P5 — the remote viewer's chrome** (presentation only: no change to input, transport, consent or session logic)
+
+| finding | where | fix |
+|---|---|---|
+| once a session starts, the toolbar's title gets 0 px (no device name), chips lose their text, and **Disconnect** and Fullscreen are off-screen | `RemoteControl.vue:15-866`, `:45` | on `xs`: name, status and Disconnect on row 1, tools on an extension row; the rarer tools in an overflow menu |
+| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:894-956`, `:5124-5131` | the alerts as an overlay on the stage |
+| the **Unverified** device-identity badge is hidden below 600 px | `RemoteControl.vue:69-80` | always shown when it warns (icon-only on `xs`) |
+| the Settings **Session** tab is off-screen on a phone | `RemoteControl.vue:1508-1513` | `show-arrows` |
+| the Metrics tab's live values never render (`hide-details` with `messages`) | `RemoteControl.vue:1674-1722` | `hide-details="auto"` |
+| the files drawer has no tap path into a folder and no "upload here" | `RemoteControl.vue:2171-2177` | a chevron per folder; an upload button |
+
+**P6 — observability, analytics, growth, hive**
+
+| finding | where | fix |
+|---|---|---|
+| a sideways swipe on a wide table switches the tab | `GrowthView.vue:41`, `AnalyticsView.vue:31` | `:touch="false"` on the `v-window` |
+| the org-timeline drawer cannot be closed on a phone | `GrowthView.vue:409` | a close button; full screen on `xs` |
+| per-user usage: the timeline track is 36 px wide | `UsagePanel.vue:34`, `UsageTimeline.vue:215-270` | full screen on `xs`; stacked rows |
+| devices named by machine name because the **server** sends only `name` | `crates/api/src/routes/stats.rs:592`, `:727`; `crates/api/src/routes/usage.rs:610-614`; hive's frozen `device_name` | send `display_name` (D4) |
+| agent-session rows squeeze the title to ~40 px | `HiveSessionsView.vue:108-164` | the row's actions in a menu on `xs` |
+| Growth's tabs and Analytics' 4th tab hidden without arrows | `GrowthView.vue:23-35`, `AnalyticsView.vue:24-29` | `show-arrows` |
+| Growth's headline number hidden at 360 px | `GrowthView.vue:49-54` | the number into `v-card-text` |
+
+**P7 — public pages and sign-in**
+
+| finding | where | fix |
+|---|---|---|
+| iOS capitalises the username, and the server matches it exactly | `LoginView.vue:14-29`, `RegisterView.vue:22-42`; `crates/services/src/dao/user.rs:159-161` | `autocapitalize="none"`, `autocorrect="off"`, `autocomplete` |
+| sign-in provider buttons are 28 px tall | `LoginView.vue:50-62` | full-width on `xs` |
+| the landing nav has no phone menu | `LandingView.vue:12-21` | a menu below 600 px |
+
+**P8 — docs and a guard**: `docs/ui.md` gets §3.1's rules with a diagram; and a phone-width smoke (the SPA against a
+mocked API, at 360 and 390 px, every signed-in route): no page-level sideways scroll, and each page's primary
+actions inside the viewport.
+
+## 4. Phases
+
+| Phase | What | Kill switch | Proven on | Size |
+|---|---|---|---|---|
+| **P1** (built; PR in review) | the Devices page (§3.2) | revert the PR: UI only, no server or agent state, no stored preference changed | the operator's org at 390 px on production after a promote, red then green; the desktop grid pixel-identical | M |
+| **P2** | the shell (§3.3) | revert | a route sweep at 360/390 px | M |
+| **P3** | admin, network, audit, device dialogs | revert | the same sweep; the ACL editors and Overlay routes by hand | L |
+| **P4** | chat and conference | revert | a two-browser call with one at phone width | L |
+| **P5** | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
+| **P6** | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
+| **P7** | public pages, sign-in | revert | iOS Safari sign-in (the operator) | S |
+| **P8** | docs + the phone-width smoke | — | CI | S |
+
+## 5. Acceptance criteria
+
+- [ ] **AC1**: Devices at 390 px on production names every device as the desktop grid does, collapses access and
+  details by default, offers every desktop action, searches, filters by kind and pages; tunnel clients are cards;
+  the desktop grid is unchanged. Red on production first (§8), then green after the promote.
+- [ ] **AC2**: no page-level sideways scroll at 360 and 390 px on any signed-in route (measured per route).
+- [ ] **AC3**: every page's primary actions are on-screen at 360 px without a sideways scroll (the list per page is
+  the P8 smoke's).
+- [ ] **AC4**: a device is named by its display name everywhere a person reads a device name: the Devices page and
+  its dialogs, the audit pages, the overlay pages, the Tunnel ACL, analytics, usage, hive.
+- [ ] **AC5**: complex dialogs are full screen on `xs` with their actions reachable.
+- [ ] **AC6**: chat and calls on a phone: Send is always visible; message actions work by tap, and nothing invisible
+  takes a tap; the transcript closes; a call leaves visible controls once you leave its page.
+- [ ] **AC7**: the remote viewer on a phone: a connected session at 360 px shows the device name, its status and
+  Disconnect; the Unverified badge shows; every settings tab is reachable.
+- [ ] **AC8**: sign-in from iOS does not capitalise the username.
+- [ ] **AC9**: Docs: `docs/ui.md` states §3.1's rules with a diagram, and the `docs/README.md` index row covers them.
+
+## 6. Open decisions
+
+| | decision | recommendation |
+|---|---|---|
+| **D1** | the desktop grid's Consent column keeps all six controls open, so a row is ~210 px tall — collapse it to the same summary plus an expandable row? | yes, as **P1b**, once the operator has seen P1 on a phone; it reuses `DeviceAccessPolicyFields` |
+| **D2** | the breakpoint vocabulary | §3.1 rule 5; do **not** change Vuetify's global `mobileBreakpoint`, which would move the drawer and the viewer at 960–1279 px |
+| **D3** | the built-in touch presets put buttons above a short landscape stage (`touchControls.ts:165-205`) | a product call: moving them changes them for every user |
+| **D4** | display names in the stats, usage and hive payloads | yes, in P6: additive fields, the `AgentDao::label()` rule |
+| **D5** | the in-call controls on a phone | an app-bar button opening Return · Mute · Camera · Hang up |
+
+## 7. Out of scope
+
+- Native apps; offline mode; a PWA install flow.
+- Redesigning desktop layouts beyond parity (D1 is the one exception, and it is a decision).
+- The viewer's input, transport, consent and session logic — P5 is presentation only.
+- Server behaviour other than the three display-name fields (D4).
+
+## 8. Field-verification log
+
+| date | build | host | result |
+|---|---|---|---|
+| 2026-10-19 21:14Z | production (the image live that evening) | the operator's org, Devices, in a 390 px frame of the same origin in the operator's browser (DOM read + screenshots; no control touched) | 🔴 **RED (AC1).** 22 cards of 481–521 px, 11,895 px tall; 16 of 16 display-named devices shown by machine name; no Edit name & tags; `/tenant//network/…` links; a 7-column tunnel table scrolling sideways; no search |
+| 2026-10-19 21:20Z | the same | tenant dashboard, org list, Billing, Observability at 390 px | 🔴 **RED (AC2).** `v-main` `scrollWidth − clientWidth` = 4 on each |
+| 2026-10-19 23:30Z | P1 in the local harness (the SPA from `vite dev`, every `/api` call answered by synthetic devices) | 390 × 844, 820 × 1100, 1300 × 900, 2400 × 1000 | 🟢 P1 locally: 7 cards in 2,015 px (a card ~260 px, Access and Details closed); display names; the full menu with Edit name & tags; `?type=tunnel` lands on tunnel cards; two columns at 820 px. **Desktop: 0 differing pixels** against master at 1300 and 2400 px |
+
+## 9. Related
+
+FR-12 (#788, the tour), FR-27 (the owner's consent shortcut the Access summary names), FR-51 (ephemeral devices),
+FR-100 (#2092, the identity badge P5 makes visible on phones), FR-103 (#2134) and FR-106 (#2314) (the chips), FR-111
+(#2359, touch control of the viewer).
