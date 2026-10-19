@@ -282,7 +282,7 @@ agent's session can change it.
 |---|---|---|
 | GET | `…/agent` | List enrolled devices (status, caps, overlay info) |
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
-| POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device) |
+| POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`), and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the first. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
 | GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/recording-activity/{aid}`, `…/transfer-activity/{aid}`) still resolve a removed device |
 | GET | `…/agent/{aid}/crash` | Crash reports |

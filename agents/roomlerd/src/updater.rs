@@ -2964,6 +2964,28 @@ pub fn install_update_trigger(
     Some(rx)
 }
 
+/// FR-67 P7 — what an enrollment's caps say about a pushed `rc:agent.update`
+/// (`AgentCaps::update_mode`, stamped by `signaling::stub_caps` at every
+/// announcement): `self` when it acts on one, `primary_org` on a secondary
+/// enrollment (the `rc:agent.update` arm ignores it there), `off` when
+/// auto-update is off (no trigger is installed, so the arm drops it). The
+/// trigger is installed in `run_cmd` before any signalling loop starts, so a
+/// hello always reads it settled.
+pub fn update_mode(is_primary: bool) -> &'static str {
+    update_mode_for(is_primary, UPDATE_TRIGGER.get().is_some())
+}
+
+/// [`update_mode`] as a pure function of its two facts.
+pub(crate) fn update_mode_for(is_primary: bool, takes_triggers: bool) -> &'static str {
+    if !is_primary {
+        "primary_org"
+    } else if !takes_triggers {
+        "off"
+    } else {
+        "self"
+    }
+}
+
 /// Request an immediate update cycle (server-pushed `rc:agent.update`).
 /// `pin` = optional release tag; `None` = latest. Returns `false` when
 /// nothing is listening (auto-update disabled, trigger not installed)
@@ -4032,6 +4054,17 @@ pub fn helper_owns_updates() -> Option<PathBuf> {
 // docs/fr/FR-21
 #[cfg(test)]
 mod tests {
+    /// FR-67 P7 — the hello's word for each case the `rc:agent.update` arm
+    /// handles: a secondary ignores the push whatever its updater, a primary
+    /// with no trigger drops it, and only a primary with one acts.
+    #[test]
+    fn update_mode_names_what_the_update_arm_will_do() {
+        assert_eq!(super::update_mode_for(false, true), "primary_org");
+        assert_eq!(super::update_mode_for(false, false), "primary_org");
+        assert_eq!(super::update_mode_for(true, false), "off");
+        assert_eq!(super::update_mode_for(true, true), "self");
+    }
+
     /// #1689 — a daemon whose updater is off must report an `rc:agent.update`
     /// push as undeliverable, so the arm's "update trigger dropped" warning
     /// fires. RED-FIRST against the old wiring (install unconditionally, hold

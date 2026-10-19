@@ -96,7 +96,9 @@ CLI: `roomler org ls | rm | enable | disable | set-primary`, `enroll --label`,
 the primary slot. Do this when the organization that should manage the machine
 is not its primary. The primary drives the machine-wide effects:
 - **the self-updater:** an `rc:agent.update` ("Update" or "Update all" in a
-  secondary org's dashboard) is ignored, with a WARN;
+  secondary org's dashboard) is ignored, with a WARN. Since FR-67 P7 that
+  dashboard says so before the click, and the server refuses the push with
+  `primary_org` instead of counting it delivered;
 - **attention sentinels;**
 - **declared tunnel routes.**
 
@@ -137,6 +139,14 @@ it could not keep one.
 must not be able to force-update a shared binary — the ignore is surfaced via
 log + a LocalAPI counter), attention sentinels, exit-route purge, and
 `process::exit` escalations. The updater polls the primary's server.
+
+⚠️ **The server is told too (FR-67 P7).** Every announcement of an enrollment's
+caps carries `update_mode`: `self` (the primary, with its updater on),
+`primary_org` (a secondary: the push is ignored) or `off` (auto-update off: the
+push is dropped). The server refuses a push the device will not act on: a 409 on
+one device, a `refused` row with its `refused_code` in Update all. Before this,
+a frame the device ignored had still reached its socket, so the dashboard counted
+it delivered. An agent that predates the word is pushed as before.
 
 LocalAPI grew `NodeStatus.orgs` (wire-locked; empty ⇒ omitted, so single-org
 daemons stay byte-identical) and `RouteDescriptor.org`.

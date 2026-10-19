@@ -331,6 +331,26 @@ pub struct AgentCaps {
     /// lands in the agent's unknown-variant debug branch and vanishes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub multi_org: Vec<String>,
+    /// FR-67 P7 — whether THIS enrollment acts on a server-pushed
+    /// `rc:agent.update`, and if not, why. Recognised values:
+    ///
+    /// * `self` — it does: the machine's primary enrollment, its updater on.
+    /// * `primary_org` — it ignores it: the self-updater is machine-wide, and
+    ///   only the primary enrollment drives it (multi-org; a secondary org's
+    ///   admin must not force-update a binary every org shares).
+    /// * `off` — it drops it: auto-update is off on the device
+    ///   (`auto_update = false` / `ROOMLERD_AUTO_UPDATE=0`).
+    ///
+    /// Before this the device's refusal was surfaced only locally (a WARN and
+    /// a LocalAPI counter), so "Update all" counted it as delivered: on
+    /// 2026-10-19 the operator's dashboard "updated" a device three times
+    /// while it logged `rc:agent.update ignored` three times.
+    ///
+    /// Unset (an older agent) = unknown: the server pushes as before. ⚠️ An
+    /// unrecognised value is IGNORED (treated as unset), never an error — a
+    /// newer agent may say something this server has never heard of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<String>,
     /// VP9 chroma format the agent will emit on the
     /// `data-channel-vp9-444` transport. Values: `"yuv444"` (default,
     /// current behaviour, VP9 profile 1) for sharpest text via
@@ -532,6 +552,47 @@ pub struct AgentCaps {
     /// say, so an absent key never means "unavailable".
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub unavailable: std::collections::BTreeMap<String, Unavailable>,
+}
+
+/// FR-67 P7 — why an enrollment will not act on a pushed `rc:agent.update`;
+/// see [`AgentCaps::update_refusal`]. The server refuses such a push up front
+/// (a 409, or a `refused` row in a bulk update) rather than counting a frame
+/// the device will ignore as an update delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateRefusal {
+    /// A secondary enrollment: only the machine's primary drives its updater.
+    PrimaryOrg,
+    /// `auto_update = false` on the device.
+    AutoUpdateOff,
+}
+
+impl UpdateRefusal {
+    /// The stable code a client branches on.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PrimaryOrg => "primary_org",
+            Self::AutoUpdateOff => "auto_update_off",
+        }
+    }
+
+    /// What an admin is told, including the way out.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::PrimaryOrg => {
+                "this device takes its updates from another organization: only the \
+                 machine's primary enrollment drives its self-updater, so an update \
+                 ordered here is ignored. Order it from that organization, or make this \
+                 one the device's primary (on the device: `roomlerd org set-primary \
+                 <this org's label>`, then restart its daemon)"
+            }
+            Self::AutoUpdateOff => {
+                "auto-update is off on this device (`auto_update = false`, or \
+                 `ROOMLERD_AUTO_UPDATE=0` in its service environment), so it drops an \
+                 update ordered from here. Switch it on at the device (`roomler config \
+                 set auto_update true`, or its Roomler settings), then restart its daemon"
+            }
+        }
+    }
 }
 
 /// FR-97 P0c — why a feature is not offered here; see [`AgentCaps::unavailable`].
@@ -1294,6 +1355,17 @@ impl RecordCap {
 }
 
 impl AgentCaps {
+    /// FR-67 P7 — why this enrollment will not act on an `rc:agent.update`
+    /// pushed from this organization, or `None` when it will — or when it
+    /// does not say (an older agent, or a value this server does not know).
+    pub fn update_refusal(&self) -> Option<UpdateRefusal> {
+        match self.update_mode.as_deref() {
+            Some("primary_org") => Some(UpdateRefusal::PrimaryOrg),
+            Some("off") => Some(UpdateRefusal::AutoUpdateOff),
+            _ => None,
+        }
+    }
+
     /// Does this agent advertise `cap`?
     ///
     /// ⚠️ Unrecognised verbs are IGNORED rather than rejected. A NEWER agent
@@ -7227,6 +7299,58 @@ mod tests {
         assert!(plain.get("unavailable").is_none(), "{plain}");
         let old: AgentCaps = serde_json::from_value(plain).unwrap();
         assert!(old.unavailable.is_empty());
+    }
+
+    /// FR-67 P7 — the hello's `update_mode`: absent on the wire when unset (an
+    /// older agent's hello stays byte-identical), round-trips, and maps to a
+    /// refusal only for the two values that mean "will not act on it".
+    /// Unknown words are ignored, never an error.
+    #[test]
+    fn update_mode_round_trips_and_maps_to_refusals() {
+        let unset = AgentCaps::default();
+        assert!(
+            !serde_json::to_string(&unset)
+                .unwrap()
+                .contains("update_mode")
+        );
+        assert_eq!(unset.update_refusal(), None);
+
+        for (word, want) in [
+            ("primary_org", Some(UpdateRefusal::PrimaryOrg)),
+            ("off", Some(UpdateRefusal::AutoUpdateOff)),
+            ("self", None),
+            ("some-future-word", None),
+        ] {
+            let caps = AgentCaps {
+                update_mode: Some(word.into()),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&caps).unwrap();
+            assert_eq!(json["update_mode"], word);
+            let back: AgentCaps = serde_json::from_value(json).unwrap();
+            assert_eq!(back.update_refusal(), want, "{word}");
+            // The server stores caps on the agent row as BSON, and the
+            // update routes read them back from there.
+            let stored: AgentCaps = bson::from_bson(bson::to_bson(&caps).unwrap()).unwrap();
+            assert_eq!(stored.update_refusal(), want, "{word} via BSON");
+        }
+
+        // An older agent's hello, without the field.
+        let plain = serde_json::to_value(AgentCaps::default()).unwrap();
+        assert!(plain.get("update_mode").is_none(), "{plain}");
+        let old: AgentCaps = serde_json::from_value(plain).unwrap();
+        assert_eq!(old.update_mode, None);
+        assert_eq!(old.update_refusal(), None);
+
+        // The codes a client branches on, spelled out so a rename is deliberate.
+        assert_eq!(UpdateRefusal::PrimaryOrg.code(), "primary_org");
+        assert_eq!(UpdateRefusal::AutoUpdateOff.code(), "auto_update_off");
+        assert!(UpdateRefusal::PrimaryOrg.reason().contains("set-primary"));
+        assert!(
+            UpdateRefusal::AutoUpdateOff
+                .reason()
+                .contains("auto_update")
+        );
     }
 
     /// Spelled out literally rather than derived, so a rename has to be a

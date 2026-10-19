@@ -1405,10 +1405,27 @@ pub struct TriggerUpdateResult {
     /// periodic check anyway.
     pub delivered: bool,
     /// FR-2: set (with the reason) when the push was NOT sent because the
-    /// pin would downgrade this agent and `force` wasn't given. Additive —
-    /// absent on delivered/offline rows.
+    /// pin would downgrade this agent and `force` wasn't given. FR-67 P7:
+    /// also when the device said it would not act on it (a secondary
+    /// enrollment, or auto-update off). Additive — absent on
+    /// delivered/offline rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+    /// FR-67 P7 — the refusal as a stable code a client branches on:
+    /// `pin_downgrade`, `primary_org` or `auto_update_off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused_code: Option<&'static str>,
+}
+
+/// FR-67 P7 — the push this route must not send: the device's hello said it
+/// would ignore (a secondary enrollment) or drop (auto-update off) it. A
+/// frame sent anyway reached the socket, so it counted as `delivered`, while
+/// the device logged `rc:agent.update ignored` and stayed where it was.
+fn device_refusal(
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+) -> Option<(&'static str, String)> {
+    caps.update_refusal()
+        .map(|r| (r.code(), r.reason().to_string()))
 }
 
 /// POST /api/tenant/{tid}/agent/{agent_id}/update — push `rc:agent.update`
@@ -1448,6 +1465,12 @@ pub async fn trigger_agent_update(
     {
         return Err(ApiError::Conflict(reason));
     }
+    // FR-67 P7: refuse what the device said it would not act on. `force`
+    // does not override this: it overrides OUR downgrade guard, and the
+    // device ignores or drops the frame whatever the server sends.
+    if let Some((_, reason)) = device_refusal(&agent.capabilities) {
+        return Err(ApiError::Conflict(reason));
+    }
 
     let pin = body.pin;
     let delivered = state
@@ -1465,6 +1488,7 @@ pub async fn trigger_agent_update(
         agent_id: aid.to_hex(),
         delivered,
         refused: None,
+        refused_code: None,
     }))
 }
 
@@ -1489,8 +1513,9 @@ pub struct BulkTriggerUpdateResponse {
     pub results: Vec<TriggerUpdateResult>,
     pub requested: usize,
     pub delivered: usize,
-    /// FR-2: how many targets were skipped because the pin would downgrade
-    /// them (additive; 0 when force or no pin).
+    /// How many targets were skipped, each with its `refused` reason and
+    /// `refused_code`: FR-2's downgrade guard (0 when force or no pin), and
+    /// FR-67 P7's devices that said they would not act on the push.
     pub refused: usize,
 }
 
@@ -1515,8 +1540,10 @@ pub async fn trigger_agents_update(
     )
     .await?;
 
-    // (id, running version) — the FR-2 guard needs the version per target.
-    let targets: Vec<(ObjectId, String)> = match body.agent_ids {
+    // (id, running version, the device's own refusal) — the FR-2 guard needs
+    // the version per target, FR-67 P7 what the device's hello said.
+    type Target = (ObjectId, String, Option<(&'static str, String)>);
+    let targets: Vec<Target> = match body.agent_ids {
         Some(ids) if !ids.is_empty() => {
             let mut out = Vec::with_capacity(ids.len());
             for id in ids {
@@ -1525,7 +1552,8 @@ pub async fn trigger_agents_update(
                 // Tenant-scope every explicit target — LIVE, like the
                 // "all devices" arm below, which lists live rows only.
                 let a = state.agents.find_live_in_tenant(tid, aid).await?;
-                out.push((aid, a.agent_version));
+                let refusal = device_refusal(&a.capabilities);
+                out.push((aid, a.agent_version, refusal));
             }
             out
         }
@@ -1543,7 +1571,10 @@ pub async fn trigger_agents_update(
                 .await?;
             page.items
                 .into_iter()
-                .filter_map(|a| a.id.map(|i| (i, a.agent_version)))
+                .filter_map(|a| {
+                    let refusal = device_refusal(&a.capabilities);
+                    a.id.map(|i| (i, a.agent_version, refusal))
+                })
                 .collect()
         }
     };
@@ -1551,7 +1582,7 @@ pub async fn trigger_agents_update(
     let mut results = Vec::with_capacity(targets.len());
     let mut delivered = 0usize;
     let mut refused = 0usize;
-    for (aid, version) in &targets {
+    for (aid, version, device) in &targets {
         // FR-2: skip (never fail the batch) targets a stale pin would
         // downgrade.
         if let Some(pin) = body.pin.as_deref()
@@ -1563,6 +1594,19 @@ pub async fn trigger_agents_update(
                 agent_id: aid.to_hex(),
                 delivered: false,
                 refused: Some(reason),
+                refused_code: Some("pin_downgrade"),
+            });
+            continue;
+        }
+        // FR-67 P7: skip (never fail the batch) a device that said it would
+        // ignore or drop the push, and say why, rather than count it delivered.
+        if let Some((code, reason)) = device {
+            refused += 1;
+            results.push(TriggerUpdateResult {
+                agent_id: aid.to_hex(),
+                delivered: false,
+                refused: Some(reason.clone()),
+                refused_code: Some(code),
             });
             continue;
         }
@@ -1582,6 +1626,7 @@ pub async fn trigger_agents_update(
             agent_id: aid.to_hex(),
             delivered: ok,
             refused: None,
+            refused_code: None,
         });
     }
     tracing::info!(

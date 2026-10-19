@@ -1,6 +1,6 @@
 # FR-67 — An update's outcome is written, and nothing ever reads it
 
-**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** proposed · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
+**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2 shipped; P7 in review) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
 
 ## Goal
 
@@ -104,6 +104,59 @@ It was the first design, and it was refuted:
   wedge-recovery path (`recover_wedged_install`) depends on it.
 - The pid stays in the record for forensics; only the *wait* changes.
 
+### P7 — an update the device was never going to act on
+
+Found 2026-10-19. The operator's **Update all** "updated" a two-org device three
+times, and its journal logged `rc:agent.update ignored — only the primary
+enrollment drives the machine-wide self-updater` three times. The dashboard's org
+was the device's **secondary** enrollment. A device also drops the push when its
+auto-update is off (#1689). Both refusals showed up only on the device (a WARN and
+a LocalAPI counter). The frame had reached the socket, so the server counted it
+`delivered`. That adds a fourth case to *failed*, *rolled back* and *hasn't polled
+yet*, and no version check can tell it apart from them.
+
+```mermaid
+sequenceDiagram
+    participant D as roomlerd (one enrollment)
+    participant S as server
+    participant UI as dashboard
+    D->>S: rc:agent.hello, and every heartbeat re-announce<br/>update_mode = self | primary_org | off
+    S->>S: store capabilities (replaced wholesale)
+    UI->>S: GET agents
+    S-->>UI: capabilities.update_mode
+    Note over UI: "Update now" disabled with the reason,<br/>the Update-all dialog lists who will not update
+    UI->>S: POST …/agent/update
+    alt update_mode = primary_org or off
+        S-->>UI: refused + refused_code (409 on one device), never sent
+    else self, or unset (an older agent)
+        S->>D: rc:agent.update
+        S-->>UI: delivered
+    end
+```
+
+| Piece | Where |
+|---|---|
+| The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:353`); `UpdateRefusal` and `update_refusal()` (`:562`, `:1361`) |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:4683`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:2973`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:2956`), else `self` |
+| Stamped at **every** announcement | `stub_caps` (`signaling.rs:6712`, `:6725`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1424`): a 409 on one device (`:1471`), a `refused` row with its `refused_code` in a bulk (`:1603`) |
+| Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
+
+> [!WARNING]
+> **Stamped in `stub_caps`, not in the hello alone.** A heartbeat that
+> re-announces changed caps (a login, a policy flip) *replaces* the stored blob
+> (`AgentDao::update_capabilities`). A hello-only word would be erased at the
+> device's first login, and the dashboard would count refused pushes as delivered
+> again. The first draft had exactly that hole.
+
+- ⚠️ **Unset means unknown, never a refusal.** No agent before P7 sends the word.
+  An unrecognised word from a newer agent is ignored the same way. In both cases
+  the push goes out as before.
+- ⚠️ **`force` does not override it.** `force` overrides the server's own FR-2
+  downgrade guard. The device ignores or drops the frame whatever the server sends.
+- ⚠️ The codes are a compatibility surface with every dashboard: `primary_org`,
+  `auto_update_off`, and FR-2's `pin_downgrade`.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -114,6 +167,7 @@ It was the first design, and it was refuted:
 | P4 | macOS `AbandonProcessGroup` — **`com.roomler.update.plist`** is the job that matters (`update-helper` is that LaunchDaemon's body and is where `installer -pkg` is spawned) | packaging-only revert | proposed — see the note below |
 | P5 | Fleet answer: report the outcome to the server and show it | render-only; absent field ⇒ today's blank | proposed |
 | P6 | Transient systemd unit — **only if P1 leaves a measurable race** | `update_watcher_escape_cgroup`, default OFF | deferred, evidence-gated |
+| P7 | The dashboard is told which devices will not act on an update ordered from it, and why: `update_mode` in the caps, refused up front with a `refused_code`, marked before the click | revert = today's blind push; an agent without the word is pushed as before | **in review** · field check on the release carrying it |
 
 ## Acceptance criteria
 
@@ -132,6 +186,13 @@ It was the first design, and it was refuted:
       seven days against **zero** `post-install watcher started` (P2, #1427)
 - [ ] A fleet query answers "did this update succeed on each host" without SSH
 - [ ] Windows behaviour is byte-for-byte unchanged
+- [ ] **P7**: an update ordered from a device's **secondary** org is refused with
+      `primary_org` and the way out, and never counted delivered. ⚠️ The "before"
+      is recorded: on 2026-10-19 the bulk route counted it delivered (field log)
+- [ ] **P7**: a device with auto-update off is refused with `auto_update_off`
+- [ ] **P7**: an agent that predates P7 is pushed exactly as before
+- [ ] **P7**: the word survives a heartbeat re-announce: after a login on the
+      device, its row still carries `update_mode`
 
 ## Out of scope
 
@@ -158,6 +219,7 @@ It was the first design, and it was refuted:
 | 2026-09-02 | Preconditions measured on two distros | `systemd-run` present and `INVOCATION_ID` set in the unit process on both (Fedora/systemd 257, Ubuntu/systemd 255); `KillMode=control-group` on both |
 | 2026-09-02 | ⚠️ Measurement hazard | `pgrep -x roomlerd` matched a **container's** process on a host running containerised test nodes (cgroup `/system.slice/docker-….scope`). A first reading wrongly showed `INVOCATION_ID` absent on Ubuntu. Probe `systemctl show roomlerd -p MainPID` instead |
 | 2026-09-02 | ⛔ First design refuted before implementation | A systemd transient unit was the initial P1. Adversarial review found its safety premise false without `--service-type=exec`, its kill switch inert against the mode it guards, and that it would *create* a PID-reuse false-`Timeout` mode. The real defect is the self-pid wait (`updater.rs:1577` + `post_install.rs:221`) — removing it needs no systemd at all |
+| 2026-10-19 | ❌ P7's "before", on the fleet | The operator's **Update all** counted a two-org aarch64 device (Fedora/Asahi) as pushed three times. Its journal logged `rc:agent.update ignored — only the primary enrollment drives the machine-wide self-updater` three times: the dashboard's org was its secondary enrollment. That day's remedy was `roomlerd org set-primary` on the device, which exposed #2540 (both meshes off; fixed in #2541) |
 
 ## P4 — scoped, and one question left before it is safe to write
 
