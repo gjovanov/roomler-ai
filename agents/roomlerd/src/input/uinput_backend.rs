@@ -72,6 +72,8 @@ const KEY_LEFTSHIFT: u16 = 42;
 /// FR-93 P4c — the other shift, so a viewer holding EITHER counts as holding
 /// shift when KeyText decides whether to press it.
 const KEY_RIGHTSHIFT: u16 = 54;
+/// FR-97 P3f — AltGr: the right Alt key, where the keymap makes it level 3.
+const KEY_RIGHTALT: u16 = 100;
 
 /// Absolute axis range. 0..=32767 is the conventional span for an absolute
 /// pointing device; the compositor scales it to the current screen, so this
@@ -217,11 +219,11 @@ pub struct UinputInjector {
     warned_text: bool,
     warned_touch: bool,
     warned_rel: bool,
-    /// FR-36 P4b — the verified keyboard layout for this host, if we have a
-    /// table for it, plus the raw name that was detected. The name is kept even
-    /// when unsupported so the refusal can SAY what it found: "unsupported
-    /// layout" is not actionable, "unsupported layout `de`" is.
-    layout: Option<super::keylayout::Layout>,
+    /// FR-36 P4b, FR-97 P3f — how typed text becomes keys on this host: its
+    /// own XKB keymap, else the verified table; `None` refuses typed text. The
+    /// raw layout name is kept even then, so the refusal can SAY what it found:
+    /// "unsupported layout" is not actionable, "unsupported layout `de`" is.
+    text_keys: Option<super::keylayout::TextKeys>,
     layout_name: String,
     /// FR-95 P2 — switched on by a system install by itself: inject only while
     /// the automatic capture reads the person's session (`seat_guard`).
@@ -233,6 +235,9 @@ pub struct UinputInjector {
     /// right), so KeyText neither presses shift again nor lets go of the
     /// viewer's own.
     shift_held: [bool; 2],
+    /// FR-97 P3f — the right Alt key a viewer holds down, AltGr where the
+    /// keymap makes it level 3: KeyText leaves it to them, as with shift.
+    altgr_held: bool,
 }
 
 impl UinputInjector {
@@ -344,15 +349,18 @@ impl UinputInjector {
         info!("input: backend=uinput (virtual kernel device, below the compositor)");
 
         let (layout, layout_name) = super::keylayout::detect();
-        match layout {
-            Some(l) => info!(
-                layout = l.as_str(),
+        let keys: Vec<u16> = KEYMAP.iter().map(|&(_, k)| k).collect();
+        let (text_keys, how) = super::keylayout::TextKeys::for_host(&layout_name, layout, &keys);
+        match &text_keys {
+            Some(_) => info!(
                 detected = layout_name.as_str(),
+                keys = how.as_str(),
                 "uinput: typed text will be sent as physical keys for this layout"
             ),
             None => warn!(
                 detected = layout_name.as_str(),
-                "uinput: no verified key table for this keyboard layout — typed text will NOT \
+                why = how.as_str(),
+                "uinput: no key map for this keyboard layout — typed text will NOT \
                  arrive (pointer and non-text keys are unaffected)"
             ),
         }
@@ -364,11 +372,12 @@ impl UinputInjector {
             warned_text: false,
             warned_touch: false,
             warned_rel: false,
-            layout,
+            text_keys,
             layout_name,
             auto_system: false,
             dropping: false,
             shift_held: [false; 2],
+            altgr_held: false,
         })
     }
 
@@ -384,11 +393,12 @@ impl UinputInjector {
             warned_text: false,
             warned_touch: false,
             warned_rel: false,
-            layout: None,
+            text_keys: None,
             layout_name: String::new(),
             auto_system: false,
             dropping: false,
             shift_held: [false; 2],
+            altgr_held: false,
         }
     }
 
@@ -620,55 +630,61 @@ impl InputInjector for UinputInjector {
                 match key {
                     KEY_LEFTSHIFT => self.shift_held[0] = down,
                     KEY_RIGHTSHIFT => self.shift_held[1] = down,
+                    KEY_RIGHTALT => self.altgr_held = down,
                     _ => {}
                 }
                 self.emit(EV_KEY, key, i32::from(down))?;
                 self.sync()
             }
             InputMsg::KeyText { text } => {
-                // FR-36 P4b. evdev carries PHYSICAL keys, so typing text means
-                // pressing the key that produces each character *under this
-                // host's layout*. We do that only for a layout we have a
-                // verified table for; anything else refuses loudly rather than
-                // typing the US mapping at a keyboard whose keys are elsewhere.
-                let Some(layout) = self.layout else {
+                // FR-36 P4b, FR-97 P3f. evdev carries PHYSICAL keys, so typing
+                // text means pressing the key that produces each character
+                // *under this host's layout*: from the host's own XKB keymap,
+                // else the verified table. With neither it refuses loudly
+                // rather than typing the US mapping at a keyboard whose keys
+                // are elsewhere.
+                let Some(keys) = self.text_keys.as_ref() else {
                     if !self.warned_text {
                         self.warned_text = true;
                         warn!(
                             detected = self.layout_name.as_str(),
-                            "uinput: typed text dropped — no verified key table for this layout. \
+                            "uinput: typed text dropped — no key map for this layout. \
                              Pointer and non-text keys still work."
                         );
                     }
                     return Ok(());
                 };
+                let name = keys.name().to_string();
+                let strokes: Vec<_> = text.chars().map(|ch| keys.stroke(ch)).collect();
                 let mut skipped = 0usize;
-                for ch in text.chars() {
-                    let Some(k) = layout.stroke(ch) else {
-                        // A character this layout cannot reach (accented, CJK,
-                        // or needing a dead-key sequence). Skip it rather than
+                for k in strokes {
+                    let Some(k) = k else {
+                        // A character this layout cannot reach in one stroke
+                        // (CJK, or one needing a dead key). Skip it rather than
                         // substituting something wrong.
                         skipped += 1;
                         continue;
                     };
-                    let Some(code) = hid_to_evdev(k.hid) else {
-                        skipped += 1;
-                        continue;
-                    };
-                    // FR-93 P4c — shift goes in a report of its OWN, before
-                    // the key and after it. KWin (Plasma 6.6, measured) gives
-                    // every key in a report the modifiers that report ENDS
-                    // with: a key pressed together with shift's release came
-                    // out unshifted, so "A" typed "a" and "!" typed "1". And a
-                    // shift the viewer is holding is theirs: neither pressed
-                    // again nor let go of here.
+                    // FR-93 P4c — a modifier goes in a report of its OWN,
+                    // before the key and after it. KWin (Plasma 6.6, measured)
+                    // gives every key in a report the modifiers that report
+                    // ENDS with: a key pressed together with shift's release
+                    // came out unshifted, so "A" typed "a" and "!" typed "1".
+                    // AltGr (FR-97 P3f) goes the same way, outside shift. A
+                    // modifier the viewer is holding is theirs: neither
+                    // pressed again nor let go of here.
+                    let press_altgr = k.level3 && !self.altgr_held;
                     let press_shift = k.shift && !self.shift_held.contains(&true);
+                    if press_altgr {
+                        self.emit(EV_KEY, KEY_RIGHTALT, 1)?;
+                        self.sync()?;
+                    }
                     if press_shift {
                         self.emit(EV_KEY, KEY_LEFTSHIFT, 1)?;
                         self.sync()?;
                     }
-                    self.emit(EV_KEY, code, 1)?;
-                    self.emit(EV_KEY, code, 0)?;
+                    self.emit(EV_KEY, k.key, 1)?;
+                    self.emit(EV_KEY, k.key, 0)?;
                     // One report per character: a compositor coalescing an
                     // entire string into a single frame can drop repeats of the
                     // same key, which is exactly what typing "ll" looks like.
@@ -677,11 +693,15 @@ impl InputInjector for UinputInjector {
                         self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
                         self.sync()?;
                     }
+                    if press_altgr {
+                        self.emit(EV_KEY, KEY_RIGHTALT, 0)?;
+                        self.sync()?;
+                    }
                 }
                 if skipped > 0 && !self.warned_text {
                     self.warned_text = true;
                     warn!(
-                        layout = layout.as_str(),
+                        layout = name.as_str(),
                         skipped, "uinput: some characters are not typeable under this layout"
                     );
                 }
@@ -771,10 +791,21 @@ mod tests {
     /// As [`written`], for a sequence through ONE injector that has a
     /// verified layout (KeyText types nothing without one).
     fn written_seq(msgs: Vec<InputMsg>) -> Vec<(u16, u16, i32)> {
+        written_with(
+            crate::input::keylayout::TextKeys::Table(crate::input::keylayout::Layout::Us),
+            msgs,
+        )
+    }
+
+    /// As [`written_seq`], typing with `keys`.
+    fn written_with(
+        keys: crate::input::keylayout::TextKeys,
+        msgs: Vec<InputMsg>,
+    ) -> Vec<(u16, u16, i32)> {
         use std::io::{Read, Seek};
         let mut file = tempfile::tempfile().expect("a temp file");
         let mut inj = UinputInjector::over(file.try_clone().expect("clone the fd"));
-        inj.layout = Some(crate::input::keylayout::Layout::Us);
+        inj.text_keys = Some(keys);
         for msg in msgs {
             inj.inject(msg).expect("inject");
         }
@@ -931,6 +962,55 @@ mod tests {
                 SYN,
                 (EV_KEY, KEY_A, 1),
                 (EV_KEY, KEY_A, 0),
+                SYN,
+                (EV_KEY, KEY_LEFTSHIFT, 0),
+                SYN,
+            ]
+        );
+    }
+
+    /// FR-97 P3f — AltGr goes in reports of its own around the key, as shift
+    /// does, and outside it. On a German keymap `@` is AltGr+Q, `z` the key a
+    /// US board calls Y, and `Ä` shift with no AltGr.
+    #[test]
+    fn a_level3_character_keeps_altgr_in_reports_of_its_own() {
+        let keys: Vec<u16> = KEYMAP.iter().map(|&(_, k)| k).collect();
+        let de = match crate::input::keylayout::xkb::XkbText::compile("de", "", &keys) {
+            Ok(t) => crate::input::keylayout::TextKeys::Xkb(t),
+            Err(e) => {
+                assert!(
+                    std::env::var("ROOMLERD_TEST_XKB").as_deref() != Ok("1"),
+                    "ROOMLERD_TEST_XKB=1 but: {e}"
+                );
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+        const KEY_Q: u16 = 16;
+        const KEY_Y: u16 = 21;
+        const KEY_APOSTROPHE: u16 = 40;
+        assert_eq!(
+            written_with(
+                de,
+                vec![InputMsg::KeyText {
+                    text: "@zÄ".into()
+                }]
+            ),
+            [
+                (EV_KEY, KEY_RIGHTALT, 1),
+                SYN,
+                (EV_KEY, KEY_Q, 1),
+                (EV_KEY, KEY_Q, 0),
+                SYN,
+                (EV_KEY, KEY_RIGHTALT, 0),
+                SYN,
+                (EV_KEY, KEY_Y, 1),
+                (EV_KEY, KEY_Y, 0),
+                SYN,
+                (EV_KEY, KEY_LEFTSHIFT, 1),
+                SYN,
+                (EV_KEY, KEY_APOSTROPHE, 1),
+                (EV_KEY, KEY_APOSTROPHE, 0),
                 SYN,
                 (EV_KEY, KEY_LEFTSHIFT, 0),
                 SYN,

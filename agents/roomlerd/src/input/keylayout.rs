@@ -9,10 +9,10 @@
 //! a different key again. Get it wrong and the remote user watches mojibake
 //! appear, which is worse than nothing happening.
 //!
-//! ## Why this is a table and not `libxkbcommon`
+//! ## Why a table, and `libxkbcommon` only through `dlopen` (FR-97 P3f)
 //!
-//! xkbcommon is the correct general answer and was rejected on deployment
-//! grounds: it is a **dynamic system library**, and linking it would put
+//! xkbcommon is the correct general answer and LINKING it was rejected on
+//! deployment grounds: it is a **dynamic system library**, and that would put
 //! `libxkbcommon.so` in `roomlerd`'s `DT_NEEDED` on every Linux build. Headless
 //! fleet hosts (cluster nodes, containers) have no reason to carry it, and a
 //! missing `.so` does not degrade a feature — the loader refuses to start the
@@ -20,10 +20,10 @@
 //! vendored FFmpeg dylibs baked a Homebrew path into the macOS agent and dyld
 //! killed it at launch on every end-user Mac.
 //!
-//! So: **detect the layout, and type only when we have a verified table for
-//! it.** Never assume. An unknown layout keeps the old behaviour — a single
-//! loud warning naming what was detected — which is honest and leaves the
-//! operator a next step, rather than silently typing the wrong characters.
+//! So: **detect the layout, and type only with a map we trust**: the host's
+//! own XKB keymap where libxkbcommon loads ([`xkb`], dlopen'd), else a verified
+//! table. Never assume. A layout with neither keeps the old behaviour: one loud
+//! warning naming what was detected, rather than silently typing wrong keys.
 
 use std::process::Command;
 
@@ -155,12 +155,14 @@ pub fn detect() -> (Option<Layout>, String) {
 }
 
 fn from_localectl() -> Option<String> {
+    from_localectl_field("X11 Layout:")
+}
+
+fn from_localectl_field(field: &str) -> Option<String> {
     let out = Command::new("localectl").arg("status").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.lines().find_map(|l| {
-        l.split_once("X11 Layout:")
-            .map(|(_, v)| v.trim().to_string())
-    })
+    text.lines()
+        .find_map(|l| l.split_once(field).map(|(_, v)| v.trim().to_string()))
 }
 
 /// Read `KEY=value` from a shell-style config file. Tolerates quotes and
@@ -180,6 +182,103 @@ fn from_keyfile(path: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// FR-97 P3f — typed text on any layout, through the host's own XKB keymap.
+pub mod xkb;
+
+/// One character's keystroke, in evdev codes, whichever way it was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextStroke {
+    pub key: u16,
+    pub shift: bool,
+    /// AltGr, pressed as the right Alt key ([`xkb::XkbStroke::level3`]).
+    pub level3: bool,
+}
+
+/// How typed text becomes keys on this host: its own XKB keymap (FR-97 P3f),
+/// else the verified table.
+#[derive(Debug, Clone)]
+pub enum TextKeys {
+    Xkb(xkb::XkbText),
+    Table(Layout),
+}
+
+impl TextKeys {
+    /// For the layout [`detect`] found (`name`, and `table` where it has one):
+    /// the host's XKB keymap where it compiles, else the table, else `None`,
+    /// and typed text is refused as before P3f. `keys` is what the caller can
+    /// emit. The string says which way, or why neither, for the log.
+    pub fn for_host(name: &str, table: Option<Layout>, keys: &[u16]) -> (Option<Self>, String) {
+        let xkb_said = if xkb::enabled() {
+            match xkb::XkbText::compile(name, &variant_for(name), keys) {
+                Ok(t) => {
+                    let how = format!("the host's XKB keymap `{}`", t.name());
+                    return (Some(Self::Xkb(t)), how);
+                }
+                Err(e) => format!("no XKB keymap: {e}"),
+            }
+        } else {
+            "ROOMLERD_UINPUT_XKB=0".to_string()
+        };
+        match table {
+            Some(l) => (
+                Some(Self::Table(l)),
+                format!("the verified `{}` table ({xkb_said})", l.as_str()),
+            ),
+            None => (None, format!("no verified table for `{name}` ({xkb_said})")),
+        }
+    }
+
+    /// The keystroke that types `ch`, or `None` where there is none in one.
+    pub fn stroke(&self, ch: char) -> Option<TextStroke> {
+        match self {
+            Self::Xkb(t) => t.stroke(ch).map(|s| TextStroke {
+                key: s.key,
+                shift: s.shift,
+                level3: s.level3,
+            }),
+            Self::Table(l) => {
+                let k = l.stroke(ch)?;
+                Some(TextStroke {
+                    key: crate::input::hid_evdev::hid_to_evdev(k.hid)?,
+                    shift: k.shift,
+                    level3: false,
+                })
+            }
+        }
+    }
+
+    /// The layout typed for: `de`, `fr(bepo)`, `us`.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Xkb(t) => t.name(),
+            Self::Table(l) => l.as_str(),
+        }
+    }
+}
+
+/// The variant to compile `layout` with, from the SAME source [`detect`] took
+/// the layout from: a variant beside another source's layout would describe a
+/// keymap nobody configured. Empty is the layout's default.
+fn variant_for(layout: &str) -> String {
+    let unquote = |v: String| v.trim().trim_matches('"').to_string();
+    let sources = [
+        (
+            std::env::var("XKB_DEFAULT_LAYOUT").ok(),
+            std::env::var("XKB_DEFAULT_VARIANT").ok(),
+        ),
+        (from_localectl(), from_localectl_field("X11 Variant:")),
+        (
+            from_keyfile("/etc/default/keyboard", "XKBLAYOUT"),
+            from_keyfile("/etc/default/keyboard", "XKBVARIANT"),
+        ),
+    ];
+    sources
+        .into_iter()
+        .find(|(l, _)| l.clone().map(unquote).as_deref() == Some(layout))
+        .and_then(|(_, v)| v.map(unquote))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
