@@ -113,13 +113,27 @@ fn central_url(derp_base: &str, token: &str, tenant_id: &str) -> String {
 /// FR-103 — the central URL, built per ATTEMPT from the live token: the WS
 /// owner outlives the connection that spawned it, and a URL fixed at spawn
 /// would keep dialling with a token renewed since.
+///
+/// #2512 — and NO URL while the control socket's verdict on that token is
+/// "refused" (`TokenSlot::is_refused`): a dial then is a request the server
+/// will only 401, and a device whose row was gone re-dialled every 10 s,
+/// forever. `run` backs off (≤ `DERP_BACKOFF_MAX`) and asks again, so a new
+/// token or the socket's next accepted upgrade brings the carrier back within
+/// one step. ⚠️ Never this dialer's own 401: `/derp` answers 401 for ANY
+/// lookup error, so a dialer that believed it would drop every device's DERP
+/// floor on one database wobble.
 fn central_url_per_attempt(
     ws_url: &str,
     token: crate::token_slot::TokenSlot,
     tenant_id: &str,
 ) -> Box<dyn Fn() -> Option<String> + Send> {
     let (base, tenant_id) = (derp_url_from_ws(ws_url), tenant_id.to_string());
-    Box::new(move || Some(central_url(&base, &token.get(), &tenant_id)))
+    Box::new(move || {
+        if token.is_refused() {
+            return None;
+        }
+        Some(central_url(&base, &token.get(), &tenant_id))
+    })
 }
 
 /// Spawn the persistent `/derp` WS owner for this overlay connection. `ws_url`
@@ -210,9 +224,15 @@ async fn run(
             return;
         }
         // Regional relays: no admission ticket cached yet — back off and
-        // retry (the signaling loop fills the slot within seconds).
+        // retry (the signaling loop fills the slot within seconds). #2512 —
+        // the central relay: the server refuses this enrollment's token, as
+        // the control socket heard it (`central_url_per_attempt`).
         let Some(url) = url_for_attempt() else {
-            debug!(%relay, "overlay derp: no admission ticket yet; delaying connect");
+            debug!(
+                %relay,
+                "overlay derp: no usable credential (no admission ticket yet, or the server \
+                 refuses this enrollment's token); delaying connect"
+            );
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(DERP_BACKOFF_MAX);
             continue;
@@ -413,5 +433,115 @@ mod tests {
             url().as_deref(),
             Some("wss://host/derp?token=renewed&role=agent&tid=t1")
         );
+    }
+
+    /// #2512 — while the control socket's verdict on the token is "refused",
+    /// the central relay is not dialled at all; the socket's next accepted
+    /// upgrade, or a renewed token, brings the dial back.
+    #[test]
+    fn a_refused_token_is_never_dialled() {
+        let slot = crate::token_slot::TokenSlot::new("dead");
+        let url = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
+        assert!(slot.mark_refused("dead"));
+        assert_eq!(url(), None);
+        assert!(slot.mark_accepted("dead"));
+        assert_eq!(
+            url().as_deref(),
+            Some("wss://host/derp?token=dead&role=agent&tid=t1")
+        );
+        assert!(slot.mark_refused("dead"));
+        assert_eq!(url(), None);
+        assert!(slot.set("renewed".into()));
+        assert_eq!(
+            url().as_deref(),
+            Some("wss://host/derp?token=renewed&role=agent&tid=t1")
+        );
+    }
+
+    /// A loopback server that answers every upgrade with a plain 401, as
+    /// `/derp` does for a gone row and for any lookup error. Returns its
+    /// `ws://…/ws` base and a count of the dials it has seen.
+    async fn refusing_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = dials.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
+                              Connection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (base, dials)
+    }
+
+    fn dialer(
+        base: &str,
+        slot: &crate::token_slot::TokenSlot,
+        mux: &Arc<DerpMux>,
+        outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(run(
+            "central".to_string(),
+            central_url_per_attempt(base, slot.clone(), "t1"),
+            mux.registration_frame(),
+            Arc::downgrade(mux),
+            outbound_rx,
+        ))
+    }
+
+    /// #2512 ⚠️ — the dialer's OWN 401 never parks it. `/derp` answers 401
+    /// for ANY lookup error (a Mongo blip included), so a 401 here keeps the
+    /// ordinary backoff and the dialer keeps trying: only the control
+    /// socket's verdict holds it.
+    #[tokio::test]
+    async fn a_derp_401_alone_never_parks_the_dialer() {
+        let (base, dials) = refusing_server().await;
+        let slot = crate::token_slot::TokenSlot::new("live");
+        let (mux, outbound_rx) = DerpMux::new([7u8; 32]);
+        let task = dialer(&base, &slot, &mux, outbound_rx);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        task.abort();
+        let n = dials.load(std::sync::atomic::Ordering::SeqCst);
+        // Dials at ~0 s, ~1 s and ~3 s on the 1 s → 2 s backoff.
+        assert!(n >= 2, "a 401 must not stop the dialer: {n} dial(s)");
+        assert!(!slot.is_refused(), "and it never marks the slot");
+    }
+
+    /// #2512 — a refused enrollment's dialer sends nothing, and a renewed
+    /// token brings it back on its next step.
+    #[tokio::test]
+    async fn a_refused_enrollment_dials_nothing_until_its_token_changes() {
+        let (base, dials) = refusing_server().await;
+        let slot = crate::token_slot::TokenSlot::new("gone");
+        assert!(slot.mark_refused("gone"));
+        let (mux, outbound_rx) = DerpMux::new([8u8; 32]);
+        let task = dialer(&base, &slot, &mux, outbound_rx);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused token is never dialled"
+        );
+        assert!(slot.set("renewed".into()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while dials.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a renewed token is dialled within one backoff step"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        task.abort();
     }
 }

@@ -614,6 +614,21 @@ jobs:
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
             --test-threads=1 --nocapture
 
+      - name: DERP dialer — unit tests (#2512)
+        # `derp.rs` compiles only under an overlay feature, and no lane ran its
+        # suite: the step above builds this very binary but runs only
+        # `tun_kernel_tests`. #2512's tests hold the dialer while the control
+        # socket's verdict on the token is "refused", and pin that its OWN 401
+        # never parks it (`/derp` answers 401 for any lookup error). They bind
+        # loopback only; no sudo. The build is the step above's, so this costs
+        # only the run. A filter that matches nothing passes too, hence the
+        # count check.
+        run: |
+          cargo test -p roomlerd --features overlay-l3 --lib -- derp:: > derp-tests.txt 2>&1 \
+            || { cat derp-tests.txt; exit 1; }
+          cat derp-tests.txt
+          grep -E 'test result: ok\. [1-9][0-9]* passed' derp-tests.txt
+
   rust-recorder:
     name: Recorder tests (FR-85)
     timeout-minutes: 30
