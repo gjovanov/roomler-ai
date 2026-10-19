@@ -531,3 +531,150 @@ pub(crate) async fn mongo_reply<R: AsyncRead + Unpin>(r: &mut R) -> (i32, i32, b
     };
     (m.op_code, m.response_to, doc)
 }
+
+/// P3-5d-1 — one request the fake HTTPS upstream saw.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpSaw {
+    /// Which of the upstream's connections it came on, counted from 0.
+    pub(crate) conn: usize,
+    pub(crate) method: String,
+    /// The request's target, as it came.
+    pub(crate) target: String,
+    pub(crate) headers: Vec<(String, String)>,
+    /// How long its body was.
+    pub(crate) body: usize,
+}
+
+impl HttpSaw {
+    /// Every value of the header `name`, in order.
+    pub(crate) fn values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+}
+
+/// P3-5d-1 — an HTTPS upstream on a random port of 127.0.0.1, with a
+/// certificate for `localhost` made for this test: its CA's PEM, its port,
+/// and each request it saw. It answers by path:
+///
+/// | Path | Answer |
+/// |---|---|
+/// | `/echo` | the request's body |
+/// | `/redirect/here` | a 302 to itself, with a query and a fragment |
+/// | `/redirect/case` | a 302 to itself, its scheme and host in capitals |
+/// | `/redirect/port` | a 302 to the same host on another port |
+/// | `/redirect/user` | a 302 to itself with a user in the authority |
+/// | `/redirect/away` | a 302 to another host |
+/// | `/headers` | its own hop-by-hop and origin headers, and one to keep |
+/// | `/close` | `Connection: close`: the connection ends after it |
+/// | anything else | `ok` |
+pub(crate) async fn fake_http() -> (String, u16, mpsc::UnboundedReceiver<HttpSaw>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+
+    let (pem, acceptor, listener, port) = tls_server().await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let conns = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (acceptor, tx) = (acceptor.clone(), tx.clone());
+            let conn = conns.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                // A proxy that refused the certificate hangs up mid-handshake.
+                let Ok(s) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    let tx = tx.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body = body
+                            .collect()
+                            .await
+                            .map(|b| b.to_bytes())
+                            .unwrap_or_default();
+                        let _ = tx.send(HttpSaw {
+                            conn,
+                            method: parts.method.to_string(),
+                            target: parts.uri.to_string(),
+                            headers: parts
+                                .headers
+                                .iter()
+                                .map(|(n, v)| {
+                                    let v = String::from_utf8_lossy(v.as_bytes()).into_owned();
+                                    (n.as_str().to_string(), v)
+                                })
+                                .collect(),
+                            body: body.len(),
+                        });
+                        let mut resp = Response::new(Full::new(Bytes::from_static(b"ok")));
+                        let redirect = |resp: &mut Response<Full<Bytes>>, to: String| {
+                            *resp.status_mut() = StatusCode::FOUND;
+                            resp.headers_mut().insert("location", to.parse().unwrap());
+                        };
+                        let other = if port == 444 { 445 } else { 444 };
+                        match parts.uri.path() {
+                            "/echo" => *resp.body_mut() = Full::new(body),
+                            "/redirect/here" => redirect(
+                                &mut resp,
+                                format!("https://localhost:{port}/landed?x=1#top"),
+                            ),
+                            "/redirect/case" => {
+                                redirect(&mut resp, format!("HTTPS://LOCALHOST:{port}/case"))
+                            }
+                            "/redirect/port" => {
+                                redirect(&mut resp, format!("https://localhost:{other}/x"))
+                            }
+                            "/redirect/user" => {
+                                redirect(&mut resp, format!("https://someone@localhost:{port}/x"))
+                            }
+                            "/redirect/away" => {
+                                redirect(&mut resp, "https://elsewhere.test/x".to_string())
+                            }
+                            "/headers" => {
+                                let h = resp.headers_mut();
+                                h.insert("alt-svc", "h3=\":443\"".parse().unwrap());
+                                h.insert(
+                                    "strict-transport-security",
+                                    "max-age=60".parse().unwrap(),
+                                );
+                                h.insert("connection", "x-upstream-hop".parse().unwrap());
+                                h.insert("x-upstream-hop", "1".parse().unwrap());
+                                h.insert("x-kept", "yes".parse().unwrap());
+                            }
+                            "/close" => {
+                                resp.headers_mut()
+                                    .insert("connection", "close".parse().unwrap());
+                            }
+                            _ => {}
+                        }
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(s), service)
+                    .await;
+            });
+        }
+    });
+    (pem, port, rx)
+}
+
+/// P3-5d-1 — a CA's PEM that vouches for no upstream a test runs.
+pub(crate) fn stranger() -> String {
+    rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .unwrap()
+        .cert
+        .pem()
+}
