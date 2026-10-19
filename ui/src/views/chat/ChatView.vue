@@ -60,6 +60,7 @@
             <div v-for="msg in messageStore.messages" :key="msg.id" :id="`msg-${msg.id}`" class="mb-3">
               <message-bubble
                 :message="msg"
+                :tenant-id="tenantId"
                 :editable="msg.author_id === currentUserId"
                 :unread="!readMessageIds.has(msg.id) && msg.author_id !== currentUserId"
                 @reply="openThread(msg)"
@@ -123,6 +124,7 @@
           <div v-for="msg in messageStore.threadMessages" :key="msg.id" class="mb-2">
             <message-bubble
               :message="msg"
+              :tenant-id="tenantId"
               :editable="msg.author_id === currentUserId"
               compact
               @react="(emoji) => handleReact(msg.id, emoji)"

@@ -44,6 +44,8 @@ interface Message {
   last_reply_user_id?: string
   created_at: string
   updated_at: string
+  /** FR-90 — the module a message belongs to (`vault` for an approval card). */
+  binding?: { module: string; ref: string }
 }
 
 export const useMessageStore = defineStore('messages', () => {

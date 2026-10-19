@@ -205,6 +205,23 @@
     "columns": "Columns",
     "reset": "Reset"
   },
+  "vault": {
+    "approval": {
+      "status": {
+        "pending": "Waiting for a driver",
+        "approved": "Approved",
+        "denied": "Denied",
+        "used": "Approved, and used",
+        "expired": "Expired",
+        "withdrawn": "Withdrawn",
+        "unknown": "Approval"
+      },
+      "answerBy": "Answer by {time}",
+      "approve": "Approve",
+      "deny": "Deny",
+      "notAccepted": "The vault's policies do not accept your approval of this use"
+    }
+  },
   "hive": {
     "title": "Agent sessions",
     "stop": "Stop",

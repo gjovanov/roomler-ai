@@ -954,8 +954,10 @@ the session's drivers answers the card, and the session's next ask for the
 same thing is leased. P3-4e-2 builds the device's half: a tool whose lease
 waits on a card asks again until the answer, so the session's call simply
 takes longer, and the model is told plainly when a person said no or nobody
-answered. P3-4e-3 builds the card's buttons in the web app; until then a card
-is answered through its route.
+answered. P3-4e-3 builds the card's answer in the web app: under the card's
+text, where it stands, and **Approve** / **Deny** for a driver who may answer it
+now ([`ui.md`](ui.md)). Any other chat client shows the card's text, and its
+route answers it.
 
 ```mermaid
 sequenceDiagram
@@ -1015,6 +1017,7 @@ owner.
 | one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:941`](../crates/modules/vault/src/lease.rs#L941), [`dao.rs:816`](../crates/modules/vault/src/dao.rs#L816) |
 | the windows | a card waits 10 min for an answer (`APPROVAL_ANSWER_SECS`); a yes is usable for 5 min from the answer (`APPROVAL_USE_SECS`) | [`vault.rs:75`](../crates/remote_control/src/vault.rs#L75) |
 | the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:413`](../agents/roomlerd/src/vault.rs#L413), [`vault.rs:568`](../agents/roomlerd/src/vault.rs#L568), [`toolbelt.rs:400`](../agents/roomlerd/src/hive/toolbelt.rs#L400), [`toolbelt.rs:483`](../agents/roomlerd/src/hive/toolbelt.rs#L483) |
+| the web app (P3-4e-3) | under a message bound to `{module: "vault"}`, the approval as `GET …/vault/approval/{id}` gives it: where it stands, the deadline while it waits, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve`, else off with why). A refusal is shown in the server's words. The vault edits the card's message whenever the approval moves on, and the new `updated_at` reads it again. The buttons only reflect what the route says; every decision stays the server's | [`VaultApprovalCard.vue`](../ui/src/components/vault/VaultApprovalCard.vue), [`MessageBubble.vue`](../ui/src/components/chat/MessageBubble.vue) |
 | the row | `vault_approvals`, one per card: its request, its status (`pending` · `approved` · `denied` · `used` · `expired` · `withdrawn`), who answered and when, the lease that spent it, and the card's message. A unique index holds one pending card per request | [`model.rs:341`](../crates/modules/vault/src/model.rs#L341), [`lib.rs:333`](../crates/modules/vault/src/lib.rs#L333) |
 
 | The answer route says | When |
@@ -1118,6 +1121,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-4e-3 | the card's Approve and Deny in the web app |
 | P3-5 to P3-9 | `proxy` mode, `short-lived` credentials, session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
