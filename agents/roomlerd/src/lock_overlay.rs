@@ -29,9 +29,9 @@
 //! enough that operators recognise "not the desktop" in <1 s; we
 //! can add text later if field reports indicate confusion.
 //!
-//! Cross-platform: this module is platform-agnostic — Linux/macOS
-//! agents will never call it (no equivalent lock-screen problem),
-//! but the function compiles everywhere so module wiring is simple.
+//! Cross-platform: compiled everywhere, called only on Windows. Off Windows
+//! `lock_state` always reads `Unlocked`: a Linux lock screen is captured and
+//! takes input like any other (FR-97 P3b's hint is advisory); macOS has no probe.
 
 use std::sync::Arc;
 

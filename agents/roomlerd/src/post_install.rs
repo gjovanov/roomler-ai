@@ -75,10 +75,10 @@
 //!    perMachine: as a last act the watcher runs `sc start` on the
 //!    SCM service — every observed wedge left the service STOPPED
 //!    (the MSI never reached StartServices), and a host that stays
-//!    down is worse than any install verdict. The supervisor
-//!    relaunches the agent on next logon (Win Scheduled Task) or
-//!    immediately (systemd / launchd). The new binary then reads
-//!    `last-install.json` at startup to surface the outcome.
+//!    down is worse than any install verdict. Elsewhere the agent comes back
+//!    at the next logon (the per-user Scheduled Task), within 5 s (systemd,
+//!    `Restart=always`), or through the `.pkg`'s postinstall (launchd skips a
+//!    clean exit); the new binary reads `last-install.json` at startup.
 //!
 //! ## What this is NOT
 //!

@@ -224,8 +224,8 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "bool",
         description: "Multi-org: let secondary [[orgs]] entries with overlay_mode=\"tun\" join \
-         their own tenant's mesh over the ONE shared TUN (same server_url as the \
-         primary required). Default: off.",
+         their own tenant's mesh, each on an OS adapter of its own (same server_url as \
+         the primary required). A netstack secondary needs no opt-in. Default: off.",
     },
     KeyMeta {
         key: "overlay_advertised_routes",
