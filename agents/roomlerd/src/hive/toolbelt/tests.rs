@@ -1944,6 +1944,185 @@ async fn a_loopback_connection_from_another_account_is_refused() {
     assert!(saw.try_recv().is_err(), "no upstream was dialled");
 }
 
+/// P3-5c-2 — `vault_connect` serves the MongoDB engine on Unix. The socket
+/// is one a driver dials by its path, and the answer's `uri` names it. A
+/// handshake from a client with no credentials is answered by a connection
+/// signed in as the secret's user, and the connection ends with its lease.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_connect_serves_mongodb_on_a_socket_a_driver_dials_by_its_path() {
+    use crate::vault_proxy::testing::{
+        MongoSaw, MongoUpstreams, fake_mongo, made, mongo_command, mongo_reply, op_query,
+    };
+    let pw = made();
+    let (ca, port, mut saw) = fake_mongo(MongoUpstreams::Scram(pw.clone())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = exec_belt(
+        dir.path(),
+        &[
+            ("db/docs#user", b"app"),
+            ("db/docs#password", pw.as_bytes()),
+            ("pki/db-ca", ca.as_bytes()),
+        ],
+    );
+    let upstream = format!("localhost:{port}");
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "db/docs",
+            "engine": "mongodb",
+            "upstream": upstream,
+            "database": "orders",
+            "ca": "pki/db-ca",
+            "auth_source": "users",
+            "ttl_s": 60,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !answer.to_string().contains(&pw),
+        "the answer holds no value"
+    );
+    let socket = PathBuf::from(answer["host"].as_str().unwrap());
+    assert!(socket.ends_with("mongodb-27017.sock"), "{answer}");
+    assert_eq!(answer["port"], Value::Null);
+    let uri = answer["uri"].as_str().unwrap();
+    assert!(
+        uri.starts_with("mongodb://%2F")
+            && uri.ends_with("mongodb-27017.sock/orders?directConnection=true"),
+        "{uri}"
+    );
+    assert_eq!(answer["env"]["MONGODB_URI"], uri);
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let mut m = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let handshake = bson::doc! { "isMaster": 1, "client": { "driver": { "name": "a-test" } } };
+    m.write_all(&op_query(7, "admin.$cmd", &handshake))
+        .await
+        .unwrap();
+    let (op, to, reply) = mongo_reply(&mut m).await;
+    assert_eq!((op, to), (1, 7), "an OP_REPLY to the handshake");
+    assert_eq!(reply.get_bool("ismaster"), Ok(true));
+    let command = |name: &str, db: &str| MongoSaw::Command(name.into(), db.into());
+    let seen: Vec<MongoSaw> = std::iter::from_fn(|| saw.try_recv().ok()).collect();
+    assert_eq!(
+        seen,
+        [
+            command("saslStart", "users"),
+            MongoSaw::User("app".into()),
+            command("saslContinue", "users"),
+            MongoSaw::Query("admin.$cmd".into(), "isMaster".into()),
+            MongoSaw::Metadata(true),
+        ],
+        "signed in in the call's auth database"
+    );
+    m.write_all(&mongo_command(
+        8,
+        &bson::doc! { "ping": 1, "$db": "orders" },
+    ))
+    .await
+    .unwrap();
+    let (op, to, reply) = mongo_reply(&mut m).await;
+    assert_eq!((op, to), (2013, 8));
+    assert_eq!(reply.get_f64("ok"), Ok(1.0));
+    let lease = |h: &str| {
+        (
+            "lease_proxy".to_string(),
+            sid,
+            5,
+            format!("{h} for {upstream} 60s"),
+        )
+    };
+    assert_eq!(
+        vault.asked(),
+        [
+            lease("db/docs#user"),
+            lease("db/docs#password"),
+            lease("pki/db-ca")
+        ]
+    );
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut m, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "the connection ended with the lease");
+}
+
+/// P3-5c-2 — and on Windows: a loopback port, `directConnection=true`, a
+/// handshake answered by a connection signed in as the secret's user.
+#[cfg(all(feature = "vault", windows))]
+#[tokio::test]
+async fn vault_connect_serves_mongodb_on_a_loopback_port() {
+    use crate::vault_proxy::testing::{
+        MongoUpstreams, fake_mongo, made, mongo_command, mongo_reply, op_query,
+    };
+    let pw = made();
+    let (ca, port, _saw) = fake_mongo(MongoUpstreams::Scram(pw.clone())).await;
+    let vault = proxy_vault(&pw, &ca);
+    let b = belt_running(
+        me(),
+        Run {
+            session: ObjectId::new(),
+            fence: 5,
+            vault: Some(vault.clone()),
+            exec: None,
+        },
+        quick(),
+    );
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "db/main",
+            "engine": "mongodb",
+            "upstream": format!("localhost:{port}"),
+            "database": "orders",
+            "ca": "pki/db-ca",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["host"], "127.0.0.1");
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    assert_eq!(
+        answer["uri"],
+        format!("mongodb://127.0.0.1:{dial}/orders?directConnection=true")
+    );
+    let mut m = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    let handshake = bson::doc! { "isMaster": 1, "client": { "driver": { "name": "a-test" } } };
+    m.write_all(&op_query(7, "admin.$cmd", &handshake))
+        .await
+        .unwrap();
+    let (_, to, reply) = mongo_reply(&mut m).await;
+    assert_eq!(to, 7);
+    assert_eq!(reply.get_bool("ismaster"), Ok(true));
+    m.write_all(&mongo_command(
+        8,
+        &bson::doc! { "ping": 1, "$db": "orders" },
+    ))
+    .await
+    .unwrap();
+    let (_, to, reply) = mongo_reply(&mut m).await;
+    assert_eq!((to, reply.get_f64("ok")), (8, Ok(1.0)));
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut m, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "the connection ended with the lease");
+}
+
 /// More open approvals than Claude Code ever asks for, and a question the
 /// surface cannot show, are refused at once — nothing is opened for them.
 #[tokio::test]

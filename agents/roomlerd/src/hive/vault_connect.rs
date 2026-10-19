@@ -7,10 +7,10 @@
 //!
 //! | Step | What holds |
 //! |---|---|
-//! | the call | `handle` (a structured secret, by its path or this org's RRN, with no `#field`), `engine` (`postgres`), `upstream` (`host:port`, exactly as the secret's `audiences` names it), `database` (optional), `ca` (optional: a secret whose value is the upstream's CA, PEM), `ttl_s` (30 to 900, default 300) |
+//! | the call | `handle` (a structured secret, by its path or this org's RRN, with no `#field`), `engine` (`postgres`, or from P3-5c-2 `mongodb`), `upstream` (`host:port`, exactly as the secret's `audiences` names it), `database` (optional), `ca` (optional: a secret whose value is the upstream's CA, PEM), `auth_source` (MongoDB's: the database the user is defined in, default `admin`), `ttl_s` (30 to 900, default 300) |
 //! | the leases | the secret's `user` and `password`, and `ca`'s, each in `proxy` mode toward the upstream: the vault's `proxy-only-named-audiences` refuses an upstream the secret does not name, recorded. A lease asked for ahead toward the same upstream is taken as it is |
-//! | the endpoint | Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`: both directories the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Windows (P3-5b-4): `127.0.0.1` on a port the system picks, each connection's process found in the connection table and served only if its token is the session's account |
-//! | a connection | [`crate::vault_proxy::pg`]: the client never authenticates; the upstream, by SCRAM-SHA-256 inside verified TLS, with the values read from the leases as each connection starts |
+//! | the endpoint | Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, which a Postgres client dials as `host=<that directory>`, or `…/mongodb-27017.sock`, which a MongoDB client dials by its path: both directories the daemon's own (`0711`), the socket handed to the session's account (`0600`), and each connection's peer uid checked again. Windows (P3-5b-4): `127.0.0.1` on a port the system picks, each connection's process found in the connection table and served only if its token is the session's account |
+//! | a connection | the call's engine, [`crate::vault_proxy::pg`] or [`crate::vault_proxy::mongo`]: the client never authenticates; the upstream, by SCRAM-SHA-256 inside verified TLS, with the values read from the leases as each connection starts |
 //! | its life | closed, with every connection it holds, when its first lease is let go: its expiry, `rc:vault.revoke`, the run's end; every one an earlier process left, at the daemon's start |
 //!
 //! ⚠️ `proxy` hands the session no value: what it holds is a socket only its
@@ -40,12 +40,15 @@ const MAX_DATABASE: usize = 63;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
     Postgres,
+    /// P3-5c-2.
+    Mongodb,
 }
 
 impl Engine {
     fn of(raw: &str) -> Option<Self> {
         match raw {
             "postgres" => Some(Self::Postgres),
+            "mongodb" => Some(Self::Mongodb),
             _ => None,
         }
     }
@@ -53,8 +56,19 @@ impl Engine {
     fn wire(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
+            Self::Mongodb => "mongodb",
         }
     }
+}
+
+/// Whether `name` is a MongoDB database name: 1 to 63 bytes, none of the
+/// characters a server refuses in one, and no control character.
+fn mongo_database_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_DATABASE
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "/\\. \"$*<>:|?".contains(c))
 }
 
 /// One `vault_connect` call, checked: what is refused here never reaches the
@@ -73,6 +87,9 @@ pub(crate) struct ConnectRequest {
     pub(crate) database: Option<String>,
     /// A secret whose value is the upstream's CA, PEM.
     pub(crate) ca: Option<Handle>,
+    /// MongoDB's: the database the secret's user is defined in. `None` for
+    /// Postgres, whose user signs in to the database a client names.
+    pub(crate) auth_source: Option<String>,
     pub(crate) ttl: u32,
 }
 
@@ -153,7 +170,7 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         .get("engine")
         .and_then(Value::as_str)
         .and_then(Engine::of)
-        .ok_or("engine must be postgres")?;
+        .ok_or("engine must be postgres or mongodb")?;
     let upstream = args
         .get("upstream")
         .and_then(Value::as_str)
@@ -177,6 +194,22 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         Some(Value::String(c)) => Some(handle_of(c)?),
         Some(_) => return Err("ca must name a secret whose value is a PEM CA".into()),
     };
+    let auth_source = match args.get("auth_source") {
+        None | Some(Value::Null) => (engine == Engine::Mongodb).then(|| "admin".to_string()),
+        Some(_) if engine == Engine::Postgres => {
+            return Err(
+                "auth_source is MongoDB's: a Postgres user signs in to the database a client names"
+                    .into(),
+            );
+        }
+        Some(Value::String(a)) if mongo_database_ok(a) => Some(a.clone()),
+        Some(_) => {
+            return Err(format!(
+                "auth_source must be a database name of 1 to {MAX_DATABASE} bytes, with none of \
+                 / \\ . \" $ * < > : | ? and no control character"
+            ));
+        }
+    };
     let ttl = match args.get("ttl_s") {
         None | Some(Value::Null) => DEFAULT_TTL,
         Some(v) => match v.as_u64().and_then(|s| u32::try_from(s).ok()) {
@@ -194,6 +227,7 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         port,
         database,
         ca,
+        auth_source,
         ttl,
     })
 }
@@ -257,7 +291,7 @@ mod endpoint {
 
     use bson::oid::ObjectId;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, warn};
     use zeroize::Zeroizing;
@@ -265,7 +299,7 @@ mod endpoint {
     use super::super::toolbelt::VaultTools;
     use super::super::vault_exec::Releasing;
     use super::{ConnectRequest, Engine};
-    use crate::vault_proxy::{pg, tls};
+    use crate::vault_proxy::{mongo, pg, tls};
 
     #[cfg(unix)]
     pub(crate) use self::place::PROXIES_DIR;
@@ -322,18 +356,40 @@ mod endpoint {
         host: String,
         port: u16,
         tls: tokio_rustls::TlsConnector,
+        /// The engine it speaks, and MongoDB's auth database.
+        engine: Engine,
+        auth_source: Option<String>,
+    }
+
+    /// One connection's upstream, in its engine.
+    enum Session {
+        Pg(pg::Upstream),
+        Mongo(mongo::Upstream),
     }
 
     impl Endpoint {
         /// The upstream for one connection, its values read from the leases
         /// now: `None` once either is let go.
-        fn upstream(&self) -> Option<pg::Upstream> {
-            Some(pg::Upstream {
-                host: self.host.clone(),
-                port: self.port,
-                user: text(self.vault.value(&self.user_lease)?)?.to_string(),
-                password: text(self.vault.value(&self.password_lease)?)?,
-                tls: self.tls.clone(),
+        fn session(&self) -> Option<Session> {
+            let user = text(self.vault.value(&self.user_lease)?)?.to_string();
+            let password = text(self.vault.value(&self.password_lease)?)?;
+            let (host, port, tls) = (self.host.clone(), self.port, self.tls.clone());
+            Some(match self.engine {
+                Engine::Postgres => Session::Pg(pg::Upstream {
+                    host,
+                    port,
+                    user,
+                    password,
+                    tls,
+                }),
+                Engine::Mongodb => Session::Mongo(mongo::Upstream {
+                    host,
+                    port,
+                    user,
+                    password,
+                    auth_source: self.auth_source.clone().unwrap_or_else(|| "admin".into()),
+                    tls,
+                }),
             })
         }
     }
@@ -362,7 +418,8 @@ mod endpoint {
     /// How a client reaches an endpoint, as the answer says it.
     pub(crate) struct Dial {
         host: String,
-        port: u16,
+        /// `None` for a socket a client dials by its path (MongoDB on Unix).
+        port: Option<u16>,
         uri: String,
         env: serde_json::Map<String, Value>,
     }
@@ -374,7 +431,6 @@ mod endpoint {
         at: At<'_>,
         req: ConnectRequest,
     ) -> Result<Value, String> {
-        let Engine::Postgres = req.engine;
         let slot = Slot::take(session, fence).ok_or_else(|| {
             format!("this session holds {MAX_ENDPOINTS} endpoints already: let one end first")
         })?;
@@ -410,7 +466,10 @@ mod endpoint {
         };
         let user = value(&leases[0], &handles[0])?;
         if user.is_empty() || user.chars().any(char::is_control) {
-            return Err(format!("{}: not a user name Postgres takes", handles[0]));
+            return Err(format!(
+                "{}: not a user name the upstream takes",
+                handles[0]
+            ));
         }
         value(&leases[1], &handles[1])?;
         let ca = match leases.get(2) {
@@ -419,7 +478,7 @@ mod endpoint {
         };
         let tls = tls::connector(ca.as_deref().map(String::as_str))
             .map_err(|e| format!("the upstream's TLS: {e}"))?;
-        let bound = bind(&at)?;
+        let bound = bind(&at, req.engine)?;
         let stop = CancellationToken::new();
         // The endpoint lives with its leases: whichever is let go first
         // closes it, and every connection it holds.
@@ -440,7 +499,7 @@ mod endpoint {
             .filter_map(|l| vault.left(l))
             .min()
             .map_or(0, |d| d.as_secs());
-        let dial = bound.dial(req.database.as_deref());
+        let dial = bound.dial(req.engine, req.database.as_deref());
         let endpoint = Arc::new(Endpoint {
             vault: Arc::clone(&vault),
             user_lease: leases[0].clone(),
@@ -448,6 +507,8 @@ mod endpoint {
             host: req.host.clone(),
             port: req.port,
             tls,
+            engine: req.engine,
+            auth_source: req.auth_source.clone(),
         });
         tokio::spawn(serve(bound, endpoint, stop, own, slot));
         Ok(json!({
@@ -498,6 +559,7 @@ mod endpoint {
             }
             let Ok(permit) = Arc::clone(&open).try_acquire_owned() else {
                 tokio::spawn(refuse(
+                    endpoint.engine,
                     stream,
                     format!("the endpoint serves {MAX_CONNECTIONS} connections at once"),
                 ));
@@ -506,12 +568,23 @@ mod endpoint {
             let (endpoint, stop) = (Arc::clone(&endpoint), stop.clone());
             tokio::spawn(async move {
                 let _permit = permit;
-                let Some(upstream) = endpoint.upstream() else {
-                    return refuse(stream, "the endpoint's lease has ended".into()).await;
+                let Some(session) = endpoint.session() else {
+                    return refuse(
+                        endpoint.engine,
+                        stream,
+                        "the endpoint's lease has ended".into(),
+                    )
+                    .await;
+                };
+                let served = async {
+                    match &session {
+                        Session::Pg(up) => pg::serve(stream, up).await,
+                        Session::Mongo(up) => mongo::serve(stream, up).await,
+                    }
                 };
                 tokio::select! {
                     _ = stop.cancelled() => {}
-                    served = pg::serve(stream, &upstream) => {
+                    served = served => {
                         if let Err(why) = served {
                             debug!(%why, "vault: a proxy connection did not start");
                         }
@@ -523,10 +596,17 @@ mod endpoint {
         endpoint.vault.release(&own);
     }
 
-    /// Tell a client why it is not served, as Postgres would, and hang up.
-    async fn refuse<S: AsyncWrite + Unpin>(mut stream: S, why: String) {
-        let _ =
-            tokio::time::timeout(Duration::from_secs(2), stream.write_all(&pg::fatal(&why))).await;
+    /// Tell a client why it is not served, in its engine's wire, and hang
+    /// up: a Postgres client is sent a fatal error; a MongoDB client, which
+    /// speaks first, has its first message answered.
+    async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(engine: Engine, mut stream: S, why: String) {
+        let told = async {
+            match engine {
+                Engine::Postgres => stream.write_all(&pg::fatal(&why)).await,
+                Engine::Mongodb => mongo::refuse(&mut stream, &why).await,
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), told).await;
     }
 
     /// Unix: a socket in a directory of the session's runtime directory,
@@ -539,13 +619,16 @@ mod endpoint {
         use tokio::net::{UnixListener, UnixStream};
 
         use super::super::super::vault_exec::ExecTarget;
-        use super::{Dial, encode};
+        use super::{Dial, Engine, encode};
 
         /// Each session's endpoints, under its runtime directory.
         pub(crate) const PROXIES_DIR: &str = "proxies";
         /// The port a Postgres endpoint's socket is named for: a client dials
         /// `host=<directory>` and, unless told otherwise, port 5432.
         pub(crate) const PG_PORT: u16 = 5432;
+        /// P3-5c-2 — a MongoDB endpoint's socket: a client dials a host that
+        /// ends in `.sock` as a socket's path.
+        pub(crate) const MONGO_SOCKET: &str = "mongodb-27017.sock";
 
         /// Where an endpoint is served: the session's runtime directory, and
         /// the account its socket is handed to.
@@ -556,6 +639,7 @@ mod endpoint {
         pub(crate) struct Bound {
             listener: UnixListener,
             dir: PathBuf,
+            socket: PathBuf,
             peer: u32,
         }
 
@@ -573,9 +657,25 @@ mod endpoint {
                 }
             }
 
-            pub(crate) fn dial(&self, database: Option<&str>) -> Dial {
-                let host = self.dir.to_string_lossy().into_owned();
+            pub(crate) fn dial(&self, engine: Engine, database: Option<&str>) -> Dial {
                 let mut env = serde_json::Map::new();
+                if engine == Engine::Mongodb {
+                    // The socket's whole path, `/` and all, encoded as the host.
+                    let host = self.socket.to_string_lossy().into_owned();
+                    let uri = format!(
+                        "mongodb://{}/{}?directConnection=true",
+                        encode(&host, false),
+                        database.map(|db| encode(db, false)).unwrap_or_default()
+                    );
+                    env.insert("MONGODB_URI".into(), json!(uri));
+                    return Dial {
+                        host,
+                        port: None,
+                        uri,
+                        env,
+                    };
+                }
+                let host = self.dir.to_string_lossy().into_owned();
                 env.insert("PGHOST".into(), json!(host));
                 env.insert("PGPORT".into(), json!(PG_PORT.to_string()));
                 let mut uri = String::from("postgresql:///");
@@ -586,7 +686,7 @@ mod endpoint {
                 uri.push_str(&format!("?host={}&port={PG_PORT}", encode(&host, true)));
                 Dial {
                     host,
-                    port: PG_PORT,
+                    port: Some(PG_PORT),
                     uri,
                     env,
                 }
@@ -621,7 +721,7 @@ mod endpoint {
         /// A new endpoint's directory, `<session_dir>/proxies/<id>`, and its
         /// socket, bound and handed to the session's account at `0600`. The
         /// directory is removed again if any step fails.
-        pub(crate) fn bind(at: &At<'_>) -> Result<Bound, String> {
+        pub(crate) fn bind(at: &At<'_>, engine: Engine) -> Result<Bound, String> {
             use std::os::unix::fs::PermissionsExt;
             let ExecTarget {
                 session_dir, owner, ..
@@ -644,7 +744,10 @@ mod endpoint {
             };
             let made = (|| {
                 private_dir(&dir)?;
-                let socket = dir.join(format!(".s.PGSQL.{PG_PORT}"));
+                let socket = dir.join(match engine {
+                    Engine::Postgres => format!(".s.PGSQL.{PG_PORT}"),
+                    Engine::Mongodb => MONGO_SOCKET.to_string(),
+                });
                 let listener = UnixListener::bind(&socket)
                     .map_err(|e| format!("{}: {e}", socket.display()))?;
                 // Bound under the daemon's umask: until these two calls, only
@@ -657,12 +760,13 @@ mod endpoint {
                         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                     })
                     .map_err(|e| format!("{}: {e}", socket.display()))?;
-                Ok(listener)
+                Ok((listener, socket))
             })();
             match made {
-                Ok(listener) => Ok(Bound {
+                Ok((listener, socket)) => Ok(Bound {
                     listener,
                     dir,
+                    socket,
                     // SAFETY: geteuid reads our own credentials; it cannot fail.
                     peer: owner.map_or_else(|| unsafe { libc::geteuid() }, |(u, _)| u),
                 }),
@@ -691,7 +795,7 @@ mod endpoint {
         use serde_json::json;
         use tokio::net::{TcpListener, TcpStream};
 
-        use super::{Dial, encode};
+        use super::{Dial, Engine, encode};
 
         /// Where an endpoint is served: for the session's account, by SID.
         pub(crate) struct At<'a>(pub(crate) &'a str);
@@ -726,9 +830,22 @@ mod endpoint {
                 }
             }
 
-            pub(crate) fn dial(&self, database: Option<&str>) -> Dial {
+            pub(crate) fn dial(&self, engine: Engine, database: Option<&str>) -> Dial {
                 let (host, port) = (self.addr.ip().to_string(), self.addr.port());
                 let mut env = serde_json::Map::new();
+                if engine == Engine::Mongodb {
+                    let uri = format!(
+                        "mongodb://{host}:{port}/{}?directConnection=true",
+                        database.map(|db| encode(db, false)).unwrap_or_default()
+                    );
+                    env.insert("MONGODB_URI".into(), json!(uri));
+                    return Dial {
+                        host,
+                        port: Some(port),
+                        uri,
+                        env,
+                    };
+                }
                 env.insert("PGHOST".into(), json!(host));
                 env.insert("PGPORT".into(), json!(port.to_string()));
                 // The loopback leg is plain; the upstream's is TLS.
@@ -741,7 +858,7 @@ mod endpoint {
                 uri.push_str("?sslmode=disable");
                 Dial {
                     host,
-                    port,
+                    port: Some(port),
                     uri,
                     env,
                 }
@@ -752,8 +869,9 @@ mod endpoint {
             }
         }
 
-        /// A listener on `127.0.0.1`, on a port the system picks.
-        pub(crate) fn bind(at: &At<'_>) -> Result<Bound, String> {
+        /// A listener on `127.0.0.1`, on a port the system picks, for either
+        /// engine.
+        pub(crate) fn bind(at: &At<'_>, _engine: Engine) -> Result<Bound, String> {
             let failed = |e: std::io::Error| format!("a loopback port: {e}");
             let std = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(failed)?;
             std.set_nonblocking(true).map_err(failed)?;

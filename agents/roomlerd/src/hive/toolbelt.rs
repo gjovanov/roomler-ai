@@ -917,10 +917,10 @@ fn vault_tools() -> Vec<Value> {
     #[cfg(feature = "vault")]
     tools.push(json!({
         "name": "vault_connect",
-        "description": "Opens an endpoint on this device that signs in to a database as a Roomler \
-                        vault secret's user, and answers how to connect to it: a Postgres client \
-                        connects to its host (a socket directory) and port with any user name and \
-                        no password, and never sees the secret's value. handle names a structured \
+        "description": "Opens an endpoint on this device that signs in to a database (Postgres or \
+                        MongoDB) as a Roomler vault secret's user, and answers how to connect to \
+                        it: a client connects with the answer's uri (or host and port), with any \
+                        user name and no password, and never sees the secret's value. handle names a structured \
                         secret with user and password fields; upstream is the database's \
                         host:port, exactly as the secret's audiences name it; ca names a secret \
                         holding the database's CA certificate (PEM) when the system does not \
@@ -930,10 +930,11 @@ fn vault_tools() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "handle": {"type": "string", "description": "a structured secret: a path or rrn:<org>:secret:<path>, with no #field"},
-                "engine": {"type": "string", "enum": ["postgres"]},
+                "engine": {"type": "string", "enum": ["postgres", "mongodb"]},
                 "upstream": {"type": "string", "description": "host:port, such as db.internal:5432"},
                 "database": {"type": "string", "description": "the database to name in the connection string"},
                 "ca": {"type": "string", "description": "a secret whose value is the upstream's CA certificate, PEM"},
+                "auth_source": {"type": "string", "description": "mongodb: the database the secret's user is defined in (default admin)"},
                 "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
             },
             "required": ["handle", "engine", "upstream"],

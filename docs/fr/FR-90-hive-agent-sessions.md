@@ -1836,6 +1836,19 @@ the design document's §7 and §8; what follows binds it to the code as it stand
   - **Not field-tested yet** against a real `mongod` or `mongos`: that is P3k's. The design's
     `directConnection=true` and one host stand.
 
+  ⚠️ **As built (P3-5c-2): one endpoint, two engines, each in its own wire.**
+  - **The socket per engine.** On Unix the socket is named for the engine: `.s.PGSQL.5432`, which
+    a Postgres client dials by its directory, or `mongodb-27017.sock`, which a MongoDB driver dials
+    by its path (a host ending in `.sock`, percent-encoded in the URI). Windows uses one loopback
+    port for either.
+  - **The answer per engine.** For MongoDB, the `uri` carries `directConnection=true`, so a
+    driver stays on the one host and never discovers a replica-set member to dial around the
+    proxy.
+  - **`auth_source` is the call's,** default `admin`. It is not secret: a wrong one only fails
+    the sign-in.
+  - **A refusal speaks the engine's wire.** A MongoDB client sends first, so the endpoint answers
+    its first message rather than writing a Postgres error it cannot read.
+
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
 session and its fence (`agents/roomlerd/src/hive/sidecar.rs:94`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
@@ -1906,7 +1919,7 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
   (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
   owner.
 
-**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1143`):
+**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1144`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
 - `ssh_run`;
@@ -2273,7 +2286,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-5b-2 | `vault_connect` and its endpoint (`docs/vault.md` §19): `handle` (a structured secret, no `#field`), `engine` (`postgres`), `upstream` (`host:port`, the exact audience), `database`, `ca` (a secret holding a PEM CA), `ttl_s`; asked for in the session's settings with the other uses; at most 8 endpoints a run, taken before the vault is asked; the secret's `#user` and `#password` (and the CA) leased in `proxy` mode toward the upstream, a lease asked for ahead taken as it is (`vault_request` names `proxy` too); `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket the account's (`0600`), each connection's peer uid checked again, at most 16 at once, its values read from the leases as it starts; closed with its connections when its first lease is let go, the lease client cancelling a stop token for what was served with it (`stop_with`), the call's own leases then let go; an earlier process's endpoints swept at the daemon's start; a secret's user holding a NUL refused by the engine; Windows refused before anything is leased (P3-5b-4) | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2502 `729ae7491` |
 | P3-5b-3 | channel binding (`docs/vault.md` §19): `tls::server_end_point`, RFC 5929's hash of the certificate the proxy verified by the hash its signature algorithm names (MD5 and SHA-1 become SHA-256; none for Ed25519, RSASSA-PSS or an algorithm it does not know), read by a minimal DER walk; `scram::Binding` (`n`, `y`, `p=tls-server-end-point`) in the GS2 header and inside `c=`, which the proof covers; the engine binds wherever the upstream offers `-PLUS` and the certificate defines binding data, says `y` where it offers none, `n` otherwise; the upstream's refusals of a relayed channel and a stripped offer relayed in its words | the `vault` feature in no release build | **merged** #2506 `6ca52ec6d` |
 | P3-5b-4 | the Windows endpoint (`docs/vault.md` §19): `127.0.0.1` on a port the system picks; each connection's process found in the connection table (`hive_win::tcp_client_pid`, `GetExtendedTcpTable` over the connections) and its token's SID (`hive_win::process_sid`, from `pipe_client_sid`) compared with the session's account as its toolbelt holds it; the answer's `uri` and `env` say `sslmode=disable` for the loopback leg; the endpoint's code shared by both systems, its socket, check and answer per system; the Windows-only dead-code allowances gone, the engine now used there | device `vault_enabled = false`; the `vault` feature in no release build | **merged** #2510 `29a7fd8ad` |
-| P3-5c-1 | the MongoDB engine (`docs/vault.md` §19): the client's first message held (at most 1 MiB, `OP_MSG` or `OP_QUERY`); TCP then TLS from the first byte, verified; SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user in the exchange, `skipEmptyExchange` asked for and the empty exchange given where a server still asks; the server's signature checked before a byte of the client's is sent; no `hello` of the proxy's own (`ClientMetadataCannotBeMutated`), the client's handshake the connection's first; a refusal answering the held message as a server would, code 18; no caller yet | the `vault` feature in no release build | **in review** |
+| P3-5c-1 | the MongoDB engine (`docs/vault.md` §19): the client's first message held (at most 1 MiB, `OP_MSG` or `OP_QUERY`); TCP then TLS from the first byte, verified; SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user in the exchange, `skipEmptyExchange` asked for and the empty exchange given where a server still asks; the server's signature checked before a byte of the client's is sent; no `hello` of the proxy's own (`ClientMetadataCannotBeMutated`), the client's handshake the connection's first; a refusal answering the held message as a server would, code 18; no caller yet | the `vault` feature in no release build | **merged** #2514 `3a42d8274` |
+| P3-5c-2 | `vault_connect` serving the MongoDB engine (`docs/vault.md` §19): `engine: "mongodb"`, `auth_source` (default `admin`; refused for Postgres); on Unix the socket `mongodb-27017.sock`, dialled by its path, the `uri` `mongodb://<%-encoded path>/<db>?directConnection=true` (no `port`), on Windows `mongodb://127.0.0.1:<port>/<db>?directConnection=true`, `MONGODB_URI` in `env`; each connection's upstream built in the call's engine; a refusal in the engine's wire (a MongoDB client's first message answered, `mongo::refuse`) | device `vault_enabled = false`; the `vault` feature in no release build | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |

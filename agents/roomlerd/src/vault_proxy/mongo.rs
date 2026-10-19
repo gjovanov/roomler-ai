@@ -351,6 +351,22 @@ pub(super) fn op_msg_document(body: &[u8]) -> Result<Document, String> {
     Err(bad())
 }
 
+/// P3-5c-2 — answer a client the endpoint does not serve: its first
+/// message, read as [`serve`] reads it, is answered with `why` as a refusal
+/// answers it. A client that sends nothing readable is told nothing.
+pub(crate) async fn refuse<C>(client: &mut C, why: &str) -> std::io::Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let Ok(first) = read_message(client, MAX_FIRST).await else {
+        return Ok(());
+    };
+    match refusal(&first, why) {
+        Some(answer) => client.write_all(&answer).await,
+        None => Ok(()),
+    }
+}
+
 /// The answer to the client's first message that tells it why no session
 /// started: as a server answers that kind of message, or nothing for a kind
 /// a handshake never is.
