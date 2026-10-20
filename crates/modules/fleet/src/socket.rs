@@ -129,6 +129,12 @@ pub async fn handle_agent_socket(
         String::new()
     };
 
+    // This connection's id: the key every module's per-connection state is
+    // held under (`AgentCtx::conn_id`, below), and (#2552) what the row names
+    // as the connection that wrote its hello, so this connection's teardown
+    // writes `Offline` only while no newer hello has replaced it.
+    let conn_id = uuid::Uuid::new_v4().to_string();
+
     // Persist: mark online, update hello fields on the Mongo row. Best-effort —
     // signaling still works if Mongo lags.
     if let Err(e) = state
@@ -144,6 +150,7 @@ pub async fn handle_agent_socket(
             &peer_auth_key,
             &arch,
             arch_emulated,
+            &conn_id,
         )
         .await
     {
@@ -483,7 +490,7 @@ pub async fn handle_agent_socket(
     // originator with its sessions and transports, the probe-persist
     // throttle. The lifecycles run in HOOK_ORDER.
     let actx = roomler_core::AgentCtx {
-        conn_id: uuid::Uuid::new_v4().to_string(),
+        conn_id: conn_id.clone(),
         agent_id,
         tenant_id,
         owner_user_id,
@@ -981,15 +988,17 @@ pub async fn handle_agent_socket(
         lc.closed(&actx, removal_was_ours).await;
     }
     if removal_was_ours {
-        if let Err(e) = state
-            .agents
-            .mark_status(
-                agent_id,
-                roomler_ai_remote_control::models::AgentStatus::Offline,
-            )
-            .await
-        {
-            warn!(%agent_id, %e, "agent mark_status(offline) failed");
+        // #2552 — and only while the row still names THIS connection. The
+        // hub hears of a displacing connection only after its hello's
+        // `Online` write, so the gate above can answer "ours" between that
+        // write and the new registration; a newer hello's `conn_id` makes
+        // this write match nothing, in whichever order the two land.
+        match state.agents.mark_offline_if_conn(agent_id, &conn_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(%agent_id, "agent offline write skipped: a newer hello holds the row")
+            }
+            Err(e) => warn!(%agent_id, %e, "agent mark_offline_if_conn failed"),
         }
         // P4 — offline event, SUPPRESSED when a newer registration owns the
         // directory record (a re-homed agent's late teardown on the old pod:
