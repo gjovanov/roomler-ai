@@ -251,3 +251,16 @@ describe('RegisterView — the signup goal (FR-88)', () => {
     await vi.waitFor(() => expect(router.currentRoute.value.name).toBe('dashboard'))
   })
 })
+
+// FR-116 P7 — the same keyboard rules as the sign-in page: an account made
+// on a phone must not be "Goran" when its owner typed "goran".
+describe('RegisterView — on a phone keyboard (FR-116)', () => {
+  it('asks the keyboard not to capitalise the username or the email, and names the new password', async () => {
+    const { w } = await mountAt('/register')
+    const user = w.find('input[autocomplete="username"]')
+    expect(user.attributes('autocapitalize')).toBe('none')
+    expect(user.attributes('autocorrect')).toBe('off')
+    expect(w.find('input[autocomplete="email"]').attributes('autocapitalize')).toBe('none')
+    expect(w.find('input[autocomplete="new-password"]').exists()).toBe(true)
+  })
+})

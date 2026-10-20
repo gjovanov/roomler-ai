@@ -143,3 +143,22 @@ describe('LoginView — attribution (FR-88)', () => {
     expect(cookieSet).not.toHaveBeenCalled()
   })
 })
+
+// FR-116 P7 — iOS capitalises the first letter of a text field by default,
+// and the server matches the username exactly: "goran" typed on an iPhone
+// arrived as "Goran" and was refused. The attributes must reach the <input>.
+describe('LoginView — on a phone keyboard (FR-116)', () => {
+  it('asks the keyboard not to capitalise or correct the username', async () => {
+    const w = await mountAt('/login')
+    const user = w.find('input[autocomplete="username"]')
+    expect(user.exists()).toBe(true)
+    expect(user.attributes('autocapitalize')).toBe('none')
+    expect(user.attributes('autocorrect')).toBe('off')
+    expect(user.attributes('spellcheck')).toBe('false')
+  })
+
+  it('names the password for the password manager', async () => {
+    const w = await mountAt('/login')
+    expect(w.find('input[autocomplete="current-password"]').exists()).toBe(true)
+  })
+})
