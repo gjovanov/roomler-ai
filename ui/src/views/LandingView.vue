@@ -164,7 +164,8 @@
               <div class="my-4">
                 <span class="text-h3 font-weight-bold">${{ plan.price_cents / 100 }}</span>
                 <span v-if="plan.price_cents > 0" class="text-body-2 landing-muted">
-                  / €{{ plan.price_cents / 100 }} per user / month
+                  <!-- FR-115 — the euro figure only once EUR is on sale (`stripe.currencies`) -->
+                  <template v-if="(plan.prices || []).some((p) => p.currency === 'eur')">/ €{{ plan.price_cents / 100 }} </template>per user / month
                 </span>
                 <span v-else class="text-body-2 landing-muted">forever</span>
                 <div v-if="annualLine(plan)" class="text-body-2 landing-muted">{{ annualLine(plan) }}</div>

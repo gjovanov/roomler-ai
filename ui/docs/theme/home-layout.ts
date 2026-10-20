@@ -68,12 +68,16 @@ function iconFor(mdi: string): string {
   return icon(name, { size: 30 })
 }
 
-/** FR-115 — the same number in USD and EUR, per user per month (`home.js`
- * renders the identical label from the live plans). */
+/** FR-115 — per user per month, the same number in USD and EUR; the euro
+ * figure only once the plan lists an EUR price, i.e. once EUR is on sale
+ * (`stripe.currencies`). `home.js` renders the identical label from the live
+ * plans. */
 export function priceLabel(plan: Plan): { amount: string; unit: string } {
   const dollars = plan.price_cents / 100
   const n = Number.isInteger(dollars) ? `${dollars}` : dollars.toFixed(2)
-  return { amount: `$${n}`, unit: plan.price_cents > 0 ? `/ €${n} per user / month` : 'forever' }
+  if (plan.price_cents <= 0) return { amount: `$${n}`, unit: 'forever' }
+  const eur = (plan.prices || []).some((p) => p.currency === 'eur')
+  return { amount: `$${n}`, unit: eur ? `/ €${n} per user / month` : 'per user / month' }
 }
 
 function planCard(plan: Plan): string {

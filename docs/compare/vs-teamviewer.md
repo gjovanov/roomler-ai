@@ -31,8 +31,8 @@ plans are counted by devices rather than policed by suspicion — and if you
 self-host, there is no counting at all.
 
 **Price shape.** Roomler is $8 per user a month (Pro, 1,000 devices) and $16
-(Business, 5,000), two months free on annual billing, in dollars or euros, and
-free for 10 users and 100 devices with commercial use allowed. Remote support
+(Business, 5,000), and free for 10 users and 100 devices with commercial use
+allowed. Remote support
 suites are typically priced per concurrent seat with device tiers layered on
 top. Compare against your own quote
 rather than a number on a page — but for a small IT shop the difference is
