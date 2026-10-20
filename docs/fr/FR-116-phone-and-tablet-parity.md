@@ -1,8 +1,9 @@
 # FR-116: Phone and tablet parity — the same facts and actions at 360 px as on desktop, details on demand
 
-**Issue:** [#2561](https://github.com/gjovanov/roomler-ai/issues/2561) · **Status:** P1–P8 merged and on production
-since 2026-10-20 09:33Z (`hosted-20261020-9776afb`); AC1–AC3, AC5 and AC9 field-verified there (§8); D1 (#2599) and the
-D6 smoke (#2601) in review; AC6–AC8 need a real phone (the operator) · **Owner:** the web app (UI); P6 touches three server payloads ·
+**Issue:** [#2561](https://github.com/gjovanov/roomler-ai/issues/2561) · **Status:** every phase merged and on production —
+P1–P8 since 2026-10-20 09:33Z (`hosted-20261020-9776afb`), D1 (#2599) and the D6 smoke (#2601) since 13:53Z, P3d (#2607)
+since 14:39Z (`hosted-20261020-3fbc5ad`); AC1–AC3, AC5 and AC9 field-verified there (§8); open: AC4's hive rows (FR-90's)
+and AC6–AC8, which need a real phone (the operator) · **Owner:** the web app (UI); P6 touches three server payloads ·
 **Anchors:** master `944a85224` · **Builds on:** [FR-12](FR-12-onboarding-tutorial.md) (the tour anchors),
 [FR-103](FR-103-device-credentials-renew-themselves.md) and [FR-106](FR-106-devices-say-when-not-updating.md) (the
 "needs a person" chips), [FR-111](FR-111-touch-controls.md) (touch control of the viewer, left as it is)
@@ -265,6 +266,13 @@ Found by the audit and fixed outside the phases (every width): a deep link to an
 in the frame, as a phone's overlay scrollbars take no width, and each route settles 4.5 s after `.v-main` appears.
 The off-screen rule is the D6 smoke's. `purestat_ignore` was set for the runs and restored afterwards, so no frame
 counted as a visit. The viewer route is an offline device's idle page, which starts no session.
+
+| date | build | host | result |
+|---|---|---|---|
+| 2026-10-20 13:53Z | promote of `hosted-20261020-d2eae7e` (by FR-115's session; carries D1 #2599 and D6 #2601) | — | — |
+| 2026-10-20 14:17–14:18Z | production, `hosted-20261020-d2eae7e` (each frame's entry script checked) | the same instrument | 🟢 **D1** at 1300 px: 10 rows of 53–61 px (each ~210 px with every control open before D1), every Consent summary closed (`aria-expanded="false"`) and no select rendered; a click opens the six controls in place (4 selects, 2 checkboxes; the row 234 px) and a second click closes them. 🔴 **P3d before:** the exec audit 42,534 px at 360 px, 100 rows, no paging. 🔴 **#2605 before:** `/login` and a tenant deep link carry no `Cache-Control`, and a never-seen deep link loaded twice comes from cache the second time (`transferSize 0`) |
+| 2026-10-20 14:37:35Z | promote of `hosted-20261020-3fbc5ad`: P3d #2607, the SPA-shell fix #2605, FR-90's server half (`c3b45833f`) | the fleet | pods ready by 14:39:24Z, 0 restarts; 20 of 32 online, the operator's 14 of 22 (the one fewer last seen 13:29Z, before the roll); `roomler exec` answered from 5 devices; a tunnel forward 200 in 0.50 s |
+| 2026-10-20 14:40–14:45Z | production, `hosted-20261020-3fbc5ad` | the same instrument | 🟢 **P3d** at 360 px: the exec audit **5,264 px** (20 cards of 204–270 px; 9 long commands behind **Show all**), the SSH audit 4,376 px, SSH activity 5,476 px; **Show 20 more** reaches 40 on each; nothing off-screen. 🟢 **#2605:** `Cache-Control: no-cache` on `/login` and the deep link, and the second load of a never-seen deep link revalidates (`transferSize 300`, a 304). 🟢 **AC3's last red:** the idle viewer's break-glass button spans 99–261 px at 360 px (361 px this morning); the only elements past the edge are in the closed Remote files drawer |
 
 ## 9. Related
 
