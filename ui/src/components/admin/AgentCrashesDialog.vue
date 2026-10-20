@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog v-model="open" max-width="900" scrollable>
+  <v-dialog v-model="open" max-width="900" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center">
         <v-icon icon="mdi-alert-circle-outline" color="warning" class="mr-2" />
-        <span>Crash reports — {{ agentName }}</span>
+        <!-- The span shrinks with an ellipsis (min-width: 0), so the title's own
+             buttons stay on screen: a title never wraps, and a long device name
+             used to push Close or Refresh past the edge on a phone. -->
+        <span class="text-truncate" style="min-width: 0">Crash reports — {{ agentName }}</span>
         <v-spacer />
         <v-btn
           icon="mdi-refresh"
@@ -80,6 +83,11 @@
               </tr>
               <tr v-if="expandedId === c.id" class="crash-detail-row">
                 <td colspan="4" class="pa-3">
+                  <!-- The summary in full, and the time as a date: the row
+                       above clips the one and hides the other in a tooltip,
+                       which a phone never shows. -->
+                  <div class="text-body-2 mb-1 text-break">{{ c.summary }}</div>
+                  <div class="text-caption mb-2">{{ fmtAbsolute(c.crashedAtUnix) }}</div>
                   <div class="text-caption text-medium-emphasis mb-2">
                     <strong>Host:</strong> {{ c.hostname }} ·
                     <strong>Agent:</strong> v{{ c.agentVersion }} ·
@@ -107,6 +115,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import { useAgentStore, type AgentCrash } from '@/stores/agents'
 
 const props = defineProps<{
@@ -120,6 +129,7 @@ const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
 }>()
 
+const { fullscreen } = useResponsiveDialog()
 const open = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v),

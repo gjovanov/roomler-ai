@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog v-model="open" max-width="1100" scrollable>
+  <v-dialog v-model="open" max-width="1100" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center">
         <v-icon icon="mdi-text-box-search-outline" color="primary" class="mr-2" />
-        <span>Agent logs — {{ agentName }}</span>
+        <!-- The span shrinks with an ellipsis (min-width: 0), so the title's own
+             buttons stay on screen: a title never wraps, and a long device name
+             used to push Close or Refresh past the edge on a phone. -->
+        <span class="text-truncate" style="min-width: 0">Agent logs — {{ agentName }}</span>
         <v-spacer />
         <v-btn
           icon="mdi-refresh"
@@ -27,8 +30,10 @@
       <!-- Filter toolbar: level + target substring + a quick "throughput
            only" toggle so an operator chasing a tunnel stall can isolate
            the per-flow throughput lines in one click. -->
-      <v-card-subtitle class="pb-0">
-        <div class="d-flex align-center flex-wrap gap-2 py-2">
+      <!-- A plain block, not a v-card-subtitle: a subtitle dims its content, so
+           the filters looked disabled. (`gap-2` was no class at all — ga-2.) -->
+      <div class="px-4">
+        <div class="d-flex align-center flex-wrap ga-2 py-2">
           <v-select
             v-model="minLevel"
             :items="levelOptions"
@@ -62,9 +67,9 @@
             {{ filteredLines.length }} / {{ allLines.length }} lines
           </span>
         </div>
-      </v-card-subtitle>
+      </div>
 
-      <v-card-text style="max-height: 70vh">
+      <v-card-text :style="fullscreen ? undefined : 'max-height: 70vh'">
         <v-alert
           v-if="error"
           type="error"
@@ -114,7 +119,7 @@
         </div>
       </v-card-text>
 
-      <v-card-actions>
+      <v-card-actions class="flex-wrap">
         <span class="text-caption text-medium-emphasis ml-2">
           {{ batches.length }} batch(es) · newest {{ newestBatchAge }}
         </span>
@@ -128,6 +133,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import { useAgentStore, type AgentLogBatch, type AgentLogLine } from '@/stores/agents'
 
 const props = defineProps<{
@@ -141,6 +147,7 @@ const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
 }>()
 
+const { fullscreen } = useResponsiveDialog()
 const open = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v),
@@ -328,6 +335,22 @@ function fmtRelative(iso: string): string {
 }
 .log-msg {
   flex: 1 1 auto;
+}
+/* A phone has no room for three fixed columns before the message (~270 px
+   of a 264 px dialog left it 1–9 characters wide): time · level · target on
+   one line, the message under it at full width. */
+@media (max-width: 599.98px) {
+  .log-line {
+    flex-wrap: wrap;
+  }
+  .log-target {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .log-msg {
+    flex-basis: 100%;
+  }
 }
 .chip-trace { color: #9e9e9e; }
 .chip-debug { color: #5c8aa8; }
