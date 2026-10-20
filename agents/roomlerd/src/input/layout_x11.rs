@@ -28,6 +28,10 @@
 //!   shared reads or sets it (Xwayland's group is a copy), **nor on a system
 //!   install**, which reaches the screen through DRM and has no X connection.
 //!   Neither advertises `layout` ([`offered`]).
+//! - **GNOME reports, and does not switch.** GNOME Shell puts its own input
+//!   source back within 20 ms of a lock from outside it, so under GNOME the
+//!   hello says `report` without `set`, and the viewer shows the chip with no
+//!   picker ([`switchable`]).
 //!
 //! Kill switch `ROOMLERD_X11_LAYOUT=0`: no `layout` in the hello, no chip.
 
@@ -65,6 +69,23 @@ pub fn offered() -> bool {
 
 fn x11_session(display: Option<std::ffi::OsString>, wayland: Option<std::ffi::OsString>) -> bool {
     display.is_some_and(|d| !d.is_empty()) && wayland.is_none_or(|w| w.is_empty())
+}
+
+/// A switch here stays switched. GNOME Shell keeps its own input source on
+/// Xorg as well: an XKB group locked from outside it is put back within 20 ms
+/// (measured on GNOME 46, FR-97 §8), and it has no public interface to switch
+/// sources. Under GNOME the chip reports and the picker is not offered.
+/// Budgie names itself `Budgie:GNOME`, and is taken at its word.
+pub fn switchable() -> bool {
+    !keeps_its_own_layout(std::env::var_os("XDG_CURRENT_DESKTOP"))
+}
+
+fn keeps_its_own_layout(desktop: Option<std::ffi::OsString>) -> bool {
+    desktop.is_some_and(|d| {
+        d.to_string_lossy()
+            .split(':')
+            .any(|name| name.trim().eq_ignore_ascii_case("GNOME"))
+    })
 }
 
 /// Snapshot of the host's keyboard layouts, published on change. The same
@@ -185,6 +206,13 @@ fn publish(snap: Option<LayoutSnapshot>) {
 pub fn request_set_layout(token: String) {
     if !offered() {
         tracing::info!(%token, "layout: rc:layout.set on a host that offers no layout — refusing");
+        return;
+    }
+    if !switchable() {
+        tracing::info!(
+            %token,
+            "layout: rc:layout.set under GNOME, which puts its own layout back — refusing"
+        );
         return;
     }
     let spawned = std::thread::Builder::new()
@@ -426,13 +454,33 @@ impl Layouts {
         if self.list.is_empty() {
             return None;
         }
+        let active = self.first_group_like(self.active);
         Some(LayoutSnapshot {
-            active_hkl: self.token(self.active),
-            active_tag: self.tag(self.active),
+            active_hkl: self.token(active),
+            active_tag: self.tag(active),
             installed: (0..self.list.len())
+                .filter(|&g| self.first_group_like(g) == g)
                 .map(|g| (self.token(g), self.tag(g)))
                 .collect(),
         })
+    }
+
+    /// The first group with the same layout as `group`. Each layout is offered
+    /// once, at its first group: GNOME configures its input sources with the
+    /// locale's layout appended for its shortcuts (`us,de` is `us,de,us`), a
+    /// group nobody chose, and listing it would show the same layout twice.
+    fn first_group_like(&self, group: usize) -> usize {
+        let key = |l: &Layout| (l.code.clone(), l.variant.clone());
+        let Some(this) = self.list.get(group) else {
+            return group;
+        };
+        // A group the rules do not name is only ever like itself.
+        if this.code.is_empty() {
+            return group;
+        }
+        (0..group)
+            .find(|&g| key(&self.list[g]) == key(this))
+            .unwrap_or(group)
     }
 
     fn tag(&self, group: usize) -> String {
@@ -581,6 +629,29 @@ mod tests {
         assert!(!x11_session(s(""), None));
     }
 
+    /// Measured on GNOME 46 on Xorg (FR-97 §8): an XKB group lock from outside
+    /// GNOME Shell is back on its own source within 20 ms.
+    #[test]
+    fn gnome_keeps_its_own_layout_and_the_others_do_not() {
+        let d = |v: &str| Some(std::ffi::OsString::from(v));
+        for gnome in [
+            "GNOME",
+            "ubuntu:GNOME",
+            "GNOME-Classic:GNOME",
+            "GNOME-Flashback:GNOME",
+            "Budgie:GNOME",
+        ] {
+            assert!(keeps_its_own_layout(d(gnome)), "{gnome}");
+        }
+        for other in ["KDE", "XFCE", "MATE", "X-Cinnamon", "LXQt", ""] {
+            assert!(!keeps_its_own_layout(d(other)), "{other}");
+        }
+        assert!(
+            !keeps_its_own_layout(None),
+            "a bare window manager names none"
+        );
+    }
+
     #[test]
     fn two_layouts_and_the_second_in_use() {
         let l = Layouts::new(&rules("us,de", ","), names(&["English (US)", "German"]), 1);
@@ -634,6 +705,34 @@ mod tests {
             Layouts::new(&[], Vec::new(), 0).snapshot().is_none(),
             "nothing known"
         );
+    }
+
+    /// GNOME's input sources `us, de`, as a GNOME 46 session on Xorg sets them
+    /// (FR-97 §8, the P3e-1 field cell): `_XKB_RULES_NAMES` reads
+    /// `"evdev", "pc105+inet", "us,de,us", ",,"`, the locale's layout appended
+    /// as a third group for GNOME's shortcuts. Each layout is offered once.
+    #[test]
+    fn gnomes_locale_group_is_not_offered_twice() {
+        let rules = b"evdev\0pc105+inet\0us,de,us\0,,\0\0";
+        let names = || names(&["English (US)", "German", "English (US)"]);
+        let s = Layouts::new(rules, names(), 1).snapshot().unwrap();
+        assert_eq!(
+            s.installed
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["en-US", "de-DE"]
+        );
+        assert_eq!(s.active_tag, "de-DE");
+        // The locale group in use reads as the layout it repeats.
+        let on_locale = Layouts::new(rules, names(), 2);
+        let s2 = on_locale.snapshot().unwrap();
+        assert_eq!(s2.active_tag, "en-US");
+        assert_eq!(s2.active_hkl, s2.installed[0].0);
+        assert_eq!(on_locale.group_of(&s2.active_hkl), Some(0));
+        // Groups the rules do not name are never merged.
+        let unnamed = Layouts::new(&[], names(), 0).snapshot().unwrap();
+        assert_eq!(unnamed.installed.len(), 3);
     }
 
     #[test]

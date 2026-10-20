@@ -64,7 +64,7 @@ organization chooses it with `roomler org overlay <org> netstack`
 | "The host is locked" before you connect | ✅ | ✅ | ❌ |
 | The host's cursor, drawn by your browser | ✅ | ✅ system installs, and X11 desktops from agent 0.4.147; a per-user Wayland desktop draws it into the picture | ❌ the cursor is part of the picture |
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ❌ |
-| Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148 · ❌ Wayland desktops and system installs | ❌ |
+| Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148; on GNOME the layout is shown, and you switch it with GNOME's own shortcut (Super+Space) · ❌ Wayland desktops and system installs | ❌ |
 | Typing text on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
 | Match the remote display to your window | ✅ | 🟡 the agent's own virtual desktop | ❌ |
 | Clipboard: text, formatted text and images | ✅ | ✅ per-user · ❌ a system install | ✅ |

@@ -658,6 +658,10 @@ pub(crate) struct HostFacts {
     /// always; on Linux in an X11 session (FR-97 P3e,
     /// `input::layout_x11::offered`); on macOS not before P2d.
     pub(crate) layout_reachable: bool,
+    /// A layout switch stays switched: not under GNOME, which puts its own
+    /// back (FR-97 P3e, `input::layout_x11::switchable`). There the chip
+    /// reports and the picker is not offered.
+    pub(crate) layout_switchable: bool,
 }
 
 impl HostFacts {
@@ -679,7 +683,20 @@ impl HostFacts {
             watches_clipboard_images: cfg!(target_os = "windows"),
             clipboard_reachable: clipboard_reachable(),
             layout_reachable: layout_reachable(),
+            layout_switchable: layout_switchable(),
         }
+    }
+}
+
+/// FR-97 P3e — see [`HostFacts::layout_switchable`].
+fn layout_switchable() -> bool {
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    {
+        crate::input::layout_x11::switchable()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    {
+        cfg!(target_os = "windows")
     }
 }
 
@@ -802,6 +819,9 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
     // grey, the chip simply does not appear, as on a host before P3e.
     if !facts.layout_reachable {
         caps.layout.clear();
+    } else if !facts.layout_switchable {
+        // GNOME on Xorg: the chip reports; a picker would only snap back.
+        caps.layout.retain(|w| w != "set");
     }
     // The viewer's button types three ordinary keys everywhere.
     let sas = match facts.os {
@@ -2663,6 +2683,7 @@ mod tests {
             watches_clipboard_images: true,
             clipboard_reachable: true,
             layout_reachable: true,
+            layout_switchable: true,
         }
     }
 
@@ -2797,6 +2818,15 @@ mod tests {
         );
         assert!(wayland.layout.is_empty(), "{:?}", wayland.layout);
         assert!(!wayland.unavailable.contains_key("layout"));
+        // GNOME on Xorg puts its own layout back: the chip, and no picker.
+        let gnome = with_honest_words(
+            with_layout(),
+            &HostFacts {
+                layout_switchable: false,
+                ..p0c_facts(OsKind::Linux)
+            },
+        );
+        assert_eq!(gnome.layout, ["report"]);
     }
 
     #[test]
@@ -2825,6 +2855,7 @@ mod tests {
                         watches_clipboard_images: false,
                         clipboard_reachable: reachable,
                         layout_reachable: reachable,
+                        layout_switchable: reachable,
                     },
                 );
                 for (key, why) in &c.unavailable {
@@ -2858,7 +2889,7 @@ mod tests {
         }
         assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
         if cfg!(target_os = "windows") {
-            assert!(f.layout_reachable);
+            assert!(f.layout_reachable && f.layout_switchable);
         } else if cfg!(target_os = "macos") {
             assert!(!f.layout_reachable, "macOS until FR-97 P2d");
         }
