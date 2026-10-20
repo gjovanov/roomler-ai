@@ -48,8 +48,9 @@ People use it too.
 > `vault_render` serving a dynamic secret; P3-6d-1a, a MySQL minter;
 > P3-6d-1b, `mysql` a provider that caller serves (§20); P3-7-1a, the
 > Cedar half of a session's own egress: `net:socks` and `net:forward` over a
-> `Node` (§7); and P3-7-1b, its answer: `rc:vault.net` granted as a token
-> under an audience of its own (§21).**
+> `Node` (§7); P3-7-1b, its answer: `rc:vault.net` granted as a token
+> under an audience of its own (§21); and P3-2c, a policy that can never
+> apply refused when it is written (§7).**
 > No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
@@ -329,7 +330,7 @@ No guardrail stops a listing: all four are about using a value.
 
 **A policy is checked before it is kept** ([`check_policy`](../crates/modules/vault/src/policy.rs)):
 exactly one static Cedar statement, valid against the schema in strict mode,
-and naming only its organization:
+one that can apply (P3-2c), and naming only its organization:
 
 - a `Secret` or `SecretFolder` literal must carry the organization's RRN
   prefix, with a valid path after it;
@@ -344,14 +345,21 @@ and naming only its organization:
   outlive it.
 
 > [!WARNING]
-> **A policy that can never apply is kept** (found in P3-7-1a). Cedar calls a
-> policy whose scope can never hold *impossible*, such as one naming a `Node`
-> as the resource of `secret:use`. Its strict validation reports that as a
-> warning, not an error, and `check_policy` refuses only errors. So the policy
-> is stored and decides nothing. A `permit` like that fails closed. A `forbid`
-> like that forbids nothing its writer meant it to. `simulate` of the request
-> it was meant to forbid shows it: the policy never decides it. Refusing it on
-> write is P3-2c, a change to every policy write.
+> **A policy that can never apply is refused** (P3-2c,
+> [`policy.rs:205`](../crates/modules/vault/src/policy.rs#L205)). Cedar
+> reports two shapes of one only as warnings: a scope no action applies to,
+> such as a `Node` named as the resource of `secret:use`, and a condition
+> that is always false. Kept, such a policy would decide nothing: a `permit`
+> would fail closed, but a `forbid` would forbid nothing its writer meant it
+> to. So a write refuses it with Cedar's own words, and so does `simulate`,
+> which checks its `with` policies as writes. A policy stored before P3-2c
+> is not checked again; it decides nothing, as it always did. Found in
+> P3-7-1a.
+>
+> Cedar cannot see a condition that holds for no request the vault makes:
+> `context.host == "DB.internal"` never holds, because a forward's host is
+> decided in its one spelling (§21). `simulate` the requests a policy is
+> meant for.
 
 > [!IMPORTANT]
 > - **Default deny; a `forbid` beats every `permit`.**
@@ -776,7 +784,7 @@ no answer, and the daemon stops waiting for it.
 | Piece | Where |
 |---|---|
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1510`](../crates/remote_control/src/signaling.rs#L1510)) and `rc:vault.listed` · `rc:vault.described` ([`:4633`](../crates/remote_control/src/signaling.rs#L4633)); refusals reuse `rc:vault.refused` |
-| the decisions | `list` and `describe` ([`meta.rs:116`](../crates/modules/vault/src/meta.rs#L116)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:460`](../crates/modules/vault/src/policy.rs#L460)) |
+| the decisions | `list` and `describe` ([`meta.rs:116`](../crates/modules/vault/src/meta.rs#L116)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:481`](../crates/modules/vault/src/policy.rs#L481)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:537`](../agents/roomlerd/src/vault.rs#L537)) |
 | the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:856`](../agents/roomlerd/src/hive/toolbelt.rs#L856)), answered by `vault_tool` ([`toolbelt.rs:1019`](../agents/roomlerd/src/hive/toolbelt.rs#L1019)) |
 
@@ -815,7 +823,7 @@ sequenceDiagram
 | the answer | the exit code (and signal), stdout and stderr, at most 64 KiB each; each value replaced by `[vault:NAME]`, the longest first, then the daemon's own redactor (agent tokens, bearer and JWT shapes). A value shorter than 4 bytes cannot be masked without shredding the output, and the answer names it under `not_scrubbed` | [`vault_exec.rs:389`](../agents/roomlerd/src/hive/vault_exec.rs#L389) |
 
 **`exec_allow` is a guardrail.** `guardrail:exec-only-allowed-programs`
-([`policy.rs:122`](../crates/modules/vault/src/policy.rs#L122), §7) forbids
+([`policy.rs:123`](../crates/modules/vault/src/policy.rs#L123), §7) forbids
 every `exec` lease whose audience is not on the secret's `exec_allow`. The
 `Secret` entity carries `exec_allow`, so the refusal is a Cedar decision:
 `simulate` names it, it is recorded with its request, and no organization can
@@ -1076,7 +1084,7 @@ owner.
 |---|---|---|
 | the refusal | `awaiting_approval`, retryable. `rc:vault.refused` carries `approval_id` with it, and with no other word | [`vault.rs:178`](../crates/remote_control/src/vault.rs#L178), [`signaling.rs:4607`](../crates/remote_control/src/signaling.rs#L4607), [`lease.rs:722`](../crates/modules/vault/src/lease.rs#L722) |
 | the decision | after Cedar's deny: a usable yes, a waiting card, a no, or a new card where a driver's yes would allow it | [`lease.rs:923`](../crates/modules/vault/src/lease.rs#L923), [`approval.rs:93`](../crates/modules/vault/src/approval.rs#L93) |
-| the approver | Cedar reads `context.approval.approver` in a `Group` per roomler role they hold, as a person assuming a role is. A recorded request keeps the groups (`approver_groups`), so a replay decides it as it was decided | [`policy.rs:434`](../crates/modules/vault/src/policy.rs#L434), [`policy.rs:827`](../crates/modules/vault/src/policy.rs#L827), [`policy.rs:649`](../crates/modules/vault/src/policy.rs#L649) |
+| the approver | Cedar reads `context.approval.approver` in a `Group` per roomler role they hold, as a person assuming a role is. A recorded request keeps the groups (`approver_groups`), so a replay decides it as it was decided | [`policy.rs:455`](../crates/modules/vault/src/policy.rs#L455), [`policy.rs:848`](../crates/modules/vault/src/policy.rs#L848), [`policy.rs:670`](../crates/modules/vault/src/policy.rs#L670) |
 | who may answer | a driver who reads the session, while it is live: hive's own rule for its approvals. Their yes must be one the policy accepts, decided by Cedar with them as the approver when it is given, and again when a lease would spend it. A card is posted only where some driver could give one | [`access.rs:70`](../crates/modules/hive/src/access.rs#L70), [`approval.rs:151`](../crates/modules/vault/src/approval.rs#L151), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
 | the card | a message the session authors in its room, bound to `{module: "vault", ref: <approval id>}` and pushed to its drivers as hive's own approvals are. It names the secret's handle, the mode, the audience, the TTL and the deadline, and is edited as the approval moves on: approved, used, denied, expired, withdrawn | [`room.rs:654`](../crates/modules/hive/src/room.rs#L654), [`approval.rs:286`](../crates/modules/vault/src/approval.rs#L286) |
 | the routes | `GET …/vault/approval/{id}`: the approval as the session's readers see it, with `may_answer` (the caller drives it now) and `may_approve` (and the policy would take their yes) for the caller. `POST …/vault/approval/{id}` `{answer: "approve" \| "deny"}` | [`approval.rs:595`](../crates/modules/vault/src/approval.rs#L595), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
@@ -1601,7 +1609,7 @@ sequenceDiagram
 | the secret | `kind: "dynamic"`, naming a `provider` this build knows, and exactly one audience: where the provider mints. Both are given at its creation; `PATCH` keeps the audience one. Its fields are its issuer's, under its provider's names, and a write of any other is refused ([`routes.rs:549`](../crates/modules/vault/src/routes.rs#L549), [`:839`](../crates/modules/vault/src/routes.rs#L839)). No other kind names a provider |
 | the providers | [`vault::providers`](../crates/remote_control/src/vault.rs#L428), in the wire crate, so the server and the daemon agree on each one's names: its issuer's fields, those no mint can do without, and its minted credential's. `postgres` ([`vault.rs:457`](../crates/remote_control/src/vault.rs#L457)) and, since P3-6d-1b, `mysql`, with the same fields ([`vault.rs:469`](../crates/remote_control/src/vault.rs#L469)) |
 | what a session is told | `vault_list` and `vault_describe` name the provider, and the minted credential's fields as the ones it may name, never its issuer's ([`meta.rs:45`](../crates/modules/vault/src/meta.rs#L45)) |
-| the pairing | two guardrails in every organization's set: `dynamic-only-short-lived`, a dynamic secret in no other mode, and `short-lived-only-dynamic`, nothing else in `short-lived` ([`policy.rs:143`](../crates/modules/vault/src/policy.rs#L143)). Each refusal is recorded with its guardrail |
+| the pairing | two guardrails in every organization's set: `dynamic-only-short-lived`, a dynamic secret in no other mode, and `short-lived-only-dynamic`, nothing else in `short-lived` ([`policy.rs:144`](../crates/modules/vault/src/policy.rs#L144)). Each refusal is recorded with its guardrail |
 | a lease | for the secret as a whole: naming a field is refused `no_value`. Then, each refusal recorded: a provider this build knows (`no_value`) and the server serves (`not_served`), its one audience (`no_value`), and every field no mint can do without (`no_value`, `issuer_lacks_<field>`). Cedar decides toward the secret's own audience ([`lease.rs:1095`](../crates/modules/vault/src/lease.rs#L1095)) |
 | the bundle | every issuer field that holds a value, each opened at its version ([`lease.rs:1132`](../crates/modules/vault/src/lease.rs#L1132)), in one JSON object, `{"audience": …, "fields": {…}}`, sealed to the device's key. The frame says `provider`, and `n: 0`. The buffer is sized for the worst escaping before it is written, so it never grows and leaves no copy behind ([`dynamic.rs:144`](../crates/modules/vault/src/dynamic.rs#L144)) |
 | its row | `field: ""`, `n: 0`, and `bundle`: each field at the version it carried. It ends at its TTL, or at the first of its versions' `expires_at` |
@@ -1943,6 +1951,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-2c | an impossible policy refused on write (§7) |
 | P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; the rest of a session's own egress (the network module's half, P3-7-2; the device's, P3-7-3); `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
