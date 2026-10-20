@@ -204,7 +204,7 @@ uncapped. A refusal is `org_session_limit`
 the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
 session ending or Business. Kill switch `rc.org_session_cap = false`.
 
-### P3b, as proposed: a cluster-wide session count that heals itself (for the operator's review before code)
+### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
 (`crates/modules/fleet/src/hub.rs:1512`). Under tenant affinity, that hub holds every live
@@ -269,16 +269,26 @@ sequenceDiagram
   sessions and the support sessions its members run into other orgs share its plan's slots.
   P3's hub count stays as the fallback.
 
-**Whose org pays for an external session (O6).** FR-52's outsider is an account
-(`docs/fr/FR-52-cross-org-remote-access.md:388`). That account is not a member of the device's
-org, and it may belong to several orgs of its own, or to none. The proposal: the `/connect` page
-asks which org the session is *for*, from the outsider's orgs that are on a paid plan, and the
-session, its slot and its audit row all carry that org. An account with none cannot start an
-external session. This is the P3b row's "Free gets no support sessions to other orgs", applied
-to the org-less too (O7). Helping a friend then takes membership: the friend adds the helper to
-their org, and the session is a same-org one under the friend's plan. The alternative is to
-charge the device's org. That is always defined and needs no picker, but it contradicts AC6 as
-written and puts a support desk's sessions on its customer's plan.
+**Whose quota an external session uses (O6 + O7, decided by the operator 2026-10-20).** FR-52's
+outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:388`). That account is not a
+member of the device's org, and it may belong to several orgs of its own, or to none.
+
+- **No paid org is needed (O7).** Any account that may start an external session today still may.
+- **The session uses the quota of the org it is for, at that org's tier (O6).** The `/connect`
+  page asks which of the outsider's orgs the session is *for*, from **all** of them, Free
+  included, and needs no question when there is one. The session, its slot and its audit row all
+  carry that org, and the session takes one of that org's concurrent-session slots
+  (`max_concurrent_sessions` for its plan and seats, the same number same-org sessions use). A
+  Free org therefore runs one session at a time, whether it is to its own device or someone
+  else's.
+- **An account in no org uses Free's quota, counted against the account** (`rc:slots:user:{id}`):
+  one external session at a time. *This case is the session's application of the decision, since
+  an org-less account has no tier of its own; the operator can change it.* It keeps FR-52's
+  helping-a-friend case working without membership.
+
+The rejected alternative was to charge the device's org. That is always defined and needs no
+picker, but it contradicts AC6 as written and puts a support desk's sessions on its customer's
+plan.
 
 **Kill switches:** `rc.org_session_cap = false` lifts every cap. `rc.session_slots = false`
 returns to P3's hub count, with external sessions uncapped as they are today.
@@ -291,6 +301,8 @@ returns to P3's hub count, with external sessions uncapped as they are today.
   2. An external session from A to org B's device on pod 2 is refused with `org_session_limit`,
      naming the first; the first session is untouched.
   3. Pod 1's renewal stops, and the slot frees within 90 s.
+  4. An account in no org holds one external session; its second is refused, naming the first,
+     and the first is untouched.
 - **Field:** the same on prod with two test orgs, after FR-52's P4f field run.
 
 **Not in P3b:** metering an external session's relay bytes (FR-52 P5, its F3), and the
@@ -521,9 +533,9 @@ room is piped across workers. That is O4.
 | P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | ✅ merged #2565 (`069981677`), promoted 2026-10-20 (`hosted-20261020-9776afb`); AC1 and AC2 field-verified on prod |
 | P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | ✅ merged #2565 (`069981677`) against the fake; proven against Stripe's test mode, including a test-card checkout in a real browser (#2604, AC3 + AC4). A Free `year` price that put annual on every page was fixed by #2603 |
 | P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`73bc6daeb`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
-| P3b | A cross-org session counts against the controller's org (Redis leases); Free gets no support sessions to other orgs | `rc.org_session_cap = false`; `rc.session_slots = false` | 📝 planned 2026-10-20 (*P3b, as proposed*: session slots in the cluster directory); for the operator's review, O6 + O7 |
-| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 design approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616) is on the API pods, shipped dark. P4a-2 (the PoPs, via the signed `/stats` poll) and P4a-3 (the analytics surface) come next, and O3's measurement comes before it is switched on |
-| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | 📝 designed 2026-10-20 (*P4b, as proposed*), AC8 approved. First pin coturn (it runs `:latest`) and bring the worker ConfigMaps into the deploy repo |
+| P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | 📝 planned 2026-10-20 (*P3b, as proposed*: session slots in the cluster directory); O6 + O7 decided by the operator 2026-10-20 |
+| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 design approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `e918d9e56`) is on the API pods, shipped dark; P4a-3 (#2629, `5ffa1d84e`) is the analytics surface; P4a-2 (#2633, the PoPs via the signed `/stats` poll) is in review. O3's measurement comes before the switch is turned on |
+| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | 🟡 designed 2026-10-20 (#2619); P4b-1 (#2622, `df7648ccf`) merged dark: TURN usernames name the paying org (`:org-`), and the statsdb collector is off. Next: pin coturn (it runs `:latest`), bring the worker ConfigMaps into the deploy repo, add `redis-statsdb` one worker at a time; P4b-2 the PoPs |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
 | P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ✅ merged #2583 (`5679857cc`); AC9 field-verified on prod 2026-10-20 in real time (warned at 55:00, ended at 60:00); the SFU measurement found nothing to measure (O4) |
@@ -554,8 +566,8 @@ room is piped across workers. That is O4.
 | O3 | Throttled rate for an over-allowance org | 1 Mbps per org on Free, 4 Mbps on paid plans, measured before it ships |
 | O4 | Pro's 50 and Business's 100 people per meeting, against one mediasoup worker per room (*Meetings, as built*) | the numbers stay as published; a synthetic-participant load test measures what one room carries, then either a room pipes across workers or the published numbers come down to the measured one |
 | O5 | AC10's "no per-org view counts them". Admin stats, plan compliance and weekly active orgs exclude the 62 tombstoned orphans. FR-102's growth **Orgs** list shows them with an *archived* chip, and a cohort view asked for more than its default 26 weeks would count them in their February cohorts. Hiding archived orgs outright would also hide an owner's own archive, which is the churn signal that list is for | **Decided 2026-10-20: remove them completely, and done.** Every document of the 62 is deleted (the field log), so no view lists or counts them |
-| O6 | Whose plan pays for an external (FR-52) session (*P3b, as proposed*)? | the org the outsider picks on `/connect`, from their orgs on a paid plan. The alternative is the device's org, which needs no picker but contradicts AC6 and bills the customer for its support desk's sessions |
-| O7 | Accounts in no paid org get no external sessions: the P3b row's "Free gets no support sessions to other orgs", applied to the org-less too. That also ends FR-52's helping-a-friend case for an org-less helper, whose path becomes membership (a same-org session under the friend's plan) | as written: no external session without a paid org |
+| O6 | Whose plan pays for an external (FR-52) session (*P3b, as proposed*)? | **Decided 2026-10-20 (operator): it uses the quota of the org it is for, at that org's tier.** The outsider picks the org on `/connect`, from all of their orgs, and the session takes one of that org's concurrent-session slots. An account in no org uses Free's quota (one session), counted against the account |
+| O7 | Do accounts in no paid org get no external sessions? | **Decided 2026-10-20 (operator): no, no paid org is needed.** FR-52's helping-a-friend case keeps working without membership |
 
 ## Out of scope
 
