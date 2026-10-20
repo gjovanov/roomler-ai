@@ -93,12 +93,12 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:2078-2087`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2088-2097`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`updater.rs:2009-2023`).
+(`updater.rs:2019-2033`).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —

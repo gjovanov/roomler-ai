@@ -2,8 +2,10 @@
 
 **Issue:** [#2625](https://github.com/gjovanov/roomler-ai/issues/2625) · **Status:** proposed 2026-10-20, spec and
 claim, on the operator's report (*"also noted that asahi has diff daemon and desktop version. we need to fix the
-update … so that all are on the same version: roomlerd, roomler, roomler-desktop across all os"*) · **Owner:** the
-updater (agent) · **Anchors:** master `0c1bb97f2` · **Builds on:** [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
+update … so that all are on the same version: roomlerd, roomler, roomler-desktop across all os"*). **P1, P2 and P4
+released in 0.4.148** (#2631, published 2026-10-20 22:24Z); the candidate proved the decision and the safe failure
+(§8); the field verification on the release is in progress · **Owner:** the updater (agent) · **Anchors:** master
+`0c1bb97f2`, the pre-fix tree §2–§3 describe · **Builds on:** [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion, `companion_version` on the wire), [FR-84](FR-84-companion-and-installer-polish.md) (the companion's
 launch), [FR-96](FR-96-per-user-linux-installs-update-themselves.md) (the root update helper),
 [FR-67](FR-67-update-outcome-observability.md) (update outcomes)
@@ -93,10 +95,10 @@ flowchart TD
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
 | **P0** | spec, claim, the census in §2 | — | ✅ 2026-10-20 | S |
-| **P1** | Linux: the companion package tracks the daemon (root daemon + update helper; the per-user wake), the `.rpm` version binding | `ROOMLERD_COMPANION_SYNC=0` | | M |
-| **P2** | Windows: `refresh_if_stale` on the 4 h tick in the process that owns it | `ROOMLERD_COMPANION_SYNC=0` | | S |
+| **P1** | Linux: the companion package tracks the daemon (root daemon + update helper; the per-user wake), the `.rpm` version binding | `ROOMLERD_COMPANION_SYNC=0` | ✅ merged #2631 (`e01e03517`), released **0.4.148**; the candidate: the plan and the safe failure on an unpublished tag (§8); on the release: owed | M |
+| **P2** | Windows: `refresh_if_stale` on the 4 h tick in the process that owns it | `ROOMLERD_COMPANION_SYNC=0` | ✅ merged #2631, released **0.4.148**; the retry on the release: owed | S |
 | **P3** | the sync outcome on the heartbeat, and the grid's skew says why (D4) | — | | M |
-| **P4** | docs: `docs/linux-self-update.md`, `docs/desktop-companion.md`, the `docs/README.md` index row | — | | S |
+| **P4** | docs: `docs/linux-self-update.md`, `docs/desktop-companion.md` §13, the `docs/README.md` index rows | — | ✅ in #2631; the anchors it moved elsewhere followed in its own PR | S |
 
 ## 5. Acceptance criteria
 
@@ -110,16 +112,17 @@ flowchart TD
 - [ ] **AC6** — Only a verified package is installed: a bad digest, a missing or foreign `.asc`, or a version other
   than the tag is refused, and the companion keeps its version.
 - [ ] **AC7** — After the release that carries it, the fleet census (§2's query) shows zero skew among online devices.
-- [ ] **AC8** — Docs: `docs/linux-self-update.md` and `docs/desktop-companion.md` updated in the house style, and the
-  `docs/README.md` index row.
+- [x] **AC8** — Docs: `docs/linux-self-update.md` and `docs/desktop-companion.md` updated in the house style, and the
+  `docs/README.md` index row. *(#2631: `desktop-companion.md` §13 with its mermaid, §10.1's picker note,
+  `linux-self-update.md`'s FR-117 section, both index rows.)*
 
 ## 6. Open decisions
 
 | | Decision | Status |
 |---|---|---|
-| **D1** | A companion newer than the daemon | *(Recommended: leave it and log it. That is a person's deliberate install, or a lab, and the next daemon update catches up. Lockstep both ways would fight whoever installed it.)* |
-| **D2** | A running companion after its package is upgraded | *(Recommended: restart it in its person's session, as the Windows swap does (#1686). Otherwise the person runs the old binary until they log out, and FR-27's consent prompt talks to it.)* |
-| **D3** | A non-root daemon with no root helper | *(Recommended: skip, with one log line. Never a `pkexec` prompt for a background sync.)* |
+| **D1** | A companion newer than the daemon | *(Recommended: leave it and log it. That is a person's deliberate install, or a lab, and the next daemon update catches up. Lockstep both ways would fight whoever installed it.)* **P1 implements the recommendation** (`plan` → `Newer`, logged once per process). |
+| **D2** | A running companion after its package is upgraded | *(Recommended: restart it in its person's session, as the Windows swap does (#1686). Otherwise the person runs the old binary until they log out, and FR-27's consent prompt talks to it.)* **P1 implements the recommendation** (`restart_replaced`). |
+| **D3** | A non-root daemon with no root helper | *(Recommended: skip, with one log line. Never a `pkexec` prompt for a background sync.)* **P1 implements the recommendation**, and found a fourth rule while doing it: no `dpkg --install` fallback, since dpkg with an unmet dependency half-configures the package and breaks apt for the host. |
 | **D4** | The sync outcome on the wire | *(Recommended: P3, after P1/P2 ship: `companion_sync` on the heartbeat, so the grid's skew carries its reason. FR-67's point: an outcome nobody reads is not an outcome.)* |
 
 ## 7. Out of scope
@@ -134,3 +137,5 @@ flowchart TD
 | Date | Host | Build | What | Result |
 |---|---|---|---|---|
 | 2026-10-20 18:18Z | `asahi-m2pro` (Fedora Asahi Remix 42, aarch64) | the released 0.4.147 | the red | 🔴 `roomlerd 0.4.147`, `roomler 0.4.147`, `roomler-desktop` 0.4.139 (`rpm -q` → `roomler-desktop-0.4.139-1.aarch64`) |
+| 2026-10-20 21:28Z | a vmtest Ubuntu system install (`r148a`), two orgs, needrestart on its default config | the 0.4.148 candidate (run 39498665680, `.deb` `4cf805d6`), companion 0.4.147 | the plan + the safe failure | ✅ at the first check after the restart: `WARN companion: could not move the desktop companion package to this daemon's version; it keeps its version, and the next update check retries reason=fetching release agent-v0.4.148: GitHub returned 404 Not Found` (the tag was not published yet). `ii roomler-desktop 0.4.147-1` unchanged, its process untouched, the daemon healthy; the row read 0.4.148 / 0.4.147 |
+| 2026-10-20 22:24Z | — | **0.4.148 published** (`501b59063`, the `.deb` bit-identical to the candidate) | — | the field verification on the release follows (AC1–AC4, AC7) |

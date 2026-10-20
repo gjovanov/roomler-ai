@@ -55,7 +55,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:325`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1545`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing

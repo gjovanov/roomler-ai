@@ -166,7 +166,7 @@ and never outliving the daemon (FR-97 P0e).
 |---|---|---|---|---|
 | A per-user install updates itself | ✅ | ✅ a root update helper (FR-96) | ✅ | `docs/installation.md` |
 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ✅ the `.deb`'s `Version`, the tarball's top directory | ✅ the `.pkg`'s `PackageInfo` | `agents/roomlerd/src/artifact_version.rs:114` |
-| A private staging directory per download | ✅ | ✅ | ✅ measured: the root helper's temp directory is root's own | `agents/roomlerd/src/updater.rs:1146`, `:1170` |
+| A private staging directory per download | ✅ | ✅ | ✅ measured: the root helper's temp directory is root's own | `agents/roomlerd/src/updater.rs:1156`, `:1180` |
 | One verb registers the system service | ✅ | ✅ | ✅ | `service install --as-service` (alias `--system`, `agents/roomlerd/src/service.rs:413-420`) |
 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | ✅ `install.sh --uninstall` | ✅ the same | `docs/installation.md`, Uninstall |
 | An ephemeral device removes itself on a clean stop | ✅ | ✅ | ✅ | `docs/ephemeral-nodes.md` |
