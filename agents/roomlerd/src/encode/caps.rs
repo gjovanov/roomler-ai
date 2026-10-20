@@ -662,6 +662,10 @@ pub(crate) struct HostFacts {
     /// back (FR-97 P3e, `input::layout_x11::switchable`). There the chip
     /// reports and the picker is not offered.
     pub(crate) layout_switchable: bool,
+    /// Display match can switch this host's display (FR-97 P3e-2): Windows;
+    /// on Linux a person's own X11 display or the daemon's own virtual desktop
+    /// on Xorg's dummy driver; not macOS.
+    pub(crate) display_switchable: bool,
 }
 
 impl HostFacts {
@@ -684,6 +688,7 @@ impl HostFacts {
             clipboard_reachable: clipboard_reachable(),
             layout_reachable: layout_reachable(),
             layout_switchable: layout_switchable(),
+            display_switchable: display_switchable(),
         }
     }
 }
@@ -708,6 +713,20 @@ fn layout_reachable() -> bool {
         crate::input::layout_x11::offered()
     }
     #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    {
+        cfg!(target_os = "windows")
+    }
+}
+
+/// FR-97 P3e-2 — see [`HostFacts::display_switchable`]. A virtual desktop is
+/// up before the hello (`main.rs` starts it before connecting).
+fn display_switchable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::display_match::x11_offered()
+            || crate::virtual_desktop::switchable_display().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
     {
         cfg!(target_os = "windows")
     }
@@ -822,6 +841,22 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
     } else if !facts.layout_switchable {
         // GNOME on Xorg: the chip reports; a picker would only snap back.
         caps.layout.retain(|w| w != "set");
+    }
+    // FR-97 P3e-2 — where display match cannot switch this host's display.
+    // Until now the viewer offered the toggle by OS (Windows only), which hid
+    // a Linux virtual desktop that could switch; it follows this word now.
+    if !facts.display_switchable {
+        let why = match facts.os {
+            OsKind::Macos => Unavailable::new(
+                "unsupported",
+                "This Mac's display cannot be switched to your window: display match is built for Windows and for Linux on X11",
+            ),
+            OsKind::Linux | OsKind::Windows => Unavailable::new(
+                "unsupported",
+                "This host's display cannot be switched to your window: display match needs an X11 desktop with a per-user install, or the agent's own virtual desktop; a Wayland desktop and a system install keep their screen as it is",
+            ),
+        };
+        caps.unavailable.insert("display-match".into(), why);
     }
     // The viewer's button types three ordinary keys everywhere.
     let sas = match facts.os {
@@ -2684,6 +2719,7 @@ mod tests {
             clipboard_reachable: true,
             layout_reachable: true,
             layout_switchable: true,
+            display_switchable: true,
         }
     }
 
@@ -2796,6 +2832,30 @@ mod tests {
         );
     }
 
+    /// FR-97 P3e-2 — the viewer offered display match by OS (Windows only);
+    /// it follows the device's word now, so a host that cannot switch says
+    /// so, and one that can says nothing.
+    #[test]
+    fn a_host_whose_display_cannot_be_switched_says_so() {
+        use roomler_ai_remote_control::models::OsKind;
+        for os in [OsKind::Windows, OsKind::Linux] {
+            let can = with_honest_words(p0c_caps(), &p0c_facts(os));
+            assert!(!can.unavailable.contains_key("display-match"), "{os:?}");
+        }
+        for os in [OsKind::Linux, OsKind::Macos] {
+            let cannot = with_honest_words(
+                p0c_caps(),
+                &HostFacts {
+                    display_switchable: false,
+                    ..p0c_facts(os)
+                },
+            );
+            let why = &cannot.unavailable["display-match"];
+            assert_eq!(why.code, "unsupported", "{os:?}");
+            assert!(why.reason.contains("cannot be switched"), "{os:?}: {why:?}");
+        }
+    }
+
     #[test]
     fn the_layout_is_offered_only_where_it_can_be_switched() {
         use roomler_ai_remote_control::models::OsKind;
@@ -2856,6 +2916,7 @@ mod tests {
                         clipboard_reachable: reachable,
                         layout_reachable: reachable,
                         layout_switchable: reachable,
+                        display_switchable: reachable,
                     },
                 );
                 for (key, why) in &c.unavailable {
@@ -2890,8 +2951,10 @@ mod tests {
         assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
         if cfg!(target_os = "windows") {
             assert!(f.layout_reachable && f.layout_switchable);
+            assert!(f.display_switchable);
         } else if cfg!(target_os = "macos") {
             assert!(!f.layout_reachable, "macOS until FR-97 P2d");
+            assert!(!f.display_switchable);
         }
     }
 

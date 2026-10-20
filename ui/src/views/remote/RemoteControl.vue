@@ -2355,7 +2355,7 @@ import {
 } from '@/composables/touchControls'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
-import { hostOffers, hostReason } from '@/utils/hostUnavailable'
+import { hostOffers, hostReason, hostSpeaks } from '@/utils/hostUnavailable'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { api } from '@/api/client'
 import SessionRatingPrompt from '@/components/remote/SessionRatingPrompt.vue'
@@ -4077,10 +4077,19 @@ function applyFitResolution() {
 // invasive), persisted per-agent, Windows hosts only (v1).
 const DISPLAY_MATCH_STORAGE_PREFIX = 'roomler-rc-display-match.v2:'
 const displayMatchOn = ref(false)
+// FR-97 P3e-2 — the device's own word, not its OS: a host whose display
+// cannot be switched says so (`AgentCaps.unavailable['display-match']`), with
+// why. Until P3e-2 this gated on Windows, which hid a Linux virtual desktop
+// that could switch, and now hides nothing that can. An agent from before
+// FR-97 P0c carries no `unavailable` map at all, and keeps rc.191's gate.
+const displayMatchUnavailable = computed<string | null>(() =>
+  hostReason(agent.value?.capabilities, 'display-match'),
+)
 const agentSupportsDisplayMatch = computed<boolean>(() => {
-  // Gate on OS — old agents just ignore the unknown control message, so
-  // there's no version gate needed (harmless no-op there).
-  return (agent.value?.os ?? '').toLowerCase().startsWith('win')
+  if (!hostSpeaks(agent.value?.capabilities)) {
+    return (agent.value?.os ?? '').toLowerCase().startsWith('win')
+  }
+  return displayMatchUnavailable.value === null
 })
 /** FR-108 — what the device answered this session's request, in one line;
  *  null when it said nothing (an agent before FR-108, or no request yet). */
@@ -4089,7 +4098,9 @@ const displayMatchSaid = computed<string | null>(() =>
 )
 const displayMatchTooltip = computed<string>(() => {
   if (!agentSupportsDisplayMatch.value) {
-    return 'Match remote display is available for Windows hosts only (v1)'
+    return displayMatchUnavailable.value
+      ? `Match remote display — ${displayMatchUnavailable.value}`
+      : 'Match remote display — this agent is too old to say whether its display can be switched'
   }
   // FR-108 — the device decides (its owner's setting, and whether someone is
   // using the screen); say what it answered when it has.
