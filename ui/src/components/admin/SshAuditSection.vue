@@ -16,7 +16,7 @@
       />
     </v-card-title>
 
-    <v-card-subtitle class="pb-2">
+    <v-card-subtitle class="pb-2 text-wrap">
       Every SSH session requested on this organization's devices — including
       the ones that were refused. Retained for 90 days.
     </v-card-subtitle>
@@ -39,7 +39,9 @@
         No SSH sessions have been requested yet.
       </div>
 
-      <v-table v-else density="compact">
+      <!-- A card per entry below 600 px (table-stack-xs): the result and the
+           command or detail sat about three screens to the right. -->
+      <v-table v-else density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>When</th>
@@ -52,13 +54,13 @@
         </thead>
         <tbody>
           <tr v-for="(e, i) in entries" :key="e.id ?? `${e.at}-${i}`">
-            <td class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
-            <td class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
-            <td class="text-no-wrap">{{ userName(e.user_id) }}</td>
-            <td>
+            <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
+            <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
+            <td data-label="Who" class="text-no-wrap">{{ userName(e.user_id) }}</td>
+            <td data-label="Via">
               <v-chip size="x-small" variant="tonal">{{ e.source }}</v-chip>
             </td>
-            <td class="text-no-wrap">
+            <td data-label="As" class="text-no-wrap">
               <v-chip
                 v-if="asChip(e)"
                 size="x-small"
@@ -70,7 +72,7 @@
               </v-chip>
               <span v-else class="text-medium-emphasis">—</span>
             </td>
-            <td class="text-no-wrap">
+            <td data-label="Result" class="text-no-wrap">
               <v-tooltip v-if="e.denied" :text="e.denied_message ?? ''" location="top">
                 <template #activator="{ props: tip }">
                   <v-chip v-bind="tip" size="x-small" color="error" variant="flat">
@@ -78,6 +80,14 @@
                   </v-chip>
                 </template>
               </v-tooltip>
+              <!-- A touch screen never hovers: the server's own reason, spelled
+                   out on the phone card. -->
+              <div
+                v-if="e.denied && e.denied_message"
+                class="text-caption text-medium-emphasis d-sm-none"
+              >
+                {{ e.denied_message }}
+              </div>
               <v-chip v-else size="x-small" color="success" variant="flat">granted</v-chip>
             </td>
           </tr>
@@ -90,6 +100,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useAgentStore, type SshAuditEntry } from '@/stores/agents'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 import { sshAsChip, type SshAsChip } from '@/utils/sshIdentity'
 
 const props = defineProps<{
@@ -127,7 +138,7 @@ const DENY_LABEL: Record<string, string> = {
 
 const deviceNames = computed(() => {
   const m: Record<string, string> = {}
-  for (const a of agentStore.agents) m[a.id] = a.name
+  for (const a of agentStore.agents) m[a.id] = deviceLabel(a)
   return m
 })
 

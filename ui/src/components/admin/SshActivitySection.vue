@@ -16,7 +16,7 @@
       />
     </v-card-title>
 
-    <v-card-subtitle class="pb-2">
+    <v-card-subtitle class="pb-2 text-wrap">
       What devices reported doing inside their SSH sessions. Retained for 90 days.
     </v-card-subtitle>
 
@@ -49,7 +49,9 @@
         No device has reported SSH activity.
       </div>
 
-      <v-table v-else density="compact">
+      <!-- A card per entry below 600 px (table-stack-xs): the result and the
+           command or detail sat about three screens to the right. -->
+      <v-table v-else density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>When</th>
@@ -62,18 +64,18 @@
         </thead>
         <tbody>
           <tr v-for="(e, i) in entries" :key="e.id ?? `${e.at}-${i}`">
-            <td class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
-            <td class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
-            <td class="text-no-wrap">
+            <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
+            <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
+            <td data-label="What" class="text-no-wrap">
               <v-chip size="x-small" :color="kindColor(e.kind)" variant="tonal">
                 {{ kindLabel(e.kind) }}
               </v-chip>
             </td>
-            <td class="text-truncate" style="max-width: 26rem">
+            <td data-label="Detail" class="text-truncate" style="max-width: 26rem">
               <code v-if="e.detail" class="text-caption">{{ e.detail }}</code>
               <span v-else class="text-medium-emphasis">—</span>
             </td>
-            <td class="text-no-wrap">
+            <td data-label="Result" class="text-no-wrap">
               <!-- A refused forward is the row an operator most wants to find,
                    so it gets the loud treatment rather than a neutral dash. -->
               <v-chip v-if="!e.allowed" size="x-small" color="error" variant="flat">
@@ -89,7 +91,7 @@
               </v-chip>
               <span v-else class="text-medium-emphasis">—</span>
             </td>
-            <td class="text-no-wrap text-caption text-medium-emphasis">
+            <td data-label="Who" class="text-no-wrap text-caption text-medium-emphasis">
               {{ shortCaller(e.caller) }}
             </td>
           </tr>
@@ -102,6 +104,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useAgentStore, type SshActivityEntry, type SshActivityKind } from '@/stores/agents'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 
 const props = defineProps<{
   tenantId: string
@@ -141,7 +144,7 @@ function kindLabel(kind: SshActivityKind): string {
 
 const deviceNames = computed(() => {
   const m: Record<string, string> = {}
-  for (const a of agentStore.agents) m[a.id] = a.name
+  for (const a of agentStore.agents) m[a.id] = deviceLabel(a)
   return m
 })
 

@@ -3,6 +3,8 @@
 import { createApp } from 'vue'
 import i18n from '@/plugins/i18n'
 import vuetify from '@/plugins/vuetify'
+// After Vuetify's own styles: the phone-width utilities (FR-116).
+import '@/styles/responsive.css'
 import pinia from '@/plugins/pinia'
 import router from '@/plugins/router'
 import App from '@/App.vue'
