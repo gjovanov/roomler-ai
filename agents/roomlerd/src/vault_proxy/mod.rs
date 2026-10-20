@@ -13,10 +13,12 @@
 //! | [`mongo`] | one MongoDB session: the same, by SCRAM in `saslStart` and `saslContinue` (P3-5c-1) |
 //! | [`http`] | one HTTP client connection: each request sent on to one upstream origin, the secret's credential in `Authorization` (P3-5d-1) |
 //! | [`ssh_agent`] | one SSH agent connection: the secret's key, signing a sign-in to one of the secret's hosts and nothing else (P3-5f-1) |
+//! | [`pg_mint`] | a Postgres user minted for one lease by a dynamic secret's issuer, and taken back (P3-6b-2a) |
 //!
 //! P3-5b-1 builds these, P3-5c-1 the MongoDB engine, P3-5d-1 the HTTP one
 //! and P3-5f-1 the SSH agent; the endpoint (`hive::vault_connect`) serves
-//! them, one session per connection.
+//! them, one session per connection. The minter's caller is the daemon's
+//! lease client (`crate::vault`, P3-6b-2b).
 
 pub(crate) mod http;
 pub(crate) mod mongo;
@@ -28,3 +30,53 @@ pub(crate) mod ssh_agent;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tls;
+
+/// `host:port`, as an audience names an upstream: a host name (`_` allowed:
+/// a Compose service may carry one), an IPv4 address
+/// or a bracketed IPv6 one, then a port written plainly (no sign, no leading
+/// zero). Answers the host, unbracketed, and the port.
+///
+/// P3-6b-2b moved it here from `hive::vault_connect`: the lease client mints
+/// toward a dynamic secret's audience, and it is built wherever the `vault`
+/// feature is, while `hive` is built only on a `hive_host`.
+pub(crate) fn upstream_of(raw: &str) -> Result<(String, u16), String> {
+    use roomler_ai_remote_control::vault::lease_limits::MAX_AUDIENCE_LEN;
+    let bad = || {
+        format!(
+            "upstream must be host:port, as the secret's audiences name it (such as \
+             db.internal:5432, or [fd00::5]:5432): got {raw:?}"
+        )
+    };
+    if raw.len() > MAX_AUDIENCE_LEN {
+        return Err(bad());
+    }
+    let (host, port) = raw.rsplit_once(':').ok_or_else(bad)?;
+    // Digits only, and no leading zero: one spelling per port, so the
+    // audience the vault matches is the port dialled.
+    let plain =
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !port.starts_with('0');
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|p| plain && *p != 0)
+        .ok_or_else(bad)?;
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => {
+            v6.parse::<std::net::Ipv6Addr>().map_err(|_| bad())?;
+            v6
+        }
+        None => {
+            let name_ok = !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                && !host.starts_with(['.', '-']);
+            if !name_ok {
+                return Err(bad());
+            }
+            host
+        }
+    };
+    Ok((host.to_string(), port))
+}

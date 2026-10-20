@@ -479,11 +479,32 @@ struct FakeVault {
     /// P3-5b-2 — what each lease stops when it is let go.
     #[cfg(feature = "vault")]
     stops: std::sync::Mutex<Vec<(String, CancellationToken)>>,
+    /// P3-6b-2b — the dynamic secrets, each with its credential's fields;
+    /// the leases asked for in `short-lived`; each mint asked for, by lease;
+    /// and each lease's credential once minted, made once per lease.
+    #[cfg(feature = "vault")]
+    dynamic: HashMap<String, Vec<String>>,
+    #[cfg(feature = "vault")]
+    short: std::sync::Mutex<Vec<String>>,
+    #[cfg(feature = "vault")]
+    mints: std::sync::Mutex<Vec<String>>,
+    #[cfg(feature = "vault")]
+    credentials: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl FakeVault {
     fn asked(&self) -> Vec<(String, ObjectId, u64, String)> {
         self.asked.lock().unwrap().clone()
+    }
+
+    /// P3-6b-2b — the leases asked for, without the descriptions a use reads
+    /// first.
+    #[cfg(feature = "vault")]
+    fn leases_asked(&self) -> Vec<(String, ObjectId, u64, String)> {
+        self.asked()
+            .into_iter()
+            .filter(|a| a.0 != "describe")
+            .collect()
     }
 }
 
@@ -514,6 +535,9 @@ impl VaultTools for FakeVault {
             .issued
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = format!("L{n}");
+        if mode == crate::vault::SHORT_LIVED {
+            self.short.lock().unwrap().push(id.clone());
+        }
         self.held.lock().unwrap().insert(id.clone(), value.clone());
         self.lefts
             .lock()
@@ -611,11 +635,44 @@ impl VaultTools for FakeVault {
 
     #[cfg(feature = "vault")]
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        // As the daemon's client: a `short-lived` lease lends no bundle.
+        if self.short.lock().unwrap().iter().any(|l| l == lease_id) {
+            return None;
+        }
         self.held
             .lock()
             .unwrap()
             .get(lease_id)
             .map(|v| zeroize::Zeroizing::new(v.clone()))
+    }
+
+    #[cfg(feature = "vault")]
+    async fn mint(&self, lease_id: &str) -> Result<(), String> {
+        self.mints.lock().unwrap().push(lease_id.to_string());
+        if !self.held.lock().unwrap().contains_key(lease_id) {
+            return Err("the lease ended before its credential was minted".into());
+        }
+        self.credentials
+            .lock()
+            .unwrap()
+            .entry(lease_id.to_string())
+            .or_insert_with(|| format!("cred-{lease_id}"));
+        Ok(())
+    }
+
+    /// A field's value is its credential's tag and the field's place in the
+    /// provider's list: `cred-L0:0` for `user`, `cred-L0:1` for the next.
+    #[cfg(feature = "vault")]
+    fn minted(&self, lease_id: &str, field: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        if !self.held.lock().unwrap().contains_key(lease_id) {
+            return None;
+        }
+        let at = roomler_ai_remote_control::vault::providers::POSTGRES
+            .minted
+            .iter()
+            .position(|f| *f == field)?;
+        let tag = self.credentials.lock().unwrap().get(lease_id)?.clone();
+        Some(zeroize::Zeroizing::new(format!("{tag}:{at}").into_bytes()))
     }
 
     #[cfg(feature = "vault")]
@@ -655,6 +712,16 @@ impl VaultTools for FakeVault {
             .lock()
             .unwrap()
             .push(("describe".into(), session, fence, secret.into()));
+        #[cfg(feature = "vault")]
+        if let Some(fields) = self.dynamic.get(secret) {
+            return Ok(json!({
+                "rrn": format!("rrn:grox:secret:{secret}"),
+                "path": secret,
+                "kind": "dynamic",
+                "provider": "postgres",
+                "fields": fields,
+            }));
+        }
         Ok(json!({"rrn": format!("rrn:grox:secret:{secret}"), "path": secret, "kind": "static"}))
     }
 }
@@ -862,13 +929,43 @@ async fn a_cancelled_vault_call_gets_no_answer() {
 /// with `values` in its vault.
 #[cfg(all(feature = "vault", unix))]
 fn exec_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, ObjectId) {
-    let vault = Arc::new(FakeVault {
+    let vault = FakeVault {
         values: values
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_vec()))
             .collect(),
         ..FakeVault::default()
-    });
+    };
+    exec_belt_with(dir, vault)
+}
+
+/// P3-6b-2b — [`exec_belt`]'s, whose vault holds `db/dyn`, a dynamic
+/// Postgres secret (its bundle, never lent as a value), and `api/main`, a
+/// stored one.
+#[cfg(all(feature = "vault", unix))]
+fn dynamic_belt(dir: &Path) -> (Belt, Arc<FakeVault>, ObjectId) {
+    let minted = roomler_ai_remote_control::vault::providers::POSTGRES.minted;
+    let vault = FakeVault {
+        values: [
+            ("db/dyn".to_string(), b"the-issuer-bundle".to_vec()),
+            ("api/main".to_string(), format!("api-{}", 7).into_bytes()),
+        ]
+        .into_iter()
+        .collect(),
+        dynamic: [(
+            "db/dyn".to_string(),
+            minted.iter().map(|f| f.to_string()).collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    };
+    exec_belt_with(dir, vault)
+}
+
+#[cfg(all(feature = "vault", unix))]
+fn exec_belt_with(dir: &Path, vault: FakeVault) -> (Belt, Arc<FakeVault>, ObjectId) {
+    let vault = Arc::new(vault);
     let sid = ObjectId::new();
     // The run's own directory, as the supervisor makes it before a launch.
     std::fs::create_dir_all(dir.join("run")).unwrap();
@@ -1014,7 +1111,7 @@ async fn vault_exec_runs_with_the_value_and_answers_it_scrubbed() {
     assert_eq!(answer["timed_out"], false);
     assert!(!answer.to_string().contains("s3cr3t"), "{answer}");
     assert_eq!(
-        vault.asked(),
+        vault.leases_asked(),
         [(
             "lease_exec".to_string(),
             sid,
@@ -1184,7 +1281,7 @@ async fn vault_render_writes_the_file_and_keeps_its_leases() {
     assert_eq!(mode(&path), 0o600);
     assert_eq!(mode(&secrets), 0o711);
     assert_eq!(
-        vault.asked(),
+        vault.leases_asked(),
         [
             (
                 "lease_file".to_string(),
@@ -1309,7 +1406,7 @@ async fn vault_request_asks_a_lease_ahead_and_answers_no_value() {
                "audience": "psql", "ttl_s": 600})
     );
     assert_eq!(
-        vault.asked(),
+        vault.leases_asked(),
         [(
             "ahead_exec".to_string(),
             sid,
@@ -1357,7 +1454,7 @@ async fn vault_exec_takes_a_lease_asked_for_ahead_and_keeps_it() {
     let answer = exec_answer(&mut c, 2, run.clone()).await.unwrap();
     assert_eq!(answer["stdout"], "[vault:PW]", "{answer}");
     assert_eq!(
-        vault.asked(),
+        vault.leases_asked(),
         [(
             "ahead_exec".to_string(),
             sid,
@@ -1375,7 +1472,7 @@ async fn vault_exec_takes_a_lease_asked_for_ahead_and_keeps_it() {
         .insert("L0".into(), Duration::from_secs(5));
     let answer = exec_answer(&mut c, 3, run).await.unwrap();
     assert_eq!(answer["stdout"], "[vault:PW]", "{answer}");
-    assert_eq!(vault.asked()[1].0, "lease_exec");
+    assert_eq!(vault.leases_asked()[1].0, "lease_exec");
     assert_eq!(
         *vault.released.lock().unwrap(),
         ["L1"],
@@ -1427,7 +1524,7 @@ async fn vault_render_takes_a_lease_asked_for_ahead_toward_its_file() {
         std::fs::read(&path).unwrap(),
         format!("user=app-user-02\npass={pass}\n").into_bytes()
     );
-    let kinds: Vec<String> = vault.asked().into_iter().map(|a| a.3).collect();
+    let kinds: Vec<String> = vault.leases_asked().into_iter().map(|a| a.3).collect();
     assert_eq!(
         kinds,
         [
@@ -1454,7 +1551,7 @@ async fn vault_render_takes_a_lease_asked_for_ahead_toward_its_file() {
     let answer: Value =
         serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(answer["ttl_s"], 600, "as long as the lease it took: {m}");
-    assert_eq!(vault.asked().len(), 2, "taken: nothing asked");
+    assert_eq!(vault.leases_asked().len(), 2, "taken: nothing asked");
     // One that would end before the file is asked to: not taken.
     vault
         .lefts
@@ -1463,15 +1560,216 @@ async fn vault_render_takes_a_lease_asked_for_ahead_toward_its_file() {
         .insert("L0".into(), Duration::from_secs(30));
     c.send(render(4, "db.env")).await;
     assert!(c.recv().await["result"].get("isError").is_none());
-    assert_eq!(vault.asked()[2].3, "db/main#user for db.env 60s");
+    assert_eq!(vault.leases_asked()[2].3, "db/main#user for db.env 60s");
     // Nor one asked for ahead toward another file.
     c.send(render(5, "other.env")).await;
     assert!(c.recv().await["result"].get("isError").is_none());
     assert_eq!(
-        vault.asked()[3].3,
+        vault.leases_asked()[3].3,
         "db/main#user for other.env 60s",
         "asked for afresh toward another file"
     );
+}
+
+/// P3-6b-2b — the names a call gives one dynamic secret share ONE
+/// `short-lived` lease of it, described first, and the credential minted
+/// once for that lease; a stored secret beside it is leased as before. The
+/// bundle is never read as a value, and both leases go when the call ends.
+/// (The env's order is the JSON map's: what is asserted here holds in any.)
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_exec_hands_a_dynamic_secret_one_credential_minted_for_its_one_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = dynamic_belt(dir.path());
+    let mut c = Client::connect(&b).await;
+    // Both names from one credential: its tag, then `:0` for the user and
+    // `:1` for the next field.
+    let answer = exec_answer(
+        &mut c,
+        1,
+        json!({
+            "argv": ["sh", "-c", "[ \"${DBU%:0}\" = \"${DBP%:1}\" ] && [ \"${DBU#cred-}\" != \"$DBU\" ] && printf same; printf '|%s' \"$API\""],
+            "env": {"DBU": "db/dyn#user", "DBP": "db/dyn#password", "API": "api/main"},
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["stdout"], "same|[vault:API]", "{answer}");
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let described: Vec<String> = vault
+        .asked()
+        .into_iter()
+        .filter(|a| a.0 == "describe")
+        .map(|a| a.3)
+        .collect();
+    assert_eq!(
+        sorted(described),
+        ["api/main", "db/dyn"],
+        "each secret once"
+    );
+    let leases = vault.leases_asked();
+    assert_eq!(
+        sorted(leases.iter().map(|a| format!("{} {}", a.0, a.3)).collect()),
+        [
+            "lease_exec api/main for sh 90s",
+            "lease_short-lived db/dyn for  90s"
+        ],
+        "one lease for the dynamic secret's two names: {leases:?}"
+    );
+    assert!(leases.iter().all(|a| a.1 == sid && a.2 == 5));
+    let short = vault.short.lock().unwrap().clone();
+    assert_eq!(short.len(), 1);
+    assert_eq!(*vault.mints.lock().unwrap(), short, "minted once");
+    assert_eq!(
+        sorted(vault.released.lock().unwrap().clone()),
+        ["L0", "L1"],
+        "both let go after the run"
+    );
+    let reports = vault.reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(sorted(reports[0].lease_ids.clone()), ["L0", "L1"]);
+}
+
+/// P3-6b-2b — a dynamic secret serves its credential's fields alone: a call
+/// naming any other (an issuer's), or the secret whole, is refused before
+/// anything is leased or minted.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_exec_refuses_a_dynamic_secrets_other_fields_before_any_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, _) = dynamic_belt(dir.path());
+    let mut c = Client::connect(&b).await;
+    for handle in ["db/dyn#admin_password", "db/dyn"] {
+        let why = exec_answer(
+            &mut c,
+            1,
+            json!({"argv": ["sh", "-c", "touch ran"], "env": {"DBX": handle}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            why,
+            "DBX: db/dyn is a dynamic secret: name a field of the credential minted for it, \
+             #user, #password, #host, #port, #database",
+            "{handle}"
+        );
+    }
+    assert!(vault.leases_asked().is_empty(), "nothing leased");
+    assert!(vault.mints.lock().unwrap().is_empty(), "nothing minted");
+    assert!(!dir.path().join("ran").exists(), "nothing ran");
+}
+
+/// P3-6b-2b — a template's placeholders of one dynamic secret are written
+/// from one credential, and the file lives with that one lease.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_render_writes_a_dynamic_secret_from_one_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = dynamic_belt(dir.path());
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(
+        1,
+        "vault_render",
+        json!({
+            "template": "u={{ db/dyn#user }} p={{ db/dyn#password }}\n",
+            "dest": "pg.env",
+            "ttl_s": 60,
+        }),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert!(m["result"].get("isError").is_none(), "{m}");
+    let answer: Value =
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let path = PathBuf::from(answer["path"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"u=cred-L0:0 p=cred-L0:1\n".to_vec()
+    );
+    assert_eq!(
+        vault.asked(),
+        [
+            ("describe".to_string(), sid, 5, "db/dyn".to_string()),
+            (
+                "lease_short-lived".to_string(),
+                sid,
+                5,
+                "db/dyn for  60s".to_string()
+            ),
+        ]
+    );
+    assert_eq!(*vault.mints.lock().unwrap(), ["L0"]);
+    assert_eq!(*vault.attached.lock().unwrap(), [("L0".to_string(), path)]);
+    assert!(
+        vault.released.lock().unwrap().is_empty(),
+        "kept: the file lives with its lease"
+    );
+}
+
+/// P3-6b-2b — a dynamic secret asked for ahead is asked for whole, in
+/// `short-lived`, whatever its use, and minted at its first use, not
+/// before; each use that takes it shares the one credential. It is never
+/// asked for toward a proxy: `vault_connect` serves no dynamic secret.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn vault_request_asks_a_dynamic_secret_whole_and_its_uses_share_one_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = dynamic_belt(dir.path());
+    let mut c = Client::connect(&b).await;
+    c.send(tool_call(
+        1,
+        "vault_request",
+        json!({"handle": "db/dyn#user", "mode": "exec", "audience": "sh"}),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert!(m["result"].get("isError").is_none(), "{m}");
+    let answer: Value =
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        answer,
+        json!({"lease_id": "L0", "handle": "db/dyn", "mode": "short-lived",
+               "provider": "postgres", "ttl_s": 300})
+    );
+    assert_eq!(
+        vault.leases_asked(),
+        [(
+            "ahead_short-lived".to_string(),
+            sid,
+            5,
+            "db/dyn for  300s".to_string()
+        )]
+    );
+    assert!(
+        vault.mints.lock().unwrap().is_empty(),
+        "minted at its first use, not before"
+    );
+    let run =
+        json!({"argv": ["sh", "-c", "printf '%s' \"${DBU%:0}\""], "env": {"DBU": "db/dyn#user"}});
+    let first = exec_answer(&mut c, 2, run.clone()).await.unwrap();
+    let second = exec_answer(&mut c, 3, run).await.unwrap();
+    assert_eq!(first["stdout"], "cred-L0", "{first}");
+    assert_eq!(second["stdout"], first["stdout"], "one credential");
+    assert_eq!(vault.leases_asked().len(), 1, "taken: nothing asked again");
+    assert_eq!(*vault.mints.lock().unwrap(), ["L0", "L0"]);
+    assert!(vault.released.lock().unwrap().is_empty(), "kept");
+    c.send(tool_call(
+        4,
+        "vault_request",
+        json!({"handle": "db/dyn#user", "mode": "proxy", "audience": "db.internal:5432"}),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert_eq!(m["result"]["isError"], true, "{m}");
+    assert_eq!(
+        m["result"]["content"][0]["text"],
+        "db/dyn#user: vault_connect does not sign in with a dynamic secret's credential: \
+         vault_exec and vault_render serve it"
+    );
+    assert_eq!(vault.leases_asked().len(), 1, "nothing asked for a proxy");
 }
 
 /// P3-5b-2 — the answer to a `vault_connect` call: its JSON, or its error

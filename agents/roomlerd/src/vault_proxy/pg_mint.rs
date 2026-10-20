@@ -20,10 +20,6 @@
 //! ([`ROLE_PREFIX`] and a lease's id): a revocation can take back what this
 //! module made, and nothing else.
 
-// P3-6b-2b gives the minter its caller (the daemon's lease client): until
-// then, its tests are.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeMap;
 
 use base64::Engine;

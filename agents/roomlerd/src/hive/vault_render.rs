@@ -6,7 +6,7 @@
 //! | Step | What holds |
 //! |---|---|
 //! | the call | `template` (at most 64 KiB, `{{ handle }}` placeholders naming 1 to 8 secrets), `dest` (a bare file name), `ttl_s` (30 to 900, default 300) |
-//! | the leases | one per secret, mode `file`, audience the file's name: `prod-never-materializes` and `windows-proxy-only` refuse what they refuse, recorded |
+//! | the leases | one per secret, mode `file`, audience the file's name: `prod-never-materializes` and `windows-proxy-only` refuse what they refuse, recorded. P3-6b-2b — a dynamic secret's placeholders share one lease in `short-lived` and the credential minted for it, the file living with that lease too |
 //! | the directory | `<runtime>/<session>/secrets/`, the daemon's own, `0711`: the session's account opens a file whose name it knows, and lists nothing |
 //! | the file | written whole (a temporary, then a rename), `0600`, handed to the session's account |
 //! | its life | removed whenever its first lease is let go (its expiry, `rc:vault.revoke`, the run's end); every one an earlier process left, at the daemon's start |
@@ -21,7 +21,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::toolbelt::VaultTools;
-use super::vault_exec::{ExecTarget, Handle, Releasing, handle_of};
+use super::vault_exec::{ExecTarget, Handle, Releasing, Use, handle_of, leased_values};
 
 /// The largest template, and the largest file it may render to.
 const MAX_TEMPLATE: usize = 64 * 1024;
@@ -263,30 +263,23 @@ pub(crate) async fn call(
         vault,
         leases: Vec::with_capacity(req.handles.len()),
     };
-    let mut leases = Vec::with_capacity(req.handles.len());
-    let wanted = std::time::Duration::from_secs(u64::from(req.ttl));
-    for h in &req.handles {
-        // P3-4c-3 — a lease asked for ahead toward this file, lasting at
-        // least as long as the file is asked to, is taken as it is.
-        if let Some(lease) = vault.ahead(session, fence, h, "file", &req.dest, wanted) {
-            leases.push(lease);
-            continue;
-        }
-        let lease = vault
-            .lease(session, fence, h, "file", &req.dest, req.ttl)
-            .await
-            .map_err(|why| format!("{h}: {why}"))?;
-        held.leases.push(lease.clone());
-        leases.push(lease);
-    }
-    let mut values = Vec::with_capacity(leases.len());
-    for (h, lease) in req.handles.iter().zip(&leases) {
-        values.push(
-            vault
-                .value(lease)
-                .ok_or_else(|| format!("{h}: the lease ended before the file was written"))?,
-        );
-    }
+    // P3-4c-3 — a lease asked for ahead toward this file, lasting at least as
+    // long as the file is asked to, is taken as it is. P3-6b-2b — a dynamic
+    // secret's placeholders share one lease and the credential minted for it.
+    let labels: Vec<String> = req.handles.iter().map(Handle::to_string).collect();
+    let handles: Vec<(&str, &Handle)> = labels
+        .iter()
+        .map(String::as_str)
+        .zip(&req.handles)
+        .collect();
+    let to = Use {
+        mode: "file",
+        audience: &req.dest,
+        ttl: req.ttl,
+        covers: std::time::Duration::from_secs(u64::from(req.ttl)),
+        before: "the file was written",
+    };
+    let (leases, values) = leased_values(vault, session, fence, &handles, &to, &mut held).await?;
     let path = write_with(target, &req, &values)?;
     // The file lives with its leases: whichever is let go first removes it.
     for lease in &leases {

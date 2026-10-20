@@ -160,51 +160,9 @@ impl ConnectRequest {
     }
 }
 
-/// `host:port`, as an audience names an upstream: a host name (`_` allowed:
-/// a Compose service may carry one), an IPv4 address
-/// or a bracketed IPv6 one, then a port written plainly (no sign, no leading
-/// zero). Answers the host, unbracketed, and the port.
-pub(crate) fn upstream_of(raw: &str) -> Result<(String, u16), String> {
-    use roomler_ai_remote_control::vault::lease_limits::MAX_AUDIENCE_LEN;
-    let bad = || {
-        format!(
-            "upstream must be host:port, as the secret's audiences name it (such as \
-             db.internal:5432, or [fd00::5]:5432): got {raw:?}"
-        )
-    };
-    if raw.len() > MAX_AUDIENCE_LEN {
-        return Err(bad());
-    }
-    let (host, port) = raw.rsplit_once(':').ok_or_else(bad)?;
-    // Digits only, and no leading zero: one spelling per port, so the
-    // audience the vault matches is the port dialled.
-    let plain =
-        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !port.starts_with('0');
-    let port = port
-        .parse::<u16>()
-        .ok()
-        .filter(|p| plain && *p != 0)
-        .ok_or_else(bad)?;
-    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        Some(v6) => {
-            v6.parse::<std::net::Ipv6Addr>().map_err(|_| bad())?;
-            v6
-        }
-        None => {
-            let name_ok = !host.is_empty()
-                && host.len() <= 253
-                && host
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-                && !host.starts_with(['.', '-']);
-            if !name_ok {
-                return Err(bad());
-            }
-            host
-        }
-    };
-    Ok((host.to_string(), port))
-}
+/// `host:port`, as an audience names an upstream: `vault_proxy`'s since
+/// P3-6b-2b, where the lease client reaches it too.
+pub(crate) use crate::vault_proxy::upstream_of;
 
 /// P3-5d-2 — an origin, as an audience names an HTTP upstream:
 /// `https://<host>[:<port>]`, TLS always, with no path, query, user or

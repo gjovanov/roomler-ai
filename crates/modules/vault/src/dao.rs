@@ -566,7 +566,9 @@ impl VaultLeaseDao {
 
     /// P3-4d — whether every one of `ids` was released to this device, for
     /// this session in this organization, in `mode` toward `audience`: the
-    /// one test a device's report of using them must pass.
+    /// one test a device's report of using them must pass. P3-6b-2b — or in
+    /// `short-lived`, which serves any use: its audience is where its
+    /// credential was minted, never the use's target.
     pub async fn all_released_for(
         &self,
         ids: &[ObjectId],
@@ -584,8 +586,10 @@ impl VaultLeaseDao {
                 "tenant_id": tenant_id,
                 "device_id": device_id,
                 "session_id": session_id,
-                "mode": mode,
-                "audience": audience,
+                "$or": [
+                    { "mode": mode, "audience": audience },
+                    { "mode": "short-lived" },
+                ],
             })
             .await?;
         Ok(usize::try_from(n).is_ok_and(|n| n == ids.len()))

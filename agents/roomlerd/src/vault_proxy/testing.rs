@@ -290,6 +290,10 @@ pub(crate) struct FakeIssuer {
     /// How many connections it took: zero for a call refused before
     /// anything is dialled.
     pub(crate) dialled: Arc<std::sync::atomic::AtomicUsize>,
+    /// P3-6b-2b — while `hold_create` is set, a `CREATE ROLE` is kept
+    /// unanswered until `let_create` is notified: a mint caught mid-flight.
+    pub(crate) hold_create: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) let_create: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) async fn fake_issuer(password: &str) -> FakeIssuer {
@@ -312,13 +316,17 @@ pub(crate) async fn fake_issuer(password: &str) -> FakeIssuer {
     let roles: FakeRoles = Arc::default();
     let refuse: Arc<Refuse> = Arc::default();
     let dialled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hold_create = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let let_create = Arc::new(tokio::sync::Notify::new());
     let password = password.to_string();
     let (r2, f2, d2) = (roles.clone(), refuse.clone(), dialled.clone());
+    let (h2, l2) = (hold_create.clone(), let_create.clone());
     tokio::spawn(async move {
         while let Ok((mut tcp, _)) = listener.accept().await {
             d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (acceptor, tx, roles, refuse) =
                 (acceptor.clone(), tx.clone(), r2.clone(), f2.clone());
+            let (hold, go) = (h2.clone(), l2.clone());
             let password = password.clone();
             tokio::spawn(async move {
                 let Ok(packet) = read_startup(&mut tcp).await else {
@@ -404,6 +412,11 @@ pub(crate) async fn fake_issuer(password: &str) -> FakeIssuer {
                     }
                     let sql = String::from_utf8_lossy(&body[..body.len() - 1]).into_owned();
                     let _ = tx.send(sql.clone());
+                    if sql.starts_with("CREATE ROLE ")
+                        && hold.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        go.notified().await;
+                    }
                     let reply = issuer_answer(&sql, &roles, &refuse);
                     s.write_all(&reply).await.unwrap();
                 }
@@ -417,6 +430,8 @@ pub(crate) async fn fake_issuer(password: &str) -> FakeIssuer {
         roles,
         refuse,
         dialled,
+        hold_create,
+        let_create,
     }
 }
 
@@ -464,12 +479,12 @@ fn issuer_answer(sql: &str, roles: &FakeRoles, refuse: &Refuse) -> Vec<u8> {
     };
     let missing = |name: &str| pg_error("42704", &format!("role \"{name}\" does not exist"));
     let mut out = if sql.starts_with("CREATE ROLE ") {
+        let name = between(sql, "CREATE ROLE \"", '"')
+            .unwrap_or_default()
+            .to_string();
         if refuse.create.load(SeqCst) {
             pg_error("42501", "permission denied to create role")
         } else {
-            let name = between(sql, "CREATE ROLE \"", '"')
-                .unwrap_or_default()
-                .to_string();
             let grants = sql
                 .split_once(" IN ROLE ")
                 .map(|(_, rest)| {
@@ -492,8 +507,17 @@ fn issuer_answer(sql: &str, roles: &FakeRoles, refuse: &Refuse) -> Vec<u8> {
                 comment: between(sql, "\" IS '", '\'').map(String::from),
                 login: sql.contains(" LOGIN "),
             };
-            roles.lock().unwrap().insert(name, role);
-            done(&["CREATE ROLE", "COMMENT"])
+            match roles.lock().unwrap().entry(name) {
+                // P3-6b-2b — as Postgres: a name is one role's, so a second
+                // mint for one lease is refused, never a second credential.
+                std::collections::btree_map::Entry::Occupied(taken) => {
+                    pg_error("42710", &format!("role \"{}\" already exists", taken.key()))
+                }
+                std::collections::btree_map::Entry::Vacant(free) => {
+                    free.insert(role);
+                    done(&["CREATE ROLE", "COMMENT"])
+                }
+            }
         }
     } else if sql.starts_with("SELECT r.rolname FROM pg_catalog.pg_roles r WHERE r.rolname LIKE ") {
         // The sweep, each of its clauses applied as Postgres applies it: a

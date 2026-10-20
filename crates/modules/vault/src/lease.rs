@@ -389,8 +389,9 @@ fn refusal(req_id: &str, why: LeaseRefusal) -> ServerMsg {
 
 /// P3-4d — keep a device's report of a use when every lease it names was
 /// released to this device, for this session, in the use's mode and toward
-/// its target; drop it otherwise, at debug. A report is a claim, and a claim
-/// about a lease this device was never released is no claim at all.
+/// its target (P3-6b-2b: or in `short-lived`, which serves any use); drop it
+/// otherwise, at debug. A report is a claim, and a claim about a lease this
+/// device was never released is no claim at all.
 async fn activity(state: &VaultState, conn: Conn, r: &ActivityReport) {
     let dropped = |why: &str| {
         debug!(device = %conn.device_id, session = %r.session_id, why, "vault: an activity report dropped");
