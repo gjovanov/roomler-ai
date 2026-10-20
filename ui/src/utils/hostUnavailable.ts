@@ -22,7 +22,7 @@
 import { asSentence } from '@/utils/sentence'
 
 /** The features an agent can mark, by their wire names (`Unavailable::KEYS`). */
-export type HostFeature = 'audio' | 'clipboard' | 'clipboard-image-events' | 'sas'
+export type HostFeature = 'audio' | 'clipboard' | 'clipboard-image-events' | 'sas' | 'display-match'
 
 /** One entry of `AgentCaps.unavailable`. */
 export interface HostUnavailable {
@@ -76,6 +76,16 @@ export function hostReason(
   const u = hostUnavailable(caps, feature)
   if (!u) return null
   return asSentence(u.reason) || `Not available on this device (${u.code}).`
+}
+
+/**
+ * FR-97 P3e-2 — whether the device says anything here at all. Every agent
+ * from P0c on (0.4.142) carries the map, with `sas` at least; before it an
+ * absent key says nothing either way, so a control that gated on something
+ * else keeps that gate for such an agent.
+ */
+export function hostSpeaks(caps: { unavailable?: unknown } | null | undefined): boolean {
+  return Object.keys(parseUnavailable(caps?.unavailable)).length > 0
 }
 
 /** False only when the device says the feature means nothing on its OS. */

@@ -547,6 +547,10 @@ pub struct AgentCaps {
     ///   Windows they miss the lock and sign-in screens until FR-97 P4a sends
     ///   the real secure attention sequence; on Linux the desktop binds them.
     ///   On macOS the chord means nothing (`not-applicable`).
+    /// * `display-match` — FR-97 P3e-2: this host's display cannot be switched
+    ///   to the viewer's stage (macOS; a Linux system install, a Wayland
+    ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,
+    ///   by OS; it now follows this word, and an absent key still offers it.
     ///
     /// Empty from every agent before P0c: those agents claim what their lists
     /// say, so an absent key never means "unavailable".
@@ -611,7 +615,13 @@ impl Unavailable {
     /// The feature means nothing on this OS: hide the control.
     pub const NOT_APPLICABLE: &'static str = "not-applicable";
     /// The keys [`AgentCaps::unavailable`] may carry, in wire spelling.
-    pub const KEYS: [&'static str; 4] = ["audio", "clipboard", "clipboard-image-events", "sas"];
+    pub const KEYS: [&'static str; 5] = [
+        "audio",
+        "clipboard",
+        "clipboard-image-events",
+        "sas",
+        "display-match",
+    ];
 
     pub fn new(code: &str, reason: &str) -> Self {
         Self {
@@ -7327,7 +7337,14 @@ mod tests {
     fn unavailable_wire_shape_is_locked() {
         assert_eq!(
             Unavailable::KEYS,
-            ["audio", "clipboard", "clipboard-image-events", "sas"]
+            [
+                "audio",
+                "clipboard",
+                "clipboard-image-events",
+                "sas",
+                // FR-97 P3e-2 — added, never renamed: an older viewer ignores it.
+                "display-match"
+            ]
         );
         assert_eq!(Unavailable::NOT_APPLICABLE, "not-applicable");
         let mut caps = AgentCaps::default();
