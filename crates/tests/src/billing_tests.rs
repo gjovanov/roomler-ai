@@ -1166,7 +1166,7 @@ mod fr115 {
 
     /// Bring the tenant to exactly `seats` accepted members, plus one
     /// PENDING invite that must never count as a seat.
-    async fn set_seats(app: &TestApp, tenant_id: &str, seats: u64) {
+    pub(super) async fn set_seats(app: &TestApp, tenant_id: &str, seats: u64) {
         let tid = ObjectId::parse_str(tenant_id).unwrap();
         let members = app.db.collection::<bson::Document>("tenant_members");
         let now = bson::DateTime::now();
@@ -1219,7 +1219,7 @@ mod fr115 {
             .unwrap();
     }
 
-    async fn billing_of(app: &TestApp, tenant_id: &str) -> bson::Document {
+    pub(super) async fn billing_of(app: &TestApp, tenant_id: &str) -> bson::Document {
         let tid = ObjectId::parse_str(tenant_id).unwrap();
         app.db
             .collection::<bson::Document>("tenants")
@@ -1229,7 +1229,7 @@ mod fr115 {
             .expect("tenant")
     }
 
-    async fn checkout(
+    pub(super) async fn checkout(
         app: &TestApp,
         t: &crate::fixtures::seed::SeededTenant,
         body: serde_json::Value,
@@ -1643,5 +1643,518 @@ mod fr115 {
         assert_eq!(s["subscribed"], true);
         assert_eq!(s["seats_billed"], 1);
         assert_eq!(s["currency"], "eur");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FR-115 AC3 + AC4 — the same paths, against Stripe's TEST mode
+// ---------------------------------------------------------------------------
+
+/// What [`fr115`] proves against a recording fake, proven against Stripe's
+/// real API in test mode. This catches what a fake cannot: a parameter
+/// Stripe reads differently, a currency option it refuses, or a proration it
+/// never creates.
+///
+/// The tests are `#[ignore]`d because they need a test-mode secret key and
+/// four test Prices. Both come from the environment, never from the repo:
+///
+/// ```text
+/// FR115_STRIPE_TEST_KEY        a TEST-mode secret key; a live one is refused
+/// FR115_PRICE_PRO              USD Prices with an EUR currency option, at
+/// FR115_PRICE_PRO_ANNUAL       $8 / $80 / $16 / $160 per seat
+/// FR115_PRICE_BUSINESS
+/// FR115_PRICE_BUSINESS_ANNUAL
+/// cargo test -p roomler-ai-tests fr115_testmode -- --ignored --nocapture
+/// ```
+///
+/// The names are this module's own. Every TestApp reads `ROOMLER__STRIPE__*`,
+/// so a key exported under those names would reach every test in the process.
+/// Whatever a test creates in Stripe, it removes again.
+mod fr115_testmode {
+    use super::fr115::{billing_of, checkout, set_seats};
+    use super::*;
+    use bson::{doc, oid::ObjectId};
+    use reqwest::Method;
+    use roomler_ai_services::stripe::StripeService;
+    use std::time::Duration;
+
+    const API: &str = "https://api.stripe.com";
+
+    struct Env {
+        key: String,
+        pro: String,
+        pro_year: String,
+        biz: String,
+        biz_year: String,
+    }
+
+    fn env() -> Env {
+        let get = |k: &str| {
+            std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set: see the module docs"))
+        };
+        let key = get("FR115_STRIPE_TEST_KEY");
+        assert!(
+            key.starts_with("sk_test_") || key.starts_with("rk_test_"),
+            "FR115_STRIPE_TEST_KEY must be a TEST-mode key"
+        );
+        Env {
+            key,
+            pro: get("FR115_PRICE_PRO"),
+            pro_year: get("FR115_PRICE_PRO_ANNUAL"),
+            biz: get("FR115_PRICE_BUSINESS"),
+            biz_year: get("FR115_PRICE_BUSINESS_ANNUAL"),
+        }
+    }
+
+    fn configure(s: &mut roomler_ai_config::Settings, e: &Env, webhook_secret: &str) {
+        s.stripe.secret_key = e.key.clone();
+        s.stripe.webhook_secret = webhook_secret.into();
+        s.stripe.price_pro = e.pro.clone();
+        s.stripe.price_business = e.biz.clone();
+        s.stripe.price_pro_annual = e.pro_year.clone();
+        s.stripe.price_business_annual = e.biz_year.clone();
+        s.stripe.api_base = API.into();
+        s.stripe.currencies = "usd,eur".into();
+        // The test runs the reconcile itself; the background loop must not race it.
+        s.stripe.seat_sync = false;
+    }
+
+    /// One Stripe API call. A non-2xx answer fails the test with Stripe's message.
+    async fn stripe(
+        app: &TestApp,
+        e: &Env,
+        method: Method,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> Value {
+        let mut req = app
+            .client
+            .request(method, format!("{API}{path}"))
+            .basic_auth(&e.key, Some(""));
+        if !form.is_empty() {
+            req = req.form(form);
+        }
+        let resp = req.send().await.expect("Stripe is unreachable");
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        assert!(
+            status.is_success(),
+            "Stripe {path}: {status} {}",
+            v["error"]["message"]
+        );
+        v
+    }
+
+    /// Deliver `event`, Stripe's own JSON, to the webhook, signed the way
+    /// Stripe signs.
+    async fn deliver(app: &TestApp, secret: &str, event: &Value) {
+        let body = serde_json::to_string(event).unwrap();
+        let ts = now_ts();
+        let sig = compute_hmac_sha256(secret, &format!("{ts}.{body}"));
+        let resp = app
+            .client
+            .post(app.url("/api/stripe/webhook"))
+            .header("Content-Type", "application/json")
+            .header("stripe-signature", format!("t={ts},v1={sig}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "webhook refused {}",
+            event["type"]
+        );
+    }
+
+    /// The newest event of `kind` whose object matches, as Stripe recorded it.
+    async fn event_where(
+        app: &TestApp,
+        e: &Env,
+        kind: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
+        for _ in 0..40 {
+            let page = stripe(
+                app,
+                e,
+                Method::GET,
+                &format!("/v1/events?type={kind}&limit=25"),
+                &[],
+            )
+            .await;
+            if let Some(ev) = page["data"]
+                .as_array()
+                .and_then(|evs| evs.iter().find(|ev| matches(&ev["data"]["object"])))
+            {
+                return ev.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        panic!("Stripe recorded no matching {kind} within 20 s");
+    }
+
+    /// `cs_test_…` from a Checkout URL (`…/c/pay/cs_test_…#…`).
+    fn session_id(url: &str) -> String {
+        let start = url
+            .find("cs_test_")
+            .unwrap_or_else(|| panic!("not a test-mode Checkout URL: {url}"));
+        url[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// The sum of the customer's pending proration items, in minor units.
+    async fn proration_total(app: &TestApp, e: &Env, customer: &str) -> i64 {
+        let page = stripe(
+            app,
+            e,
+            Method::GET,
+            &format!("/v1/invoiceitems?customer={customer}&pending=true&limit=100"),
+            &[],
+        )
+        .await;
+        let items = page["data"].as_array().cloned().unwrap_or_default();
+        assert!(
+            items.iter().any(|i| i["proration"] == true),
+            "no proration item: {page}"
+        );
+        items
+            .iter()
+            .filter(|i| i["proration"] == true)
+            .filter_map(|i| i["amount"].as_i64())
+            .sum()
+    }
+
+    /// AC3: in every interval and currency, Stripe's own Checkout Session
+    /// holds one unit per seat, the Price and currency asked for, and an
+    /// amount of seats × the unit price. A pending invite is not a seat.
+    #[tokio::test]
+    #[ignore = "needs a Stripe test-mode key and Prices (see the module docs)"]
+    async fn checkout_bills_one_unit_per_seat_in_every_interval_and_currency() {
+        let e = env();
+        let secret = format!("fr115-testmode-{}", ObjectId::new());
+        let app = TestApp::spawn_with_settings(|s| configure(s, &e, &secret)).await;
+        let t = app.seed_tenant("fr115-tm-checkout").await;
+        set_seats(&app, &t.tenant_id, 3).await;
+
+        let mut customer = String::new();
+        for (plan, interval, currency, price, unit) in [
+            ("pro", "month", "usd", &e.pro, 800),
+            ("pro", "year", "eur", &e.pro_year, 8_000),
+            ("business", "month", "eur", &e.biz, 1_600),
+            ("business", "year", "usd", &e.biz_year, 16_000),
+        ] {
+            let what = format!("{plan}/{interval}/{currency}");
+            let resp = checkout(
+                &app,
+                &t,
+                serde_json::json!({ "plan": plan, "interval": interval, "currency": currency }),
+            )
+            .await;
+            let status = resp.status().as_u16();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            assert_eq!(status, 200, "{what}: {body}");
+            let id = session_id(body["url"].as_str().expect("a Checkout URL"));
+            let s = stripe(
+                &app,
+                &e,
+                Method::GET,
+                &format!("/v1/checkout/sessions/{id}?expand%5B%5D=line_items"),
+                &[],
+            )
+            .await;
+            assert_eq!(s["mode"], "subscription", "{what}");
+            assert_eq!(s["currency"], currency, "{what}");
+            let item = &s["line_items"]["data"][0];
+            assert_eq!(item["quantity"], 3, "{what}: one unit per seat");
+            assert_eq!(item["price"]["id"], price.as_str(), "{what}");
+            assert_eq!(
+                s["amount_total"],
+                3 * unit,
+                "{what}: seats × the unit price"
+            );
+            assert_eq!(s["metadata"]["seats"], "3", "{what}");
+            assert_eq!(s["metadata"]["interval"], interval, "{what}");
+            assert_eq!(s["metadata"]["tenant_id"], t.tenant_id.as_str(), "{what}");
+            customer = s["customer"].as_str().unwrap_or_default().to_string();
+            stripe(
+                &app,
+                &e,
+                Method::POST,
+                &format!("/v1/checkout/sessions/{id}/expire"),
+                &[],
+            )
+            .await;
+        }
+        assert!(
+            !customer.is_empty(),
+            "the server created no Stripe customer"
+        );
+        stripe(
+            &app,
+            &e,
+            Method::DELETE,
+            &format!("/v1/customers/{customer}"),
+            &[],
+        )
+        .await;
+    }
+
+    /// AC3, end to end: our checkout opens a real test-mode Checkout page, a
+    /// browser pays it with Stripe's published test card, and Stripe's own
+    /// `checkout.session.completed`, delivered as Stripe signs it, leaves the
+    /// org on Pro with its seats, monthly, in EUR. The card was charged
+    /// seats × the unit price.
+    ///
+    /// Interactive: the test writes the Checkout URL to the file named by
+    /// `FR115_CHECKOUT_URL_FILE` and waits up to 15 minutes for someone to
+    /// pay it with Stripe's published Visa test card (4242…), any future
+    /// expiry and any CVC.
+    #[tokio::test]
+    #[ignore = "interactive: a browser pays the Checkout URL with Stripe's test card"]
+    async fn a_test_card_checkout_puts_the_org_on_pro_with_its_seats() {
+        let e = env();
+        let handoff = std::env::var("FR115_CHECKOUT_URL_FILE")
+            .expect("FR115_CHECKOUT_URL_FILE is not set: see the test's docs");
+        let secret = format!("fr115-testmode-{}", ObjectId::new());
+        let app = TestApp::spawn_with_settings(|s| configure(s, &e, &secret)).await;
+        let t = app.seed_tenant("fr115-tm-e2e").await;
+        set_seats(&app, &t.tenant_id, 3).await;
+
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "interval": "month", "currency": "eur" }),
+        )
+        .await;
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, 200, "{body}");
+        let url = body["url"].as_str().expect("a Checkout URL").to_string();
+        let id = session_id(&url);
+        std::fs::write(&handoff, &url).unwrap();
+        eprintln!("fr115 e2e: pay the Checkout URL in {handoff} with Stripe's test card");
+
+        // Stripe reports the session complete once the card is charged.
+        let mut session = Value::Null;
+        for _ in 0..300 {
+            session = stripe(
+                &app,
+                &e,
+                Method::GET,
+                &format!("/v1/checkout/sessions/{id}"),
+                &[],
+            )
+            .await;
+            if session["status"] == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        assert_eq!(
+            session["status"], "complete",
+            "nobody paid the Checkout page within 15 minutes"
+        );
+        assert_eq!(session["payment_status"], "paid");
+        let sub_id = session["subscription"]
+            .as_str()
+            .expect("a subscription")
+            .to_string();
+        let customer = session["customer"].as_str().unwrap_or_default().to_string();
+
+        // Stripe's own event, delivered as Stripe signs it.
+        let completed = event_where(&app, &e, "checkout.session.completed", |o| {
+            o["id"] == id.as_str()
+        })
+        .await;
+        deliver(&app, &secret, &completed).await;
+        let doc = billing_of(&app, &t.tenant_id).await;
+        assert_eq!(doc.get_str("plan").unwrap(), "pro");
+        let b = doc.get_document("billing").unwrap();
+        assert_eq!(b.get_str("subscription_id").unwrap(), sub_id);
+        assert_eq!(b.get_str("customer_id").unwrap(), customer);
+        assert_eq!(b.get_i64("seats").unwrap(), 3);
+        assert_eq!(b.get_str("interval").unwrap(), "month");
+        assert_eq!(b.get_str("currency").unwrap(), "eur");
+
+        // What the card paid: 3 seats × €8.
+        let sub = stripe(
+            &app,
+            &e,
+            Method::GET,
+            &format!("/v1/subscriptions/{sub_id}?expand%5B%5D=latest_invoice"),
+            &[],
+        )
+        .await;
+        assert_eq!(sub["items"]["data"][0]["quantity"], 3);
+        assert_eq!(sub["latest_invoice"]["amount_paid"], 2_400);
+        assert_eq!(sub["latest_invoice"]["currency"], "eur");
+
+        stripe(
+            &app,
+            &e,
+            Method::DELETE,
+            &format!("/v1/subscriptions/{sub_id}"),
+            &[],
+        )
+        .await;
+        stripe(
+            &app,
+            &e,
+            Method::DELETE,
+            &format!("/v1/customers/{customer}"),
+            &[],
+        )
+        .await;
+    }
+
+    /// AC4: on a real subscription, whose first invoice Stripe's test card
+    /// pays, a third member moves Stripe's quantity to 3 and charges for the
+    /// rest of the period; the member leaving moves it back and credits it.
+    /// On the way, AC3's webhook half: Stripe's own subscription events,
+    /// delivered as Stripe signs them, leave plan, seats, interval and
+    /// currency on the org.
+    #[tokio::test]
+    #[ignore = "needs a Stripe test-mode key and Prices (see the module docs)"]
+    async fn seats_move_the_quantity_with_a_proration_and_the_webhook_records_them() {
+        let e = env();
+        let secret = format!("fr115-testmode-{}", ObjectId::new());
+        let mut settings = None;
+        let app = TestApp::spawn_with_settings(|s| {
+            configure(s, &e, &secret);
+            settings = Some(s.stripe.clone());
+        })
+        .await;
+        let t = app.seed_tenant("fr115-tm-seats").await;
+        set_seats(&app, &t.tenant_id, 2).await;
+
+        let cus = stripe(
+            &app,
+            &e,
+            Method::POST,
+            "/v1/customers",
+            &[
+                ("payment_method", "pm_card_visa"),
+                ("invoice_settings[default_payment_method]", "pm_card_visa"),
+                ("description", "FR-115 test-mode seat sync"),
+            ],
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sub = stripe(
+            &app,
+            &e,
+            Method::POST,
+            "/v1/subscriptions",
+            &[
+                ("customer", cus.as_str()),
+                ("items[0][price]", e.pro.as_str()),
+                ("items[0][quantity]", "2"),
+                ("currency", "eur"),
+                ("metadata[tenant_id]", t.tenant_id.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sub["status"], "active",
+            "the test card did not pay the first invoice"
+        );
+        let sub_id = sub["id"].as_str().unwrap().to_string();
+
+        // Stripe's own `created` event leaves plan, seats, interval and
+        // currency on the org.
+        let created = event_where(&app, &e, "customer.subscription.created", |o| {
+            o["id"] == sub_id.as_str()
+        })
+        .await;
+        deliver(&app, &secret, &created).await;
+        let doc = billing_of(&app, &t.tenant_id).await;
+        assert_eq!(doc.get_str("plan").unwrap(), "pro");
+        let b = doc.get_document("billing").unwrap();
+        assert_eq!(b.get_str("subscription_id").unwrap(), sub_id);
+        assert_eq!(b.get_i64("seats").unwrap(), 2);
+        assert_eq!(b.get_str("interval").unwrap(), "month");
+        assert_eq!(b.get_str("currency").unwrap(), "eur");
+
+        // A third member: the reconcile moves Stripe's quantity, with a charge.
+        set_seats(&app, &t.tenant_id, 3).await;
+        let sync = StripeService::new(settings.as_ref().unwrap());
+        let r = sync.reconcile_seats(&app.db).await.unwrap();
+        assert_eq!((r.orgs, r.changed, r.failed), (1, 1, 0));
+        let s = stripe(
+            &app,
+            &e,
+            Method::GET,
+            &format!("/v1/subscriptions/{sub_id}"),
+            &[],
+        )
+        .await;
+        assert_eq!(s["items"]["data"][0]["quantity"], 3);
+        let charged = proration_total(&app, &e, &cus).await;
+        assert!(
+            charged > 0,
+            "the added seat is charged for the rest of the period: {charged}"
+        );
+
+        // Stripe's `updated` event for the move agrees with the org.
+        let updated = event_where(&app, &e, "customer.subscription.updated", |o| {
+            o["id"] == sub_id.as_str() && o["items"]["data"][0]["quantity"] == 3
+        })
+        .await;
+        deliver(&app, &secret, &updated).await;
+        let doc = billing_of(&app, &t.tenant_id).await;
+        assert_eq!(
+            doc.get_document("billing")
+                .unwrap()
+                .get_i64("seats")
+                .unwrap(),
+            3
+        );
+
+        // The member leaves: back to 2, with a credit.
+        let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
+        app.db
+            .collection::<bson::Document>("tenant_members")
+            .delete_one(doc! { "tenant_id": tid, "_fr115": { "$exists": true } })
+            .await
+            .unwrap();
+        let r = sync.reconcile_seats(&app.db).await.unwrap();
+        assert_eq!((r.orgs, r.changed, r.failed), (1, 1, 0));
+        let s = stripe(
+            &app,
+            &e,
+            Method::GET,
+            &format!("/v1/subscriptions/{sub_id}"),
+            &[],
+        )
+        .await;
+        assert_eq!(s["items"]["data"][0]["quantity"], 2);
+        let after = proration_total(&app, &e, &cus).await;
+        assert!(
+            after < charged,
+            "leaving credits the rest of the period: {charged} -> {after}"
+        );
+
+        stripe(
+            &app,
+            &e,
+            Method::DELETE,
+            &format!("/v1/subscriptions/{sub_id}"),
+            &[],
+        )
+        .await;
+        stripe(
+            &app,
+            &e,
+            Method::DELETE,
+            &format!("/v1/customers/{cus}"),
+            &[],
+        )
+        .await;
     }
 }
