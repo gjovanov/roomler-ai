@@ -613,6 +613,17 @@ async fn agent_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId,
     names(state, "agents", ids, &["name", "machine_id"]).await
 }
 
+/// FR-116 D4 — each device's friendly name, beside the machine name
+/// [`agent_names`] resolves. Additive: `agent_name` keeps meaning the
+/// machine's name for every reader that already parses it, and the web shows
+/// `agent_display_name` first (the `HeartbeatBefore::label` rule), as the
+/// device list does. A device without one is absent from the map.
+async fn agent_display_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
+    let mut m = names(state, "agents", ids, &["display_name"]).await;
+    m.retain(|_, v| !v.is_empty());
+    m
+}
+
 async fn tenant_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
     names(state, "tenants", ids, &["name", "slug"]).await
 }
@@ -787,7 +798,9 @@ async fn usage_detail(
             .filter_map(|d| d.get_object_id("tenant_id").ok()),
     );
 
-    let anames = agent_names(state, &agent_ids.union(&tunnel_agents).copied().collect()).await;
+    let all_agents: HashSet<ObjectId> = agent_ids.union(&tunnel_agents).copied().collect();
+    let anames = agent_names(state, &all_agents).await;
+    let adnames = agent_display_names(state, &all_agents).await;
     let tnames = tenant_names(state, &tenant_ids).await;
     let rnames = room_names(state, &room_ids).await;
     let unames = user_names(state, &HashSet::from([user])).await;
@@ -800,6 +813,7 @@ async fn usage_detail(
                 "session_id": w.session_id.to_hex(),
                 "agent_id": w.agent_id.to_hex(),
                 "agent_name": anames.get(&w.agent_id).cloned().unwrap_or_default(),
+                "agent_display_name": adnames.get(&w.agent_id),
                 "tenant_id": w.tenant_id.to_hex(),
                 "tenant_name": tnames.get(&w.tenant_id).cloned().unwrap_or_default(),
                 "started_at": unix_secs(w.start),
@@ -846,6 +860,7 @@ async fn usage_detail(
                 "session_id": d.get_object_id("_id").ok().map(|i| i.to_hex()),
                 "agent_id": aid.map(|a| a.to_hex()),
                 "agent_name": aid.and_then(|a| anames.get(&a).cloned()).unwrap_or_default(),
+                "agent_display_name": aid.and_then(|a| adnames.get(&a)),
                 "tenant_id": tid.map(|t| t.to_hex()),
                 "tenant_name": tid.and_then(|t| tnames.get(&t).cloned()).unwrap_or_default(),
                 "started_at": unix_secs(*first),

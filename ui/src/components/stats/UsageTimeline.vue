@@ -70,6 +70,8 @@ export interface ViewingWindow {
   session_id: string
   agent_id: string
   agent_name?: string
+  /** FR-116 D4 — the admin's friendly name; null when the device has none. */
+  agent_display_name?: string | null
   tenant_id: string
   tenant_name?: string
   /** unix seconds */
@@ -141,6 +143,9 @@ const lanes = computed<Lane[]>(() => {
   const out: Lane[] = []
   for (const [agentId, list] of byDevice) {
     const first = list[0]
+    // Named as the device list names it: the friendly name, else the
+    // machine's (FR-116 D4).
+    const device = first.agent_display_name || first.agent_name
     const bars: Bar[] = []
     let totalSecs = 0
     for (const w of list) {
@@ -166,7 +171,7 @@ const lanes = computed<Lane[]>(() => {
         role: w.role,
         open,
         title:
-          `${w.role === 'controller' ? 'Controlled' : 'Watched'} ${w.agent_name || agentId}` +
+          `${w.role === 'controller' ? 'Controlled' : 'Watched'} ${device || agentId}` +
           `${orgNote}\n${fmtTip(new Date(w.started_at * 1000))} → ` +
           `${open ? 'still open' : fmtTip(new Date((w.ended_at as number) * 1000))}` +
           `\n${formatDuration(w.seconds)}${byteNote}`,
@@ -175,9 +180,9 @@ const lanes = computed<Lane[]>(() => {
     if (!bars.length) continue
     out.push({
       key: agentId,
-      label: first.agent_name || agentId.slice(-6),
+      label: device || agentId.slice(-6),
       sub: props.showOrg ? first.tenant_name : undefined,
-      title: `${first.agent_name || agentId}${first.tenant_name ? ` · ${first.tenant_name}` : ''}`,
+      title: `${device || agentId}${first.tenant_name ? ` · ${first.tenant_name}` : ''}`,
       bars,
       totalSecs,
       totalLabel: formatDuration(totalSecs),
