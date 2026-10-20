@@ -194,14 +194,16 @@ actions inside the viewport.
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P1** (built; PR in review) | the Devices page (§3.2) | revert the PR: UI only, no server or agent state, no stored preference changed | the operator's org at 390 px on production after a promote, red then green; the desktop grid pixel-identical | M |
-| **P2** | the shell (§3.3) | revert | a route sweep at 360/390 px | M |
-| **P3** | admin, network, audit, device dialogs | revert | the same sweep; the ACL editors and Overlay routes by hand | L |
-| **P4** | chat and conference | revert | a two-browser call with one at phone width | L |
-| **P5** | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
-| **P6** | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
-| **P7** | public pages, sign-in | revert | iOS Safari sign-in (the operator) | S |
-| **P8** | docs + the phone-width smoke | — | CI | S |
+| **P1** — #2563 | the Devices page (§3.2) | revert the PR: UI only, no server or agent state, no stored preference changed | the operator's org at 390 px on production after a promote, red then green; the desktop grid pixel-identical | M |
+| **P2** — #2567 | the shell (§3.3) | revert | a route sweep at 360/390 px | M |
+| **P3** — P3a #2570 · P3b #2572 · P3c #2582 (a stack on #2567) | admin, network, audit, device dialogs | revert | the same sweep; the ACL editors and Overlay routes by hand | L |
+| **P4** — P4a #2574 (chat) · P4b #2580 (calls) | chat and conference | revert | a two-browser call with one at phone width | L |
+| **P5** — #2577 · P5b #2588 (the files drawer; a stack on #2577) | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
+| **P6** — P6a #2584 (UI) · P6b #2586 (D4, the server); hive's rows are FR-90's and stay open | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
+| **P7** — #2575 (sign-in) · P7b #2587 (the landing bar) | public pages, sign-in | revert | iOS Safari sign-in (the operator) | S |
+| **P8** — docs: this PR, a stack on #2582; the smoke: open (§6) | docs + the phone-width smoke | — | CI | S |
+
+Found by the audit and fixed outside the phases (every width): a deep link to an org named the org last picked in the browser instead of the URL's — #2566.
 
 ## 5. Acceptance criteria
 
@@ -230,6 +232,7 @@ actions inside the viewport.
 | **D3** | the built-in touch presets put buttons above a short landscape stage (`touchControls.ts:165-205`) | a product call: moving them changes them for every user |
 | **D4** | display names in the stats, usage and hive payloads | yes, in P6: additive fields, the `AgentDao::label()` rule |
 | **D5** | the in-call controls on a phone | an app-bar button opening Return · Mute · Camera · Hang up |
+| **D6** | P8's phone-width smoke as a CI lane: the SPA from a build, every `/api` answered by fixtures, Playwright at 360 and 390 px over each signed-in route — no page-level sideways scroll, each page's primary actions inside the viewport. It is the harness every FR-116 PR was checked with, made a gate | yes, as its own PR: it adds a Playwright browser install to a UI lane, which is the operator's call on CI cost |
 
 ## 7. Out of scope
 
