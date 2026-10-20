@@ -263,6 +263,8 @@ fn rows_of<'a>(body: &'a Value, kind: &str) -> Vec<&'a Value> {
 async fn transfer_activity_is_kept_only_for_a_session_that_could_carry_it() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr101p3").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (a, mut a_ws) = connect_agent(&app, &seeded, "mach-fr101-a").await;
     let (b, mut b_ws) = connect_agent(&app, &seeded, "mach-fr101-b").await;
 

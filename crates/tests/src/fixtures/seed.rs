@@ -154,6 +154,21 @@ impl TestApp {
             .header("Authorization", format!("Bearer {}", token))
     }
 
+    /// FR-115 P3 — put an org on `plan` (`"free"`, `"pro"`, `"business"`),
+    /// straight in the database. A seeded org is Free, and Free runs one
+    /// remote session at a time: a test that holds several at once in one org
+    /// needs a plan without that cap (`"business"`).
+    pub async fn set_plan(&self, tenant_id: &str, plan: &str) {
+        self.db
+            .collection::<bson::Document>("tenants")
+            .update_one(
+                bson::doc! { "_id": ObjectId::parse_str(tenant_id).unwrap() },
+                bson::doc! { "$set": { "plan": plan } },
+            )
+            .await
+            .expect("the org's plan is set");
+    }
+
     /// Seed a full tenant with admin + member users, and 3 rooms.
     pub async fn seed_tenant(&self, slug: &str) -> SeededTenant {
         let tenant_name = format!("{} Corp", slug);

@@ -258,6 +258,8 @@ async fn give_member(app: &TestApp, seeded: &SeededTenant, name: &str, mask: u64
 async fn privacy_reaches_only_an_agent_that_serves_it() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr99gate1").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (serves, mut serves_ws) = connect_agent(
         &app,
         &seeded,
@@ -403,6 +405,8 @@ async fn a_heartbeat_switches_privacy_without_a_reconnect() {
 async fn the_strip_is_audited_on_the_session_request() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr99gate4").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (plain, mut plain_ws) =
         connect_agent(&app, &seeded, "mach-fr99-audit", &["privacy-available"]).await;
     let (serves, mut serves_ws) =
