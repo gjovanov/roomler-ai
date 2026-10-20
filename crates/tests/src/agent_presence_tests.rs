@@ -475,3 +475,52 @@ async fn stale_when_heartbeat_fresh_but_no_socket() {
     assert_eq!(row["presence"], "stale", "row: {row}");
     assert_eq!(row["is_online"], false, "stale must not read green: {row}");
 }
+
+/// #2552 — after a fast reconnect, the displaced connection's teardown
+/// writes `Offline` only while the row still names it. Each hello names its
+/// connection. Once a newer hello holds the row, the old connection's late
+/// write matches nothing, in whichever order the two land, and the newer
+/// connection's own teardown still writes it.
+#[tokio::test]
+async fn a_displaced_connections_late_offline_leaves_the_newer_hello_online() {
+    use roomler_ai_remote_control::models::{AgentCaps, AgentStatus};
+    use roomler_ai_services::dao::agent::AgentDao;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("p2552").await;
+    let (agent_id, _) = enroll(&app, &seeded, "mach-2552").await;
+    let id = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
+    let dao = AgentDao::new(&app.db);
+    for conn in ["the-old-connection", "the-new-connection"] {
+        dao.update_hello(
+            id,
+            "0.4.147",
+            &[],
+            &AgentCaps::default(),
+            &[],
+            "",
+            "",
+            "",
+            "",
+            false,
+            conn,
+        )
+        .await
+        .unwrap();
+    }
+    let status = || async { dao.base.find_by_id(id).await.unwrap().status };
+    assert!(
+        !dao.mark_offline_if_conn(id, "the-old-connection")
+            .await
+            .unwrap(),
+        "the displaced connection's write matches nothing"
+    );
+    assert!(matches!(status().await, AgentStatus::Online));
+    assert!(
+        dao.mark_offline_if_conn(id, "the-new-connection")
+            .await
+            .unwrap(),
+        "the connection that holds the row writes its own offline"
+    );
+    assert!(matches!(status().await, AgentStatus::Offline));
+}
