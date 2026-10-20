@@ -30,8 +30,9 @@
       @select="openUser"
     />
 
-    <!-- Detail: the from-when-till-when view for one person. -->
-    <v-dialog v-model="dialog" max-width="1100" scrollable>
+    <!-- Detail: the from-when-till-when view for one person. FR-116: full
+         screen on a phone — centred, it left the timeline's track ~36 px. -->
+    <v-dialog v-model="dialog" max-width="1100" scrollable :fullscreen="xs">
       <v-card v-if="detail">
         <v-card-title class="d-flex align-center flex-wrap" style="gap: 8px">
           <span class="text-h6">{{ detail.user?.name || 'User' }}</span>
@@ -156,6 +157,7 @@
 // (`scope="platform"`). The two differ only in which endpoint answers and
 // whether the org column/lane-subtitle is shown, so they share this panel.
 import { computed, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { timeFormat } from 'd3-time-format'
 import UsageTable from './UsageTable.vue'
 import UsageTimeline from './UsageTimeline.vue'
@@ -171,6 +173,7 @@ const props = defineProps<{
 }>()
 
 const statsStore = useStatsStore()
+const { xs } = useDisplay()
 const payload = ref<UsagePayload | null>(null)
 const detail = ref<UsageDetailPayload | null>(null)
 const loading = ref(false)
