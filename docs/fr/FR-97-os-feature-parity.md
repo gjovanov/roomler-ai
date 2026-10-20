@@ -62,6 +62,11 @@
   install over Xorg (§8).
 - P3f, typed text on any layout for uinput (the host's own XKB keymap, through a dlopen'd libxkbcommon), merged
   (#2558): red on 0.4.145, which dropped German text; green on its candidate, German and French on the lab (§8).
+- P3e-1, the keyboard layout on X11 (the XKB group in use, reported to the viewer's chip and switched from its
+  picker), built (#2618). The switch now goes through the input arbiter on both platforms, so a session that may
+  not type no longer switches the host's layout, and the current layout goes out when the control DC opens. Under
+  GNOME on Xorg the chip reports and there is no picker: GNOME Shell puts a group locked from outside it back within
+  20 ms (measured on the field cell, §8).
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -194,9 +199,9 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ❌ | ❌ | Windows-only cap (`caps.rs:1570-1574`) | P2d, P3e |
+| R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ❌ | Windows-only cap (`caps.rs:1570-1574` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:1615-1622`), and on Linux only in an X11 session, without `set` under GNOME (`:820`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1547-1555`) | P0c, P2e, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1591-1599`) | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:792` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9646-9649`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
@@ -287,7 +292,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1827`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:78-81`, `agents/roomlerd/src/encode/caps.rs:1858`, `crates/tunnel-core/src/overlay/tun.rs:3926-3927`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1875`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:78-81`, `agents/roomlerd/src/encode/caps.rs:1906`, `crates/tunnel-core/src/overlay/tun.rs:3926-3927`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
 | W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4697` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
@@ -379,14 +384,14 @@ matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked 
 
 An agent before P0c sends no map, and an absent key never means "unavailable": its lists say what it claims.
 
-**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:745`), applied
+**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:780`), applied
 in `detect()` (`:624`) after the config lists, over plain `HostFacts` (`:636`). It runs, and is tested, on every
 OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
 | `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3098`); `unavailable.audio = no-backend` |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:726`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:761`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
 | `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
@@ -666,6 +671,25 @@ test of the SIGKILL property itself.
 - **P3e, X11 polish.** Layout (`XkbGetState` / `XkbLockGroup`; Wayland has no cross-compositor API, so refuse with a
   reason), display-match through RandR (`x11rb` is linked) with a restore guard, clipboard image watching (XFixes
   selection events, or a `TARGETS` poll) and `text/rtf`.
+  - *As built, P3e-1 (the layout, #2618):* `input::layout_x11` answers `rc:layout` and `rc:layout.set` through
+    the Windows module's snapshot and watch, so the peer serves both (`docs/remote-control.md` §18.3.2). A layout
+    is one of the keymap's XKB groups: the list from the root window's `_XKB_RULES_NAMES` and the keymap's group
+    names, the one in use XKB's locked group, polled twice a second while a session watches. The tag is BCP-47 for
+    a plain layout a table knows, else the keymap's own name; the token is the layout's hash and its group, so a
+    click after the desktop changed its layouts is refused. The switch is `XkbLatchLockState`, read back.
+  - *Refused with no reason:* under Wayland and on a system install the hello carries no `layout`. There is no
+    control to grey: the chip does not appear, as before. The design's "refuse with a reason" would have needed a
+    new `unavailable` key and a place in the viewer to show it, and with no control on screen there is nothing for
+    the reason to sit on; `docs/platform-support.md` says why instead.
+  - *Found building it, both platforms:* `rc:layout.set` reached the switch for any session, a view-only one's
+    included; it now goes through the arbiter under keep busy's rule. And the emitter's first snapshot was sent
+    before the control DC opened, so it reached no one; the control arm now sends the current one.
+  - *Found on the field cell, GNOME 46 on Xorg (§8):* GNOME Shell puts an XKB group locked from outside it back
+    within 20 ms, measured with libX11's own `XkbLockGroup` and the agent out of the loop, and GNOME has no public
+    interface for switching sources. So under an `XDG_CURRENT_DESKTOP` that names GNOME the hello carries `report`
+    without `set`: the chip, which follows GNOME's own switches, and no picker that would only snap back. Pressing
+    GNOME's own Super+Space from the viewer switches it. And GNOME configures its sources `us, de` as the groups
+    `us,de,us`, the locale's layout appended for its shortcuts; each layout is offered once.
 - **P3f, uinput text on any layout.** `dlopen` libxkbcommon (the libpipewire pattern) and map char → keycode under the
   host's keymap.
   - *As built (#2558):* the keymap is compiled from the layout `detect` finds and its variant from the same source
@@ -952,7 +976,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
-| **P3e** | Linux X11 layout, display-match, clipboard images + RTF | per-verb | the lab | M |
+| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, built #2618) | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0` | the lab; P3e-1: a vmtest Ubuntu cell on Xorg, a per-user install, two layouts | M |
 | **P3f** | uinput text on any layout, through the host's own XKB keymap (merged #2558) | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts, red on 0.4.145 | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
@@ -1038,9 +1062,12 @@ one depends on it.
   *(The files clause is field-verified, §8: red on 0.4.143, where an upload landed in `/tmp` as `root:root`; green
   on P3d's branch and again on the 0.4.144 candidate, in the seat user's `~/Downloads` and owned by them. The cursor
   clause on X11 is field-verified on P3a's candidate, §8: 0.4.145 sent one `cursor:hide` and nothing else, the
-  candidate the shape and its positions; it is checked again on the release. The German and French clause is
-  field-verified on P3f's candidate, §8: 0.4.145 dropped `zyäöüß@€<>|`, the candidate typed it and `aqé1à€`
-  character for character; checked again on the release.)*
+  candidate the shape and its positions; and again on the 0.4.147 release's bytes, red on 0.4.146. The German and
+  French clause is field-verified on P3f's candidate, §8: 0.4.145 dropped `zyäöüß@€<>|`, the candidate typed it and
+  `aqé1à€` character for character; and again on the 0.4.147 release's bytes, red on 0.4.146. The layout clause
+  holds for GNOME on Xorg as a report (P3e-1, §8): the chip follows GNOME's own switches, and GNOME puts a switch
+  from outside it back, so there is no picker. The picker on a desktop that keeps an outside lock (KDE, XFCE) is
+  still owed a field run; CI's Xvfb test is its only evidence.)*
 - [ ] **AC10 (P3g):** a Fedora system install and an arm64 install show the "being viewed" banner and answer a
   consent prompt.
 - [x] **AC11 (P4a–P4d):** Ctrl+Alt+Del reaches a Windows lock screen that requires it; SFTP as `console_user` writes
@@ -1254,3 +1281,7 @@ one depends on it.
 | 2026-10-19 | the 0.4.145 candidate (release run 39248610025 on `745ddb1e1`): its `.deb` (package `0.4.145-1`) over the served 0.4.144 | a throwaway vmtest Ubuntu 24.04 system guest on zeus, made WSL-shaped as above | 🔴→🟢 **P3h-1 on the release candidate.** 0.4.144: `magicdns vmtest.roomler.ai (active, …)` while `getent` returned nothing. The candidate: `(steered but BYPASSED, …)`, the reason line and the daemon's warning. The guest was destroyed. The published 0.4.145 carries the same binary (`07412c9f…`) |
 | 2026-10-19 | released 0.4.145 (`07412c9f…`), then the P3a candidate (`e1c59bdd…`, a release-profile build of the branch without `ffmpeg-encoder`) | a throwaway vmtest Ubuntu 24.04 cell on zeus, GDM switched to Xorg (GNOME 46, auto-login), a per-user install, each run a fresh ephemeral enrollment; the production viewer (Playwright) tapping its own cursor channel and putting the pointer at (0.25, 0.25), (0.75, 0.6), (0.5, 0.5) of a 1280×800 picture | 🔴→🟢 **P3a.** 0.4.145, twice (`capture: backend=scrap`): one `cursor:hide`, no shape, no position. The candidate: one `cursor:shape` (18×24, `css: default`), no hide, and positions (320, 200), (959, 479), (640, 400), its log saying `capture: the X11 pointer is on the cursor channel (FR-97 P3a) xfixes=5`. The candidate with `ROOMLERD_X11_CURSOR=0`: one `cursor:hide` again, and `the X11 pointer stays off the cursor channel`. The cell was destroyed by name |
 | 2026-10-19 | released 0.4.145 (`07412c9f…`), then the P3f candidate (`e90b65ef…`, a release-profile build of the branch without `ffmpeg-encoder`) | the FR-93 lab's GNOME 50 system install (`wlab-gnome-sys`, Ubuntu 26.04), under its lock: the layout set to German or French (`localectl` and the seat user's GNOME input source), the daemon restarted, `wlab-probe` logging every key the compositor delivers, the production viewer clicking into it and sending one `key_text` | 🔴→🟢 **P3f.** 0.4.145, German, twice: 0 key events, the daemon warning `no verified key table for this keyboard layout … detected="de"`. The candidate: `zyäöüß@€<>|` on German (30 key events) and `aqé1à€` on French (16), character for character, in the probe's key presses and its text entry; its log names `the host's XKB keymap de` and `fr`. The first green run typed into no window: a window a service starts has no keyboard focus on GNOME, and the click fixed the rig, not the code. The layout, the guest's own binary (0.4.138) and its power state were restored |
+| 2026-10-20 | released 0.4.146 (`ba7f1397…`), then the 0.4.147 candidate (release run 39440967144 on `1642c4e05`, roomlerd `1698a76e…`; the release's bytes) | P3a's setup again: a throwaway vmtest Ubuntu 24.04 cell on zeus, GDM on Xorg (GNOME 46), a per-user install; the production viewer tapping its cursor channel | 🔴→🟢 **P3a on the 0.4.147 release.** 0.4.146: one `cursor:hide`, then nothing (`shapes=0 pos=0` after the three moves). The candidate: `cursor:shape` (18×24, `css: default`) and positions (320, 200), (959, 479), (640, 400) |
+| 2026-10-20 | released 0.4.146, then the 0.4.147 candidate (as above) | the FR-93 lab's GNOME 50 system install (`wlab-gnome-sys`), under its lock, the layout `de` then `fr`; restored after to 0.4.138, `us`, and shut off | 🔴→🟢 **P3f on the 0.4.147 release.** 0.4.146, `de`: 0 key events and `WARN uinput: no verified key table … detected="de"`. The candidate: `zyäöüß@€<>\|` exactly (30 key events) and `aqé1à€` exactly (16), its log saying `the host's XKB keymap de` and `fr`. ⚠️ The first `de` run after the guest's cold boot typed into nothing, twice (0 probe events, the keymap engaged); the next run, on the warm guest, was exact. The rig clicks the probe window first, and GNOME opens its overview at login, so most likely the first click lands there; not proven |
+| 2026-10-20 | — (libX11's own `XkbLockGroup` and `XkbGetState`, the agent out of the loop) | the P3a cell, GNOME's input sources set to `us, de` | **GNOME puts a group lock from outside it back.** `XkbLockGroup(1)`: group 1 at 0 ms, group 0 again at 20 ms and every read after, to 2 s. And `_XKB_RULES_NAMES` for the sources `us, de` reads `"evdev", "pc105+inet", "us,de,us", ",,"`: GNOME appends the locale's layout as a group of its own. These are why P3e-1 offers `report` without `set` under GNOME, and each layout once |
+| 2026-10-20 | the 0.4.147 candidate, then the P3e-1 candidates `fa852012…` and `e7f80124…` (release-profile builds of the branch without `ffmpeg-encoder`) | the same cell and sources; the production viewer (Playwright) tapping its control channel and sending keys as the viewer does; libX11's `XkbGetState` as the oracle | 🔴→🟢 **P3e-1, the layout chip.** 0.4.147: no `layout` in the caps, no `rc:layout`, no chip. The first candidate: `layout: report, set`, `rc:layout` 10 ms after the control DC opened, the chip `en-US`; its picker's `de-DE` did not take (`the switch did not take (the desktop put its own back?)`), which the row above explains. The second, with that fix: `layout: report`, `rc:layout` listing `en-US, de-DE` 1 ms after the control DC opened, in a first and a second session of one daemon; GNOME's own Super+Space, sent from the viewer, moved the chip to `de-DE` and back, with GNOME's own indicator; a crafted `rc:layout.set` refused (`under GNOME, which puts its own layout back`) with XKB untouched; with `ROOMLERD_X11_LAYOUT=0`, no `layout`, no `rc:layout`, no chip |

@@ -248,6 +248,17 @@ pub fn subscribe() -> tokio::sync::watch::Receiver<Option<LayoutSnapshot>> {
     LAYOUT_WATCH.1.clone()
 }
 
+/// FR-97 P3e — every Windows session has layouts to report; the X11 module
+/// answers this per host, and the peer asks both the same way.
+pub fn offered() -> bool {
+    true
+}
+
+/// FR-97 P3e — the last snapshot, for a control channel that just opened.
+pub fn current() -> Option<LayoutSnapshot> {
+    LAYOUT_WATCH.1.borrow().clone()
+}
+
 /// Opaque wire form of an HKL: the low 32 bits as 8 hex digits (HKLs
 /// are sign-extended 32-bit handles on 64-bit Windows). The browser
 /// echoes these back verbatim in `rc:layout.set`.

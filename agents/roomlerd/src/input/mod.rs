@@ -88,6 +88,14 @@ pub mod win_text;
 #[cfg(all(target_os = "windows", feature = "enigo-input"))]
 pub mod layout;
 
+/// FR-97 P3e — the X11 keyboard layout: the same snapshot, watch and switch
+/// as the Windows module, so the peer's `rc:layout` emitter and its
+/// `rc:layout.set` arm serve both under one name.
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+pub mod layout_x11;
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+pub use layout_x11 as layout;
+
 #[cfg(all(
     feature = "system-context",
     target_os = "windows",

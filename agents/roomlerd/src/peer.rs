@@ -1256,6 +1256,23 @@ impl AgentPeer {
                                 let _ = dc_init.send_text(crate::keep_busy::state_json(None)).await;
                             });
                         }
+                        // FR-97 P3e — the current keyboard layout, once, for the
+                        // same reason: the session's layout emitter starts before
+                        // this channel opens, so the snapshot it starts with finds
+                        // no channel, and goes out again only when the layout
+                        // changes.
+                        #[cfg(all(
+                            any(target_os = "windows", target_os = "linux"),
+                            feature = "enigo-input"
+                        ))]
+                        if crate::input::layout::offered()
+                            && let Some(snap) = crate::input::layout::current()
+                        {
+                            let dc_init = dc.clone();
+                            tokio::spawn(async move {
+                                let _ = dc_init.send_text(layout_json(&snap)).await;
+                            });
+                        }
                         attach_control_handler(
                             dc,
                             session_id,
@@ -1492,15 +1509,24 @@ impl AgentPeer {
         // the session-scoped exit: a send on a channel a network drop
         // left `Closing` can park instead of failing (#1730), so the
         // send-failure break alone is not one.
-        #[cfg(all(target_os = "windows", feature = "enigo-input"))]
-        {
+        // FR-97 P3e — on an X11 desktop the snapshots come from
+        // `input::layout_x11`, whose reader runs while a session subscribes;
+        // a host that offers no layout (Wayland, a system install) starts
+        // no emitter.
+        #[cfg(all(
+            any(target_os = "windows", target_os = "linux"),
+            feature = "enigo-input"
+        ))]
+        if crate::input::layout::offered() {
             let mut rx = crate::input::layout::subscribe();
             let stash = control_dc.clone();
             let until = session_end.clone();
             tokio::spawn(async move {
                 let run = async move {
                     // Warm-start with the last-known snapshot (None until
-                    // the first input event of the process).
+                    // the first input event of the process, or on X11 the
+                    // reader's first read). Sent only if the control DC is
+                    // already open; otherwise its `control` arm sends it.
                     let initial = rx.borrow().clone();
                     if let Some(s) = initial
                         && !emit_layout(&stash, &s).await
@@ -9522,8 +9548,12 @@ async fn emit_display_match(
 /// control DC. Returns `false` when the DC is gone (the emitter task
 /// uses that as its session-scoped exit — the layout watch channel is
 /// process-global and never closes on its own). A not-yet-stashed DC
-/// returns `true` (keep waiting for it to open).
-#[cfg(all(target_os = "windows", feature = "enigo-input"))]
+/// returns `true` (keep waiting for it to open; its `control` arm then
+/// sends the current snapshot, FR-97 P3e).
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    feature = "enigo-input"
+))]
 async fn emit_layout(
     stash: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     snap: &crate::input::layout::LayoutSnapshot,
@@ -9535,8 +9565,23 @@ async fn emit_layout(
             None => return true,
         }
     };
-    // json! (not format!) — the tags are dynamic strings.
-    let payload = serde_json::json!({
+    match dc.send_text(layout_json(snap)).await {
+        Ok(_) => true,
+        Err(e) => {
+            debug!(%e, "rc:layout send failed (control DC closed?) — stopping layout emitter");
+            false
+        }
+    }
+}
+
+/// rc.227 — one snapshot as its `rc:layout` envelope. `json!`, not
+/// `format!`: the tags are dynamic strings.
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    feature = "enigo-input"
+))]
+fn layout_json(snap: &crate::input::layout::LayoutSnapshot) -> String {
+    serde_json::json!({
         "t": "rc:layout",
         "active_hkl": snap.active_hkl,
         "active": snap.active_tag,
@@ -9545,17 +9590,8 @@ async fn emit_layout(
             .iter()
             .map(|(hkl, tag)| serde_json::json!({ "hkl": hkl, "tag": tag }))
             .collect::<Vec<_>>(),
-    });
-    let Ok(s) = serde_json::to_string(&payload) else {
-        return true;
-    };
-    match dc.send_text(s).await {
-        Ok(_) => true,
-        Err(e) => {
-            debug!(%e, "rc:layout send failed (control DC closed?) — stopping layout emitter");
-            false
-        }
-    }
+    })
+    .to_string()
 }
 
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
@@ -10067,16 +10103,22 @@ fn attach_control_handler(
                         }
                     }
                 }
-                #[cfg(all(target_os = "windows", feature = "enigo-input"))]
+                #[cfg(all(
+                    any(target_os = "windows", target_os = "linux"),
+                    feature = "enigo-input"
+                ))]
                 "rc:layout.set" => {
                     // rc.227 — the viewer's manual layout picker. Value is
-                    // an opaque 8-hex HKL string the agent itself reported
-                    // in `rc:layout`; request_set_layout re-validates it
-                    // against the CURRENT installed list before activating
-                    // (never activates arbitrary wire input) and re-samples
-                    // — the resulting `rc:layout` push is the implicit ack.
-                    // Non-Windows / non-enigo builds compile this arm out →
-                    // the catch-all debug-drops it, same as old agents.
+                    // an opaque hex token the agent itself reported in
+                    // `rc:layout` (an HKL on Windows; FR-97 P3e, a layout's
+                    // hash and its XKB group on X11); request_set_layout
+                    // re-validates it against the CURRENT layouts before
+                    // activating (never activates arbitrary wire input) and
+                    // re-reads — the resulting `rc:layout` push is the
+                    // implicit ack. FR-97 P3e — through the arbiter, which
+                    // refuses a session that may not type. macOS / non-enigo
+                    // builds compile this arm out → the catch-all
+                    // debug-drops it, same as old agents.
                     let Some(hkl) = val.get("hkl").and_then(|v| v.as_str()) else {
                         debug!(%session_id, "control: rc:layout.set missing hkl — dropped");
                         return;
@@ -10087,7 +10129,7 @@ fn attach_control_handler(
                         return;
                     }
                     info!(%session_id, hkl, "control: rc:layout.set — switching remote keyboard layout");
-                    crate::input::layout::request_set_layout(hkl.to_string());
+                    crate::input::arbiter::global().layout_set(session_id, hkl.to_string());
                 }
                 other => {
                     debug!(%session_id, t = other, "control: unknown message type");
@@ -13322,6 +13364,30 @@ mod codec_cap_tests {
 #[cfg(test)]
 mod tests {
     use super::quality::*;
+
+    /// rc.227 / FR-97 P3e — the `rc:layout` envelope as the viewer's
+    /// `parseControlInbound` reads it: `active_hkl` and `active` strings, and
+    /// `installed` as `{hkl, tag}` objects. One builder serves the emitter and
+    /// the control arm's first send, on Windows and on X11.
+    #[cfg(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    ))]
+    #[test]
+    fn the_layout_envelope_is_the_one_the_viewer_parses() {
+        let snap = crate::input::layout::LayoutSnapshot {
+            active_hkl: "1".into(),
+            active_tag: "de-DE".into(),
+            installed: vec![("0".into(), "en-US".into()), ("1".into(), "de-DE".into())],
+        };
+        let v: serde_json::Value = serde_json::from_str(&super::layout_json(&snap)).unwrap();
+        assert_eq!(v["t"], "rc:layout");
+        assert_eq!(v["active_hkl"], "1");
+        assert_eq!(v["active"], "de-DE");
+        assert_eq!(v["installed"][0]["hkl"], "0");
+        assert_eq!(v["installed"][1]["tag"], "de-DE");
+        assert_eq!(v["installed"].as_array().map(Vec::len), Some(2));
+    }
 
     /// FR-112 P2b — under the software tier every preference starts the RTP
     /// pump at 60; without it, 0.4.141's targets.
