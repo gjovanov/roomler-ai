@@ -1,8 +1,8 @@
 # FR-114: The agent-e2e lane runs every night — remote-session specs against a real agent in the e2e namespace
 
-**Issue:** [#2524](https://github.com/gjovanov/roomler-ai/issues/2524) · **Status:** P1 + P2 shipped 2026-10-19 (#2534
-`2a8a8c552`; deploy #45 `225cbb9cc`), P3's on-demand run green; the first nightly (AC5) pending. Proposed 2026-10-19 on
-the operator's go-ahead (*"do the test based on your best judgement … proceed"*) · **Owner:** testing (the
+**Issue:** [#2524](https://github.com/gjovanov/roomler-ai/issues/2524) · **Status:** ✅ **closed 2026-10-20**, every
+criterion ticked. P1 + P2 shipped 2026-10-19 (#2534 `2a8a8c552`; deploy #45 `225cbb9cc`); the first nightly (2026-10-20
+01:30Z) ran all seven agent-e2e tests and passed them. Proposed 2026-10-19 on the operator's go-ahead (*"do the test based on your best judgement … proceed"*) · **Owner:** testing (the
 e2e pod lane) · **Anchors:** master `95238f1b3` · **Builds on:** `scripts/e2e-k8s/AGENT-E2E.md` (the harness as it
 was first written), [FR-102](FR-102-growth-observability.md) AC19 (whose pod-lane run this owes)
 
@@ -64,7 +64,7 @@ flowchart LR
 |---|---|---|---|
 | P1 | the four specs' cookie sign-in; `Dockerfile.agent-e2e` on rust 1.95, with the bootstrap finding the tenant by slug; the seed reading the tenant from `GET /api/tenant`; the template's registry; the nightly's tenant discovery; `AGENT-E2E.md` and `docs/testing.md` | revert the PR | **merged** #2534 `2a8a8c552` |
 | P2 | build and push `roomlerd-e2e`; install the overlay into the deploy repo (`k8s/overlays/e2e`, manual apply, never ArgoCD-synced); apply; the seed; all three agents online | `kubectl -n roomler-ai-e2e delete statefulset agent-e2e` (the nightly then skips as today) | **done**: `agent-e2e-20261019-2a8a8c5`, deploy #45 `225cbb9cc`, applied |
-| P3 | an on-demand run of the six specs in the `pwrunner`; then the next nightly | as P2 | on-demand **7/7**; the nightly pending |
+| P3 | an on-demand run of the six specs in the `pwrunner`; then the next nightly | as P2 | **done**: on-demand 7/7 (four runs); the first nightly 7/7, skips 15 → 8 |
 
 ## 5. Acceptance criteria
 
@@ -78,7 +78,7 @@ flowchart LR
 - [x] **AC4 (P3):** an on-demand run in the `pwrunner` sidecar runs all six agent-e2e specs: none skips. Each passes,
   or its failure is diagnosed and either fixed or entered in `scripts/e2e-expected-failures.txt` with the reason.
   `remote-session-rating.spec.ts` passes, which is FR-102 AC19's pod-lane run.
-- [ ] **AC5 (P3):** the first nightly after P2 skips seven fewer tests than the night before (the six specs hold
+- [x] **AC5 (P3):** the first nightly after P2 skips seven fewer tests than the night before (the six specs hold
   seven tests; the reporter counts tests). The lane's verdict holds, or names what newly failed.
 - [x] **AC6 (docs):** `docs/testing.md` documents the agent-e2e lane in the house style (a mermaid diagram, a table,
   `file:line` anchors), `scripts/e2e-k8s/AGENT-E2E.md` matches what was run, and `docs/README.md`'s index row for
@@ -112,5 +112,7 @@ flowchart LR
 | 2026-10-19 15:10–15:14Z | candidate `agent-e2e-20261019-cc74490-p1`, three agents | the recording states by ordinal | `agent-e2e-1` (opted in) **crash-looped**, 6 restarts in 3 min: `TOML parse error at line 31 … record_remote_enabled = false`. `roomlerd enroll` already writes the key at the root, so the prepended `= true` was a duplicate key and the daemon refused the whole config. The bootstrap now replaces the root table's line and checks one `= true` is left (`582d7ec`). An OrderedReady StatefulSet will not roll past a pod that is not Ready, so recovery was the P2 kill switch plus a fresh apply |
 | 2026-10-19 15:25–15:29Z | candidate `agent-e2e-20261019-582d7ec-p1` (digest `sha256:cb799c89…a818`); e2e server `hosted-20261018-368ac01` | AC3 and AC4, fresh apply | **Green.** 3/3 Ready, 0 restarts, no Secret edited. `record`: `-0` `["available"]`, `-1` `["available","remote"]`, `-2` none. The six specs: **7 passed, 0 skipped** (2.2 min), the rating spec (FR-102 AC19) among them. The recording smoke accepts a worded refusal too, so the agent's log is the oracle: `remote recording started … ended reason=requested bytes=2404` |
 | 2026-10-19 16:20–16:23Z | the same agents; the e2e server moved to `hosted-20261019-dd59ede`, the image prod had run since 16:16:59Z | the suite on the new prod image (also that roll's RC check: FR-100 #2517 changed the hub's offer/answer relay) | **7 passed, 0 skipped**; REC again (4207 bytes) |
-| 2026-10-19 16:27Z | deploy branch `fr114-agent-e2e` vs the live namespace | `kubectl diff -k k8s/overlays/e2e` before the apply | Five objects. Two are P2's: the agent image and the seed Job. Three are **drift that predates P2**, not applied: `StatefulSet/minio` (deploy #27/#28's pin, never applied to e2e; minio's data is an emptyDir, so applying it wipes the e2e store), `Deployment/roomler2` (the `pwrunner` container's position only, which restarts the server), `ConfigMap/roomler2-config` (labels). Recorded on deploy #45 |
+| 2026-10-19 16:27Z | deploy branch `fr114-agent-e2e` vs the live namespace | `kubectl diff -k k8s/overlays/e2e` before the apply | Five objects. Two are P2's: the agent image and the seed Job. Three are **drift that predates P2**, not applied: `StatefulSet/minio` (deploy #27/#28's pin, never applied to e2e; harmless to this lane, as measured later that day: the e2e server runs with `s3.enabled` false, `crates/config/src/settings.rs:1484`, so it never uses that minio, which holds no buckets; corrected on #2034 and deploy #45), `Deployment/roomler2` (the `pwrunner` container's position only, which restarts the server), `ConfigMap/roomler2-config` (labels). Recorded on deploy #45 |
 | 2026-10-19 16:28–16:32Z | **master** `2a8a8c552` → `agent-e2e-20261019-2a8a8c5`: the **same digest** as the candidate (the agent's sources did not change between the two, so the binary rebuilt bit-for-bit). Deploy #45 `225cbb9cc` | AC2 and AC3 on the final tag, then AC4 | Applied: the four objects alone, byte-identical to deploy #45's files, a fresh apply. 3/3 Ready, 0 restarts; `record` as above. **7 passed, 0 skipped** (2.2 min) |
+| 2026-10-19 22:12–22:15Z | the same agents; the e2e server moved to `hosted-20261019-e46da07`, which prod has run since 21:57Z (#2131's consent-ordered offers; FR-100 P2a, P2b and P1c's server half) | the suite on prod's next image, before the nightly | **7 passed, 0 skipped.** Every session on all three agents logged `peer-auth: answer signed with this enrollment's device key`: FR-100 P2a's viewer asked for a signature, the 0.4.145 agents signed, and the viewer verified before applying it. REC on `agent-e2e-1` (2404 bytes) |
+| 2026-10-20 01:30–01:47Z | **the nightly** `20261020-0130`: the e2e server `hosted-20261019-e46da07`, the specs at master `069981677` | AC5: the first nightly after P2 | **Green for this FR.** The log reads `agent-e2e harness: tenant 6ad62c14…, 3 agent(s) ready — its specs run`. **8 skipped** against 15 the night before. The seven fewer are this lane's tests, each run once, none retried, all passed. REC on `agent-e2e-1` (3256 bytes); the agents had run 9 h with 0 restarts. The night's verdict is **REGRESSION** (9 failed, 173 passed), and it names what newly failed. Two are the expected `rc-vp9-444` pair. Seven are `billing.spec.ts`: FR-115's #2565 merged nine minutes before the run, and its specs tested an image that predates it (#2573, attributed there). The totals reconcile: 168 passed − 3 billing tests #2565 updated + 7 agent tests + the previous night's flake = 173 |
