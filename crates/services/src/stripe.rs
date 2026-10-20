@@ -297,6 +297,13 @@ impl StripeService {
         // "payment not working" failure (2026-07-27): refused here with an
         // actionable error rather than forwarded as `price=""`.
         let price_id = self.price_id(p.plan, p.interval)?;
+        // A currency the operator has not put on sale is refused before
+        // anything else, with the same words as one the Price lacks.
+        if !currencies_on_sale(&self.settings).contains(&p.currency) {
+            return Err(StripeError::CurrencyNotOffered(
+                p.currency.as_str().to_ascii_uppercase(),
+            ));
+        }
 
         let collection = db.collection::<Tenant>(Tenant::COLLECTION);
         let tenant = collection
@@ -665,9 +672,12 @@ impl StripeService {
     /// plan gives rather than what it withholds. The ids stay
     /// `free`/`pro`/`business` (stored in tenant docs + matched in the
     /// webhook; renaming needs a migration — display copy is the thing to
-    /// change). Annual prices appear only once their Prices are configured.
+    /// change). Annual prices appear only once their Prices are configured,
+    /// and a currency only once `stripe.currencies` names it
+    /// ([`currencies_on_sale`]).
     pub fn get_plans(settings: &StripeSettings) -> Vec<PlanInfo> {
         let ids = PriceIds::of(settings);
+        let on_sale = currencies_on_sale(settings);
         let prices = |plan: Plan| -> Vec<PlanPrice> {
             let mut out = Vec::new();
             for interval in BillingInterval::ALL {
@@ -675,7 +685,7 @@ impl StripeService {
                 if !sold && interval == BillingInterval::Year {
                     continue;
                 }
-                for currency in BillingCurrency::ALL {
+                for &currency in &on_sale {
                     out.push(PlanPrice {
                         interval,
                         currency,
@@ -1392,6 +1402,27 @@ impl StripeService {
     }
 }
 
+/// FR-115 — the currencies the paid plans are offered in, from
+/// `stripe.currencies` (`"usd,eur"`), in the order given; USD when nothing in
+/// it is readable. A currency joins the list once every configured Price
+/// carries an amount in it: the billing page starts a European browser on
+/// EUR, and an EUR checkout on a Price without an EUR `currency_options`
+/// entry is refused.
+pub fn currencies_on_sale(settings: &StripeSettings) -> Vec<BillingCurrency> {
+    let mut out = Vec::new();
+    for raw in settings.currencies.split(',') {
+        if let Some(c) = BillingCurrency::parse(&raw.trim().to_ascii_lowercase())
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    if out.is_empty() {
+        out.push(BillingCurrency::Usd);
+    }
+    out
+}
+
 /// FR-115 — an org whose subscription bills (or is about to): a checkout
 /// would bill it twice, so a plan change takes the change path instead.
 pub fn has_live_subscription(t: &Tenant) -> bool {
@@ -1427,6 +1458,7 @@ mod tests {
         let monthly_only = StripeSettings {
             price_pro: "price_p".into(),
             price_business: "price_b".into(),
+            currencies: "usd,eur".into(),
             ..Default::default()
         };
         let plans = StripeService::get_plans(&monthly_only);
@@ -1464,6 +1496,37 @@ mod tests {
                 .iter()
                 .all(|p| !p.features.iter().any(|f| f.contains("AI"))),
             "AI recognition was deleted in FR-32 and must not be sold"
+        );
+    }
+
+    /// FR-115 — a currency is offered only once the operator names it. The
+    /// default is USD alone, so a Price without an EUR amount is never
+    /// offered, or sold, in EUR.
+    #[test]
+    fn a_currency_is_offered_only_once_named() {
+        let on_sale = |raw: &str| {
+            currencies_on_sale(&StripeSettings {
+                currencies: raw.into(),
+                ..Default::default()
+            })
+        };
+        use BillingCurrency::{Eur, Usd};
+        assert_eq!(on_sale(""), vec![Usd]);
+        assert_eq!(on_sale("usd"), vec![Usd]);
+        assert_eq!(on_sale("usd,eur"), vec![Usd, Eur]);
+        assert_eq!(on_sale(" EUR , usd ,eur"), vec![Eur, Usd]);
+        assert_eq!(on_sale("gbp"), vec![Usd], "nothing readable means USD");
+
+        let usd_only = StripeService::get_plans(&StripeSettings {
+            price_pro: "price_p".into(),
+            price_business: "price_b".into(),
+            ..Default::default()
+        });
+        assert!(
+            usd_only
+                .iter()
+                .all(|p| p.prices.iter().all(|x| x.currency == Usd)),
+            "EUR stays off the page until it is on sale"
         );
     }
 

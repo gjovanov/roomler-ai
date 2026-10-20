@@ -49,16 +49,25 @@ test.describe('Billing & Subscription', () => {
 
     await expect(page.getByText('Available Plans')).toBeVisible({ timeout: 10000 })
 
-    // FR-115 — per user, in the currency the toggle picks. USD pinned so the
+    // FR-115 — per user, in the currency the toggle picks. EUR is on sale
+    // only where the server's `stripe.currencies` names it, and the toggle
+    // shows only when there is a choice. USD is pinned when it does, so the
     // amounts do not depend on the runner's time zone.
-    await page.getByTestId('currency-toggle').getByRole('button', { name: 'USD' }).click()
+    const plans = (await (await fetch(`${API_URL}/api/stripe/plans`)).json()) as Array<{
+      prices: Array<{ currency: string }>
+    }>
+    const eurOnSale = plans.some((p) => p.prices.some((x) => x.currency === 'eur'))
+    const toggle = page.getByTestId('currency-toggle')
+    if (eurOnSale) await toggle.getByRole('button', { name: 'USD' }).click()
+    else await expect(toggle).toHaveCount(0)
     await expect(page.getByTestId('price-free')).toContainText('$0')
     await expect(page.getByTestId('price-pro')).toContainText('$8')
     await expect(page.getByTestId('price-pro')).toContainText('per user / month')
     await expect(page.getByTestId('price-business')).toContainText('$16')
+    if (!eurOnSale) return
 
     // The same plans in EUR: the same number.
-    await page.getByTestId('currency-toggle').getByRole('button', { name: 'EUR' }).click()
+    await toggle.getByRole('button', { name: 'EUR' }).click()
     await expect(page.getByTestId('price-pro')).toContainText('€8')
     await expect(page.getByTestId('price-business')).toContainText('€16')
   })
@@ -218,7 +227,11 @@ test.describe('Billing & Subscription', () => {
     expect(pro.price_cents).toBe(800)
     expect(pro.per_seat).toBe(true)
     expect(pro.prices).toContainEqual({ interval: 'month', currency: 'usd', unit_amount: 800 })
-    expect(pro.prices).toContainEqual({ interval: 'month', currency: 'eur', unit_amount: 800 })
+    // EUR only where the server puts it on sale (`stripe.currencies`), and
+    // then at the same number.
+    for (const p of pro.prices.filter((x) => x.interval === 'month' && x.currency === 'eur')) {
+      expect(p.unit_amount).toBe(800)
+    }
     for (const p of pro.prices.filter((x) => x.interval === 'year')) {
       expect(p.unit_amount).toBe(8000) // two months free
     }
