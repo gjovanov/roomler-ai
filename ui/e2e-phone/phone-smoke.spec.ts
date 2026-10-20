@@ -5,14 +5,18 @@
 // (the two projects in playwright.phone.config.ts), against the built SPA with
 // every `/api` call answered from fixtures.ts.
 //
-// Two assertions per page, the two FR-116 kept finding broken:
-//  1. Nothing visible is cut off sideways. `v-main` clips horizontal overflow
-//     (FR-116 P2), so the page can never scroll sideways; what that rule must
-//     not do is HIDE a control. So no button, link, field, chip or heading may
-//     sit past the screen's edge — unless it is inside something that scrolls
-//     sideways by design (a table's own box, a tab slider). The 4 px a `v-row`
-//     gutter reaches past `pa-2` is empty margin, not content, and passes.
-//  2. The page's primary action is inside the viewport — the Overlay ACL's
+// Three assertions per page, the things FR-116 kept finding broken:
+//  1. The page does not scroll sideways. The page's scroller is `.v-main`, not
+//     the document, so both are checked. `v-main` clips horizontal overflow
+//     (FR-116 P2); the 4 px a `v-row` gutter reaches past `pa-2` is empty
+//     margin, which the clip hides.
+//  2. Nothing visible is cut off sideways, because the clip must not HIDE a
+//     control. So no button, link, field, chip or heading may sit past the
+//     screen's edge, unless it is inside something within the page that
+//     scrolls sideways by design (a table's own box, a tab slider). `.v-main`
+//     itself is never that exemption: without its clip it would exempt the
+//     whole page, and the smoke would pass the very regression it is for.
+//  3. The page's primary action is inside the viewport. The Overlay ACL's
 //     "New rule" sat past the right edge, unreachable, for months.
 //
 // Page errors and unmocked calls are recorded as annotations, not failures:
@@ -67,15 +71,26 @@ for (const route of ROUTES) {
     const width = page.viewportSize()!.width
     const docOver = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
     expect(docOver, 'the document itself scrolls sideways').toBeLessThanOrEqual(1)
+    // A clipped `.v-main` reports its overflow in scrollWidth, but no finger
+    // can scroll it; one that can scroll may not have anything to scroll.
+    const pageOver = await page.evaluate(() => {
+      const main = document.querySelector('.v-main')
+      if (!main) return 0
+      const ox = getComputedStyle(main).overflowX
+      return ox === 'hidden' || ox === 'clip' ? 0 : main.scrollWidth - main.clientWidth
+    })
+    expect(pageOver, 'the page (.v-main, the app scroller) scrolls sideways').toBeLessThanOrEqual(1)
     const offscreen = await page.evaluate(() => {
       const vw = window.innerWidth
       // Inside something built to sit off-screen or scroll sideways: a closed
-      // drawer (parked past the edge), a tab slider, or a scroller that
-      // actually overflows (a table's wrapper, the viewer's tool row).
+      // drawer (parked past the edge), a tab slider, or a scroller within the
+      // page that actually overflows (a table's wrapper, the viewer's tool
+      // row). The walk stops below `.v-main`: the page is never its own
+      // exemption.
       const scrollsAway = (el: Element) => {
         if (el.closest('.v-navigation-drawer:not(.v-navigation-drawer--active)')) return true
         if (el.closest('.v-slide-group')) return true
-        for (let e = el.parentElement; e && e !== document.body; e = e.parentElement) {
+        for (let e = el.parentElement; e && !e.classList.contains('v-main') && e !== document.body; e = e.parentElement) {
           const ox = getComputedStyle(e).overflowX
           if ((ox === 'auto' || ox === 'scroll') && e.scrollWidth > e.clientWidth + 1) return true
         }

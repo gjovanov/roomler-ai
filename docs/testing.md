@@ -106,22 +106,29 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
   by `vite preview`, every `/api` call answered from `e2e-phone/fixtures.ts`, each
   signed-in route at 360 and 390 px (`playwright.phone.config.ts`). It needs no
   backend, and CI runs it on any PR that touches `ui/` (`ui-phone-smoke.yml`).
-  It asserts two things per page:
+  It asserts three things per page:
+  - the page does not scroll sideways: neither the document nor `.v-main`,
+    which is the app's real scroller (FR-116 P2 clips it);
   - no button, link, field, chip or heading sits past the screen's edge,
-    unless it is inside something built to scroll sideways or sit off-screen
-    (a table's own box, a tab slider, a closed drawer);
+    unless it is inside something within the page that is built to scroll
+    sideways or sit off-screen (a table's own box, a tab slider, a closed
+    drawer). `.v-main` is never that exemption, or a page that lost its clip
+    would exempt itself;
   - the page's primary action is wholly on screen.
 
   Unmocked calls and page errors become annotations, not failures, because
   the smoke judges layout. Its first run found the Overlay ACL's **New rule**
   past the edge on master (FR-116 P3a fixes it) and the viewer's break-glass
-  button 2 px past a 360 px screen.
+  button 2 px past a 360 px screen. With `.v-main`'s clip removed, it fails
+  the dashboard and Observability with the 4 px that production showed
+  before FR-116.
 
   ```mermaid
   flowchart LR
       B["vite build"] --> P["vite preview :4173"]
       F["fixtures.ts<br/>every /api call"] --> PW["Playwright<br/>360 · 390 px"]
       P --> PW
+      PW --> C0{"page scrolls<br/>sideways?"}
       PW --> C1{"visible content<br/>past the edge?"}
       PW --> C2{"primary action<br/>on screen?"}
   ```
