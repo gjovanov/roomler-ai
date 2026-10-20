@@ -28,6 +28,7 @@ flowchart TB
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
+| Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
 | Encoder smoke | `roomlerd encoder-smoke --encoder hardware [--codec hevc]` | the host's GPU — 10 synthetic frames, prints the cascade's decisions |
 
@@ -101,6 +102,29 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
   `rc-vp9-444` (needs an agent built with the feature),
   `remote-recording-refused` and `remote-recording-smoke` (FR-85; the second
   needs an agent that advertises `record`), and a field-host upload spec. Chromium runs with fake media devices for WebRTC.
+- **The phone-width smoke** (`ui/e2e-phone/`, FR-116 D6): the BUILT SPA served
+  by `vite preview`, every `/api` call answered from `e2e-phone/fixtures.ts`, each
+  signed-in route at 360 and 390 px (`playwright.phone.config.ts`). It needs no
+  backend, and CI runs it on any PR that touches `ui/` (`ui-phone-smoke.yml`).
+  It asserts two things per page:
+  - no button, link, field, chip or heading sits past the screen's edge,
+    unless it is inside something built to scroll sideways or sit off-screen
+    (a table's own box, a tab slider, a closed drawer);
+  - the page's primary action is wholly on screen.
+
+  Unmocked calls and page errors become annotations, not failures, because
+  the smoke judges layout. Its first run found the Overlay ACL's **New rule**
+  past the edge on master (FR-116 P3a fixes it) and the viewer's break-glass
+  button 2 px past a 360 px screen.
+
+  ```mermaid
+  flowchart LR
+      B["vite build"] --> P["vite preview :4173"]
+      F["fixtures.ts<br/>every /api call"] --> PW["Playwright<br/>360 · 390 px"]
+      P --> PW
+      PW --> C1{"visible content<br/>past the edge?"}
+      PW --> C2{"primary action<br/>on screen?"}
+  ```
 
 ## In-crate Rust unit tests
 
