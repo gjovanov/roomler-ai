@@ -69,6 +69,11 @@ async fn get_plans_free_plan_has_correct_data() {
     // currencies on sale, zero.
     let prices = free["prices"].as_array().unwrap();
     assert!(prices.iter().all(|p| p["unit_amount"] == 0));
+    // Free's `year` entry alone put an Annual toggle on the billing page.
+    assert!(
+        prices.iter().all(|p| p["interval"] == "month"),
+        "Free lists a year while nothing is sold annually: {prices:?}"
+    );
 }
 
 #[tokio::test]
