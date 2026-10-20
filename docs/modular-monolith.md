@@ -286,7 +286,7 @@ sequenceDiagram
     participant M as remote / network (AgentMsgHandler)
     A->>H: /ws?role=agent (agent JWT, tid)
     H->>F: Modules::agent_upgrade → ws_upgrade_agent (row check, Goodbye) · 503 when fleet is unmounted
-    F->>F: hello · Hub registration · presence
+    F->>F: hello (the row Online, naming this conn_id) · Hub registration · presence
     loop read loop
         A->>F: ClientMsg
         F->>F: owner = ClientMsg::namespace()
@@ -297,7 +297,7 @@ sequenceDiagram
             M-->>F: hands back what it did not consume
         end
     end
-    F->>F: closing → unregister (answers ours) → closed(ours) → Offline + presence (ours)
+    F->>F: closing → unregister (answers ours) → closed(ours) → Offline (ours, while the row names this conn_id) + presence (ours)
 ```
 
 ⚠️ The prefix is **not** the owner: `rc:consent*` is fleet's, `rc:relay.*` and
@@ -305,6 +305,17 @@ sequenceDiagram
 the probe throttle) lives behind its `AgentSocketLifecycle`, keyed by `conn_id` — a displacing
 connection must not tear down its successor. The teardown order above is the rc.53 / rc.307 B /
 Phase A-1 invariants written once; do not reorder.
+
+⚠️ **"Ours" is not enough for the row's `Offline`** (#2552). The Hub hears of a displacing
+connection only after its hello wrote `Online`, so a fast reconnect's old connection can still
+answer "ours" between that write and the new registration. Its `Offline` would then land on top
+of the new `Online`, which only the next heartbeat repairs. So each hello names its connection on
+the row (`conn_id`), and a teardown writes `Offline` only while the row still names it
+(`AgentDao::mark_offline_if_conn`, `crates/services/src/dao/agent.rs`). A newer hello makes the
+late write a no-op, in whichever order the two land, on this pod or another.
+⚠️ The pod's shutdown sweep (`mark_status_many`) still writes `Offline` for every agent it held,
+300 ms after cancelling their sockets. An agent that reconnects to another pod within that window
+reads `Offline` until its next heartbeat.
 
 ### Adding a variant
 
