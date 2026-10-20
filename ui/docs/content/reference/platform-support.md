@@ -68,7 +68,7 @@ organization chooses it with `roomler org overlay <org> netstack`
 | Typing text on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
 | Match the remote display to your window | ✅ | ✅ X11 desktops with one screen and a per-user install, from agent 0.4.148, and the agent's own virtual desktop · ❌ Wayland desktops, system installs, several screens | ❌ |
 | Clipboard: text, formatted text and images | ✅ | ✅ per-user · ❌ a system install | ✅ |
-| A copied image arrives by itself | ✅ | ❌ on request | ❌ on request |
+| A copied image arrives by itself | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148 · ❌ Wayland desktops and system installs: on request | ❌ on request |
 | An idle desktop costs little CPU | ✅ | ✅ | ❌ |
 | Privacy mode (the person at the computer sees a notice, not the desktop) | ✅ Windows 10 2004 and later | ❌ | ⛔ |
 | Lock the computer when the last session ends | ✅ | ✅ | ❌ |
