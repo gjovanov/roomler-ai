@@ -290,6 +290,69 @@ says when the throttle is on.
 over-allowance org's credentials to a rate-capped realm), and exit nodes on Free (P4d, after
 the throttle exists).
 
+### P4b, as proposed: per-org TURN bytes from coturn's statistics DB (AC8, approved 2026-10-20)
+
+**Where FR-20 left it.** FR-20's P3 weighed per-tenant TURN attribution and deferred it on
+purpose (`docs/fr/FR-20-per-tenant-relay-cost-metering.md`, its P3 row). coturn's Prometheus
+labels are realm-only. Per-username labels would be a cardinality bomb, because a REST username
+carries its expiry and is never reused. `--redis-statsdb` is sound, and FR-20 recommends it
+when this is taken up. AC8 takes it up. `Meter::TurnBytes` already exists
+(`crates/services/src/dao/stats.rs:80`), but nothing writes it.
+
+**What coturn publishes.** This is from its source (`src/apps/relay/ns_ioalib_engine_impl.c`,
+read 2026-10-20). The cluster's coturn is 4.18.0, linked with hiredis.
+
+| Channel | When | Payload |
+|---|---|---|
+| `turn/realm/<realm>/user/<username>/allocation/<id>/traffic` | every 4096 packets of the allocation | that period's `rcvp=…, rcvb=…, sentp=…, sentb=…` (a delta) |
+| `…/allocation/<id>/total_traffic` | once, when the allocation is deleted | the allocation's totals, in the same format |
+| `…/traffic/peer`, `…/total_traffic/peer` | the same, for the relay ↔ peer leg | the same format |
+
+**The design.**
+
+1. **The username names the paying org: `{expiry}:{principal}:org-{org}`.** Four issuance
+   paths know the org: the hub's per-session issuance (the session's org), a meeting's
+   credentials (the room's org), an overlay pair's relay grant and a tunnel's QUIC credentials
+   (the node's or tunnel's org). coturn reads the expiry before the first `:` and HMACs the
+   whole username, so neither coturn nor any client sees a difference. The session-less
+   pre-fetch (`GET /api/turn/credentials`) knows no org. Bytes relayed under it are counted as
+   unattributed and logged, never guessed; that is FR-20's rule.
+   ⚠️ The `org-` marker, not the position, is what makes the org readable. An overlay pair's
+   principal is itself `{node}:{node}` (`overlay::pair_key`), so an uncharged pair username
+   also ends in an ObjectId, which a "last hex part" rule would book as an org.
+2. **Cluster coturn** (`coturn-worker-1..3` in the `coturn` namespace) points `redis-statsdb`
+   at the cluster's Redis. The API subscribes to `…/total_traffic` and `…/total_traffic/peer`.
+   Both API pods receive every message, so the first pod to win a `SET NX` on the allocation
+   leg records it, and no allocation is counted twice. The key is the username, the
+   allocation id and the leg, because coturn numbers allocations per process and two workers
+   can reuse an id. The bytes counted are what coturn sends
+   out: `sentb` toward the client plus the peer leg's `sentb`, just as DERP counts the bytes it
+   forwards. They are written per org as `turn_bytes`, with the same `add_usage` the DERP
+   flusher uses.
+3. **PoP coturn** (the four regional PoPs, docker-compose) gets a local Redis on each PoP for
+   coturn's statistics. The PoP's `derp-relay` daemon subscribes and keeps per-org totals. It
+   reports them on the `/stats` poll the API already makes (`crates/core/src/relay_load.rs`),
+   and the API turns them into `turn_bytes`. The PoP stays database-free.
+4. **Exact, but not immediate.** `total_traffic` lands when the allocation ends, so a long
+   allocation reports late. For AC8, which is accounting, that is enough. P4c's throttle needs
+   fresher numbers and can add the 4096-packet deltas then.
+5. **Kill switch:** `relay_allowance.turn_attribution = false` means no subscription and no
+   TURN bytes read from the PoPs.
+
+**Rollout, one worker at a time.** The workers run `coturn/coturn:latest`, unpinned, so a
+restart can pull a different coturn than the one verified here. **Pinning the running version
+(4.18.0) comes first.** Their ConfigMaps (`coturn-worker-N-config`) live outside the deploy repo
+and move into it before they are edited, so the change is reviewable and reversible. Then one
+line (`redis-statsdb=…`) goes to worker-1. It is verified (a TURN-only session still connects,
+and the statistics arrive), then applied to workers 2 and 3. The PoPs follow.
+
+**Before the field.**
+- **Unit:** the parser on coturn's exact payloads, the username split, and the egress sum.
+- **Integration:** a fake publisher on the test Redis produces `turn_bytes` rows for the org,
+  with each allocation counted once even with two subscribers.
+- **Field:** a session forced through TURN (`iceTransportPolicy: relay`), after which
+  `stats_usage` shows `turn_bytes` for that org (AC8). Check it before the coturn flip and after.
+
 ### Meetings
 
 Free meetings end at 60 minutes with a warning at 55; the participant caps become
@@ -368,7 +431,7 @@ room is piped across workers. That is O4.
 | P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`73bc6daeb`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
 | P3b | A cross-org session counts against the controller's org (Redis leases); Free gets no support sessions to other orgs | `rc.org_session_cap = false` | ⬜ |
 | P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 design approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616) is on the API pods, shipped dark. P4a-2 (the PoPs, via the signed `/stats` poll) and P4a-3 (the analytics surface) come next, and O3's measurement comes before it is switched on |
-| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | coturn flag off | ⬜ |
+| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | 📝 designed 2026-10-20 (*P4b, as proposed*), AC8 approved. First pin coturn (it runs `:latest`) and bring the worker ConfigMaps into the deploy repo |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
 | P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ✅ merged #2583 (`5679857cc`); AC9 field-verified on prod 2026-10-20 in real time (warned at 55:00, ended at 60:00); the SFU measurement found nothing to measure (O4) |
