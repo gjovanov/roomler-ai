@@ -99,6 +99,7 @@ import {
   appsLaunchWireMessage,
   decodeStatWireMessage,
   displayMatchWireMessage,
+  HeldRequest,
   pickAutoTransport,
   AV1_CODEC_STRING,
   priorityWireMessage,
@@ -3058,6 +3059,36 @@ describe('displayMatchWireMessage (rc.191)', () => {
       t: 'rc:display-match',
       enable: false,
     })
+  })
+})
+
+/** #2638 - the per-connect display-match re-send is made when the session turns
+ *  `connected`, before the control channel opens; it is held, and the channel's
+ *  open sends it. */
+describe('HeldRequest (#2638)', () => {
+  it('holds nothing until asked, and gives a held request back once', () => {
+    const held = new HeldRequest<{ width: number; height: number } | null>()
+    expect(held.take()).toBeNull()
+    held.hold({ width: 946, height: 598 })
+    expect(held.take()).toEqual({ value: { width: 946, height: 598 } })
+    // Taken: the open that sent it cannot send it twice.
+    expect(held.take()).toBeNull()
+  })
+
+  it('keeps the newest, and a held "turn it off" is a request too', () => {
+    const held = new HeldRequest<{ width: number; height: number } | null>()
+    held.hold({ width: 946, height: 598 })
+    held.hold(null)
+    // `null` is a value here, not "nothing held": the toggle went off before
+    // the channel opened, and the host must hear that.
+    expect(held.take()).toEqual({ value: null })
+  })
+
+  it('a new session clears what an earlier one held', () => {
+    const held = new HeldRequest<{ width: number; height: number } | null>()
+    held.hold({ width: 1280, height: 720 })
+    held.clear()
+    expect(held.take()).toBeNull()
   })
 })
 

@@ -2883,6 +2883,28 @@ export function displayMatchWireMessage(
   }
 }
 
+/** #2638 - a request the control channel cannot carry yet, held until it
+ *  opens. The newest wins, and a held `null` (turn it off) is a request too.
+ *  The viewer re-sends its display-match preference when the session turns
+ *  `connected`, which is the peer connection's state; the control channel
+ *  opens after it, so a send that waited for nothing was dropped and the
+ *  default-ON preference never reached a host. */
+export class HeldRequest<T> {
+  private held: { value: T } | null = null
+  hold(value: T): void {
+    this.held = { value }
+  }
+  clear(): void {
+    this.held = null
+  }
+  /** The held request, once; `null` when nothing is held. */
+  take(): { value: T } | null {
+    const h = this.held
+    this.held = null
+    return h
+  }
+}
+
 /** rc.190 Ã¢ÂÂ the AV1 codec string for the `data-channel-av1` transport.
  *  Main profile (0), seq_level_idx 13 = Level 5.1 (covers 4K@60 Ã¢ÂÂ the
  *  HEVC L3.1 lesson: the declared level is a MAX, a smaller stream
@@ -5297,6 +5319,9 @@ export function useRemoteControl(
   /** Data channels we open proactively (per docs ÃÂ§5). Labels match the
    *  agent's expected routing: input/control/clipboard/files. */
   const channels: Record<string, RTCDataChannel> = {}
+  // #2638 - a display-match request made before the control channel opened,
+  // sent from its `onopen` (see `sendDisplayMatch`).
+  const heldDisplayMatch = new HeldRequest<{ width: number; height: number } | null>()
   const inputChannelOpen = ref(false)
   // Multi-user P3: the session's EFFECTIVE input grant, from
   // `rc:session.created.permissions`. `true` until a server says otherwise
@@ -6827,11 +6852,16 @@ export function useRemoteControl(
 
   /** rc.191 Ã¢ÂÂ send a display-match request over the control DC: the agent
    *  switches its display to the largest mode fitting `dims` (viewer stage
-   *  in physical px) and restores on `null` / channel close. No-op while
-   *  the channel is closed. */
+   *  in physical px) and restores on `null` / channel close. Held while
+   *  the channel is not open yet, and sent from its `onopen` (#2638). */
   function sendDisplayMatch(dims: { width: number; height: number } | null) {
     const ch = channels.control
-    if (!ch || ch.readyState !== 'open') return
+    if (!ch || ch.readyState !== 'open') {
+      // #2638 - not open yet: `channels.control.onopen` sends it.
+      heldDisplayMatch.hold(dims)
+      return
+    }
+    heldDisplayMatch.clear()
     try {
       ch.send(JSON.stringify(displayMatchWireMessage(dims)))
     } catch {
@@ -9123,6 +9153,9 @@ export function useRemoteControl(
       maxRetransmits: 0,
     })
     channels.control = pc.createDataChannel('control', { ordered: true })
+    // #2638 - a request held for an earlier session's channel never carries
+    // over into this one.
+    heldDisplayMatch.clear()
     // Cursor channel: reliable + ordered because a dropped `cursor:
     // shape` message would leave the browser unable to render the
     // current cursor. Position-only updates would also be fine
@@ -9763,6 +9796,10 @@ export function useRemoteControl(
     channels.control.onopen = () => {
       sendQualityPreference()
       sendResolutionPreference()
+      // #2638 - the display-match request the session made before this
+      // channel opened (the per-connect re-send of the stored preference).
+      const dm = heldDisplayMatch.take()
+      if (dm) sendDisplayMatch(dm.value)
       // rc.199 Ã¢ÂÂ re-emit the stored Priority dial so a reloaded session
       // restores the operator's sharpness/smoothness choice without a click.
       sendPriorityPreference()
