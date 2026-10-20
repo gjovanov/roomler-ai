@@ -27,6 +27,14 @@
 //! then posts a card into the session's room and refuses
 //! `awaiting_approval`, naming the approval; once a driver has said yes, the
 //! same request is answered with a lease, which spends the approval.
+//!
+//! P3-7-1b — a session asks for its own egress with `rc:vault.net`: a SOCKS5
+//! listener, or one forward, through one exit ([`NetKind`]). The vault
+//! answers `rc:vault.net.granted`, a grant signed by the server's auth
+//! service under an audience of its own (`net_grant`), or `rc:vault.refused`.
+//! A grant is no lease: it carries no value, and nothing revokes it before
+//! its end. A forward's host is decided and granted in one spelling,
+//! [`canonical_net_host`]'s.
 
 /// Bounds on a lease request, read by both ends: the server refuses past
 /// them (`bad_request`), and a device never asks past them.
@@ -76,6 +84,9 @@ pub mod lease_limits {
     /// P3-4e — how long a yes stays usable, in seconds from the answer: the
     /// session asks again within it, and the one lease it gets spends it.
     pub const APPROVAL_USE_SECS: u32 = 300;
+    /// P3-7-1b — a forward's destination host, at most as long as DNS
+    /// allows a name.
+    pub const MAX_NET_HOST_LEN: usize = 253;
 }
 
 /// P3-4c — a program's BARE name, as `exec_allow` holds it and as a device
@@ -165,6 +176,8 @@ pub enum LeaseRefusal {
     /// approval: a card waits in the session's room, and the same request is
     /// answered once a driver has said yes (a no makes it `denied`).
     AwaitingApproval,
+    /// P3-7-1b — no live device of this organization by the exit's id.
+    NoExit,
 }
 
 impl LeaseRefusal {
@@ -187,10 +200,11 @@ impl LeaseRefusal {
             Self::Undecided => "undecided",
             Self::Busy => "busy",
             Self::AwaitingApproval => "awaiting_approval",
+            Self::NoExit => "no_exit",
         }
     }
 
-    pub const ALL: [LeaseRefusal; 15] = [
+    pub const ALL: [LeaseRefusal; 16] = [
         Self::NotServed,
         Self::Unsupported,
         Self::BadRequest,
@@ -206,6 +220,7 @@ impl LeaseRefusal {
         Self::Undecided,
         Self::Busy,
         Self::AwaitingApproval,
+        Self::NoExit,
     ];
 
     /// Parse a refusal word. `None` for a word this build cannot name, which
@@ -325,6 +340,81 @@ impl VaultActivityKind {
     }
 }
 
+/// P3-7-1b — the egress a session asks for (`rc:vault.net`): a SOCKS5
+/// listener, whose flows reach what the tunnel policies let through the
+/// exit, or a forward to one destination. Cedar decides them as two actions,
+/// `net:socks` and `net:forward`, so a permit for one opens nothing for the
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetKind {
+    Socks,
+    Forward,
+}
+
+impl NetKind {
+    /// Exactly what crosses the wire, and what a grant names. ⚠️ A
+    /// compatibility surface, locked by test.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Socks => "socks",
+            Self::Forward => "forward",
+        }
+    }
+
+    pub const ALL: [NetKind; 2] = [Self::Socks, Self::Forward];
+
+    /// `None` for a word this build cannot name: the vault refuses such a
+    /// request `bad_request`, and a grant naming one is no grant.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.wire() == s)
+    }
+}
+
+/// P3-7-1b — a forward's destination host in the one spelling the vault
+/// decides and grants it in, and the network module (P3-7-2) and the device
+/// (P3-7-3) compare it in:
+/// - an IP address in its canonical form, an IPv4-mapped IPv6 address as its
+///   IPv4;
+/// - a DNS name lowercased, without the root's dot, in labels of letters,
+///   digits, `-` and `_`, none empty, none longer than 63, none starting or
+///   ending with `-`.
+///
+/// `None` for anything else: brackets, a zone, a port, a path, a space.
+///
+/// ⚠️ A policy compares `context.host` by equality, so the spelling a session
+/// asks in must never decide whether a `forbid` applies: `DB.internal.` is
+/// `db.internal`.
+///
+/// ⚠️ A name whose LAST label is a number (`10.0.0`, `167772165`,
+/// `0xa000005`, `010.0.0.5`) is refused, never taken as a name. The system
+/// resolver (`inet_aton`) reads each as an address, `010.0.0.5` in octal as
+/// `8.0.0.5`, so a forward permitted toward a name could be dialled to an
+/// address no policy saw. No top-level domain is numeric (RFC 3696 §2).
+pub fn canonical_net_host(host: &str) -> Option<String> {
+    if host.is_empty() || host.len() > lease_limits::MAX_NET_HOST_LEN {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip.to_canonical().to_string());
+    }
+    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+    };
+    let numeric = |l: &str| {
+        l.bytes().all(|b| b.is_ascii_digit())
+            || l.strip_prefix("0x")
+                .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    let last = name.rsplit('.').next()?;
+    (name.split('.').all(label_ok) && !numeric(last)).then_some(name)
+}
+
 /// P3-6b — the providers a `dynamic` secret names (FR-90 §3e "P3-6,
 /// `short-lived`, as designed"). Each fixes two sets of names, which the
 /// server and the daemon must agree on:
@@ -420,6 +510,7 @@ mod tests {
                 "undecided",
                 "busy",
                 "awaiting_approval",
+                "no_exit",
             ]
         );
         for r in LeaseRefusal::ALL {
@@ -441,6 +532,79 @@ mod tests {
             assert_eq!(VaultActivityKind::from_wire(k.wire()), Some(k));
         }
         assert_eq!(VaultActivityKind::from_wire("teleport"), None);
+    }
+
+    /// P3-7-1b — spelled out literally, so a rename is a deliberate edit
+    /// here.
+    #[test]
+    fn net_kinds_are_locked_and_round_trip() {
+        let words: Vec<&str> = NetKind::ALL.iter().map(|k| k.wire()).collect();
+        assert_eq!(words, ["socks", "forward"]);
+        for k in NetKind::ALL {
+            assert_eq!(NetKind::from_wire(k.wire()), Some(k));
+        }
+        assert_eq!(NetKind::from_wire("udp"), None);
+        assert_eq!(NetKind::from_wire("SOCKS"), None, "one spelling");
+    }
+
+    /// P3-7-1b — one spelling per destination, so a `forbid` cannot be
+    /// stepped around by asking in another, and nothing a resolver would read
+    /// as some other address.
+    #[test]
+    fn a_forwards_host_has_one_spelling() {
+        let longest = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        for (asked, canonical) in [
+            ("db.internal", "db.internal"),
+            ("DB.Internal.", "db.internal"),
+            ("db", "db"),
+            ("db-1.corp.example", "db-1.corp.example"),
+            ("_ldap._tcp.corp.example", "_ldap._tcp.corp.example"),
+            ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+            ("localhost", "localhost"),
+            ("10.0.0.5", "10.0.0.5"),
+            ("::1", "::1"),
+            ("2001:DB8::1", "2001:db8::1"),
+            ("::ffff:10.0.0.5", "10.0.0.5"),
+            ("::ffff:a00:5", "10.0.0.5"),
+            (longest.as_str(), longest.as_str()),
+        ] {
+            assert_eq!(
+                canonical_net_host(asked).as_deref(),
+                Some(canonical),
+                "{asked}"
+            );
+        }
+        for bad in [
+            "",
+            ".",
+            "db..internal",
+            ".db",
+            "-db.internal",
+            "db-.internal",
+            "db.internal:5432",
+            "[::1]",
+            "fe80::1%eth0",
+            "db internal",
+            "db/internal",
+            "d\u{e9}.example",
+            "10.0.0",
+            "167772165",
+            "0xa000005",
+            "0XA000005",
+            "010.0.0.5",
+            "1.2.3.4.5",
+            &"a".repeat(64),
+            &format!("{}.example", "a".repeat(64)),
+            &format!("{longest}x"),
+        ] {
+            assert_eq!(canonical_net_host(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

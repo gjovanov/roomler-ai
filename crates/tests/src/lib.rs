@@ -297,6 +297,11 @@ mod vault_lease_tests;
 /// never a value.
 #[cfg(test)]
 mod vault_meta_tests;
+/// FR-90 P3-7-1b — a session's own egress: `rc:vault.net` decided by Cedar's
+/// `net:socks` or `net:forward`, believed as a lease is, answered with a grant
+/// under its own audience that names exactly what was decided.
+#[cfg(test)]
+mod vault_net_tests;
 /// FR-90 P3-3c — revocation: a session's end or move, a changed, disabled
 /// or deleted secret, a new device key, a removed device; told at once on
 /// the device's pod or at its sweep, again at every hello, never expired.

@@ -17,7 +17,7 @@ flowchart TB
         CORS["CORS · rate limit · security headers · CSP"]
     end
     subgraph ident["Identity — who is this?"]
-        JWT["JWT: 4 audiences, cross-audience rejected"]
+        JWT["JWT: one audience per credential, cross-audience rejected"]
         COOK["Session cookie — HttpOnly, Secure in prod"]
         EMAIL["Email ownership — the unique index is a RESERVATION"]
     end

@@ -63,6 +63,12 @@ pub enum TokenType {
     /// on an attended install: a user who could swap one for the other could
     /// tell SYSTEM what to run (FR-94 §4).
     AgentService,
+    /// FR-90 P3-7-1b — the vault's grant of one agent session's own egress
+    /// (`rc:vault.net`), which the network module verifies when the device
+    /// opens the tunnel. Its own audience, so no other gate accepts it and it
+    /// accepts no other credential: it acts for a session, never for the
+    /// device or a person.
+    NetGrant,
 }
 
 /// Claims carried by a remote-control enrollment token (aud = enroll).
@@ -144,6 +150,65 @@ pub struct TunnelClientClaims {
     /// FR-103: the client row's token generation, as for [`AgentClaims::generation`].
     #[serde(default, rename = "gen")]
     pub generation: u32,
+}
+
+/// FR-90 P3-7-1b — claims carried by a session's egress grant (`net_grant`).
+/// It names one session at one fence, running on one device, and the one
+/// exit its flows leave through: for a forward one destination, for SOCKS
+/// none. It lives at most a lease's ceiling.
+///
+/// ⚠️ The network module believes a flow under it only from the device it
+/// names as the origin: a grant copied to another device opens nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NetGrantClaims {
+    /// The session's id, hex.
+    pub sub: String,
+    pub tenant_id: String,
+    /// The session's fence when the vault decided.
+    pub fence: u64,
+    /// The person the session acts for, hex.
+    pub owner_user_id: String,
+    /// The device the session runs on, hex: the only one that may use it.
+    pub origin_agent_id: String,
+    /// The device the flows exit through, hex.
+    pub exit_agent_id: String,
+    /// A `roomler_ai_remote_control::vault::NetKind` word.
+    pub net: String,
+    /// A forward's one destination, as `canonical_net_host` spells it;
+    /// empty for SOCKS.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dst_host: String,
+    #[serde(default, skip_serializing_if = "is_zero_port")]
+    pub dst_port: u16,
+    /// The grant's id, as the vault records its allow (`grant:<jti>`).
+    pub jti: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub token_type: TokenType,
+}
+
+fn is_zero_port(port: &u16) -> bool {
+    *port == 0
+}
+
+/// FR-90 P3-7-1b — what the vault grants: every claim but the issuer, the
+/// audience and the start, which the auth service fills.
+#[derive(Debug, Clone, Copy)]
+pub struct NetGrant<'a> {
+    pub session_id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub fence: u64,
+    pub owner_user_id: ObjectId,
+    pub origin_agent_id: ObjectId,
+    pub exit_agent_id: ObjectId,
+    pub net: roomler_ai_remote_control::vault::NetKind,
+    /// A forward's destination, its host canonical; `None` for SOCKS.
+    pub dst: Option<(&'a str, u16)>,
+    pub grant_id: ObjectId,
+    /// When it ends, in seconds since the epoch: at most
+    /// `lease_limits::MAX_TTL_SECS` from now.
+    pub exp: i64,
 }
 
 /// Claims carried by a tunnel-enrollment token. Mirrors
@@ -696,6 +761,97 @@ impl AuthService {
         }
         Ok(claims)
     }
+
+    // ─── FR-90 P3-7-1b: a session's egress grant ──────────────────────
+
+    /// Sign the vault's grant of a session's egress. Refuses a grant that
+    /// does not hold together, before signing anything: a forward with no
+    /// destination, or a host not in its canonical spelling, would otherwise
+    /// be read as a grant wider than the one decided; SOCKS names no
+    /// destination; and none ends past the lease ceiling.
+    pub fn issue_net_grant(&self, g: &NetGrant<'_>) -> Result<String, AuthError> {
+        let now = Utc::now().timestamp();
+        let (dst_host, dst_port) = match g.dst {
+            Some((host, port)) => (host.to_string(), port),
+            None => (String::new(), 0),
+        };
+        let claims = NetGrantClaims {
+            sub: g.session_id.to_hex(),
+            tenant_id: g.tenant_id.to_hex(),
+            fence: g.fence,
+            owner_user_id: g.owner_user_id.to_hex(),
+            origin_agent_id: g.origin_agent_id.to_hex(),
+            exit_agent_id: g.exit_agent_id.to_hex(),
+            net: g.net.wire().to_string(),
+            dst_host,
+            dst_port,
+            jti: g.grant_id.to_hex(),
+            iat: now,
+            exp: g.exp,
+            iss: self.jwt_settings.issuer.clone(),
+            token_type: TokenType::NetGrant,
+        };
+        net_grant_holds(&claims)?;
+        encode(&self.header(), &claims, &self.signing.encoding)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+    }
+
+    /// Verify a session's egress grant. Refuses every other audience, and
+    /// every other verifier refuses this one. Checked as it was issued: its
+    /// kind, its destination, its ids and its life.
+    ///
+    /// ⚠️ No leeway past `exp`: a grant's end is a decision's, at most the
+    /// lease ceiling, never the minute of clock skew a year-long token is
+    /// given. The tokens are made and checked by the same servers.
+    pub fn verify_net_grant(&self, token: &str) -> Result<NetGrantClaims, AuthError> {
+        let mut validation = self.validation();
+        validation.leeway = 0;
+        let claims = self.decode_any::<NetGrantClaims>(token, &validation)?;
+        if claims.token_type != TokenType::NetGrant {
+            return Err(AuthError::InvalidToken("Not a net grant".to_string()));
+        }
+        net_grant_holds(&claims)?;
+        Ok(claims)
+    }
+}
+
+/// FR-90 P3-7-1b — whether a grant's claims hold together, at its signing
+/// and at every check: a kind this build names; a forward's destination
+/// canonical and whole, and SOCKS naming none; every id an id; and a life no
+/// longer than a lease's ceiling.
+fn net_grant_holds(c: &NetGrantClaims) -> Result<(), AuthError> {
+    use roomler_ai_remote_control::vault::{NetKind, canonical_net_host, lease_limits};
+    let bad = |why: &str| Err(AuthError::InvalidToken(format!("net grant: {why}")));
+    match NetKind::from_wire(&c.net) {
+        None => return bad("a kind this build cannot name"),
+        Some(NetKind::Forward) => {
+            if c.dst_port == 0
+                || canonical_net_host(&c.dst_host).as_deref() != Some(c.dst_host.as_str())
+            {
+                return bad("a forward names one destination, its host canonical");
+            }
+        }
+        Some(NetKind::Socks) => {
+            if !c.dst_host.is_empty() || c.dst_port != 0 {
+                return bad("SOCKS names no destination");
+            }
+        }
+    }
+    let ids = [
+        &c.sub,
+        &c.tenant_id,
+        &c.owner_user_id,
+        &c.origin_agent_id,
+        &c.exit_agent_id,
+        &c.jti,
+    ];
+    if ids.iter().any(|id| ObjectId::parse_str(id).is_err()) {
+        return bad("an id that is not one");
+    }
+    if c.exp <= c.iat || c.exp - c.iat > i64::from(lease_limits::MAX_TTL_SECS) {
+        return bad("a life past the lease ceiling");
+    }
+    Ok(())
 }
 
 fn uuid_v4_hex() -> String {
@@ -1378,5 +1534,215 @@ mod tests {
             b64(claims.to_string()),
         );
         assert!(s.verify_agent_token(&forged).is_err());
+    }
+
+    // ─── FR-90 P3-7-1b: a session's egress grant ──────────────────────
+
+    use roomler_ai_remote_control::vault::NetKind;
+
+    fn a_grant<'a>(net: NetKind, dst: Option<(&'a str, u16)>, exp: i64) -> NetGrant<'a> {
+        NetGrant {
+            session_id: ObjectId::new(),
+            tenant_id: ObjectId::new(),
+            fence: 7,
+            owner_user_id: ObjectId::new(),
+            origin_agent_id: ObjectId::new(),
+            exit_agent_id: ObjectId::new(),
+            net,
+            dst,
+            grant_id: ObjectId::new(),
+            exp,
+        }
+    }
+
+    fn in_secs(s: i64) -> i64 {
+        Utc::now().timestamp() + s
+    }
+
+    /// A grant names what was decided, and only its own verifier takes it:
+    /// no other gate accepts it, and it accepts no other credential.
+    #[test]
+    fn net_grant_roundtrip_and_audiences() {
+        let s = svc();
+        let g = a_grant(NetKind::Forward, Some(("db.internal", 5432)), in_secs(300));
+        let token = s.issue_net_grant(&g).unwrap();
+        let c = s.verify_net_grant(&token).unwrap();
+        assert_eq!(
+            (c.sub.as_str(), c.tenant_id.as_str(), c.fence),
+            (
+                g.session_id.to_hex().as_str(),
+                g.tenant_id.to_hex().as_str(),
+                7
+            )
+        );
+        assert_eq!(c.owner_user_id, g.owner_user_id.to_hex());
+        assert_eq!(c.origin_agent_id, g.origin_agent_id.to_hex());
+        assert_eq!(c.exit_agent_id, g.exit_agent_id.to_hex());
+        assert_eq!(
+            (c.net.as_str(), c.dst_host.as_str(), c.dst_port),
+            ("forward", "db.internal", 5432)
+        );
+        assert_eq!(c.jti, g.grant_id.to_hex());
+        assert_eq!((c.exp, c.token_type.clone()), (g.exp, TokenType::NetGrant));
+
+        let socks = s
+            .issue_net_grant(&a_grant(NetKind::Socks, None, in_secs(60)))
+            .unwrap();
+        let c = s.verify_net_grant(&socks).unwrap();
+        assert_eq!(
+            (c.net.as_str(), c.dst_host.as_str(), c.dst_port),
+            ("socks", "", 0)
+        );
+
+        // No other gate accepts a grant.
+        for t in [&token, &socks] {
+            assert!(s.verify_token(t).is_err());
+            assert!(s.verify_access_token(t).is_err());
+            assert!(s.verify_refresh_token(t).is_err());
+            assert!(s.verify_enrollment_token(t).is_err());
+            assert!(s.verify_enrollment_token_any(t).is_err());
+            assert!(s.verify_agent_token(t).is_err());
+            assert!(s.verify_agent_token_for_renewal(t).is_err());
+            assert!(s.verify_agent_service_token(t).is_err());
+            assert!(s.verify_tunnel_enrollment_token(t).is_err());
+            assert!(s.verify_tunnel_client_token(t).is_err());
+            assert!(s.verify_tunnel_client_token_for_renewal(t).is_err());
+        }
+        // And a grant is no other credential.
+        let (agent, tenant) = (ObjectId::new(), ObjectId::new());
+        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
+        let others = [
+            pair.access_token,
+            pair.refresh_token,
+            s.issue_enrollment_token(ObjectId::new(), tenant, 600)
+                .unwrap()
+                .0,
+            s.issue_ephemeral_enroll_key_token(ObjectId::new(), tenant, "j", in_secs(600))
+                .unwrap(),
+            s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap(),
+            s.issue_agent_service_token(agent, tenant, "anchor-1")
+                .unwrap(),
+            s.issue_tunnel_enrollment_token(ObjectId::new(), tenant, 600)
+                .unwrap()
+                .0,
+            s.issue_tunnel_client_token(ObjectId::new(), tenant, ObjectId::new(), 0, Some(60))
+                .unwrap(),
+        ];
+        for t in &others {
+            assert!(s.verify_net_grant(t).is_err());
+        }
+    }
+
+    /// The issuer refuses a grant that does not hold together, so no caller's
+    /// slip can sign one wider than the vault decided.
+    #[test]
+    fn a_net_grant_that_does_not_hold_together_is_never_signed() {
+        let s = svc();
+        for g in [
+            a_grant(NetKind::Forward, None, in_secs(60)),
+            a_grant(NetKind::Forward, Some(("db.internal", 0)), in_secs(60)),
+            a_grant(NetKind::Forward, Some(("", 5432)), in_secs(60)),
+            a_grant(NetKind::Forward, Some(("DB.internal", 5432)), in_secs(60)),
+            a_grant(NetKind::Forward, Some(("db.internal.", 5432)), in_secs(60)),
+            a_grant(NetKind::Socks, Some(("db.internal", 5432)), in_secs(60)),
+            // Past the ceiling by more than a second's tick between the two
+            // clocks reads, so never at it by chance.
+            a_grant(NetKind::Socks, None, in_secs(905)),
+            a_grant(NetKind::Socks, None, in_secs(0)),
+            a_grant(NetKind::Socks, None, in_secs(-10)),
+        ] {
+            assert!(s.issue_net_grant(&g).is_err(), "{g:?}");
+        }
+        assert!(
+            s.issue_net_grant(&a_grant(NetKind::Socks, None, in_secs(900)))
+                .is_ok(),
+            "the ceiling itself"
+        );
+    }
+
+    /// A token signed with the server's own key but naming a grant that does
+    /// not hold together is refused at the check too, whoever signed it.
+    #[test]
+    fn a_net_grant_signed_wider_than_it_holds_is_refused() {
+        let s = svc();
+        let now = Utc::now().timestamp();
+        let good = NetGrantClaims {
+            sub: ObjectId::new().to_hex(),
+            tenant_id: ObjectId::new().to_hex(),
+            fence: 1,
+            owner_user_id: ObjectId::new().to_hex(),
+            origin_agent_id: ObjectId::new().to_hex(),
+            exit_agent_id: ObjectId::new().to_hex(),
+            net: "forward".into(),
+            dst_host: "db.internal".into(),
+            dst_port: 5432,
+            jti: ObjectId::new().to_hex(),
+            iat: now,
+            exp: now + 60,
+            iss: "roomler-ai-test".into(),
+            token_type: TokenType::NetGrant,
+        };
+        let signed = |c: &NetGrantClaims| encode(&s.header(), c, &s.signing.encoding).unwrap();
+        assert!(s.verify_net_grant(&signed(&good)).is_ok());
+        let mut wider = Vec::new();
+        let mut c = good.clone();
+        c.dst_host = String::new();
+        c.dst_port = 0;
+        wider.push(("a forward with no destination", c));
+        let mut c = good.clone();
+        c.dst_host = "DB.INTERNAL".into();
+        wider.push(("a host not canonical", c));
+        let mut c = good.clone();
+        c.net = "socks".into();
+        wider.push(("SOCKS naming a destination", c));
+        let mut c = good.clone();
+        c.net = "udp".into();
+        wider.push(("a kind this build cannot name", c));
+        let mut c = good.clone();
+        c.origin_agent_id = "any-device".into();
+        wider.push(("an origin that is no id", c));
+        let mut c = good.clone();
+        c.exp = now + 901;
+        wider.push(("a life past the ceiling", c));
+        // A grant's every claim, under another audience: no grant at all.
+        let mut c = good.clone();
+        c.token_type = TokenType::Agent;
+        wider.push(("another audience", c));
+        for (why, c) in &wider {
+            assert!(s.verify_net_grant(&signed(c)).is_err(), "{why}");
+        }
+    }
+
+    /// A grant ends at its end: none of the leeway every other verifier
+    /// gives, which would let a grant decided for 900 s open a flow at 959.
+    #[test]
+    fn a_net_grant_has_no_leeway_past_its_end() {
+        let s = svc();
+        let now = Utc::now().timestamp();
+        let lapsed = NetGrantClaims {
+            sub: ObjectId::new().to_hex(),
+            tenant_id: ObjectId::new().to_hex(),
+            fence: 1,
+            owner_user_id: ObjectId::new().to_hex(),
+            origin_agent_id: ObjectId::new().to_hex(),
+            exit_agent_id: ObjectId::new().to_hex(),
+            net: "socks".into(),
+            dst_host: String::new(),
+            dst_port: 0,
+            jti: ObjectId::new().to_hex(),
+            iat: now - 65,
+            exp: now - 5,
+            iss: "roomler-ai-test".into(),
+            token_type: TokenType::NetGrant,
+        };
+        let t = encode(&s.header(), &lapsed, &s.signing.encoding).unwrap();
+        assert!(
+            s.decode_any::<NetGrantClaims>(&t, &s.validation()).is_ok(),
+            "the default validation's minute of leeway would take it"
+        );
+        assert!(matches!(
+            s.verify_net_grant(&t),
+            Err(AuthError::TokenExpired)
+        ));
     }
 }

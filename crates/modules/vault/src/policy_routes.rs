@@ -25,6 +25,7 @@ use axum::{
     http::StatusCode,
 };
 use bson::{DateTime, Document, doc, oid::ObjectId};
+use roomler_ai_remote_control::vault::canonical_net_host;
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 use serde::{Deserialize, Serialize};
@@ -850,10 +851,19 @@ pub async fn simulate(
                         "net:forward needs host and port".into(),
                     ));
                 };
+                // P3-7-1b — decided as the vault decides a session's request:
+                // the host in its one spelling, and a port.
+                let Some(host) = canonical_net_host(host).filter(|_| port != 0) else {
+                    return Err(ApiError::BadRequest(
+                        "net:forward needs a host a forward can name (a DNS name or an address, \
+                         no port) and a port other than 0"
+                            .into(),
+                    ));
+                };
                 Request::NetForward {
                     session,
                     node,
-                    host: host.clone(),
+                    host,
                     port,
                     device,
                 }
