@@ -192,7 +192,7 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
       },
       {
         label: 'Free to start',
-        text: 'Up to three devices on the free plan — remote desktop, private mesh, tunnels, chat and calls all included.',
+        text: 'Up to 10 users and 100 devices on the free plan, commercial use included — remote desktop, private mesh, tunnels, chat and calls.',
       },
     ],
   },
