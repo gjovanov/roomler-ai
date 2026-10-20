@@ -232,8 +232,8 @@ standing (`fleet/src/socket.rs:275-281`).
 ## Reconcile on connect — and the three races it must not re-run
 
 At agent register, where `ConfigPush` reconciles, a standing order is pushed again
-if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:260-199`,
-`:250-272`) — the offline case, through the same path as the online one, so it runs
+if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:361-377`,
+`:440-461`) — the offline case, through the same path as the online one, so it runs
 on every connect rather than only when nobody is watching. Three field cycles on
 2026-08-30 each found a way for that to go wrong; each left a rule:
 
@@ -310,10 +310,10 @@ The server cannot see the device switch, so a switched-off device is still order
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2837`, `:964`; owner `network` (`:2074`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1770`, `:1796`, `:1821`, `:1852`, `:3305`, `:5864`, `:5879` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
-| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:260-199`, `:280-302` |
+| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:361-377`, `:440-461` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:173` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:536-559`; `crates/services/src/dao/agent.rs:915` |
-| the conditional report write | `crates/services/src/dao/agent.rs:798-764` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:536-559`; `crates/services/src/dao/agent.rs:945` |
+| the conditional report write | `crates/services/src/dao/agent.rs:999-1029` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-676`, `:1449-1457` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:4567-4381`, `:2369-2391`, `:2401-2413`, `:819-836` |
