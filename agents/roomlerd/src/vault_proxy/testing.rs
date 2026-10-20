@@ -252,6 +252,320 @@ pub(crate) async fn fake(how: Upstreams) -> (String, u16, mpsc::UnboundedReceive
     (pem, port, rx)
 }
 
+/// P3-6b-2 — one role the fake issuer's database holds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FakeRole {
+    pub(crate) verifier: String,
+    pub(crate) valid_until: String,
+    pub(crate) grants: Vec<String>,
+    pub(crate) comment: Option<String>,
+    pub(crate) login: bool,
+}
+
+/// The fake issuer's roles, by name.
+pub(crate) type FakeRoles = Arc<std::sync::Mutex<std::collections::BTreeMap<String, FakeRole>>>;
+
+/// What the fake issuer refuses, as Postgres refuses an issuer short of a
+/// privilege: `CREATE ROLE` without `CREATEROLE`, ending another role's
+/// session without `pg_signal_backend`, `REASSIGN OWNED` without the role's
+/// privileges.
+#[derive(Default)]
+pub(crate) struct Refuse {
+    pub(crate) create: std::sync::atomic::AtomicBool,
+    pub(crate) terminate: std::sync::atomic::AtomicBool,
+    pub(crate) reassign: std::sync::atomic::AtomicBool,
+}
+
+/// P3-6b-2 — a Postgres an issuer mints in, over real TLS with a
+/// certificate made for the test. `admin` signs in with the password it was
+/// made with; a role it made signs in by the verifier `CREATE ROLE` gave
+/// it, as Postgres signs one in, while it may log in. The minter's
+/// statements are answered as Postgres answers them, and every query kept.
+pub(crate) struct FakeIssuer {
+    pub(crate) ca: String,
+    pub(crate) port: u16,
+    pub(crate) saw: mpsc::UnboundedReceiver<String>,
+    pub(crate) roles: FakeRoles,
+    pub(crate) refuse: Arc<Refuse>,
+    /// How many connections it took: zero for a call refused before
+    /// anything is dialled.
+    pub(crate) dialled: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(crate) async fn fake_issuer(password: &str) -> FakeIssuer {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let ca = cert.cert.pem();
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, saw) = mpsc::unbounded_channel();
+    let roles: FakeRoles = Arc::default();
+    let refuse: Arc<Refuse> = Arc::default();
+    let dialled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let password = password.to_string();
+    let (r2, f2, d2) = (roles.clone(), refuse.clone(), dialled.clone());
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (acceptor, tx, roles, refuse) =
+                (acceptor.clone(), tx.clone(), r2.clone(), f2.clone());
+            let password = password.clone();
+            tokio::spawn(async move {
+                let Ok(packet) = read_startup(&mut tcp).await else {
+                    return;
+                };
+                assert_eq!(&packet[..4], &SSL_REQUEST.to_be_bytes());
+                tcp.write_all(b"S").await.unwrap();
+                let Ok(mut s) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(packet) = read_startup(&mut s).await else {
+                    return;
+                };
+                let params = parse_params(&packet[4..]).unwrap();
+                let user = params
+                    .iter()
+                    .find(|(k, _)| k == "user")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let server = if user == "admin" {
+                    Some(ScramServer::new(&password, b"a-salt", 4096, "upnonce"))
+                } else {
+                    let role = roles
+                        .lock()
+                        .unwrap()
+                        .get(&user)
+                        .filter(|r| r.login)
+                        .cloned();
+                    // A password that is no verifier signs nobody in.
+                    role.and_then(|r| ScramServer::from_verifier(&r.verifier, "upnonce").ok())
+                };
+                let r = |code: u32, more: &[u8]| {
+                    let mut b = code.to_be_bytes().to_vec();
+                    b.extend(more);
+                    frame(Some(b'R'), &b)
+                };
+                let Some(mut srv) = server else {
+                    let _ = s
+                        .write_all(&pg_error(
+                            "28P01",
+                            &format!("password authentication failed for user \"{user}\""),
+                        ))
+                        .await;
+                    return;
+                };
+                // Plain SCRAM-SHA-256 only: a server that cannot bind.
+                s.write_all(&r(10, b"SCRAM-SHA-256\0\0")).await.unwrap();
+                let Ok((_, body)) = read_message(&mut s, 64 * 1024).await else {
+                    return;
+                };
+                let nul = body.iter().position(|b| *b == 0).unwrap();
+                let first = std::str::from_utf8(&body[nul + 1 + 4..]).unwrap();
+                let server_first = srv.server_first(first);
+                s.write_all(&r(11, server_first.as_bytes())).await.unwrap();
+                let Ok((_, fin)) = read_message(&mut s, 64 * 1024).await else {
+                    return;
+                };
+                match srv.server_final(std::str::from_utf8(&fin).unwrap()) {
+                    Ok(v) => {
+                        s.write_all(&r(12, v.as_bytes())).await.unwrap();
+                        s.write_all(&r(0, &[])).await.unwrap();
+                    }
+                    Err(_) => {
+                        let _ = s
+                            .write_all(&pg_error(
+                                "28P01",
+                                &format!("password authentication failed for user \"{user}\""),
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+                s.write_all(&frame(Some(b'S'), b"server_version\x0017.2\x00"))
+                    .await
+                    .unwrap();
+                s.write_all(&frame(Some(b'K'), &[0, 0, 0, 9, 1, 2, 3, 4]))
+                    .await
+                    .unwrap();
+                s.write_all(&frame(Some(b'Z'), b"I")).await.unwrap();
+                while let Ok((tag, body)) = read_message(&mut s, 1 << 20).await {
+                    if tag != b'Q' {
+                        return;
+                    }
+                    let sql = String::from_utf8_lossy(&body[..body.len() - 1]).into_owned();
+                    let _ = tx.send(sql.clone());
+                    let reply = issuer_answer(&sql, &roles, &refuse);
+                    s.write_all(&reply).await.unwrap();
+                }
+            });
+        }
+    });
+    FakeIssuer {
+        ca,
+        port,
+        saw,
+        roles,
+        refuse,
+        dialled,
+    }
+}
+
+/// An `ErrorResponse`, `ERROR` with this SQLSTATE and message.
+fn pg_error(code: &str, message: &str) -> Vec<u8> {
+    let mut e = Vec::new();
+    for (c, t) in [(b'S', "ERROR"), (b'C', code), (b'M', message)] {
+        e.push(c);
+        e.extend(t.as_bytes());
+        e.push(0);
+    }
+    e.push(0);
+    frame(Some(b'E'), &e)
+}
+
+/// A `DataRow` of text columns.
+fn pg_row(columns: &[&str]) -> Vec<u8> {
+    let mut d = (columns.len() as u16).to_be_bytes().to_vec();
+    for c in columns {
+        d.extend((c.len() as i32).to_be_bytes());
+        d.extend(c.as_bytes());
+    }
+    frame(Some(b'D'), &d)
+}
+
+/// The text between `open` and the next `close` after it.
+fn between<'a>(s: &'a str, open: &str, close: char) -> Option<&'a str> {
+    let rest = &s[s.find(open)? + open.len()..];
+    Some(&rest[..rest.find(close)?])
+}
+
+/// How the fake issuer's database answers one query: the statements the
+/// minter sends, as Postgres answers them; anything else, a syntax error.
+/// Each clause is read where it stands, and one that is absent leaves what it
+/// sets empty, so a minter that drops a clause is caught by what its test
+/// asserts, never by this fake.
+fn issuer_answer(sql: &str, roles: &FakeRoles, refuse: &Refuse) -> Vec<u8> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let done = |tags: &[&str]| {
+        let mut out = Vec::new();
+        for t in tags {
+            out.extend(frame(Some(b'C'), format!("{t}\0").as_bytes()));
+        }
+        out
+    };
+    let missing = |name: &str| pg_error("42704", &format!("role \"{name}\" does not exist"));
+    let mut out = if sql.starts_with("CREATE ROLE ") {
+        if refuse.create.load(SeqCst) {
+            pg_error("42501", "permission denied to create role")
+        } else {
+            let name = between(sql, "CREATE ROLE \"", '"')
+                .unwrap_or_default()
+                .to_string();
+            let grants = sql
+                .split_once(" IN ROLE ")
+                .map(|(_, rest)| {
+                    rest.split(';')
+                        .next()
+                        .unwrap()
+                        .split(", ")
+                        .map(|g| g.trim_matches('"').to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let role = FakeRole {
+                verifier: between(sql, "PASSWORD '", '\'')
+                    .unwrap_or_default()
+                    .to_string(),
+                valid_until: between(sql, "VALID UNTIL '", '\'')
+                    .unwrap_or_default()
+                    .to_string(),
+                grants,
+                comment: between(sql, "\" IS '", '\'').map(String::from),
+                login: sql.contains(" LOGIN "),
+            };
+            roles.lock().unwrap().insert(name, role);
+            done(&["CREATE ROLE", "COMMENT"])
+        }
+    } else if sql.starts_with("SELECT r.rolname FROM pg_catalog.pg_roles r WHERE r.rolname LIKE ") {
+        // The sweep, each of its clauses applied as Postgres applies it: a
+        // name's prefix (`\_` an underscore), `VALID UNTIL` past (a role
+        // with none is never past it), the comment's prefix.
+        let prefix = between(sql, "r.rolname LIKE '", '\'')
+            .map(|p| p.trim_end_matches('%').replace("\\_", "_"));
+        let expiry = sql.contains("r.rolvaliduntil < now()");
+        let mark = between(sql, "'pg_authid') LIKE '", '\'').map(|m| m.trim_end_matches('%'));
+        let now = bson::DateTime::now();
+        let expired: Vec<String> = roles
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, r)| {
+                prefix.as_deref().is_none_or(|p| name.starts_with(p))
+                    && (!expiry
+                        || bson::DateTime::parse_rfc3339_str(&r.valid_until).is_ok_and(|t| t < now))
+                    && mark.is_none_or(|m| r.comment.as_deref().is_some_and(|c| c.starts_with(m)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut out = Vec::new();
+        for name in &expired {
+            out.extend(pg_row(&[name]));
+        }
+        out.extend(done(&[&format!("SELECT {}", expired.len())]));
+        out
+    } else if let Some(name) = sql
+        .strip_prefix("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '")
+        .and_then(|r| r.strip_suffix('\''))
+    {
+        if roles.lock().unwrap().contains_key(name) {
+            let mut out = pg_row(&["1"]);
+            out.extend(done(&["SELECT 1"]));
+            out
+        } else {
+            done(&["SELECT 0"])
+        }
+    } else if sql.starts_with("ALTER ROLE ") && sql.ends_with(" NOLOGIN") {
+        let name = between(sql, "ALTER ROLE \"", '"').unwrap_or_default();
+        match roles.lock().unwrap().get_mut(name) {
+            Some(r) => {
+                r.login = false;
+                done(&["ALTER ROLE"])
+            }
+            None => missing(name),
+        }
+    } else if sql.starts_with("SELECT pg_catalog.pg_terminate_backend(pid) ") {
+        if refuse.terminate.load(SeqCst) {
+            pg_error("42501", "permission denied to terminate process")
+        } else {
+            done(&["SELECT 0"])
+        }
+    } else if let Some(name) = between(sql, "REASSIGN OWNED BY \"", '"') {
+        if refuse.reassign.load(SeqCst) {
+            pg_error("42501", "permission denied to reassign objects")
+        } else if roles.lock().unwrap().contains_key(name) {
+            done(&["REASSIGN OWNED", "DROP OWNED"])
+        } else {
+            missing(name)
+        }
+    } else if let Some(name) = between(sql, "DROP ROLE IF EXISTS \"", '"') {
+        roles.lock().unwrap().remove(name);
+        done(&["DROP ROLE"])
+    } else {
+        pg_error("42601", "syntax error")
+    };
+    out.extend(frame(Some(b'Z'), b"I"));
+    out
+}
+
 /// A password made for one test run, never written down.
 pub(crate) fn made() -> String {
     format!("made-{:016x}", rand::random::<u64>())
