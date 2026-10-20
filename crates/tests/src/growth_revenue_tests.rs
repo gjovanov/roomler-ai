@@ -790,9 +790,37 @@ async fn set_plan(app: &TestApp, tenant_id: &str, plan: &str, mode: &str) {
         .unwrap();
 }
 
-async fn create_room(app: &TestApp, tenant_id: &str, token: &str, name: &str) -> u16 {
-    app.auth_post(&format!("/api/tenant/{tenant_id}/room"), token)
-        .json(&json!({ "name": name, "is_open": true }))
+/// FR-115 made chat unlimited on every plan, so the channel cap these tests
+/// used to collide with is gone; storage (1 GiB on Free, a mode-subject
+/// count gate) collides instead. Sit the org `headroom` bytes under the
+/// quota, the way the gate measures it (`FileDao::sum_storage_for_tenant`).
+async fn fill_storage(app: &TestApp, tenant_id: &str, headroom: u64) {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    app.db
+        .collection::<Document>("files")
+        .insert_one(doc! {
+            "tenant_id": ObjectId::parse_str(tenant_id).unwrap(),
+            "filename": "fill.bin",
+            "size": (GIB - headroom) as i64,
+            "deleted_at": Bson::Null,
+        })
+        .await
+        .unwrap();
+}
+
+/// Upload a 13-byte file into the org's first room; the status.
+async fn upload_small_file(app: &TestApp, t: &crate::fixtures::seed::SeededTenant) -> u16 {
+    let part = reqwest::multipart::Part::bytes(b"Hello, World!".to_vec())
+        .file_name("hello.txt")
+        .mime_str("text/plain")
+        .unwrap();
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("room_id", t.rooms[0].id.clone());
+    app.client
+        .post(app.url(&format!("/api/tenant/{}/file/upload", t.tenant_id)))
+        .header("Authorization", format!("Bearer {}", t.admin.access_token))
+        .multipart(form)
         .send()
         .await
         .unwrap()
@@ -804,7 +832,7 @@ async fn create_room(app: &TestApp, tenant_id: &str, token: &str, name: &str) ->
 async fn collisions(app: &TestApp, tenant: &str, want: i64) -> i64 {
     let filter = doc! {
         "source": QUOTA_SOURCE, "metric": QUOTA_COLLISION_METRIC,
-        "dims.tenant": tenant, "dims.limit": "max_channels",
+        "dims.tenant": tenant, "dims.limit": "storage_bytes",
     };
     let mut last = 0;
     for _ in 0..50 {
@@ -832,23 +860,16 @@ async fn quota_collisions_count_per_org_and_limit() {
     let (app, token) = revenue_app(|_| {}).await;
     let t = app.seed_tenant("p4quota").await;
     set_plan(&app, &t.tenant_id, "free", "warn").await;
-    // A seeded tenant holds three channels; Free caps at five.
-    for i in 0..2 {
-        let s = create_room(
-            &app,
-            &t.tenant_id,
-            &t.admin.access_token,
-            &format!("fill-{i}"),
-        )
-        .await;
-        assert!((200..300).contains(&s), "fill-{i}: {s}");
-    }
+    // Twenty bytes under Free's 1 GiB: one 13-byte file fits, the next not.
+    fill_storage(&app, &t.tenant_id, 20).await;
+    let fits = upload_small_file(&app, &t).await;
+    assert!((200..300).contains(&fits), "under the cap: {fits}");
     assert_eq!(collisions(&app, &t.tenant_id, 0).await, 0, "under the cap");
-    let warn = create_room(&app, &t.tenant_id, &t.admin.access_token, "over-warn").await;
+    let warn = upload_small_file(&app, &t).await;
     assert!((200..300).contains(&warn), "warn lets it through: {warn}");
     assert_eq!(collisions(&app, &t.tenant_id, 1).await, 1);
     set_plan(&app, &t.tenant_id, "free", "enforce").await;
-    let refused = create_room(&app, &t.tenant_id, &t.admin.access_token, "over-enforce").await;
+    let refused = upload_small_file(&app, &t).await;
     assert!(refused >= 400, "enforce refuses: {refused}");
     assert_eq!(collisions(&app, &t.tenant_id, 2).await, 2);
 
@@ -872,7 +893,7 @@ async fn quota_collisions_count_per_org_and_limit() {
     assert_eq!((&u["collisions"], &u["orgs"]), (&json!(2), &json!(1)));
     assert_eq!(
         u["by_limit"],
-        json!([{ "limit": "max_channels", "count": 2 }])
+        json!([{ "limit": "storage_bytes", "count": 2 }])
     );
     assert_eq!(u["top"][0]["tenant_id"], t.tenant_id);
     assert_eq!(u["top"][0]["days"], 1);
@@ -898,8 +919,13 @@ async fn no_collision_is_counted_with_growth_off() {
     let (app, _token) = revenue_app(|s| s.growth.enabled = false).await;
     let t = app.seed_tenant("p4quotaoff").await;
     set_plan(&app, &t.tenant_id, "free", "warn").await;
-    for i in 0..3 {
-        create_room(&app, &t.tenant_id, &t.admin.access_token, &format!("r-{i}")).await;
+    // Over the storage cap, so every upload collides (the same collision
+    // the test above counts with growth on) — and with growth off, none is
+    // counted. Without a real collision this absence would prove nothing.
+    fill_storage(&app, &t.tenant_id, 5).await;
+    for _ in 0..2 {
+        let s = upload_small_file(&app, &t).await;
+        assert!((200..300).contains(&s), "warn lets it through: {s}");
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let n = app
@@ -1015,6 +1041,7 @@ async fn the_backfill_reads_stripe_once() {
         webhook_secret: SECRET.into(),
         price_pro: PRICE_PRO.into(),
         price_business: PRICE_BIZ.into(),
+        ..Default::default()
     });
 
     assert!(billing::last_backfill(&app.db).await.unwrap().is_none());
@@ -1130,6 +1157,7 @@ async fn a_backfill_that_records_nothing_says_it_ran() {
         webhook_secret: SECRET.into(),
         price_pro: PRICE_PRO.into(),
         price_business: PRICE_BIZ.into(),
+        ..Default::default()
     });
     let now = DateTime::now();
     let r = stripe

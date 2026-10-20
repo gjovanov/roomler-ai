@@ -43,7 +43,7 @@ async fn create_room(app: &TestApp, tenant_id: &str, token: &str, name: &str) ->
 }
 
 /// Bring the tenant to exactly `target` live channels. A seeded tenant starts
-/// with three, and Free caps at five.
+/// with three; no plan caps channels since FR-115.
 async fn fill_channels(app: &TestApp, t: &SeededTenant, target: usize) {
     let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
     loop {
@@ -67,16 +67,65 @@ async fn fill_channels(app: &TestApp, t: &SeededTenant, target: usize) {
     }
 }
 
-// ── max_channels: the three modes, three outcomes ───────────────────
+// ── the three modes, three outcomes ─────────────────────────────────
+//
+// FR-115 made chat unlimited on every plan, so the channel cap these tests
+// used to exercise is gone. Recordings (off on Free, a mode-subject gate) and
+// storage (1 GiB on Free, a mode-subject COUNT gate) carry the same three
+// properties now.
+
+async fn start_recording(app: &TestApp, t: &SeededTenant) -> reqwest::Response {
+    let room = &t.rooms[0].id;
+    app.auth_post(
+        &format!("/api/tenant/{}/room/{}/recording", t.tenant_id, room),
+        &t.admin.access_token,
+    )
+    .json(&serde_json::json!({ "recording_type": "video" }))
+    .send()
+    .await
+    .expect("recording request failed")
+}
+
+/// Sit the tenant `headroom` bytes under its storage quota, the way the
+/// gate measures it (`FileDao::sum_storage_for_tenant`).
+async fn fill_storage(app: &TestApp, tenant_id: &str, quota: u64, headroom: u64) {
+    let tid = ObjectId::parse_str(tenant_id).unwrap();
+    app.db
+        .collection::<bson::Document>("files")
+        .insert_one(doc! {
+            "tenant_id": tid,
+            "filename": "fill.bin",
+            "size": (quota - headroom) as i64,
+            "deleted_at": Bson::Null,
+        })
+        .await
+        .expect("storage seed failed");
+}
+
+async fn upload_small_file(app: &TestApp, t: &SeededTenant) -> reqwest::Response {
+    let part = reqwest::multipart::Part::bytes(b"Hello, World!".to_vec())
+        .file_name("hello.txt")
+        .mime_str("text/plain")
+        .unwrap();
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("room_id", t.rooms[0].id.clone());
+    app.client
+        .post(app.url(&format!("/api/tenant/{}/file/upload", t.tenant_id)))
+        .header("Authorization", format!("Bearer {}", t.admin.access_token))
+        .multipart(form)
+        .send()
+        .await
+        .expect("upload failed")
+}
 
 #[tokio::test]
-async fn warn_records_the_channel_cap_but_does_not_refuse() {
+async fn warn_records_a_gate_but_does_not_refuse() {
     let app = TestApp::spawn().await;
     let t = app.seed_tenant("planwarn").await;
-    set_plan(&app, &t.tenant_id, "free", "warn").await;
-    fill_channels(&app, &t, 5).await; // Free.max_channels == 5
+    set_plan(&app, &t.tenant_id, "free", "warn").await; // Free.recordings == false
 
-    let r = create_room(&app, &t.tenant_id, &t.admin.access_token, "over-the-cap").await;
+    let r = start_recording(&app, &t).await;
     assert!(
         r.status().is_success(),
         "Warn must record and let the request through, got {}",
@@ -85,17 +134,18 @@ async fn warn_records_the_channel_cap_but_does_not_refuse() {
 }
 
 #[tokio::test]
-async fn enforce_refuses_at_the_channel_cap() {
+async fn enforce_refuses_at_the_storage_cap() {
     let app = TestApp::spawn().await;
     let t = app.seed_tenant("planenf").await;
     set_plan(&app, &t.tenant_id, "free", "enforce").await;
-    fill_channels(&app, &t, 5).await;
+    // Free.storage_bytes == 1 GiB; leave five bytes, upload thirteen.
+    fill_storage(&app, &t.tenant_id, 1024 * 1024 * 1024, 5).await;
 
-    let r = create_room(&app, &t.tenant_id, &t.admin.access_token, "over-the-cap").await;
-    assert_eq!(r.status(), 403, "Enforce must refuse at the cap");
+    let r = upload_small_file(&app, &t).await;
+    assert_eq!(r.status(), 403, "Enforce must refuse past the cap");
     let body = r.text().await.unwrap_or_default();
     assert!(
-        body.contains("Channels limit reached") && body.contains("5 of 5"),
+        body.contains("Bytes of storage limit reached") && body.contains("of 1073741824"),
         "refusal must name the limit and the numbers, got: {body}"
     );
 }
@@ -105,22 +155,22 @@ async fn off_disables_a_newly_wired_gate_entirely() {
     let app = TestApp::spawn().await;
     let t = app.seed_tenant("planoff").await;
     set_plan(&app, &t.tenant_id, "free", "off").await;
-    fill_channels(&app, &t, 5).await;
+    fill_storage(&app, &t.tenant_id, 1024 * 1024 * 1024, 5).await;
 
-    for i in 0..3 {
-        let r = create_room(
-            &app,
-            &t.tenant_id,
-            &t.admin.access_token,
-            &format!("off-{i}"),
-        )
-        .await;
+    for i in 0..2 {
+        let r = start_recording(&app, &t).await;
         assert!(
             r.status().is_success(),
             "Off must not check at all (iteration {i}), got {}",
             r.status()
         );
     }
+    let r = upload_small_file(&app, &t).await;
+    assert!(
+        r.status().is_success(),
+        "Off must not check storage either, got {}",
+        r.status()
+    );
 }
 
 // ── The regression guard ────────────────────────────────────────────
@@ -138,25 +188,28 @@ async fn an_established_limit_ignores_the_mode() {
     // `Off` is the most permissive mode there is.
     set_plan(&app, &t.tenant_id, "free", "off").await;
 
-    // Free.max_devices == 3. Seed the tenant to its cap directly.
+    // Free.max_devices == 100 (FR-115). Seed the tenant to its cap directly.
     let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
     let now = bson::DateTime::now();
-    for i in 0..3 {
-        app.db
-            .collection::<bson::Document>("agents")
-            .insert_one(doc! {
+    let docs: Vec<bson::Document> = (0..100)
+        .map(|i| {
+            doc! {
                 "tenant_id": tid,
                 "machine_id": format!("est-machine-{i}"),
                 "name": format!("est-{i}"),
                 "created_at": now,
                 "updated_at": now,
                 "deleted_at": Bson::Null,
-            })
-            .await
-            .expect("agent seed failed");
-    }
+            }
+        })
+        .collect();
+    app.db
+        .collection::<bson::Document>("agents")
+        .insert_many(docs)
+        .await
+        .expect("agent seed failed");
 
-    // Mint an enrollment token and try to enroll a fourth device.
+    // Mint an enrollment token and try to enroll a 101st device.
     let tok: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", t.tenant_id),
@@ -256,13 +309,51 @@ async fn a_feature_the_plan_includes_is_allowed() {
 /// Gating a toggle's *disable* path would let a plan downgrade strand a tenant
 /// holding a feature they are not allowed to turn off — strictly worse than the
 /// feature having been free. Only enabling is gated.
+///
+/// FR-115 put MagicDNS on every plan, so exit nodes (Free gets them at P4d)
+/// carry the property. The gate runs before the node lookup: enabling an
+/// unknown node on Free is refused BY THE PLAN (403, feature wording), while
+/// disabling it gets as far as the lookup (404) — the plan never refused it.
 #[tokio::test]
-async fn magic_dns_can_always_be_turned_off_but_not_on() {
+async fn an_exit_node_can_always_be_turned_off_but_not_on() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("planexit").await;
+    set_plan(&app, &t.tenant_id, "free", "enforce").await;
+    let node = ObjectId::new().to_hex();
+    let url = format!("/api/tenant/{}/overlay-node/{node}/exit-node", t.tenant_id);
+
+    let on = app
+        .auth_put(&url, &t.admin.access_token)
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(on.status(), 403, "Free must not enable an exit node yet");
+    let body = on.text().await.unwrap_or_default();
+    assert!(
+        body.contains("not available on the Free plan"),
+        "the refusal must be the plan's, got: {body}"
+    );
+
+    let off = app
+        .auth_put(&url, &t.admin.access_token)
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        off.status(),
+        403,
+        "withdrawing an exit node must never be refused by the plan"
+    );
+}
+
+/// FR-115 — MagicDNS is on every plan, Free included.
+#[tokio::test]
+async fn free_can_set_a_magic_dns_zone() {
     let app = TestApp::spawn().await;
     let t = app.seed_tenant("plandns").await;
-
-    // Grant it on a plan that includes MagicDNS, so the tenant really holds one.
-    set_plan(&app, &t.tenant_id, "pro", "enforce").await;
+    set_plan(&app, &t.tenant_id, "free", "enforce").await;
     let on = app
         .auth_put(
             &format!("/api/tenant/{}/magic-dns", t.tenant_id),
@@ -275,44 +366,96 @@ async fn magic_dns_can_always_be_turned_off_but_not_on() {
         .send()
         .await
         .expect("set magic dns failed");
-    assert!(on.status().is_success(), "Pro includes MagicDNS");
-
-    // Now downgrade to a plan that does not.
-    set_plan(&app, &t.tenant_id, "free", "enforce").await;
-
-    // Turning it back ON is refused...
-    let re_on = app
-        .auth_put(
-            &format!("/api/tenant/{}/magic-dns", t.tenant_id),
-            &t.admin.access_token,
-        )
-        .json(&serde_json::json!({
-            "magic_dns_domain": "plandns2.example",
-            "magic_dns_nameservers": [],
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(re_on.status(), 403, "Free must not be able to set a zone");
-
-    // ...but turning it OFF must always work, or the downgrade traps them.
-    let off = app
-        .auth_put(
-            &format!("/api/tenant/{}/magic-dns", t.tenant_id),
-            &t.admin.access_token,
-        )
-        .json(&serde_json::json!({
-            "magic_dns_domain": null,
-            "magic_dns_nameservers": [],
-        }))
-        .send()
-        .await
-        .unwrap();
     assert!(
-        off.status().is_success(),
-        "clearing a zone must never be gated, got {}",
-        off.status()
+        on.status().is_success(),
+        "Free includes MagicDNS since FR-115, got {}",
+        on.status()
     );
+}
+
+/// FR-115 D2 — Free's ten users is enforced whatever the mode: `off` is the
+/// most permissive mode there is, and the eleventh member is still refused.
+#[tokio::test]
+async fn the_free_member_cap_ignores_the_mode() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("planmemoff").await;
+    set_plan(&app, &t.tenant_id, "free", "off").await;
+    fill_members(&app, &t.tenant_id, 10).await;
+
+    let outsider = app
+        .register_user(
+            "outsider@planmemoff.test",
+            "planmemoff_outsider",
+            "Outsider",
+            "Outsider123!",
+            None,
+            None,
+        )
+        .await;
+    let r = app
+        .auth_post(
+            &format!("/api/tenant/{}/member", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&serde_json::json!({ "user_id": outsider.id }))
+        .send()
+        .await
+        .expect("add member failed");
+    assert_eq!(
+        r.status(),
+        403,
+        "the eleventh member must be refused under Off"
+    );
+
+    // A paid plan has no member cap: every user is a billed seat.
+    set_plan(&app, &t.tenant_id, "pro", "enforce").await;
+    let r = app
+        .auth_post(
+            &format!("/api/tenant/{}/member", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&serde_json::json!({ "user_id": outsider.id }))
+        .send()
+        .await
+        .expect("add member failed");
+    assert!(
+        r.status().is_success(),
+        "Pro has no member cap, got {}",
+        r.status()
+    );
+}
+
+/// Bring the tenant to exactly `target` members (rows the gate counts).
+async fn fill_members(app: &TestApp, tenant_id: &str, target: u64) {
+    let tid = ObjectId::parse_str(tenant_id).unwrap();
+    let now = bson::DateTime::now();
+    let existing = app
+        .db
+        .collection::<bson::Document>("tenant_members")
+        .count_documents(doc! { "tenant_id": tid })
+        .await
+        .unwrap();
+    for i in existing..target {
+        app.db
+            .collection::<bson::Document>("tenant_members")
+            .insert_one(doc! {
+                "tenant_id": tid,
+                "user_id": ObjectId::new(),
+                "role_ids": [],
+                "joined_at": now,
+                "is_pending": false,
+                "is_muted": false,
+                "created_at": now,
+                "updated_at": now,
+                "nickname": Bson::Null,
+                "notification_override": Bson::Null,
+                "invited_by": Bson::Null,
+                "last_seen_at": Bson::Null,
+                "_filler": i as i64,
+            })
+            .await
+            .expect("member seed failed");
+    }
 }
 
 // ── The unlimited sentinel, through the route ───────────────────────
@@ -325,7 +468,7 @@ async fn an_unlimited_plan_never_trips_a_count_gate() {
     let app = TestApp::spawn().await;
     let t = app.seed_tenant("planpro").await;
     set_plan(&app, &t.tenant_id, "pro", "enforce").await;
-    fill_channels(&app, &t, 12).await; // far past Free's 5
+    fill_channels(&app, &t, 12).await; // far past the five Free had before FR-115
 
     let r = create_room(&app, &t.tenant_id, &t.admin.access_token, "still-fine").await;
     assert!(
