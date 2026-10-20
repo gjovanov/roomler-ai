@@ -1353,6 +1353,52 @@ mod fr115 {
         assert_eq!(resp.status().as_u16(), 200);
     }
 
+    /// `stripe.currencies` puts a currency on sale. One left out is absent
+    /// from the plans the billing page reads, so a European browser is not
+    /// started on it, and a checkout asking for it anyway is refused before
+    /// any Stripe call: not even the Price is read.
+    #[tokio::test]
+    async fn a_currency_not_on_sale_is_neither_shown_nor_sold() {
+        let fake = Fake::default();
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| {
+            configure(s, &base, false);
+            s.stripe.currencies = "usd".into();
+        })
+        .await;
+        let t = app.seed_tenant("fr115-eur-off").await;
+
+        let plans: serde_json::Value = app
+            .client
+            .get(app.url("/api/stripe/plans"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for plan in plans.as_array().unwrap() {
+            for price in plan["prices"].as_array().unwrap() {
+                assert_eq!(price["currency"], "usd", "{}: {price}", plan["id"]);
+            }
+        }
+
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "currency": "eur" }),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 400);
+        let body = resp.text().await.unwrap_or_default();
+        assert!(body.contains("not sold in EUR"), "got: {body}");
+        assert!(
+            fake.calls().is_empty(),
+            "a currency not on sale never reaches Stripe: {:?}",
+            fake.calls()
+        );
+    }
+
     /// The double-billing bug: "Switch to Business" used to run a second
     /// checkout and start a second subscription. A live subscription now
     /// refuses checkout with a 409; the change goes through change-plan.

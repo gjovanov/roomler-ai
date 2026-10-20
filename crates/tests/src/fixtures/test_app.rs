@@ -535,8 +535,10 @@ fn test_settings() -> Settings {
             price_business: String::new(),
             // FR-115 — annual off, real Stripe, and the seat sync as the
             // config default has it (on); a test that needs a fake Stripe
-            // or annual prices sets them.
+            // or annual prices sets them. Both currencies on sale: the
+            // tests check EUR end to end (deployed, it waits for O1).
             seat_sync: true,
+            currencies: "usd,eur".into(),
             ..Default::default()
         },
         giphy: roomler_ai_config::GiphySettings {

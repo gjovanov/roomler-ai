@@ -1294,6 +1294,14 @@ pub struct StripeSettings {
     pub price_pro_annual: String,
     #[serde(default)]
     pub price_business_annual: String,
+    /// FR-115 — the currencies the paid plans are offered in, comma-separated
+    /// (`usd,eur`). Default `usd`: a currency is offered only once every
+    /// configured Price carries an amount in it (an EUR `currency_options`
+    /// entry), or a European browser, which the billing page starts on EUR,
+    /// would be refused at checkout. An unknown code is ignored; nothing
+    /// readable means USD. Env: `ROOMLER__STRIPE__CURRENCIES`.
+    #[serde(default)]
+    pub currencies: String,
     /// FR-115 — the Stripe API's base URL; empty = `https://api.stripe.com`.
     /// Tests point it at a fake. Env: `ROOMLER__STRIPE__API_BASE`.
     #[serde(default)]
@@ -1557,6 +1565,7 @@ impl Settings {
             .set_default("stripe.price_business", "")?
             .set_default("stripe.price_pro_annual", "")?
             .set_default("stripe.price_business_annual", "")?
+            .set_default("stripe.currencies", "usd")?
             .set_default("stripe.api_base", "")?
             .set_default("stripe.seat_sync", true)?
             .set_default("giphy.api_key", "")?
