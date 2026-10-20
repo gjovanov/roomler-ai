@@ -167,6 +167,11 @@ impl AppState {
             ),
             None => (None, None),
         };
+        // FR-115 P3b — remote-session slots, on the same connection manager
+        // and the same fail-soft rule; scoped to this database.
+        let session_slots = redis_pubsub.as_ref().map(|ps| {
+            roomler_core::cluster::session_slots::SessionSlots::new(ps.connection(), db.name())
+        });
 
         // Remote-control subsystem
         let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
@@ -282,6 +287,7 @@ impl AppState {
             geoip: geoip.clone(),
             pod: pod.clone(),
             cluster_directory: cluster_directory.clone(),
+            session_slots: session_slots.clone(),
             cluster_bus: cluster_bus.clone(),
             turn_map: turn_map.clone(),
             relay_load: relay_load.clone(),

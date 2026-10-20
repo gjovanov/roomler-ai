@@ -321,6 +321,7 @@ fn result(
         attempt_id,
         refused,
         retry_after_secs,
+        message: None,
     }
 }
 
@@ -796,6 +797,95 @@ pub struct SessionAsk {
     pub chroma_pref: Option<String>,
     pub chunk_framing: Option<bool>,
     pub audio_enabled: bool,
+    /// FR-115 P3b (O6) — the org the outsider says the session is for (hex),
+    /// honoured only when they belong to it ([`charge_scope`]).
+    pub charge_org: Option<String>,
+}
+
+/// FR-115 P3b (O6 + O7, decided 2026-10-20) — whose concurrent-session
+/// slots an external session takes, and how many there are. No paid org is
+/// needed:
+///
+/// * the org the outsider named (`charge_org`), when they belong to it;
+/// * else their only org;
+/// * else (in no org, or in several and naming none) the account itself,
+///   with Free's quota.
+///
+/// An archived org stops acting, so it is never charged. The cap is the
+/// org's `max_concurrent_sessions` for its plan and seats, the same number
+/// its own sessions use; `None` = unlimited (no slot to claim). An unreadable
+/// membership answers `None` overall: the session runs as before P3b rather
+/// than being counted against a guess.
+pub async fn charge_scope(
+    state: &RemoteState,
+    principal: ObjectId,
+    charge_org: Option<&str>,
+) -> Option<(roomler_core::cluster::session_slots::SlotScope, Option<u32>)> {
+    use roomler_core::cluster::session_slots::SlotScope;
+    let orgs: Vec<_> = state
+        .tenants
+        .find_user_tenants(principal)
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|t| !t.is_archived)
+        .collect();
+    let named = charge_org
+        .and_then(|h| ObjectId::parse_str(h).ok())
+        .and_then(|id| orgs.iter().find(|t| t.id == Some(id)));
+    let chosen = named.or_else(|| (orgs.len() == 1).then(|| &orgs[0]));
+    Some(match chosen.and_then(|t| Some((t.id?, t))) {
+        Some((id, t)) => (SlotScope::Org(id), crate::controller::org_session_cap_of(t)),
+        None => (
+            SlotScope::User(principal),
+            Some(
+                roomler_ai_db::models::Plan::Free
+                    .limits_for(1)
+                    .max_concurrent_sessions,
+            ),
+        ),
+    })
+}
+
+/// FR-115 P3b — the words an outsider refused by the slot count reads: who
+/// holds the slot and on which device. An org's is P3's own sentence; an
+/// account in no org gets its own, since no org plan is involved.
+async fn session_limit_message(
+    state: &RemoteState,
+    scope: roomler_core::cluster::session_slots::SlotScope,
+    cap: u32,
+    holder_user: String,
+    holder_agent: String,
+) -> String {
+    use roomler_core::cluster::session_slots::SlotScope;
+    if let SlotScope::Org(_) = scope {
+        let e = roomler_ai_remote_control::Error::OrgSessionLimit {
+            cap,
+            holder_user,
+            holder_agent,
+        };
+        return crate::controller::refusal_message(state, &e).await;
+    }
+    let device = match ObjectId::parse_str(&holder_agent) {
+        Ok(aid) => state
+            .fleet
+            .agents
+            .base
+            .find_by_id(aid)
+            .await
+            .ok()
+            .map(|a| a.display_name.unwrap_or(a.name))
+            .filter(|n| !n.trim().is_empty()),
+        Err(_) => None,
+    };
+    let holder = match device {
+        Some(d) => format!("you are connected to {d} right now"),
+        None => "a session of yours is open right now".to_string(),
+    };
+    format!(
+        "Without an organization, an account runs one remote session at a time, and {holder}. \
+         End that session, or run this one for an organization you belong to."
+    )
 }
 
 /// `rc:extauth.session` — open the session a verified login earned.
@@ -914,6 +1004,48 @@ pub async fn handle_session(
         agent.access_policy.idle_limit_secs(),
     );
     let lock_on_end = agent.access_policy.lock_on_end_ask();
+    // FR-115 P3b (O6 + O7) — an external session takes a slot of the org it
+    // is for, at that org's tier, or Free's one of an account in no org
+    // ([`charge_scope`]). Before P3b it ran uncapped, and with slots off (or
+    // Redis unable to answer) it still does: never refused on a guess.
+    let mut slot = None;
+    if crate::slots::enabled(state)
+        && let Some((scope, Some(cap))) =
+            charge_scope(state, principal, ask.charge_org.as_deref()).await
+    {
+        use crate::slots::SlotDecision;
+        match crate::slots::claim(state, scope, principal, device, cap).await {
+            SlotDecision::Claimed(lease) => slot = Some(lease),
+            SlotDecision::Fallback => {}
+            SlotDecision::Full {
+                cap,
+                holder_user,
+                holder_agent,
+            } => {
+                let message =
+                    session_limit_message(state, scope, cap, holder_user, holder_agent).await;
+                let _ = tx.try_send(ServerMsg::ExtauthResult {
+                    attempt_id: Some(attempt_id.clone()),
+                    refused: Some(ExtauthRefusal::SessionLimit),
+                    retry_after_secs: None,
+                    message: Some(message),
+                });
+                info!(%principal, agent = %device, %attempt_id, ?scope, "extauth: refused by the session slots");
+                audit_session(
+                    state,
+                    &agent,
+                    device,
+                    principal,
+                    actor,
+                    attempt_id,
+                    Some(ExtauthRefusal::SessionLimit),
+                    Some("every concurrent-session slot of the payer is held"),
+                    None,
+                );
+                return;
+            }
+        }
+    }
     let session = state.fleet.rc_hub.create_session_full(
         device,
         principal,
@@ -951,7 +1083,12 @@ pub async fn handle_session(
             attempt_id: attempt_id.clone(),
         }),
         None,
+        slot.clone(),
     );
+    // FR-115 P3b — a slot the hub did not take goes back now.
+    if let Some(lease) = &slot {
+        crate::slots::release_unused(state, lease, session.as_ref().ok().copied()).await;
+    }
     match session {
         Ok(session_id) => {
             info!(%principal, agent = %device, %attempt_id, %session_id, "extauth: session opened");
@@ -1094,6 +1231,7 @@ fn dispatch(
             chroma_pref,
             chunk_framing,
             audio_enabled,
+            charge_org,
         } => {
             let ask = SessionAsk {
                 connect_code,
@@ -1104,6 +1242,7 @@ fn dispatch(
                 chroma_pref,
                 chunk_framing,
                 audio_enabled,
+                charge_org,
             };
             tokio::spawn(async move {
                 handle_session(&state, principal, &actor, &tx, ask, hop).await;
