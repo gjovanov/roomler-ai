@@ -480,7 +480,7 @@ boundary.
 every agent mid-turn.
 
 - Linux: `hive-host` runs as a transient unit outside the daemon's cgroup
-  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:682-722`),
+  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:701-731`),
   so `systemctl restart roomlerd` leaves it running, and it reconnects to the daemon's
   per-uid socket.
 - macOS: `hive-host` starts in the user's bootstrap context (`launchctl asuser`, as
@@ -1009,7 +1009,7 @@ Version { n, ciphertext, dek_wrapped, created_by, created_at, expires_at? }
   GCP or Azure KMS, PKCS#11. Hosted roomler.ai would use a cloud KMS.
 - ⚠️ **Nothing in the server encrypts at rest today.** JWTs are HS256 with a shared secret
   (`crates/services/src/auth/mod.rs:246-260`), and the only asymmetric key signs DERP
-  tickets (`crates/remote_control/src/derp_ticket.rs:91,116`). The vault brings its own
+  tickets (`crates/remote_control/src/derp_ticket.rs:92,116`). The vault brings its own
   keys and never derives anything from the JWT secret. The dormant plaintext
   `OAuthCredential` in tenant integrations (`crates/db/src/models/tenant.rs:208-220`) is
   the pattern to retire into the vault, not to copy.
@@ -1533,7 +1533,7 @@ open (§18).
 | Threat | Controls |
 |---|---|
 | A session is remote code execution on a device | four gates, shaped like exec and SSH: `HIVE_RUN` (no managed role below `ADMINISTRATOR`); `role:assume` (default deny); per-(user, device) limits applied after the identity gates so a refusal is attributable; device-local `hive_enabled` with the account map and roots. Never SYSTEM/root. A consent prompt (`PromptKind::Hive`, floored by `consent::strictest_of`, `agents/roomlerd/src/consent.rs:153`) when the starter doesn't own the device |
-| A compromised server starts sessions everywhere | gate 4 belongs to the device. `hive_enabled` and `hive_replica` join `DesiredConfig` (`crates/remote_control/src/models.rs:1794`) and so can be pushed only to devices that opted into remote config; `hive_accounts`, `hive_roots` and `hive_archive` are never pushable, locked the way `the_device_owned_refusals_are_not_pushable` (`:6638`) locks `remote_config_enabled` |
+| A compromised server starts sessions everywhere | gate 4 belongs to the device. `hive_enabled` and `hive_replica` join `DesiredConfig` (`crates/remote_control/src/models.rs:2673`) and so can be pushed only to devices that opted into remote config; `hive_accounts`, `hive_roots` and `hive_archive` are never pushable, locked the way `the_device_owned_refusals_are_not_pushable` (`:9008`) locks `remote_config_enabled` |
 | A compromised server reads sessions | it holds no transcripts. It holds metadata, stubs, cards (if enabled), the brain and audit. It can mint a view grant for itself and open a viewer peer, as it could initiate remote control — the same trust in signalling RC already has, and every view grant is audited |
 | A replica's disk is stolen, or its device compromised | the store is daemon-owned and unreadable by other local users; placement policy keeps sensitive roles on tagged devices; purge tombstones; encryption at rest with per-session keys (P7). Until then a stolen disk exposes the sessions it held |
 | A viewer reads a session it shouldn't | view grants list session ids and expire; the replica checks the grant before serving; peers close on expiry |
