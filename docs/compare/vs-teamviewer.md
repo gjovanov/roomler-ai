@@ -62,7 +62,7 @@ and [`../../COMMERCIAL.md`](../../COMMERCIAL.md).
 
 | | Roomler | TeamViewer / AnyDesk |
 |---|---|---|
-| Attended support for a stranger's PC | **no** — enrolment model | yes, session codes |
+| Attended support for a stranger's PC | **limited** — only your own already-enrolled devices, by a time-limited code the device owner approves (FR-52) | yes, session codes, nothing pre-installed |
 | Mobile device support | **no** | yes |
 | Unattended access to your own machines | yes | yes |
 | Viewer | browser tab, nothing to install | native client |
@@ -77,9 +77,13 @@ and [`../../COMMERCIAL.md`](../../COMMERCIAL.md).
 
 ## Choosing
 
-- **Stay with TeamViewer** for attended support of machines and phones you do
-  not administer, or where procurement requires certifications and a support
-  contract.
+- **Stay with TeamViewer** for attended support of a device with nothing
+  Roomler installed on it — a customer's laptop, a one-off repair, a phone —
+  or where procurement requires certifications and a support contract.
+  **Use Roomler's connect codes** once the device is already enrolled in
+  someone's fleet: its owner opens that one device for a limited window,
+  approves the specific request by name ("outside your organization"), and
+  the access is scoped (view + input, never files) and fully audited.
 - **Use Roomler** for a fleet you enrol once — your own machines, or clients on a
   managed agreement — especially if you would also like those machines on a
   private network, and especially if you want the option to host it yourself.
@@ -90,7 +94,9 @@ and [`../../COMMERCIAL.md`](../../COMMERCIAL.md).
 ---
 
 *Checked 2026-08-29 against Roomler's own source and public vendor
-documentation; Roomler's own prices updated 2026-10-20 (FR-115). Pricing and
+documentation; Roomler's own prices updated 2026-10-20 (FR-115); the attended-
+support row updated 2026-10-20 after FR-52's connect codes were field-verified
+end to end. Pricing and
 packaging change often, so verify against your own quote. If anything here is wrong or has aged,
 [open an issue](https://github.com/gjovanov/roomler-ai/issues) — we would rather
 fix it than win on a stale fact.*
