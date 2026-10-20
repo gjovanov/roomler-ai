@@ -9,7 +9,7 @@
 > | P1 | the device decides: its owner's `display_match`, and under `auto` whether someone is using the screen; every request answered | shipped (0.4.140); field-verified on Windows |
 > | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | shipped (0.4.140); field-verified on Windows |
 > | P2 | Linux virtual desktops: the desktop runs on Xorg with the dummy driver, which takes any mode, so the viewer's stage size becomes the mode exactly; restored at the end | shipped in 0.4.143 and field-verified on its released binary (FR-108 §8 row 14; the operator settled decision 4 on 2026-10-17) |
-> | FR-97 P3e-2 | a person's own X11 display (a per-user install in an X11 session): the one active output switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand | shipped in 0.4.148 (#2623); its release check's pointer-clamp hand-back fixed (#P3E2CLAMPPR) |
+> | FR-97 P3e-2 | a person's own X11 display (a per-user install in an X11 session): the one active output switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand | shipped in 0.4.148 (#2623); its release check's pointer-clamp hand-back fixed (#2644) |
 > | P3–P4 | modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
@@ -282,7 +282,7 @@ sequenceDiagram
   clamp the pointer into the new screen, and the clamp resets the X idle clock as an input would. Each mode set
   records its run, and presence counts an idle-clock move inside it, give or take `MACHINE_SLACK_MS`, as the
   machine's ([`display_match.rs:561`](../agents/roomlerd/src/display_match.rs#L561) `own_switch_explains`). Until
-  #P3E2CLAMPPR, presence read the clamp as a person and handed the screen back 0.2 s after every such switch
+  #2644, presence read the clamp as a person and handed the screen back 0.2 s after every such switch
   (FR-97 §8, 0.4.148's release check).
 - **The guard needs somewhere to live.** No `$XDG_RUNTIME_DIR`, no switch: an X11 mode outlives the process
   that set it, and a mode a crash stranded would be the person's screen until they fixed it themselves.

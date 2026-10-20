@@ -74,7 +74,7 @@
   Windows only, by OS, which had also hidden FR-108 P2's virtual desktop since 0.4.143; the viewer now follows the
   device's `unavailable["display-match"]`. 0.4.148's release check found two more defects. A switch to a mode
   smaller than where the pointer sits was handed back 0.2 s later, because the X server's pointer clamp reads as a
-  person; that is fixed (#P3E2CLAMPPR). And on any OS, the viewer's default-ON preference never reached a host at
+  person; that is fixed (#2644). And on any OS, the viewer's default-ON preference never reached a host at
   connect (#2638, fixed by #2640).
 - P3e-3a, copied images on X11: the clipboard watcher's change gate on an X11 session is XFixes' selection-owner
   events (Windows' sequence number in another form), so copied images are watched there and text is no longer
@@ -725,7 +725,7 @@ test of the SIGKILL property itself.
     (measured with the agent out of the loop; a client's `XWarpPointer` counts too). Presence read a person and
     handed the screen back 0.2 s after the switch. Each mode set now records its run on presence's clock
     (`display_match::own_switch_explains`), and the Linux sampler counts an idle-clock move inside it, give or take
-    `MACHINE_SLACK_MS`, as the machine's (#P3E2CLAMPPR). The same run measured the viewer's half on the deployed SPA.
+    `MACHINE_SLACK_MS`, as the machine's (#2644). The same run measured the viewer's half on the deployed SPA.
     It offers the toggle to a Linux host by the device's word and sends on a click, but its default-ON re-send at
     connect never left the page, on any OS: it fired when the peer connection connected, before the control channel
     opened (#2638, fixed by #2640).
@@ -1028,7 +1028,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
-| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, #2618), *P3e-2* (display match, #2623) and *P3e-3a* (copied images, #2632) released in 0.4.148; P3e-2's pointer-clamp fix #P3E2CLAMPPR; *P3e-3b* (RTF) not built | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0`; P3e-3a: `ROOMLERD_CLIPBOARD_X11_WATCH=0` | the lab; P3e-1, P3e-2 and P3e-3a: a vmtest Ubuntu cell on Xorg, a per-user install | M |
+| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, #2618), *P3e-2* (display match, #2623) and *P3e-3a* (copied images, #2632) released in 0.4.148; P3e-2's pointer-clamp fix #2644; *P3e-3b* (RTF) not built | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0`; P3e-3a: `ROOMLERD_CLIPBOARD_X11_WATCH=0` | the lab; P3e-1, P3e-2 and P3e-3a: a vmtest Ubuntu cell on Xorg, a per-user install | M |
 | **P3f** | uinput text on any layout, through the host's own XKB keymap (merged #2558) | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts, red on 0.4.145 | M |
 | **P3g** | Linux companion for arm64 + tarball. *The arm64 `.deb` and `.rpm`: FR-93 P6e (#2257), in every release since 0.4.138.* *The tarball: not built (D17)* | — (a package) | the FR-93 lab (`wlab-kde-sys`, `wlab-asahi`) | M |
 | **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
