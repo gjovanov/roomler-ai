@@ -1,7 +1,12 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog :model-value="modelValue" max-width="700" @update:model-value="$emit('update:modelValue', $event)">
+  <v-dialog
+    :model-value="modelValue"
+    max-width="700"
+    :fullscreen="fullscreen"
+    @update:model-value="$emit('update:modelValue', $event)"
+  >
     <v-card>
       <v-card-title class="d-flex align-center">
         <v-icon class="mr-2">mdi-email-multiple</v-icon>
@@ -13,8 +18,14 @@
           Add multiple email invites at once. Each invite can have a different role assigned.
         </p>
 
-        <!-- Invite rows -->
-        <div v-for="(row, idx) in rows" :key="idx" class="d-flex align-center ga-3 mb-3">
+        <!-- Invite rows. FR-116: on a phone the email takes a line of its
+             own — beside a 180 px role picker it was ~60 px wide. -->
+        <div
+          v-for="(row, idx) in rows"
+          :key="idx"
+          class="d-flex align-center ga-3 mb-3"
+          :class="{ 'flex-wrap': fullscreen }"
+        >
           <v-text-field
             v-model="row.email"
             label="Email"
@@ -23,6 +34,7 @@
             hide-details
             :rules="[emailRule]"
             class="flex-grow-1"
+            :style="fullscreen ? 'flex-basis: 100%' : undefined"
           />
           <v-select
             v-model="row.role_id"
@@ -32,7 +44,7 @@
             label="Role"
             density="compact"
             hide-details
-            style="max-width: 180px"
+            :style="fullscreen ? undefined : 'max-width: 180px'"
           />
           <v-btn
             icon
@@ -110,6 +122,7 @@
 import { ref, computed } from 'vue'
 import { useInviteStore } from '@/stores/invite'
 import { useSnackbar } from '@/composables/useSnackbar'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import type { Role } from '@/stores/role'
 
 interface InviteRow {
@@ -134,6 +147,7 @@ const emit = defineEmits<{
 
 const inviteStore = useInviteStore()
 const { showSuccess, showError } = useSnackbar()
+const { fullscreen } = useResponsiveDialog()
 
 const rows = ref<InviteRow[]>([{ email: '', role_id: '' }])
 const expiresInHours = ref<number | undefined>(undefined)

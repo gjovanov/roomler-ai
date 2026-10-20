@@ -5,7 +5,9 @@
     <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
       <h2 class="text-h5">Invite Links</h2>
       <v-spacer />
-      <!-- FR-11: server-side search over code / target email + status filter. -->
+      <!-- FR-11: server-side search over code / target email + status filter.
+           FR-116: on a phone the two share a row of their own, under the
+           title, and the buttons take the next one. -->
       <v-text-field
         v-model="gridSearch"
         density="compact"
@@ -13,8 +15,8 @@
         clearable
         prepend-inner-icon="mdi-magnify"
         placeholder="Search code or email"
-        style="max-width: 220px"
-        class="flex-grow-0"
+        :style="xs ? 'flex: 1 1 60%' : 'max-width: 220px'"
+        :class="xs ? 'order-1' : 'flex-grow-0'"
       />
       <v-select
         v-model="gridStatus"
@@ -23,8 +25,8 @@
         hide-details
         clearable
         placeholder="Status"
-        style="max-width: 150px"
-        class="flex-grow-0"
+        :style="xs ? 'flex: 0 0 128px' : 'max-width: 150px'"
+        :class="xs ? 'order-1' : 'flex-grow-0'"
       />
       <v-btn
         icon="mdi-table-cog"
@@ -38,12 +40,13 @@
       <v-btn
         variant="outlined"
         color="primary"
+        :class="{ 'order-2 flex-grow-1': xs }"
         @click="showBatchDialog = true"
       >
         <v-icon start>mdi-email-multiple</v-icon>
         Batch Invite
       </v-btn>
-      <v-btn color="primary" @click="showCreateDialog = true">
+      <v-btn color="primary" :class="{ 'order-2 flex-grow-1': xs }" @click="showCreateDialog = true">
         <v-icon start>mdi-plus</v-icon>
         Create Invite
       </v-btn>
@@ -64,7 +67,9 @@
         :items-per-page-options="[10, 25, 50, 100]"
         density="compact"
         class="invites-table"
+        :class="{ 'invites-table--stacked': xs }"
         item-value="id"
+        :mobile="xs"
         @update:options="onGridOptions"
       >
             <template #item.code="{ item }">
@@ -177,6 +182,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import { useInviteStore } from '@/stores/invite'
 import { useRoleStore } from '@/stores/role'
 import { useAuthStore } from '@/stores/auth'
@@ -190,6 +196,10 @@ const route = useRoute()
 const inviteStore = useInviteStore()
 const roleStore = useRoleStore()
 const auth = useAuthStore()
+// FR-116 — below 600 px each invite is a stacked row (Vuetify's mobile rows,
+// from the same headers): Uses, Created and Revoke were behind a sideways
+// scroll inside the table.
+const { xs } = useDisplay()
 const { showSuccess, showError } = useSnackbar()
 const { rules } = useValidation()
 
@@ -346,16 +356,23 @@ onMounted(() => {
 <style scoped>
 /* Never squeeze the columns into the viewport — cells keep their natural
    width and the WRAPPER scrolls horizontally (house rule: wide tables
-   scroll in their own container). */
+   scroll in their own container). FR-116: the desktop layout only — in the
+   stacked rows of a phone these rules pushed every value off the edge. */
 .invites-table :deep(.v-table__wrapper) {
   overflow-x: auto;
 }
-.invites-table :deep(table) {
+.invites-table:not(.invites-table--stacked) :deep(table) {
   width: max-content;
   min-width: 100%;
 }
-.invites-table :deep(th),
-.invites-table :deep(td) {
+.invites-table:not(.invites-table--stacked) :deep(th),
+.invites-table:not(.invites-table--stacked) :deep(td) {
   white-space: nowrap;
+}
+/* FR-116 — a stacked row's value can be one long unbroken token (an email,
+   a file name): it wraps rather than widening the row past the screen. */
+.invites-table--stacked :deep(.v-data-table__td-value) {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 </style>

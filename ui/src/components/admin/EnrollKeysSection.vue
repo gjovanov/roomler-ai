@@ -32,7 +32,9 @@
         use; devices it already minted die by their own deadline.
       </p>
 
-      <v-table v-if="keys.length" density="compact">
+      <!-- FR-116: `table-stack-xs` — on a phone each key is a block, with its
+           state and Revoke on screen (both sat past the edge). -->
+      <v-table v-if="keys.length" density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>Label</th>
@@ -51,10 +53,10 @@
                 minted {{ fmtDate(k.created_at) }}
               </div>
             </td>
-            <td>{{ k.uses }} / {{ k.max_uses }}</td>
-            <td :title="k.expires_at">{{ fmtDate(k.expires_at) }}</td>
-            <td>{{ k.ephemeral_ttl_secs ? `${k.ephemeral_ttl_secs}s` : 'default' }}</td>
-            <td>
+            <td data-label="Uses">{{ k.uses }} / {{ k.max_uses }}</td>
+            <td data-label="Expires" :title="k.expires_at">{{ fmtDate(k.expires_at) }}</td>
+            <td data-label="Device TTL">{{ k.ephemeral_ttl_secs ? `${k.ephemeral_ttl_secs}s` : 'default' }}</td>
+            <td data-label="State">
               <v-chip v-if="k.revoked_at" size="x-small" color="error" variant="tonal">
                 revoked
               </v-chip>
@@ -97,7 +99,7 @@
   <!-- Mint dialog. Two phases in one dialog: the form, then the one-time
        key reveal — deliberately not dismissible by a misclick once the key
        is showing (persistent), because there is no second look. -->
-  <v-dialog v-model="mintOpen" max-width="560" :persistent="!!mintedKey">
+  <v-dialog v-model="mintOpen" max-width="560" :persistent="!!mintedKey" :fullscreen="fullscreen">
     <v-card>
       <v-card-title>
         {{ mintedKey ? 'Ephemeral key — shown once' : 'Mint ephemeral enrollment key' }}
@@ -181,9 +183,11 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
 import { useAgentStore, type EnrollmentKeyRow } from '@/stores/agents'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 
 const props = defineProps<{ tenantId: string }>()
 const agentStore = useAgentStore()
+const { fullscreen } = useResponsiveDialog()
 
 const keys = ref<EnrollmentKeyRow[]>([])
 const error = ref<string | null>(null)

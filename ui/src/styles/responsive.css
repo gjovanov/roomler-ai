@@ -12,8 +12,10 @@
  * widths, so the phone cannot drift from the desktop; above 600 px nothing
  * changes.
  *
- * For `v-data-table` / `v-data-table-server` use Vuetify's own
- * `mobile-breakpoint` instead — it renders the same idea from the headers.
+ * For `v-data-table` / `v-data-table-server` use Vuetify's own mobile rows
+ * instead (`:mobile="xs"`) — they render the same idea from the headers. Scope
+ * any natural-width rule of that table (`width: max-content`, `nowrap`) away
+ * from them, or every value sits past the right edge (`MembersSection.vue`).
  */
 @media (max-width: 599.98px) {
   .table-stack-xs thead {

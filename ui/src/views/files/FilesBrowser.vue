@@ -5,7 +5,9 @@
     <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
       <h1 class="text-h5 text-md-h4">{{ $t('nav.files') }}</h1>
       <v-spacer />
-      <!-- FR-11: server-side search over filename / display name. -->
+      <!-- FR-11: server-side search over filename / display name.
+           FR-116: a row of its own on a phone, under the title; the view
+           toggle and Upload take the next one. -->
       <v-text-field
         v-model="gridSearch"
         density="compact"
@@ -13,8 +15,8 @@
         clearable
         prepend-inner-icon="mdi-magnify"
         placeholder="Search files"
-        style="max-width: 240px"
-        class="flex-grow-0"
+        :style="xs ? 'flex: 1 1 100%' : 'max-width: 240px'"
+        :class="xs ? 'order-1' : 'flex-grow-0'"
       />
       <v-btn
         icon="mdi-table-cog"
@@ -25,11 +27,17 @@
         aria-label="Configure columns"
         @click="colDialogOpen = true"
       />
-      <v-btn-toggle v-model="viewMode" mandatory density="compact">
+      <v-btn-toggle v-model="viewMode" mandatory density="compact" :class="{ 'order-2': xs }">
         <v-btn value="all" size="small">All Files</v-btn>
         <v-btn value="room" size="small" :disabled="!currentRoomId">Room Files</v-btn>
       </v-btn-toggle>
-      <v-btn color="primary" prepend-icon="mdi-upload" @click="triggerUpload" :disabled="!currentRoomId">
+      <v-btn
+        color="primary"
+        prepend-icon="mdi-upload"
+        :class="{ 'order-2 flex-grow-1': xs }"
+        @click="triggerUpload"
+        :disabled="!currentRoomId"
+      >
         {{ $t('files.upload') }}
       </v-btn>
       <input
@@ -52,7 +60,9 @@
         :items-per-page-options="[10, 25, 50, 100]"
         density="compact"
         class="files-table"
+        :class="{ 'files-table--stacked': xs }"
         item-value="id"
+        :mobile="xs"
         @update:options="onGridOptions"
       >
         <template #item.filename="{ item }">
@@ -122,6 +132,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import { useFileStore } from '@/stores/files'
 import { useRoomStore } from '@/stores/rooms'
 import { useAuthStore } from '@/stores/auth'
@@ -132,6 +143,10 @@ const route = useRoute()
 const fileStore = useFileStore()
 const roomStore = useRoomStore()
 const auth = useAuthStore()
+// FR-116 — below 600 px each file is a stacked row (Vuetify's mobile rows,
+// from the same headers): only the name fitted, and Download / Delete were
+// behind a sideways scroll inside the table.
+const { xs } = useDisplay()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const currentRoomId = computed(() => roomStore.current?.id || roomStore.rooms[0]?.id || '')
@@ -263,16 +278,23 @@ function formatSize(bytes: number): string {
 <style scoped>
 /* Never squeeze the columns into the viewport — cells keep their natural
    width and the WRAPPER scrolls horizontally (house rule: wide tables
-   scroll in their own container). */
+   scroll in their own container). FR-116: the desktop layout only — in the
+   stacked rows of a phone these rules pushed every value off the edge. */
 .files-table :deep(.v-table__wrapper) {
   overflow-x: auto;
 }
-.files-table :deep(table) {
+.files-table:not(.files-table--stacked) :deep(table) {
   width: max-content;
   min-width: 100%;
 }
-.files-table :deep(th),
-.files-table :deep(td) {
+.files-table:not(.files-table--stacked) :deep(th),
+.files-table:not(.files-table--stacked) :deep(td) {
   white-space: nowrap;
+}
+/* FR-116 — a stacked row's value can be one long unbroken token (an email,
+   a file name): it wraps rather than widening the row past the screen. */
+.files-table--stacked :deep(.v-data-table__td-value) {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 </style>
