@@ -2120,7 +2120,7 @@
     <v-navigation-drawer
       v-model="filesDrawer"
       location="right"
-      width="420"
+      :width="xs ? displayWidth : 420"
       temporary
       class="files-drawer"
       :class="{ 'drawer-drag-over': isDrawerDragOver }"
@@ -2172,6 +2172,23 @@
         >
           <v-icon>mdi-monitor</v-icon>
         </v-btn>
+        <!-- FR-116 P5b — a touch screen has nothing to drop onto the drawer:
+             this uploads INTO the folder on screen, by the same path as a
+             drop or a paste. -->
+        <v-btn
+          v-if="filesTouchOnly"
+          icon
+          variant="text"
+          size="small"
+          :disabled="dirLoading || drawerUploadDestPath() === undefined"
+          title="Upload here"
+          aria-label="Upload here"
+          data-testid="files-upload-here"
+          @click="drawerFileInput?.click()"
+        >
+          <v-icon>mdi-upload</v-icon>
+        </v-btn>
+        <input ref="drawerFileInput" type="file" multiple hidden @change="onDrawerFilePicked" />
         <v-text-field
           v-model="dirPathInput"
           density="compact"
@@ -2204,6 +2221,21 @@
             {{ formatFileSize(entry.size) }}
           </v-list-item-subtitle>
           <template #append>
+            <!-- FR-116 P5b — into a folder by a tap: a double-tap is not a
+                 dependable double-click on a touch screen, and a single tap
+                 selects (as a click does). -->
+            <v-btn
+              v-if="entry.is_dir && filesTouchOnly"
+              icon
+              size="x-small"
+              variant="text"
+              :title="`Open ${entry.name}`"
+              :aria-label="`Open ${entry.name}`"
+              data-testid="files-open-folder"
+              @click.stop="onEntryDblClick(entry)"
+            >
+              <v-icon>mdi-chevron-right</v-icon>
+            </v-btn>
             <v-btn
               icon
               size="x-small"
@@ -2371,7 +2403,7 @@ const { t } = useI18n()
 const { showSuccess, showError, showSnackbar } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
-const { mobile } = useDisplay()
+const { mobile, xs, width: displayWidth } = useDisplay()
 // rc.199 — the single grouped Settings panel (gear button opens it at every
 // viewport, replacing the desktop inline Row 2 + the mobile bottom-sheet).
 const settingsOpen = ref(false)
@@ -2986,6 +3018,39 @@ function onWindowPasteForDrawer(ev: ClipboardEvent) {
 // drawer root) shows the operator they're aiming at the drawer's
 // current dir. Drops on the viewer keep going to Downloads.
 const isDrawerDragOver = ref(false)
+/** FR-116 P5b — the drawer's touch affordances (open a folder by a tap,
+ *  upload here) are for screens whose pointer cannot hover: a phone or a
+ *  tablet, where a double-click and a drop are not dependable. Not
+ *  `touchModeOffered`, which also holds on a touchscreen LAPTOP — that one
+ *  has a mouse, so its drawer keeps the desktop's. */
+const filesTouchOnly = (() => {
+  try {
+    return globalThis.matchMedia?.('(hover: none)').matches === true
+  } catch {
+    return false
+  }
+})()
+const drawerFileInput = ref<HTMLInputElement | null>(null)
+
+// FR-116 P5b — "Upload here": the same refusal and the same destination as a
+// drop on the drawer or a paste into it.
+async function onDrawerFilePicked(ev: Event) {
+  const input = ev.target as HTMLInputElement | null
+  const list = input?.files
+  if (!list || list.length === 0) return
+  try {
+    if (filesRefusal.value) {
+      showError(filesRefusal.value)
+      return
+    }
+    const files: File[] = []
+    for (let i = 0; i < list.length; i++) files.push(list[i])
+    await uploadMany(files, drawerUploadDestPath())
+  } finally {
+    if (input) input.value = '' // allow re-picking the same file(s)
+  }
+}
+
 function drawerUploadDestPath(): string | undefined {
   // Only return a dest_path when the drawer is on a real directory
   // (not the roots view which shows drive letters). Root labels are
