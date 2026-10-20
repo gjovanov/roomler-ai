@@ -123,7 +123,7 @@ pub fn verify_artifact_version(path: &Path, claimed: &str) -> Result<String, Ver
         .is_some_and(|n| n.to_ascii_lowercase().ends_with(".tar.gz"));
     match ext.as_str() {
         "msi" => verify_msi(path, claimed),
-        "deb" | "pkg" | "gz" if (ext != "gz" || tarball) && !unix_binding_enabled() => {
+        "deb" | "rpm" | "pkg" | "gz" if (ext != "gz" || tarball) && !unix_binding_enabled() => {
             let format = if tarball { "tar.gz" } else { ext.as_str() };
             Err(VersionError::Unsupported(format!(
                 ".{format} artifacts while the binding is switched off \
@@ -131,6 +131,7 @@ pub fn verify_artifact_version(path: &Path, claimed: &str) -> Result<String, Ver
             )))
         }
         "deb" => verify_deb(path, claimed),
+        "rpm" => verify_rpm(path, claimed),
         "pkg" => verify_pkg(path, claimed),
         "gz" if tarball => verify_tarball(path, claimed),
         "" => Err(VersionError::Unsupported(
@@ -323,6 +324,58 @@ fn verify_deb(path: &Path, claimed: &str) -> Result<String, VersionError> {
 fn verify_deb(_path: &Path, _claimed: &str) -> Result<String, VersionError> {
     Err(VersionError::Unsupported(
         ".deb artifacts off Linux".to_string(),
+    ))
+}
+
+/// An `.rpm` header's `VERSION` as the release it names. It carries no release
+/// suffix (that is `RELEASE`, a separate tag), and a pre-release is written
+/// with `~` for the `-` RPM does not allow in a version (`0.3.0~rc.458`).
+#[cfg(any(target_os = "linux", test))]
+fn rpm_upstream_version(v: &str) -> String {
+    v.trim().replace('~', "-")
+}
+
+/// FR-117 P1 — an `.rpm` states its version in its header, inside the signed
+/// bytes (the `.asc` the updater checks against the pinned key covers the whole
+/// package). Only the desktop companion ships as an `.rpm`, and it is picked
+/// only on a host whose package database is rpm's, so `rpm` is there.
+#[cfg(target_os = "linux")]
+fn verify_rpm(path: &Path, claimed: &str) -> Result<String, VersionError> {
+    let expected = release_version_for(claimed)
+        .ok_or_else(|| VersionError::UnmappableClaim(claimed.to_string()))?;
+    let out = match std::process::Command::new("rpm")
+        .args(["-qp", "--qf", "%{VERSION}"])
+        .arg(path)
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VersionError::Unsupported(
+                ".rpm artifacts without rpm".to_string(),
+            ));
+        }
+        Err(e) => return Err(VersionError::Unreadable(format!("running rpm: {e}"))),
+    };
+    if !out.status.success() {
+        return Err(VersionError::Unreadable(format!(
+            "rpm: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if found.is_empty() {
+        return Err(VersionError::Unreadable(
+            "the package names no VERSION".to_string(),
+        ));
+    }
+    let normalized = rpm_upstream_version(&found);
+    bind(claimed, expected, found, &normalized)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_rpm(_path: &Path, _claimed: &str) -> Result<String, VersionError> {
+    Err(VersionError::Unsupported(
+        ".rpm artifacts off Linux".to_string(),
     ))
 }
 
@@ -851,8 +904,15 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok();
+        // FR-117 P1 — the same for the companion's .rpm, wherever rpm runs (a
+        // Debian host may well have it, and then its reader must refuse too).
+        let rpm = std::process::Command::new("rpm")
+            .arg("--version")
+            .output()
+            .is_ok();
         for (name, runs_here) in [
             ("roomlerd.deb", cfg!(target_os = "linux") && dpkg),
+            ("roomler-desktop.rpm", cfg!(target_os = "linux") && rpm),
             ("roomlerd.pkg", cfg!(target_os = "macos")),
             ("roomlerd.tar.gz", cfg!(unix)),
         ] {
@@ -907,6 +967,20 @@ mod tests {
         // A pre-release with no revision keeps its `-rc.N`.
         assert_eq!(deb_upstream_version("0.3.0-rc.458"), "0.3.0-rc.458");
         assert_eq!(deb_upstream_version(" 0.4.142-1\n"), "0.4.142");
+    }
+
+    /// FR-117 P1 — the companion's `.rpm`: `VERSION` alone (the `-1` is
+    /// `RELEASE`, never part of it), and `~` for a pre-release's `-`.
+    #[test]
+    fn an_rpm_version_reads_back_as_its_release() {
+        assert_eq!(rpm_upstream_version("0.4.147"), "0.4.147");
+        assert_eq!(rpm_upstream_version(" 0.4.147\n"), "0.4.147");
+        assert_eq!(rpm_upstream_version("0.3.0~rc.458"), "0.3.0-rc.458");
+        // The binding then compares it with the tag's own semver.
+        assert_eq!(
+            release_version_for("agent-v0.4.147").as_deref(),
+            Some(rpm_upstream_version("0.4.147").as_str())
+        );
     }
 
     #[test]

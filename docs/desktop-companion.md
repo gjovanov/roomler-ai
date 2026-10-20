@@ -512,8 +512,9 @@ flowchart LR
   `rpm -q --qf '%{VERSION}'` (`companion.rs`, `installed_version_inner`).
 - Every asset is signed (`.asc`) like the daemon's. The server's daemon-first ordering
   (`agent_release::order_assets_daemon_first`) keys on the `roomler-desktop-` prefix, so an
-  `.rpm` sorts after the daemon's packages too, and no updater picks one: they match `.deb` and
-  `.tar.gz` only.
+  `.rpm` sorts after the daemon's packages too. The daemon's own picker never takes a companion
+  package: it matches the daemon's `.deb` and `.tar.gz` only. From FR-117 the updater moves an
+  INSTALLED companion package to the daemon's version through a picker of its own (§13).
 
 ## 11. Testing it
 
@@ -695,3 +696,63 @@ Measured on Fedora Asahi Remix 42 (an Apple M2 Pro Mac mini), 2026-10-16:
 
 The kill switch is `ROOMLER_DESKTOP_BANNER_PIN=0`. It loads no KWin script, and on GNOME the
 companion stays on native Wayland.
+
+## 13. One version: the companion follows the daemon (FR-117)
+
+After an update a device runs one version: the daemon (`roomlerd`), the CLI (`roomler`) and the
+companion (`roomler-desktop`). Each OS packages the companion differently, so each keeps it in
+step differently:
+
+| OS | How the companion ships | What moves it with the daemon |
+|---|---|---|
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:960`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
+| Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
+
+The CLI needs nothing of its own: it ships inside every daemon package (the MSI's `roomler.exe`
+shim, the `.pkg`, the `.deb`, and the tarball, where `usr/bin/roomler` is a required member).
+
+**Why Linux needed it.** The companion's package is installed once, by `install.sh` or the wizard,
+from a release asset. There is no apt or dnf repository, so nothing ever upgraded it. **Update
+all** moved the daemon and left the companion behind, and the grid showed the skew: a Fedora
+Asahi box read `v0.4.147 · desktop v0.4.139` on 2026-10-20. `refresh_if_stale` had been
+Windows-only on the false premise that apt upgrades the companion.
+
+```mermaid
+flowchart TD
+    S([the root update owner:<br/>at its start, every check,<br/>an operator's push]) --> K{ROOMLERD_COMPANION_SYNC=0?}
+    K -->|yes| N0[nothing]
+    K -->|no| Q{roomler-desktop<br/>installed? dpkg / rpm}
+    Q -->|no| N1[nothing: headless stays headless]
+    Q -->|yes| V{its version vs<br/>this daemon's}
+    V -->|equal| N2[nothing]
+    V -->|newer| N3[logged once, never a downgrade]
+    V -->|older| F[release agent-v OWN: the companion<br/>for this arch, .deb for dpkg, .rpm for rpm]
+    F --> D[download_asset: digest, the pinned key,<br/>the version binding]
+    D --> I[the host's package manager,<br/>needrestart suspended]
+    I --> P[stop the companions on the replaced<br/>image; start one in the session<br/>where one was stopped]
+```
+
+- **Who:** the process that installs updates as root on this host, so a person is never asked for
+  a password. That is a system install's root daemon, or a per-user install's root update
+  helper (FR-96). A per-user daemon that sees the skew wakes its helper. Mechanics:
+  [linux-self-update.md](linux-self-update.md#the-desktop-companion-follows-the-daemon-fr-117).
+- **What it reads:** `installed_package` (`companion.rs:367`) asks dpkg, then rpm. ⚠️ dpkg's
+  answer counts only for an INSTALLED package (`dpkg_installed_version`,
+  `companion/package_sync.rs:56`). `dpkg-query -W` also answers, with a version, for one that was
+  removed with its config kept, and a companion a person removed must stay removed.
+- **Never a downgrade, never a new install** (`plan`, `package_sync.rs:79`). A companion newer
+  than the daemon is someone's deliberate install, and the next daemon update catches up. A host
+  with no companion stays without one.
+- ⚠️ **The picker is a positive match** on `roomler-desktop-…-unknown-linux-gnu.<deb|rpm>`
+  (`pick_asset`, `package_sync.rs:103`), the mirror of the daemon picker's `is_daemon_asset`. So
+  the two can never take each other's package (§10.1's freeze, one axis over).
+- **A running companion is restarted** (`restart_replaced`, `package_sync.rs:412`). The package
+  manager renames the new binary over the old, so a running companion's `/proc/<pid>/exe` reads
+  `… (deleted)` (`is_replaced_companion`). Those are stopped, and a new one starts in the
+  graphical session where one was stopped, through FR-27's `systemd_run_command`, as the Windows
+  swap does (#1686). A companion that was not running stays stopped.
+- **The grid catches up at once:** the sync drops `installed_version`'s 10-minute cache
+  (`forget_installed_version`, `companion.rs:322`).
+- **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
+  the Windows retry. Windows' refresh at start is older and stays.

@@ -3826,6 +3826,14 @@ async fn run_cmd(
             if let Some(owner) = launch_owner {
                 roomlerd::companion::launch_once_after_install(owner).await;
             }
+            // FR-117 P2 — the refresh again on every tick, so one that failed
+            // (a download a middlebox dropped, a companion that would not stop)
+            // is retried within hours, not at the next restart. Windows only:
+            // on Linux the companion's package moves inside the updater's loop.
+            #[cfg(target_os = "windows")]
+            if !host_refreshes_companion {
+                roomlerd::companion::refresh_periodically(respawn_ctx).await;
+            }
         });
     }
 

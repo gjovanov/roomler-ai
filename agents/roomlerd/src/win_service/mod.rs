@@ -473,6 +473,13 @@ fn service_main_inner() -> Result<()> {
                         )
                         .await;
                         crate::companion::scm_host_startup().await;
+                        // FR-117 P2 — and again on every tick for the life of
+                        // this host, so a refresh that failed at the start is
+                        // retried within hours, not at the next restart.
+                        crate::companion::refresh_periodically(
+                            crate::companion::RespawnContext::SystemService,
+                        )
+                        .await;
                     });
                 }
             });
