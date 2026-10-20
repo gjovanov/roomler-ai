@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearSignedIn, markSignedIn } from '../../src/api/session.ts'
 import { enrollCommands } from '../../src/utils/enrollCommands.ts'
-import { CAPABILITIES, FALLBACK_PLANS, HERO, PILLARS } from '../../src/utils/landing.ts'
+import { CAPABILITIES, FALLBACK_PLANS, HERO, PILLARS, annualLine } from '../../src/utils/landing.ts'
 import { MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS, SITE_ORIGIN } from '../site.ts'
 import { HOME_DESCRIPTION, HOME_TITLE, priceLabel, renderHome } from '../theme/home-layout.ts'
 import type { ShellNav, SiteAssets } from '../theme/shell.ts'
@@ -172,6 +172,21 @@ describe('priceLabel', () => {
     })
     expect(priceLabel(withEur(800))).toEqual({ amount: '$8', unit: '/ €8 per user / month' })
     expect(priceLabel(withEur(1250))).toEqual({ amount: '$12.50', unit: '/ €12.50 per user / month' })
+  })
+})
+
+describe('annualLine', () => {
+  it('names a paid plan’s yearly price, and never a free plan’s (prod, 2026-10-20)', () => {
+    const yearly = (price_cents: number, unit_amount: number) => ({
+      id: 'x',
+      name: 'X',
+      price_cents,
+      features: [],
+      prices: [{ interval: 'year' as const, currency: 'usd' as const, unit_amount }],
+    })
+    expect(annualLine(yearly(800, 8000))).toBe('or $80 per user per year (two months free)')
+    expect(annualLine(yearly(0, 0))).toBeNull()
+    expect(annualLine({ id: 'x', name: 'X', price_cents: 800, features: [] })).toBeNull()
   })
 })
 
@@ -376,6 +391,27 @@ describe('home.js — live prices', () => {
     expect(annual.textContent).toBe('or $80 / €80 per user per year (two months free)')
     // EUR on sale: the monthly label carries the euro figure too.
     expect(doc.querySelector('[data-plan="pro"] [data-unit]')!.textContent).toBe('/ €8 per user / month')
+  })
+
+  it('never offers the free plan by the year (prod, 2026-10-20: "or $0 per user per year")', async () => {
+    const plans = [
+      {
+        id: 'free',
+        name: 'Free',
+        price_cents: 0,
+        features: ['Alpha'],
+        prices: [
+          { interval: 'month', currency: 'usd', unit_amount: 0 },
+          { interval: 'year', currency: 'usd', unit_amount: 0 },
+        ],
+      },
+    ]
+    const { doc } = runHomeJs({ '/api/capabilities': SAAS, '/api/stripe/plans': { ok: true, body: plans } })
+    await settle()
+    const annual = doc.querySelector('[data-plan="free"] [data-annual]') as HTMLElement
+    expect(annual.hidden).toBe(true)
+    expect(annual.textContent).toBe('')
+    expect(doc.querySelector('[data-plan="free"] [data-unit]')!.textContent).toBe('forever')
   })
 
   it('keeps the fallback table when the answer is unusable', async () => {

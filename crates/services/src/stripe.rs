@@ -678,10 +678,22 @@ impl StripeService {
     pub fn get_plans(settings: &StripeSettings) -> Vec<PlanInfo> {
         let ids = PriceIds::of(settings);
         let on_sale = currencies_on_sale(settings);
+        // A `year` entry is how every page learns that annual is on sale, so
+        // Free, which costs nothing either way, lists one only where a paid
+        // plan is sold annually. Listing it unconditionally put an Annual
+        // toggle on the billing page and "or $0 per user per year" on the
+        // Free card while nothing was sold annually (prod, 2026-10-20).
+        let annual_on_sale = [Plan::Pro, Plan::Business]
+            .iter()
+            .any(|p| ids.price_for(p.id(), BillingInterval::Year).is_some());
         let prices = |plan: Plan| -> Vec<PlanPrice> {
             let mut out = Vec::new();
             for interval in BillingInterval::ALL {
-                let sold = plan == Plan::Free || ids.price_for(plan.id(), interval).is_some();
+                let sold = if plan == Plan::Free {
+                    interval != BillingInterval::Year || annual_on_sale
+                } else {
+                    ids.price_for(plan.id(), interval).is_some()
+                };
                 if !sold && interval == BillingInterval::Year {
                     continue;
                 }
@@ -1471,6 +1483,15 @@ mod tests {
         );
         assert_eq!(pro.prices.len(), 2, "USD and EUR");
         assert!(pro.prices.iter().all(|p| p.unit_amount == 800));
+        // No plan lists a year while nothing is sold annually, Free included:
+        // a `year` entry is what puts the Annual toggle on the billing page.
+        assert!(
+            plans.iter().all(|p| p
+                .prices
+                .iter()
+                .all(|x| x.interval == BillingInterval::Month)),
+            "a year is listed with no annual Price configured"
+        );
 
         let with_annual = StripeSettings {
             price_pro_annual: "price_py".into(),
@@ -1488,6 +1509,12 @@ mod tests {
         assert!(year.iter().all(|p| p.unit_amount == 16_000), "ten months");
 
         let free = plans.iter().find(|p| p.id == "free").unwrap();
+        assert!(
+            free.prices
+                .iter()
+                .any(|p| p.interval == BillingInterval::Year && p.unit_amount == 0),
+            "once annual is sold, Free is listed at 0 in both intervals"
+        );
         assert!(free.commercial_use);
         assert!(!free.per_seat);
         assert_eq!(free.features[0], "Free for commercial use");
