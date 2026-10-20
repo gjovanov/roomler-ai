@@ -100,11 +100,16 @@ pub struct VaultSecretMeta {
     /// `rrn:{org}:secret:{path}`: the handle a session's tools name it by.
     pub rrn: String,
     pub path: String,
-    /// `static` · `structured`.
+    /// `static` · `structured` · (P3-6b) `dynamic`.
     pub kind: String,
+    /// P3-6b — a dynamic secret's provider ([`providers`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
-    /// The fields that hold a value: `value` for a static secret.
+    /// The fields a session may name: those that hold a value, `value` for
+    /// a static secret; for a dynamic one, its minted credential's, never
+    /// its issuer's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
     /// Where a value may be presented.
@@ -320,6 +325,63 @@ impl VaultActivityKind {
     }
 }
 
+/// P3-6b — the providers a `dynamic` secret names (FR-90 §3e "P3-6,
+/// `short-lived`, as designed"). Each fixes two sets of names, which the
+/// server and the daemon must agree on:
+/// - the ISSUER's fields, which the secret stores and a lease's bundle
+///   carries to the device that mints;
+/// - the MINTED credential's, which a session names.
+///
+/// ⚠️ No mode releases an issuer's field to a session. A lease of a dynamic
+/// secret names no field at all: the device takes every field a call names
+/// from the one credential it mints for the lease.
+pub mod providers {
+    /// Where a provider's credential is minted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MintsOn {
+        /// On the device that runs the session. The lease's bundle carries
+        /// the issuer's fields to it, and they stay in daemon memory, as a
+        /// `proxy` value does.
+        Device,
+    }
+
+    /// One provider: its name, its issuer's fields, its credential's.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Provider {
+        /// Exactly what a secret's `provider` says. ⚠️ A compatibility
+        /// surface, locked by test.
+        pub name: &'static str,
+        /// The issuer's fields: the vault refuses a write of any other.
+        pub issuer: &'static [&'static str],
+        /// The issuer's fields no mint can do without. A lease of a secret
+        /// missing one is refused `no_value`.
+        pub required: &'static [&'static str],
+        /// The minted credential's fields: what a session names.
+        pub minted: &'static [&'static str],
+        pub mints_on: MintsOn,
+    }
+
+    /// A Postgres user, made for the lease by the issuer's account. The
+    /// minted `host`, `port` and `database` say where it signs in: the
+    /// secret's one audience, and its `database`.
+    pub const POSTGRES: Provider = Provider {
+        name: "postgres",
+        issuer: &["admin_user", "admin_password", "database", "grants", "ca"],
+        required: &["admin_user", "admin_password", "database"],
+        minted: &["user", "password", "host", "port", "database"],
+        mints_on: MintsOn::Device,
+    };
+
+    /// Every provider this build knows.
+    pub const ALL: &[Provider] = &[POSTGRES];
+
+    /// The provider a secret names. `None` for a name this build cannot
+    /// name, which nothing mints for.
+    pub fn named(name: &str) -> Option<&'static Provider> {
+        ALL.iter().find(|p| p.name == name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +514,44 @@ mod tests {
             assert_eq!(RevokeReason::from_wire(r.wire()), Some(r));
         }
         assert_eq!(RevokeReason::from_wire("from_a_newer_server"), None);
+    }
+
+    /// P3-6b — a provider's names are what a secret stores and a session
+    /// names on two builds at once: spelled out literally, so a rename is a
+    /// deliberate edit here.
+    #[test]
+    fn a_providers_names_are_locked() {
+        use providers::*;
+        let names: Vec<&str> = ALL.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["postgres"]);
+        assert_eq!(
+            (POSTGRES.issuer, POSTGRES.required, POSTGRES.minted),
+            (
+                &["admin_user", "admin_password", "database", "grants", "ca"][..],
+                &["admin_user", "admin_password", "database"][..],
+                &["user", "password", "host", "port", "database"][..],
+            )
+        );
+        assert_eq!(named("postgres"), Some(&POSTGRES));
+        assert_eq!(named("Postgres"), None, "one spelling");
+        assert_eq!(
+            named("mysql"),
+            None,
+            "nothing mints for a name this build cannot name"
+        );
+    }
+
+    #[test]
+    fn a_provider_requires_only_its_issuers_fields() {
+        for p in providers::ALL {
+            assert!(!p.issuer.is_empty() && !p.minted.is_empty(), "{}", p.name);
+            for f in p.required {
+                assert!(p.issuer.contains(f), "{}: {f}", p.name);
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for f in p.issuer {
+                assert!(seen.insert(*f), "{}: {f} twice", p.name);
+            }
+        }
     }
 }

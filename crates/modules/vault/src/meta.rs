@@ -43,17 +43,26 @@ fn req_id_ok(req_id: &str) -> bool {
 /// What a session is told of a secret: never a value, a version's number,
 /// or who wrote it.
 pub fn meta_of(secret: &VaultSecret, slug: &str) -> VaultSecretMeta {
+    // P3-6b — a dynamic secret's fields are its issuer's, which no session
+    // names: it is told the minted credential's instead.
+    let dynamic =
+        crate::dynamic::provider_of(secret).filter(|_| secret.kind == crate::model::KIND_DYNAMIC);
     VaultSecretMeta {
         rrn: rrn::secret_rrn(slug, &secret.path),
         path: secret.path.clone(),
         kind: secret.kind.clone(),
+        provider: dynamic.map(|p| p.name.to_string()),
         description: secret.description.clone(),
-        fields: secret
-            .fields
-            .iter()
-            .filter(|(_, f)| f.current > 0)
-            .map(|(name, _)| name.clone())
-            .collect(),
+        fields: match dynamic {
+            Some(p) => p.minted.iter().map(|f| (*f).to_string()).collect(),
+            None if secret.kind == crate::model::KIND_DYNAMIC => Vec::new(),
+            None => secret
+                .fields
+                .iter()
+                .filter(|(_, f)| f.current > 0)
+                .map(|(name, _)| name.clone())
+                .collect(),
+        },
         audiences: secret.audiences.clone(),
         exec_allow: secret.exec_allow.clone(),
         tags: secret.tags.clone(),
@@ -268,6 +277,7 @@ mod tests {
             tenant_id: ObjectId::new(),
             path: "db/main".into(),
             kind: "structured".into(),
+            provider: None,
             description: "the main database".into(),
             fields: [
                 ("password".to_string(), field(3)),
@@ -296,8 +306,64 @@ mod tests {
         );
         assert_eq!(meta.exec_allow, ["psql"]);
         let wire = serde_json::to_string(&meta).unwrap();
-        for absent in ["owner", "created_by", "\"seq\"", "current", "disabled"] {
+        for absent in [
+            "owner",
+            "created_by",
+            "\"seq\"",
+            "current",
+            "disabled",
+            "provider",
+        ] {
             assert!(!wire.contains(absent), "{absent} in {wire}");
         }
+    }
+
+    /// P3-6b — a session is told a dynamic secret's provider and the fields
+    /// it may name, the minted credential's, and never its issuer's.
+    #[test]
+    fn a_dynamic_secrets_metadata_names_what_it_mints() {
+        let now = DateTime::now();
+        let field = |current| crate::model::FieldState {
+            seq: current,
+            current,
+            updated_at: Some(now),
+        };
+        let mut secret = VaultSecret {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            path: "db/dyn".into(),
+            kind: crate::model::KIND_DYNAMIC.into(),
+            provider: Some("postgres".into()),
+            description: String::new(),
+            fields: [
+                ("admin_user".to_string(), field(1)),
+                ("admin_password".to_string(), field(2)),
+                ("database".to_string(), field(1)),
+            ]
+            .into_iter()
+            .collect(),
+            audiences: vec!["db.internal:5432".into()],
+            exec_allow: Vec::new(),
+            tags: Vec::new(),
+            owner_id: ObjectId::new(),
+            rotation_days: None,
+            disabled: false,
+            created_by: ObjectId::new(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        let meta = meta_of(&secret, "grox");
+        assert_eq!(meta.provider.as_deref(), Some("postgres"));
+        assert_eq!(
+            meta.fields,
+            ["user", "password", "host", "port", "database"]
+        );
+        let wire = serde_json::to_string(&meta).unwrap();
+        assert!(!wire.contains("admin_"), "{wire}");
+        // A provider this build cannot name: nothing to name at all.
+        secret.provider = Some("mysql".into());
+        let meta = meta_of(&secret, "grox");
+        assert_eq!((meta.provider, meta.fields), (None, Vec::<String>::new()));
     }
 }

@@ -519,7 +519,16 @@ mod client {
             n: i64,
             sealed: &str,
             expires_at_ms: i64,
+            provider: Option<&str>,
         ) {
+            // P3-6b — a dynamic secret's bundle: its issuer's fields, for a
+            // build that mints with them. This one mints nothing, so it
+            // refuses the lease unopened rather than take a bundle for a
+            // stored value.
+            if let Some(provider) = provider {
+                debug!(%lease_id, %provider, "vault: a bundle this build cannot mint with — refused unopened");
+                return self.on_refused(req_id, LeaseRefusal::Unsupported.wire(), None);
+            }
             let (ask, reply) = match lock(&self.pending).remove(req_id) {
                 Some(Waiting::Lease { ask, reply }) => (ask, reply),
                 // An answer of the wrong kind answers nothing it was asked.
@@ -758,8 +767,15 @@ mod client {
     }
 
     /// The daemon's [`Client::on_leased`].
-    pub fn on_leased(req_id: &str, lease_id: &str, n: i64, sealed: &str, expires_at_ms: i64) {
-        CLIENT.on_leased(req_id, lease_id, n, sealed, expires_at_ms);
+    pub fn on_leased(
+        req_id: &str,
+        lease_id: &str,
+        n: i64,
+        sealed: &str,
+        expires_at_ms: i64,
+        provider: Option<&str>,
+    ) {
+        CLIENT.on_leased(req_id, lease_id, n, sealed, expires_at_ms, provider);
     }
 
     /// The daemon's [`Client::on_refused`].
@@ -931,6 +947,7 @@ mod tests {
                 rrn: format!("rrn:grox:secret:{path}"),
                 path: path.into(),
                 kind: "static".into(),
+                provider: None,
                 description: String::new(),
                 fields: vec!["value".into()],
                 audiences: Vec::new(),
@@ -1054,8 +1071,35 @@ mod tests {
                 1,
                 &sealed_for_us(b"canary-vault-value"),
                 expires_at_ms,
+                None,
             );
             asker.await.unwrap().unwrap()
+        }
+
+        /// P3-6b — a dynamic secret's bundle, which this build mints nothing
+        /// with: the asker is told `unsupported`, and nothing is held.
+        #[tokio::test]
+        async fn a_bundle_is_refused_unopened_by_a_build_that_mints_nothing() {
+            let (c, mut rx) = connected();
+            let sid = ObjectId::new();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.request(ask(sid, 3)).await })
+            };
+            let req_id = req_id_of(rx.recv().await.unwrap());
+            c.on_leased(
+                &req_id,
+                "L-bundle",
+                0,
+                &sealed_for_us(br#"{"audience":"db.internal:5432","fields":{}}"#),
+                in_ms(60_000),
+                Some("postgres"),
+            );
+            assert_eq!(
+                asker.await.unwrap(),
+                Err(LeaseError::Refused("unsupported".into()))
+            );
+            assert!(c.held().is_empty(), "a bundle is never held as a value");
         }
 
         /// A request goes out on the connection, bounded as the vault bounds
@@ -1093,6 +1137,7 @@ mod tests {
                 7,
                 &sealed_for_us(b"canary-vault-value"),
                 in_ms(60_000),
+                None,
             );
             let info = asker.await.unwrap().unwrap();
             assert_eq!(
@@ -1152,6 +1197,7 @@ mod tests {
                 1,
                 &sealed_for_us(b"canary-vault-value"),
                 in_ms(60_000),
+                None,
             );
             assert_eq!(asker.await.unwrap().unwrap().lease_id, "L1");
         }
@@ -1228,6 +1274,7 @@ mod tests {
                 1,
                 &sealed_for_us(b"canary-vault-value"),
                 in_ms(60_000),
+                None,
             );
             assert!(c.held().is_empty(), "a late answer is not held");
         }
@@ -1253,6 +1300,7 @@ mod tests {
                 1,
                 &sealed_for_us(b"canary-vault-value"),
                 in_ms(60_000),
+                None,
             );
             assert!(
                 c.held().is_empty(),
@@ -1290,6 +1338,7 @@ mod tests {
                 1,
                 &sealed,
                 in_ms(60_000),
+                None,
             );
             assert_eq!(asker.await.unwrap(), Err(LeaseError::Unopenable));
             assert!(c.held().is_empty());
@@ -1439,7 +1488,7 @@ mod tests {
                     tokio::spawn(async move { c.request(a).await })
                 };
                 let req_id = req_id_of(rx.recv().await.unwrap());
-                c.on_leased(&req_id, id, 1, &sealed_for_us(b"v"), in_ms(ms));
+                c.on_leased(&req_id, id, 1, &sealed_for_us(b"v"), in_ms(ms), None);
                 asker.await.unwrap().unwrap();
             }
             let held = c.held();
