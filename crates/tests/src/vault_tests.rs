@@ -1273,6 +1273,73 @@ async fn net_policies_name_this_organizations_exits_and_simulate_decides_them() 
     );
 }
 
+/// P3-2c — a policy that can never apply is refused when it is written,
+/// and as a change `simulate` is asked about: a `forbid` like that would
+/// forbid nothing its writer meant it to. Nothing is stored.
+#[tokio::test]
+async fn a_policy_that_can_never_apply_is_refused_when_written() {
+    let app = vault_app(Some(fresh_kek())).await;
+    let t = app.seed_tenant("vaultnever").await;
+    let me = t.admin.id.clone();
+    post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
+    let (node, _) = crate::vault_lease_tests::enroll(&app, &t, "never-node", "linux").await;
+    let never = [
+        format!(
+            r#"forbid (principal, action == Roomler::Action::"secret:use", resource == Roomler::Node::"{node}");"#
+        ),
+        r#"forbid (principal, action == Roomler::Action::"net:socks", resource) when { false };"#
+            .to_string(),
+    ];
+    for (i, text) in never.iter().enumerate() {
+        let (code, body, _) = post_json(
+            &app,
+            &t,
+            "/policy",
+            json!({ "name": format!("never-{i}"), "text": text }),
+        )
+        .await;
+        assert_eq!(code, 400, "{text}: {body}");
+        assert!(body.contains("can never apply"), "{text}: {body}");
+        let (code, body, _) = post_json(
+            &app,
+            &t,
+            "/simulate",
+            json!({
+                "action": "net:socks",
+                "principal": { "role": "dev", "owner_id": me },
+                "resource": { "node_id": node },
+                "device": { "os": "linux", "tags": [], "owner_id": me },
+                "with": [text],
+            }),
+        )
+        .await;
+        assert_eq!(code, 400, "simulate with {text}: {body}");
+        assert!(
+            body.contains("can never apply"),
+            "simulate with {text}: {body}"
+        );
+    }
+    assert_eq!(
+        app.db
+            .collection::<Document>("vault_policies")
+            .count_documents(doc! {})
+            .await
+            .unwrap(),
+        0,
+        "nothing was stored"
+    );
+    // One that can apply is kept, as before.
+    let can = r#"forbid (principal, action == Roomler::Action::"net:forward", resource) when { context.port == 22 };"#;
+    let (code, body, _) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "no-ssh", "text": can }),
+    )
+    .await;
+    assert_eq!(code, 201, "{body}");
+}
+
 /// P3-2b — `simulate/replay`: the recorded Cedar decisions, each with the
 /// request it decided, decided again under a change not yet made; it
 /// answers the ones that would come out the other way, counts a row it
