@@ -16,6 +16,7 @@
       <v-btn
         icon="mdi-arrow-left"
         variant="text"
+        class="rc-tb-back"
         :to="isExternal ? { name: 'connect' } : { name: 'devices', params: { tenantId } }"
         :aria-label="isExternal ? 'Back to Connect' : 'Back to Agents'"
       />
@@ -48,7 +49,7 @@
         size="small"
         :color="phaseColor"
         variant="flat"
-        class="mr-2"
+        class="mr-2 rc-tb-status"
       >
         <template v-if="rc.phase.value === 'reconnecting'">
           Reconnecting (attempt {{ rc.reconnectAttempt.value }})…
@@ -72,7 +73,7 @@
         :color="peerAuthBadgeShown.color"
         variant="tonal"
         :prepend-icon="peerAuthBadgeShown.icon"
-        class="mr-2 d-none d-sm-inline-flex"
+        :class="peerAuthBadgeShown.color === 'warning' ? 'mr-2 rc-tb-status' : 'mr-2 d-none d-sm-inline-flex'"
         :title="peerAuthBadgeShown.title"
         data-testid="rc-peer-auth"
       >
@@ -94,7 +95,7 @@
         color="warning"
         variant="flat"
         prepend-icon="mdi-lock"
-        class="mr-2"
+        class="mr-2 rc-tb-status"
         :title="rc.hostLockedInputPasses.value
           ? 'The remote host is on its lock screen. Your input reaches it, so you can type the password to unlock.'
           : 'The remote host is on the lock screen — input is suppressed.'"
@@ -746,7 +747,7 @@
             <v-icon v-else>mdi-swap-vertical-circle-outline</v-icon>
           </v-btn>
         </template>
-        <v-card min-width="380" max-width="460">
+        <v-card min-width="min(380px, calc(100vw - 24px))" max-width="460">
           <v-toolbar density="compact" color="primary">
             <v-icon class="ml-3">mdi-swap-vertical-circle-outline</v-icon>
             <v-toolbar-title>Transfers</v-toolbar-title>
@@ -832,6 +833,7 @@
         color="primary"
         variant="flat"
         prepend-icon="mdi-play"
+        class="rc-tb-session"
         :disabled="!canConnect"
         @click="startSession"
       >
@@ -842,9 +844,12 @@
         color="error"
         variant="flat"
         prepend-icon="mdi-stop"
+        class="rc-tb-session"
+        aria-label="Disconnect"
         @click="leave()"
       >
-        Disconnect
+        <!-- Icon-only on a phone, where the row has no room for the word. -->
+        <span class="d-none d-sm-inline">Disconnect</span>
       </v-btn>
       <!-- Fullscreen: gated on (a) connected session AND (b) the
            document supports the Fullscreen API. iOS Safari only
@@ -857,7 +862,7 @@
         icon
         variant="text"
         size="small"
-        class="ml-1"
+        class="ml-1 rc-tb-fullscreen"
         :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
         :title="isFullscreen ? 'Exit fullscreen (hold Esc)' : fullscreenButtonTooltip"
         @click="toggleFullscreen"
@@ -892,6 +897,13 @@
       class="ma-2 ma-md-3 remote-stage-card flex-grow-1 d-flex"
     >
     <div class="remote-stage">
+      <!-- An overlay along the top of the stage. As flex siblings of the
+           picture in a ROW flexbox these alerts were 32 px strips beside it at
+           every width — text, icon and close invisible — and each one's
+           coming and going resized the frame, which re-sent rc:resolution
+           (and rebuilt the agent's encoder) in Fit mode. Here the frame keeps
+           its size; only the alerts themselves take a click. -->
+      <div class="rc-stage-alerts">
       <v-alert
         v-if="rc.error.value"
         type="error"
@@ -954,6 +966,7 @@
         This session ends in {{ idleLeft }} s. Move the mouse or press a key over the remote
         screen to keep it.
       </v-alert>
+      </div>
 
       <div v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed'" class="empty-state">
         <!-- FR-27 P10 - the person at the device ended the session. Said in
@@ -1505,7 +1518,10 @@
         <!-- FR-26 — four tabs instead of one long scroll. The dialog is
              fullscreen on a phone, where ~8 stacked buttons plus three
              sections meant the Session tools were below two screenfuls. -->
-        <v-tabs v-model="settingsTab" density="comfortable" color="primary" grow>
+        <!-- show-arrows: Vuetify hides the slide arrows below 1280 px unless
+             asked, and four icon tabs need ~480 px — the Session tab sat 6 px
+             into view on a 360 px phone. -->
+        <v-tabs v-model="settingsTab" density="comfortable" color="primary" grow show-arrows>
           <v-tab value="video" prepend-icon="mdi-video-outline">Video</v-tab>
           <v-tab value="display" prepend-icon="mdi-monitor-screenshot">Display</v-tab>
           <v-tab value="metrics" prepend-icon="mdi-speedometer">Metrics</v-tab>
@@ -1668,55 +1684,58 @@
             <v-icon size="small" color="primary">mdi-speedometer</v-icon>
             <span class="text-subtitle-2 font-weight-medium">Quality metrics</span>
           </div>
+          <!-- The toolbar readout is md and up (d-none d-md-flex), so on a phone
+               the values under each item below are the only readout. -->
           <div class="text-caption text-medium-emphasis mb-2 ml-1">
-            Shown in the toolbar while a session is connected.
+            Shown in the toolbar while a session is connected, on wider screens;
+            the live value is under each item here.
           </div>
           <v-checkbox
             v-model="metrics.codec"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Codec, transport and decoder"
             :messages="statsCodecLabel || 'e.g. AV1 4:2:0 HW (av1_qsv) · direct · dec HW · FSR'"
           />
           <v-checkbox
             v-model="metrics.bitrate"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Bitrate"
             :messages="statsBitrateLabel || 'e.g. 1.8 Mbps'"
           />
           <v-checkbox
             v-model="metrics.fps"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Frame rate"
             :messages="statsFpsLabel || 'e.g. 13 fps'"
           />
           <v-checkbox
             v-model="metrics.resolution"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Resolution"
             :messages="statsResolutionLabel || 'e.g. 2880×1800'"
           />
           <v-checkbox
             v-model="metrics.scale"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Display scale (1:1 check)"
             :messages="statsScaleLabel || 'e.g. shown at 1.05× — 1:1 pixels when the host renders at your window size'"
           />
           <v-checkbox
             v-model="metrics.age"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Frame age (end to end)"
             :messages="statsAgeLabel || 'e.g. ~4 ms — needs agent 0.4.9+'"
           />
           <v-checkbox
             v-model="metrics.paint"
             density="compact"
-            hide-details
+            hide-details="auto"
             label="Pipeline diagnostics"
             messages="paint / forward / decode milliseconds — for chasing an fps ceiling"
           />
@@ -5107,6 +5126,42 @@ onBeforeUnmount(() => {
 .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar__content) {
   overflow-x: auto;
 }
+/* FR-116 — below 960 px (a phone either way up, a portrait tablet) a
+   connected session's toolbar holds more than the row. On a 360 px phone: ~600 px of
+   tools in ~344 px. The title is `flex: 1 1 0`, so it was the first thing to
+   go (0 px: no device name, no status dot), the status chips shrank to empty
+   coloured stubs, and Disconnect started off-screen. Now Back, the device's
+   name, Disconnect (and Fullscreen) and the session's state come FIRST (flex
+   order) and keep their size; every other tool follows and the row scrolls
+   as before. Disconnect goes before the chips so a long state never pushes
+   it out of view. */
+@media (max-width: 959.98px) {
+  .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar__content > *) {
+    order: 10;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary .rc-tb-back) {
+    order: 0;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar-title) {
+    order: 1;
+    flex: 0 1 auto !important;
+    min-width: 96px !important;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary .rc-tb-session) {
+    order: 2;
+    flex-shrink: 0;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary .rc-tb-fullscreen) {
+    order: 3;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary .rc-tb-status) {
+    order: 4;
+    flex-shrink: 0;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary .v-chip) {
+    flex-shrink: 0;
+  }
+}
 .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar-title) {
   flex-shrink: 1;
   min-width: 0;
@@ -5128,6 +5183,17 @@ onBeforeUnmount(() => {
   justify-content: stretch;
   background: #0b0b0b;
   position: relative;
+}
+.rc-stage-alerts {
+  position: absolute;
+  inset: 0 0 auto 0;
+  z-index: 31; /* above the stage's pills (30) */
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+}
+.rc-stage-alerts > * {
+  pointer-events: auto;
 }
 .empty-state {
   margin: auto;
