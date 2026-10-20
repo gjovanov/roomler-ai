@@ -112,6 +112,8 @@ import { useRoomStore } from '@/stores/rooms'
 import { useTenantStore } from '@/stores/tenant'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useAgentStore } from '@/stores/agents'
+import { useConferenceStore } from '@/stores/conference'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 describe('useWsStore', () => {
   beforeEach(() => {
@@ -347,6 +349,81 @@ describe('useWsStore', () => {
       })
 
       expect(spy).toHaveBeenCalledWith('r1', null, 0)
+    })
+  })
+
+  // FR-115 P5 — the meeting-length cap's warning, and its end.
+  describe('meeting cap', () => {
+    function inCall(roomId: string) {
+      const leaveRoom = vi.fn()
+      vi.mocked(useConferenceStore).mockReturnValueOnce({
+        isInCall: true,
+        roomId,
+        leaveRoom,
+      } as unknown as ReturnType<typeof useConferenceStore>)
+      return leaveRoom
+    }
+
+    function connected() {
+      const store = useWsStore()
+      store.connect()
+      mockWsInstance.simulateOpen()
+    }
+
+    beforeEach(() => {
+      const snackbar = useSnackbar()
+      snackbar.hideSnackbar()
+      snackbar.state.text = ''
+    })
+
+    it('warns the participants of the capped meeting', () => {
+      connected()
+      inCall('r1')
+      mockWsInstance.simulateMessage({
+        type: 'room:call_ending_soon',
+        data: { room_id: 'r1', ends_at: Date.now() + 5 * 60_000, max_minutes: 60, plan: 'free' },
+      })
+
+      const { state } = useSnackbar()
+      expect(state.show).toBe(true)
+      expect(state.color).toBe('warning')
+      expect(state.text).toContain('This meeting ends in 5 minutes.')
+      expect(state.text).toContain('on the Free plan run up to 60 minutes')
+    })
+
+    it('says nothing to a member who is not in that meeting', () => {
+      connected()
+      inCall('r2')
+      mockWsInstance.simulateMessage({
+        type: 'room:call_ending_soon',
+        data: { room_id: 'r1', ends_at: Date.now() + 5 * 60_000, max_minutes: 60, plan: 'free' },
+      })
+
+      expect(useSnackbar().state.show).toBe(false)
+    })
+
+    it('says why when the cap ends the meeting, and leaves it', () => {
+      connected()
+      const leaveRoom = inCall('r1')
+      mockWsInstance.simulateMessage({
+        type: 'room:call_ended',
+        data: { room_id: 'r1', reason: 'plan_limit', max_minutes: 60, plan: 'free' },
+      })
+
+      expect(leaveRoom).toHaveBeenCalled()
+      const { state } = useSnackbar()
+      expect(state.show).toBe(true)
+      expect(state.color).toBe('info')
+      expect(state.text).toContain("the Free plan's 60-minute limit")
+    })
+
+    it('stays quiet when a person ended the meeting', () => {
+      connected()
+      const leaveRoom = inCall('r1')
+      mockWsInstance.simulateMessage({ type: 'room:call_ended', data: { room_id: 'r1' } })
+
+      expect(leaveRoom).toHaveBeenCalled()
+      expect(useSnackbar().state.show).toBe(false)
     })
   })
 

@@ -161,6 +161,9 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-115 P5 — the meeting-length cap: warned at 55, ended at 60, once.
+#[cfg(test)]
+mod meeting_cap_tests;
 #[cfg(test)]
 mod member_tests;
 #[cfg(test)]

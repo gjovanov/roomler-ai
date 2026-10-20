@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
-| **Status** | in progress — P0 and P0-ops done 2026-10-19; P1+P2 implemented, merge held for the 0.4.146 release freeze |
+| **Status** | in progress — P0 and P0-ops done 2026-10-19; P1+P2 and P3 merged 2026-10-20, not yet promoted; P5 in review |
 | **Arc** | P3 of the pricing sequence in [`../business-model.md`](../business-model.md) §5 (enforce → meter → **reshape** → keys) |
 | **Related** | [FR-32](FR-32-plan-limit-enforcement.md) (the one decision point), [FR-20](FR-20-per-tenant-relay-cost-metering.md) (the ledger), [FR-19](FR-19-peer-relays.md) (org relays), [FR-52](FR-52-cross-org-remote-access.md) (support sessions to other orgs), [FR-102](FR-102-growth-observability.md) (revenue view) |
 | **Private annex** | `roomler-ai-docs/gtm/pricing/FR-115-annex-census-2026-10-19.md` — per-org census, account counts, competitor detail |
@@ -55,7 +55,7 @@ A 20-person team is quoted $160 and billed $8.
 ### 3. The one limit a new Free org hits is the one that should not exist
 
 Only `max_devices` and `max_tunnel_clients` are **established** — enforced whatever the org's
-`plan_enforcement` mode (`crates/services/src/quota.rs:71`). Every other gate runs in `Warn` for
+`plan_enforcement` mode (`crates/services/src/quota.rs:71` at `8dcb27a32`, before P1). Every other gate runs in `Warn` for
 an org created after 2026-08-30, by standing decision (`crates/db/src/models/tenant.rs:58`), so
 for a new signup MagicDNS and exit nodes already pass. The advertised "1 concurrent session"
 (Free) and "5" (Pro) are enforced **nowhere**: FR-32 withheld the gate because nothing wrote
@@ -119,7 +119,7 @@ the webhook, so renaming one is a migration (`crates/services/src/stripe.rs:337`
 ### Limits become a function of plan **and** seats
 
 `Plan::limits()` (`crates/db/src/models/tenant.rs:411`) is a pure function of the plan, and
-`quota::evaluate` takes only the plan (`crates/services/src/quota.rs:258`). Per-seat
+`quota::evaluate` takes only the plan (`crates/services/src/quota.rs:258` at `8dcb27a32`; P1 added `evaluate_for`). Per-seat
 allowances (concurrency, relay, storage) need the billed seat count, so the tenant's
 `BillingInfo` gains `seats` (the subscription quantity, written by the webhook) and the
 limits are computed from `(plan, seats)`. Free has no seats; a paid org whose webhook has not
@@ -215,21 +215,78 @@ established. The SFU's unit cost (`sfu_participant_hour = 0.004` in `relay-costs
 never been checked against a real call; P5 measures it from `stats_call_user` before any
 number is advertised beyond what the current single-worker room is known to carry.
 
+### Meetings, as built (P5)
+
+**A sweep, not a timer.** A timer lives in the pod that started the call, and a rolling
+deploy restarts pods: the call would outlive its timer and run uncapped. Every pod reads
+the calls in progress every 30 s (`crates/modules/conference/src/meeting_cap.rs:248`) and
+decides each one with `quota::evaluate_for` on the new `Limit::MeetingMinutes`, read as
+"may it run one more minute?" (`meeting_cap.rs:58`). The comparison stays in the one
+place plan limits are compared, and like the device cap it is **established**: `warn`,
+every new org's default, does not soften it (`crates/services/src/quota.rs:93`). So does
+`VideoMaxParticipants`, Free's other meeting fence; its count reads the owner pod's room,
+so it can only under-count and fails open.
+
+```mermaid
+sequenceDiagram
+    participant S as sweep (every pod, 30 s)
+    participant R as rooms (Mongo)
+    participant M as members' sockets
+    S->>R: calls in progress that started 55+ minutes ago
+    S->>S: step(plan, seats, mode, elapsed, warned)
+    alt 55 ≤ minutes < 60 and not warned
+        S->>R: claim_cap_warning(room, call)
+        R-->>S: won by one pod
+        S->>M: room:call_ending_soon {ends_at, max_minutes, plan}
+    else minutes ≥ 60
+        S->>R: end_call_if_current(room, call)
+        R-->>S: won by one pod
+        S->>S: count the collision · close the call session · close the media island
+        S->>M: room:call_ended {reason: plan_limit, max_minutes, plan}
+    end
+```
+
+| Guard | Where | What it prevents |
+|---|---|---|
+| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:743` | two pods warning one meeting; warning a meeting that ended |
+| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:762` | ending the **next** meeting in a room restarted between the sweep's read and its write |
+| The FR-102 collision is counted after the won end | `meeting_cap.rs:198` | a meeting counted twice when two pods reach it together |
+| `meetings.free_cap = false` | `crates/config/src/settings.rs` (`MeetingsSettings`) | the kill switch: no meeting is warned or ended |
+
+Precision is one sweep period: the warning lands between 55:00 and 55:30, the end between
+60:00 and 60:30. The browser counts the minutes left from `ends_at`, not from the moment
+the warning arrives (`ui/src/utils/meetingCap.ts`). A meeting started again after the end
+is a new call with its own sixty minutes.
+
+⚠️ A call whose row the startup stale-call reset ends (`maintenance.rs:21`, on every boot,
+under the startup lease) while its media lives on in the surviving pod is no longer
+in progress, so the sweep does not see it. That gap is in call state, which predates
+P5. The cap can lose at most the minutes of one meeting that spans a deploy.
+
+**The SFU measurement P5 owed came back empty**: the 90 days to 2026-10-20 held too
+little conferencing to fit a unit cost from (the field log; counts in the private annex),
+so there is no field number for what one room carries. A room is one
+mediasoup router on one worker, which mediasoup's own scalability guidance puts at
+roughly 500 consumers. A meeting where everyone sends a camera and a microphone needs
+2·N·(N−1) consumers: 180 at 10 people, about 4,900 at 50 and 19,800 at 100. Free's 10
+fits. Pro's 50 (P1 raised it from 10) and Business's 100 (unchanged) do not, unless a
+room is piped across workers. That is O4.
+
 ## Phases
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | Spec, registry row, issue | — | ✅ #2560 (`8dcb27a32`) |
 | P0-ops | Tombstone the orphaned orgs (owner account gone), with an export first | restore from the export | ✅ 2026-10-19 21:32Z — 62 of 62, backup verified first |
-| P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | 🟡 implemented, in review |
-| P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | 🟡 implemented against the fake; test-mode run waits for test keys |
-| P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | 🟡 in review (#2571) |
+| P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | 🟡 merged #2565 (`069981677`); its prod ACs wait for the promote |
+| P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | 🟡 merged #2565 (`069981677`) against the fake; the test-mode run waits for test keys |
+| P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | 🟡 merged #2571 (`73bc6daeb`); AC6 on prod waits for the promote |
 | P3b | A cross-org session counts against the controller's org (Redis leases); Free gets no support sessions to other orgs | `rc.org_session_cap = false` | ⬜ |
 | P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | ⬜ |
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | coturn flag off | ⬜ |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
-| P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ⬜ |
+| P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | 🟡 in review (#2583); the SFU measurement found nothing to measure (O4) |
 | P6 | Announcement email to real users, once P1 + P2 are live | — | ⬜ |
 | P7 | **Docs**: `business-model.md` (§4 ladder, §6 rule 4, §7), `compare/vs-tailscale.md`, a plans-and-limits page, with diagrams, linked from `docs/README.md` | — | ⬜ |
 
@@ -255,6 +312,7 @@ number is advertised beyond what the current single-worker room is known to carr
 | O1 | Live Stripe prices: create the annual Prices and the EUR currency options in the live account, then set `ROOMLER__STRIPE__PRICE_PRO_ANNUAL`, `…__PRICE_BUSINESS_ANNUAL` and `ROOMLER__STRIPE__CURRENCIES=usd,eur` | operator. Until then the deployment sells monthly USD only, and the page offers nothing else |
 | O2 | Do pending invites count toward Free's 10? | no — a seat is a member who accepted |
 | O3 | Throttled rate for an over-allowance org | 1 Mbps per org on Free, 4 Mbps on paid plans, measured before it ships |
+| O4 | Pro's 50 and Business's 100 people per meeting, against one mediasoup worker per room (*Meetings, as built*) | the numbers stay as published; a synthetic-participant load test measures what one room carries, then either a room pipes across workers or the published numbers come down to the measured one |
 
 ## Out of scope
 
@@ -269,3 +327,4 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-19 | Read-only prod census (ledger, sessions, relay stats, memberships) | the numbers in *Root cause*; per-org detail in the annex. ⚠️ A first pass summed BSON `Long`s with JS `+`, which concatenates: the fleet DERP total read 1.03e34 GB while every per-row figure was right. Re-run with `Number()` conversion and checked against the weekly sums |
 | 2026-10-19 | P0-ops — the orphaned orgs | Selection: a missing owner account, outside the exclusion set, no live member, and no devices, overlay, messages or files: **62**, all created 2026-02. Exported with their 100 memberships, 62 rooms, 83 room members and 310 roles to a private backup on the ops host, and the file checked before any write. Recomputed at write time and matched the backup (62 = 62); `deleted_at` + `is_archived` set on 62 of 62. Live orgs went from 77 to 15 |
 | 2026-10-19 | Found while building P2 | Two live billing bugs beyond the ones in *Root cause*. (1) A Pro org's "Switch to Business" ran a **second checkout**, which starts a second subscription: two bills. (2) `customer.subscription.updated` wrote only the status, so a plan changed in Stripe's portal **never reached the org**. Both fixed in P2: a live subscription refuses checkout (409) and changes go through `change-plan`; the webhook maps the price to the plan. No org's billing record shows a second subscription |
+| 2026-10-20 | P5's SFU measurement — read-only prod census of `call_sessions` and `stats_call`, 30 and 90 days | **Nothing to measure**: too little conferencing in the window to fit a unit cost from, so `sfu_participant_hour` stays unverified. Neither fence would have changed a meeting in it — none on a capped plan ran past 60 minutes or held more than 10 people. Counts in the private annex; the consequence is O4 |
