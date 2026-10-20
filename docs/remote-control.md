@@ -2774,6 +2774,12 @@ the chip and no picker, and `rc:layout.set` is refused there too. The chip
 does follow GNOME's own switch: Super+Space sent from the viewer moved it to
 `de-DE` and back, with GNOME's indicator.
 
+**Elsewhere the picker switches.** XFCE 4.18 on Xorg keeps a group locked from
+outside it (measured the same way: held for 2 s, both ways), so its hello says
+`set`. The picker is in the viewer's Settings, on the Session tab ("Remote
+keyboard layout"). Clicking a layout there switched the host's XKB group, which
+held (FR-97 §8).
+
 ⚠️ **GNOME configures one group more than it shows.** Its input sources `us,
 de` reach XKB as `us,de,us`: the locale's layout appended for GNOME's own
 shortcuts. Each layout is offered once, at its first group, and the locale
