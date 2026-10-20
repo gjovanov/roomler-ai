@@ -85,6 +85,14 @@ on:
 permissions:
   contents: read
 
+# FR-6 wave 25 (#773): ci.yml's rule. A newer push to a PR cancels its
+# running smokes. On master a running smoke always finishes (it publishes
+# the cargo caches), and a newer push cancels only the run still waiting.
+# A dispatch gets a group of its own.
+concurrency:
+  group: installer-smoke-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   windows-msi-install-uninstall:
     name: per-User MSI install + uninstall (windows-latest)

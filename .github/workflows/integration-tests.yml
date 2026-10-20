@@ -80,6 +80,15 @@ on:
 permissions:
   contents: read
 
+# FR-6 wave 25 (#773): ci.yml's rule, since one run here is three jobs. A
+# newer push to a PR cancels its running suite. On master a running suite
+# always finishes (it publishes the cargo cache), and a newer push cancels
+# only the run still waiting behind it. A dispatch gets a group of its own,
+# so arms dispatched side by side all run.
+concurrency:
+  group: integration-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   integration:
     name: Integration suite (MongoDB + Redis) ${{ matrix.shard }}/3
