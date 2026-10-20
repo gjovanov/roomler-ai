@@ -1,8 +1,8 @@
 # Platform support — what each OS serves, and why where it does not
 
 > **FR-97** ([#2082](https://github.com/gjovanov/roomler-ai/issues/2082),
-> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.145** (2026-10-19), which carries
-> every FR-97 phase merged so far. The spec's §2 is the register this page was built from: each
+> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.146** (2026-10-19); a row that says
+> "from 0.4.147" is on master for the next release. The spec's §2 is the register this page was built from: each
 > gap's evidence, its phase and its field run. This page says what is true now. A change that
 > moves a row moves it here, in the same PR.
 >
@@ -103,7 +103,7 @@ flowchart LR
 | The host's cursor shape, drawn by the viewer | ✅ | ✅ X11, read from XFixes (FR-97 P3a, from 0.4.147), and the DRM arm's hardware cursor (FR-93 P3c) · a per-user Wayland compositor draws it into the picture instead | ❌ WindowServer draws the pointer into the picture | `agents/roomlerd/src/capture/cursor.rs:128-165`, `agents/roomlerd/src/capture/x11_cursor.rs`; `docs/linux-capture.md` §2.1, `docs/wayland.md` §2 |
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: the windows Xwayland owns | ❌ | `Unavailable::Platform` (`agents/roomlerd/src/apps/mod.rs:207`); `docs/remote-apps.md` |
 | Keyboard layout report and switch | ✅ | ❌ | ❌ | Windows-only code behind `enigo-input` (`agents/roomlerd/src/encode/caps.rs:1566-1573`) |
-| Typing text on a non-US layout | ✅ | 🟡 through uinput, a US table only: an unknown layout refuses to type rather than mistype | ✅ | `agents/roomlerd/src/input/keylayout.rs:23-25`, `:55` |
+| Typing text on a non-US layout | ✅ | ✅ through uinput, the host's own XKB keymap (FR-97 P3f, from 0.4.147); without libxkbcommon, a US table, and other layouts refuse rather than mistype | ✅ | `agents/roomlerd/src/input/keylayout/xkb.rs:82`, `agents/roomlerd/src/input/keylayout.rs:23-26`; `docs/linux-capture.md` §3 |
 | Match the remote display to the viewer | ✅ | 🟡 the daemon's own virtual desktop on Xorg's dummy driver | ❌ | `agents/roomlerd/src/display_match.rs:430-455`; `docs/display-match.md` |
 | Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:721-739`; FR-93 P7 |
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ❌ on request only, said as `not-watched` | ❌ the same | image watching rides Windows' clipboard sequence number (`agents/roomlerd/src/clipboard.rs:805-809`) |
