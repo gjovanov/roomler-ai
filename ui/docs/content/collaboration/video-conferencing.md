@@ -70,4 +70,7 @@ is fine.
 
 ## Limits by plan
 
-Participant counts vary by plan. See [pricing](/pricing).
+On the Free plan a meeting holds up to 10 people and runs for up to 60 minutes.
+Everyone in it sees a notice five minutes before the end, and at 60 minutes the
+meeting ends for everyone; starting it again begins a new meeting. Paid plans
+hold more people and have no time limit. See [pricing](/pricing).

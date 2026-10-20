@@ -159,7 +159,9 @@ Notes that matter more than the numbers:
 - Free's `video_max_participants` was `0` until FR-32 and enforced nowhere, so
   Free tenants have always held calls. It went to **4**, and to **10** with a
   60-minute meeting in FR-115 — enforcing `0` would have removed a capability
-  people already use, which is a different act from holding a line.
+  people already use, which is a different act from holding a line. Both fences
+  hold in every mode since FR-115 P5; the census before they shipped found no
+  meeting either would have changed.
 - ⚠️ Before FR-115, checkout sold **one unit per org** whatever its size while the
   site said "per user", and a plan switch ran a second checkout that started a
   second subscription. Both are fixed: checkout bills `quantity = seats`, a
@@ -170,6 +172,12 @@ Notes that matter more than the numbers:
 
 Fourteen limits, one decision point (`services::quota`), three modes per tenant:
 `Off` → `Warn` (record the denial, allow the request) → `Enforce`.
+
+⚠️ **The mode reaches only the limits still being staged.** The *established* ones
+refuse in every mode, `Off` included (`Limit::is_established`): devices and tunnel
+clients (enforced before FR-32), members (FR-115 D2), concurrent remote sessions (FR-115
+P3), and Free's two meeting fences, participants and meeting length (FR-115 P5). Every new
+org starts in `Warn`, so a fence that `Warn` softened would not be one.
 
 ⚠️ **Grandfather before enforcing.** `/plan-compliance` answers *"who would break
 if I turned this on?"* as a **snapshot**, not from denial logs — a tenant sitting

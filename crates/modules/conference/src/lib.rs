@@ -60,6 +60,7 @@ pub mod maintenance;
 pub mod media;
 pub mod media_cluster;
 pub mod media_stats;
+pub mod meeting_cap;
 pub mod recording;
 pub mod ws_media;
 
@@ -143,6 +144,9 @@ impl Module for ConferenceState {
         media_cluster::wire_media_cluster(&state);
         // Stats PR-1 — the per-pod media sampler (no-op unless stats are on).
         media_stats::spawn_media_sampler(state.clone());
+        // FR-115 P5 — the meeting-length cap's sweep (every pod; its writes
+        // are conditional, so two pods warn and end a meeting once).
+        meeting_cap::spawn(state.clone());
         Ok(state)
     }
 

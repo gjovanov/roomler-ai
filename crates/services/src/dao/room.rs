@@ -23,6 +23,17 @@ pub struct LeaveOutcome {
     pub closed_sessions: Vec<(DateTime, DateTime)>,
 }
 
+/// FR-115 P5 — one call in progress, as the meeting-length sweep reads it.
+#[derive(Debug, Clone)]
+pub struct LiveCall {
+    pub room_id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub call_id: ObjectId,
+    pub started_at: DateTime,
+    /// The warning already went out for THIS call.
+    pub warned: bool,
+}
+
 pub struct RoomDao {
     pub base: BaseDao<Room>,
     pub members: BaseDao<RoomMember>,
@@ -71,6 +82,7 @@ fn new_room(r: NewRoom) -> Room {
         conference_settings: r.conference_settings,
         conference_status: None,
         current_call_id: None,
+        cap_warned_call_id: None,
         meeting_code: r.meeting_code,
         join_url: r.join_url,
         organizer_id: None,
@@ -682,6 +694,95 @@ impl RoomDao {
             .await
             .map_err(DaoError::Mongo)?;
         Ok(pre.and_then(|r| r.current_call_id))
+    }
+
+    /// FR-115 P5 — the calls in progress that started at or before `cutoff`:
+    /// the meeting-length sweep's candidates. Read as raw documents, so one
+    /// malformed room is skipped rather than failing the sweep.
+    pub async fn live_calls_started_by(&self, cutoff: DateTime) -> DaoResult<Vec<LiveCall>> {
+        use futures::TryStreamExt;
+
+        let coll = self.base.collection().clone_with_type::<bson::Document>();
+        let mut cursor = coll
+            .find(doc! {
+                "conference_status": "in_progress",
+                "current_call_id": { "$type": "objectId" },
+                "actual_start_time": { "$lte": cutoff },
+            })
+            .projection(doc! {
+                "tenant_id": 1,
+                "current_call_id": 1,
+                "actual_start_time": 1,
+                "cap_warned_call_id": 1,
+            })
+            .await?;
+        let mut calls = Vec::new();
+        while let Some(d) = cursor.try_next().await? {
+            let (Ok(room_id), Ok(tenant_id), Ok(call_id), Ok(started_at)) = (
+                d.get_object_id("_id"),
+                d.get_object_id("tenant_id"),
+                d.get_object_id("current_call_id"),
+                d.get_datetime("actual_start_time"),
+            ) else {
+                continue;
+            };
+            calls.push(LiveCall {
+                room_id,
+                tenant_id,
+                call_id,
+                started_at: *started_at,
+                warned: d.get_object_id("cap_warned_call_id").ok() == Some(call_id),
+            });
+        }
+        Ok(calls)
+    }
+
+    /// FR-115 P5 — claim the meeting-length warning for `call_id`: `true` for
+    /// exactly one caller per call (two pods sweep), and only while it is
+    /// still the room's call.
+    pub async fn claim_cap_warning(&self, room_id: ObjectId, call_id: ObjectId) -> DaoResult<bool> {
+        let res = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": room_id,
+                    "current_call_id": call_id,
+                    "cap_warned_call_id": { "$ne": call_id },
+                },
+                doc! { "$set": { "cap_warned_call_id": call_id } },
+            )
+            .await?;
+        Ok(res.modified_count == 1)
+    }
+
+    /// FR-115 P5 — [`Self::end_call`], but only while `call_id` is still the
+    /// room's call in progress: a sweep that read one call must not end the
+    /// next, which may have started since. `true` = this caller ended it.
+    pub async fn end_call_if_current(
+        &self,
+        room_id: ObjectId,
+        call_id: ObjectId,
+    ) -> DaoResult<bool> {
+        let res = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": room_id,
+                    "current_call_id": call_id,
+                    "conference_status": "in_progress",
+                },
+                doc! {
+                    "$set": {
+                        "conference_status": "ended",
+                        "actual_end_time": DateTime::now(),
+                    },
+                    "$unset": { "current_call_id": "" },
+                },
+            )
+            .await?;
+        Ok(res.modified_count == 1)
     }
 
     /// Join a call as a participant (add session, update media state on RoomMember).

@@ -72,7 +72,11 @@ pub fn collision_dims(tenant_hex: &str, limit: Limit) -> BTreeMap<String, String
     ])
 }
 
-fn record_collision(core: &Core, tenant: &Tenant, limit: Limit) {
+/// Count one collision for the org. [`check_delta`] calls it on every
+/// collision it sees; a caller that decides with the pure
+/// `quota::evaluate_for` and acts later (FR-115's meeting cap, which counts a
+/// meeting once, when the end it won lands) calls it itself.
+pub fn record_collision(core: &Core, tenant: &Tenant, limit: Limit) {
     if !core.settings.growth.enabled {
         return;
     }
