@@ -7,7 +7,7 @@
       :rail="!mobile && rail"
       :permanent="!mobile"
       :temporary="mobile"
-      :width="navWidth"
+      :width="mobile ? undefined : navWidth"
       class="app-nav"
     >
       <!-- Drag the right edge to resize (persisted). Hidden in rail mode —
@@ -46,7 +46,7 @@
            create a new one, back to the picker). Switching NAVIGATES —
            the old list only mutated the store, leaving the URL and the
            room list on the previous org. -->
-      <v-list v-if="!rail" density="compact">
+      <v-list v-if="!railActive" density="compact">
         <v-menu @update:model-value="(open: boolean) => open && orgBadges.fetchSummary()">
           <template #activator="{ props: menuProps }">
             <v-list-item
@@ -173,7 +173,7 @@
             </v-list-item>
           </template>
           <v-text-field
-            v-if="!rail"
+            v-if="!railActive"
             v-model="deviceNav.query.value"
             density="compact"
             variant="solo-filled"
@@ -268,7 +268,7 @@
           />
           <v-divider class="my-1" />
           <v-text-field
-            v-if="!rail"
+            v-if="!railActive"
             v-model="roomNav.query.value"
             density="compact"
             variant="solo-filled"
@@ -409,7 +409,7 @@
           v-if="conferenceStore.isInCall && !isOnCallPage"
         />
         <!-- Pulsing phone icon in rail mode when in call -->
-        <v-list v-if="rail && conferenceStore.isInCall" density="compact">
+        <v-list v-if="railActive && conferenceStore.isInCall" density="compact">
           <v-list-item
             prepend-icon="mdi-phone"
             class="call-indicator"
@@ -430,17 +430,85 @@
 
     <v-app-bar density="compact" flat>
       <template #prepend>
-        <v-app-bar-nav-icon v-if="mobile" @click="drawer = !drawer" />
+        <!-- The drawer is closed on a phone, so what it signals has to reach
+             the bar: the dot says another org has unread activity (the
+             switcher row's own dot sits inside the drawer). -->
+        <v-badge
+          v-if="mobile"
+          dot
+          color="error"
+          :model-value="orgBadges.anyForeignActivity(tenantStore.current?.id ?? null)"
+          offset-x="10"
+          offset-y="10"
+        >
+          <v-app-bar-nav-icon aria-label="Menu" @click="drawer = !drawer" />
+        </v-badge>
       </template>
       <v-app-bar-title class="app-bar-title-truncate">
         {{ pageTitle }}
       </v-app-bar-title>
 
       <template #append>
+        <!-- A phone's bar holds ☰ · title · search · bell · avatar, plus
+             these two indicators as icons with a badge (their text versions
+             alone cost ~125 px). Past that budget the avatar menu — and
+             Logout with it — was pushed off-screen. -->
+        <!-- YOUR call, on a phone, off the call page. The desktop drawer's
+             MiniConference carries mute / camera / hang up; on a phone the
+             drawer is closed, so a call kept running with a live mic and
+             nothing on screen saying so (the indicator next to this one
+             deliberately lists only OTHER rooms' calls). -->
+        <v-menu v-if="mobile && conferenceStore.isInCall && route.name !== 'room-call'">
+          <template #activator="{ props: inCallProps }">
+            <v-btn
+              v-bind="inCallProps"
+              icon
+              size="small"
+              variant="flat"
+              color="success"
+              class="call-pulse mr-1"
+              data-testid="in-call-menu"
+              :aria-label="conferenceStore.isMuted ? 'In a call, muted — call controls' : 'In a call — call controls'"
+            >
+              <v-icon>{{ conferenceStore.isMuted ? 'mdi-microphone-off' : 'mdi-phone-in-talk' }}</v-icon>
+            </v-btn>
+          </template>
+          <v-list density="compact" min-width="220">
+            <v-list-subheader>{{ conferenceStore.roomName || 'Call' }}</v-list-subheader>
+            <v-list-item prepend-icon="mdi-arrow-expand" title="Return to call" @click="returnToCall" />
+            <v-list-item
+              :prepend-icon="conferenceStore.isMuted ? 'mdi-microphone-off' : 'mdi-microphone'"
+              :title="conferenceStore.isMuted ? 'Unmute' : 'Mute'"
+              @click="conferenceStore.toggleMute()"
+            />
+            <v-list-item
+              :prepend-icon="conferenceStore.isVideoOn ? 'mdi-video' : 'mdi-video-off'"
+              :title="conferenceStore.isVideoOn ? 'Turn camera off' : 'Turn camera on'"
+              @click="conferenceStore.toggleVideo()"
+            />
+            <v-divider />
+            <v-list-item prepend-icon="mdi-phone-hangup" title="Hang up" base-color="error" @click="hangUp" />
+          </v-list>
+        </v-menu>
         <!-- Active call indicator -->
         <v-menu v-if="activeCallRooms.length > 0">
           <template #activator="{ props: callMenuProps }">
             <v-btn
+              v-if="xs"
+              v-bind="callMenuProps"
+              icon
+              size="small"
+              variant="tonal"
+              color="success"
+              class="call-pulse mr-1"
+              :aria-label="`${activeCallRooms.length} active call${activeCallRooms.length !== 1 ? 's' : ''}`"
+            >
+              <v-badge :content="activeCallRooms.length" color="success" floating>
+                <v-icon>mdi-phone-ring</v-icon>
+              </v-badge>
+            </v-btn>
+            <v-btn
+              v-else
               v-bind="callMenuProps"
               size="small"
               variant="tonal"
@@ -464,30 +532,52 @@
           </v-list>
         </v-menu>
         <!-- Unread messages indicator -->
-        <v-btn
-          v-if="roomStore.totalUnread > 0"
-          size="small"
-          variant="tonal"
-          color="error"
-          class="mr-2"
-          @click="goToFirstUnread"
-        >
-          <v-icon start>mdi-message-badge</v-icon>
-          {{ roomStore.totalUnread }}
-        </v-btn>
-        <v-btn icon="mdi-magnify" size="small" @click="showSearch = true" />
-        <!-- FR-12 — the tour, reachable forever (not only at first login). -->
+        <template v-if="roomStore.totalUnread > 0">
+          <v-btn
+            v-if="xs"
+            icon
+            size="small"
+            variant="tonal"
+            color="error"
+            class="mr-1"
+            :aria-label="`${roomStore.totalUnread} unread message${roomStore.totalUnread !== 1 ? 's' : ''}`"
+            @click="goToFirstUnread"
+          >
+            <v-badge :content="roomStore.totalUnread" color="error" floating>
+              <v-icon>mdi-message-badge</v-icon>
+            </v-badge>
+          </v-btn>
+          <v-btn
+            v-else
+            size="small"
+            variant="tonal"
+            color="error"
+            class="mr-2"
+            @click="goToFirstUnread"
+          >
+            <v-icon start>mdi-message-badge</v-icon>
+            {{ roomStore.totalUnread }}
+          </v-btn>
+        </template>
+        <v-btn icon="mdi-magnify" size="small" aria-label="Search" @click="showSearch = true" />
+        <!-- FR-12 — the tour, reachable forever (not only at first login).
+             Below 600 px it lives in the avatar menu only (it is already
+             there), to keep the bar inside a phone's width. -->
         <v-btn
           v-if="tenantId"
           icon="mdi-help-circle-outline"
           size="small"
+          class="d-none d-sm-inline-flex"
           :title="$t('nav.tutorial')"
           :aria-label="$t('nav.tutorial')"
           :to="{ name: 'tutorial', params: { tenantId } }"
         />
+        <!-- The theme toggle's phone fallback is in the avatar menu. -->
         <v-btn
           :icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
           size="small"
+          class="d-none d-sm-inline-flex"
+          :aria-label="isDark ? 'Light mode' : 'Dark mode'"
           @click="toggleTheme"
         />
         <v-menu v-model="showNotifications" :close-on-content-click="false">
@@ -533,6 +623,14 @@
               target="_blank"
               rel="noopener"
             />
+            <!-- The bar's theme toggle, below 600 px where the bar has no
+                 room for it. -->
+            <v-list-item
+              v-if="xs"
+              :prepend-icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
+              :title="isDark ? 'Light mode' : 'Dark mode'"
+              @click="toggleTheme"
+            />
             <v-list-item prepend-icon="mdi-logout" title="Logout" @click="handleLogout" />
           </v-list>
         </v-menu>
@@ -560,7 +658,7 @@
       Disconnected. Reconnecting...
     </v-alert>
 
-    <v-main class="app-main-no-scroll">
+    <v-main ref="mainRef" class="app-main-no-scroll">
       <!-- #1631 — keyed by `meta.remountOn` so the remote viewer follows the
            device in the URL; every other route keeps the plain reuse. -->
       <keyed-router-view />
@@ -639,6 +737,7 @@ import { api } from '@/api/client'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
+import { useCallControls } from '@/composables/useCallControls'
 import { useWsStore } from '@/stores/ws'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useHiveStore } from '@/stores/hive'
@@ -656,7 +755,7 @@ import {
   shouldAutoOpenTour,
 } from '@/composables/useTutorialProgress'
 
-const { mobile } = useDisplay()
+const { mobile, xs } = useDisplay()
 const { showError: showCreateOrgError } = useSnackbar()
 const { rules } = useValidation()
 const { auth, logout: handleLogout } = useAuth()
@@ -669,6 +768,7 @@ const roomStore = useRoomStore()
 const notificationStore = useNotificationStore()
 const orgBadges = useOrgBadgesStore()
 const conferenceStore = useConferenceStore()
+const { returnToCall, hangUp } = useCallControls()
 const wsStore = useWsStore()
 // FR-69 P9 — which pillars THIS server mounts. Every nav item below that
 // belongs to a module reads `caps.has(...)`: one predicate for navigation
@@ -720,24 +820,27 @@ function goToProfile() {
   }
 }
 
-function returnToCall() {
-  if (conferenceStore.tenantId && conferenceStore.roomId) {
-    router.push({
-      name: 'room-call',
-      params: {
-        tenantId: conferenceStore.tenantId,
-        roomId: conferenceStore.roomId,
-      },
-    })
-  }
-}
-
 // Drawer starts CLOSED on mobile (so the hamburger button is the
 // affordance to open it) and OPEN on desktop (the standard sidebar
 // experience). Without this, mobile users would land with the nav
 // drawer covering the page until they explicitly close it.
 const drawer = ref(!mobile.value)
 const rail = ref(false)
+// Rail is a desktop state: a window narrowed below 1280 px after the rail
+// was chosen keeps `rail` true, and every check that read it raw then hid
+// the org switcher and the drawer's searches from the phone drawer.
+const railActive = computed(() => !mobile.value && rail.value)
+
+// <v-main> is the page's scroller, not the window, and it stays mounted
+// across child routes — so nothing reset it, and a page opened at the
+// previous page's offset (on a phone, often its bottom, its header and
+// primary action out of view). The PATH only: several views rewrite their
+// query or hash in place and must keep their place.
+const mainRef = ref<{ $el: HTMLElement } | null>(null)
+watch(
+  () => route.path,
+  () => mainRef.value?.$el?.scrollTo?.({ top: 0 }),
+)
 // S4 nav groups — Collaboration starts open (the day-to-day pages);
 // Only Devices starts EXPANDED (the primary nav destination); Rooms /
 // Network / Admin / Audit start collapsed. The user's toggles win afterwards.
@@ -1224,8 +1327,13 @@ onUnmounted(() => {
    inner root so their internal scroll containers (`flex-grow-1
    overflow-y-auto` on the message list) keep working unchanged.
    Note: Vuetify 3 does NOT render .v-main__wrap — slot content goes directly in <main>. */
+/* overflow-x: the page never scrolls sideways — a wide table scrolls in its
+   own box. The house padding (pa-2, 8 px) is narrower than a v-row's
+   gutters (12 px), so every page with a row overflowed by 4 px and swayed
+   sideways under a finger (FR-116). */
 .app-main-no-scroll {
   overflow-y: auto !important;
+  overflow-x: hidden !important;
   flex: 1 1 0 !important;
   min-height: 0 !important;
   display: flex !important;
