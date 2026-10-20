@@ -124,16 +124,18 @@
           if (!p || typeof p.id !== 'string' || typeof p.price_cents !== 'number') return
           var card = box.querySelector('[data-plan="' + p.id.replace(/[^a-z0-9_-]/gi, '') + '"]')
           if (!card) return
-          // FR-115 — the label `priceLabel` (home-layout.ts) renders: the
-          // same number in USD and EUR, per user per month; and the yearly
-          // line when the server sells annual.
+          // FR-115 — the label `priceLabel` (home-layout.ts) renders: per
+          // user per month, the euro figure only once EUR is on sale; and the
+          // yearly line when the server sells annual.
           var dollars = p.price_cents / 100
           var n = dollars % 1 === 0 ? String(dollars) : dollars.toFixed(2)
+          var prices = Array.isArray(p.prices) ? p.prices : []
+          var eur = prices.some(function (x) { return x && x.currency === 'eur' })
           card.querySelector('[data-price]').textContent = '$' + n
-          card.querySelector('[data-unit]').textContent = p.price_cents > 0 ? '/ €' + n + ' per user / month' : 'forever'
+          card.querySelector('[data-unit]').textContent =
+            p.price_cents > 0 ? (eur ? '/ €' + n + ' per user / month' : 'per user / month') : 'forever'
           var annualEl = card.querySelector('[data-annual]')
           if (annualEl) {
-            var prices = Array.isArray(p.prices) ? p.prices : []
             var yUsd = prices.filter(function (x) { return x && x.interval === 'year' && x.currency === 'usd' })[0]
             var yEur = prices.filter(function (x) { return x && x.interval === 'year' && x.currency === 'eur' })[0]
             if (yUsd && typeof yUsd.unit_amount === 'number') {
