@@ -1,7 +1,8 @@
 # FR-116: Phone and tablet parity — the same facts and actions at 360 px as on desktop, details on demand
 
-**Issue:** [#2561](https://github.com/gjovanov/roomler-ai/issues/2561) · **Status:** proposed 2026-10-20, spec and
-claim. P1 (the Devices page) is built and in review · **Owner:** the web app (UI); P6 touches three server payloads ·
+**Issue:** [#2561](https://github.com/gjovanov/roomler-ai/issues/2561) · **Status:** P1–P8 merged and on production
+since 2026-10-20 09:33Z (`hosted-20261020-9776afb`); AC1–AC3, AC5 and AC9 field-verified there (§8); D1 (#2599) and the
+D6 smoke (#2601) in review; AC6–AC8 need a real phone (the operator) · **Owner:** the web app (UI); P6 touches three server payloads ·
 **Anchors:** master `944a85224` · **Builds on:** [FR-12](FR-12-onboarding-tutorial.md) (the tour anchors),
 [FR-103](FR-103-device-credentials-renew-themselves.md) and [FR-106](FR-106-devices-say-when-not-updating.md) (the
 "needs a person" chips), [FR-111](FR-111-touch-controls.md) (touch control of the viewer, left as it is)
@@ -207,21 +208,24 @@ Found by the audit and fixed outside the phases (every width): a deep link to an
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1**: Devices at 390 px on production names every device as the desktop grid does, collapses access and
+- [x] **AC1**: Devices at 390 px on production names every device as the desktop grid does, collapses access and
   details by default, offers every desktop action, searches, filters by kind and pages; tunnel clients are cards;
-  the desktop grid is unchanged. Red on production first (§8), then green after the promote.
-- [ ] **AC2**: no page-level sideways scroll at 360 and 390 px on any signed-in route (measured per route).
-- [ ] **AC3**: every page's primary actions are on-screen at 360 px without a sideways scroll (the list per page is
-  the P8 smoke's).
+  the desktop grid is unchanged. Red on production first (§8), then green after the promote. *(§8, 2026-10-20.)*
+- [x] **AC2**: no page-level sideways scroll at 360 and 390 px on any signed-in route (measured per route).
+  *(§8: the smoke's 17 routes at both widths, on production.)*
+- [x] **AC3**: every page's primary actions are on-screen at 360 px without a sideways scroll (the list per page is
+  the P8 smoke's). *(§8. The idle viewer's secondary break-glass button still reaches 361 px; #2601 shortens it.)*
 - [ ] **AC4**: a device is named by its display name everywhere a person reads a device name: the Devices page and
-  its dialogs, the audit pages, the overlay pages, the Tunnel ACL, analytics, usage, hive.
-- [ ] **AC5**: complex dialogs are full screen on `xs` with their actions reachable.
+  its dialogs, the audit pages, the overlay pages, the Tunnel ACL, analytics, usage, hive. *(§8: every surface
+  but hive verified on production 2026-10-20; hive's rows are FR-90's.)*
+- [x] **AC5**: complex dialogs are full screen on `xs` with their actions reachable. *(§8, 2026-10-20.)*
 - [ ] **AC6**: chat and calls on a phone: Send is always visible; message actions work by tap, and nothing invisible
   takes a tap; the transcript closes; a call leaves visible controls once you leave its page.
 - [ ] **AC7**: the remote viewer on a phone: a connected session at 360 px shows the device name, its status and
   Disconnect; the Unverified badge shows; every settings tab is reachable.
 - [ ] **AC8**: sign-in from iOS does not capitalise the username.
-- [ ] **AC9**: Docs: `docs/ui.md` states §3.1's rules with a diagram, and the `docs/README.md` index row covers them.
+- [x] **AC9**: Docs: `docs/ui.md` states §3.1's rules with a diagram, and the `docs/README.md` index row covers them.
+  *(P8 #2589: `docs/ui.md` § Phones and tablets — the breakpoint diagram, the rules table, the list decision.)*
 
 ## 6. Open decisions
 
@@ -248,6 +252,18 @@ Found by the audit and fixed outside the phases (every width): a deep link to an
 | 2026-10-19 21:14Z | production (the image live that evening) | the operator's org, Devices, in a 390 px frame of the same origin in the operator's browser (DOM read + screenshots; no control touched) | 🔴 **RED (AC1).** 22 cards of 481–521 px, 11,895 px tall; 16 of 16 display-named devices shown by machine name; no Edit name & tags; `/tenant//network/…` links; a 7-column tunnel table scrolling sideways; no search |
 | 2026-10-19 21:20Z | the same | tenant dashboard, org list, Billing, Observability at 390 px | 🔴 **RED (AC2).** `v-main` `scrollWidth − clientWidth` = 4 on each |
 | 2026-10-19 23:30Z | P1 in the local harness (the SPA from `vite dev`, every `/api` call answered by synthetic devices) | 390 × 844, 820 × 1100, 1300 × 900, 2400 × 1000 | 🟢 P1 locally: 7 cards in 2,015 px (a card ~260 px, Access and Details closed); display names; the full menu with Edit name & tags; `?type=tunnel` lands on tunnel cards; two columns at 820 px. **Desktop: 0 differing pixels** against master at 1300 and 2400 px |
+| 2026-10-20 09:13–09:20Z | production, `hosted-20261019-e46da07` (the image before FR-116's promote) | the operator's org: the P8 smoke's routes except chat and call, at 390 and 360 px (instrument below) | 🔴 **RED (AC2, AC3).** `.v-main` scrolls 4 px sideways on `/`, the dashboard and Observability at both widths; Overlay ACL's **Refresh** and **New rule** at 524–756 px; Devices 11,839 px tall at 390 px; at 360 px the idle viewer's **Force control (admin break-glass)** reaches 361 px |
+| 2026-10-20 09:32Z | promote of `hosted-20261020-9776afb`: 44 commits, every FR-116 phase among them | the fleet | pods on the image at 09:33Z, 0 restarts; 21 of 32 devices online across 4 orgs, the operator's 15 of 22 as before the roll; `roomler exec` answered from 6 devices (Linux, and Windows on direct and on DERP); a tunnel forward 200 in 0.44 s |
+| 2026-10-20 09:47Z | the same | the same frames | ⚠️ **The browser kept the previous build.** Every route still drew the old entry script from cache (`transferSize 0`) while the network served the new one, and the old one was a 404 on the new pods. The SPA shell (`location /`) carried no `Cache-Control`. Not FR-116's: fixed by #2605. The runs below add a unique query to every route and record each frame's entry script |
+| 2026-10-20 09:50–10:10Z | production, `hosted-20261020-9776afb` (each frame's entry script checked) | the same routes, plus chat and call (a room with 0 unread and nobody in a call); dialogs; the API | 🟢 **GREEN (AC1, AC2, AC3, AC5).** **AC1:** 22 devices on 3 pages of cards 203–255 px (page 1 2,716 px); 22 of 22 named as the desktop grid names them; 16 of 16 display-named devices by their display name; Access and Details closed on every card; search on screen, the kind filter, paging; the full menu with Edit name & tags; Overlay routes and Overlay ACL at `/tenant/<id>/network/…`; `?type=tunnel` selects Tunnels and shows them as cards; two columns of 231 px at 820 px. **AC2:** 17 routes × 2 widths — the document 0, `.v-main` clipped. **AC3:** every route's primary action on screen at 360 px. **AC5:** Execution policy, SSH policy and Agent logs full screen at 390 px with their actions on screen; Edit name & tags a small dialog, whole |
+| 2026-10-20 10:00Z | the same | desktop width (1300 px); the usage payload | 🟡 **AC4, but for hive.** Machine name / display name as a device's text: exec audit 0 / 54, SSH activity 0 / 28, analytics 0 / 16; Overlay routes name 2 of 2 by display name; the ACLs' only matches are free text (a rule's name, two policies' names), and no id prefixes are left; a person's usage over 30 days: 754 of 754 viewing and 1,970 of 1,970 tunnel windows on display-named devices carry `agent_display_name`. Hive's rows are FR-90's |
+| 2026-10-20 | the same | — | **Open on production.** The idle viewer's break-glass button at 360 px (#2601). The exec audit list is **43,398 px** at 360 px — 100 rows as cards of ~424 px, a long command up to 1,936 px, no paging — against §3.1's detail-on-demand rule: a follow-up. Not run: AC6 (chat and a call from a phone), AC7 (a connected session from a phone), AC8 (iOS sign-in), all the operator's |
+
+**The instrument (2026-10-20).** The operator's Chrome, signed in: a same-origin W × 844 frame of each route inside
+`/icon-192.png`, a document with no CSP (the SPA's own `frame-src` refuses a frame of itself). Scrollbars are hidden
+in the frame, as a phone's overlay scrollbars take no width, and each route settles 4.5 s after `.v-main` appears.
+The off-screen rule is the D6 smoke's. `purestat_ignore` was set for the runs and restored afterwards, so no frame
+counted as a visit. The viewer route is an offline device's idle page, which starts no session.
 
 ## 9. Related
 
