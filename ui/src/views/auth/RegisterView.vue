@@ -18,18 +18,30 @@
               type="email"
               :rules="[rules.required, rules.email]"
               autofocus
+              autocomplete="email"
+              autocapitalize="none"
+              spellcheck="false"
             />
+            <!-- No auto-capitalisation, no autocorrect: iOS capitalises the first
+                 letter of a text field by default, and the server matches the
+                 username exactly — "goran" typed on an iPhone arrived as
+                 "Goran" and was refused as invalid credentials. -->
             <v-text-field
               v-model="username"
               :label="$t('auth.username')"
               prepend-inner-icon="mdi-account"
               :rules="[rules.required, rules.minLength(3)]"
+              autocomplete="username"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
             />
             <v-text-field
               v-model="displayName"
               :label="$t('auth.displayName')"
               prepend-inner-icon="mdi-badge-account"
               :rules="[rules.required]"
+              autocomplete="name"
             />
             <v-text-field
               v-model="password"
@@ -38,6 +50,7 @@
               :type="showPassword ? 'text' : 'password'"
               :append-inner-icon="showPassword ? 'mdi-eye-off' : 'mdi-eye'"
               :rules="[rules.required, rules.minLength(6)]"
+              autocomplete="new-password"
               @click:append-inner="showPassword = !showPassword"
             />
             <!-- FR-88: optional, never required, never blocks sign-up. It
@@ -80,7 +93,7 @@
               @click="oauthRegister(p.name)"
               :color="p.color"
               variant="outlined"
-              size="small"
+              :size="xs ? 'default' : 'small'"
             >
               <v-icon start>{{ p.icon }}</v-icon>
               {{ p.label }}
@@ -100,6 +113,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
@@ -118,6 +132,8 @@ import {
 import { trackGoal } from '@/utils/goals'
 
 const auth = useAuthStore()
+// Provider buttons are a real touch target on a phone (28 px at `small`).
+const { xs } = useDisplay()
 const ws = useWsStore()
 const router = useRouter()
 const route = useRoute()

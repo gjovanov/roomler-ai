@@ -11,12 +11,20 @@
           </v-card-title>
 
           <v-form ref="formRef" @submit.prevent="handleLogin">
+            <!-- No auto-capitalisation, no autocorrect: iOS capitalises the first
+                 letter of a text field by default, and the server matches the
+                 username exactly — "goran" typed on an iPhone arrived as
+                 "Goran" and was refused as invalid credentials. -->
             <v-text-field
               v-model="username"
               :label="$t('auth.username')"
               prepend-inner-icon="mdi-account"
               :rules="[rules.required]"
               autofocus
+              autocomplete="username"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
             />
             <v-text-field
               v-model="password"
@@ -25,6 +33,7 @@
               :type="showPassword ? 'text' : 'password'"
               :append-inner-icon="showPassword ? 'mdi-eye-off' : 'mdi-eye'"
               :rules="[rules.required]"
+              autocomplete="current-password"
               @click:append-inner="showPassword = !showPassword"
             />
 
@@ -54,7 +63,7 @@
               @click="oauthLogin(p.name)"
               :color="p.color"
               variant="outlined"
-              size="small"
+              :size="xs ? 'default' : 'small'"
             >
               <v-icon start>{{ p.icon }}</v-icon>
               {{ p.label }}
@@ -74,6 +83,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
@@ -81,6 +91,8 @@ import { useBrand } from '@/composables/useBrand'
 import { carriedQuery, signupAttribution, startOAuth, type Landing } from '@/utils/attribution'
 
 const auth = useAuthStore()
+// Provider buttons are a real touch target on a phone (28 px at `small`).
+const { xs } = useDisplay()
 const ws = useWsStore()
 const router = useRouter()
 const route = useRoute()
