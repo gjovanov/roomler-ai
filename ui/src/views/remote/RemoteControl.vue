@@ -1031,7 +1031,9 @@
           data-testid="rc-force-control"
           @click="forceDialogOpen = true"
         >
-          Force control (admin break-glass)
+          <!-- FR-116 D6 — the label cannot wrap, and whole it ran 2 px past a
+               360 px screen; the dialog behind it says what break-glass is. -->
+          Force control<span class="d-none d-sm-inline">&nbsp;(admin break-glass)</span>
         </v-btn>
 
         <!-- Phase 5 — admin break-glass. Starts the session skipping the device's
