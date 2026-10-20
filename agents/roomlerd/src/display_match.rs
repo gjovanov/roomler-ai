@@ -361,12 +361,36 @@ mod x11 {
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::Mutex;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{ApplyError, RestoreGuard, XOutput};
 
     /// The guard of the switch in force, `None` when none is.
     static STATE: Mutex<Option<RestoreGuard>> = Mutex::new(None);
+
+    /// The last mode set we made, as `start << 32 | end` on presence's clock
+    /// (whose ticks are never 0), 0 before the first. See
+    /// [`super::own_switch_explains`].
+    static OWN_SWITCH: AtomicU64 = AtomicU64::new(0);
+
+    /// `xrandr --output … --mode …`, with its run recorded in [`OWN_SWITCH`]:
+    /// a mode smaller than where the pointer sits makes the X server clamp the
+    /// pointer, and the clamp resets the X idle clock as a person's input does.
+    fn mode_set(output: &str, mode: &str) -> Result<String, String> {
+        let start = crate::presence::os_tick();
+        let r = xrandr(&["--output", output, "--mode", mode]);
+        let end = crate::presence::os_tick();
+        OWN_SWITCH.store((u64::from(start) << 32) | u64::from(end), Ordering::Release);
+        r
+    }
+
+    /// The last mode set's `(start, end)` on presence's clock.
+    pub fn own_switch() -> Option<(u32, u32)> {
+        match OWN_SWITCH.load(Ordering::Acquire) {
+            0 => None,
+            v => Some(((v >> 32) as u32, v as u32)),
+        }
+    }
 
     fn xrandr(args: &[&str]) -> Result<String, String> {
         let out = Command::new("xrandr")
@@ -453,7 +477,7 @@ mod x11 {
             tracing::warn!(%e, path = %path.display(), "display-match: the restore guard could not be written — not switching");
             return Err(ApplyError::Unsupported);
         }
-        let switched = xrandr(&["--output", &out.name, "--mode", ours]);
+        let switched = mode_set(&out.name, ours);
         super::MODE_GENERATION.fetch_add(1, Ordering::AcqRel);
         *st = Some(guard);
         if let Err(e) = switched {
@@ -479,7 +503,7 @@ mod x11 {
     }
 
     fn put_back(g: &RestoreGuard) {
-        if let Err(e) = xrandr(&["--output", &g.output, "--mode", &g.start]) {
+        if let Err(e) = mode_set(&g.output, &g.start) {
             tracing::warn!(output = %g.output, start = %g.start, %e, "display-match: restore failed");
         } else {
             tracing::info!(output = %g.output, start = %g.start, "display-match: the display's own mode is back");
@@ -525,6 +549,25 @@ pub fn recover_after_restart() {
     if x11_offered() {
         x11::recover();
     }
+}
+
+/// FR-97 P3e-2 — was a move of the idle clock at `input` (presence's clock)
+/// our own last mode switch, give or take `slack`? A switch to a mode smaller
+/// than where the pointer sits makes the X server clamp the pointer, and the
+/// clamp resets the X idle clock as a person's input does (measured with the
+/// agent out of the loop on 0.4.148's candidate, FR-97 §8). Read as a person,
+/// it handed the screen back 0.2 s after every such switch.
+#[cfg(target_os = "linux")]
+pub fn own_switch_explains(input: u32, slack: u32) -> bool {
+    x11::own_switch().is_some_and(|(start, end)| switch_window_holds(input, start, end, slack))
+}
+
+/// Pure: `input` lies within `[start - slack, end + slack]` on the wrapping
+/// 32-bit tick clock.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn switch_window_holds(input: u32, start: u32, end: u32, slack: u32) -> bool {
+    let delta = |a: u32, b: u32| i64::from(a.wrapping_sub(b) as i32);
+    delta(input, start) >= -i64::from(slack) && delta(input, end) <= i64::from(slack)
 }
 
 #[cfg(target_os = "windows")]
@@ -1401,6 +1444,37 @@ mod ownership_tests {
 #[cfg(test)]
 mod tests {
     use super::pick_display_mode;
+
+    /// FR-97 P3e-2 — an idle-clock move inside our own mode switch, give or
+    /// take the slack, is the switch's (the X server's pointer clamp).
+    #[test]
+    fn our_own_switch_window_holds_its_clamp_and_nothing_else() {
+        use super::switch_window_holds as holds;
+        let slack = crate::presence::MACHINE_SLACK_MS;
+        // A switch that ran from tick 10_000 to 10_006 (xrandr took 6 ms).
+        assert!(holds(10_003, 10_000, 10_006, slack), "inside the run");
+        assert!(
+            holds(10_000 - slack, 10_000, 10_006, slack),
+            "the slack before"
+        );
+        assert!(
+            holds(10_006 + slack, 10_000, 10_006, slack),
+            "the slack after"
+        );
+        assert!(
+            !holds(10_000 - slack - 1, 10_000, 10_006, slack),
+            "before it: a person"
+        );
+        assert!(
+            !holds(10_006 + slack + 1, 10_000, 10_006, slack),
+            "after it: a person"
+        );
+        // A slow run (a loaded host) is covered end to end, not only at its ends.
+        assert!(holds(10_900, 10_000, 11_800, slack));
+        // Across the 32-bit wrap.
+        assert!(holds(5, u32::MAX - 10, 20, slack));
+        assert!(!holds(u32::MAX / 2, u32::MAX - 10, 20, slack));
+    }
 
     const MODES: &[(u32, u32)] = &[
         (800, 600),

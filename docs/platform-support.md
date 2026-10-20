@@ -1,8 +1,8 @@
 # Platform support — what each OS serves, and why where it does not
 
 > **FR-97** ([#2082](https://github.com/gjovanov/roomler-ai/issues/2082),
-> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.147** (2026-10-20); a row that says
-> "from 0.4.148" is on master for the next release. The spec's §2 is the register this page was built from: each
+> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.148** (2026-10-20); a row that says
+> "from 0.4.149" is on master for the next release. The spec's §2 is the register this page was built from: each
 > gap's evidence, its phase and its field run. This page says what is true now. A change that
 > moves a row moves it here, in the same PR.
 >
@@ -104,7 +104,7 @@ flowchart LR
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: the windows Xwayland owns | ❌ | `Unavailable::Platform` (`agents/roomlerd/src/apps/mod.rs:207`); `docs/remote-apps.md` |
 | Keyboard layout report and switch | ✅ | ✅ an X11 desktop with a per-user install (FR-97 P3e, from 0.4.148); 🟡 GNOME on Xorg reports its layout and is not switched, because GNOME Shell puts its own input source back · ❌ under Wayland, where the compositor owns the layout and shares no way to read or set it, and on a system install, which has no X connection | ❌ | `agents/roomlerd/src/input/layout_x11.rs:62`, `:79`, `agents/roomlerd/src/encode/caps.rs:854`; `docs/remote-control.md` §18.3.2 |
 | Typing text on a non-US layout | ✅ | ✅ through uinput, the host's own XKB keymap (FR-97 P3f, from 0.4.147); without libxkbcommon, a US table, and other layouts refuse rather than mistype | ✅ | `agents/roomlerd/src/input/keylayout/xkb.rs:82`, `agents/roomlerd/src/input/keylayout.rs:23-26`; `docs/linux-capture.md` §3 |
-| Match the remote display to the viewer | ✅ | ✅ a person's own X11 display with one active output, a per-user install (FR-97 P3e-2, from 0.4.148), and the daemon's own virtual desktop on Xorg's dummy driver · ❌ Wayland, a system install, several active outputs | ❌ | `agents/roomlerd/src/display_match.rs:696-744`, `:262`; `docs/display-match.md` |
+| Match the remote display to the viewer | ✅ | ✅ a person's own X11 display with one active output, a per-user install (FR-97 P3e-2, from 0.4.148), and the daemon's own virtual desktop on Xorg's dummy driver · ❌ Wayland, a system install, several active outputs | ❌ | `agents/roomlerd/src/display_match.rs:739-744`, `:262`; `docs/display-match.md` |
 | Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:790-808`; FR-93 P7 |
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ❌ the same | image watching rides Windows' clipboard sequence number, and on X11 the change gate (`agents/roomlerd/src/clipboard.rs:632`, `:1055`); `docs/remote-control.md`, the watcher on X11 |
 | Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:1650-1654` |

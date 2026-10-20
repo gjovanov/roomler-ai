@@ -314,12 +314,18 @@ pub fn note_linux_lock_hint(locked: bool) {
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
 fn sample() -> bool {
     let locked = LINUX_LOCKED.load(std::sync::atomic::Ordering::Relaxed);
-    let machine = [
-        crate::keep_busy::last_remote_input_tick(),
-        crate::keep_busy::last_own_move_tick(),
-    ];
     let input = x11_idle::last_input_tick(os_tick());
     if let Some(input) = input {
+        // An input inside display match's own mode switch was the switch's:
+        // the X server clamping the pointer into a smaller mode moves the idle
+        // clock as a person would (FR-97 §8, 0.4.148's release check).
+        let switched =
+            crate::display_match::own_switch_explains(input, MACHINE_SLACK_MS).then_some(input);
+        let machine = [
+            crate::keep_busy::last_remote_input_tick(),
+            crate::keep_busy::last_own_move_tick(),
+            switched,
+        ];
         TRACKER
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -493,6 +499,21 @@ mod tests {
         // was the machine's before the tracker existed.
         t.observe(1_000, &[Some(1_000), None]);
         assert_eq!(t.person_ms_ago(301_000), Some(300_000));
+    }
+
+    /// FR-97 P3e-2 — the Linux sampler passes an input inside display match's
+    /// own switch as a machine tick: the X server's pointer clamp, not a person.
+    #[test]
+    fn our_own_display_switch_does_not_move_the_person() {
+        let mut t = Tracker::default();
+        t.observe(100_000, &[None, None, None]);
+        t.observe(400_000, &[None, None, Some(400_000)]);
+        assert_eq!(t.person_ms_ago(700_000), Some(600_000));
+        // The same move with no switch to explain it is a person's.
+        let mut u = Tracker::default();
+        u.observe(100_000, &[None, None, None]);
+        u.observe(400_000, &[None, None, None]);
+        assert_eq!(u.person_ms_ago(700_000), Some(300_000));
     }
 
     #[test]
