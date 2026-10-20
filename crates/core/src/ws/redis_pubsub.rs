@@ -256,6 +256,40 @@ impl RedisPubSub {
         Ok(res.is_some())
     }
 
+    /// FR-115 P4a — a value every pod reads and one pod writes (`SET key
+    /// value EX ttl`). The TTL is the fail-open backstop: a writer that
+    /// stops lets the value lapse rather than leave it in force.
+    pub async fn kv_set_ex(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("EX")
+            .arg(ttl_secs.max(1))
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    /// FR-115 P4a — the value at `key`; `None` when absent.
+    pub async fn kv_get(&self, key: &str) -> Result<Option<String>, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("GET").arg(key).query_async(&mut conn).await
+    }
+
+    /// FR-115 P4a — remove `key` (absent is fine).
+    pub async fn kv_del(&self, key: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("DEL")
+            .arg(key)
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
     /// Batched presence read for the agent listing: one MGET over all
     /// ids, `Some(owner_token)` per present (⇒ fresh, TTL-enforced) key.
     pub async fn agent_presence_get_many(
