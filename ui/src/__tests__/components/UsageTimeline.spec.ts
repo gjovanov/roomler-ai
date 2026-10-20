@@ -11,7 +11,11 @@ import { createVuetify } from 'vuetify'
 import * as components from 'vuetify/components'
 import * as directives from 'vuetify/directives'
 
-import UsageTimeline, { type ViewingWindow } from '@/components/stats/UsageTimeline.vue'
+import UsageTimeline from '@/components/stats/UsageTimeline.vue'
+// The store's type, never one imported from the `.vue` file: the hosted image's
+// build checks `.vue` imports through a shim with a default export only, so a
+// named type from an SFC failed that build while local vue-tsc passed.
+import type { UsageViewingWindow as ViewingWindow } from '@/stores/stats'
 
 const vuetify = createVuetify({ components, directives })
 
