@@ -273,9 +273,10 @@ sequenceDiagram
 - ⚠️ **No hook, no raw input.** The X idle clock is the Linux twin of `GetLastInputInfo`; the source scan that
   fails the build on a Windows hook now fails it on XRecord, an XInput2 event stream and an input device node
   as well.
-- **GNOME keeps a mode set from outside it.** Measured on GNOME 46 on Xorg (FR-97 §8): an `xrandr` mode change
-  stayed. GNOME does put back an outside XKB group lock, which is why the layout picker is not offered there
-  (`docs/remote-control.md` §18.3.2).
+- **GNOME and XFCE keep a mode set from outside it.** Measured on GNOME 46 and on XFCE 4.18, both on Xorg
+  (FR-97 §8): an `xrandr` mode change stayed. On XFCE the agent's own switch held through a 25 s session and was
+  put back when the session closed. GNOME does put back an outside XKB group lock, which is why the layout
+  picker is not offered there (`docs/remote-control.md` §18.3.2); XFCE keeps that too.
 - **The guard needs somewhere to live.** No `$XDG_RUNTIME_DIR`, no switch: an X11 mode outlives the process
   that set it, and a mode a crash stranded would be the person's screen until they fixed it themselves.
 
