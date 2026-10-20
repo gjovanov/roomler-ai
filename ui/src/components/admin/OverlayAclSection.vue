@@ -2,35 +2,45 @@
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-card>
-    <v-card-title class="d-flex align-center">
-      <div>
-        <span>Overlay ACL</span>
-        <div class="text-caption text-medium-emphasis font-weight-regular">
-          Peer visibility + routes — enforced on direct, TURN-relayed and
-          DERP-relayed paths alike
-        </div>
-      </div>
+    <!-- The caption lives in a wrapping subtitle: inside the title (which
+         never wraps) its one long line pushed Refresh and New rule past the
+         card's edge below ~800 px — no rule could be created on a phone. -->
+    <v-card-title class="d-flex align-center flex-wrap ga-2">
+      <span>Overlay ACL</span>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-refresh"
         variant="text"
         size="small"
+        class="d-none d-sm-inline-flex"
         :loading="store.loading"
         @click="refresh"
       >
         Refresh
       </v-btn>
       <v-btn
+        icon="mdi-refresh"
+        variant="text"
+        size="small"
+        class="d-sm-none"
+        aria-label="Refresh"
+        :loading="store.loading"
+        @click="refresh"
+      />
+      <v-btn
         prepend-icon="mdi-plus"
         color="primary"
         variant="flat"
         size="small"
-        class="ml-2"
         @click="openCreate"
       >
         New rule
       </v-btn>
     </v-card-title>
+    <v-card-subtitle class="text-wrap pb-2">
+      Peer visibility + routes — enforced on direct, TURN-relayed and
+      DERP-relayed paths alike
+    </v-card-subtitle>
 
     <v-card-text>
       <v-alert
@@ -87,7 +97,9 @@
         <v-progress-circular indeterminate />
       </div>
 
-      <v-table v-else-if="store.policies.length > 0" density="compact">
+      <!-- A card per rule below 600 px (table-stack-xs): the destinations and
+           the edit/delete actions were off-screen to the right on a phone. -->
+      <v-table v-else-if="store.policies.length > 0" density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>Name</th>
@@ -99,7 +111,7 @@
         </thead>
         <tbody>
           <tr v-for="p in store.policies" :key="p.id">
-            <td>
+            <td data-label="Name">
               <div class="font-weight-medium">
                 {{ p.name }}
                 <v-chip v-if="!p.enabled" size="x-small" variant="tonal" class="ml-1">
@@ -107,7 +119,7 @@
                 </v-chip>
               </div>
             </td>
-            <td>
+            <td data-label="Sources">
               <v-chip
                 v-for="(s, i) in p.sources"
                 :key="`s-${i}`"
@@ -118,7 +130,7 @@
                 {{ selectorLabel(s) }}
               </v-chip>
             </td>
-            <td>
+            <td data-label="Via">
               <v-chip
                 v-for="(t, i) in p.via"
                 :key="`t-${i}`"
@@ -129,9 +141,9 @@
                 {{ targetLabel(t) }}
               </v-chip>
             </td>
-            <td>
+            <td data-label="Destinations">
               <div v-for="(d, i) in p.destinations" :key="`d-${i}`" class="text-caption">
-                <code>{{ d.cidr }}:{{ portLabel(d.port_range) }}</code>
+                <code class="text-break">{{ d.cidr }}:{{ portLabel(d.port_range) }}</code>
                 <span class="text-medium-emphasis">/{{ d.proto }}</span>
               </div>
             </td>
@@ -151,7 +163,7 @@
     </v-card-text>
 
     <!-- Create / edit ─────────────────────────────────────────────── -->
-    <v-dialog v-model="editDialog" max-width="900" persistent>
+    <v-dialog v-model="editDialog" max-width="900" persistent scrollable :fullscreen="fullscreen">
       <v-card>
         <v-card-title>{{ editingId ? 'Edit overlay rule' : 'New overlay rule' }}</v-card-title>
         <v-card-text>
@@ -186,7 +198,7 @@
           </div>
 
           <!-- Sources -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Sources</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               Which nodes this rule grants access FROM.
@@ -249,7 +261,7 @@
           <v-divider class="my-4" />
 
           <!-- Via -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Via</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               The peer they may reach — and the gateway for its subnet routes.
@@ -292,7 +304,7 @@
           <v-divider class="my-4" />
 
           <!-- Destinations -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Destinations</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               CIDRs only — the overlay is L3, so hostnames can never match.
@@ -390,6 +402,8 @@ import {
   type OverlayTarget,
 } from '@/stores/overlayAcl'
 import { useOverlayRoutesStore } from '@/stores/overlayRoutes'
+import { useNodeLabel } from '@/composables/useNodeLabel'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import { useRoleStore } from '@/stores/role'
 import { useMembersStore, type Member } from '@/stores/members'
 
@@ -422,9 +436,13 @@ const protoKinds = [
 
 // Pickers over what the existing stores already expose — never hand-typed
 // ObjectIds (the tunnel-policy form's worst trait).
+// Nodes by their device's name (FR-116), the DNS label only for a node
+// whose device is not known here.
+const { nodeLabel, ensureLoaded } = useNodeLabel()
+const { fullscreen } = useResponsiveDialog()
 const nodeItems = computed(() =>
   nodesStore.nodes.map((n) => ({
-    title: `${n.name || '(unnamed)'} — ${n.overlay_ip}`,
+    title: `${nodeLabel(n) || '(unnamed)'} — ${n.overlay_ip}`,
     value: n.id,
   })),
 )
@@ -626,6 +644,7 @@ function portLabel(r: { low: number; high: number }): string {
 }
 
 async function refresh() {
+  ensureLoaded(props.tenantId, { tunnels: true })
   await Promise.all([
     store.fetchPolicies(props.tenantId),
     nodesStore.fetchNodes(props.tenantId),

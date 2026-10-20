@@ -1,7 +1,11 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <div class="d-flex align-center ga-3">
+  <!-- The toggle keeps its width and the label wraps under it on a narrow
+       screen. In a no-wrap row the toggle (a v-btn-group, which scrolls inside
+       itself) shrank instead, and its third button — On — was hidden: a key
+       that was On looked exactly like Leave alone. -->
+  <div class="d-flex flex-wrap align-center ga-2 ga-sm-3">
     <v-btn-toggle
       :model-value="choice"
       :disabled="disabled"
@@ -10,6 +14,7 @@
       variant="outlined"
       divided
       mandatory
+      class="flex-shrink-0"
       @update:model-value="pick"
     >
       <v-btn value="unmanaged" size="small">Leave alone</v-btn>
