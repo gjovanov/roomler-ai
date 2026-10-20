@@ -218,6 +218,12 @@ pub fn switchable_display() -> Option<String> {
     }
 }
 
+/// FR-97 P3e-2 — this daemon runs its own virtual desktop, on any server: its
+/// `DISPLAY` is that desktop's, not a person's X11 display.
+pub fn active() -> bool {
+    SERVER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
 /// A running virtual desktop. Its `Drop` tears the whole process tree down
 /// (see [`teardown`]), so the caller keeps the handle alive for the agent's
 /// lifetime.

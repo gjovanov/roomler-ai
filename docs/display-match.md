@@ -9,6 +9,7 @@
 > | P1 | the device decides: its owner's `display_match`, and under `auto` whether someone is using the screen; every request answered | shipped (0.4.140); field-verified on Windows |
 > | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | shipped (0.4.140); field-verified on Windows |
 > | P2 | Linux virtual desktops: the desktop runs on Xorg with the dummy driver, which takes any mode, so the viewer's stage size becomes the mode exactly; restored at the end | shipped in 0.4.143 and field-verified on its released binary (FR-108 §8 row 14; the operator settled decision 4 on 2026-10-17) |
+> | FR-97 P3e-2 | a person's own X11 display (a per-user install in an X11 session): the one active output switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand | built (#2623) |
 > | P3–P4 | modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
@@ -17,7 +18,7 @@ Remote text is only crisp when the pixels run 1:1 end to end: the host renders a
 shows it, the stream carries those pixels untouched, and the viewer paints them unscaled. RDP gets there by
 changing the session's resolution. Display match is Roomler's equivalent: the viewer sends its stage size,
 and the agent switches the host's primary display to the largest mode that fits inside it
-([`display_match.rs:44`](../agents/roomlerd/src/display_match.rs#L44) `pick_display_mode`). The change is
+([`display_match.rs:50`](../agents/roomlerd/src/display_match.rs#L50) `pick_display_mode`). The change is
 temporary (`CDS_FULLSCREEN`), so even a crash gives the mode back.
 
 The toggle has been **on by default** since 2026-08-02, and until FR-108 nothing asked who was sitting at the
@@ -53,15 +54,15 @@ sequenceDiagram
     Note over V,A: the session's end, or {enable:false}, restores the mode (only the session that applied it)
 ```
 
-[`display_match.rs:589`](../agents/roomlerd/src/display_match.rs#L589) `may_switch` is the decision, pure and
-unit-tested. [`display_match.rs:614`](../agents/roomlerd/src/display_match.rs#L614) `request_for` runs it,
+[`display_match.rs:880`](../agents/roomlerd/src/display_match.rs#L880) `may_switch` is the decision, pure and
+unit-tested. [`display_match.rs:905`](../agents/roomlerd/src/display_match.rs#L905) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:9792`](../agents/roomlerd/src/peer.rs#L9792)).
+control-channel arm sends the answer ([`peer.rs:9848`](../agents/roomlerd/src/peer.rs#L9848)).
 
 ### The answers
 
 Every request gets exactly one `rc:display-match.state`
-([`display_match.rs:742`](../agents/roomlerd/src/display_match.rs#L742) `state_json`):
+([`display_match.rs:1043`](../agents/roomlerd/src/display_match.rs#L1043) `state_json`):
 
 | `refused` | It means | The viewer says |
 |---|---|---|
@@ -70,8 +71,8 @@ Every request gets exactly one `rc:display-match.state`
 | `locked` | the secure desktop is up (locked, or the logon screen) | "the computer is locked; it switches once unlocked" (P1b) |
 | `disabled_on_device` | the owner set `display_match = never` | "this device's owner turned display match off" |
 | `no_fitting_mode` | no mode the display offers fits inside the stage | "no display mode fits this window" |
-| `switch_failed` | `ChangeDisplaySettingsExW` refused, or on a Linux virtual desktop `xrandr` did | "the display could not be switched" |
-| `unsupported` | neither a Windows host nor a Linux virtual desktop on Xorg with the dummy driver (P2) | "this device can't switch its display" |
+| `switch_failed` | `ChangeDisplaySettingsExW` refused, or on Linux `xrandr` did | "the display could not be switched" |
+| `unsupported` | neither a Windows host, a Linux virtual desktop on Xorg with the dummy driver (P2), nor a person's X11 display with one active output (FR-97 P3e-2) | "this device can't switch its display" |
 
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
@@ -80,7 +81,7 @@ puts the answer under the toggle ([`RemoteControl.vue:3977`](../ui/src/views/rem
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
-([`display_match.rs:607`](../agents/roomlerd/src/display_match.rs#L607) `hands_the_screen_back`). `locked`
+([`display_match.rs:898`](../agents/roomlerd/src/display_match.rs#L898) `hands_the_screen_back`). `locked`
 does not, because the worker cannot touch the secure desktop (below).
 
 ## The owner's key
@@ -97,9 +98,9 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3032`](../crates/localapi/src/lib.rs#L3032)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:8947`](../crates/remote_control/src/models.rs#L8947)). A server that could set it could
+  push it ([`models.rs:8964`](../crates/remote_control/src/models.rs#L8964)). A server that could set it could
   take every screen it reaches.
-- **Read live** at every request ([`display_match.rs:519`](../agents/roomlerd/src/display_match.rs#L519)
+- **Read live** at every request ([`display_match.rs:810`](../agents/roomlerd/src/display_match.rs#L810)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
   ([`config.rs:2527`](../crates/agent-core/src/config.rs#L2527) `DisplayMatchPolicy`).
@@ -112,7 +113,7 @@ the session's idle clock, `GetLastInputInfo`.
 
 That clock moves for every input, and FR-108's P0 measured both kinds moving it: the person's
 (QMP on a vmtest guest) and the controller's injected moves. So
-[`presence.rs:96`](../agents/roomlerd/src/presence.rs#L96) `observe` follows it and keeps the last move
+[`presence.rs:116`](../agents/roomlerd/src/presence.rs#L116) `observe` follows it and keeps the last move
 **the machine does not explain**:
 
 | Input | Noted by | On the clock as |
@@ -122,28 +123,28 @@ That clock moves for every input, and FR-108's P0 measured both kinds moving it:
 | anything else | — | **a person's** |
 
 A move within 250 ms of a machine input is that input
-([`presence.rs:34`](../agents/roomlerd/src/presence.rs#L34) `MACHINE_SLACK_MS`). A sampler reads the clock
-every 500 ms from the worker's start ([`presence.rs:186`](../agents/roomlerd/src/presence.rs#L186) `start`),
+([`presence.rs:48`](../agents/roomlerd/src/presence.rs#L48) `MACHINE_SLACK_MS`). A sampler reads the clock
+every 500 ms from the worker's start ([`presence.rs:354`](../agents/roomlerd/src/presence.rs#L354) `start`),
 so a request mid-session still tells the controller's input from a person's.
 
 - **Before the first reading nothing is known**, and an unknown is never read as an empty chair: the first
   reading counts as a person's.
-- **The decision** ([`presence.rs:57`](../agents/roomlerd/src/presence.rs#L57) `decide`): locked wins over
+- **The decision** ([`presence.rs:77`](../agents/roomlerd/src/presence.rs#L77) `decide`): locked wins over
   everything; a lock after the person's last input means away (P1b, below); otherwise a person's input
   inside the window is `attended`.
-- **The source scan** ([`presence.rs:412`](../agents/roomlerd/src/presence.rs#L412)) fails the build on a
+- **The source scan** ([`presence.rs:637`](../agents/roomlerd/src/presence.rs#L637)) fails the build on a
   hook, raw input or a keyboard poll in `presence.rs` or `display_match.rs`, FR-92's rule.
 
 ### Locked waits for the unlock (P1b)
 
 P0 tried it: on the lock screen the worker's `ChangeDisplaySettingsExW` returns `-1`, and the screen stays as
 it was. So a locked host answers `locked`, and the request waits
-([`display_match.rs:614`](../agents/roomlerd/src/display_match.rs#L614) `request_for` keeps it per session).
+([`display_match.rs:905`](../agents/roomlerd/src/display_match.rs#L905) `request_for` keeps it per session).
 An unattended office PC is usually locked, so this is the main path, not an edge.
 
 At the session's unlock the device decides again
-([`display_match.rs:694`](../agents/roomlerd/src/display_match.rs#L694) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1394`](../agents/roomlerd/src/peer.rs#L1394)):
+([`display_match.rs:987`](../agents/roomlerd/src/display_match.rs#L987) `on_unlock`, called from the
+session's lock watcher, [`peer.rs:1411`](../agents/roomlerd/src/peer.rs#L1411)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -151,15 +152,15 @@ session's lock watcher, [`peer.rs:1394`](../agents/roomlerd/src/peer.rs#L1394)):
 | the person, at the keyboard | a person's input after the lock | `attended` |
 
 ⚠️ The rule that makes the first row work: **a lock after the person's last input means they are away**,
-however recent that input was ([`presence.rs:128`](../agents/roomlerd/src/presence.rs#L128)
+however recent that input was ([`presence.rs:148`](../agents/roomlerd/src/presence.rs#L148)
 `away_since_lock`). Without it, someone who locked their screen and walked off a minute ago would still
 read as `attended` for four more minutes, and the request would be refused for nothing.
 
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1462`](../agents/roomlerd/src/peer.rs#L1462), Windows only). It hands the screen back at once
-and tells the viewer ([`display_match.rs:727`](../agents/roomlerd/src/display_match.rs#L727)
+([`peer.rs:1499`](../agents/roomlerd/src/peer.rs#L1499), Windows only). It hands the screen back at once
+and tells the viewer ([`display_match.rs:1020`](../agents/roomlerd/src/display_match.rs#L1020)
 `on_tick`):
 
 | What changed | The answer | Restored |
@@ -169,14 +170,14 @@ and tells the viewer ([`display_match.rs:727`](../agents/roomlerd/src/display_ma
 | the screen locked | — | no: nobody came back, and the secure desktop cannot be switched anyway |
 
 The mode is not re-applied until the viewer asks again (toggle off and on): a returning person never fights a
-timer for their own screen ([`display_match.rs:708`](../agents/roomlerd/src/display_match.rs#L708)
+timer for their own screen ([`display_match.rs:1001`](../agents/roomlerd/src/display_match.rs#L1001)
 `hand_back`).
 
 ## A Linux virtual desktop (P2)
 
 A daemon started with `ROOMLERD_VIRTUAL_DESKTOP=1` runs a desktop of its own: an X server, a window manager
 and the startup apps. Nobody sits at that screen, since it is the daemon's own, so display match switches it
-without asking who is there ([`display_match.rs:628`](../agents/roomlerd/src/display_match.rs#L628)). The
+without asking who is there ([`display_match.rs:919`](../agents/roomlerd/src/display_match.rs#L919)). The
 owner's `never` still holds.
 
 ```mermaid
@@ -211,26 +212,77 @@ sequenceDiagram
   2048×1536, leaving no named mode to restore to. Found in the build's own probe.
 - **A request becomes a mode of exactly that size**, even on both axes for the encoders: the dummy driver
   takes any size, so a 946×598 stage gets 946×598, not the nearest standard mode (`cvt` would have rounded it
-  to 952) ([`display_match.rs:98`](../agents/roomlerd/src/display_match.rs#L98) `virtual_mode_for`,
-  [`display_match.rs:74`](../agents/roomlerd/src/display_match.rs#L74) `modeline`). Below 640×480 the display is
+  to 952) ([`display_match.rs:104`](../agents/roomlerd/src/display_match.rs#L104) `virtual_mode_for`,
+  [`display_match.rs:80`](../agents/roomlerd/src/display_match.rs#L80) `modeline`). Below 640×480 the display is
   left alone, as on Windows. Above the framebuffer (`VideoRam`, room for 8K) the request is scaled down.
 - **The switch** adds the mode and makes it current
-  ([`display_match.rs:186`](../agents/roomlerd/src/display_match.rs#L186) `lin::apply_mode`). **The restore**
+  ([`display_match.rs:192`](../agents/roomlerd/src/display_match.rs#L192) `lin::apply_mode`). **The restore**
   makes the start mode current again, then removes the modes the session added, in that order, because X
-  refuses to delete the mode in use ([`display_match.rs:226`](../agents/roomlerd/src/display_match.rs#L226)).
+  refuses to delete the mode in use ([`display_match.rs:232`](../agents/roomlerd/src/display_match.rs#L232)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
   ([`scrap_backend.rs:243`](../agents/roomlerd/src/capture/scrap_backend.rs#L243)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb
-  ([`virtual_desktop.rs:741`](../agents/roomlerd/src/virtual_desktop.rs#L741) `spawn_x_server`).
+  ([`virtual_desktop.rs:747`](../agents/roomlerd/src/virtual_desktop.rs#L747) `spawn_x_server`).
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`
   stops the switching.
 
+## A person's own X11 display (FR-97 P3e-2)
+
+A per-user install in an X11 session switches the person's own display: the daemon has the session's
+`DISPLAY` and no `WAYLAND_DISPLAY`, and runs no virtual desktop of its own
+([`display_match.rs:262`](../agents/roomlerd/src/display_match.rs#L262) `x11_offered`).
+The decision is Windows': the owner's `display_match`, and under `auto` whether someone is at the screen.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as roomlerd (per-user, X11)
+    participant P as presence
+    participant X as the session's Xorg
+    participant G as $XDG_RUNTIME_DIR
+    V->>A: rc:display-match {1366, 768}
+    A->>P: who is at the screen?
+    P-->>A: unattended (the X idle clock: no person's input for 5 min)
+    A->>X: xrandr --current
+    X-->>A: one active output, its modes, the one shown
+    A->>G: the restore guard {output, start 1280x800, ours 1280x720}
+    A->>X: xrandr --output Virtual-1 --mode 1280x720
+    A-->>V: rc:display-match.state {on, mode 1280x720}
+    Note over A,P: a person's input: the watcher hands the screen back (P1b)
+    V->>A: the session ends
+    A->>X: xrandr --output Virtual-1 --mode 1280x800
+    A->>G: the guard removed
+```
+
+| | Windows | A person's X11 display |
+|---|---|---|
+| Who is at the screen | `GetLastInputInfo`, and the secure desktop | the X server's idle clock (MIT-SCREEN-SAVER), which XTest input moves as injected input moves Windows' clock, and logind's `LockedHint` ([`presence.rs:200`](../agents/roomlerd/src/presence.rs#L200)) |
+| The modes | the display's own list | the one active output's list in `xrandr --current`; none is added, this is someone's monitor ([`display_match.rs:285`](../agents/roomlerd/src/display_match.rs#L285) `parse_xrandr_outputs`) |
+| Several displays | the primary only | more than one active output answers `unsupported` |
+| After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:340`](../agents/roomlerd/src/display_match.rs#L340) `guard_undoes`, [`display_match.rs:496`](../agents/roomlerd/src/display_match.rs#L496) `recover`) |
+| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1450`](../agents/roomlerd/src/peer.rs#L1450)) |
+| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1486`](../agents/roomlerd/src/peer.rs#L1486)) |
+| Kill switch | `display_match = never` | `ROOMLERD_X11_DISPLAY_MATCH=0`, and `display_match = never` |
+
+- ⚠️ **The X server says how long ago, not when.** "Now minus the idle time" moves by each read's latency,
+  and the tracker would take every such move for a new input, a person's, so nobody would ever read as away.
+  A reading within 50 ms of the last names the same input
+  ([`presence.rs:189`](../agents/roomlerd/src/presence.rs#L189) `steady`).
+- ⚠️ **No hook, no raw input.** The X idle clock is the Linux twin of `GetLastInputInfo`; the source scan that
+  fails the build on a Windows hook now fails it on XRecord, an XInput2 event stream and an input device node
+  as well.
+- **GNOME keeps a mode set from outside it.** Measured on GNOME 46 on Xorg (FR-97 §8): an `xrandr` mode change
+  stayed. GNOME does put back an outside XKB group lock, which is why the layout picker is not offered there
+  (`docs/remote-control.md` §18.3.2).
+- **The guard needs somewhere to live.** No `$XDG_RUNTIME_DIR`, no switch: an X11 mode outlives the process
+  that set it, and a mode a crash stranded would be the person's screen until they fixed it themselves.
+
 ## What it does not do
 
-- macOS and Wayland hosts, and a Linux desktop a person is using: display match runs on Windows and on a
-  Linux virtual desktop only.
+- macOS and Wayland hosts, and a Linux system install: display match runs on Windows, on a Linux virtual
+  desktop, and on a person's own X11 display with one active output (FR-97 P3e-2).
 - DPI and scaling are never changed.
 - One primary display; several displays at once are P4.
 

@@ -4328,6 +4328,10 @@ async fn run_cmd(
     // tell the controller's input from a person's.
     roomlerd::display_match::set_device_policy(cfg.display_match);
     roomlerd::presence::start();
+    // FR-97 P3e-2 — a switch the last run left on a person's own X11 display
+    // (killed or crashed before it restored) goes back, only while the screen
+    // still shows the mode display match set.
+    roomlerd::display_match::recover_after_restart();
     // FR-101 P2b — the owner's session-policy floor, likewise device-only.
     roomlerd::session_policy::set_device_policy(roomlerd::session_policy::from_config(&cfg));
     // FR-92 — the keep-busy engine: restores a keep-busy the signed-in

@@ -1435,13 +1435,31 @@ impl AgentPeer {
         if lock_state::linux_lock_hint_enabled() {
             let stash = control_dc.clone();
             let until = session_end.clone();
+            let sid = session_id;
             tokio::spawn(async move {
                 let run = async move {
                     let mut said = false;
+                    let mut seen = false;
                     loop {
                         let locked = tokio::task::spawn_blocking(lock_state::linux_locked_hint)
                             .await
                             .unwrap_or(false);
+                        // FR-97 P3e-2 — display match's presence takes the
+                        // lock from here: each read is a `loginctl` run.
+                        crate::presence::note_linux_lock_hint(locked);
+                        // FR-97 P3e-2 — a display-match request answered
+                        // `locked` on a person's own X11 display is decided
+                        // again at the unlock, as on Windows (FR-108 P1b).
+                        if seen
+                            && !locked
+                            && let Ok(Some(answer)) = tokio::task::spawn_blocking(move || {
+                                crate::display_match::on_unlock(sid)
+                            })
+                            .await
+                        {
+                            emit_display_match(&stash, answer).await;
+                        }
+                        seen = locked;
                         if locked != said
                             && send_control_notice(
                                 &stash,
@@ -1467,9 +1485,11 @@ impl AgentPeer {
 
         // FR-108 P1b — while this session holds a display mode it applied, a
         // person who comes back (or the owner's `never`) gets the screen back
-        // within a quarter second, and the viewer is told. Windows only, where
-        // display match switches anything; it ends with the session.
-        #[cfg(target_os = "windows")]
+        // within a quarter second, and the viewer is told. It ends with the
+        // session. FR-97 P3e-2 — Linux too: a person's own X11 display, read
+        // by the X idle clock; a virtual desktop holds its mode but for the
+        // owner's `never`.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             let stash = control_dc.clone();
             let until = session_end.clone();
