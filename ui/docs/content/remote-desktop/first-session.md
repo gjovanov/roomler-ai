@@ -79,6 +79,14 @@ there is no server-side recording of a remote session. Anything else would make
 the server a data path, which is the one thing the design does not permit.
 :::
 
+## One session at a time on the Free plan
+
+On the Free plan an organization runs one remote session at a time. While
+someone in it is connected, a new session is refused with a message that says
+who is connected, and to which machine. The session that is already running is
+not affected. End it, or upgrade: Pro runs one session per user, and Business
+has no cap.
+
 ## If the screen is black
 
 Almost always a capture-permission problem on the target, not a network problem

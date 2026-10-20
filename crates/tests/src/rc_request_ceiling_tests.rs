@@ -134,6 +134,8 @@ async fn drain(ws: &mut Ws, quiet: Duration) -> (usize, Vec<String>) {
 async fn session_requests_meet_a_per_device_ceiling_after_the_identity_gates() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr101p4a").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (a, _a_ws) = connect_agent(&app, &seeded, "mach-fr101-ceiling-a").await;
     let (b, _b_ws) = connect_agent(&app, &seeded, "mach-fr101-ceiling-b").await;
     let limit = LIMIT;

@@ -31,6 +31,19 @@ pub enum Error {
     #[error("agent capacity exceeded")]
     AgentBusy,
 
+    /// FR-115 P3 — the organization already runs as many remote sessions at
+    /// once as its plan allows (Free: one, Pro: one per seat). Refused at
+    /// the START of a session, never by ending a live one. The hub has no
+    /// names, so it hands over the ids of one session holding a slot (hex);
+    /// the API layer turns them into "who, on which device" so the person
+    /// asking can end that session or upgrade.
+    #[error("your organization's plan runs {cap} remote session(s) at a time, and one is open now")]
+    OrgSessionLimit {
+        cap: u32,
+        holder_user: String,
+        holder_agent: String,
+    },
+
     #[error("ws send failed")]
     SendFailed,
 

@@ -242,6 +242,8 @@ async fn concurrent_sessions_each_get_distinct_session_ids() {
     // the contract makes a future refactor visible.
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("agent-e2e-concurrent").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let cfg = enrol(&app, &seeded, "mach-e2e-concurrent", "Concurrent test").await;
     let (sig_task, stop_tx) = spawn_agent_and_wait_online(&app, &seeded, &cfg).await;
 
