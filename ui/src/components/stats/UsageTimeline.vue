@@ -63,7 +63,7 @@
 import { computed } from 'vue'
 import { scaleTime } from 'd3-scale'
 import { timeFormat } from 'd3-time-format'
-import { useTheme } from 'vuetify'
+import { useDisplay, useTheme } from 'vuetify'
 import { formatDuration, formatBytes } from '@/utils/format'
 
 export interface ViewingWindow {
@@ -101,6 +101,7 @@ const props = withDefaults(
 )
 
 const theme = useTheme()
+const { xs } = useDisplay()
 const controllerColor = computed(() => theme.current.value.colors.primary)
 const watcherColor = computed(() => theme.current.value.colors.info)
 
@@ -187,9 +188,10 @@ const lanes = computed<Lane[]>(() => {
 
 const ticks = computed(() => {
   const scale = scaleTime().domain([new Date(props.from * 1000), new Date(props.to * 1000)])
-  // Fewer ticks on a wide range keeps the labels from colliding.
+  // Fewer ticks on a wide range keeps the labels from colliding — and on a
+  // phone (FR-116), where seven "Oct 14" labels ran into each other.
   const fmt = span.value > 3 * 86_400 ? timeFormat('%b %d') : timeFormat('%H:%M')
-  return scale.ticks(5).map((d) => ({
+  return scale.ticks(xs.value ? 3 : 5).map((d) => ({
     left: `${pct(d.getTime() / 1000)}%`,
     label: fmt(d),
   }))
@@ -284,5 +286,23 @@ const ticks = computed(() => {
 }
 .tl-legend-note {
   font-style: italic;
+}
+/* FR-116 — on a phone the device's name takes a line of its own above its
+   lane, so the track gets the width: beside a 150 px label and a 62 px total
+   it was ~36 px, and every viewing window was a sliver. The axis and legend
+   drop the label column's indent with it. */
+@media (max-width: 599.98px) {
+  .tl-row {
+    flex-wrap: wrap;
+    row-gap: 2px;
+    margin-bottom: 10px;
+  }
+  .tl-label {
+    flex: 1 1 100%;
+  }
+  .tl-axis,
+  .tl-legend {
+    margin-left: 0;
+  }
 }
 </style>

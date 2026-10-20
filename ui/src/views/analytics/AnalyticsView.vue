@@ -21,14 +21,19 @@
     </v-alert>
 
     <template v-else>
-      <v-tabs v-model="tab" class="mb-3">
+      <!-- FR-116: `show-arrows` — below 1280 px Vuetify hides the arrows
+           unless asked, and at 360 px the fourth tab (People) sat past the
+           edge with nothing saying so. -->
+      <v-tabs v-model="tab" class="mb-3" show-arrows>
         <v-tab value="machines">Machines</v-tab>
         <v-tab value="calls">Calls</v-tab>
         <v-tab value="tunnels">Tunnels</v-tab>
         <v-tab value="usage">People</v-tab>
       </v-tabs>
 
-      <v-window v-model="tab">
+      <!-- FR-116: no swipe — a sideways swipe across a chart or a wide table
+           switched the tab; the tabs above are the way to switch. -->
+      <v-window v-model="tab" :touch="false">
         <v-window-item value="machines">
           <v-row>
             <v-col cols="12" md="6">
@@ -310,7 +315,7 @@
         <v-window-item value="usage">
           <v-card>
             <v-card-title class="text-subtitle-1">Usage by person</v-card-title>
-            <v-card-subtitle>
+            <v-card-subtitle class="text-wrap">
               Minutes and traffic per member. Select someone to see when they viewed which
               machine.
             </v-card-subtitle>
