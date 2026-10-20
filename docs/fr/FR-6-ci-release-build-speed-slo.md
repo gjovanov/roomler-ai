@@ -103,6 +103,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 23b | 10-19 | Integration-suite dispatch inputs `threads`, `mongo_tmpfs` and `report_time` (libtest's per-test durations; the slowest tests, seconds per module and mongod's descriptor peaks go to the step summary) | #2544 |
 | 23c | 10-19 | The release-asset cache key covers every manifest: profile and feature settings shape the dependency builds, and Cargo.lock records neither | #2544 |
 | 23d | 10-19 | The crypto crates (Argon2, OPAQUE, the curve and AEAD crates) build at `opt-level = 3` in the dev and test profiles: the integration suite's test time −34% | #2544 |
+| 24 | 10-20 | **The integration suite runs as three shards**, each on its own runner with its own mongod at 2 threads. Each shard lists the same binaries, sorts the (test, binary) pairs and runs every third with `--exact`; each must report every test it was handed. Only the first shard publishes the cargo cache | #2596 |
 
 ## Acceptance criteria
 
@@ -609,3 +610,20 @@ itself on the affected run's page. Baseline when the program started: releases t
   - Not shipped: all third-party crates at opt-level 2 (test time −54% against −34%). It
     costs a ~12-min cold rebuild of every dependency in every dev-profile lane, and slower
     cold local builds. That trade-off is the operator's (see Open decisions).
+- 2026-10-20: **wave 24, the suite as three shards** (the operator's choice of the levers
+  above). Dispatch run 39386817512 on the branch, with wave 23 in it:
+  - **12.0 min wall-clock** (was ~30). The suite listed 874 tests (35 more than the night
+    before). The shards were handed 292, 291 and 291, and each passed exactly what it was
+    handed.
+
+    | shard | job | build | suite | test time | mongod fd peak |
+    |---|---|---|---|---|---|
+    | 1/3 | 9.6 min | 2.5 | 5.3 | 613 s | 34.3 k |
+    | 2/3 | 11.5 min | 3.7 | 6.4 | 741 s | 25.2 k |
+    | 3/3 | 11.7 min | 3.3 | 6.6 | 756 s | 23.0 k |
+
+  - Each build restored the integration cache under a changed key (wave 23 had not reached
+    master yet), so it recompiled the crypto crates on top of the warm target. Once
+    master republishes, a warm build is ~2–2.5 min and a shard ~10 min.
+  - The partition was dry-run first with two fake libtest binaries (103 tests): union ==
+    listing, no duplicates, the skipped test excluded, a module's tests spread 8/8/9.
