@@ -1,7 +1,13 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog :model-value="modelValue" max-width="720" @update:model-value="$emit('update:modelValue', $event)">
+  <v-dialog
+    :model-value="modelValue"
+    max-width="720"
+    scrollable
+    :fullscreen="fullscreen"
+    @update:model-value="$emit('update:modelValue', $event)"
+  >
     <v-card>
       <v-card-title>
         {{ kind === 'agent' ? 'Enroll a new device' : 'Enroll a tunnel client' }}
@@ -46,12 +52,16 @@
                clients are a per-user CLI with no scope choice. -->
           <template v-if="kind === 'agent'">
             <p class="text-body-2 font-weight-medium mb-1">Install scope</p>
+            <!-- Stacked below 600 px: side by side, the three need ~480 px, and
+                 the group scrolled inside itself — "This user only", the
+                 install that needs no admin rights, sat out of sight. -->
             <v-btn-toggle
               v-model="scope"
               mandatory
               density="comfortable"
               variant="outlined"
               divided
+              :direction="fullscreen ? 'vertical' : 'horizontal'"
               class="mb-1"
             >
               <v-btn value="system" size="small">Background service</v-btn>
@@ -138,6 +148,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import {
   enrollCommands,
   type DaemonScope,
@@ -146,6 +157,7 @@ import {
 } from '@/utils/enrollCommands'
 import { trackGoal } from '@/utils/goals'
 
+const { fullscreen } = useResponsiveDialog()
 const props = defineProps<{
   modelValue: boolean
   kind: EnrollKind

@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog v-model="open" max-width="720" scrollable>
+  <v-dialog v-model="open" max-width="720" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center">
         <v-icon icon="mdi-console-network-outline" color="primary" class="mr-2" />
-        <span>SSH policy — {{ agent?.name }}</span>
+        <!-- The span shrinks with an ellipsis (min-width: 0), so the title's own
+             buttons stay on screen: a title never wraps, and a long device name
+             used to push Close or Refresh past the edge on a phone. -->
+        <span class="text-truncate" style="min-width: 0">SSH policy — {{ deviceLabel(agent) }}</span>
       </v-card-title>
 
       <v-card-text>
@@ -188,6 +191,8 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 import { useAgentStore, type Agent, type SshPolicy } from '@/stores/agents'
 import { dropsToConsoleUser, servesSshAsSystem } from '@/utils/sshIdentity'
 
@@ -202,6 +207,7 @@ const emit = defineEmits<{
   (e: 'saved'): void
 }>()
 
+const { fullscreen } = useResponsiveDialog()
 const open = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v),
