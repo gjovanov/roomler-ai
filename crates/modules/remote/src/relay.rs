@@ -242,7 +242,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     max_duration,
                     idle_secs,
                     lock_on_end,
-                    org_session_cap: org_session_cap,
+                    org_session_cap,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),

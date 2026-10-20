@@ -370,6 +370,7 @@ pub async fn dispatch_controller_rc(
                         max_duration,
                         idle_secs,
                         lock_on_end,
+                        org_session_cap,
                         &frame_val,
                     )
                     .await
