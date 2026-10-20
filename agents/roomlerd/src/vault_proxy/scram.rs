@@ -228,9 +228,6 @@ fn escape(name: &str) -> String {
 
 /// P3-6b-2 — the iterations a minted password's verifier is made with:
 /// Postgres's own default (`scram_iterations`).
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const VERIFIER_ITERATIONS: u32 = 4096;
 
 /// P3-6b-2 — the SCRAM-SHA-256 verifier Postgres stores for `password`:
@@ -239,9 +236,6 @@ pub(crate) const VERIFIER_ITERATIONS: u32 = 4096;
 /// password, which so never reaches the database, nor a statement log there.
 /// The password is SASLprepped as a client's sign-in prepares it, so the
 /// keys are those a sign-in derives.
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn verifier(password: &str, salt: &[u8], iterations: u32) -> Result<String, String> {
     if salt.is_empty() || iterations == 0 || iterations > MAX_ITERATIONS {
         return Err("a verifier needs a salt and a sane iteration count".into());

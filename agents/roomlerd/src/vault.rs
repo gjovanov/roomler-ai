@@ -101,20 +101,30 @@ pub use client::*;
 mod client {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use base64::Engine;
     use bson::oid::ObjectId;
     use roomler_ai_remote_control::signaling::ClientMsg;
     use roomler_ai_remote_control::vault::{
-        LeaseRefusal, VaultActivityKind, VaultSecretMeta, lease_limits,
+        LeaseRefusal, VaultActivityKind, VaultSecretMeta, lease_limits, providers,
     };
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, info, warn};
     use zeroize::Zeroizing;
 
     use super::key;
+    use crate::vault_proxy::pg_mint;
+
+    /// P3-6b-2b — the providers this build mints for, on the device: a lease
+    /// of theirs is held (its bundle lent to no tool) and its credential
+    /// minted at its first use. Every other provider's bundle is refused
+    /// unopened.
+    pub const MINTS: [&str; 1] = [providers::POSTGRES.name];
+
+    /// P3-6b-2b — the mode a dynamic secret is leased in.
+    pub const SHORT_LIVED: &str = "short-lived";
 
     /// How long a request waits for the vault's answer. A server without the
     /// vault mounted never answers one.
@@ -164,6 +174,10 @@ mod client {
         pub ahead: bool,
         /// When the server says it ends, in milliseconds of its clock.
         pub expires_at_ms: i64,
+        /// P3-6b-2b — a dynamic secret's provider: the lease holds its
+        /// issuer's fields, which no tool is lent, and serves the credential
+        /// minted for it ([`Client::mint`], [`Client::minted`]).
+        pub provider: Option<String>,
     }
 
     /// Why a request got no lease.
@@ -194,11 +208,38 @@ mod client {
         /// P3-5b-2 — what a tool serves with this lease's value (a proxy
         /// endpoint): cancelled whenever the lease is let go.
         stops: Vec<tokio_util::sync::CancellationToken>,
+        /// P3-6b-2b — a dynamic secret's lease: `value` is its bundle, and
+        /// this is the credential minted with it.
+        minting: Option<Arc<Minting>>,
+    }
+
+    /// P3-6b-2b — the credential a dynamic secret's lease serves: minted at
+    /// its first use, once, and taken back when the lease is let go.
+    #[derive(Default)]
+    struct Minting {
+        /// Held across the mint, so a second use waits for the first's
+        /// credential rather than mint its own.
+        once: tokio::sync::Mutex<()>,
+        /// Where it stands. Letting the lease go and a mint's last step each
+        /// change it under this lock, so a credential minted while the lease
+        /// was let go is taken back by whichever comes second.
+        state: Mutex<MintState>,
+    }
+
+    #[derive(Default)]
+    enum MintState {
+        #[default]
+        Fresh,
+        Minted(Box<(pg_mint::Issuer, pg_mint::Minted)>),
+        /// The lease is let go: a mint that ends now takes its own credential
+        /// back at once.
+        Gone,
     }
 
     /// Let go of leases already taken out of the map: each value is zeroed as
-    /// it drops, every file written with it is removed, and everything served
-    /// with it is stopped. Answers how many.
+    /// it drops, every file written with it is removed, everything served
+    /// with it is stopped, and (P3-6b-2b) a credential minted for it is taken
+    /// back. Answers how many.
     fn let_go(gone: Vec<Held>) -> usize {
         let n = gone.len();
         for h in gone {
@@ -215,8 +256,46 @@ mod client {
                     ),
                 }
             }
+            if let Some(m) = &h.minting {
+                let was = std::mem::replace(&mut *lock(&m.state), MintState::Gone);
+                if let MintState::Minted(role) = was {
+                    revoke_later(&h.info.lease_id, *role);
+                }
+            }
         }
         n
+    }
+
+    /// P3-6b-2b — take a minted credential back, in the background: the
+    /// revocation dials the database, and nothing that lets a lease go waits
+    /// on it. Without a runtime to spawn on (never so in the daemon), the
+    /// role is left to its `VALID UNTIL` and its issuer's next sweep.
+    fn revoke_later(lease_id: &str, role: (pg_mint::Issuer, pg_mint::Minted)) {
+        let lease = lease_id.to_string();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            warn!(%lease, "vault: a minted credential was left to its VALID UNTIL: no runtime to revoke it on");
+            return;
+        };
+        rt.spawn(async move {
+            let (issuer, minted) = role;
+            match pg_mint::revoke(&issuer, &minted.user).await {
+                Ok(()) => {
+                    info!(%lease, role = %minted.user, "vault: a minted credential taken back")
+                }
+                Err(why) => warn!(
+                    %lease, role = %minted.user, %why,
+                    "vault: a minted credential was not taken back: it lives to its VALID UNTIL"
+                ),
+            }
+        });
+    }
+
+    /// P3-6b-2b — `ms` (milliseconds of the server's clock) as RFC 3339, what
+    /// a minted role's `VALID UNTIL` is given.
+    fn rfc3339(ms: i64) -> Result<String, String> {
+        bson::DateTime::from_millis(ms)
+            .try_to_rfc3339_string()
+            .map_err(|_| "the lease's end is not a time Postgres takes".to_string())
     }
 
     /// P3-4b — what a session's role may list: metadata only, and whether
@@ -521,11 +600,13 @@ mod client {
             expires_at_ms: i64,
             provider: Option<&str>,
         ) {
-            // P3-6b — a dynamic secret's bundle: its issuer's fields, for a
-            // build that mints with them. This one mints nothing, so it
-            // refuses the lease unopened rather than take a bundle for a
-            // stored value.
-            if let Some(provider) = provider {
+            // P3-6b — a dynamic secret's bundle: its issuer's fields. Held,
+            // and lent to no tool, where this build mints for its provider
+            // (P3-6b-2b); refused unopened otherwise, rather than taken for
+            // a stored value.
+            if let Some(provider) = provider
+                && !MINTS.contains(&provider)
+            {
                 debug!(%lease_id, %provider, "vault: a bundle this build cannot mint with — refused unopened");
                 return self.on_refused(req_id, LeaseRefusal::Unsupported.wire(), None);
             }
@@ -561,6 +642,7 @@ mod client {
                 audience: ask.audience,
                 ahead: ask.ahead,
                 expires_at_ms,
+                provider: provider.map(String::from),
             };
             lock(&self.held).insert(
                 lease_id.to_string(),
@@ -570,6 +652,7 @@ mod client {
                     value,
                     files: Vec::new(),
                     stops: Vec::new(),
+                    minting: provider.map(|_| Arc::default()),
                 },
             );
             if reply.send(Ok(info)).is_err() {
@@ -723,10 +806,71 @@ mod client {
         }
 
         /// Use a held value without it leaving this daemon: `None` once the
-        /// lease has expired or been taken back.
+        /// lease has expired or been taken back, and (P3-6b-2b) for a
+        /// dynamic secret's lease, whose bundle holds its issuer's fields:
+        /// those are lent to nothing, and a tool reads the credential minted
+        /// with them ([`Self::minted`]).
         pub fn with_value<R>(&self, lease_id: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
             self.prune();
-            lock(&self.held).get(lease_id).map(|h| f(&h.value))
+            lock(&self.held)
+                .get(lease_id)
+                .filter(|h| h.minting.is_none())
+                .map(|h| f(&h.value))
+        }
+
+        /// P3-6b-2b — mint the credential a dynamic secret's lease serves, if
+        /// it has none yet: once per lease, a second use waiting for the
+        /// first's. Its `VALID UNTIL` is the lease's end. Err, in words that
+        /// name no value, for a lease no longer held or no dynamic secret's,
+        /// or a mint the issuer or its database refused.
+        pub async fn mint(&self, lease_id: &str) -> Result<(), String> {
+            let ended = || "the lease ended before its credential was minted".to_string();
+            let (minting, bundle, expires_at_ms) = {
+                let held = lock(&self.held);
+                let h = held.get(lease_id).ok_or_else(ended)?;
+                let m = h
+                    .minting
+                    .clone()
+                    .ok_or("the lease is no dynamic secret's")?;
+                (m, Zeroizing::new(h.value.to_vec()), h.info.expires_at_ms)
+            };
+            let _one = minting.once.lock().await;
+            match &*lock(&minting.state) {
+                MintState::Minted(_) => return Ok(()),
+                MintState::Gone => return Err(ended()),
+                MintState::Fresh => {}
+            }
+            let issuer = pg_mint::Issuer::from_bundle(&bundle, crate::vault_proxy::upstream_of)?;
+            drop(bundle);
+            let minted = pg_mint::mint(&issuer, lease_id, &rfc3339(expires_at_ms)?).await?;
+            let mut state = lock(&minting.state);
+            if matches!(*state, MintState::Gone) {
+                drop(state);
+                revoke_later(lease_id, (issuer, minted));
+                return Err(
+                    "the lease ended while its credential was minted: it is taken back".into(),
+                );
+            }
+            *state = MintState::Minted(Box::new((issuer, minted)));
+            info!(lease = %lease_id, "vault: a credential minted for a lease");
+            Ok(())
+        }
+
+        /// P3-6b-2b — one field of the credential minted for `lease_id`, by
+        /// the name a session gives it (`user`, `password`, `host`, `port`,
+        /// `database`): `None` before its mint, once the lease is let go, or
+        /// for any other name.
+        pub fn minted(&self, lease_id: &str, field: &str) -> Option<Zeroizing<Vec<u8>>> {
+            self.prune();
+            let held = lock(&self.held);
+            let minting = held.get(lease_id)?.minting.as_ref()?;
+            match &*lock(&minting.state) {
+                MintState::Minted(role) => role
+                    .1
+                    .field(field)
+                    .map(|v| Zeroizing::new(v.as_bytes().to_vec())),
+                MintState::Fresh | MintState::Gone => None,
+            }
         }
 
         /// What this daemon holds, never a value.
@@ -903,6 +1047,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         use super::super::{Client, LeaseAsk, LeaseError, LeaseInfo, Listing, Report, hello_key};
+        use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, made};
 
         fn in_ms(ms: i64) -> i64 {
             let now = std::time::SystemTime::now()
@@ -1076,10 +1221,10 @@ mod tests {
             asker.await.unwrap().unwrap()
         }
 
-        /// P3-6b — a dynamic secret's bundle, which this build mints nothing
-        /// with: the asker is told `unsupported`, and nothing is held.
+        /// P3-6b — a dynamic secret's bundle of a provider this build mints
+        /// nothing for: the asker is told `unsupported`, and nothing is held.
         #[tokio::test]
-        async fn a_bundle_is_refused_unopened_by_a_build_that_mints_nothing() {
+        async fn a_bundle_this_build_cannot_mint_with_is_refused_unopened() {
             let (c, mut rx) = connected();
             let sid = ObjectId::new();
             let asker = {
@@ -1091,15 +1236,167 @@ mod tests {
                 &req_id,
                 "L-bundle",
                 0,
-                &sealed_for_us(br#"{"audience":"db.internal:5432","fields":{}}"#),
+                &sealed_for_us(br#"{"audience":"https://api.github.com","fields":{}}"#),
                 in_ms(60_000),
-                Some("postgres"),
+                Some("github_app"),
             );
             assert_eq!(
                 asker.await.unwrap(),
                 Err(LeaseError::Refused("unsupported".into()))
             );
             assert!(c.held().is_empty(), "a bundle is never held as a value");
+        }
+
+        /// P3-6b-2b — lease `lease_id` as the vault leases a dynamic secret:
+        /// the frame names `postgres`, and its bundle `f`'s database, the
+        /// issuer `admin` signing in with `password`.
+        async fn lease_bundle(
+            c: &Arc<Client>,
+            rx: &mut mpsc::Receiver<ClientMsg>,
+            lease_id: &str,
+            f: &FakeIssuer,
+            password: &str,
+        ) -> LeaseInfo {
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.request(ask(ObjectId::new(), 3)).await })
+            };
+            let req_id = req_id_of(rx.recv().await.unwrap());
+            let bundle = serde_json::to_vec(&serde_json::json!({
+                "audience": format!("localhost:{}", f.port),
+                "fields": {
+                    "admin_user": "admin",
+                    "admin_password": password,
+                    "database": "orders",
+                    "ca": f.ca,
+                },
+            }))
+            .unwrap();
+            c.on_leased(
+                &req_id,
+                lease_id,
+                0,
+                &sealed_for_us(&bundle),
+                in_ms(60_000),
+                Some("postgres"),
+            );
+            asker.await.unwrap().unwrap()
+        }
+
+        /// What a background revocation leaves: polled for 5 s.
+        async fn eventually(what: &str, done: impl Fn() -> bool) {
+            for _ in 0..200 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{what}: not within 5 s");
+        }
+
+        /// P3-6b-2b — a dynamic secret's lease is held, its bundle lent to
+        /// no tool. Its credential is minted at its first use, once, two uses
+        /// at once sharing it, valid until the lease's end; and taken back
+        /// when the lease is let go.
+        #[tokio::test]
+        async fn a_bundle_is_held_its_credential_minted_once_and_taken_back() {
+            let admin = made();
+            let f = fake_issuer(&admin).await;
+            let (c, mut rx) = connected();
+            let lease_id = ObjectId::new().to_hex();
+            let info = lease_bundle(&c, &mut rx, &lease_id, &f, &admin).await;
+            assert_eq!(info.provider.as_deref(), Some("postgres"));
+            assert_eq!(
+                c.with_value(&lease_id, |_| ()),
+                None,
+                "no tool is lent the issuer's fields"
+            );
+            assert!(
+                c.minted(&lease_id, "user").is_none(),
+                "nothing is minted before its first use"
+            );
+            let (a, b) = tokio::join!(c.mint(&lease_id), c.mint(&lease_id));
+            assert_eq!((a, b), (Ok(()), Ok(())));
+            let role = format!("roomler_{lease_id}");
+            let roles = f.roles.lock().unwrap().clone();
+            assert_eq!(
+                roles.keys().collect::<Vec<_>>(),
+                [&role],
+                "one credential per lease"
+            );
+            let until = bson::DateTime::from_millis(info.expires_at_ms)
+                .try_to_rfc3339_string()
+                .unwrap();
+            assert_eq!(
+                roles[&role].valid_until, until,
+                "valid until the lease's end"
+            );
+            let field = |name: &str| c.minted(&lease_id, name).map(|v| v.to_vec());
+            assert_eq!(field("user"), Some(role.clone().into_bytes()));
+            assert_eq!(field("port"), Some(f.port.to_string().into_bytes()));
+            assert_eq!(field("password").map(|p| p.len()), Some(43));
+            assert_eq!(
+                field("admin_password"),
+                None,
+                "an issuer's field is no credential's"
+            );
+            assert_eq!(c.release(std::slice::from_ref(&lease_id)), 1);
+            eventually("the role taken back", || {
+                !f.roles.lock().unwrap().contains_key(&role)
+            })
+            .await;
+            assert_eq!(
+                c.mint(&lease_id).await,
+                Err("the lease ended before its credential was minted".into())
+            );
+        }
+
+        /// P3-6b-2b — a lease let go while its credential is being minted:
+        /// the mint, when it ends, takes its own credential back at once.
+        #[tokio::test]
+        async fn a_credential_minted_while_its_lease_is_let_go_is_taken_back() {
+            let admin = made();
+            let mut f = fake_issuer(&admin).await;
+            f.hold_create
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (c, mut rx) = connected();
+            let lease_id = ObjectId::new().to_hex();
+            lease_bundle(&c, &mut rx, &lease_id, &f, &admin).await;
+            let minting = {
+                let (c, id) = (c.clone(), lease_id.clone());
+                tokio::spawn(async move { c.mint(&id).await })
+            };
+            // The mint is at the database: its CREATE ROLE came, unanswered.
+            while !f.saw.recv().await.unwrap().starts_with("CREATE ROLE ") {}
+            assert_eq!(c.release(std::slice::from_ref(&lease_id)), 1);
+            f.let_create.notify_one();
+            assert_eq!(
+                minting.await.unwrap(),
+                Err("the lease ended while its credential was minted: it is taken back".into())
+            );
+            let role = format!("roomler_{lease_id}");
+            eventually("the role taken back", || {
+                !f.roles.lock().unwrap().contains_key(&role)
+            })
+            .await;
+        }
+
+        /// P3-6b-2b — a stored secret's lease mints nothing and has no
+        /// credential; its value is lent as before.
+        #[tokio::test]
+        async fn a_stored_lease_mints_nothing() {
+            let (c, mut rx) = connected();
+            let info = lease(&c, &mut rx, "L-stored", ObjectId::new(), 1, in_ms(60_000)).await;
+            assert_eq!(info.provider, None);
+            assert_eq!(
+                c.mint("L-stored").await,
+                Err("the lease is no dynamic secret's".into())
+            );
+            assert!(c.minted("L-stored", "user").is_none());
+            assert_eq!(
+                c.with_value("L-stored", |v| v.to_vec()),
+                Some(b"canary-vault-value".to_vec())
+            );
         }
 
         /// A request goes out on the connection, bounded as the vault bounds
