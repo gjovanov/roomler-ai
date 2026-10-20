@@ -82,9 +82,21 @@ permissions:
 
 jobs:
   integration:
-    name: Integration suite (MongoDB + Redis)
+    name: Integration suite (MongoDB + Redis) ${{ matrix.shard }}/3
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # FR-6 wave 24 (#773): the suite runs as three shards, each on its own
+    # runner with its own mongod, and each takes every third test of the
+    # sorted listing (see "Run the suite"). Not more threads against one
+    # mongod: every test creates and drops a database of ~246 WiredTiger
+    # files, and at 4 threads the dropped ones piled up to 63,769 open files
+    # of the 64,000 ceiling until mongod aborted (dispatch run 39312454242).
+    # Three shards at 2 threads each keep every mongod at the load this lane
+    # has always run. A shard is ~10 min warm, so 45 leaves a cold build room.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    timeout-minutes: 45
     # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
     # release asset (ci-seed-save), which needs `contents: write`.
     permissions:
@@ -268,6 +280,8 @@ jobs:
           FILTER: ${{ github.event.inputs.filter }}
           THREADS: ${{ github.event.inputs.threads || '2' }}
           REPORT_TIME: ${{ github.event.inputs.report_time || 'false' }}
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
           # FR-69 P4/P5a — the test binary is a DEBUG build whose frames are
           # enormous, and `peer_relay_mint_tests::every_refusal_is_audited…`
           # builds SEVEN servers in one body. On the harness's default 2 MiB
@@ -281,9 +295,12 @@ jobs:
           RUST_MIN_STACK: "8388608"
         run: |
           set -o pipefail
-          # 2 threads, not 4: every test creates and drops its OWN database,
-          # so concurrency here is concurrent DB churn against one Mongo on a
-          # 2-core runner — which is what took it down on the first run.
+          # 2 threads per shard. Every test creates and drops its OWN database
+          # (~246 WiredTiger files), and mongod closes a dropped database's
+          # files only minutes later, so what bounds one mongod's threads is
+          # its open files, not the runner's 4 cores. At 2 they peak at 22-35 k
+          # of the 64 k ceiling; at 4 they reached it and mongod aborted (FR-6
+          # wave 24). More speed comes from more shards, each its own mongod.
           #
           # The skips were MEASURED here (run 32671814889), not inherited from
           # the build host — porting that box's list across would have been the
@@ -305,27 +322,39 @@ jobs:
           # ⚠️ Adding a third skip should feel expensive. If this list grows,
           # the lane is drifting back toward the unfalsifiable state it
           # replaced.
-          skip=(--skip conference_tests::call_leave_cleans_up_participant_media)
-          if [ "$REPORT_TIME" != true ]; then
-            cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads="$THREADS" \
-              "${skip[@]}" 2>&1 | tee /tmp/itest.log
-          else
-            # FR-6 wave 23 (#773): libtest prints each test's duration only
-            # under `-Z unstable-options --report-time`, which a stable test
-            # binary accepts when RUSTC_BOOTSTRAP is set in ITS environment.
-            # So set it there alone: run the binaries cargo would run, from
-            # the directory cargo runs them in, and the build never sees it.
-            # (The crate has no doc tests to lose.)
-            mapfile -t bins < <(cargo test -p roomler-ai-tests --no-run --message-format=json 2>/dev/null \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
-            echo "test binaries: ${#bins[@]}"
-            [ "${#bins[@]}" -gt 0 ] || { echo "::error::cargo listed no test binaries"; exit 1; }
-            (cd crates/tests && for b in "${bins[@]}"; do
-                echo "     Running ${b##*/}"
-                RUSTC_BOOTSTRAP=1 "$b" ${FILTER:+"$FILTER"} --test-threads="$THREADS" \
-                  -Z unstable-options --report-time "${skip[@]}"
-              done) 2>&1 | tee /tmp/itest.log
-          fi
+          skip=conference_tests::call_leave_cleans_up_participant_media
+          # FR-6 wave 24 (#773): the shard runs the test binaries itself, with
+          # the exact names it owns, from the directory cargo runs them in.
+          # Every shard lists the same binaries, sorts the same (test, binary)
+          # pairs and takes every Nth from its own offset, so between them the
+          # shards run each test exactly once, and a module's tests spread
+          # over all three. (The crate has no doc tests to lose.)
+          mapfile -t bins < <(cargo test -p roomler-ai-tests --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
+          echo "test binaries: ${#bins[@]}"
+          [ "${#bins[@]}" -gt 0 ] || { echo "::error::cargo listed no test binaries"; exit 1; }
+          cd crates/tests
+          for b in "${bins[@]}"; do
+            "$b" --list --format terse ${FILTER:+"$FILTER"} | sed -n 's/: test$//p' \
+              | awk -v b="$b" '{ print b "\t" $0 }'
+          done | awk -F'\t' -v s="$skip" '$2 != s' | LC_ALL=C sort -t$'\t' -k2,2 -k1,1 > /tmp/suite-listing.tsv
+          awk -v n="$SHARD_TOTAL" -v i="$SHARD_INDEX" '(NR - 1) % n == i' /tmp/suite-listing.tsv > /tmp/shard-plan.tsv
+          echo "suite: $(wc -l < /tmp/suite-listing.tsv) tests; shard $((SHARD_INDEX + 1))/$SHARD_TOTAL runs $(wc -l < /tmp/shard-plan.tsv)"
+          for b in "${bins[@]}"; do
+            mapfile -t names < <(awk -F'\t' -v b="$b" '$1 == b { print $2 }' /tmp/shard-plan.tsv)
+            [ "${#names[@]}" -gt 0 ] || continue
+            echo "     Running ${b##*/} (${#names[@]} tests)"
+            if [ "$REPORT_TIME" = true ]; then
+              # FR-6 wave 23: libtest prints each test's duration only under
+              # `-Z unstable-options --report-time`, which a stable test binary
+              # accepts when RUSTC_BOOTSTRAP is set in ITS environment. Here it
+              # is, and the build never sees it.
+              RUSTC_BOOTSTRAP=1 "$b" --exact --test-threads="$THREADS" \
+                -Z unstable-options --report-time "${names[@]}"
+            else
+              "$b" --exact --test-threads="$THREADS" "${names[@]}"
+            fi
+          done 2>&1 | tee /tmp/itest.log
 
       - name: The mongod watch log (READ THIS FIRST on a failure)
         # The curve, not the corpse. Read the last sample before the numbers
@@ -373,16 +402,27 @@ jobs:
         # that runs a handful — or none — fails loudly. Raise it when the
         # suite grows; if you find yourself LOWERING it, that is the signal
         # to stop and ask what stopped running.
+        #
+        # Since wave 24 the floor applies to the whole listing, which every
+        # shard reads, and each shard must also report every test it was
+        # handed: a shard that drops tests on the way fails here even while
+        # the suite as a whole still clears the floor.
         if: ${{ github.event.inputs.filter == '' }}
         run: |
           set -euo pipefail
-          total=$(grep -oE '^test result: .*[0-9]+ passed' /tmp/itest.log \
-                  | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' \
-                  | awk '{s+=$1} END {print s+0}')
-          echo "tests reported passed: $total"
+          sum() { grep -oE '^test result: .*' /tmp/itest.log | grep -oE "[0-9]+ $1" \
+                  | grep -oE '^[0-9]+' | awk '{s+=$1} END {print s+0}'; }
+          listed=$(wc -l < /tmp/suite-listing.tsv)
+          planned=$(wc -l < /tmp/shard-plan.tsv)
+          passed=$(sum passed); ignored=$(sum ignored)
+          echo "suite listed: $listed tests; this shard was handed $planned, passed $passed, ignored $ignored"
           MIN=200
-          if [ "$total" -lt "$MIN" ]; then
-            echo "::error::only $total tests ran (floor $MIN). A green run that executes nothing is the failure this lane exists to prevent — find out what stopped running before touching this number."
+          if [ "$listed" -lt "$MIN" ]; then
+            echo "::error::the suite lists only $listed tests (floor $MIN). A green run that executes nothing is the failure this lane exists to prevent — find out what stopped running before touching this number."
+            exit 1
+          fi
+          if [ $((passed + ignored)) -ne "$planned" ]; then
+            echo "::error::this shard was handed $planned tests and reported $((passed + ignored)) (passed + ignored). Tests went missing between the plan and the run."
             exit 1
           fi
 
@@ -456,7 +496,9 @@ jobs:
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
       - name: Publish the cargo cache (release-asset store)
-        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        # The first shard alone: all three build the same target, and three
+        # uploads of one asset would race each other's --clobber.
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success' && strategy.job-index == 0
         continue-on-error: true
         uses: ./.github/actions/ci-seed-save
         env:
