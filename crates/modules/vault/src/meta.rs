@@ -361,8 +361,16 @@ mod tests {
         );
         let wire = serde_json::to_string(&meta).unwrap();
         assert!(!wire.contains("admin_"), "{wire}");
-        // A provider this build cannot name: nothing to name at all.
+        // P3-6d-1b — a MySQL issuer's secret names the same credential.
         secret.provider = Some("mysql".into());
+        let meta = meta_of(&secret, "grox");
+        assert_eq!(meta.provider.as_deref(), Some("mysql"));
+        assert_eq!(
+            meta.fields,
+            ["user", "password", "host", "port", "database"]
+        );
+        // A provider this build cannot name: nothing to name at all.
+        secret.provider = Some("from_a_newer_build".into());
         let meta = meta_of(&secret, "grox");
         assert_eq!((meta.provider, meta.fields), (None, Vec::<String>::new()));
     }

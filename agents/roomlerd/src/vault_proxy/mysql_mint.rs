@@ -20,10 +20,6 @@
 //! a lease's id). That is checked before a revocation dials, and again before
 //! each drop, whatever the sweep's query returns.
 
-// P3-6d-1b gives the minter its caller (the daemon's lease client): until
-// then, its tests are.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use base64::Engine;
 use tracing::warn;
 use zeroize::Zeroizing;

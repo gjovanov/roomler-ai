@@ -14,6 +14,8 @@
 //! | [`http`] | one HTTP client connection: each request sent on to one upstream origin, the secret's credential in `Authorization` (P3-5d-1) |
 //! | [`ssh_agent`] | one SSH agent connection: the secret's key, signing a sign-in to one of the secret's hosts and nothing else (P3-5f-1) |
 //! | [`pg_mint`] | a Postgres user minted for one lease by a dynamic secret's issuer, and taken back (P3-6b-2a) |
+//! | [`mysql_mint`] | a MySQL user minted for one lease, ended by an event, and taken back (P3-6d-1a) |
+//! | [`minter`] | the minter a dynamic secret's provider names, which the lease client calls (P3-6d-1b) |
 //!
 //! P3-5b-1 builds these, P3-5c-1 the MongoDB engine, P3-5d-1 the HTTP one
 //! and P3-5f-1 the SSH agent; the endpoint (`hive::vault_connect`) serves
@@ -23,6 +25,8 @@
 // P3-6d-1 — a dynamic secret's bundle, as every minter opens it.
 pub(crate) mod bundle;
 pub(crate) mod http;
+// P3-6d-1b — the minter by provider, the lease client's one door to them.
+pub(crate) mod minter;
 pub(crate) mod mongo;
 // P3-6d-1 — MySQL's client protocol, as a dynamic secret's issuer speaks it,
 // and a MySQL user minted per lease.
