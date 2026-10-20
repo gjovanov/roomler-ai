@@ -124,7 +124,7 @@
               </thead>
               <tbody>
                 <tr v-for="(t, i) in detail.tunnels" :key="i">
-                  <td>{{ t.agent_name || t.agent_id?.slice(-6) || '—' }}</td>
+                  <td>{{ t.agent_display_name || t.agent_name || t.agent_id?.slice(-6) || '—' }}</td>
                   <td v-if="scope === 'platform'">{{ t.tenant_name || '—' }}</td>
                   <td>{{ fmtTime(t.started_at) }}</td>
                   <td>{{ fmtTime(t.ended_at) }}</td>
