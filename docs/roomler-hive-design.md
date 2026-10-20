@@ -166,7 +166,7 @@ envelope relay, an extension host inside `roomlerd`, an import-map SPA loader �
 Hive outside core. FR-69 provides each of those already: modules mount behind one
 `Module` contract (`crates/core/src/module.rs:23`), the SPA gates on
 `/api/capabilities` (`ui/src/stores/capabilities.ts:30`), every wire variant names its
-owner (`crates/remote_control/src/signaling.rs:1982`), and an unmounted module answers
+owner (`crates/remote_control/src/signaling.rs:2015`), and an unmounted module answers
 503 (`docs/modular-monolith.md`). Hive becomes three modules:
 
 ```mermaid
@@ -1008,7 +1008,7 @@ Version { n, ciphertext, dek_wrapped, created_by, created_at, expires_at? }
   org's key-encryption key. KEK backends: an `age` key file (the self-host default), AWS,
   GCP or Azure KMS, PKCS#11. Hosted roomler.ai would use a cloud KMS.
 - ⚠️ **Nothing in the server encrypts at rest today.** JWTs are HS256 with a shared secret
-  (`crates/services/src/auth/mod.rs:148-143`), and the only asymmetric key signs DERP
+  (`crates/services/src/auth/mod.rs:246-260`), and the only asymmetric key signs DERP
   tickets (`crates/remote_control/src/derp_ticket.rs:91,116`). The vault brings its own
   keys and never derives anything from the JWT secret. The dormant plaintext
   `OAuthCredential` in tenant integrations (`crates/db/src/models/tenant.rs:208-220`) is
