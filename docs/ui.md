@@ -244,11 +244,42 @@ flowchart LR
 | **A plain `v-table` with actions or results on its right is a card per row below 600 px**: `class="table-stack-xs"` on the table and `data-label="…"` on each cell. One template for both widths; above 600 px nothing changes. A `v-data-table` uses Vuetify's own mobile rows instead (next row) | `styles/responsive.css` (imported in `main.ts`); the ACL lists, Overlay routes, the audit lists, Roles, enrollment keys | the rightmost columns — Save, Edit/Delete, Result, the command — sat off-screen behind a sideways scroll nobody finds |
 | **A `v-data-table(-server)` takes `:mobile="xs"`**, and any natural-width rule on it (`width: max-content`, `white-space: nowrap`) is scoped to `:not(.<table>--stacked)`, with `overflow-wrap: anywhere` on a stacked value | `MembersSection.vue`, `InviteManageView.vue`, `FilesBrowser.vue` | with the desktop rules left on, every stacked value sat past the right edge — the rows showed their titles and nothing else — and one unbroken email widened a row past the screen |
 | **A page of independent settings is one expansion panel per setting below 600 px, titled with its current state** ("On", "Allowed", "Files: ask · Audio: off"); an unknown state shows nothing, never a guess | `components/admin/SettingsGate.vue`, used by `SettingsSection.vue` | Settings was ~4 screens of warnings and captions before its last switch; now one screen of decisions, each opening on demand. From 600 px up the gate renders the card it always was |
-| **Nothing is hover-only on a touch screen** (`(hover: none)`): what a tooltip says is reachable by a tap, or shown as a persistent hint | `RolesSection.vue` — a role's grants open on tap; a permission's description is a hint under its box | the description was a tooltip on the checkbox's label, so the tap meant to read it toggled the permission |
+| **Nothing is hover-only on a touch screen** (`(hover: none)`): what a tooltip or a hover reveals is reachable by a tap, or shown as a persistent hint — and a control hidden until hover takes no taps while hidden (`pointer-events: none`) | `RolesSection.vue` (grants on tap; descriptions as hints) · `MessageBubble.vue` (a ⋮ menu) · `VideoTile.vue` (a tap shows the tile's actions) · the viewer's files drawer (a › into a folder, "Upload here") | a permission's description was a tooltip on its label, so the tap meant to read it toggled the permission; a message's invisible hover buttons pinned it for the whole room; a tap on a face in a call hit an invisible picture-in-picture button |
+| **On a phone, show what decides and open the rest on a tap**: a row shows its name, its state, its total; access, details, grants and breakdowns open on demand | the Devices cards' Access / Details panels (`AgentsSection.vue`) · `SettingsGate.vue` · `UsageTable.vue` (User · Total; a row opens the breakdown) · a role's grants | the Devices page was ~11,900 px of open selects and checkboxes at 390 px; Settings was ~3,600 px before its last switch |
+| **A device is named by its display name everywhere a person reads one**: `deviceLabel()` (`composables/useHideDeviceName.ts`) and `useNodeLabel()` on the client, and the server sends the friendly name beside the machine's (`display_name`, `agent_display_name`; additive, `null` when none) | the Devices page and its dialogs, the audit and overlay pages, the Tunnel ACL, `crates/api/src/routes/stats.rs` (uptime), `crates/api/src/routes/usage.rs` (D4) | the device list said "Reception PC" while the dialogs, the audit lists, the uptime strip and the usage timeline said `DESKTOP-…` |
+| **A side panel that would squeeze the main view overlays it below 960 px**, one at a time, with a close button | `ConferenceView.vue` (chat, files) | a 320 px chat column left the call ~70 px wide and cut off the pre-join pickers; the chat now starts closed there, with a dot on its button when someone writes |
+| **A drawer that can cover a phone takes the full width and carries its own close button** | `GrowthView.vue` (org timeline), the viewer's files drawer | a 440 px temporary drawer on a 390 px screen leaves no scrim to tap — no way out |
+| **A tab window over wide content takes `:touch="false"`; a tab row that can overflow takes `show-arrows`** | `GrowthView.vue`, `AnalyticsView.vue`, the viewer's Settings tabs | a sideways swipe across a wide table switched the **tab**; and below 1280 px Vuetify hides the arrows unless asked, so tabs past the edge gave no sign of themselves |
+| **A number or caption that must be read never sits at the end of a card title** on a phone — it moves into the card's text | `GrowthView.vue` (the weekly-active-orgs north star) | a title never wraps: at 360 px the caption pushed the number off the card |
+| **The remote viewer's toolbar keeps the device's name, its state and Disconnect first** below 960 px (flex `order`; the rest scrolls), and the stage's alerts overlay the stage | `RemoteControl.vue` (`rc-tb-*`, `.rc-stage-alerts`) | the title went to 0 px and Disconnect started off-screen; each alert's coming and going resized the frame, re-sent `rc:resolution` and rebuilt the agent's encoder |
+| **Text that cannot break still wraps** (`overflow-wrap: anywhere`) | message content (`MessageBubble.vue`), stacked table values | one long URL or email widened a whole list past the screen |
+| **Sign-in fields say what they are**: `autocapitalize="none"`, `autocorrect="off"`, `spellcheck="false"` on the username, `autocomplete` on every credential | `LoginView.vue`, `RegisterView.vue` | iOS capitalised the username, and the server matches it exactly |
+| **The public landing page's sections are a ☰ menu below 960 px**, and its wordmark never shrinks (`flex-0-0` on the title) | `LandingView.vue` | the links were hidden below 600 px with no other way to them, and the wordmark was clipped to "Roo" |
 | **A toolbar's search takes a row of its own below 600 px** (`order-*` and `flex: 1 1 100%`); the buttons take the next | Members, Invites, Files | beside the title and the buttons it was left ~100 px ("Searc") |
 | **A title row with buttons wraps** (`flex-wrap ga-2`), and its caption is a `v-card-subtitle class="text-wrap"`, never text inside the title | e.g. `OverlayAclSection.vue` | `v-card-title` and `v-card-subtitle` never wrap: Overlay ACL's caption pushed **New rule** off the card below ~800 px |
 | **A row of form fields wraps**: `flex-wrap` on the row and a `flex: 1 1 <basis>` on each field | the ACL editors | without wrap a Vuetify field shrinks instead — the Tunnel ACL host field rendered 0 px wide |
 | **An overlay node, or an audit row's device, is named by `useNodeLabel()`** — joined on the wire's `agent_id` / `tunnel_client_id`, never on the node's name | `composables/useNodeLabel.ts` | `OverlayNode.name` is a lossy DNS label, and audit rows carry the stored machine name: the device a person had just tapped on Devices came back under another name |
+
+A list or a table on a phone goes through one decision:
+
+```mermaid
+flowchart TD
+    T["a list or table at 360 px"] --> Q1{"every row's actions<br/>and result on screen?"}
+    Q1 -- yes --> KEEP["keep it"]
+    Q1 -- no --> Q2{"a v-data-table?"}
+    Q2 -- yes --> MOB[":mobile=&quot;xs&quot;, and scope its<br/>natural-width rules away"]
+    Q2 -- no --> STACK["table-stack-xs +<br/>data-label on each cell"]
+    MOB --> Q3{"a row longer<br/>than a screen?"}
+    STACK --> Q3
+    Q3 -- no --> DONE["done"]
+    Q3 -- yes --> DEMAND["show what decides —<br/>the rest opens on a tap"]
+```
+
+⚠️ **Prove "the desktop is unchanged" with pixels, against the branch's own
+base served beside it** — and grep each dev server's served module for a
+marker only its branch has before any screenshot: a dev server that lost its
+port to another one dies silently, and a before/after pair from ONE server
+diffs at 0 px while proving nothing (FR-116 P3c, recorded in its PR).
 
 ⚠️ `ChatView` and `ConferenceView` own their own custom-flex layout and
 **intentionally do not use `<v-container>`** — do not "fix" them to match.
