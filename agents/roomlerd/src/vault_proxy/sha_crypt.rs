@@ -11,10 +11,6 @@
 //! gives the salt already cut, and the digest is the same algorithm either
 //! way.
 
-// P3-6d-1b gives the minter its caller (the daemon's lease client): until
-// then, its tests are.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 

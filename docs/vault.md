@@ -45,8 +45,8 @@ People use it too.
 > P3-6b-1, the vault's half of `short-lived`: dynamic secrets, their
 > providers, and a lease sealed as one bundle (§20); P3-6b-2a, the
 > daemon's Postgres minter; P3-6b-2b, its caller: `vault_exec` and
-> `vault_render` serving a dynamic secret; and P3-6d-1a, a MySQL minter,
-> with no caller yet (§20).**
+> `vault_render` serving a dynamic secret; P3-6d-1a, a MySQL minter; and
+> P3-6d-1b, `mysql` a provider that caller serves (§20).**
 > No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
@@ -743,7 +743,7 @@ no answer, and the daemon stops waiting for it.
 |---|---|
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1510`](../crates/remote_control/src/signaling.rs#L1510)) and `rc:vault.listed` · `rc:vault.described` ([`:4592`](../crates/remote_control/src/signaling.rs#L4592)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:116`](../crates/modules/vault/src/meta.rs#L116)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:400`](../crates/modules/vault/src/policy.rs#L400)) |
-| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:544`](../agents/roomlerd/src/vault.rs#L544)) |
+| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:537`](../agents/roomlerd/src/vault.rs#L537)) |
 | the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:856`](../agents/roomlerd/src/hive/toolbelt.rs#L856)), answered by `vault_tool` ([`toolbelt.rs:1019`](../agents/roomlerd/src/hive/toolbelt.rs#L1019)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
@@ -824,7 +824,7 @@ device share): a path could match nothing a device asks for.
 |---|---|
 | the tool | `vault_exec` in [`toolbelt.rs:889`](../agents/roomlerd/src/hive/toolbelt.rs#L889), offered with the reads where the device takes leases, and asked for in the settings |
 | where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4243`](../agents/roomlerd/src/hive/supervisor.rs#L4243)); none on Windows |
-| letting go | `Client::release` ([`vault.rs:713`](../agents/roomlerd/src/vault.rs#L713)) |
+| letting go | `Client::release` ([`vault.rs:706`](../agents/roomlerd/src/vault.rs#L706)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
 
@@ -855,7 +855,7 @@ sequenceDiagram
 | the leases | one per distinct secret, mode `file`, audience the file's name, all asked before anything is written; one refusal writes nothing and lets the others go | [`vault_render.rs:253`](../agents/roomlerd/src/hive/vault_render.rs#L253) |
 | the directory | `<runtime>/<session>/secrets/`, made by the daemon, its own, `0711`: the session's account opens a file whose name it knows, and lists nothing. A link or a file in its place is refused, never followed | [`vault_render.rs:170`](../agents/roomlerd/src/hive/vault_render.rs#L170) |
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
-| its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:243`](../agents/roomlerd/src/vault.rs#L243), [`:720`](../agents/roomlerd/src/vault.rs#L720) |
+| its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:243`](../agents/roomlerd/src/vault.rs#L243), [`:713`](../agents/roomlerd/src/vault.rs#L713) |
 | a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:725`](../agents/roomlerd/src/hive/supervisor.rs#L725), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
 | the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4636`](../agents/roomlerd/src/hive/supervisor.rs#L4636) |
 
@@ -906,7 +906,7 @@ sequenceDiagram
 |---|---|---|
 | the call | `handle`: a path or this org's RRN, `#field` for a field. `mode`: `exec`, `file` or (P3-5b-2) `proxy`, the modes a use takes. `audience`: a bare name, by the rule `exec_allow` holds; the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to, `host:port` by that tool's own rule (§19). `ttl_s`: 30 to 900, default 300 | [`vault_request.rs:36`](../agents/roomlerd/src/hive/vault_request.rs#L36) |
 | the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:102`](../agents/roomlerd/src/hive/vault_request.rs#L102), [`vault.rs:159`](../agents/roomlerd/src/vault.rs#L159) |
-| its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:749`](../agents/roomlerd/src/vault.rs#L749), [`vault_exec.rs:615`](../agents/roomlerd/src/hive/vault_exec.rs#L615), the lookup both tools share (`leased_values`, P3-6b-2b) |
+| its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:742`](../agents/roomlerd/src/vault.rs#L742), [`vault_exec.rs:615`](../agents/roomlerd/src/hive/vault_exec.rs#L615), the lookup both tools share (`leased_values`, P3-6b-2b) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:293`](../agents/roomlerd/src/hive/vault_render.rs#L293) |
 | the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4662`](../agents/roomlerd/src/hive/supervisor.rs#L4662) |
 
@@ -926,7 +926,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the tool | `vault_request` in [`toolbelt.rs:987`](../agents/roomlerd/src/hive/toolbelt.rs#L987), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L407)) |
-| finding the lease | `Client::find_ahead` ([`vault.rs:749`](../agents/roomlerd/src/vault.rs#L749)); how long one has left, `Client::left` ([`vault.rs:770`](../agents/roomlerd/src/vault.rs#L770)) |
+| finding the lease | `Client::find_ahead` ([`vault.rs:742`](../agents/roomlerd/src/vault.rs#L742)); how long one has left, `Client::left` ([`vault.rs:763`](../agents/roomlerd/src/vault.rs#L763)) |
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
 
@@ -959,7 +959,7 @@ sequenceDiagram
 | Step | What holds | Where |
 |---|---|---|
 | the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:8928`](../crates/remote_control/src/models.rs#L8928) |
-| the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:423`](../agents/roomlerd/src/vault.rs#L423), [`vault_exec.rs:470`](../agents/roomlerd/src/hive/vault_exec.rs#L470), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
+| the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:416`](../agents/roomlerd/src/vault.rs#L416), [`vault_exec.rs:470`](../agents/roomlerd/src/hive/vault_exec.rs#L470), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
 | the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1545`](../crates/remote_control/src/signaling.rs#L1545), [`vault.rs:292`](../crates/remote_control/src/vault.rs#L292) |
 | the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:370`](../crates/modules/vault/src/lease.rs#L370) |
 | the check | every lease the report names was released to this device, for this session in this organization, in the use's mode (`exec` for `exec`, `file` for `render`) and toward its target. Otherwise, or for a kind this server cannot name or a target that is not a bare name, the report is dropped | [`lease.rs:395`](../crates/modules/vault/src/lease.rs#L395), [`dao.rs:572`](../crates/modules/vault/src/dao.rs#L572) |
@@ -1048,7 +1048,7 @@ owner.
 | the routes | `GET …/vault/approval/{id}`: the approval as the session's readers see it, with `may_answer` (the caller drives it now) and `may_approve` (and the policy would take their yes) for the caller. `POST …/vault/approval/{id}` `{answer: "approve" \| "deny"}` | [`approval.rs:595`](../crates/modules/vault/src/approval.rs#L595), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
 | one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:965`](../crates/modules/vault/src/lease.rs#L965), [`dao.rs:820`](../crates/modules/vault/src/dao.rs#L820) |
 | the windows | a card waits 10 min for an answer (`APPROVAL_ANSWER_SECS`); a yes is usable for 5 min from the answer (`APPROVAL_USE_SECS`) | [`vault.rs:75`](../crates/remote_control/src/vault.rs#L75) |
-| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:499`](../agents/roomlerd/src/vault.rs#L499), [`vault.rs:668`](../agents/roomlerd/src/vault.rs#L668), [`toolbelt.rs:425`](../agents/roomlerd/src/hive/toolbelt.rs#L425), [`toolbelt.rs:508`](../agents/roomlerd/src/hive/toolbelt.rs#L508) |
+| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:492`](../agents/roomlerd/src/vault.rs#L492), [`vault.rs:661`](../agents/roomlerd/src/vault.rs#L661), [`toolbelt.rs:425`](../agents/roomlerd/src/hive/toolbelt.rs#L425), [`toolbelt.rs:508`](../agents/roomlerd/src/hive/toolbelt.rs#L508) |
 | the web app (P3-4e-3) | under a message bound to `{module: "vault"}`, the approval as `GET …/vault/approval/{id}` gives it: where it stands, the deadline while it waits, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve`, else off with why). A refusal is shown in the server's words. The vault edits the card's message whenever the approval moves on, and the new `updated_at` reads it again. The buttons only reflect what the route says; every decision stays the server's | [`VaultApprovalCard.vue`](../ui/src/components/vault/VaultApprovalCard.vue), [`MessageBubble.vue`](../ui/src/components/chat/MessageBubble.vue) |
 | the row | `vault_approvals`, one per card: its request, its status (`pending` · `approved` · `denied` · `used` · `expired` · `withdrawn`), who answered and when, the lease that spent it, and the card's message. A unique index holds one pending card per request | [`model.rs:359`](../crates/modules/vault/src/model.rs#L359), [`lib.rs:340`](../crates/modules/vault/src/lib.rs#L340) |
 
@@ -1495,7 +1495,7 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:264`, `agents/roomlerd/src/vault_proxy/mod.rs:50`, `vault_connect.rs:173`, `vault_connect.rs:211` |
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:264`, `agents/roomlerd/src/vault_proxy/mod.rs:54`, `vault_connect.rs:173`, `vault_connect.rs:211` |
 | its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:826` |
 | the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1046` |
 | the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1089`, `vault_connect.rs:1112`, `vault_connect.rs:1120`, `vault_connect.rs:927`, `vault_connect.rs:969` |
@@ -1547,7 +1547,8 @@ for that long; it never sees the issuer. The design is the spec's §3e "P3-6,
 P3-6b-1 builds the vault's half: dynamic secrets, their providers, and a lease
 sealed as one bundle. P3-6b-2a builds the daemon's first provider, a Postgres
 minter, and P3-6b-2b its caller: `vault_exec` and `vault_render` serve a
-dynamic secret. P3-6d-1a builds a MySQL minter, with no caller yet.
+dynamic secret. P3-6d-1a builds a MySQL minter, and P3-6d-1b makes `mysql` a
+provider the caller serves.
 
 ```mermaid
 sequenceDiagram
@@ -1564,7 +1565,7 @@ sequenceDiagram
 | Piece | Built |
 |---|---|
 | the secret | `kind: "dynamic"`, naming a `provider` this build knows, and exactly one audience: where the provider mints. Both are given at its creation; `PATCH` keeps the audience one. Its fields are its issuer's, under its provider's names, and a write of any other is refused ([`routes.rs:549`](../crates/modules/vault/src/routes.rs#L549), [`:839`](../crates/modules/vault/src/routes.rs#L839)). No other kind names a provider |
-| the providers | [`vault::providers`](../crates/remote_control/src/vault.rs#L338), in the wire crate, so the server and the daemon agree on each one's names: its issuer's fields, those no mint can do without, and its minted credential's. `postgres` first ([`vault.rs:367`](../crates/remote_control/src/vault.rs#L367)) |
+| the providers | [`vault::providers`](../crates/remote_control/src/vault.rs#L338), in the wire crate, so the server and the daemon agree on each one's names: its issuer's fields, those no mint can do without, and its minted credential's. `postgres` ([`vault.rs:367`](../crates/remote_control/src/vault.rs#L367)) and, since P3-6d-1b, `mysql`, with the same fields ([`vault.rs:379`](../crates/remote_control/src/vault.rs#L379)) |
 | what a session is told | `vault_list` and `vault_describe` name the provider, and the minted credential's fields as the ones it may name, never its issuer's ([`meta.rs:45`](../crates/modules/vault/src/meta.rs#L45)) |
 | the pairing | two guardrails in every organization's set: `dynamic-only-short-lived`, a dynamic secret in no other mode, and `short-lived-only-dynamic`, nothing else in `short-lived` ([`policy.rs:131`](../crates/modules/vault/src/policy.rs#L131)). Each refusal is recorded with its guardrail |
 | a lease | for the secret as a whole: naming a field is refused `no_value`. Then, each refusal recorded: a provider this build knows (`no_value`) and the server serves (`not_served`), its one audience (`no_value`), and every field no mint can do without (`no_value`, `issuer_lacks_<field>`). Cedar decides toward the secret's own audience ([`lease.rs:1053`](../crates/modules/vault/src/lease.rs#L1053)) |
@@ -1572,7 +1573,7 @@ sequenceDiagram
 | its row | `field: ""`, `n: 0`, and `bundle`: each field at the version it carried. It ends at its TTL, or at the first of its versions' `expires_at` |
 | its standing | a new version of any of the issuer's fields takes it back. The write takes back every lease of the secret at once, and a sweep compares each field with the bundle's ([`revoke.rs:236`](../crates/modules/vault/src/revoke.rs#L236)). A provider this build cannot name stands for nothing |
 | the kill switch | `vault.providers` (`ROOMLER__VAULT__PROVIDERS`): empty or `*` is every provider built, and a list only those ([`dynamic.rs:31`](../crates/modules/vault/src/dynamic.rs#L31)). A word that names none serves nothing, so `none` turns them all off. Per secret, `disabled` |
-| the daemon | holds the bundle of a provider it mints for (`postgres`), lent to no tool ("The caller", below), and refuses any other provider's unopened, as `unsupported`: it never takes a bundle for a stored value ([`vault.rs:608`](../agents/roomlerd/src/vault.rs#L608)) |
+| the daemon | holds the bundle of a provider it mints for (`postgres`, `mysql`), lent to no tool ("The caller", below), and refuses any other provider's unopened, as `unsupported`: it never takes a bundle for a stored value ([`vault.rs:601`](../agents/roomlerd/src/vault.rs#L601)) |
 
 - ⚠️ **The vault never mints.** For `postgres` the device does: only it
   reaches the database, as for `proxy`. The bundle carries the issuer's fields
@@ -1630,15 +1631,15 @@ sequenceDiagram
     participant S as the session's tool call
     participant D as device (roomlerd)
     participant V as vault
-    participant P as Postgres
+    participant P as the issuer's database
     S->>D: vault_exec, env DBU = db/dyn#user and DBP = db/dyn#password
     D->>V: rc:vault.describe db/dyn
-    V-->>D: kind dynamic, provider postgres, its credential's fields
+    V-->>D: kind dynamic, provider postgres or mysql, its credential's fields
     D->>V: rc:vault.lease db/dyn in short-lived, once for both names
     V-->>D: rc:vault.leased, the bundle sealed to the device
-    D->>P: the mint, once for the lease
+    D->>P: the mint, once for the lease, by the minter its provider names
     Note over D: DBU and DBP from the one credential, and the command runs
-    D->>P: the call ends and its lease is let go, so the role is dropped
+    D->>P: the call ends and its lease is let go, so the user is dropped
 ```
 
 | Step | Built |
@@ -1646,8 +1647,8 @@ sequenceDiagram
 | the kind | each secret a call names is described first. Its metadata says whether it is dynamic, and names its credential's fields ([`vault_exec.rs:520`](../agents/roomlerd/src/hive/vault_exec.rs#L520)). A secret the session's role may not describe is leased as a stored one |
 | the lease | every name a call gives one dynamic secret shares ONE lease of the secret as a whole, in `short-lived`, with no field and no audience: the vault decides toward the secret's own. A stored secret's names are leased as before ([`vault_exec.rs:573`](../agents/roomlerd/src/hive/vault_exec.rs#L573)) |
 | a field | only the credential's: `#user`, `#password`, `#host`, `#port`, `#database`. Any other, an issuer's included, or the secret named whole, is refused before anything is leased |
-| the bundle | held in daemon memory and lent to no tool: `with_value` answers nothing for it, and a tool reads only the credential's fields ([`vault.rs:813`](../agents/roomlerd/src/vault.rs#L813)). The bundle of a provider this build mints nothing for is refused unopened, as `unsupported` ([`vault.rs:124`](../agents/roomlerd/src/vault.rs#L124)) |
-| the mint | at the lease's first use, once: a use that comes while the mint runs waits for its credential. `VALID UNTIL` is the lease's end ([`vault.rs:826`](../agents/roomlerd/src/vault.rs#L826)) |
+| the bundle | held in daemon memory and lent to no tool: `with_value` answers nothing for it, and a tool reads only the credential's fields ([`vault.rs:806`](../agents/roomlerd/src/vault.rs#L806)). The bundle of a provider this build mints nothing for is refused unopened, as `unsupported`. The providers it mints for are the minters' own list, `postgres` and `mysql` ([`minter.rs:24`](../agents/roomlerd/src/vault_proxy/minter.rs#L24)) |
+| the mint | at the lease's first use, once: a use that comes while the mint runs waits for its credential ([`vault.rs:820`](../agents/roomlerd/src/vault.rs#L820)). The minter is the one the bundle's provider names (P3-6d-1b, [`minter.rs:37`](../agents/roomlerd/src/vault_proxy/minter.rs#L37)), and the credential ends with the lease: a Postgres role's `VALID UNTIL`, a MySQL user's event, each given in the form its database takes ([`minter.rs:50`](../agents/roomlerd/src/vault_proxy/minter.rs#L50)) |
 | the revocation | whenever the lease is let go (its expiry, `rc:vault.revoke`, the run's end, or the end of the call that asked for it), in the background, with nothing waiting on it. A mint that ends after its lease was let go takes its own credential back at once ([`vault.rs:243`](../agents/roomlerd/src/vault.rs#L243)) |
 | asked ahead | `vault_request` asks for a dynamic secret whole, in `short-lived`, for `exec` or `file` alike. Its first use mints, and every later use that takes the lease shares the credential. Not for `proxy` ([`vault_request.rs:112`](../agents/roomlerd/src/hive/vault_request.rs#L112)) |
 | the report | a use's report names the short-lived lease once, and the vault keeps it for any use: the lease's audience is where the credential was minted, never the use's target ([`dao.rs:572`](../crates/modules/vault/src/dao.rs#L572)) |
@@ -1659,17 +1660,19 @@ sequenceDiagram
   tools learn the kind from the secret's metadata. A role that may use a
   dynamic secret but not list it gets a stored mode's lease, which
   `dynamic-only-short-lived` refuses.
-- ⚠️ **A daemon that restarts forgets what it minted.** Those roles stop
-  signing in at their `VALID UNTIL`, and the issuer's next mint sweeps them.
+- ⚠️ **A daemon that restarts forgets what it minted.** Those credentials end
+  as their database ends them (a Postgres role's `VALID UNTIL`, a MySQL user's
+  event), and the issuer's next mint sweeps them.
   A revocation that fails is logged on the device, not reported to the vault.
 - ⚠️ **`vault_connect` serves no dynamic secret yet.**
 
 ### The MySQL minter (P3-6d-1a)
 
 `vault_proxy::mysql_mint` mints a MySQL user for one lease, and takes it back.
-Nothing calls it yet. P3-6d-1b names `mysql` in `vault::providers` and gives
-the minter the lease client as its caller. The design is the spec's §3e "P3-6d,
-MySQL, SQL Server and Redis users, as designed".
+Since P3-6d-1b its caller is the lease client ("The caller", above), through
+`vault_proxy::minter`, which picks the minter a bundle's provider names. The
+design is the spec's §3e "P3-6d, MySQL, SQL Server and Redis users, as
+designed".
 
 ```mermaid
 sequenceDiagram
@@ -1687,15 +1690,15 @@ sequenceDiagram
 
 | Step | Built |
 |---|---|
-| the client | MySQL's client protocol, a client of its own (`vault_proxy::mysql`). The server's greeting must offer TLS and the 4.1 protocol, or the client sends it nothing at all. Then an `SSLRequest`, and TLS verified against the issuer's `ca` (or the system's roots), before a byte of the sign-in ([`mysql.rs:241`](../agents/roomlerd/src/vault_proxy/mysql.rs#L241)). The sign-in is `caching_sha2_password`: its scramble, and, from a server that has not cached the account, the password itself inside that TLS. A switch to `sha256_password` is followed inside the TLS too: MySQL answers so for an account under it, and for one that is not there. Any other plugin is refused ([`mysql.rs:305`](../agents/roomlerd/src/vault_proxy/mysql.rs#L305)) |
-| a query | `COM_QUERY`, text rows, the server's error in its own words. At most 1 MiB a packet and 10,000 rows an answer. `CLIENT_LOCAL_FILES` is never offered ([`mysql.rs:44`](../agents/roomlerd/src/vault_proxy/mysql.rs#L44)). A server that asks for a local file anyway is refused and sent nothing ([`mysql.rs:354`](../agents/roomlerd/src/vault_proxy/mysql.rs#L354)) |
-| the issuer | the bundle's `admin_user` and `admin_password`, to its `database`, at the secret's one audience. The bundle is opened by the reader the Postgres minter uses: refused before anything is dialled when it does not parse or lacks a field no mint can do without, and zeroed when it drops ([`bundle.rs:43`](../agents/roomlerd/src/vault_proxy/bundle.rs#L43)). The `database` and each grant must be names the minter quotes: no quote, backtick, backslash or control character ([`mysql_mint.rs:53`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L53)) |
-| the sweep | first, at every mint: each `roomler_…` user whose `ATTRIBUTE` says its lease has ended, dropped where the issuer may ([`mysql_mint.rs:190`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L190)). That covers an event that never ran: the scheduler off, or an end already past when the mint ran |
-| the mint | `CREATE USER 'roomler_<lease id>'@'%' IDENTIFIED WITH caching_sha2_password AS '<form>' ATTRIBUTE '{"roomler": {"lease": "<id>", "until": <end>}}'` ([`mysql_mint.rs:147`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L147)). Then each of the issuer's `grants` (`role` or `role@host`, one per line) as its own `GRANT`, and `SET DEFAULT ROLE ALL`. Then its end, in the issuer's database: `CREATE EVENT … ON SCHEDULE AT FROM_UNIXTIME(<end>) ON COMPLETION NOT PRESERVE DO DROP USER IF EXISTS …` ([`mysql_mint.rs:166`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L166)). The end is a count of seconds (`FROM_UNIXTIME`), so it names the same instant whatever the server's time zone |
-| a step refused | MySQL commits each statement as it runs. A grant or the event refused takes the user back at once, and the mint is refused in MySQL's words: no user is left without its end ([`mysql_mint.rs:116`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L116)) |
-| the password | 32 random bytes, base64url, one per lease. MySQL is sent its `caching_sha2_password` form, never the password: `$A$005$`, a 20-character salt, and the SHA-256 crypt digest at 5,000 rounds, which is what MySQL keeps ([`sha_crypt.rs:136`](../agents/roomlerd/src/vault_proxy/sha_crypt.rs#L136)). The salt is drawn from crypt's own alphabet, so the form holds nothing a SQL literal must escape ([`sha_crypt.rs:126`](../agents/roomlerd/src/vault_proxy/sha_crypt.rs#L126)) |
-| the revocation | the user looked up, and a user already gone is done, its event dropped all the same. Otherwise `ACCOUNT LOCK`; its connections listed and ended where the issuer may (`KILL`, sent only for a thread id of digits); `DROP USER`; `DROP EVENT` ([`mysql_mint.rs:217`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L217)). Ending its connections is best effort, each refusal logged: the lock has already refused any new sign-in |
-| the names | a user is dropped only if its name is `roomler_` and 24 hex characters, a lease's id: the Postgres minter's rule, and its code ([`pg_mint.rs:102`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L102)). That is checked before a revocation dials ([`mysql_mint.rs:179`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L179)), and again before each drop, whatever the sweep's query returns |
+| the client | MySQL's client protocol, a client of its own (`vault_proxy::mysql`). The server's greeting must offer TLS and the 4.1 protocol, or the client sends it nothing at all. Then an `SSLRequest`, and TLS verified against the issuer's `ca` (or the system's roots), before a byte of the sign-in ([`mysql.rs:240`](../agents/roomlerd/src/vault_proxy/mysql.rs#L240)). The sign-in is `caching_sha2_password`: its scramble, and, from a server that has not cached the account, the password itself inside that TLS. A switch to `sha256_password` is followed inside the TLS too: MySQL answers so for an account under it, and for one that is not there. Any other plugin is refused ([`mysql.rs:304`](../agents/roomlerd/src/vault_proxy/mysql.rs#L304)) |
+| a query | `COM_QUERY`, text rows, the server's error in its own words. At most 1 MiB a packet and 10,000 rows an answer. `CLIENT_LOCAL_FILES` is never offered ([`mysql.rs:40`](../agents/roomlerd/src/vault_proxy/mysql.rs#L40)), which the daemon's build checks: since P3-6d-1b, a `CAPS` that offered it does not compile ([`mysql.rs:51`](../agents/roomlerd/src/vault_proxy/mysql.rs#L51)). A server that asks for a local file anyway is refused and sent nothing ([`mysql.rs:353`](../agents/roomlerd/src/vault_proxy/mysql.rs#L353)) |
+| the issuer | the bundle's `admin_user` and `admin_password`, to its `database`, at the secret's one audience. The bundle is opened by the reader the Postgres minter uses: refused before anything is dialled when it does not parse or lacks a field no mint can do without, and zeroed when it drops ([`bundle.rs:43`](../agents/roomlerd/src/vault_proxy/bundle.rs#L43)). The `database` and each grant must be names the minter quotes: no quote, backtick, backslash or control character ([`mysql_mint.rs:49`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L49)) |
+| the sweep | first, at every mint: each `roomler_…` user whose `ATTRIBUTE` says its lease has ended, dropped where the issuer may ([`mysql_mint.rs:186`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L186)). That covers an event that never ran: the scheduler off, or an end already past when the mint ran |
+| the mint | `CREATE USER 'roomler_<lease id>'@'%' IDENTIFIED WITH caching_sha2_password AS '<form>' ATTRIBUTE '{"roomler": {"lease": "<id>", "until": <end>}}'` ([`mysql_mint.rs:143`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L143)). Then each of the issuer's `grants` (`role` or `role@host`, one per line) as its own `GRANT`, and `SET DEFAULT ROLE ALL`. Then its end, in the issuer's database: `CREATE EVENT … ON SCHEDULE AT FROM_UNIXTIME(<end>) ON COMPLETION NOT PRESERVE DO DROP USER IF EXISTS …` ([`mysql_mint.rs:162`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L162)). The end is a count of seconds (`FROM_UNIXTIME`), so it names the same instant whatever the server's time zone |
+| a step refused | MySQL commits each statement as it runs. A grant or the event refused takes the user back at once, and the mint is refused in MySQL's words: no user is left without its end ([`mysql_mint.rs:112`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L112)) |
+| the password | 32 random bytes, base64url, one per lease. MySQL is sent its `caching_sha2_password` form, never the password: `$A$005$`, a 20-character salt, and the SHA-256 crypt digest at 5,000 rounds, which is what MySQL keeps ([`sha_crypt.rs:132`](../agents/roomlerd/src/vault_proxy/sha_crypt.rs#L132)). The salt is drawn from crypt's own alphabet, so the form holds nothing a SQL literal must escape ([`sha_crypt.rs:122`](../agents/roomlerd/src/vault_proxy/sha_crypt.rs#L122)) |
+| the revocation | the user looked up, and a user already gone is done, its event dropped all the same. Otherwise `ACCOUNT LOCK`; its connections listed and ended where the issuer may (`KILL`, sent only for a thread id of digits); `DROP USER`; `DROP EVENT` ([`mysql_mint.rs:213`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L213)). Ending its connections is best effort, each refusal logged: the lock has already refused any new sign-in |
+| the names | a user is dropped only if its name is `roomler_` and 24 hex characters, a lease's id: the Postgres minter's rule, and its code ([`pg_mint.rs:102`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L102)). That is checked before a revocation dials ([`mysql_mint.rs:175`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L175)), and again before each drop, whatever the sweep's query returns |
 
 - ⚠️ **The issuer needs** `CREATE USER`, `EVENT` on its database, and each
   role in `grants` granted to it `WITH ADMIN OPTION`. To end a minted user's
@@ -1786,5 +1789,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; the MySQL minter's caller (P3-6d-1b); SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
+| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
