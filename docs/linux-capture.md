@@ -659,7 +659,27 @@ report the modifiers that report ends with. So on a KDE system install "A"
 typed "a", and every shifted symbol came out unshifted: a password with a
 capital in it failed. Shift is now pressed in a report before the key and
 released in one after it, and a shift the viewer holds is left alone
-(`agents/roomlerd/src/input/uinput_backend.rs:665`).
+(`agents/roomlerd/src/input/uinput_backend.rs:677`).
+
+⚠️ **uinput: typed text on any layout** (FR-97 P3f). evdev carries physical
+keys, so `key_text` (the mobile keyboard, IME composition) has to know which
+key makes each character under the host's layout, and until P3f the backend
+knew only a US table: a German or French host dropped typed text, and said so.
+It now compiles the host's own XKB keymap, from the layout and variant
+`localectl` or `/etc/default/keyboard` name (rules `evdev`, model `pc105`),
+through a libxkbcommon it `dlopen`s, never links: a `DT_NEEDED` entry would
+stop the daemon starting on a headless host that lacks it. Each character is
+one stroke, with no modifier, Shift, AltGr (the right Alt key, where the keymap
+makes it `ISO_Level3_Shift`), or both, and AltGr goes in reports of its own as
+shift does. Where a keymap reaches a character twice, the main block wins over
+the keypad, which a terminal in application-keypad mode reads as escape
+sequences. A character that needs a dead key is skipped, as before. Without the
+library, the table still serves a US host
+(`agents/roomlerd/src/input/keylayout/xkb.rs`). Kill switch
+`ROOMLERD_UINPUT_XKB=0`. Field (FR-97 §8, 2026-10-19): on the lab's GNOME 50
+system install, typing into `wlab-probe`, 0.4.145 dropped `zyäöüß@€<>|` on a
+German layout, and the candidate typed it, and `aqé1à€` on a French one,
+character for character.
 
 ⚠️ **uinput: the injector opens before the first event** (FR-93 P4c). libinput
 adds a new uinput device asynchronously. Under load, a move written after the
@@ -2021,6 +2041,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | — | `ROOMLERD_SCREEN_STOP` | **on** | FR-93 P6c (§5.7): a share the person at the screen stopped with the desktop's own control (GNOME's Stop, KDE's End) ends the session as their Disconnect does. Off = the capture is reopened, as before P6c, which undoes their stop |
 | — | `ROOMLERD_SLEEP_NOTICE` | **on** | FR-93 P5h (§5.8): while a session is live, a logind delay inhibitor on sleep, and every controller told `host_sleep` before the computer sleeps. Off = no inhibitor and no notice, as before P5h |
 | `uinput` | `ROOMLERD_UINPUT` | off | inject through `/dev/uinput`, below the compositor — the input pair of `drm_capture` on Wayland. Host-global: it injects into whatever has focus, the greeter included |
+| — | `ROOMLERD_UINPUT_XKB` | **on** | FR-97 P3f (§3): uinput types text through the host's own XKB keymap, any layout. Off = the US table only, and other layouts drop typed text, as before P3f |
 | `portal_capture` | `ROOMLERD_PORTAL_CAPTURE` | off | the portal arm (§4). **Attended**: a logged-in user and a consent dialog on first use; tried after DRM, before X11. A per-user daemon in its own Wayland session uses the portal by itself where mutter is absent (§1.2, P2d-3), so there this key only forces it (`true`) or keeps it off (`false`) |
 | `portal_input` | `ROOMLERD_PORTAL_INPUT` | off for a configured arm; **on** for the automatic portal | input through the portal's RemoteDesktop, on the same session. A configured `portal_capture` takes input only with it `true`. The automatic portal (§1.2) asks for remote control unless it is `false` (FR-93 P4b). On GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped. On a configured mutter arm (`mutter_capture`) it means mutter's own RemoteDesktop (§5.2) |
 | `mutter_input` | `ROOMLERD_MUTTER_INPUT` | **on** | FR-93 P4 (§5.2): a mutter screencast is driven by mutter's own RemoteDesktop, which takes the viewer's input. **It asks nobody**, like the screencast. The automatic arm carries it; a configured one only with `portal_input`. Off = mutter capture is view-only, the behaviour before P4 |
