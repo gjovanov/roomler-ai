@@ -212,3 +212,79 @@ async fn a_server_that_sells_no_plans_throttles_nobody() {
         Some(0)
     );
 }
+
+/// The org's analytics page (`/stats/resources`): its `quota.relay`.
+async fn relay_quota(app: &TestApp, t: &crate::fixtures::seed::SeededTenant) -> serde_json::Value {
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/stats/resources?range=24h", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["quota"]["relay"].clone()
+}
+
+/// AC7's surface: the org's analytics page shows the month's relay against
+/// its plan's allowance, by the throttle's own arithmetic. With the switch
+/// off (the default) it is shown and not applied: never throttled.
+#[tokio::test]
+async fn the_org_page_shows_its_relay_against_the_allowance() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr115relay6").await;
+    let tid = oid(&t.tenant_id);
+
+    relayed_this_month(&app, tid, 2 * GB).await;
+    let q = relay_quota(&app, &t).await;
+    assert_eq!(q["used_bytes"], 2 * GB, "{q}");
+    assert_eq!(q["allowance_bytes"], 10 * GB, "Free's flat 10 GB: {q}");
+    assert_eq!(q["rate_kbps"], 1_000, "{q}");
+    assert_eq!(q["enforced"], false, "{q}");
+    assert_eq!(q["throttled"], false, "{q}");
+    assert!(
+        q["resets_at"]
+            .as_str()
+            .is_some_and(|s| s.contains("-01T00:00:00")),
+        "{q}"
+    );
+
+    // Past the allowance with the switch off: shown over, not throttled.
+    relayed_this_month(&app, tid, 9 * GB).await;
+    let q = relay_quota(&app, &t).await;
+    assert_eq!(q["used_bytes"], 11 * GB, "{q}");
+    assert_eq!(q["throttled"], false, "not enforced: {q}");
+
+    // A paid plan: 25 GB per billed seat, at the paid rate.
+    set_plan(&app, tid, "pro", 3).await;
+    let q = relay_quota(&app, &t).await;
+    assert_eq!(q["allowance_bytes"], 75 * GB, "{q}");
+    assert_eq!(q["rate_kbps"], 4_000, "{q}");
+}
+
+/// With the throttle on, an org past its allowance reads as throttled; a
+/// server that sells no plans shows no allowance at all.
+#[tokio::test]
+async fn the_org_page_says_when_the_throttle_is_on() {
+    let app = TestApp::spawn_with_settings(enable).await;
+    let t = app.seed_tenant("fr115relay7").await;
+    let tid = oid(&t.tenant_id);
+    relayed_this_month(&app, tid, 11 * GB).await;
+    let q = relay_quota(&app, &t).await;
+    assert_eq!(q["enforced"], true, "{q}");
+    assert_eq!(q["throttled"], true, "{q}");
+
+    let selfhost = TestApp::spawn_with_settings(|s| {
+        enable(s);
+        s.modules.saas = false;
+    })
+    .await;
+    let t = selfhost.seed_tenant("fr115relay8").await;
+    relayed_this_month(&selfhost, oid(&t.tenant_id), 11 * GB).await;
+    assert!(
+        relay_quota(&selfhost, &t).await.is_null(),
+        "self-hosting has no allowance"
+    );
+}
