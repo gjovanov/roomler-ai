@@ -42,7 +42,7 @@
           class="mini-video"
           :class="{ 'active-speaker': conferenceStore.activeSpeakerKey === key }"
         />
-        <span class="mini-label">{{ remote.userId.slice(0, 6) }}</span>
+        <span class="mini-label">{{ participantName(remote.userId) }}</span>
       </div>
     </div>
 
@@ -75,13 +75,12 @@
 
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
 import { useConferenceStore } from '@/stores/conference'
 import { useRoomStore } from '@/stores/rooms'
+import { useCallControls } from '@/composables/useCallControls'
 
 const conferenceStore = useConferenceStore()
 const roomStore = useRoomStore()
-const router = useRouter()
 
 const localVideoRef = ref<HTMLVideoElement | null>(null)
 const remoteVideoRefs = new Map<string, HTMLVideoElement>()
@@ -109,23 +108,14 @@ function setRemoteVideoRef(key: string, el: HTMLVideoElement | null) {
   }
 }
 
-function returnToCall() {
-  if (conferenceStore.tenantId && conferenceStore.roomId) {
-    router.push({
-      name: 'room-call',
-      params: {
-        tenantId: conferenceStore.tenantId,
-        roomId: conferenceStore.roomId,
-      },
-    })
-  }
-}
+// One copy of return / hang up, shared with the phone's app-bar menu.
+const { returnToCall, hangUp: handleHangup } = useCallControls()
 
-async function handleHangup() {
-  if (conferenceStore.tenantId && conferenceStore.roomId) {
-    await roomStore.leaveCall(conferenceStore.tenantId, conferenceStore.roomId)
-  }
-  conferenceStore.leaveRoom()
+/** A participant by name, as the call page labels them (its
+ *  `getDisplayName`) — the tile used to show a 6-character user-id prefix. */
+function participantName(userId: string): string {
+  const p = roomStore.participants.find((x) => x.user_id === userId)
+  return p?.display_name || userId.slice(0, 8)
 }
 
 // Attach local stream to video element
