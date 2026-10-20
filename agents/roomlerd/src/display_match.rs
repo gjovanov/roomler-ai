@@ -31,6 +31,12 @@
 //! who is at the screen ([`crate::presence`]). Every request gets one answer,
 //! `rc:display-match.state` ([`state_json`]), so the viewer can say what
 //! happened instead of guessing.
+//!
+//! FR-97 P3e-2 — **a person's own X11 display** as well (a per-user install in
+//! an X11 session, [`x11_offered`]): the one active output switched to a mode
+//! it already lists, with a restore guard that a crash cannot strand, since an
+//! X11 mode outlives the process that set it. Who is at that screen comes from
+//! the X idle clock (`presence`). Kill switch `ROOMLERD_X11_DISPLAY_MATCH=0`.
 
 use crate::config::DisplayMatchPolicy;
 use crate::presence::Presence;
@@ -243,6 +249,284 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// FR-97 P3e-2 — kill switch `ROOMLERD_X11_DISPLAY_MATCH=0`.
+pub fn x11_enabled() -> bool {
+    tunnel_core::env::flag("X11_DISPLAY_MATCH", true)
+}
+
+/// FR-97 P3e-2 — display match may switch this process's own X11 display: a
+/// per-user install in an X11 session (an X display and no Wayland one), not
+/// the daemon's virtual desktop, with the switch on. The `enigo-input` build
+/// carries the X idle clock that tells whether someone is at that screen
+/// (`presence`); without it nothing would ever read as unattended.
+pub fn x11_offered() -> bool {
+    cfg!(all(target_os = "linux", feature = "enigo-input"))
+        && x11_enabled()
+        && std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
+        && std::env::var_os("WAYLAND_DISPLAY").is_none_or(|w| w.is_empty())
+        && !crate::virtual_desktop::active()
+}
+
+/// FR-97 P3e-2 — one output, as `xrandr --current` lists it.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct XOutput {
+    name: String,
+    /// The name of the mode it shows (`*`), when it shows one.
+    current: Option<String>,
+    /// Every mode it lists: name and size.
+    modes: Vec<(String, u32, u32)>,
+}
+
+/// FR-97 P3e-2 — `xrandr --current`: the connected outputs, each with its
+/// modes and the one it shows. A mode's size is read from its name
+/// (`1920x1080`, `1920x1080i`, `roomler-1920x1080`). Pure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_xrandr_outputs(s: &str) -> Vec<XOutput> {
+    fn size_of(name: &str) -> Option<(u32, u32)> {
+        let start = name.find(|c: char| c.is_ascii_digit())?;
+        let rest = &name[start..];
+        let (w, rest) = rest.split_once('x')?;
+        let h: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        Some((w.parse().ok()?, h.parse().ok()?))
+    }
+    let mut outs: Vec<XOutput> = Vec::new();
+    let mut connected = false;
+    for line in s.lines() {
+        if !line.starts_with(' ') {
+            connected = line.contains(" connected");
+            if connected && let Some(name) = line.split_whitespace().next() {
+                outs.push(XOutput {
+                    name: name.to_string(),
+                    current: None,
+                    modes: Vec::new(),
+                });
+            }
+            continue;
+        }
+        let (true, Some(out)) = (connected, outs.last_mut()) else {
+            continue;
+        };
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Some((w, h)) = size_of(name) else {
+            continue;
+        };
+        if line.contains('*') {
+            out.current = Some(name.to_string());
+        }
+        out.modes.push((name.to_string(), w, h));
+    }
+    outs
+}
+
+/// FR-97 P3e-2 — what a switch leaves behind, so the next start of the daemon
+/// can undo it after a crash: the display, the output, the mode it showed
+/// before, and the mode display match put on it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct RestoreGuard {
+    display: String,
+    output: String,
+    start: String,
+    ours: String,
+}
+
+/// FR-97 P3e-2 — undo a switch found at start only while the screen still
+/// shows the mode display match put there: a mode a person chose since is
+/// theirs. Pure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn guard_undoes(guard: &RestoreGuard, display: &str, shown: Option<&str>) -> bool {
+    guard.display == display && shown == Some(guard.ours.as_str()) && guard.start != guard.ours
+}
+
+/// FR-97 P3e-2 — display match on a person's own X11 display (a per-user
+/// install in an X11 session): its one active output switched to the largest
+/// mode it already lists that fits the viewer's stage, as on Windows. No mode
+/// is added: this is someone's monitor, not the daemon's dummy driver.
+///
+/// - **One output.** Switching one of several moves the others' places, so a
+///   host with more than one active output is `unsupported`, as several
+///   displays are P4 on Windows.
+/// - **The restore guard.** An X11 mode outlives the process that set it,
+///   unlike Windows' `CDS_FULLSCREEN`. Before switching, the start mode and
+///   ours go to the session's runtime directory; the next start of the daemon
+///   puts the start mode back, only while the screen still shows ours
+///   ([`guard_undoes`]). No runtime directory, no switch.
+/// - GNOME on Xorg keeps a mode set from outside it (measured, FR-97 §8), as
+///   it does not an outside XKB group lock.
+#[cfg(target_os = "linux")]
+mod x11 {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    use super::{ApplyError, RestoreGuard, XOutput};
+
+    /// The guard of the switch in force, `None` when none is.
+    static STATE: Mutex<Option<RestoreGuard>> = Mutex::new(None);
+
+    fn xrandr(args: &[&str]) -> Result<String, String> {
+        let out = Command::new("xrandr")
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    fn guard_path() -> Option<PathBuf> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
+        Some(PathBuf::from(dir).join("roomler-display-match.json"))
+    }
+
+    fn outputs() -> Result<Vec<XOutput>, ApplyError> {
+        xrandr(&["--current"])
+            .map(|s| super::parse_xrandr_outputs(&s))
+            .map_err(|e| {
+                tracing::info!(%e, "display-match: xrandr could not read this display");
+                ApplyError::Unsupported
+            })
+    }
+
+    /// The one active output, or `unsupported` with none or several.
+    fn the_output() -> Result<XOutput, ApplyError> {
+        let mut active: Vec<XOutput> = outputs()?
+            .into_iter()
+            .filter(|o| o.current.is_some())
+            .collect();
+        if active.len() != 1 {
+            tracing::info!(
+                active = active.len(),
+                "display-match: an X11 display switches only with exactly one active output"
+            );
+            return Err(ApplyError::Unsupported);
+        }
+        Ok(active.remove(0))
+    }
+
+    pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), ApplyError> {
+        let display = std::env::var("DISPLAY").unwrap_or_default();
+        let out = the_output()?;
+        let sizes: Vec<(u32, u32)> = out.modes.iter().map(|&(_, w, h)| (w, h)).collect();
+        let Some((w, h)) = super::pick_display_mode(&sizes, req_w, req_h) else {
+            return Err(ApplyError::NoFittingMode {
+                req_w,
+                req_h,
+                modes: sizes.len(),
+            });
+        };
+        let shown = out.current.clone().unwrap_or_default();
+        if out
+            .modes
+            .iter()
+            .any(|(n, mw, mh)| *n == shown && (*mw, *mh) == (w, h))
+        {
+            return Ok((w, h)); // already there: nothing to change or restore
+        }
+        let Some((ours, _, _)) = out.modes.iter().find(|&&(_, mw, mh)| (mw, mh) == (w, h)) else {
+            return Err(ApplyError::SwitchFailed(-100));
+        };
+        let Some(path) = guard_path() else {
+            tracing::warn!(
+                "display-match: no runtime directory for the restore guard — not switching"
+            );
+            return Err(ApplyError::Unsupported);
+        };
+        let mut st = super::lock(&STATE);
+        // A second switch in one hold keeps the FIRST start mode.
+        let guard = RestoreGuard {
+            display,
+            output: out.name.clone(),
+            start: st.as_ref().map_or(shown, |g| g.start.clone()),
+            ours: ours.clone(),
+        };
+        let written = serde_json::to_vec(&guard)
+            .map_err(|e| e.to_string())
+            .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()));
+        if let Err(e) = written {
+            tracing::warn!(%e, path = %path.display(), "display-match: the restore guard could not be written — not switching");
+            return Err(ApplyError::Unsupported);
+        }
+        let switched = xrandr(&["--output", &out.name, "--mode", ours]);
+        super::MODE_GENERATION.fetch_add(1, Ordering::AcqRel);
+        *st = Some(guard);
+        if let Err(e) = switched {
+            tracing::warn!(output = %out.name, mode = %ours, %e, "display-match: xrandr refused the mode");
+            return Err(ApplyError::SwitchFailed(-3));
+        }
+        match the_output() {
+            Ok(now) if now.current.as_deref() == Some(ours.as_str()) => Ok((w, h)),
+            other => {
+                tracing::warn!(?other, "display-match: the display did not follow the mode");
+                Err(ApplyError::SwitchFailed(-4))
+            }
+        }
+    }
+
+    /// Back to the start mode, and the guard removed. No-op when nothing is in
+    /// force.
+    pub fn restore() {
+        let Some(g) = super::lock(&STATE).take() else {
+            return;
+        };
+        put_back(&g);
+    }
+
+    fn put_back(g: &RestoreGuard) {
+        if let Err(e) = xrandr(&["--output", &g.output, "--mode", &g.start]) {
+            tracing::warn!(output = %g.output, start = %g.start, %e, "display-match: restore failed");
+        } else {
+            tracing::info!(output = %g.output, start = %g.start, "display-match: the display's own mode is back");
+        }
+        super::MODE_GENERATION.fetch_add(1, Ordering::AcqRel);
+        if let Some(path) = guard_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// At the daemon's start: a guard left by a run that did not restore
+    /// (killed, crashed) puts the start mode back, only while the screen still
+    /// shows the mode it set. Removed either way.
+    pub fn recover() {
+        let Some(path) = guard_path() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        let Ok(g) = serde_json::from_slice::<RestoreGuard>(&bytes) else {
+            return;
+        };
+        let display = std::env::var("DISPLAY").unwrap_or_default();
+        let shown = outputs()
+            .ok()
+            .and_then(|o| o.into_iter().find(|o| o.name == g.output))
+            .and_then(|o| o.current);
+        if super::guard_undoes(&g, &display, shown.as_deref()) {
+            tracing::info!(output = %g.output, ours = %g.ours, start = %g.start, "display-match: a switch the last run left in force is undone");
+            put_back(&g);
+        } else {
+            tracing::info!(output = %g.output, shown = ?shown, "display-match: a restore guard from the last run, and the screen no longer shows its mode — left as it is");
+        }
+    }
+}
+
+/// FR-97 P3e-2 — at the daemon's start, undo a switch the last run left on a
+/// person's X11 display (see `x11::recover`). Does nothing elsewhere.
+pub fn recover_after_restart() {
+    #[cfg(target_os = "linux")]
+    if x11_offered() {
+        x11::recover();
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -430,6 +714,10 @@ pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), ApplyError> {
     #[cfg(target_os = "linux")]
     {
         let Some(dpy) = crate::virtual_desktop::switchable_display() else {
+            // FR-97 P3e-2 — a person's own X11 display.
+            if x11_offered() {
+                return x11::apply(req_w, req_h);
+            }
             return Err(ApplyError::Unsupported);
         };
         let Some((w, h)) =
@@ -460,7 +748,10 @@ pub fn restore() {
     #[cfg(target_os = "windows")]
     win::restore();
     #[cfg(target_os = "linux")]
-    lin::restore();
+    {
+        lin::restore();
+        x11::restore();
+    }
 }
 
 // ── Multi-user P3: per-session ownership ────────────────────────────────────
@@ -626,7 +917,9 @@ fn decide_request(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answe
     // switch. It is this daemon's own display, so nobody can be at its screen:
     // unattended by construction, and the owner's `never` still holds.
     let virtual_desktop = crate::virtual_desktop::switchable_display().is_some();
-    if !cfg!(target_os = "windows") && !virtual_desktop {
+    // FR-97 P3e-2 — and a person's own X11 display, where `presence` reads the
+    // X idle clock and logind's lock hint, as it reads Windows' on Windows.
+    if !cfg!(target_os = "windows") && !virtual_desktop && !x11_offered() {
         return Answer::Refused(Refusal::Unsupported);
     }
     let presence = || {
@@ -725,7 +1018,15 @@ pub fn hand_back(
 /// once, and the viewer is told. It is not re-applied until the viewer asks
 /// again. Blocks on OS calls.
 pub fn on_tick(session: bson::oid::ObjectId) -> Option<Answer> {
-    let why = hand_back(owns_mode(session), device_policy(), crate::presence::now)?;
+    // The virtual desktop is the daemon's own: nobody comes back to it.
+    let presence = || {
+        if crate::virtual_desktop::switchable_display().is_some() {
+            Presence::Unattended
+        } else {
+            crate::presence::now()
+        }
+    };
+    let why = hand_back(owns_mode(session), device_policy(), presence)?;
     if !restore_for(session) {
         return None;
     }
@@ -880,6 +1181,77 @@ mod fr108_tests {
             "{w}x{h}"
         );
         assert_eq!((w % 2, h % 2), (0, 0));
+    }
+
+    /// FR-97 P3e-2 — `xrandr --current` as a GNOME 46 cell on Xorg printed it
+    /// (FR-97 §8, trimmed): one connected output, its modes, the one shown.
+    #[test]
+    fn a_persons_x11_display_is_read_with_every_mode() {
+        let s = "Screen 0: minimum 320 x 200, current 1280 x 800, maximum 16384 x 16384\n\
+                 Virtual-1 connected primary 1280x800+0+0 0mm x 0mm\n   \
+                 1280x800      59.81*+\n   5120x2160     50.00  \n   1920x1080     60.00    59.94  \n   \
+                 1280x720      60.00  \n   1024x768i     60.00  \n   800x600       60.32  \n\
+                 Virtual-2 disconnected\n   640x480       60.00  \n";
+        let outs = parse_xrandr_outputs(s);
+        assert_eq!(outs.len(), 1, "a disconnected output is not one: {outs:?}");
+        let o = &outs[0];
+        assert_eq!(o.name, "Virtual-1");
+        assert_eq!(o.current.as_deref(), Some("1280x800"));
+        assert_eq!(
+            o.modes
+                .iter()
+                .map(|(n, _, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "1280x800",
+                "5120x2160",
+                "1920x1080",
+                "1280x720",
+                "1024x768i",
+                "800x600"
+            ]
+        );
+        assert_eq!(
+            o.modes[4],
+            ("1024x768i".into(), 1024, 768),
+            "an interlaced name"
+        );
+        // The pick, as Windows makes it, from the modes the monitor lists.
+        let sizes: Vec<(u32, u32)> = o.modes.iter().map(|&(_, w, h)| (w, h)).collect();
+        assert_eq!(pick_display_mode(&sizes, 1366, 768), Some((1280, 720)));
+        // Two active outputs, and a connected one showing nothing.
+        let two = "Screen 0: minimum 8 x 8, current 3840 x 1080, maximum 16384 x 16384\n\
+                   HDMI-1 connected 1920x1080+0+0 0mm x 0mm\n   1920x1080     60.00*+\n\
+                   DP-1 connected 1920x1080+1920+0 0mm x 0mm\n   1920x1080     60.00*+\n\
+                   DP-2 connected (normal left inverted right x axis y axis)\n   1920x1080     60.00 +\n";
+        let outs = parse_xrandr_outputs(two);
+        assert_eq!(outs.iter().filter(|o| o.current.is_some()).count(), 2);
+        assert_eq!(outs[2].current, None);
+        assert!(parse_xrandr_outputs("").is_empty());
+    }
+
+    /// FR-97 P3e-2 — a switch the last run left goes back at the next start
+    /// only while the screen still shows the mode display match set: a mode a
+    /// person chose since is theirs.
+    #[test]
+    fn the_restore_guard_undoes_only_its_own_mode() {
+        let g = RestoreGuard {
+            display: ":0".into(),
+            output: "Virtual-1".into(),
+            start: "1920x1080".into(),
+            ours: "1280x720".into(),
+        };
+        assert!(guard_undoes(&g, ":0", Some("1280x720")));
+        assert!(
+            !guard_undoes(&g, ":0", Some("1600x900")),
+            "a person's own choice"
+        );
+        assert!(!guard_undoes(&g, ":0", Some("1920x1080")), "already back");
+        assert!(!guard_undoes(&g, ":1", Some("1280x720")), "another display");
+        assert!(!guard_undoes(&g, ":0", None), "the output shows nothing");
+        // The guard survives its own round trip through the runtime file.
+        let json = serde_json::to_vec(&g).unwrap();
+        assert_eq!(serde_json::from_slice::<RestoreGuard>(&json).unwrap(), g);
     }
 
     /// FR-108 P2 — what `xrandr --current` printed on the dummy driver: the

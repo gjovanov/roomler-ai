@@ -5,6 +5,7 @@ import {
   NOT_APPLICABLE,
   hostOffers,
   hostReason,
+  hostSpeaks,
   hostUnavailable,
   parseUnavailable,
 } from '@/utils/hostUnavailable'
@@ -109,5 +110,29 @@ describe('hostUnavailable', () => {
   it('caps a reason at a tooltip, not a page', () => {
     const long = 'a'.repeat(5000)
     expect(parseUnavailable({ audio: { code: 'c', reason: long } }).audio!.reason).toHaveLength(300)
+  })
+
+  // FR-97 P3e-2 — display match follows the device's word, and an agent from
+  // before P0c, which says nothing at all, keeps the old gate.
+  it('says whether the device speaks at all', () => {
+    expect(hostSpeaks(null)).toBe(false)
+    expect(hostSpeaks({})).toBe(false)
+    expect(hostSpeaks({ unavailable: {} })).toBe(false)
+    expect(hostSpeaks({ unavailable: { sas: { code: 'keys-only', reason: 'r' } } })).toBe(true)
+    expect(hostSpeaks({ unavailable: { sas: { reason: 'no code' } } })).toBe(false)
+  })
+
+  it('reads a host whose display cannot be switched', () => {
+    const caps = {
+      unavailable: {
+        sas: { code: 'keys-only', reason: 'Ctrl+Alt+Del is sent as ordinary keys' },
+        'display-match': {
+          code: 'unsupported',
+          reason: "This host's display cannot be switched to your window",
+        },
+      },
+    }
+    expect(hostReason(caps, 'display-match')).toBe("This host's display cannot be switched to your window.")
+    expect(hostReason({ unavailable: { sas: { code: 'keys-only', reason: 'r' } } }, 'display-match')).toBeNull()
   })
 })
