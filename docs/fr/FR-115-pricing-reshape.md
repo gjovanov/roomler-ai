@@ -310,16 +310,22 @@ read 2026-10-20). The cluster's coturn is 4.18.0, linked with hiredis.
 
 **The design.**
 
-1. **The username names the paying org: `{expiry}:{user}:{org}`.** Two issuance paths know the
-   org: the hub's per-session issuance (the session's org) and a meeting's credentials (the
-   room's org). coturn reads the expiry before the first `:` and HMACs the whole username, so
-   neither coturn nor any client sees a difference. The session-less pre-fetch
-   (`GET /api/turn/credentials`) knows no org. Bytes relayed under it are counted as
+1. **The username names the paying org: `{expiry}:{principal}:org-{org}`.** Four issuance
+   paths know the org: the hub's per-session issuance (the session's org), a meeting's
+   credentials (the room's org), an overlay pair's relay grant and a tunnel's QUIC credentials
+   (the node's or tunnel's org). coturn reads the expiry before the first `:` and HMACs the
+   whole username, so neither coturn nor any client sees a difference. The session-less
+   pre-fetch (`GET /api/turn/credentials`) knows no org. Bytes relayed under it are counted as
    unattributed and logged, never guessed; that is FR-20's rule.
+   ⚠️ The `org-` marker, not the position, is what makes the org readable. An overlay pair's
+   principal is itself `{node}:{node}` (`overlay::pair_key`), so an uncharged pair username
+   also ends in an ObjectId, which a "last hex part" rule would book as an org.
 2. **Cluster coturn** (`coturn-worker-1..3` in the `coturn` namespace) points `redis-statsdb`
    at the cluster's Redis. The API subscribes to `…/total_traffic` and `…/total_traffic/peer`.
    Both API pods receive every message, so the first pod to win a `SET NX` on the allocation
-   id records it, and no allocation is counted twice. The bytes counted are what coturn sends
+   leg records it, and no allocation is counted twice. The key is the username, the
+   allocation id and the leg, because coturn numbers allocations per process and two workers
+   can reuse an id. The bytes counted are what coturn sends
    out: `sentb` toward the client plus the peer leg's `sentb`, just as DERP counts the bytes it
    forwards. They are written per org as `turn_bytes`, with the same `add_usage` the DERP
    flusher uses.
