@@ -25,6 +25,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::{wait_agent_offline, wait_agent_online};
+use crate::vault_dynamic_tests::{Issuer, dynamic_secret, put, short_lived};
 use crate::vault_lease_tests::{
     Device, RUNS_HIVE, TAKES_LEASES, ask, device, fresh_kek, rows, seed_vault, start,
 };
@@ -516,4 +517,69 @@ async fn a_lease_never_outlives_its_version() {
     assert_eq!(answer["reason"], "no_value", "{answer}");
     let audit = rows(&app, "vault_audit", doc! { "reason": "version_expired" }).await;
     assert_eq!(audit.len(), 1, "{audit:?}");
+}
+
+/// FR-90 P3-6b-1 — a dynamic secret's lease is one bundle of its issuer's
+/// fields, so it stands across sweeps while none of them changes. A sweep
+/// that read one field's version for it would take it back at once. A new
+/// version of any field, found by the sweep alone (written straight to the
+/// row, as another pod's write would be), takes it back.
+#[tokio::test]
+async fn a_bundle_lease_stands_across_sweeps_until_its_issuer_changes() {
+    let app = revoke_app(1).await;
+    let t = app.seed_tenant("revoke-bundle").await;
+    seed_vault(&app, &t).await;
+    let id = dynamic_secret(&app, &t, &Issuer::made(), true).await;
+    let mut dev = device(&app, &t, "rv-bundle", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/b", Some("dev")).await;
+    let answer = ask(&mut dev, "b1", short_lived(&sid, fence)).await;
+    let lease = answer["lease_id"].as_str().expect("leased").to_string();
+
+    assert!(
+        revoked(&mut dev, Duration::from_millis(2_500))
+            .await
+            .is_none(),
+        "it stands across two sweeps"
+    );
+    assert!(
+        lease_row(&app, &lease)
+            .await
+            .get_datetime("revoked_at")
+            .is_err()
+    );
+    // A newer `admin_password`, as the row would say after a write on
+    // another pod: only a sweep can find it.
+    app.db
+        .collection::<bson::Document>("vault_secrets")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&id).unwrap() },
+            doc! { "$inc": { "fields.admin_password.seq": 1, "fields.admin_password.current": 1 } },
+        )
+        .await
+        .unwrap();
+    let frame = revoked(&mut dev, Duration::from_secs(5))
+        .await
+        .expect("the sweep takes the lease back");
+    assert_revoked(&frame, &lease, "value_changed");
+}
+
+/// FR-90 P3-6b-1 — and the write itself takes back every lease of a dynamic
+/// secret at once, a field the bundle did not carry included: here no sweep
+/// runs.
+#[tokio::test]
+async fn a_new_issuer_field_takes_a_bundle_back_at_once() {
+    let app = revoke_app(NEVER).await;
+    let t = app.seed_tenant("revoke-bundle-now").await;
+    seed_vault(&app, &t).await;
+    let id = dynamic_secret(&app, &t, &Issuer::made(), true).await;
+    let mut dev = device(&app, &t, "rv-bundle-now", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/bn", Some("dev")).await;
+    let answer = ask(&mut dev, "bn1", short_lived(&sid, fence)).await;
+    let lease = answer["lease_id"].as_str().expect("leased").to_string();
+    // `grants`, a field the bundle did not carry.
+    assert_eq!(put(&app, &t, &id, "grants", "readonly").await, 200);
+    let frame = revoked(&mut dev, Duration::from_secs(5))
+        .await
+        .expect("the write takes the lease back at once");
+    assert_revoked(&frame, &lease, "value_changed");
 }

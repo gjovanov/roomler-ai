@@ -904,6 +904,8 @@ async fn roles_and_policies_are_checked_before_they_are_kept() {
             "guardrail:prod-never-materializes",
             "guardrail:exec-only-allowed-programs",
             "guardrail:proxy-only-named-audiences",
+            "guardrail:dynamic-only-short-lived",
+            "guardrail:short-lived-only-dynamic",
             pid.as_str()
         ],
         "{list}"

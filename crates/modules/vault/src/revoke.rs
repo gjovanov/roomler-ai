@@ -191,8 +191,9 @@ pub struct SessionStanding {
 pub struct SecretStanding {
     pub deleted: bool,
     pub disabled: bool,
-    /// The current version of the lease's field.
-    pub current: Option<i64>,
+    /// Whether what the lease released has a newer version: its field's, or
+    /// (P3-6b) for a bundle, any of the issuer's fields.
+    pub changed: bool,
 }
 
 /// What a lease is checked against, read by the caller; `None` = gone.
@@ -224,9 +225,22 @@ impl<'a> Standing<'a> {
             secret: secret.map(|s| SecretStanding {
                 deleted: s.deleted_at.is_some(),
                 disabled: s.disabled,
-                current: s.fields.get(&lease.field).map(|f| f.current),
+                changed: changed(lease, s),
             }),
         }
+    }
+}
+
+/// Whether what `lease` released has a newer version in `secret`: its
+/// field's, or (P3-6b) for a bundle, any of the issuer's fields. Pure.
+pub fn changed(lease: &VaultLease, secret: &VaultSecret) -> bool {
+    match &lease.bundle {
+        Some(bundle) => crate::dynamic::bundle_changed(
+            bundle,
+            crate::dynamic::provider_of(secret),
+            &secret.fields,
+        ),
+        None => secret.fields.get(&lease.field).map(|f| f.current) != Some(lease.n),
     }
 }
 
@@ -253,7 +267,7 @@ pub fn verdict(lease: &VaultLease, s: &Standing<'_>) -> Option<RevokeReason> {
     if secret.disabled {
         return Some(RevokeReason::SecretDisabled);
     }
-    if secret.current != Some(lease.n) {
+    if secret.changed {
         return Some(RevokeReason::ValueChanged);
     }
     None
@@ -529,6 +543,7 @@ mod tests {
             secret_id: ObjectId::new(),
             field: "value".into(),
             n: 3,
+            bundle: None,
             session_id: ObjectId::new(),
             fence: 2,
             device_id: ObjectId::new(),
@@ -555,7 +570,7 @@ mod tests {
             secret: Some(SecretStanding {
                 deleted: false,
                 disabled: false,
-                current: Some(l.n),
+                changed: false,
             }),
         }
     }
@@ -641,17 +656,7 @@ mod tests {
             (
                 Standing {
                     secret: Some(SecretStanding {
-                        current: Some(l.n + 1),
-                        ..secret
-                    }),
-                    ..ok
-                },
-                RevokeReason::ValueChanged,
-            ),
-            (
-                Standing {
-                    secret: Some(SecretStanding {
-                        current: None,
+                        changed: true,
                         ..secret
                     }),
                     ..ok

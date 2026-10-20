@@ -97,6 +97,13 @@ pub struct VaultSettings {
     /// pushed to the device. 0 or absent: 10.
     #[serde(default)]
     pub revoke_sweep_secs: u64,
+    /// P3-6b — the providers a dynamic secret is leased for, as
+    /// comma-separated names (`ROOMLER__VAULT__PROVIDERS=postgres`). Empty —
+    /// the default — or `*` is every provider this build knows; a list is
+    /// only those. A provider left out is refused `not_served`, and a word
+    /// that names no provider serves nothing: `none` turns them all off.
+    #[serde(default)]
+    pub providers: String,
 }
 
 impl std::fmt::Debug for VaultSettings {
@@ -113,6 +120,7 @@ impl std::fmt::Debug for VaultSettings {
             )
             .field("kek_file", &self.kek_file)
             .field("revoke_sweep_secs", &self.revoke_sweep_secs)
+            .field("providers", &self.providers)
             .finish()
     }
 }
@@ -1730,6 +1738,7 @@ mod vault_settings_tests {
             kek: key.into(),
             kek_file: String::new(),
             revoke_sweep_secs: 0,
+            providers: String::new(),
         };
         let shown = format!("{s:?} {s:#?}");
         assert!(!shown.contains(key), "{shown}");

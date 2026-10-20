@@ -123,6 +123,26 @@ when { context.mode == "exec" && !(resource.exec_allow.contains(context.audience
         text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
 when { context.mode == "proxy" && !(resource.audiences.contains(context.audience)) };"#,
     },
+    // P3-6b — a dynamic secret's fields are its issuer's: the account that
+    // mints, the App's key. In any other mode a lease would release one of
+    // them to the session as a stored value, which no policy that permits a
+    // mode for "a secret" ever meant.
+    Guardrail {
+        id: "guardrail:dynamic-only-short-lived",
+        why: "a dynamic secret's fields are its issuer's, used only in `short-lived` to mint a \
+              credential: no other mode hands one to a session",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
+when { resource.kind == "dynamic" && context.mode != "short-lived" };"#,
+    },
+    // P3-6b — and the other way about: `short-lived` releases a bundle to
+    // mint with, which a stored value is not.
+    Guardrail {
+        id: "guardrail:short-lived-only-dynamic",
+        why: "`short-lived` mints a credential with a dynamic secret's issuer: no other kind of \
+              secret is leased in it",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
+when { context.mode == "short-lived" && resource.kind != "dynamic" };"#,
+    },
 ];
 
 /// What a policy may name of its organization.
@@ -905,16 +925,92 @@ mod tests {
             "identity",
             "placeholder",
         ] {
-            let v = decide(
-                &set,
-                &use_secret(Some("dev"), "staging/db", &[], mode, "windows"),
-            );
+            // P3-6b — `short-lived` with the one kind it is for, so only
+            // the guardrail this test is about decides.
+            let ask = use_secret(Some("dev"), "staging/db", &[], mode, "windows");
+            let ask = if mode == "short-lived" {
+                of_kind(ask, "dynamic")
+            } else {
+                ask
+            };
+            let v = decide(&set, &ask);
             assert!(!v.allow, "{mode}: {v:?}");
             assert_eq!(v.determining, ["guardrail:windows-proxy-only"], "{mode}");
         }
         // Linux and macOS are not held to it.
         for os in ["linux", "macos"] {
             assert!(decide(&set, &use_secret(Some("dev"), "staging/db", &[], "env", os)).allow);
+        }
+    }
+
+    /// The same ask, of another kind of secret.
+    fn of_kind(mut ask: Ask, kind: &str) -> Ask {
+        if let Ask::UseSecret { secret, .. } = &mut ask {
+            secret.kind = kind.into();
+        }
+        ask
+    }
+
+    /// P3-6b — a dynamic secret's issuer is used to mint, in `short-lived`,
+    /// and in no other mode: whatever a policy permits.
+    #[test]
+    fn a_dynamic_secret_is_used_short_lived_alone() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let set = set_with(&[any]);
+        for os in ["linux", "macos"] {
+            let ask = of_kind(
+                use_secret(Some("dev"), "db/dyn", &[], "short-lived", os),
+                "dynamic",
+            );
+            assert!(decide(&set, &ask).allow, "{os}");
+        }
+        for mode in ["proxy", "file", "env", "exec", "identity", "placeholder"] {
+            let ask = of_kind(
+                use_secret(Some("dev"), "db/dyn", &[], mode, "linux"),
+                "dynamic",
+            );
+            let v = decide(&set, &ask);
+            assert!(!v.allow, "{mode}: {v:?}");
+            assert_eq!(
+                v.determining,
+                ["guardrail:dynamic-only-short-lived"],
+                "{mode}"
+            );
+        }
+    }
+
+    /// P3-6b — and `short-lived` leases nothing a dynamic secret is not.
+    #[test]
+    fn short_lived_uses_a_dynamic_secret_alone() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let set = set_with(&[any]);
+        for kind in ["static", "structured", "template", ""] {
+            let ask = of_kind(
+                use_secret(Some("dev"), "db/x", &[], "short-lived", "linux"),
+                kind,
+            );
+            let v = decide(&set, &ask);
+            assert!(!v.allow, "{kind:?}: {v:?}");
+            assert_eq!(
+                v.determining,
+                ["guardrail:short-lived-only-dynamic"],
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// P3-6b — prod's guardrail keeps a STORED value from materializing; a
+    /// credential minted for minutes is what it pushes toward.
+    #[test]
+    fn a_prod_credential_is_minted_short_lived() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let set = set_with(&[any]);
+        for (path, tags) in [("prod/db", &[][..]), ("svc/db", &["prod"][..])] {
+            let ask = of_kind(
+                use_secret(Some("ops"), path, tags, "short-lived", "linux"),
+                "dynamic",
+            );
+            assert!(decide(&set, &ask).allow, "{path} {tags:?}");
         }
     }
 

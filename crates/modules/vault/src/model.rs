@@ -13,15 +13,21 @@ use std::collections::BTreeMap;
 use bson::{Binary, DateTime, oid::ObjectId, spec::BinarySubtype};
 use serde::{Deserialize, Serialize};
 
-/// The kinds P3-1 accepts. `dynamic`, `template` and `llm_credential` come
-/// with the steps that give them meaning (P3-6 and later); a row is read
-/// whatever its kind says, so a server rolled back past them still lists
-/// what a later one wrote.
-pub const KINDS: &[&str] = &[KIND_STATIC, KIND_STRUCTURED];
+/// The kinds the vault accepts. `template` and `llm_credential` come with the
+/// steps that give them meaning; a row is read whatever its kind says, so a
+/// server rolled back past one still lists what a later one wrote.
+pub const KINDS: &[&str] = &[KIND_STATIC, KIND_STRUCTURED, KIND_DYNAMIC];
 /// One field, `value`.
 pub const KIND_STATIC: &str = "static";
 /// Named fields: a username, a password, a host…
 pub const KIND_STRUCTURED: &str = "structured";
+/// P3-6b — an issuer, for a credential minted per lease: its fields are
+/// those its `provider` names
+/// (`roomler_ai_remote_control::vault::providers`), and a session never
+/// gets one of them. It is used in `short-lived` mode alone, and that mode
+/// uses nothing else (the guardrails `dynamic-only-short-lived` and
+/// `short-lived-only-dynamic`).
+pub const KIND_DYNAMIC: &str = "dynamic";
 
 /// A secret: the name and the rules, never the value (`vault_secrets`).
 ///
@@ -39,6 +45,10 @@ pub struct VaultSecret {
     pub path: String,
     /// [`KINDS`], as a string: an unknown kind still reads.
     pub kind: String,
+    /// P3-6b — a dynamic secret's provider, and only a dynamic secret's.
+    /// Never changes, as its kind never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub description: String,
     /// Each field's counter and current version, by name. A field appears
@@ -249,8 +259,16 @@ pub struct VaultLease {
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
     pub secret_id: ObjectId,
+    /// The field leased; empty for a dynamic secret's bundle, which is the
+    /// secret as a whole.
     pub field: String,
+    /// The field's version leased; `0` for a bundle.
     pub n: i64,
+    /// P3-6b — a bundle's fields, each at the version it carried. A newer
+    /// version of any field of the secret, one the bundle did not carry
+    /// included, takes the lease back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<BTreeMap<String, i64>>,
     pub session_id: ObjectId,
     pub fence: i64,
     pub device_id: ObjectId,
@@ -396,6 +414,7 @@ mod tests {
             tenant_id: ObjectId::new(),
             path: "db".into(),
             kind: KIND_STATIC.into(),
+            provider: None,
             description: String::new(),
             fields: BTreeMap::new(),
             audiences: Vec::new(),
