@@ -7482,6 +7482,31 @@ mod tests {
         );
     }
 
+    /// FR-100 P2b — the browser's OFFER transcript: role `offer` and an EMPTY
+    /// answer fingerprint, the one the device judges (P1c). Its known answer
+    /// was computed outside both implementations (Perl's `Digest::SHA` over
+    /// the same framing), and the viewer's tests pin the same bytes.
+    #[test]
+    fn a_peer_auth_offer_transcript_matches_its_known_answer() {
+        let t = peer_auth_transcript(
+            "offer",
+            "66f0c0ffee0000000000000a",
+            "66f0c0ffee0000000000000b",
+            "66f0c0ffee0000000000000c",
+            "sha-256 AA:BB:CC",
+            "",
+            &nonce_0_to_15(),
+        )
+        .unwrap();
+        assert_eq!(t.len(), 149);
+        let digest = ring::digest::digest(&ring::digest::SHA256, &t);
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "3c3da0182f79f04f878356ddbb0983d748b8152a15912a92d095429756428840"
+        );
+    }
+
     /// FR-100 P2a — a signature made OUTSIDE both implementations: an OpenSSL
     /// 3.5 P-256 key (its private half deleted after signing) over the
     /// known-answer transcript, converted from DER to `r ‖ s`. The viewer's
