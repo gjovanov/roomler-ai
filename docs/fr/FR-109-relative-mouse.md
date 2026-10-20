@@ -24,7 +24,7 @@ Nothing to install on the controlling side stays true: Pointer Lock is a web API
 |---|---|
 | Every move is absolute: `mouse_move {x, y, mon}`, normalised `0..1` per monitor, so a resolution change mid-session needs no resync | [`input/mod.rs:320`](../../agents/roomlerd/src/input/mod.rs#L320) `InputMsg` |
 | enigo moves to an absolute pixel | [`enigo_backend.rs:152`](../../agents/roomlerd/src/input/enigo_backend.rs#L152) `Coordinate::Abs` |
-| The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:307` |
+| The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:312` |
 | The portal path moves with `NotifyPointerMotionAbsolute` on the stream | [`portal/input.rs:468`](../../agents/roomlerd/src/capture/portal/input.rs#L468) |
 | The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:6128`](../../ui/src/composables/useRemoteControl.ts#L6128), the gap's key at `:2312` |
 | The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9291` |
