@@ -30,9 +30,11 @@ incorrectly. Roomler has no heuristic that watches how you use it, because the
 plans are counted by devices rather than policed by suspicion — and if you
 self-host, there is no counting at all.
 
-**Price shape.** Roomler is $8/user/month for 30 devices and $16 for 300, with
-three devices free forever. Remote support suites are typically priced per
-concurrent seat with device tiers layered on top. Compare against your own quote
+**Price shape.** Roomler is $8 per user a month (Pro, 1,000 devices) and $16
+(Business, 5,000), two months free on annual billing, in dollars or euros, and
+free for 10 users and 100 devices with commercial use allowed. Remote support
+suites are typically priced per concurrent seat with device tiers layered on
+top. Compare against your own quote
 rather than a number on a page — but for a small IT shop the difference is
 usually an order of magnitude.
 
@@ -88,7 +90,7 @@ and [`../../COMMERCIAL.md`](../../COMMERCIAL.md).
 ---
 
 *Checked 2026-08-29 against Roomler's own source and public vendor
-documentation; pricing and packaging change often, so verify against your own
-quote. If anything here is wrong or has aged,
+documentation; Roomler's own prices updated 2026-10-20 (FR-115). Pricing and
+packaging change often, so verify against your own quote. If anything here is wrong or has aged,
 [open an issue](https://github.com/gjovanov/roomler-ai/issues) — we would rather
 fix it than win on a stale fact.*

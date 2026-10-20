@@ -68,7 +68,7 @@ runs as SYSTEM or root on your machines.
 | Private mesh network, tunnels, SSH | **yes** | no |
 | Self-host the whole product | yes | no |
 | Source available | yes | no |
-| Price | 3 devices free; paid plans; free to self-host | free |
+| Price | 10 users and 100 devices free, commercial use included; paid plans per user; free to self-host | free |
 
 ## Choosing
 
@@ -79,7 +79,7 @@ runs as SYSTEM or root on your machines.
 
 ---
 
-*Checked 2026-10-13 against Roomler's own source and StarDesk's public website and help center. StarDesk is
-young and changes quickly. If anything here is wrong or has aged,
+*Checked 2026-10-13 against Roomler's own source and StarDesk's public website and help center; Roomler's own
+price updated 2026-10-20 (FR-115). StarDesk is young and changes quickly. If anything here is wrong or has aged,
 [open an issue](https://github.com/gjovanov/roomler-ai/issues); we would rather fix it than win on a stale
 fact.*

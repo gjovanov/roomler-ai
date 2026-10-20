@@ -15,8 +15,9 @@ run a command on.
 Sign up at [roomler.ai](/register) and give the organization a name your team
 will recognise — it labels **every device and every invite** you issue from it.
 
-The free plan covers **three devices** with the private network, remote desktop,
-tunnels, chat and calls all included, so nothing below needs a card.
+The free plan covers **10 users and 100 devices**, commercial use included, with
+the private network, remote desktop, tunnels, chat and calls, so nothing below
+needs a card.
 
 ## 2 · Mint an enrollment token
 

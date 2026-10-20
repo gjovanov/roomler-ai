@@ -32,9 +32,12 @@ works that way.
 
 ## Is it free?
 
-There is a free plan covering three devices, with the private network, remote
-desktop, tunnels, chat and calls all included. Paid plans raise the device count
-and add features like exit nodes. Self-hosting has no device limit imposed by us.
+There is a free plan for up to 10 users and 100 devices, and commercial use is
+allowed on it: a business can run on the free plan, and nothing tries to detect
+one. The private network, remote desktop, tunnels, chat and calls are all
+included. Paid plans are billed per user, monthly or annually (two months free),
+in US dollars or euros; they raise the limits and add features like exit nodes.
+Self-hosting has no device limit imposed by us.
 
 ## Can I host it myself?
 
