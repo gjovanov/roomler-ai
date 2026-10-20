@@ -81,7 +81,7 @@
   polled every second; merged (#2632). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
 - P3g needed no build of its own: FR-93 P6d and P6e ship the companion as an `.rpm` and for aarch64 (since
   0.4.138), and AC10 is field-verified in FR-93's lab. A tarball for a host with neither dpkg nor rpm waits on D17.
-- P7b, an aarch64 Linux tunnel CLI and setup wizard, built (#P7BPR). `install.sh --role tunnel` picks the build by
+- P7b, an aarch64 Linux tunnel CLI and setup wizard, built (#2641). `install.sh --role tunnel` picks the build by
   arch; before it, an arm64 host got the x86_64 CLI, which it could not run. The wizard rides 0.4.149's lockstep
   release, and the CLI the first tunnel release from then on.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
@@ -993,7 +993,7 @@ model on Windows, so the three agree on what the mode means.
 - **P7a, Linux arm64 hardware encode.** A vendored aarch64 FFmpeg (VAAPI, V4L2 M2M, Vulkan) in the existing arm64 lane;
   recordings then write AAC.
 - **P7b, arm64 tunnel CLI and wizard.** Two more matrix rows.
-  - *As built (#P7BPR):* more than the two rows, because nothing downstream knew aarch64. `install.sh --role
+  - *As built (#2641):* more than the two rows, because nothing downstream knew aarch64. `install.sh --role
     tunnel` handed every Linux host the x86_64 CLI: on aarch64, dpkg refused the package for its architecture, and
     the tarball's binary could not run. The wizard's own platform said `unsupported`, so it refused there outright.
   - The release jobs build both on the arm64 runner (`ubuntu-22.04-arm`, the glibc floor the agent's and the
@@ -1067,7 +1067,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
-| **P7b** | arm64 tunnel CLI + wizard (built #P7BPR; rides 0.4.149 for the wizard, the next tunnel release for the CLI) | — (new artifacts; x86_64's names and tokens unchanged) | an arm64 vmtest guest | S |
+| **P7b** | arm64 tunnel CLI + wizard (built #2641; rides 0.4.149 for the wizard, the next tunnel release for the CLI) | — (new artifacts; x86_64's names and tokens unchanged) | an arm64 vmtest guest | S |
 | **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction. *P8-1* merged (#2489): every §2.8 row but two, each re-checked against master first. *P8-2* (#2548), after 0.4.144 shipped FR-113: `platform-support.md` and the user page, written against 0.4.145; the stale code comments and W7c's last leftovers; the Linux system-install claims, but for the two public Wayland pages, which ride #2533 | — | — | M |
 
 Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `hive_adopt`,
