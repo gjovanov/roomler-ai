@@ -12,6 +12,14 @@ use chrono::{Datelike, TimeZone, Utc};
 use roomler_ai_config::RelayAllowanceSettings;
 use roomler_ai_db::models::Plan;
 
+/// The Redis key of the published over-allowance set (`{network hex: rate}`),
+/// scoped to the database so two deployments that share a Redis never read
+/// each other's. The throttle's job writes it; every API pod's refresh and
+/// the push to the PoPs (FR-115 P4a-2, `roomler_core::relay_load`) read it.
+pub fn set_key(db_name: &str) -> String {
+    format!("roomler:relay_over_allowance:{db_name}")
+}
+
 /// The month's relay allowance in bytes for `plan` with `seats`; `None` when
 /// the plan has none (unlimited).
 pub fn allowance_bytes(plan: &Plan, seats: u32) -> Option<u64> {

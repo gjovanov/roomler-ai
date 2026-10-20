@@ -227,6 +227,13 @@ impl AppState {
                 .stats
                 .enabled
                 .then(|| Arc::new(OverlayNetworkDao::new(&db))),
+            // FR-115 P4a-2 — the over-allowance set, pushed to the PoPs on
+            // the same poll. Not gated on stats (it is a throttle, not
+            // metering); without Redis or a ticket key, no push, and no PoP
+            // throttles.
+            redis_pubsub.clone().and_then(|redis| {
+                crate::relay_load::AllowancePush::new(&settings.relay, redis, db.name())
+            }),
         );
 
         // C-1 — the directory heartbeat: every 30 s, re-assert this pod's

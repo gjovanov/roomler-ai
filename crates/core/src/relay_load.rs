@@ -161,6 +161,93 @@ fn region_stats_urls(spec: &roomler_ai_remote_control::turn_creds::RelayRegionSp
         .collect()
 }
 
+/// FR-115 P4a-2 — the push of the over-allowance set to the PoPs, on the
+/// poll the API already makes (`POST` to the same `/stats`; the `GET` is
+/// unchanged). The set is the one the throttle's job publishes in Redis
+/// (`roomler_ai_services::relay_allowance::set_key`), signed with the DERP
+/// ticket key the PoP already verifies tickets with, so the PoP stays DB-free
+/// and secret-free.
+///
+/// Every way this can fail leaves the PoPs throttling NOTHING: a PoP keeps a
+/// set three polls after it arrives and then lets it lapse, so a stopped
+/// push, an unreachable PoP and an older PoP (which answers the `POST` 405
+/// and has no throttle) all fail open. An empty or absent set is pushed too:
+/// that is how the API's kill switch reaches a PoP within one poll.
+pub struct AllowancePush {
+    redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
+    key: String,
+    signer: roomler_ai_remote_control::derp_ticket::DerpTicketSigner,
+}
+
+impl AllowancePush {
+    /// `None` without a usable ticket key: no PoP could verify a set.
+    pub fn new(
+        settings: &roomler_ai_config::RelaySettings,
+        redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
+        db_name: &str,
+    ) -> Option<Self> {
+        let private_b64 = settings.derp_ticket_private_key.as_deref()?;
+        match roomler_ai_remote_control::derp_ticket::DerpTicketSigner::from_pkcs8_b64(private_b64)
+        {
+            Ok(signer) => Some(Self {
+                redis,
+                key: roomler_ai_services::relay_allowance::set_key(db_name),
+                signer,
+            }),
+            Err(e) => {
+                warn!(%e, "relay allowance push: no usable ticket key; PoPs will not throttle");
+                None
+            }
+        }
+    }
+
+    /// Sign the current set and `POST` it to every endpoint at once (one dead
+    /// PoP must not stretch the tick by its timeout per endpoint).
+    async fn push(&self, client: &reqwest::Client, targets: &[(String, Vec<String>)], ttl: u64) {
+        let raw = match self.redis.kv_get(&self.key).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Unreadable: push nothing, rather than an empty set over the
+                // one another pod just pushed. The PoPs lapse on their own.
+                debug!(%e, "relay allowance push: the set is unreadable; skipping this poll");
+                return;
+            }
+        };
+        // Absent = nobody is over (the job deletes an empty set); a set that
+        // does not parse is treated the same way, which fails open.
+        let set: std::collections::BTreeMap<String, u64> = raw
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default();
+        let token = match self.signer.sign_allowance_set(set, ttl) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(%e, "relay allowance push: signing failed");
+                return;
+            }
+        };
+        let token = &token;
+        let pushes = targets.iter().flat_map(|(region, urls)| {
+            urls.iter().map(move |url| {
+                let req = client
+                    .post(url)
+                    .header("content-type", "application/jwt")
+                    .body(token.clone());
+                async move { (region, url, req.send().await) }
+            })
+        });
+        for (region, url, res) in futures::future::join_all(pushes).await {
+            match res {
+                Ok(r) if r.status().is_success() => {}
+                // An older PoP answers 405: it has no throttle to feed.
+                Ok(r) => {
+                    debug!(%region, %url, status = %r.status(), "relay allowance push: refused")
+                }
+                Err(e) => debug!(%region, %url, %e, "relay allowance push: failed"),
+            }
+        }
+    }
+}
+
 /// Spawn the poller. No-op (never spawns) when regions are disabled or none
 /// exposes a `/stats` endpoint, or when `relay.stats_poll_secs` is 0.
 pub fn spawn_poller(
@@ -172,6 +259,8 @@ pub fn spawn_poller(
     // bytes can be attributed. `None` ⇒ metering off; the load poller itself
     // is unaffected.
     networks: Option<Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>>,
+    // FR-115 P4a-2 — `None` ⇒ no push, and so no PoP throttles (fail open).
+    allowance_push: Option<AllowancePush>,
 ) {
     let poll_secs = settings.stats_poll_secs;
     let busy_load = settings.busy_load;
@@ -217,6 +306,11 @@ pub fn spawn_poller(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            // FR-115 P4a-2 — a PoP keeps the set three polls after it arrives.
+            if let Some(push) = &allowance_push {
+                push.push(&client, &targets, poll_secs.saturating_mul(3))
+                    .await;
+            }
             for (region, urls) in &targets {
                 // Multi-worker region: poll every endpoint and aggregate
                 // pessimistically (see `Agg`). One unreachable worker of

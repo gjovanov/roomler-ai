@@ -240,42 +240,16 @@ struct PeerRoutes {
     hive: HashMap<HiveStreamTag, mpsc::Sender<Vec<u8>>>,
 }
 
-/// Local copy of the disco magic (`overlay::disco::MAGIC`) — `transport` must
-/// compile without the `overlay` feature, so it cannot reference the module;
-/// a feature-gated test asserts the two never drift.
-const DISCO_MAGIC: &[u8; 8] = b"RMDISCO1";
-
-/// Which consumer an inbound DERP payload belongs to. WireGuard frames start
-/// with their LE u32 message type — `[1..=4, 0, 0, 0]` — and disco frames
-/// with the 8-byte `RMDISCO1` magic (designed disjoint from WG, doc'd in
-/// `overlay::disco`); both belong to the carrier/WG consumer. EVERYTHING else
-/// (QUIC long headers ≥0xC0, short headers 0x40..=0x7F, version-negotiation
-/// 0x80..=0xBF) is tunnel traffic — but only when a tunnel consumer is
-/// registered; otherwise it falls through to the WG consumer exactly as
-/// before R4 (boringtun discards non-WG bytes — harmless, and preserves the
-/// legacy path for anything unexpected). A QUIC short-header packet CAN start
-/// with 0x52 ('R'), which is why the disco check is the full 8-byte magic and
-/// runs first.
-///
-/// ⚠️ #2002 — WireGuard is the WHOLE 4-byte header, never the first byte
-/// alone. quinn greases QUIC's fixed bit by default (RFC 9287): an end whose
-/// peer advertised it clears the bit on about half of what it sends, and a
-/// short header then starts anywhere below 0x40, 1..=4 among it — measured at
-/// 2.6-4.0% of a transfer's datagrams (`quic::tests::
-/// quic_over_derp_never_clears_the_fixed_bit`). Read by the first byte alone,
-/// those went to the WG consumer and were lost, and the server's tunnel
-/// shaper let them by. A greased QUIC packet that still passes must also open
-/// its random connection ID with three zero bytes.
-pub fn payload_is_wg_or_disco(payload: &[u8]) -> bool {
-    is_wg_header(payload) || payload.len() >= 8 && &payload[..8] == DISCO_MAGIC
-}
-
-/// WireGuard's own message header: the type (1 handshake initiation, 2
-/// response, 3 cookie reply, 4 transport data) and three reserved bytes, zero
-/// in every WireGuard message.
-fn is_wg_header(payload: &[u8]) -> bool {
-    matches!(payload, [1..=4, 0, 0, 0, ..])
-}
+/// Which consumer an inbound DERP payload belongs to: WireGuard and disco to
+/// the carrier, everything else to a tunnel consumer, by the whole 4-byte
+/// WireGuard header (#2002). Since FR-115 P4a-2 the definition (and its
+/// history) lives in `remote_control::derp_frame`, so the regional PoP
+/// relays read frames by this very function; the path here is unchanged.
+pub use roomler_ai_remote_control::derp_frame::payload_is_wg_or_disco;
+// The disco magic, from the same module; the feature-gated test below
+// asserts it equals `overlay::disco::MAGIC`.
+#[cfg(test)]
+use roomler_ai_remote_control::derp_frame::DISCO_MAGIC;
 
 /// R4 — everything the tunnel driver needs to run the `quic-derp-v1` flavor:
 /// the node's established DERP mux + its own pubkey (hex, as it travels on
