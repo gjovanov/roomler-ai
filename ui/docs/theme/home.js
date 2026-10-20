@@ -136,7 +136,8 @@
             p.price_cents > 0 ? (eur ? '/ €' + n + ' per user / month' : 'per user / month') : 'forever'
           var annualEl = card.querySelector('[data-annual]')
           if (annualEl) {
-            var yUsd = prices.filter(function (x) { return x && x.interval === 'year' && x.currency === 'usd' })[0]
+            // `annualLine` (landing.ts): a free plan never says "or $0 per user per year".
+            var yUsd = p.price_cents > 0 && prices.filter(function (x) { return x && x.interval === 'year' && x.currency === 'usd' })[0]
             var yEur = prices.filter(function (x) { return x && x.interval === 'year' && x.currency === 'eur' })[0]
             if (yUsd && typeof yUsd.unit_amount === 'number') {
               annualEl.textContent =

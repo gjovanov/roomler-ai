@@ -197,7 +197,12 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useTenantStore } from '@/stores/tenant'
 import { api } from '@/api/client'
-import { type Currency, currenciesOnSale as onSaleIn, shownCurrency as pickShownCurrency } from '@/utils/billingCurrency'
+import {
+  type Currency,
+  annualOnSale as annualIn,
+  currenciesOnSale as onSaleIn,
+  shownCurrency as pickShownCurrency,
+} from '@/utils/billingCurrency'
 
 const tenantStore = useTenantStore()
 
@@ -270,9 +275,8 @@ const currentPlan = computed(() => summary.value?.plan || currentTenant.value?.p
 const billing = computed(() => currentTenant.value?.billing || {})
 const subscribed = computed(() => summary.value?.subscribed === true)
 const seatsNow = computed(() => Math.max(1, summary.value?.seats_now ?? 1))
-const annualOnSale = computed(() =>
-  plans.value.some((p) => (p.prices || []).some((x) => x.interval === 'year')),
-)
+/** A PAID plan sells annually here (`utils/billingCurrency`). */
+const annualOnSale = computed(() => annualIn(plans.value))
 /** The currencies on sale here (`stripe.currencies` on the server); the
  * toggle shows only when there is a choice. */
 const currenciesOnSale = computed(() => onSaleIn(plans.value))
