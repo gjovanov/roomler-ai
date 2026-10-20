@@ -829,8 +829,12 @@ async fn handle_tunnel_open(
     // configured (dev / direct-only) — the QUIC path then stays on
     // host/srflx candidates. `user_id` for the HMAC is the session id so
     // both peers derive identical, session-scoped creds.
+    // FR-115 P4b — charged to the tunnel's org, so coturn's statistics name it.
     let quic_ice_servers = roomler_ai_remote_control::turn_creds::ice_servers_for(
-        &tunnel_session_id.to_hex(),
+        &roomler_ai_remote_control::turn_creds::charged(
+            &tunnel_session_id.to_hex(),
+            &orig.tenant_id.to_hex(),
+        ),
         // Region-keyed map; `None` = default region until the agent's
         // relay_home is threaded through (probe reports, PR3).
         state.turn_map.cfg_for(None),

@@ -376,6 +376,7 @@ mod tests {
             enabled: true,
             free_rate_kbps: 1_000,
             paid_rate_kbps: 4_000,
+            turn_attribution: false,
         }
     }
 

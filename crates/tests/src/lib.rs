@@ -260,6 +260,10 @@ mod touch_preset_tests;
 mod transfer_activity_tests;
 #[cfg(test)]
 mod tunnel_tests;
+/// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the
+/// org a charged TURN username names, once per allocation leg.
+#[cfg(test)]
+mod turn_usage_tests;
 #[cfg(test)]
 mod tutorial_tests;
 #[cfg(test)]

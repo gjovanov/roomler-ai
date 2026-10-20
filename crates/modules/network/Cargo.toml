@@ -36,6 +36,8 @@ dashmap.workspace = true
 # Subnet / static-endpoint validation in the overlay ACL and relay routes (not a workspace dep).
 ipnet = "2"
 rand.workspace = true
+# FR-115 P4b — the pattern subscription to coturn's statistics DB.
+redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

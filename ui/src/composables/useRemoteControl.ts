@@ -667,6 +667,18 @@ export function expectedOrgTid(
 }
 
 /**
+ * FR-115 P4b — the TURN pre-fetch path. Naming the device and its org lets
+ * the server charge the relay to the org that pays (it checks that the
+ * caller is a member and the device is live there, and issues uncharged
+ * credentials otherwise). Without both ids, the plain path, as before.
+ */
+export function turnCredsPath(agentId: string, orgTid: string | null): string {
+  const hex = /^[0-9a-f]{24}$/
+  if (!orgTid || !hex.test(orgTid) || !hex.test(agentId)) return '/turn/credentials'
+  return `/turn/credentials?tenant_id=${orgTid}&agent_id=${agentId}`
+}
+
+/**
  * FR-52 P4e — what an EXTERNAL session rests on: the device, named by its
  * connect code (an outsider never learns its internal id), and the login the
  * device verified. Held in memory for one session and zeroed when it ends.
@@ -8876,9 +8888,15 @@ export function useRemoteControl(
     }
 
     // Pull TURN creds before creating the PC so the first gather uses them.
+    // FR-115 P4b — charged to the device's org; an external session names
+    // neither id (its device is a connect code here), so it stays uncharged.
     let iceServers: IceServer[] = []
     try {
-      const creds = await api.get<TurnCredsResponse>('/turn/credentials')
+      const creds = await api.get<TurnCredsResponse>(
+        externalMode
+          ? '/turn/credentials'
+          : turnCredsPath(agentId, expectedOrgTid(orgId, location.pathname)),
+      )
       iceServers = creds.ice_servers
     } catch {
       // Fall back to a public STUN if the server has none configured.

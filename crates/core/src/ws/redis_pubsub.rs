@@ -281,6 +281,17 @@ impl RedisPubSub {
         redis::cmd("GET").arg(key).query_async(&mut conn).await
     }
 
+    /// FR-115 P4b — publish `message` on any `channel` (coturn's statistics
+    /// channels are someone else's; the tests play coturn through this).
+    pub async fn publish_to(&self, channel: &str, message: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("PUBLISH")
+            .arg(channel)
+            .arg(message)
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
     /// FR-115 P4a — remove `key` (absent is fine).
     pub async fn kv_del(&self, key: &str) -> Result<(), redis::RedisError> {
         let mut conn = self.publisher.clone();

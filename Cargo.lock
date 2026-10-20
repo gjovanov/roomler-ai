@@ -9004,6 +9004,7 @@ dependencies = [
  "futures",
  "ipnet",
  "rand 0.9.4",
+ "redis",
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-fleet",

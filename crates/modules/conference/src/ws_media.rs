@@ -277,7 +277,11 @@ async fn handle_media_join(
     //
     // A rejoining participant is already in the map, so `>=` would refuse them
     // their own seat — hence the membership test before the count.
-    if let Ok(room) = state.rooms.base.find_by_id(rid).await
+    let room = state.rooms.base.find_by_id(rid).await.ok();
+    // FR-115 P4b — the org that pays for this meeting's TURN relay, named in
+    // the TURN username below so coturn's statistics name it.
+    let room_org = room.as_ref().map(|r| r.tenant_id);
+    if let Some(room) = room.as_ref()
         && let Ok(tenant) = state.tenants.base.find_by_id(room.tenant_id).await
     {
         let present = state.room_manager.get_participant_user_ids(&rid);
@@ -337,6 +341,15 @@ async fn handle_media_join(
         .as_deref()
         .map(str::trim)
         .filter(|u| !u.is_empty());
+    // FR-115 P4b — the TURN user, charged to the room's org when it is known
+    // (`<expiry>:<user>:org-<org>`), so coturn's statistics name the org that
+    // pays; coturn reads only the expiry part.
+    let turn_user = match room_org {
+        Some(org) => {
+            roomler_ai_remote_control::turn_creds::charged(&user_id.to_hex(), &org.to_hex())
+        }
+        None => user_id.to_hex(),
+    };
     let ice_servers: Vec<serde_json::Value> = if let Some(url) = turn_url_configured {
         let (turn_username, turn_credential) =
             if let Some(ref secret) = state.settings.turn.shared_secret {
@@ -345,7 +358,7 @@ async fn handle_media_join(
                     .unwrap()
                     .as_secs()
                     + 86400;
-                let username = format!("{}:{}", expiry, user_id.to_hex());
+                let username = format!("{}:{}", expiry, turn_user);
                 let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
                     .expect("HMAC key length is valid");
                 mac.update(username.as_bytes());
