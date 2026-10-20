@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog v-model="open" max-width="1100" scrollable>
+  <v-dialog v-model="open" max-width="1100" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center">
         <v-icon icon="mdi-console" color="primary" class="mr-2" />
-        <span>Device console — {{ agentName }}</span>
+        <!-- The span shrinks with an ellipsis (min-width: 0), so the title's own
+             buttons stay on screen: a title never wraps, and a long device name
+             used to push Close or Refresh past the edge on a phone. -->
+        <span class="text-truncate" style="min-width: 0">Device console — {{ agentName }}</span>
         <v-spacer />
         <v-btn icon="mdi-close" size="small" variant="text" @click="close" aria-label="Close" />
       </v-card-title>
@@ -16,12 +19,15 @@
            token if they are an admin), SYSTEM in SystemContext mode — FR-94
            makes SYSTEM the default. An operator should learn that from the
            UI, not from an incident. -->
-      <v-card-subtitle class="pb-0">
+      <!-- In the card text, not a v-card-subtitle: a subtitle never wraps and
+           dims its content, which turned this warning into one clipped grey
+           line ("Commands run with the Roomler d…") at every width. -->
+      <v-card-text :style="fullscreen ? undefined : 'max-height: 70vh'">
         <v-alert
           type="warning"
           variant="tonal"
           density="compact"
-          class="my-2"
+          class="mb-3"
           icon="mdi-shield-alert-outline"
         >
           Commands run with the Roomler daemon's privileges:
@@ -30,9 +36,7 @@
           <strong>SYSTEM</strong> in SystemContext mode.
           Every attempt is recorded in the org's execution audit log.
         </v-alert>
-      </v-card-subtitle>
 
-      <v-card-text style="max-height: 70vh">
         <!-- Explain a closed gate BEFORE the operator types a command and
              watches it get refused. Each gate names its own owner, because
              "ask your org owner" and "turn it on for this device" are
@@ -146,6 +150,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useAgentStore, type Agent, type ExecResult } from '@/stores/agents'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 
 const props = defineProps<{
   modelValue: boolean
@@ -163,7 +169,9 @@ const open = computed({
 })
 
 const agentStore = useAgentStore()
-const agentName = computed(() => props.agent?.name ?? '')
+// The name a person knows the device by (FR-116), as the Devices page shows it.
+const agentName = computed(() => deviceLabel(props.agent))
+const { fullscreen } = useResponsiveDialog()
 
 const command = ref('')
 const shell = ref('')

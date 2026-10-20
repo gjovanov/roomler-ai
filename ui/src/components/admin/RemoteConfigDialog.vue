@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog v-model="open" max-width="760" scrollable>
+  <v-dialog v-model="open" max-width="760" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center">
         <v-icon icon="mdi-cog-transfer-outline" color="primary" class="mr-2" />
-        <span>Device configuration — {{ agent?.name }}</span>
+        <!-- The span shrinks with an ellipsis (min-width: 0), so the title's own
+             buttons stay on screen: a title never wraps, and a long device name
+             used to push Close or Refresh past the edge on a phone. -->
+        <span class="text-truncate" style="min-width: 0">Device configuration — {{ deviceLabel(agent) }}</span>
       </v-card-title>
 
       <v-card-text>
@@ -211,7 +214,9 @@
         </v-alert>
       </v-card-text>
 
-      <v-card-actions>
+      <!-- Wraps: three buttons in one row overflowed a phone to the LEFT
+           (the dialog right-aligns its actions), clipping "Stop managing". -->
+      <v-card-actions class="flex-wrap">
         <v-btn
           v-if="hasRequest"
           variant="text"
@@ -233,6 +238,8 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 import { useAgentStore, type Agent, type DesiredConfig } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { canGrantDeviceExec, canGrantDeviceSsh } from '@/utils/permissions'
@@ -249,6 +256,7 @@ const emit = defineEmits<{
   (e: 'saved'): void
 }>()
 
+const { fullscreen } = useResponsiveDialog()
 const open = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v),
