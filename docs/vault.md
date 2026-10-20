@@ -44,8 +44,9 @@ People use it too.
 > answer; P3-5f-3, the same agent on Windows, on a named pipe (§19);
 > P3-6b-1, the vault's half of `short-lived`: dynamic secrets, their
 > providers, and a lease sealed as one bundle (§20); P3-6b-2a, the
-> daemon's Postgres minter; and P3-6b-2b, its caller: `vault_exec` and
-> `vault_render` serving a dynamic secret (§20).**
+> daemon's Postgres minter; P3-6b-2b, its caller: `vault_exec` and
+> `vault_render` serving a dynamic secret; and P3-6d-1a, a MySQL minter,
+> with no caller yet (§20).**
 > No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
@@ -1494,7 +1495,7 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:264`, `agents/roomlerd/src/vault_proxy/mod.rs:42`, `vault_connect.rs:173`, `vault_connect.rs:211` |
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:264`, `agents/roomlerd/src/vault_proxy/mod.rs:50`, `vault_connect.rs:173`, `vault_connect.rs:211` |
 | its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:826` |
 | the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1046` |
 | the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1089`, `vault_connect.rs:1112`, `vault_connect.rs:1120`, `vault_connect.rs:927`, `vault_connect.rs:969` |
@@ -1546,7 +1547,7 @@ for that long; it never sees the issuer. The design is the spec's §3e "P3-6,
 P3-6b-1 builds the vault's half: dynamic secrets, their providers, and a lease
 sealed as one bundle. P3-6b-2a builds the daemon's first provider, a Postgres
 minter, and P3-6b-2b its caller: `vault_exec` and `vault_render` serve a
-dynamic secret.
+dynamic secret. P3-6d-1a builds a MySQL minter, with no caller yet.
 
 ```mermaid
 sequenceDiagram
@@ -1602,12 +1603,12 @@ sequenceDiagram
 
 | Step | Built |
 |---|---|
-| the issuer | the bundle's `admin_user` and `admin_password`, signed in by SCRAM-SHA-256 over TLS verified against its `ca` (or the system's roots), to its `database`, at the secret's one audience. A bundle that does not parse, or lacks one of those three, is refused before anything is dialled, in words that name no value. The parsed fields are zeroed when they drop, so the parse leaves no copy of the password behind ([`pg_mint.rs:72`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L72)). The sign-in is the proxy's own handshake, with no client behind it ([`pg.rs:310`](../agents/roomlerd/src/vault_proxy/pg.rs#L310)) |
-| the sweep | first, at every mint: each role named `roomler_…`, past its `VALID UNTIL`, whose comment is `roomler lease …`, dropped where the issuer may. That is what a daemon that died before revoking left ([`pg_mint.rs:221`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L221)) |
-| the mint | `CREATE ROLE "roomler_<lease id>" LOGIN PASSWORD '<verifier>' VALID UNTIL '<the lease's end>' IN ROLE <grants>`, and `COMMENT ON ROLE … IS 'roomler lease <lease id>'`, sent as one query and so run as one transaction ([`pg_mint.rs:171`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L171)). The grants are the issuer's `grants` field, one role per line |
+| the issuer | the bundle's `admin_user` and `admin_password`, signed in by SCRAM-SHA-256 over TLS verified against its `ca` (or the system's roots), to its `database`, at the secret's one audience. A bundle that does not parse, or lacks one of those three, is refused before anything is dialled, in words that name no value ([`pg_mint.rs:51`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L51)). Since P3-6d-1a the bundle is opened by one reader every minter shares, whose parsed fields are zeroed when they drop, so the parse leaves no copy of the password behind ([`bundle.rs:29`](../agents/roomlerd/src/vault_proxy/bundle.rs#L29)). The sign-in is the proxy's own handshake, with no client behind it ([`pg.rs:310`](../agents/roomlerd/src/vault_proxy/pg.rs#L310)) |
+| the sweep | first, at every mint: each role named `roomler_…`, past its `VALID UNTIL`, whose comment is `roomler lease …`, dropped where the issuer may. That is what a daemon that died before revoking left ([`pg_mint.rs:173`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L173)) |
+| the mint | `CREATE ROLE "roomler_<lease id>" LOGIN PASSWORD '<verifier>' VALID UNTIL '<the lease's end>' IN ROLE <grants>`, and `COMMENT ON ROLE … IS 'roomler lease <lease id>'`, sent as one query and so run as one transaction ([`pg_mint.rs:123`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L123)). The grants are the issuer's `grants` field, one role per line |
 | the password | 32 random bytes, base64url, one per lease. Postgres is sent its SCRAM-SHA-256 verifier, `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, never the password, so a database that logs its statements logs no password ([`scram.rs:239`](../agents/roomlerd/src/vault_proxy/scram.rs#L239)) |
-| the revocation | the role looked up, and a role already gone is done; `NOLOGIN`; its sessions ended (`pg_terminate_backend`); what it owns in the issuer's database given to the issuer (`REASSIGN OWNED`, then `DROP OWNED`); `DROP ROLE` ([`pg_mint.rs:250`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L250)). Ending its sessions and giving back what it owns are best effort, each refusal logged: `NOLOGIN` has already refused any new session |
-| the names | every name quoted as an identifier, and every value as a literal. A role is dropped only if its name is `roomler_` and 24 hex characters, a lease's id. That is checked before a revocation dials, and again before each drop, which covers whatever the sweep's query returns ([`pg_mint.rs:150`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L150)) |
+| the revocation | the role looked up, and a role already gone is done; `NOLOGIN`; its sessions ended (`pg_terminate_backend`); what it owns in the issuer's database given to the issuer (`REASSIGN OWNED`, then `DROP OWNED`); `DROP ROLE` ([`pg_mint.rs:202`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L202)). Ending its sessions and giving back what it owns are best effort, each refusal logged: `NOLOGIN` has already refused any new session |
+| the names | every name quoted as an identifier, and every value as a literal. A role is dropped only if its name is `roomler_` and 24 hex characters, a lease's id. That is checked before a revocation dials, and again before each drop, which covers whatever the sweep's query returns ([`pg_mint.rs:102`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L102)) |
 
 - ⚠️ **The issuer needs `CREATEROLE`**, and on Postgres 16 and later
   `ADMIN OPTION` on each role in `grants`. Ending a minted role's sessions
@@ -1662,6 +1663,55 @@ sequenceDiagram
   signing in at their `VALID UNTIL`, and the issuer's next mint sweeps them.
   A revocation that fails is logged on the device, not reported to the vault.
 - ⚠️ **`vault_connect` serves no dynamic secret yet.**
+
+### The MySQL minter (P3-6d-1a)
+
+`vault_proxy::mysql_mint` mints a MySQL user for one lease, and takes it back.
+Nothing calls it yet. P3-6d-1b names `mysql` in `vault::providers` and gives
+the minter the lease client as its caller. The design is the spec's §3e "P3-6d,
+MySQL, SQL Server and Redis users, as designed".
+
+```mermaid
+sequenceDiagram
+    participant D as device (roomlerd)
+    participant M as MySQL at the secret's audience
+    M-->>D: the greeting, which must offer TLS, or nothing is sent
+    D->>M: SSLRequest, then TLS against the issuer's ca
+    D->>M: caching_sha2_password as admin_user, to its database
+    D->>M: the ended: roomler_… users whose ATTRIBUTE says their lease is over, each dropped
+    D->>M: CREATE USER roomler_(lease id) AS (its password's form) ATTRIBUTE (its lease, its end)
+    D->>M: each grant, SET DEFAULT ROLE ALL, then CREATE EVENT at its end, DO DROP USER
+    Note over D: the session gets user, password, host, port, database
+    D->>M: at the lease's end: ACCOUNT LOCK, KILL its connections, DROP USER, DROP EVENT
+```
+
+| Step | Built |
+|---|---|
+| the client | MySQL's client protocol, a client of its own (`vault_proxy::mysql`). The server's greeting must offer TLS and the 4.1 protocol, or the client sends it nothing at all. Then an `SSLRequest`, and TLS verified against the issuer's `ca` (or the system's roots), before a byte of the sign-in ([`mysql.rs:241`](../agents/roomlerd/src/vault_proxy/mysql.rs#L241)). The sign-in is `caching_sha2_password`: its scramble, and, from a server that has not cached the account, the password itself inside that TLS. A switch to `sha256_password` is followed inside the TLS too: MySQL answers so for an account under it, and for one that is not there. Any other plugin is refused ([`mysql.rs:305`](../agents/roomlerd/src/vault_proxy/mysql.rs#L305)) |
+| a query | `COM_QUERY`, text rows, the server's error in its own words. At most 1 MiB a packet and 10,000 rows an answer. `CLIENT_LOCAL_FILES` is never offered ([`mysql.rs:44`](../agents/roomlerd/src/vault_proxy/mysql.rs#L44)). A server that asks for a local file anyway is refused and sent nothing ([`mysql.rs:354`](../agents/roomlerd/src/vault_proxy/mysql.rs#L354)) |
+| the issuer | the bundle's `admin_user` and `admin_password`, to its `database`, at the secret's one audience. The bundle is opened by the reader the Postgres minter uses: refused before anything is dialled when it does not parse or lacks a field no mint can do without, and zeroed when it drops ([`bundle.rs:43`](../agents/roomlerd/src/vault_proxy/bundle.rs#L43)). The `database` and each grant must be names the minter quotes: no quote, backtick, backslash or control character ([`mysql_mint.rs:53`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L53)) |
+| the sweep | first, at every mint: each `roomler_…` user whose `ATTRIBUTE` says its lease has ended, dropped where the issuer may ([`mysql_mint.rs:190`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L190)). That covers an event that never ran: the scheduler off, or an end already past when the mint ran |
+| the mint | `CREATE USER 'roomler_<lease id>'@'%' IDENTIFIED WITH caching_sha2_password AS '<form>' ATTRIBUTE '{"roomler": {"lease": "<id>", "until": <end>}}'` ([`mysql_mint.rs:147`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L147)). Then each of the issuer's `grants` (`role` or `role@host`, one per line) as its own `GRANT`, and `SET DEFAULT ROLE ALL`. Then its end, in the issuer's database: `CREATE EVENT … ON SCHEDULE AT FROM_UNIXTIME(<end>) ON COMPLETION NOT PRESERVE DO DROP USER IF EXISTS …` ([`mysql_mint.rs:166`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L166)). The end is a count of seconds (`FROM_UNIXTIME`), so it names the same instant whatever the server's time zone |
+| a step refused | MySQL commits each statement as it runs. A grant or the event refused takes the user back at once, and the mint is refused in MySQL's words: no user is left without its end ([`mysql_mint.rs:116`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L116)) |
+| the password | 32 random bytes, base64url, one per lease. MySQL is sent its `caching_sha2_password` form, never the password: `$A$005$`, a 20-character salt, and the SHA-256 crypt digest at 5,000 rounds, which is what MySQL keeps ([`sha_crypt.rs:136`](../agents/roomlerd/src/vault_proxy/sha_crypt.rs#L136)). The salt is drawn from crypt's own alphabet, so the form holds nothing a SQL literal must escape ([`sha_crypt.rs:126`](../agents/roomlerd/src/vault_proxy/sha_crypt.rs#L126)) |
+| the revocation | the user looked up, and a user already gone is done, its event dropped all the same. Otherwise `ACCOUNT LOCK`; its connections listed and ended where the issuer may (`KILL`, sent only for a thread id of digits); `DROP USER`; `DROP EVENT` ([`mysql_mint.rs:217`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L217)). Ending its connections is best effort, each refusal logged: the lock has already refused any new sign-in |
+| the names | a user is dropped only if its name is `roomler_` and 24 hex characters, a lease's id: the Postgres minter's rule, and its code ([`pg_mint.rs:102`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L102)). That is checked before a revocation dials ([`mysql_mint.rs:179`](../agents/roomlerd/src/vault_proxy/mysql_mint.rs#L179)), and again before each drop, whatever the sweep's query returns |
+
+- ⚠️ **The issuer needs** `CREATE USER`, `EVENT` on its database, and each
+  role in `grants` granted to it `WITH ADMIN OPTION`. To end a minted user's
+  connections it also needs `PROCESS` (to see them) and `CONNECTION_ADMIN` (to
+  end them). Without those two, a revocation still drops the user, but a
+  connection open at that moment runs until it closes.
+- ⚠️ **The end is the event's, and only where the scheduler runs**
+  (`event_scheduler`, on by default in MySQL 8). MySQL keeps no end of its own
+  for an account: a password's expiry counts in days, and a client that signs
+  in with an expired password may set a new one. With the scheduler off, a
+  user whose daemon died before revoking signs in until the issuer's next mint
+  sweeps it.
+- ⚠️ **`mysql_native_password` is refused.** Its proof is SHA-1, and MySQL 8.4
+  turns it off by default. An issuer account under it cannot mint.
+- ⚠️ **MySQL 8.0.21 or later.** `ATTRIBUTE`, the sweep's mark, arrived in
+  8.0.21. Tested against MySQL 8.4.11.
 
 ## 21. Audit
 
@@ -1736,5 +1786,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; MySQL, SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
+| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; the MySQL minter's caller (P3-6d-1b); SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

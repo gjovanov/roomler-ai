@@ -20,17 +20,15 @@
 //! ([`ROLE_PREFIX`] and a lease's id): a revocation can take back what this
 //! module made, and nothing else.
 
-use std::collections::BTreeMap;
-
 use base64::Engine;
-use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tracing::warn;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
+use super::bundle::Opened;
 use super::pg::{self, Upstream};
-use super::{scram, tls};
+use super::scram;
 
 /// What every minted role's name begins with.
 pub(crate) const ROLE_PREFIX: &str = "roomler_";
@@ -45,66 +43,20 @@ pub(crate) struct Issuer {
     pub(crate) grants: Vec<String>,
 }
 
-/// A bundle as the vault seals it (`crates/modules/vault/src/dynamic.rs`).
-#[derive(Deserialize)]
-struct Bundle {
-    audience: String,
-    fields: Fields,
-}
-
-/// A bundle's fields, as parsed: each value zeroed when they drop, so the
-/// parse leaves no copy of the issuer's password behind.
-#[derive(Deserialize)]
-#[serde(transparent)]
-struct Fields(BTreeMap<String, String>);
-
-impl Drop for Fields {
-    fn drop(&mut self) {
-        self.0.values_mut().for_each(Zeroize::zeroize);
-    }
-}
-
 impl Issuer {
-    /// The issuer in a lease's `bundle`, its audience read by `upstream_of`
-    /// (the endpoint's own spelling of `host:port`). Err, in words that name
-    /// no value, for a bundle that does not parse or lacks a field no mint
-    /// can do without.
+    /// The issuer in a lease's `bundle` (`super::bundle`), its audience read
+    /// by `upstream_of` (the endpoint's own spelling of `host:port`). Err, in
+    /// words that name no value, for a bundle that does not parse or lacks a
+    /// field no mint can do without.
     pub(crate) fn from_bundle(
         bundle: &[u8],
         upstream_of: impl Fn(&str) -> Result<(String, u16), String>,
     ) -> Result<Self, String> {
-        let Bundle { audience, fields } =
-            serde_json::from_slice(bundle).map_err(|_| "the bundle does not parse".to_string())?;
-        let field = |name: &str| {
-            fields
-                .0
-                .get(name)
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| format!("the issuer has no {name}"))
-        };
-        let (host, port) = upstream_of(&audience)?;
-        let ca = fields.0.get("ca").filter(|v| !v.is_empty());
-        let (user, with) = (field("admin_user")?, field("admin_password")?);
+        let opened = Opened::open(bundle)?;
         Ok(Self {
-            up: Upstream {
-                host,
-                port,
-                user: user.clone(),
-                password: Zeroizing::new(with.clone()),
-                tls: tls::connector_for(tls::roots(ca.map(String::as_str))?, None)?,
-            },
-            database: field("database")?.clone(),
-            grants: fields
-                .0
-                .get("grants")
-                .map(|g| {
-                    g.lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            up: opened.upstream(upstream_of)?,
+            database: opened.required("database")?.clone(),
+            grants: opened.lines("grants"),
         })
     }
 }
@@ -146,8 +98,8 @@ pub(crate) fn role_for(lease_id: &str) -> Result<String, String> {
 }
 
 /// Whether `role` is a name a mint made: Err for any other, which nothing
-/// here ever drops.
-fn minted(role: &str) -> Result<(), String> {
+/// here ever drops. Shared with `mysql_mint`, whose users are named the same.
+pub(crate) fn minted(role: &str) -> Result<(), String> {
     let lease = role
         .strip_prefix(ROLE_PREFIX)
         .ok_or("only a minted role is ever dropped")?;
