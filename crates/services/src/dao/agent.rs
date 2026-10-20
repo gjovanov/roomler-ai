@@ -470,6 +470,7 @@ impl AgentDao {
         peer_auth_key: &str,
         arch: &str,
         arch_emulated: bool,
+        conn_id: &str,
     ) -> DaoResult<bool> {
         let displays_bson = bson::to_bson(displays).unwrap_or(bson::Bson::Array(vec![]));
         let caps_bson = bson::to_bson(capabilities).unwrap_or(bson::Bson::Null);
@@ -494,6 +495,10 @@ impl AgentDao {
             "peer_auth_key": peer_auth_key,
             "status": bson::to_bson(&AgentStatus::Online).unwrap(),
             "last_seen_at": DateTime::now(),
+            // #2552 — the connection that wrote this hello: its teardown
+            // writes `Offline` only while the row still names it
+            // ([`Self::mark_offline_if_conn`]).
+            "conn_id": conn_id,
         };
         // FR-97 P0d — the hardware does not change, so only a hello that
         // reports it writes it: a rollback to an agent predating the field
@@ -503,6 +508,31 @@ impl AgentDao {
             set.insert("arch_emulated", arch_emulated);
         }
         self.base.update_by_id(agent_id, doc! { "$set": set }).await
+    }
+
+    /// #2552 — a connection's teardown: `Offline`, but only while the row
+    /// still names `conn_id`, the connection that wrote its hello. A newer
+    /// hello (a fast reconnect, on this pod or another) has written its own
+    /// `conn_id`, so this late write matches nothing and the row stays
+    /// `Online`, in whichever order the two writes land. Answers whether it
+    /// wrote.
+    ///
+    /// ⚠️ A row this connection's hello never reached (that write is best
+    /// effort) names some other `conn_id`, or none, and is left as it is:
+    /// the presence sweep heals it from the heartbeat, as it heals the row a
+    /// hard-killed pod leaves `Online`.
+    pub async fn mark_offline_if_conn(&self, agent_id: ObjectId, conn_id: &str) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "conn_id": conn_id },
+                doc! {
+                    "$set": {
+                        "status": bson::to_bson(&AgentStatus::Offline).unwrap(),
+                        "last_seen_at": DateTime::now(),
+                    }
+                },
+            )
+            .await
     }
 
     pub async fn mark_status(&self, agent_id: ObjectId, status: AgentStatus) -> DaoResult<bool> {
