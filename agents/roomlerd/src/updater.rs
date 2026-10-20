@@ -914,13 +914,7 @@ pub fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     // not ours) and dpkg it. Match the arch token the release filenames
     // already carry (`…-x86_64-unknown-linux-gnu.deb`), keeping the
     // legacy `_amd64.deb` cargo-deb spelling for old releases.
-    let arch_tokens: &[&str] = if cfg!(target_arch = "x86_64") {
-        &["x86_64", "amd64"]
-    } else if cfg!(target_arch = "aarch64") {
-        &["aarch64", "arm64"]
-    } else {
-        &[]
-    };
+    let arch_tokens = linux_arch_tokens();
     if mac {
         return assets
             .iter()
@@ -930,6 +924,22 @@ pub fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
         return None;
     }
     pick_linux_asset(assets, arch_tokens, host_has_debian_tooling())
+}
+
+/// The arch tokens a Linux release asset's name carries for THIS build's
+/// architecture (`…-x86_64-unknown-linux-gnu.deb`, plus cargo-deb's legacy
+/// `_amd64.deb`). Empty for an architecture no release ships. One list for the
+/// daemon's picker and FR-117's companion picker, so the two cannot drift.
+#[cfg(any(not(target_os = "windows"), test))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn linux_arch_tokens() -> &'static [&'static str] {
+    if cfg!(target_arch = "x86_64") {
+        &["x86_64", "amd64"]
+    } else if cfg!(target_arch = "aarch64") {
+        &["aarch64", "arm64"]
+    } else {
+        &[]
+    }
 }
 
 /// Is there anything on this host that can install a `.deb`?
@@ -1412,7 +1422,7 @@ fn is_staging_dir(dir: &std::path::Path) -> bool {
 /// in a directory only we own (Linux: 0755 and caller-owned; Windows: SYSTEM
 /// is the caller, or the per-user `%TEMP%` already keeps everyone else out).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn discard_staging(installer_path: &std::path::Path) {
+pub(crate) fn discard_staging(installer_path: &std::path::Path) {
     let Some(dir) = installer_path.parent() else {
         return;
     };
@@ -3109,6 +3119,22 @@ pub async fn run_periodic(
                     "auto-updater: the root update helper (roomler-update.service) owns updates \
                      on this host — forwarding rc:agent.update to its wake file, installing nothing here"
                 );
+                // FR-117 P1 — the helper moves the companion package too, but on
+                // its own timer. A skew this daemon can see (it reads the package
+                // database as well) wakes it now: the restart after the helper
+                // installed this very binary is exactly that moment.
+                if crate::companion::package_needs_sync() {
+                    match queue_update_check() {
+                        Ok(()) => tracing::info!(
+                            "auto-updater: the desktop companion is behind this daemon; woke the \
+                             root update helper to move it"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "auto-updater: could not wake the root update helper for the companion"
+                        ),
+                    }
+                }
                 return forward_triggers(shutdown, trigger_rx).await;
             }
             // FR-96 P5 — the helper is off, and nothing this daemon spawns can
@@ -3165,6 +3191,10 @@ pub async fn run_periodic(
                 cooldown_secs = STARTUP_UPDATE_COOLDOWN.as_secs(),
                 "auto-updater: at-startup check suppressed by recent-install cooldown"
             );
+            // FR-117 P1 — a daemon that just updated itself moves the companion
+            // NOW, not after the full interval this cooldown makes it sleep.
+            #[cfg(target_os = "linux")]
+            crate::companion::sync_package().await;
         }
         // Last-iteration's defer (if any) shortens the sleep — the hour
         // for transfers, [`NET_DEFER_RECHECK`] for a network transition —
@@ -3212,6 +3242,13 @@ pub async fn run_periodic(
                 Some(tag) => pin_version(&tag).await,
                 None => check_once().await,
             };
+            // FR-117 P1 — an operator's update moves the companion too: on a
+            // device whose daemon is already current, the companion lagging
+            // behind it is all there is to update.
+            #[cfg(target_os = "linux")]
+            if !matches!(outcome, CheckOutcome::UpdateReady { .. }) {
+                crate::companion::sync_package().await;
+            }
             let retry = recheck_after(&outcome, &mut transport_failures, interval);
             // FR-90 P1d-1 — even a pushed update waits for running agent
             // turns (bounded): a person asked for the update, not for their
@@ -3273,6 +3310,15 @@ pub async fn run_periodic(
         }
 
         let outcome = check_once().await;
+        // FR-117 P1 — the companion package follows this daemon. Here, in the
+        // loop that runs the daemon's own install and never beside it, so two
+        // package-manager runs of ours can never contend for dpkg's lock. Not
+        // when an update is about to install: this daemon is on its way out,
+        // and the next one moves the companion to ITS version at its start.
+        #[cfg(target_os = "linux")]
+        if !matches!(outcome, CheckOutcome::UpdateReady { .. }) {
+            crate::companion::sync_package().await;
+        }
         let retry = recheck_after(&outcome, &mut transport_failures, interval);
         // FR-90 P1d-1 — AC7: the installer waits for running agent turns.
         if matches!(outcome, CheckOutcome::UpdateReady { .. })
@@ -3830,6 +3876,15 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
         tracing::info!(marker = %marker, "auto-update opted out — exiting");
         return Ok(());
     }
+
+    // FR-117 P1 — the companion package follows the INSTALLED daemon, which is
+    // this binary (the unit runs /usr/bin/roomlerd). Before the install
+    // cooldown, which guards the DAEMON's install: the run a per-user daemon's
+    // restart wakes right after an update is exactly the one that must move
+    // the companion, and it always falls inside that cooldown. If this run then
+    // installs a newer daemon, that daemon's restart wakes the next run.
+    #[cfg(target_os = "linux")]
+    crate::companion::sync_package().await;
 
     if recent_update_attempt(STARTUP_UPDATE_COOLDOWN) {
         tracing::info!(
