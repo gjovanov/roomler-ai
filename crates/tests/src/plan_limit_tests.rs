@@ -548,3 +548,104 @@ async fn the_member_cap_gates_the_admin_add_path() {
         "refusal must name the real counts, got: {body}"
     );
 }
+
+// ── Self-hosting: no plans sold, no limits held ─────────────────────
+
+/// FR-115 — a server without the hosted `saas` module sells no plans, so no
+/// org on it is held to one: the self-hosted image is built that way, and
+/// self-hosting is free and unlimited. A Free org in the strictest mode, at
+/// every cap, still enrolls its 101st device, adds its 11th member and stores
+/// past 1 GiB. The control is every other test in this file, where the same
+/// org on a server that sells plans is refused at each one.
+#[tokio::test]
+async fn a_server_that_sells_no_plans_holds_no_org_to_one() {
+    let app = TestApp::spawn_with_settings(|s| s.modules.saas = false).await;
+    let t = app.seed_tenant("planselfhost").await;
+    set_plan(&app, &t.tenant_id, "free", "enforce").await;
+
+    // Devices (established): 100 seeded, the 101st enrolls.
+    let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
+    let now = bson::DateTime::now();
+    let docs: Vec<bson::Document> = (0..100)
+        .map(|i| {
+            doc! {
+                "tenant_id": tid,
+                "machine_id": format!("selfhost-machine-{i}"),
+                "name": format!("selfhost-{i}"),
+                "created_at": now,
+                "updated_at": now,
+                "deleted_at": Bson::Null,
+            }
+        })
+        .collect();
+    app.db
+        .collection::<bson::Document>("agents")
+        .insert_many(docs)
+        .await
+        .expect("agent seed failed");
+    let tok: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let r = app
+        .client
+        .post(app.url("/api/agent/enroll"))
+        .json(&serde_json::json!({
+            "enrollment_token": tok["enrollment_token"].as_str().expect("no token"),
+            "machine_id": "selfhost-machine-101",
+            "machine_name": "the 101st",
+            "os": "linux",
+            "agent_version": "0.0.0",
+        }))
+        .send()
+        .await
+        .expect("enroll request failed");
+    assert!(
+        r.status().is_success(),
+        "a self-hosted org enrolls past Free's 100 devices, got {}",
+        r.status()
+    );
+
+    // Members (established): 10 seeded, the 11th joins.
+    fill_members(&app, &t.tenant_id, 10).await;
+    let outsider = app
+        .register_user(
+            "outsider@planselfhost.test",
+            "planselfhost_outsider",
+            "Outsider",
+            "Outsider123!",
+            None,
+            None,
+        )
+        .await;
+    let r = app
+        .auth_post(
+            &format!("/api/tenant/{}/member", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&serde_json::json!({ "user_id": outsider.id }))
+        .send()
+        .await
+        .expect("add member failed");
+    assert!(
+        r.status().is_success(),
+        "a self-hosted org adds its 11th member, got {}",
+        r.status()
+    );
+
+    // Storage (staged, under enforce): past 1 GiB, the upload lands.
+    fill_storage(&app, &t.tenant_id, 1024 * 1024 * 1024, 5).await;
+    let r = upload_small_file(&app, &t).await;
+    assert!(
+        r.status().is_success(),
+        "a self-hosted org stores past Free's 1 GiB, got {}",
+        r.status()
+    );
+}

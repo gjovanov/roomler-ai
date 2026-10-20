@@ -118,4 +118,11 @@ pub struct Core {
     /// per-connection lifecycles the modules register for `/ws?role=agent`,
     /// dispatched by `fleet` (the socket's owner) per `ClientMsg::namespace()`.
     pub agent_socket: crate::agent_socket::AgentSocketRegistry,
+    /// FR-115 — this server sells plans: the hosted `saas` module is compiled
+    /// in and mounted. Every plan limit binds only then. A self-hosted server
+    /// (built without `saas`, as the published image and the compose build
+    /// both are) holds every org to no limit at all: self-hosting is free and
+    /// unlimited, and an org there is `free` only because nobody sold it
+    /// anything. Set once, by the host.
+    pub plans_sold: bool,
 }

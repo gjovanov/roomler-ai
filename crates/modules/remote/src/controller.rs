@@ -693,8 +693,9 @@ pub async fn resolve_session_authz(
     // FR-115 P3 — the org's concurrent-session cap, from its plan and billed
     // seats; the hub that owns the device counts against it. A row we could
     // not see is no cap (never refuse on a guess), and `rc.org_session_cap`
-    // is the kill switch.
-    let org_session_cap = if state.settings.rc.org_session_cap {
+    // is the kill switch. A server that sells no plans caps nobody
+    // (`Core::plans_sold`: self-hosting is unlimited).
+    let org_session_cap = if state.settings.rc.org_session_cap && state.plans_sold {
         tenant.as_ref().and_then(org_session_cap_of)
     } else {
         None
