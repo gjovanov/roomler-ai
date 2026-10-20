@@ -58,7 +58,7 @@ curl -sI https://roomler.ai/api/setup/macos   → 404
 ```
 
 The agent lane is at `agent-v0.4.102`. The resolver is correct — it serves the newest
-`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:377-398`); nothing has
+`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:418-439`); nothing has
 cut one since 0.4.48, which shipped without macOS (`skip_macos`, before Apple signing).
 
 ## The mechanism, in the code (master `d5db02c0f`)

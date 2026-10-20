@@ -33,7 +33,7 @@ Asahi tarball install.
 **Root cause.** `companion::refresh_if_stale` (`agents/roomlerd/src/companion.rs:881`) is Windows-only "by design".
 Its premise (`companion.rs:888-899`) is that on Linux "the companion is its own `roomler-desktop` .deb that apt
 upgrades". That is false: there is no apt or dnf repository. `install.sh` installs the companion once, from a release
-asset (`desktop_install`, `scripts/install.sh:788`), and the daemon's updater picks only the daemon's own asset
+asset (`desktop_install`, `scripts/install.sh:804`), and the daemon's updater picks only the daemon's own asset
 (`is_daemon_asset`, `updater.rs:978`, on purpose: FR-27's companion-as-daemon freeze). So the companion package moves
 only when a person re-runs the installer. The dashboard has shown the skew since FR-27 (`companion_version`), and
 until today the fleet had none to show.
@@ -74,7 +74,7 @@ flowchart TD
     the daemon (#2055).
   - **Install:** the host's own package manager, so it stays the source of truth. `apt-get install -y` (then
     `dpkg --install`) for a `.deb`; `dnf`, `zypper` or `yum` for an `.rpm`, in `install.sh`'s order
-    (`desktop_rpm_tool`, `scripts/install.sh:777`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
+    (`desktop_rpm_tool`, `scripts/install.sh:793`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through

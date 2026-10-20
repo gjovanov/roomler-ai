@@ -148,8 +148,12 @@ pub async fn setup_installer_proxy(
 /// Pick the unified-wizard asset for a platform. Asset naming follows
 /// the release-setup.yml matrix with the `roomler-setup-` prefix:
 ///   - linux-x86_64 — `roomler-setup-*-x86_64-unknown-linux-gnu.tar.gz`
+///   - linux-aarch64 — `roomler-setup-*-aarch64-unknown-linux-gnu.tar.gz` (FR-97 P7b)
 ///   - macos — `roomler-setup-*-universal-apple-darwin.tar.gz`
 ///   - windows-x86_64 — `roomler-setup-*-x86_64-pc-windows-msvc.zip`
+///
+/// Each arm names its own target triple, so neither Linux arm can take the
+/// other's tarball whatever order GitHub lists them in.
 pub fn pick_setup_asset<'a>(
     assets: &'a [AgentReleaseAsset],
     platform: &str,
@@ -165,6 +169,9 @@ pub fn pick_setup_asset<'a>(
         match platform {
             "linux-x86_64" => {
                 name.contains("x86_64-unknown-linux-gnu") && name.ends_with(".tar.gz")
+            }
+            "linux-aarch64" => {
+                name.contains("aarch64-unknown-linux-gnu") && name.ends_with(".tar.gz")
             }
             "macos" => name.contains("universal-apple-darwin") && name.ends_with(".tar.gz"),
             "windows-x86_64" => name.contains("x86_64-pc-windows-msvc") && name.ends_with(".zip"),
@@ -391,11 +398,16 @@ fn content_type_for(filename: &str) -> &'static str {
 
 fn normalise_platform(s: &str) -> Result<&'static str, ApiError> {
     match s.to_ascii_lowercase().as_str() {
+        // The bare `linux` stays x86_64: every link handed out before FR-97
+        // P7b says `/api/setup/linux` and means that one.
         "linux-x86_64" | "linux" | "linux-tar" => Ok("linux-x86_64"),
+        // FR-97 P7b — what an aarch64 wizard names itself
+        // (`roomler_setup_core::asset_resolver::current_platform`).
+        "linux-aarch64" | "linux-arm64" => Ok("linux-aarch64"),
         "macos" | "macos-universal" | "darwin" => Ok("macos"),
         "windows-x86_64" | "windows" | "win" => Ok("windows-x86_64"),
         other => Err(ApiError::BadRequest(format!(
-            "unknown platform {other:?}; expected one of linux-x86_64 / macos / windows-x86_64"
+            "unknown platform {other:?}; expected one of linux-x86_64 / linux-aarch64 / macos / windows-x86_64"
         ))),
     }
 }
@@ -453,8 +465,35 @@ mod tests {
     fn normalise_platform_accepts_aliases() {
         assert_eq!(normalise_platform("linux").unwrap(), "linux-x86_64");
         assert_eq!(normalise_platform("LINUX-X86_64").unwrap(), "linux-x86_64");
+        assert_eq!(
+            normalise_platform("linux-aarch64").unwrap(),
+            "linux-aarch64"
+        );
+        assert_eq!(normalise_platform("Linux-ARM64").unwrap(), "linux-aarch64");
         assert_eq!(normalise_platform("Darwin").unwrap(), "macos");
         assert_eq!(normalise_platform("WIN").unwrap(), "windows-x86_64");
+    }
+
+    /// FR-97 P7b — the two Linux tarballs never stand in for each other, in
+    /// either listing order (GitHub's order is the upload order, which this
+    /// code does not control).
+    #[test]
+    fn pick_setup_asset_keeps_the_linux_arches_apart() {
+        let x86 = "roomler-setup-0.4.148-x86_64-unknown-linux-gnu.tar.gz";
+        let arm = "roomler-setup-0.4.148-aarch64-unknown-linux-gnu.tar.gz";
+        for order in [[arm, x86], [x86, arm]] {
+            let assets: Vec<_> = order.iter().map(|n| asset(n)).collect();
+            assert_eq!(pick_setup_asset(&assets, "linux-x86_64").unwrap().name, x86);
+            assert_eq!(
+                pick_setup_asset(&assets, "linux-aarch64").unwrap().name,
+                arm
+            );
+        }
+        // A release from before P7b has no aarch64 wizard: a clean 404, never
+        // the x86_64 tarball.
+        let before = vec![asset(x86)];
+        assert!(pick_setup_asset(&before, "linux-aarch64").is_none());
+        assert!(pick_setup_asset(&[asset(arm)], "linux-x86_64").is_none());
     }
 
     #[test]
