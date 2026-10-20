@@ -83,13 +83,17 @@ interface RemoteStream {
  * Order is deliberate: a screen share is the reason everyone is looking, an
  * explicit pin is the operator overriding us, a 1:1 wants one big tile, and
  * everything else is a grid.
+ *
+ * FR-116 — `narrow` (below 960 px): a share goes to spotlight, not sidebar.
+ * The sidebar's 280 px strip left the shared screen ~72 px wide on a phone;
+ * spotlight's filmstrip scrolls and the share gets the width.
  */
 export function resolveEffectiveMode(
   mode: LayoutMode,
-  ctx: { hasScreenShare: boolean; pinnedCount: number; participantCount: number },
+  ctx: { hasScreenShare: boolean; pinnedCount: number; participantCount: number; narrow?: boolean },
 ): 'tiled' | 'spotlight' | 'sidebar' {
   if (mode !== 'auto') return mode
-  if (ctx.hasScreenShare) return 'sidebar'
+  if (ctx.hasScreenShare) return ctx.narrow ? 'spotlight' : 'sidebar'
   if (ctx.pinnedCount > 0) return 'spotlight'
   if (ctx.participantCount <= 2) return 'spotlight'
   return 'tiled'
@@ -131,6 +135,10 @@ export function useConferenceLayout(
   remotePaused?: {
     video?: Map<string, boolean>
     audio?: Map<string, boolean>
+    /** FR-116 — the viewport is narrow (below 960 px): Auto spotlights a
+     *  screen share instead of the sidebar layout. Rides this options object
+     *  for the reason above. */
+    narrow?: Ref<boolean>
   },
 ) {
   const prefs = ref<LayoutPreferences>(loadPrefs())
@@ -283,6 +291,7 @@ export function useConferenceLayout(
       hasScreenShare: hasScreenShare.value,
       pinnedCount: pinnedParticipants.value.length,
       participantCount: sorted.length,
+      narrow: remotePaused?.narrow?.value === true,
     })
 
     // Split into primary/secondary based on effective mode

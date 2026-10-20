@@ -136,9 +136,11 @@ function stopDrag() {
   background: #000;
 }
 
+/* FR-116 — at most 30% of the call's width: a fixed 200 px covered over
+   half of a phone's video. */
 .floating-self-view {
   position: absolute;
-  width: 200px;
+  width: clamp(96px, 30%, 200px);
   z-index: 10;
   cursor: grab;
   border-radius: 8px;
