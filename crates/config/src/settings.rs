@@ -64,6 +64,9 @@ pub struct Settings {
     /// FR-115 P5 — the plan's meeting-length cap. Absent ⇒ on.
     #[serde(default)]
     pub meetings: MeetingsSettings,
+    /// FR-115 P4a — the relay allowance on DERP. Absent ⇒ off.
+    #[serde(default)]
+    pub relay_allowance: RelayAllowanceSettings,
 }
 
 /// FR-90 P3-1 — `[vault]`, env `ROOMLER__VAULT__*`.
@@ -309,6 +312,45 @@ impl Default for MeetingsSettings {
     fn default() -> Self {
         Self {
             free_cap: meetings_default_on(),
+        }
+    }
+}
+
+/// FR-115 P4a — `[relay_allowance]`, env `ROOMLER__RELAY_ALLOWANCE__*`: an
+/// org past its plan's monthly relay allowance keeps its DERP floor, at a
+/// throttled rate for bulk frames only (a WireGuard handshake and disco are
+/// never held back). Default **off**: it ships dark, and is switched on
+/// after the fleet measurement O3 asks for.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RelayAllowanceSettings {
+    /// The kill switch. `false`: no over-allowance set is published, and
+    /// every pod drops the one it holds within a refresh period.
+    /// Env: `ROOMLER__RELAY_ALLOWANCE__ENABLED`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The throttled rate for a Free org over its allowance, in kbit/s, per
+    /// network (the org's mesh). Env: `ROOMLER__RELAY_ALLOWANCE__FREE_RATE_KBPS`.
+    #[serde(default = "relay_allowance_free_rate_kbps")]
+    pub free_rate_kbps: u32,
+    /// The same for a paid plan. Env: `ROOMLER__RELAY_ALLOWANCE__PAID_RATE_KBPS`.
+    #[serde(default = "relay_allowance_paid_rate_kbps")]
+    pub paid_rate_kbps: u32,
+}
+
+fn relay_allowance_free_rate_kbps() -> u32 {
+    1_000
+}
+
+fn relay_allowance_paid_rate_kbps() -> u32 {
+    4_000
+}
+
+impl Default for RelayAllowanceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            free_rate_kbps: relay_allowance_free_rate_kbps(),
+            paid_rate_kbps: relay_allowance_paid_rate_kbps(),
         }
     }
 }

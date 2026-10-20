@@ -109,6 +109,10 @@ static TUNNEL_BUCKETS: LazyLock<DashMap<DerpKey, std::sync::Mutex<(f64, Instant)
     LazyLock::new(DashMap::new);
 const TUNNEL_RATE_BYTES_PER_SEC: f64 = 375_000.0; // ~3 Mbit/s sustained
 const TUNNEL_BURST_BYTES: f64 = 1_048_576.0; // 1 MiB burst
+/// FR-115 P4a — bulk frames dropped by the relay allowance (an org past its
+/// plan's monthly relay, `crate::relay_allowance`), and their paced log.
+static DERP_ALLOWANCE_SHAPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ALLOWANCE_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
 /// Debit `len` bytes from the (network, src) tunnel bucket; `false` = over
 /// budget, drop the frame (QUIC retransmits under its congestion control,
 /// which converges onto the sustained rate).
@@ -609,6 +613,26 @@ fn forward_frame(
         );
         return;
     }
+    // FR-115 P4a — the relay allowance. A network whose org is past its
+    // plan's monthly relay has its BULK frames held to its rate; a WireGuard
+    // handshake and disco always pass, so the floor still connects. While no
+    // network is over, this is one relaxed atomic load.
+    if let Some(rate) = crate::relay_allowance::rate_of(&network_id)
+        && crate::relay_allowance::frame_is_bulk(payload)
+        && !crate::relay_allowance::permits(network_id, frame.len(), rate)
+    {
+        let total = DERP_ALLOWANCE_SHAPED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if drop_log_due(&ALLOWANCE_LOG_AT, (network_id, *src_pubkey)) {
+            info!(
+                %network_id,
+                src = %pk8(src_pubkey),
+                rate_bytes_per_sec = rate,
+                derp_allowance_shaped_total = total,
+                "derp: bulk frame dropped by the relay allowance (the org is past its plan's monthly relay)"
+            );
+        }
+        return;
+    }
     // R4 — shape tunnel-class payloads (see the bucket's doc); WG + disco
     // frames pass untouched.
     if !tunnel_core::transport::derp::payload_is_wg_or_disco(payload)
@@ -686,6 +710,65 @@ fn forward_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-115 P4a (AC7): over the relay allowance, a BULK frame past the
+    /// bucket is dropped and billed nothing, while a WireGuard handshake on
+    /// the same network still passes and is billed as carried. This is
+    /// FR-20's rule, that only carried bytes are billed, applied to the new
+    /// drop.
+    #[test]
+    fn the_allowance_holds_bulk_and_passes_the_handshake() {
+        let _map = crate::relay_allowance::TEST_MAP_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let network = ObjectId::new();
+        let (src, dst) = ([1u8; 32], [2u8; 32]);
+        let registry: crate::derp_types::DerpRegistry = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel(1024);
+        registry.insert((network, dst), tx);
+        let acl: DerpAclCache = Arc::new(DashMap::new());
+        let frame = |head: [u8; 4], body: usize| {
+            let mut f = dst.to_vec();
+            f.extend_from_slice(&head);
+            f.extend(std::iter::repeat_n(0u8, body));
+            f
+        };
+        let bulk = frame([4, 0, 0, 0], 1200);
+        let hello = frame([1, 0, 0, 0], 144);
+        let billed = || {
+            DERP_NETWORK_BYTES
+                .get(&network)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+
+        forward_frame(&registry, &acl, network, &src, &bulk);
+        assert!(rx.try_recv().is_ok(), "inside the allowance, bulk passes");
+
+        // Over, at 1 B/s: the bucket's 64 KiB minimum burst lets ~53 of
+        // these through, and then holds.
+        crate::relay_allowance::apply(std::collections::HashMap::from([(network, 1)]));
+        let mut passed = 0;
+        for _ in 0..200 {
+            forward_frame(&registry, &acl, network, &src, &bulk);
+            if rx.try_recv().is_ok() {
+                passed += 1;
+            }
+        }
+        assert!(
+            (40..=60).contains(&passed),
+            "the burst passes, then the bucket holds: {passed}"
+        );
+        let before = billed();
+        forward_frame(&registry, &acl, network, &src, &bulk);
+        assert!(rx.try_recv().is_err(), "past the bucket, bulk is dropped");
+        assert_eq!(billed(), before, "a dropped frame is billed nothing");
+
+        forward_frame(&registry, &acl, network, &src, &hello);
+        assert!(rx.try_recv().is_ok(), "the handshake is never held back");
+        assert_eq!(billed(), before + 32 + 148, "and it is billed as carried");
+        crate::relay_allowance::apply(std::collections::HashMap::new());
+    }
     /// FR-20 acceptance: *"measured DERP forward-path overhead is within noise
     /// of the pre-change baseline"*. `#[ignore]`d — it is a measurement, not a
     /// pass/fail assertion, and its numbers are machine-specific.
