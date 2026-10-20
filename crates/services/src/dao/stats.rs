@@ -14,10 +14,22 @@
 //! could ("healthy if any pod reached it", matching the load poller's
 //! fail-open philosophy).
 
+use std::collections::HashMap;
+
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use mongodb::{Collection, Database};
 
 use super::base::DaoResult;
+
+/// A `$sum` as bytes, whatever numeric type Mongo returns it as.
+fn bytes_of(v: Option<&Bson>) -> u64 {
+    match v {
+        Some(Bson::Int64(n)) => (*n).max(0) as u64,
+        Some(Bson::Int32(n)) => (*n).max(0) as u64,
+        Some(Bson::Double(n)) if n.is_finite() && *n > 0.0 => *n as u64,
+        _ => 0,
+    }
+}
 
 pub const STATS_RELAY: &str = "stats_relay";
 pub const STATS_MACHINE: &str = "stats_machine";
@@ -183,6 +195,44 @@ impl StatsDao {
             },
         )
         .await
+    }
+
+    /// FR-115 P4a — month-to-date relayed bytes (`derp_bytes`) per org, for
+    /// one org or for all of them: the hourly tier for the completed hours,
+    /// the raw tier for the open one. The rollup recomputes its open bucket,
+    /// so reading the hourly tier up to this hour's start and the raw tier
+    /// from it counts every byte once. The throttle's job and the org's
+    /// analytics page both read this (`crate::relay_allowance`).
+    pub async fn relay_month_to_date(
+        &self,
+        tenant: Option<ObjectId>,
+        now: DateTime,
+    ) -> DaoResult<HashMap<ObjectId, u64>> {
+        use futures::TryStreamExt;
+
+        let start = crate::relay_allowance::month_start(now);
+        let hour = DateTime::from_millis(now.timestamp_millis() / 3_600_000 * 3_600_000);
+        let mut out: HashMap<ObjectId, u64> = HashMap::new();
+        for (coll, ts) in [
+            (STATS_USAGE_1H, doc! { "$gte": start, "$lt": hour }),
+            (STATS_USAGE, doc! { "$gte": hour }),
+        ] {
+            let mut filter = doc! { "meter": Meter::DerpBytes.as_str(), "ts": ts };
+            if let Some(t) = tenant {
+                filter.insert("tenant_id", t);
+            }
+            let pipeline = vec![
+                doc! { "$match": filter },
+                doc! { "$group": { "_id": "$tenant_id", "total": { "$sum": "$value" } } },
+            ];
+            let mut cursor = self.coll(coll).aggregate(pipeline).await?;
+            while let Some(row) = cursor.try_next().await? {
+                if let Ok(t) = row.get_object_id("_id") {
+                    *out.entry(t).or_default() += bytes_of(row.get("total"));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Successful poll → full `$set` (overwrites a failure-only bucket).

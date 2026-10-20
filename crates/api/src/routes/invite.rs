@@ -528,8 +528,9 @@ pub async fn add_member(
 
     // FR-32 P1b — plan `max_members` cap. Checked AFTER the already-a-member
     // test, so only a NEW seat consumes one; mirrors the device cap's "only NEW
-    // rows consume a slot". Ships in the tenant's `plan_enforcement` mode,
-    // default `Warn` — recorded, not refused.
+    // rows consume a slot". Established since FR-115 D2
+    // (`Limit::is_established`): refused in every `plan_enforcement` mode,
+    // `warn` included.
     {
         let tenant = state.tenants.base.find_by_id(tid).await?;
         let used = state.tenants.count_members(tid).await?;

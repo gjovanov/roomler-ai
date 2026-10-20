@@ -32,12 +32,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
-use chrono::{Datelike, TimeZone, Utc};
+use bson::{DateTime, doc, oid::ObjectId};
 use dashmap::DashMap;
-use futures::TryStreamExt;
-use roomler_ai_config::RelayAllowanceSettings;
-use roomler_ai_db::models::Plan;
 use tracing::{debug, info, warn};
 
 use crate::NetworkState;
@@ -105,75 +101,16 @@ pub fn permits(network_id: ObjectId, len: usize, rate: u64) -> bool {
     }
 }
 
-/// The throttled rate (bytes/s) for an org on `plan` with `seats` that has
-/// relayed `used` bytes this month; `None` while it is inside its allowance.
-pub fn rate_for(plan: &Plan, seats: u32, used: u64, s: &RelayAllowanceSettings) -> Option<u64> {
-    let allowance = plan.limits_for(seats).relay_bytes_per_month;
-    if allowance == u64::MAX || used <= allowance {
-        return None;
-    }
-    let kbps = if *plan == Plan::Free {
-        s.free_rate_kbps
-    } else {
-        s.paid_rate_kbps
-    };
-    Some(u64::from(kbps) * 1000 / 8)
-}
+/// The allowance's arithmetic lives in `roomler-ai-services`, shared with the
+/// org's analytics page, so what an org is shown is what it is throttled by.
+pub use roomler_ai_services::relay_allowance::{month_start, rate_for};
 
-/// The first instant of `now`'s month, UTC: the allowance resets there.
-pub fn month_start(now: DateTime) -> DateTime {
-    let at = Utc
-        .timestamp_millis_opt(now.timestamp_millis())
-        .single()
-        .expect("a BSON date is in range");
-    let first = Utc
-        .with_ymd_and_hms(at.year(), at.month(), 1, 0, 0, 0)
-        .single()
-        .expect("the first of a month exists");
-    DateTime::from_millis(first.timestamp_millis())
-}
-
-/// A `$sum` as bytes, whatever numeric type Mongo returns it as.
-fn bytes_of(v: Option<&Bson>) -> u64 {
-    match v {
-        Some(Bson::Int64(n)) => (*n).max(0) as u64,
-        Some(Bson::Int32(n)) => (*n).max(0) as u64,
-        Some(Bson::Double(n)) if n.is_finite() && *n > 0.0 => *n as u64,
-        _ => 0,
-    }
-}
-
-/// Month-to-date relayed bytes per org: the hourly tier for the completed
-/// hours, the raw tier for the open one. The rollup recomputes its open
-/// bucket, so reading the hourly tier up to this hour's start and the raw
-/// tier from it counts every byte once.
+/// Month-to-date relayed bytes per org (`StatsDao::relay_month_to_date`).
 pub async fn month_to_date(
     state: &NetworkState,
     now: DateTime,
 ) -> anyhow::Result<HashMap<ObjectId, u64>> {
-    let start = month_start(now);
-    let hour = DateTime::from_millis(now.timestamp_millis() / 3_600_000 * 3_600_000);
-    let mut out: HashMap<ObjectId, u64> = HashMap::new();
-    for (coll, ts) in [
-        ("stats_usage_1h", doc! { "$gte": start, "$lt": hour }),
-        ("stats_usage", doc! { "$gte": hour }),
-    ] {
-        let pipeline = vec![
-            doc! { "$match": { "meter": "derp_bytes", "ts": ts } },
-            doc! { "$group": { "_id": "$tenant_id", "total": { "$sum": "$value" } } },
-        ];
-        let mut cursor = state
-            .db
-            .collection::<Document>(coll)
-            .aggregate(pipeline)
-            .await?;
-        while let Some(row) = cursor.try_next().await? {
-            if let Ok(tenant) = row.get_object_id("_id") {
-                *out.entry(tenant).or_default() += bytes_of(row.get("total"));
-            }
-        }
-    }
-    Ok(out)
+    Ok(state.stats.relay_month_to_date(None, now).await?)
 }
 
 /// The over-allowance set at `now`: network → rate, for every network of
@@ -368,6 +305,9 @@ pub(crate) static TEST_MAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use roomler_ai_config::RelayAllowanceSettings;
+    use roomler_ai_db::models::Plan;
 
     const GB: u64 = 1_000_000_000;
 

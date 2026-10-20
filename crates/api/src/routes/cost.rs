@@ -11,10 +11,11 @@
 //! 1. **A cost with no price.** Every unit cost is `Option`; unset yields
 //!    `null`, which the UI renders as *not priced*. A defaulted 0.00 would
 //!    read as "this org is free to serve" and imply 100 % margin.
-//! 2. **A zero for an uncollected meter.** `turn_bytes` has no writer at all
-//!    (FR-20 P3 is blocked on coturn emitting no `user` label), so it reports
-//!    `monitored: false`. *No traffic* and *not measured* are different facts
-//!    and must never share a cell.
+//! 2. **A zero for an uncollected meter.** `turn_bytes` is written only by
+//!    FR-115 P4b's collector (`relay_allowance.turn_attribution`, off by
+//!    default), and only for the cluster's coturn until P4b-2 brings the PoPs
+//!    in, so it reports `monitored: false` until both are. *No traffic* and
+//!    *not measured* are different facts and must never share a cell.
 //! 3. **A relayed fraction with no reporters.** An empty denominator yields
 //!    `null`, not `0`, which would otherwise read as a flawless mesh.
 //!
@@ -39,14 +40,16 @@ use super::stats::{
     require_tenant_stats, tier_coll,
 };
 use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
+use bson::oid::ObjectId;
 use roomler_ai_config::RelayCosts;
 use roomler_ai_db::models::tenant::Plan;
+use roomler_ai_services::relay_allowance;
 
 /// Meters this deployment actually collects. A meter absent from this list is
 /// reported `monitored: false` rather than `0` — see the module docs.
 ///
-/// `turn_bytes` is deliberately NOT here: the meter exists in the `Meter` enum
-/// so the ledger shape is complete, but nothing writes it.
+/// `turn_bytes` is deliberately NOT here: until FR-115 P4b's collector covers
+/// every coturn (the cluster's and the PoPs'), a total would be partial.
 const MONITORED: &[&str] = &["derp_bytes", "sfu_participant_seconds"];
 
 /// Cost of `total` units of `meter`, or `None` when that meter has no price
@@ -481,11 +484,57 @@ pub async fn tenant_resources(
         "meters": meters,
         "storage": storage.first().cloned(),
         "carrier_mix": carrier_mix,
-        // No quotas exist yet. The field is present and null so the UI can
-        // render the slot dark instead of pretending an unlimited plan is a
-        // satisfied one — and so adding quotas is a server-side change only.
-        "quota": serde_json::Value::Null,
+        // FR-115 P4a — the relay allowance, the first quota this slot holds.
+        // `null` where plans are not sold, so the UI renders the slot dark
+        // instead of pretending an unlimited plan is a satisfied one.
+        "quota": relay_quota(&state, tid).await,
     })))
+}
+
+/// FR-115 P4a — the org's relay allowance this month, as the throttle reads
+/// it (`roomler_ai_services::relay_allowance`, the same functions): the bytes
+/// relayed through DERP since the first of the month (UTC) against the
+/// plan's allowance for its seats. In units, never money (FR-20).
+///
+/// `null` where plans are not sold (self-hosting has no allowance) and on
+/// any error: the panel that polls this degrades, it never fails over it.
+async fn relay_quota(state: &Core, tid: ObjectId) -> serde_json::Value {
+    if !state.plans_sold {
+        return serde_json::Value::Null;
+    }
+    let now = bson::DateTime::now();
+    let (tenant, used) = match (
+        state.tenants.base.find_by_id(tid).await,
+        state.stats.relay_month_to_date(Some(tid), now).await,
+    ) {
+        (Ok(t), Ok(used)) => (t, used.get(&tid).copied().unwrap_or(0)),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(%tid, %e, "relay quota: not computed");
+            return serde_json::Value::Null;
+        }
+    };
+    let s = &state.settings.relay_allowance;
+    let seats = tenant.billed_seats();
+    let allowance = relay_allowance::allowance_bytes(&tenant.plan, seats);
+    let over = relay_allowance::rate_for(&tenant.plan, seats, used, s).is_some();
+    let iso = |d: bson::DateTime| d.try_to_rfc3339_string().unwrap_or_default();
+    serde_json::json!({
+        "relay": {
+            "month_start": iso(relay_allowance::month_start(now)),
+            "resets_at": iso(relay_allowance::next_month_start(now)),
+            "used_bytes": used,
+            // `null` = the plan has no allowance (unlimited).
+            "allowance_bytes": allowance,
+            // The rate past the allowance; it is slowed, never cut off.
+            "rate_kbps": allowance.map(|_| relay_allowance::rate_kbps(&tenant.plan, s)),
+            // `relay_allowance.enabled`: the throttle is on for this
+            // deployment. Off, the allowance is shown and not applied.
+            "enforced": s.enabled,
+            // Recomputed here; the throttle's own job runs every five
+            // minutes, so the two agree within one job period.
+            "throttled": s.enabled && over,
+        }
+    })
 }
 
 #[cfg(test)]
