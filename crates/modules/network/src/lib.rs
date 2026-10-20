@@ -62,6 +62,7 @@ pub mod overlay;
 pub mod relay_allowance;
 pub mod ssh_grant_acks;
 pub mod tunnel;
+pub mod turn_usage;
 pub mod routes {
     pub mod agent_ssh;
     pub mod overlay_block;
@@ -341,6 +342,9 @@ impl Module for NetworkState {
         // per tick) and every pod's refresh. Throttles nothing unless
         // `relay_allowance.enabled`, and never on a server that sells no plans.
         relay_allowance::spawn(state.clone());
+        // FR-115 P4b — coturn's statistics DB into `turn_bytes` per org.
+        // Subscribes to nothing unless `relay_allowance.turn_attribution`.
+        turn_usage::spawn(state.clone());
         // C-3/C-5 — the directory heartbeat for this module's classes
         // (tunnel sessions, derp registrations). The agent-presence half is
         // fleet's, spawned by its init.

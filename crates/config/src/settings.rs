@@ -335,6 +335,12 @@ pub struct RelayAllowanceSettings {
     /// The same for a paid plan. Env: `ROOMLER__RELAY_ALLOWANCE__PAID_RATE_KBPS`.
     #[serde(default = "relay_allowance_paid_rate_kbps")]
     pub paid_rate_kbps: u32,
+    /// FR-115 P4b — read coturn's statistics DB (`--redis-statsdb`) into
+    /// `turn_bytes` per org. Off until coturn publishes there; `false` is
+    /// the kill switch (no subscription). Env:
+    /// `ROOMLER__RELAY_ALLOWANCE__TURN_ATTRIBUTION`.
+    #[serde(default)]
+    pub turn_attribution: bool,
 }
 
 fn relay_allowance_free_rate_kbps() -> u32 {
@@ -351,6 +357,7 @@ impl Default for RelayAllowanceSettings {
             enabled: false,
             free_rate_kbps: relay_allowance_free_rate_kbps(),
             paid_rate_kbps: relay_allowance_paid_rate_kbps(),
+            turn_attribution: false,
         }
     }
 }
