@@ -413,8 +413,11 @@ libc = "0.2"
 # modules: `screensaver` (MIT-SCREEN-SAVER — the idle counter that tells the
 # engine's own XTest moves from a person's) and `randr` (the monitor under
 # the pointer).
+#
+# FR-97 P3e adds `xkb`: the keyboard layout an X11 desktop has in use (its
+# locked group) and the switch to another (`input::layout_x11`).
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["damage", "screensaver", "randr"], optional = true }
+x11rb = { version = "0.13", features = ["damage", "screensaver", "randr", "xkb"], optional = true }
 
 # FR-96 security review (#2055) — the root update helper stages each download in
 # a FRESH private directory (mkdtemp) instead of a fixed world-creatable name in
