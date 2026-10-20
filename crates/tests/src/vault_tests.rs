@@ -1168,6 +1168,111 @@ async fn simulate_says_what_would_decide_a_request() {
     );
 }
 
+/// P3-7 — a policy may name an exit by its device's id only when it is a live
+/// device of this organization; `simulate` decides `net:socks` and
+/// `net:forward` from the node's row, its tags included.
+#[tokio::test]
+async fn net_policies_name_this_organizations_exits_and_simulate_decides_them() {
+    let app = vault_app(Some(fresh_kek())).await;
+    let t = app.seed_tenant("vaultnet").await;
+    let other = app.seed_tenant("vaultnet2").await;
+    let me = t.admin.id.clone();
+    post_json(&app, &t, "/role", json!({ "name": "dev" })).await;
+    let (office, _) = crate::vault_lease_tests::enroll(&app, &t, "net-office", "linux").await;
+    let (lab, _) = crate::vault_lease_tests::enroll(&app, &t, "net-lab", "linux").await;
+    let (foreign, _) = crate::vault_lease_tests::enroll(&app, &other, "net-foreign", "linux").await;
+    app.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&office).unwrap() },
+            doc! { "$set": { "tags": ["Office"] } },
+        )
+        .await
+        .unwrap();
+
+    let naming = |id: &str| {
+        format!(
+            r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"net:socks", resource == Roomler::Node::"{id}");"#
+        )
+    };
+    let (code, text, _) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "socks-via-office", "text": naming(&office) }),
+    )
+    .await;
+    assert_eq!(code, 201, "{text}");
+    for (id, why) in [
+        (foreign.clone(), "another organization's device"),
+        (ObjectId::new().to_hex(), "no device at all"),
+    ] {
+        let (code, text, _) = post_json(
+            &app,
+            &t,
+            "/policy",
+            json!({ "name": "socks-elsewhere", "text": naming(&id) }),
+        )
+        .await;
+        assert_eq!(code, 400, "{why}: {text}");
+        assert!(
+            text.contains("is not a device of this organization"),
+            "{why}: {text}"
+        );
+    }
+    let forward = r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"net:forward", resource) when { resource.tags.contains("office") && context.port == 5432 };"#;
+    let (code, text, _) = post_json(
+        &app,
+        &t,
+        "/policy",
+        json!({ "name": "pg-via-office", "text": forward }),
+    )
+    .await;
+    assert_eq!(code, 201, "{text}");
+
+    let sim = |action: &str, node: &str, extra: Value| {
+        let mut body = json!({
+            "action": action,
+            "principal": { "role": "dev", "owner_id": me },
+            "resource": { "node_id": node },
+            "device": { "os": "macos", "tags": [], "owner_id": me },
+        });
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        post_json(&app, &t, "/simulate", body)
+    };
+    let decision = |v: &Value| v["decision"].as_str().unwrap_or_default().to_string();
+    let (code, text, v) = sim("net:socks", &office, json!({})).await;
+    assert_eq!((code, decision(&v).as_str()), (200, "allow"), "{text}");
+    let (_, _, v) = sim("net:socks", &lab, json!({})).await;
+    assert_eq!(decision(&v), "deny", "another exit");
+    let (_, _, v) = sim(
+        "net:forward",
+        &office,
+        json!({ "host": "db.internal", "port": 5432 }),
+    )
+    .await;
+    assert_eq!(decision(&v), "allow", "the office's tag, read from its row");
+    let (_, _, v) = sim(
+        "net:forward",
+        &office,
+        json!({ "host": "db.internal", "port": 22 }),
+    )
+    .await;
+    assert_eq!(decision(&v), "deny", "another port");
+    let (code, text, _) = sim("net:forward", &office, json!({})).await;
+    assert_eq!(code, 400, "{text}");
+    let (code, text, _) = sim("net:socks", &foreign, json!({})).await;
+    assert_eq!(code, 400, "{text}");
+    assert!(
+        text.contains("is not a device of this organization"),
+        "{text}"
+    );
+}
+
 /// P3-2b — `simulate/replay`: the recorded Cedar decisions, each with the
 /// request it decided, decided again under a change not yet made; it
 /// answers the ones that would come out the other way, counts a row it
