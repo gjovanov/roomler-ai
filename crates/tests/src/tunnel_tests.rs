@@ -991,9 +991,11 @@ async fn connect_agent_ws_inner(
 /// Poll the agent row until `status == "online"` (hello processed → Hub
 /// registered), so a subsequent `send_to_agent` relay lands.
 ///
-/// Up to 10 s: it returns the moment the row says online, and 2 s was too
-/// short for a hello under the full suite's load (`vault_revoke_tests`
-/// timed out here on master's lane, 2026-10-18, run 39155622658).
+/// Up to 10 s: it returns the moment the row says online. ⚠️ A reconnect
+/// waits for [`wait_agent_offline`] first. Raising this from 2 s to 10 s for
+/// a `vault_revoke_tests` failure read as load (2026-10-18, run 39155622658)
+/// did not help: that failure was the reconnect race, and it came back on
+/// 10 s (2026-10-19, run 39306461861).
 pub(crate) async fn wait_agent_online(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
@@ -1017,6 +1019,41 @@ pub(crate) async fn wait_agent_online(
         }
     }
     panic!("agent {agent_id} never came online");
+}
+
+/// Poll the agent row until it no longer says online: the closed
+/// connection's teardown has run. A reconnect waits for this first, as a real
+/// restart's gap does.
+///
+/// ⚠️ Without it, the new hello can race the old connection's teardown. The
+/// hello writes `online` before it registers with the hub, so the teardown
+/// can still find the hub's slot its own and write `offline`, and that write
+/// can land after the hello's. The row then reads offline while the hub holds
+/// the new connection. Only a heartbeat writes it online again, and no test
+/// device sends one.
+pub(crate) async fn wait_agent_offline(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    agent_id: &str,
+) {
+    for _ in 0..200 {
+        let row: Value = app
+            .auth_get(
+                &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if row["status"].as_str() != Some("online") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("agent {agent_id} never went offline");
 }
 
 /// Read WS frames until one arrives whose `t` == `want`, or a 5 s deadline
