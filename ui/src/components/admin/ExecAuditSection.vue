@@ -16,7 +16,7 @@
       />
     </v-card-title>
 
-    <v-card-subtitle class="pb-2">
+    <v-card-subtitle class="pb-2 text-wrap">
       Every remote command attempted on this organization's devices — including
       the ones that were refused. Retained for 90 days.
     </v-card-subtitle>
@@ -30,7 +30,9 @@
         No commands have been attempted yet.
       </div>
 
-      <v-table v-else density="compact">
+      <!-- A card per entry below 600 px (table-stack-xs): the result and the
+           command or detail sat about three screens to the right. -->
+      <v-table v-else density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>When</th>
@@ -43,16 +45,16 @@
         </thead>
         <tbody>
           <tr v-for="e in entries" :key="e.request_id">
-            <td class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
-            <td class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
-            <td class="text-no-wrap">{{ userName(e.user_id) }}</td>
-            <td>
+            <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
+            <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
+            <td data-label="Who" class="text-no-wrap">{{ userName(e.user_id) }}</td>
+            <td data-label="Via">
               <v-chip size="x-small" variant="tonal">{{ e.source }}</v-chip>
             </td>
-            <td>
-              <code class="audit-cmd">{{ e.command }}</code>
+            <td data-label="Command">
+              <code class="audit-cmd" :title="e.command">{{ e.command }}</code>
             </td>
-            <td class="text-no-wrap">
+            <td data-label="Result" class="text-no-wrap">
               <v-chip size="x-small" :color="resultColor(e)" variant="flat">
                 {{ resultLabel(e) }}
               </v-chip>
@@ -76,6 +78,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useAgentStore, type ExecAuditEntry } from '@/stores/agents'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 
 const props = defineProps<{
   tenantId: string
@@ -126,7 +129,7 @@ function ranAsTitle(e: ExecAuditEntry): string {
 
 const deviceNames = computed(() => {
   const m: Record<string, string> = {}
-  for (const a of agentStore.agents) m[a.id] = a.name
+  for (const a of agentStore.agents) m[a.id] = deviceLabel(a)
   return m
 })
 
@@ -200,5 +203,15 @@ defineExpose({ load })
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: bottom;
+}
+/* A phone stacks the row into a card (table-stack-xs), so the command has
+   the card's whole width and nothing to blow out: show all of it. The
+   clamp hid it on every width — `title` (above) is the desktop's way in. */
+@media (max-width: 599.98px) {
+  .audit-cmd {
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
 }
 </style>

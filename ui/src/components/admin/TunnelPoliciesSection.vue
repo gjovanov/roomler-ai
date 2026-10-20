@@ -2,7 +2,7 @@
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-card>
-    <v-card-title class="d-flex align-center">
+    <v-card-title class="d-flex align-center flex-wrap ga-2">
       <span>Tunnel ACL</span>
       <v-spacer />
       <v-btn
@@ -41,7 +41,9 @@
         <v-progress-circular indeterminate />
       </div>
 
-      <v-table v-else-if="store.policies.length > 0" density="compact">
+      <!-- A card per policy below 600 px (table-stack-xs): the allowlist,
+           the ceilings and the actions were off-screen on a phone. -->
+      <v-table v-else-if="store.policies.length > 0" density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>Name</th>
@@ -54,13 +56,13 @@
         </thead>
         <tbody>
           <tr v-for="p in store.policies" :key="p.id">
-            <td>
+            <td data-label="Name">
               <div class="font-weight-medium">{{ p.name }}</div>
               <div class="text-caption text-medium-emphasis">
                 {{ formatDate(p.created_at) }}
               </div>
             </td>
-            <td>
+            <td data-label="Subjects">
               <v-chip
                 v-for="(s, i) in p.subjects"
                 :key="i"
@@ -71,7 +73,7 @@
                 {{ subjectLabel(s) }}
               </v-chip>
             </td>
-            <td>
+            <td data-label="Targets">
               <v-chip
                 v-for="(t, i) in p.targets"
                 :key="i"
@@ -82,13 +84,13 @@
                 {{ targetLabel(t) }}
               </v-chip>
             </td>
-            <td>
+            <td data-label="Allowlist">
               <div v-for="(r, i) in p.allowlist" :key="i" class="text-caption">
-                <code>{{ hostLabel(r.host_pattern) }}:{{ portRangeLabel(r.port_range) }}</code>
+                <code class="text-break">{{ hostLabel(r.host_pattern) }}:{{ portRangeLabel(r.port_range) }}</code>
                 <span class="text-medium-emphasis">/{{ (r.proto ?? 'any') }}</span>
               </div>
             </td>
-            <td class="text-caption">
+            <td class="text-caption" data-label="Ceilings">
               <div>
                 flows:
                 <strong>{{ p.max_concurrent_flows ?? '∞' }}</strong>
@@ -119,7 +121,7 @@
     </v-card-text>
 
     <!-- Create/edit dialog ──────────────────────────────────────── -->
-    <v-dialog v-model="editDialog" max-width="900" persistent>
+    <v-dialog v-model="editDialog" max-width="900" persistent scrollable :fullscreen="fullscreen">
       <v-card>
         <v-card-title>
           {{ editingId ? 'Edit tunnel policy' : 'New tunnel policy' }}
@@ -147,7 +149,7 @@
           />
 
           <!-- Subjects -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Subjects</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               Who this policy applies to. First-match-wins across all policies.
@@ -165,7 +167,7 @@
           <div
             v-for="(s, i) in form.subjects"
             :key="`s-${i}`"
-            class="d-flex align-center mb-2 ga-2"
+            class="d-flex align-center flex-wrap mb-2 ga-2"
           >
             <v-select
               :model-value="s.kind"
@@ -173,7 +175,7 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="max-width: 220px"
+              style="flex: 1 1 150px; max-width: 220px"
               @update:model-value="setSubjectKind(i, $event)"
             />
             <!-- Pick from the fleet where a store already has the rows
@@ -181,29 +183,45 @@
             <v-select
               v-if="s.kind === 'agent_id'"
               v-model="s.id"
-              :items="agentStore.agents.map((a) => ({ title: a.name, value: a.id }))"
+              :items="withCurrent(agentItems, s.id)"
               :label="subjectIdLabel(s.kind)"
               variant="outlined"
               density="compact"
               hide-details
+              style="flex: 1 1 200px"
             />
             <v-select
               v-else-if="s.kind === 'tunnel_client_id'"
               v-model="s.id"
-              :items="tunnelClientStore.clients.map((c) => ({ title: c.name, value: c.id }))"
+              :items="withCurrent(clientItems, s.id)"
               :label="subjectIdLabel(s.kind)"
               variant="outlined"
               density="compact"
               hide-details
+              style="flex: 1 1 200px"
             />
-            <v-text-field
-              v-else-if="s.kind !== 'all_users'"
+            <!-- Roles and people are picked, as on the Overlay tab: a 24-hex
+                 ObjectId typed into a field was the only way before, and on a
+                 phone it was no way at all. -->
+            <v-select
+              v-else-if="s.kind === 'role_id'"
               v-model="s.id"
+              :items="withCurrent(roleItems, s.id)"
               :label="subjectIdLabel(s.kind)"
-              placeholder="24-hex ObjectId"
               variant="outlined"
               density="compact"
               hide-details
+              style="flex: 1 1 200px"
+            />
+            <v-select
+              v-else-if="s.kind === 'user_id'"
+              v-model="s.id"
+              :items="withCurrent(memberItems, s.id)"
+              :label="subjectIdLabel(s.kind)"
+              variant="outlined"
+              density="compact"
+              hide-details
+              style="flex: 1 1 200px"
             />
             <span v-else class="text-medium-emphasis text-caption">
               (catch-all — matches every user in the tenant)
@@ -219,7 +237,7 @@
           <v-divider class="my-4" />
 
           <!-- Targets -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Targets</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               Which agents this policy lets the subjects reach.
@@ -237,7 +255,7 @@
           <div
             v-for="(t, i) in form.targets"
             :key="`t-${i}`"
-            class="d-flex align-center mb-2 ga-2"
+            class="d-flex align-center flex-wrap mb-2 ga-2"
           >
             <v-select
               :model-value="t.kind"
@@ -245,17 +263,18 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="max-width: 220px"
+              style="flex: 1 1 150px; max-width: 220px"
               @update:model-value="setTargetKind(i, $event)"
             />
             <v-select
               v-if="t.kind === 'agent_id'"
               v-model="t.id"
-              :items="agentStore.agents.map((a) => ({ title: a.name, value: a.id }))"
+              :items="withCurrent(agentItems, t.id)"
               label="Agent"
               variant="outlined"
               density="compact"
               hide-details
+              style="flex: 1 1 200px"
             />
             <span v-else class="text-medium-emphasis text-caption">
               (catch-all — matches every agent in the tenant)
@@ -271,7 +290,7 @@
           <v-divider class="my-4" />
 
           <!-- Allowlist -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Destination allowlist</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               Host + port-range patterns the subjects may reach via the targets.
@@ -289,7 +308,7 @@
           <div
             v-for="(r, i) in form.allowlist"
             :key="`r-${i}`"
-            class="d-flex align-center mb-2 ga-2"
+            class="d-flex align-center flex-wrap mb-2 ga-2"
           >
             <v-select
               :model-value="r.host_pattern.kind"
@@ -298,7 +317,7 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="max-width: 160px"
+              style="flex: 1 1 130px; max-width: 160px"
               @update:model-value="setHostKind(i, $event)"
             />
             <v-text-field
@@ -307,7 +326,7 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="flex: 1"
+              style="flex: 1 1 220px"
             />
             <v-text-field
               v-model.number="r.port_range.low"
@@ -316,7 +335,7 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="max-width: 120px"
+              style="flex: 1 1 96px; max-width: 120px"
             />
             <v-text-field
               v-model.number="r.port_range.high"
@@ -325,7 +344,7 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="max-width: 120px"
+              style="flex: 1 1 96px; max-width: 120px"
             />
             <v-select
               v-model="r.proto"
@@ -334,7 +353,7 @@
               variant="outlined"
               density="compact"
               hide-details
-              style="max-width: 120px"
+              style="flex: 1 1 96px; max-width: 120px"
             />
             <v-btn
               icon="mdi-close"
@@ -347,13 +366,13 @@
           <v-divider class="my-4" />
 
           <!-- Ceilings -->
-          <div class="d-flex align-center mb-2">
+          <div class="d-flex align-center flex-wrap ga-1 mb-2">
             <strong>Per-session ceilings</strong>
             <span class="text-medium-emphasis text-caption ml-2">
               Leave blank for unlimited.
             </span>
           </div>
-          <div class="d-flex ga-3">
+          <div class="d-flex flex-wrap ga-3">
             <v-text-field
               v-model.number="form.max_concurrent_flows"
               label="Max concurrent flows"
@@ -363,7 +382,7 @@
               hide-details
               clearable
               placeholder="e.g. 64"
-              style="max-width: 240px"
+              style="flex: 1 1 200px; max-width: 240px"
             />
             <v-text-field
               v-model.number="form.max_bytes_per_session"
@@ -374,7 +393,7 @@
               hide-details
               clearable
               placeholder="e.g. 10737418240 (10 GiB)"
-              style="max-width: 280px"
+              style="flex: 1 1 200px; max-width: 280px"
             />
           </div>
         </v-card-text>
@@ -425,6 +444,11 @@ import {
 } from '@/stores/tunnelPolicies'
 import { useAgentStore } from '@/stores/agents'
 import { useTunnelClientStore } from '@/stores/tunnelClients'
+import { useRoleStore } from '@/stores/role'
+import { useMembersStore, type Member } from '@/stores/members'
+import { useNodeLabel } from '@/composables/useNodeLabel'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 
 const props = defineProps<{ tenantId: string }>()
 const store = useTunnelPolicyStore()
@@ -432,11 +456,41 @@ const store = useTunnelPolicyStore()
 // subjects/targets were hand-typed 24-hex ids before (2026-08-04).
 const agentStore = useAgentStore()
 const tunnelClientStore = useTunnelClientStore()
+const roleStore = useRoleStore()
+const membersStore = useMembersStore()
+const { agentLabel, clientLabel } = useNodeLabel()
+const { fullscreen } = useResponsiveDialog()
+
+// The pickers name devices as the Devices page does (FR-116), and roles and
+// people by name — the subject list used to show `Agent 64cd34…`.
+const agentItems = computed(() =>
+  agentStore.agents.map((a) => ({ title: deviceLabel(a), value: a.id })),
+)
+const clientItems = computed(() =>
+  tunnelClientStore.clients.map((c) => ({ title: deviceLabel(c), value: c.id })),
+)
+const roleItems = computed(() => roleStore.roles.map((r) => ({ title: r.name, value: r.id })))
+// Page 1 of the members (25), as the Overlay tab's picker: a policy that
+// names someone beyond it still shows them, by id, through withCurrent().
+const memberItems = computed(() =>
+  membersStore.items.map((m: Member) => ({
+    title: m.display_name || m.nickname || m.user_id,
+    value: m.user_id,
+  })),
+)
+
+/** The picker's items, plus the value a stored policy already holds when the
+ *  list does not (a device beyond the first page, someone not in page 1 of
+ *  the members) — so editing a policy never blanks a subject it had. */
+function withCurrent(items: { title: string; value: string }[], current: string) {
+  if (!current || items.some((i) => i.value === current)) return items
+  return [...items, { title: `${current.slice(0, 6)}…`, value: current }]
+}
 
 const subjectKinds = [
   { title: 'All users', value: 'all_users' },
-  { title: 'User ID', value: 'user_id' },
-  { title: 'Role ID', value: 'role_id' },
+  { title: 'User', value: 'user_id' },
+  { title: 'Role', value: 'role_id' },
   { title: 'Tunnel client', value: 'tunnel_client_id' },
   // 2026-08-04 — the wire supported AgentId subjects (node-stack
   // unification P3b-2: an agent acting as a tunnel ORIGIN) but the picker
@@ -445,7 +499,7 @@ const subjectKinds = [
 ]
 const targetKinds = [
   { title: 'All agents', value: 'all_agents' },
-  { title: 'Agent ID', value: 'agent_id' },
+  { title: 'Agent', value: 'agent_id' },
 ]
 const hostKinds = [
   { title: 'Exact', value: 'exact' },
@@ -546,10 +600,10 @@ function setSubjectKind(i: number, kind: string) {
 }
 function subjectIdLabel(kind: string) {
   switch (kind) {
-    case 'user_id': return 'User ID'
-    case 'role_id': return 'Role ID'
-    case 'tunnel_client_id': return 'Tunnel-client ID'
-    case 'agent_id': return 'Agent ID'
+    case 'user_id': return 'User'
+    case 'role_id': return 'Role'
+    case 'tunnel_client_id': return 'Tunnel client'
+    case 'agent_id': return 'Agent'
     default: return 'ID'
   }
 }
@@ -680,21 +734,22 @@ async function doDelete() {
   }
 }
 
+/** A subject by name — the id prefix only when the name is not known here. */
 function subjectLabel(s: PolicySubject): string {
   if (s.kind === 'all_users') return 'All users'
   const id = s.id.length > 8 ? `${s.id.slice(0, 6)}…` : s.id
   switch (s.kind) {
-    case 'user_id': return `User ${id}`
-    case 'role_id': return `Role ${id}`
-    case 'tunnel_client_id': return `Client ${id}`
-    case 'agent_id': return `Agent ${id}`
+    case 'user_id': return `User ${memberItems.value.find((m) => m.value === s.id)?.title ?? id}`
+    case 'role_id': return `Role ${roleItems.value.find((r) => r.value === s.id)?.title ?? id}`
+    case 'tunnel_client_id': return `Client ${clientLabel(s.id, id)}`
+    case 'agent_id': return `Agent ${agentLabel(s.id, id)}`
   }
 }
 
 function targetLabel(t: PolicyTarget): string {
   if (t.kind === 'all_agents') return 'All agents'
   const id = t.id.length > 8 ? `${t.id.slice(0, 6)}…` : t.id
-  return `Agent ${id}`
+  return `Agent ${agentLabel(t.id, id)}`
 }
 
 function hostLabel(h: HostPattern): string {
@@ -722,6 +777,8 @@ function formatBytes(n: number): string {
 
 onMounted(() => {
   store.fetchPolicies(props.tenantId)
+  roleStore.fetchRoles(props.tenantId)
+  membersStore.fetchMembers(props.tenantId)
   if (agentStore.agents.length === 0) agentStore.fetchAgents(props.tenantId)
   if (tunnelClientStore.clients.length === 0) {
     tunnelClientStore.fetchTunnelClients(props.tenantId)

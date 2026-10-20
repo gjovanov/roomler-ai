@@ -1,0 +1,54 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) 2026 G ROX EOOD */
+
+/*
+ * FR-116 — `table-stack-xs`: a plain `v-table` whose row is a card below
+ * 600 px.
+ *
+ * A wide table on a phone hides its rightmost columns — usually the row's
+ * actions or its result — behind a sideways scroll nobody discovers. On `xs`
+ * each row becomes a block, each cell a line, and each cell's
+ * `data-label="…"` names it (the header row is hidden). ONE template for both
+ * widths, so the phone cannot drift from the desktop; above 600 px nothing
+ * changes.
+ *
+ * For `v-data-table` / `v-data-table-server` use Vuetify's own
+ * `mobile-breakpoint` instead — it renders the same idea from the headers.
+ */
+@media (max-width: 599.98px) {
+  .table-stack-xs thead {
+    display: none;
+  }
+  .table-stack-xs table,
+  .table-stack-xs tbody,
+  .table-stack-xs tr,
+  .table-stack-xs td {
+    display: block;
+    width: 100%;
+  }
+  .table-stack-xs .v-table__wrapper {
+    overflow-x: visible;
+  }
+  .table-stack-xs tbody tr {
+    border: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
+    border-radius: 4px;
+    margin-bottom: 8px;
+    padding: 8px 12px;
+  }
+  .table-stack-xs tbody tr > td {
+    height: auto !important;
+    min-height: 0;
+    padding: 4px 0 !important;
+    border-bottom: 0 !important;
+    white-space: normal !important;
+    text-align: left !important;
+    overflow-wrap: anywhere;
+  }
+  .table-stack-xs tbody tr > td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.75rem;
+    letter-spacing: 0.0333em;
+    color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+  }
+}
