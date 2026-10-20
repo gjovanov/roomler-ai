@@ -80,7 +80,7 @@ staged by the mode.
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
 | meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:286`) | `media:error`; a rejoining participant keeps their seat |
 | meeting length | the sweep (`crates/modules/conference/src/meeting_cap.rs:100`) | `room:call_ending_soon` at 55, `room:call_ended {reason: plan_limit}` at 60 |
-| concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1524`) | `org_session_limit`, naming who holds the slot and where |
+| concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1577`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
 | recordings, exit nodes, MagicDNS | `require_feature` at each route | 403 in feature wording ("not available on the Free plan") |
 
 The two fences that are not a request — a meeting that runs long, a session started on
@@ -92,8 +92,14 @@ another pod — are where the design is unusual:
   [FR-115 *Meetings, as built*](fr/FR-115-pricing-reshape.md#meetings-as-built-p5).
 - **Concurrent sessions are counted by the hub that owns the device.** Tenant affinity puts
   an org's devices and controllers on one pod, so that pod's count is the org's; a request
-  relayed from another pod carries the cap its gate read. A session to another org's device
-  counts against the device's org until P3b.
+  relayed from another pod carries the cap its gate read.
+- **P3b makes the count cluster-wide** (`rc.session_slots`, shipped dark): one record per
+  payer in Redis (`crates/core/src/cluster/session_slots.rs`), claimed atomically, renewed
+  every 30 s by the pod that holds the session, and freed within 90 s of a pod dying. An
+  org's own sessions and the external (FR-52) sessions its members run for it share its
+  slots: the outsider picks the org on `/connect`, from any of theirs, and no paid org is
+  needed. An account in no org gets Free's one session, counted against the account. When
+  Redis cannot answer, the hub's count decides, as before.
 
 ## 5. Seats and billing
 

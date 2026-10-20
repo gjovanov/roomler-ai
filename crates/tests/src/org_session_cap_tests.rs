@@ -338,3 +338,287 @@ async fn a_cross_pod_request_carries_the_cap() {
         "the owner pod names the holder: {message}"
     );
 }
+
+// ── FR-115 P3b — session slots, the cluster-wide count ──────────────────
+
+/// Two pods whose cluster buses are up, both under `mutator`.
+async fn two_pods(mutator: fn(&mut roomler_ai_config::Settings)) -> Option<(TestApp, TestApp)> {
+    let (app1, app2) = TestApp::spawn_pair(mutator).await;
+    if app1.state.cluster_bus.is_none() || app1.state.session_slots.is_none() {
+        eprintln!("skipping: no Redis available");
+        return None;
+    }
+    for _ in 0..40 {
+        let a = app1.state.cluster_bus.as_ref().unwrap();
+        let b = app2.state.cluster_bus.as_ref().unwrap();
+        if a.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+            && b.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Some((app1, app2))
+}
+
+fn slots_on(s: &mut roomler_ai_config::Settings) {
+    s.rc.session_slots = true;
+}
+
+/// With slots on, the cap is cluster-wide. A Free org's session to its device
+/// on pod 1 holds its one slot, so a request on pod 2 for the org's device
+/// THERE is refused, naming the first; P3's count, kept per hub, let both open
+/// (`with_slots_off_each_hub_counts_its_own`). Ending the first gives the
+/// slot back.
+#[tokio::test]
+async fn slots_count_an_orgs_sessions_across_pods() {
+    let Some((app1, app2)) = two_pods(slots_on).await else {
+        return;
+    };
+    let seeded = app1.seed_tenant("fr115slot1").await;
+    let (a, _a_ws) = connect_agent(&app1, &seeded, "mach-fr115-slot1-a").await;
+    let (b, _b_ws) = connect_agent(&app2, &seeded, "mach-fr115-slot1-b").await;
+    let token = &seeded.admin.access_token;
+
+    let (_one, answer) = ask(&app1, token, &a).await;
+    let first = created(&answer);
+    let (_two, answer) = ask(&app2, token, &b).await;
+    let message = refused_by_the_cap(&answer);
+    assert!(
+        message.contains("mach-fr115-slot1-a"),
+        "pod 2 names the holder on pod 1: {message}"
+    );
+
+    let r = app1
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/session/{}/terminate",
+                seeded.tenant_id, first
+            ),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let mut freed = None;
+    for _ in 0..15 {
+        let (ctl, answer) = ask(&app2, token, &b).await;
+        if answer["t"] == "rc:session.created" {
+            freed = Some((ctl, answer));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(freed.is_some(), "the slot comes back when its session ends");
+}
+
+/// The kill switch (`rc.session_slots = false`, the default): P3's count on
+/// each hub, which sees only its own sessions, so the same two requests both
+/// open. This is the gap the slots close.
+#[tokio::test]
+async fn with_slots_off_each_hub_counts_its_own() {
+    let Some((app1, app2)) = two_pods(|_| {}).await else {
+        return;
+    };
+    let seeded = app1.seed_tenant("fr115slot2").await;
+    let (a, _a_ws) = connect_agent(&app1, &seeded, "mach-fr115-slot2-a").await;
+    let (b, _b_ws) = connect_agent(&app2, &seeded, "mach-fr115-slot2-b").await;
+    let token = &seeded.admin.access_token;
+    let (_one, answer) = ask(&app1, token, &a).await;
+    created(&answer);
+    let (_two, answer) = ask(&app2, token, &b).await;
+    created(&answer);
+}
+
+/// The claim itself, against the real Redis: a free slot is claimed, a retry
+/// for the same session renews it, a full set names its holder, an expired
+/// lease is dropped before counting, and a release frees the slot.
+#[tokio::test]
+async fn the_slot_claim_claims_renews_refuses_and_expires() {
+    use bson::oid::ObjectId;
+    use roomler_core::cluster::session_slots::{SlotClaim, SlotScope};
+    let app = TestApp::spawn_with_settings(slots_on).await;
+    let (Some(slots), Some(redis)) = (
+        app.state.session_slots.clone(),
+        app.state.redis_pubsub.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let org = SlotScope::Org(ObjectId::new());
+    let (s1, s2) = (ObjectId::new(), ObjectId::new());
+    let (user, device) = (ObjectId::new(), ObjectId::new());
+    let pod = "fr115-test-pod";
+
+    assert_eq!(
+        slots.claim(org, s1, user, device, 1, pod).await.unwrap(),
+        SlotClaim::Claimed
+    );
+    assert_eq!(
+        slots.claim(org, s1, user, device, 1, pod).await.unwrap(),
+        SlotClaim::Renewed
+    );
+    match slots.claim(org, s2, user, device, 1, pod).await.unwrap() {
+        SlotClaim::Full(holders) => {
+            assert_eq!(holders.len(), 1, "{holders:?}");
+            assert_eq!(holders[0].session, s1.to_hex());
+            assert_eq!(holders[0].user, user.to_hex());
+            assert_eq!(holders[0].device, device.to_hex());
+            assert_eq!(holders[0].pod, pod);
+        }
+        other => panic!("one slot, held: {other:?}"),
+    }
+    // A pod that died stops renewing: age the lease into the past.
+    let mut conn = redis.connection();
+    redis::cmd("ZADD")
+        .arg(slots.slots_key(org))
+        .arg(1)
+        .arg(s1.to_hex())
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        slots.claim(org, s2, user, device, 1, pod).await.unwrap(),
+        SlotClaim::Claimed
+    );
+    assert_eq!(
+        slots.held(org).await.unwrap(),
+        1,
+        "the expired lease is gone"
+    );
+    slots.release(org, s2).await.unwrap();
+    assert_eq!(slots.held(org).await.unwrap(), 0);
+    // Renewal only updates: a lease released while a round was in flight is
+    // answered missing and never put back. `restore` puts back the ones the
+    // hub still holds (a Redis that lost them).
+    let lease = roomler_core::cluster::session_slots::Lease {
+        scope: org,
+        session: s2,
+        user,
+        device,
+    };
+    let missing = slots.renew(std::slice::from_ref(&lease)).await.unwrap();
+    assert_eq!(missing, vec![lease.clone()]);
+    assert_eq!(
+        slots.held(org).await.unwrap(),
+        0,
+        "renewal never resurrects a slot"
+    );
+    slots.restore(&missing, pod).await.unwrap();
+    assert_eq!(slots.held(org).await.unwrap(), 1, "restore puts it back");
+    // Another payer's slots are its own.
+    let account = SlotScope::User(ObjectId::new());
+    assert_eq!(
+        slots
+            .claim(account, s1, user, device, 1, pod)
+            .await
+            .unwrap(),
+        SlotClaim::Claimed
+    );
+}
+
+/// A slot THIS pod claimed for a session its hub no longer holds (a release
+/// that failed) does not lock the org out for a whole lease: the next request
+/// drops it and claims. The same lease claimed by ANOTHER pod is never judged
+/// here, and refuses as any held slot does.
+#[tokio::test]
+async fn a_stale_slot_this_pod_claimed_does_not_lock_the_org_out() {
+    use bson::oid::ObjectId;
+    use roomler_core::cluster::session_slots::SlotScope;
+    let app = TestApp::spawn_with_settings(slots_on).await;
+    let Some(slots) = app.state.session_slots.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let seeded = app.seed_tenant("fr115slot3").await;
+    let org = SlotScope::Org(ObjectId::parse_str(&seeded.tenant_id).unwrap());
+    let (a, _a_ws) = connect_agent(&app, &seeded, "mach-fr115-slot3-a").await;
+    let token = &seeded.admin.access_token;
+    let ghost = ObjectId::new();
+
+    slots
+        .claim(
+            org,
+            ghost,
+            ObjectId::new(),
+            ObjectId::new(),
+            1,
+            "another-pod",
+        )
+        .await
+        .unwrap();
+    let (_refused, answer) = ask(&app, token, &a).await;
+    refused_by_the_cap(&answer);
+
+    slots.release(org, ghost).await.unwrap();
+    slots
+        .claim(
+            org,
+            ghost,
+            ObjectId::new(),
+            ObjectId::new(),
+            1,
+            &app.state.pod.pod_id,
+        )
+        .await
+        .unwrap();
+    let (_live, answer) = ask(&app, token, &a).await;
+    created(&answer);
+}
+
+/// O6 + O7 — whose slots an external session takes: the org the outsider
+/// names when they belong to it, else their only org, else (none, or several
+/// and none named) the account with Free's one. No paid org is needed, a
+/// Business org is unlimited, and an org they are not in is never charged.
+#[tokio::test]
+async fn an_external_session_is_charged_to_the_org_it_is_for() {
+    use bson::oid::ObjectId;
+    use roomler_ai_mod_remote::extauth::charge_scope;
+    use roomler_core::cluster::session_slots::SlotScope;
+    let app = TestApp::spawn().await;
+    let remote = app
+        .state
+        .modules
+        .remote
+        .clone()
+        .expect("the remote module is mounted in tests");
+    let free = app.seed_tenant("fr115chg1").await;
+    let free_org = ObjectId::parse_str(&free.tenant_id).unwrap();
+    let outsider = ObjectId::parse_str(&free.admin.id).unwrap();
+
+    // One org (Free): it, at Free's one, with nothing named.
+    assert_eq!(
+        charge_scope(&remote, outsider, None).await,
+        Some((SlotScope::Org(free_org), Some(1)))
+    );
+    // An org they are not in is never charged: the default applies.
+    let other = app.seed_tenant("fr115chg2").await;
+    assert_eq!(
+        charge_scope(&remote, outsider, Some(&other.tenant_id)).await,
+        Some((SlotScope::Org(free_org), Some(1)))
+    );
+    // In no org at all: the account, at Free's one.
+    let stranger = ObjectId::new();
+    assert_eq!(
+        charge_scope(&remote, stranger, None).await,
+        Some((SlotScope::User(stranger), Some(1)))
+    );
+    // A Business org they name is unlimited (nothing to claim).
+    let biz = ObjectId::parse_str(&other.tenant_id).unwrap();
+    app.set_plan(&other.tenant_id, "business").await;
+    app.state
+        .tenants
+        .add_member(biz, outsider, vec![], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        charge_scope(&remote, outsider, Some(&other.tenant_id)).await,
+        Some((SlotScope::Org(biz), None))
+    );
+    // Two orgs and none named: the account, at Free's one.
+    assert_eq!(
+        charge_scope(&remote, outsider, None).await,
+        Some((SlotScope::User(outsider), Some(1)))
+    );
+}

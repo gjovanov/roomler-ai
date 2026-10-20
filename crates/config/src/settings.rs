@@ -1060,6 +1060,15 @@ pub struct RcSettings {
     /// Env: `ROOMLER__RC__ORG_SESSION_CAP`.
     #[serde(default = "default_true")]
     pub org_session_cap: bool,
+    /// FR-115 P3b — count concurrent remote sessions cluster-wide, in Redis
+    /// (`roomler_core::cluster::session_slots`): an org's sessions to its own
+    /// devices and the external (FR-52) sessions run for it share its slots,
+    /// and an account in no org gets Free's one. Default **false** (shipped
+    /// dark): P3's count on the hub that owns the device, with external
+    /// sessions uncapped, as before. Needs `org_session_cap` on too.
+    /// Env: `ROOMLER__RC__SESSION_SLOTS`.
+    #[serde(default)]
+    pub session_slots: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -1089,6 +1098,7 @@ impl Default for RcSettings {
             agent_token_ttl_secs: default_agent_token_ttl_secs(),
             removal_goodbye: true,
             org_session_cap: true,
+            session_slots: false,
         }
     }
 }
@@ -1600,6 +1610,7 @@ impl Settings {
             .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?
             .set_default("rc.removal_goodbye", true)?
             .set_default("rc.org_session_cap", true)?
+            .set_default("rc.session_slots", false)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use roomler_core::cluster::session_slots::{Lease, SessionSlots};
+
 use roomler_ai_remote_control::audit::AuditSink;
 use roomler_ai_remote_control::consent::{
     ASYNC_CONSENT_TIMEOUT, ConsentOutcome, DEFAULT_CONSENT_TIMEOUT, HOST_PROMPT_TIMEOUT,
@@ -714,6 +716,14 @@ pub struct HubInner {
     /// is awaiting live in one process, and the API layer routes a request to
     /// the owner pod BEFORE reaching the Hub (see `ws/rc_relay.rs`).
     exec_waiters: DashMap<String, oneshot::Sender<ExecOutcome>>,
+
+    /// FR-115 P3b — the cluster-wide slot record, set once at startup when
+    /// the deployment has Redis (`roomler_core::cluster::session_slots`).
+    session_slots: std::sync::OnceLock<SessionSlots>,
+    /// FR-115 P3b — the live sessions that hold a slot, each with the lease
+    /// this pod renews (`slot_leases`) and gives back when the session ends
+    /// (`terminate_with_limit`, the one place every session ends).
+    slotted: DashMap<ObjectId, Lease>,
 }
 
 #[derive(Clone)]
@@ -744,7 +754,42 @@ impl Hub {
                 audit,
                 consent_tx,
                 exec_waiters: DashMap::new(),
+                session_slots: std::sync::OnceLock::new(),
+                slotted: DashMap::new(),
             }),
+        }
+    }
+
+    /// FR-115 P3b — hand the hub the slot record (once, at startup).
+    pub fn set_session_slots(&self, slots: SessionSlots) {
+        let _ = self.inner.session_slots.set(slots);
+    }
+
+    /// FR-115 P3b — this pod's live slot leases, for the renewal round.
+    pub fn slot_leases(&self) -> Vec<Lease> {
+        self.inner
+            .slotted
+            .iter()
+            .map(|e| e.value().clone())
+            .collect()
+    }
+
+    /// FR-115 P3b — give a slot back, off the caller's thread. A failed or
+    /// impossible release (no runtime) is backed up by the lease's own TTL.
+    fn release_slot(&self, lease: Lease) {
+        let Some(slots) = self.inner.session_slots.get().cloned() else {
+            return;
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = slots.release(lease.scope, lease.session).await {
+                    warn!(
+                        session = %lease.session,
+                        %e,
+                        "session slot: release failed; its lease expires on its own"
+                    );
+                }
+            });
         }
     }
 
@@ -1346,6 +1391,7 @@ impl Hub {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1398,6 +1444,13 @@ impl Hub {
         // FR-115 P3 — how many remote sessions the device's organization may
         // run at once (`DispatchCtx::org_session_cap`). `None` = no cap.
         org_session_cap: Option<u32>,
+        // FR-115 P3b — a cluster-wide slot the async caller already claimed
+        // for this session: the session is created under the lease's id, and
+        // the hub renews the lease and gives it back when the session ends.
+        // The caller passes `org_session_cap: None` with it (the slot IS the
+        // count), and releases the slot itself when no session took its id
+        // (a refusal, or a coalesced duplicate that returned another id).
+        slot: Option<Lease>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -1687,7 +1740,8 @@ impl Hub {
             );
         }
 
-        let session_id = ObjectId::new();
+        // FR-115 P3b — the id the caller claimed a slot for, when it did.
+        let session_id = slot.as_ref().map_or_else(ObjectId::new, |l| l.session);
         let (mut live, waiter) = LiveSession::new(
             session_id,
             agent_id,
@@ -1737,6 +1791,11 @@ impl Hub {
         self.inner
             .sessions
             .insert(session_id, Arc::new(Mutex::new(live)));
+        // FR-115 P3b — from here the session holds its slot: renewed by this
+        // pod, given back when it ends.
+        if let Some(lease) = slot {
+            self.inner.slotted.insert(session_id, lease);
+        }
 
         // Tell the controller the session id + its EFFECTIVE grant (which the
         // single-INPUT-holder rule above may have narrowed).
@@ -2272,6 +2331,10 @@ impl Hub {
         let Some((_, arc)) = self.inner.sessions.remove(&session_id) else {
             return Ok(()); // already gone, idempotent
         };
+        // FR-115 P3b — the session's slot goes back with it.
+        if let Some((_, lease)) = self.inner.slotted.remove(&session_id) {
+            self.release_slot(lease);
+        }
 
         let (agent_id, tenant_id, controller_tx) = {
             let mut s = arc.lock();
@@ -3580,6 +3643,12 @@ impl Hub {
         self.inner.agents.contains_key(&agent_id)
     }
 
+    /// FR-115 P3b — the org of a device connected to THIS hub: whose slots a
+    /// same-org session to it takes. `None` when it is on another pod.
+    pub fn agent_org(&self, agent_id: ObjectId) -> Option<ObjectId> {
+        self.inner.agents.get(&agent_id).map(|a| a.tenant_id)
+    }
+
     pub fn live_sessions(&self) -> usize {
         self.inner.sessions.len()
     }
@@ -3662,6 +3731,10 @@ pub struct DispatchCtx {
     /// other pod would skip the cap. `None` = no cap (an unlimited plan, the
     /// kill switch, or an unreadable tenant row: never refuse on a guess).
     pub org_session_cap: Option<u32>,
+    /// FR-115 P3b — the cluster-wide slot the caller claimed for this request
+    /// (`create_session_full`'s `slot`); set only by the pod that owns the
+    /// device, together with `org_session_cap: None`. `None` everywhere else.
+    pub slot: Option<Lease>,
 }
 
 impl Hub {
@@ -3764,6 +3837,8 @@ impl Hub {
                     // FR-115 P3 — the device org's session cap, from the
                     // authz gate (or the relay, for the other pod).
                     ctx.org_session_cap,
+                    // FR-115 P3b — the slot the owner pod claimed, if any.
+                    ctx.slot.clone(),
                 )?;
                 Ok(())
             }
@@ -4084,6 +4159,7 @@ mod tests {
             None,
             None,
             Some(grant.clone()),
+            None,
             None,
         )
         .unwrap();
@@ -4474,6 +4550,7 @@ mod tests {
                 None,
                 None, // external (FR-52 P4)
                 None,
+                None,
             )
             .unwrap()
         };
@@ -4552,6 +4629,7 @@ mod tests {
                 None,
                 None, // external (FR-52 P4)
                 None,
+                None,
             )
             .unwrap()
         };
@@ -4606,6 +4684,7 @@ mod tests {
             idle_secs: None,
             lock_on_end: None,
             org_session_cap: None,
+            slot: None,
         };
         hub.dispatch(
             &device,
@@ -4757,6 +4836,7 @@ mod tests {
             idle_secs: None,
             lock_on_end: None,
             org_session_cap: None,
+            slot: None,
         };
         let offer = || ClientMsg::SdpOffer {
             session_id: sid,
@@ -4875,6 +4955,7 @@ mod tests {
             idle_secs: None,
             lock_on_end: None,
             org_session_cap: None,
+            slot: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -5047,6 +5128,7 @@ mod tests {
             idle_secs: None,
             lock_on_end: None,
             org_session_cap: None,
+            slot: None,
         };
         let device = ctx_for(Role::Agent, None, Some(agent_id));
         let viewer = ctx_for(Role::Controller, Some(owner), None);
@@ -5196,6 +5278,7 @@ mod tests {
                 None,
                 None, // external (FR-52 P4)
                 None,
+                None,
             )
             .unwrap();
             match rx.try_recv().unwrap() {
@@ -5302,6 +5385,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
                 None,
             )
             .unwrap()
@@ -5476,6 +5560,7 @@ mod tests {
                 external.then(|| roomler_ai_remote_control::signaling::ExternalGrant {
                     attempt_id: "a1".into(),
                 }),
+                None,
                 None,
             )
             .unwrap();
@@ -5815,6 +5900,7 @@ mod tests {
                 None,
                 None, // external (FR-52 P4)
                 None,
+                None,
             )
             .unwrap();
             let (granted, refused) = match rx.try_recv().unwrap() {
@@ -5892,6 +5978,7 @@ mod tests {
             None,
             None,
             None, // external (FR-52 P4)
+            None,
             None,
         )
         .unwrap();
@@ -6334,6 +6421,7 @@ mod tests {
                 None,
                 None,
                 cap,
+                None,
             )
         };
         let (holder, other_user) = (ObjectId::new(), ObjectId::new());
@@ -6548,6 +6636,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
                 None,
             )
             .unwrap();

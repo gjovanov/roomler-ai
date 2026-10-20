@@ -226,6 +226,43 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     return Ok(serde_json::json!({ "dispatched": handled }));
                 }
 
+                // FR-115 P3b — this pod owns the device, so the org's slot is
+                // claimed here, exactly as the local path claims it.
+                let mut org_session_cap = org_session_cap;
+                let mut slot = None;
+                if let ClientMsg::SessionRequest { agent_id, .. } = &frame
+                    && let Some(cap) = org_session_cap
+                    && crate::slots::enabled(&state)
+                    && let Some(org) = state.fleet.rc_hub.agent_org(*agent_id)
+                {
+                    use crate::slots::SlotDecision;
+                    use roomler_core::cluster::session_slots::SlotScope;
+                    match crate::slots::claim(&state, SlotScope::Org(org), user_id, *agent_id, cap)
+                        .await
+                    {
+                        SlotDecision::Claimed(lease) => {
+                            slot = Some(lease);
+                            org_session_cap = None;
+                        }
+                        SlotDecision::Fallback => {}
+                        SlotDecision::Full {
+                            cap,
+                            holder_user,
+                            holder_agent,
+                        } => {
+                            let e = roomler_ai_remote_control::Error::OrgSessionLimit {
+                                cap,
+                                holder_user,
+                                holder_agent,
+                            };
+                            return Ok(serde_json::json!({
+                                "dispatched": false,
+                                "code": crate::controller::error_code(&e),
+                                "message": crate::controller::refusal_message(&state, &e).await,
+                            }));
+                        }
+                    }
+                }
                 let ctx = DispatchCtx {
                     role: Role::Controller,
                     user_id: Some(user_id),
@@ -243,8 +280,18 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     idle_secs,
                     lock_on_end,
                     org_session_cap,
+                    slot: slot.clone(),
                 };
-                match state.fleet.rc_hub.dispatch(&ctx, frame) {
+                let dispatched = state.fleet.rc_hub.dispatch(&ctx, frame);
+                if let Some(lease) = &slot {
+                    let created = state
+                        .fleet
+                        .rc_hub
+                        .session_snapshot(lease.session)
+                        .map(|_| lease.session);
+                    crate::slots::release_unused(&state, lease, created).await;
+                }
+                match dispatched {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
                     Err(e) => Ok(serde_json::json!({
                         "dispatched": false,

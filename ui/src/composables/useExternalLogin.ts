@@ -50,6 +50,8 @@ export type ExtauthRefusal =
   | 'malformed'
   | 'rejected'
   | 'unknown_attempt'
+  // FR-115 P3b — the session's org (or the account) has every slot in use.
+  | 'session_limit'
   | 'other'
 
 export type ExternalLoginResult =
@@ -74,6 +76,7 @@ const KNOWN: ReadonlySet<string> = new Set([
   'malformed',
   'rejected',
   'unknown_attempt',
+  'session_limit',
   'other',
 ])
 
@@ -109,6 +112,9 @@ export function friendlyExtauthRefusal(reason: unknown, retryAfterSecs?: unknown
       return 'The request could not be read. Reload the page and try again.'
     case 'unavailable':
       return 'This device is not available for outside access. Check the code, or ask the device owner.'
+    case 'session_limit':
+      // The server's own words name who holds the slot; this is the fallback.
+      return 'Your organization already runs as many remote sessions as its plan allows. End one, or connect for another organization.'
     default:
       return 'The device refused the request.'
   }

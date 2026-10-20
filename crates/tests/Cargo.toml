@@ -17,11 +17,15 @@ base64.workspace = true
 roomler-ai-remote-control = { path = "../remote_control" }
 roomler-ai-api = { path = "../api" }
 roomler-core = { path = "../core" }
+# FR-115 P3b — the session-slot tests age a lease by hand.
+redis.workspace = true
 # FR-69 P4 — the cluster + stats tests reach the conference module's state
 # (room manager, media claims) through `AppState::modules`.
 roomler-ai-mod-conference = { path = "../modules/conference" }
 roomler-ai-mod-fleet = { path = "../modules/fleet" }
 roomler-ai-mod-network = { path = "../modules/network" }
+# FR-115 P3b — the external session's charge scope (`extauth::charge_scope`).
+roomler-ai-mod-remote = { path = "../modules/remote" }
 # FR-102 P6 — the purestat puller is the `saas` module's; its test drives
 # `purestat_pull::run_once` with an injected clock against a fake purestat.
 roomler-ai-mod-saas = { path = "../modules/saas" }
