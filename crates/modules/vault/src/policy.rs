@@ -11,6 +11,7 @@
 //! | `forbid` | beats every `permit`, as an explicit deny does in IAM |
 //! | guardrails | [`GUARDRAILS`]: code, not rows, so no organization can lose one; they are in every organization's set from its first decision |
 //! | a set that fails to build | is an error, and the caller DENIES: a `forbid` that did not parse must never vanish quietly |
+//! | a policy that can never apply | refused when it is written (P3-2c): Cedar reports one only as a warning, and a `forbid` like that would forbid nothing |
 //!
 //! ⚠️ A policy can only name its own organization: a `Secret` or
 //! `SecretFolder` literal must carry the organization's RRN prefix, a `Role`
@@ -25,7 +26,7 @@ use std::sync::LazyLock;
 use bson::oid::ObjectId;
 use cedar_policy::{
     Authorizer, Context, Decision, Entities, EntityUid, Policy, PolicyId, PolicySet, Request,
-    Schema, ValidationMode, Validator,
+    Schema, ValidationMode, ValidationWarning, Validator,
 };
 use serde_json::{Value, json};
 
@@ -200,6 +201,26 @@ pub fn check_policy(text: &str, names: &OrgNames) -> Result<CheckedPolicy, Strin
             "the policy does not fit the vault's schema: {}",
             errors.join("; ")
         ));
+    }
+    // P3-2c — a policy that can never apply is refused, never kept. Cedar
+    // reports one only as a warning: a condition that is always false, or a
+    // scope no action applies to (a `Node` named where `secret:use` takes a
+    // `Secret`). Kept, it decides nothing, and a `forbid` like that forbids
+    // nothing its writer meant it to. Cedar reports the scope's shape as
+    // impossible too; its own warning is the one that says why.
+    let never: Vec<String> = result
+        .validation_warnings()
+        .filter(|w| {
+            matches!(
+                w,
+                ValidationWarning::ImpossiblePolicy(_)
+                    | ValidationWarning::InvalidActionApplication(_)
+            )
+        })
+        .map(|w| w.to_string())
+        .collect();
+    if !never.is_empty() {
+        return Err(format!("the policy can never apply: {}", never.join("; ")));
     }
     let est = policy
         .to_json()
@@ -1783,5 +1804,52 @@ mod tests {
             &names(),
         );
         assert!(not_an_id.unwrap_err().contains("is not a device id"));
+    }
+
+    /// P3-2c — a policy that can never apply is refused, a `forbid` above
+    /// all: kept, it would forbid nothing its writer meant it to. Cedar
+    /// reports both shapes only as warnings, a scope no action applies to and
+    /// a condition that is always false.
+    #[test]
+    fn a_policy_that_can_never_apply_is_refused() {
+        let node = ObjectId::new().to_hex();
+        // Cedar's own words for each shape, which the refusal carries.
+        let no_action = "unable to find an applicable action";
+        let always_false = "policy is impossible";
+        for (text, why, cedar) in [
+            (
+                format!(
+                    r#"forbid (principal, action == Roomler::Action::"secret:use", resource == Roomler::Node::"{node}");"#
+                ),
+                "a Node where secret:use takes a Secret",
+                no_action,
+            ),
+            (
+                r#"forbid (principal, action == Roomler::Action::"net:socks", resource is Roomler::Secret);"#
+                    .to_string(),
+                "a Secret where net:socks takes a Node",
+                no_action,
+            ),
+            (
+                r#"forbid (principal, action == Roomler::Action::"net:socks", resource) when { false };"#
+                    .to_string(),
+                "a condition that is always false",
+                always_false,
+            ),
+        ] {
+            let refused = check_policy(&text, &names()).expect_err(why);
+            assert!(refused.contains("can never apply"), "{why}: {refused}");
+            assert!(refused.contains(cedar), "{why}: {refused}");
+        }
+        // What can apply is kept, a forbid as a permit.
+        for text in [
+            format!(
+                r#"forbid (principal, action == Roomler::Action::"net:socks", resource == Roomler::Node::"{node}");"#
+            ),
+            r#"forbid (principal, action == Roomler::Action::"net:forward", resource) when { context.port == 22 };"#
+                .to_string(),
+        ] {
+            check_policy(&text, &names()).unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
     }
 }
