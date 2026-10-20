@@ -138,6 +138,9 @@ pub enum Request {
     /// P3-4d — in the same queue, so a flood of reports is dropped at its
     /// bound like a flood of requests, and answered with nothing.
     Activity(ActivityReport),
+    /// P3-7-1b — a session's own egress ([`crate::net`]), answered in order
+    /// with the leases.
+    Net(crate::net::NetRequest),
 }
 
 impl Request {
@@ -148,6 +151,7 @@ impl Request {
             Self::List(r) => Some(&r.req_id),
             Self::Describe(r) => Some(&r.req_id),
             Self::Activity(_) => None,
+            Self::Net(r) => Some(&r.req_id),
         }
     }
 }
@@ -266,6 +270,25 @@ impl AgentMsgHandler for LeaseSocket {
                 exit_code,
                 timed_out,
             }),
+            ClientMsg::VaultNet {
+                req_id,
+                session_id,
+                fence,
+                exit,
+                kind,
+                host,
+                port,
+                ttl_secs,
+            } => Request::Net(crate::net::NetRequest {
+                req_id,
+                session_id,
+                fence,
+                exit,
+                kind,
+                host,
+                port,
+                ttl_secs,
+            }),
             other => return Some(other),
         };
         let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
@@ -371,6 +394,21 @@ async fn answer_in_order(
                 activity(&state, conn, r).await;
                 continue;
             }
+            // P3-7-1b — a grant, never a value.
+            Request::Net(r) => match crate::net::grant(&state, conn, r).await {
+                Ok(g) => {
+                    let (host, port) = g.dst.unwrap_or_default();
+                    ServerMsg::VaultNetGranted {
+                        req_id: r.req_id.clone(),
+                        grant_id: g.grant_id.to_hex(),
+                        grant: g.grant,
+                        expires_at_ms: g.expires_at.timestamp_millis(),
+                        host,
+                        port,
+                    }
+                }
+                Err(why) => refusal(&r.req_id, why),
+            },
         };
         let Some(tx) = tx.upgrade() else { break };
         if tx.send(answer).await.is_err() {
@@ -585,6 +623,8 @@ pub(crate) struct Record<'a> {
     /// P3-4e — the approval a deny waits on or stands on, which its row
     /// names as the target.
     pub(crate) approval: Option<ObjectId>,
+    /// P3-7-1b — the grant an allow gave, which its row names as the target.
+    pub(crate) grant: Option<ObjectId>,
 }
 
 impl Record<'_> {
@@ -604,10 +644,11 @@ impl Record<'_> {
             ),
             None => (None, None, None, None),
         };
-        let target = match (lease, &self.secret) {
-            (Some(id), _) => Some(format!("lease:{}", id.to_hex())),
-            (None, None) => Some(format!("asked:{}", self.asked)),
-            (None, Some(_)) => self.approval.map(|id| format!("approval:{}", id.to_hex())),
+        let target = match (lease, self.grant, &self.secret) {
+            (Some(id), _, _) => Some(format!("lease:{}", id.to_hex())),
+            (None, Some(id), _) => Some(format!("grant:{}", id.to_hex())),
+            (None, None, None) => Some(format!("asked:{}", self.asked)),
+            (None, None, Some(_)) => self.approval.map(|id| format!("approval:{}", id.to_hex())),
         };
         VaultAuditEvent {
             id: None,
@@ -748,6 +789,7 @@ pub(crate) async fn identify<'a>(
         action,
         op,
         approval: None,
+        grant: None,
     };
     if u64::try_from(session.fence).ok() != Some(fence) {
         let why = LeaseRefusal::StaleFence;

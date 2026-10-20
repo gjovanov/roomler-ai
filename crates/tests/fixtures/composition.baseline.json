@@ -5523,6 +5523,7 @@
     "rc:vault.list",
     "rc:vault.describe",
     "rc:vault.activity",
+    "rc:vault.net",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5644,6 +5645,7 @@
     "rc:vault.revoke",
     "rc:vault.listed",
     "rc:vault.described",
+    "rc:vault.net.granted",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -5725,6 +5727,7 @@
     "rc:vault.activity": "vault",
     "rc:vault.describe": "vault",
     "rc:vault.lease": "vault",
-    "rc:vault.list": "vault"
+    "rc:vault.list": "vault",
+    "rc:vault.net": "vault"
   }
 }
