@@ -20,12 +20,20 @@
 //! them, one session per connection. The minter's caller is the daemon's
 //! lease client (`crate::vault`, P3-6b-2b).
 
+// P3-6d-1 — a dynamic secret's bundle, as every minter opens it.
+pub(crate) mod bundle;
 pub(crate) mod http;
 pub(crate) mod mongo;
+// P3-6d-1 — MySQL's client protocol, as a dynamic secret's issuer speaks it,
+// and a MySQL user minted per lease.
+pub(crate) mod mysql;
+pub(crate) mod mysql_mint;
 pub(crate) mod pg;
 // P3-6b-2 — a Postgres user minted per lease, by a dynamic secret's issuer.
 pub(crate) mod pg_mint;
 pub(crate) mod scram;
+// P3-6d-1 — SHA-256 crypt, the form a MySQL account keeps its password in.
+pub(crate) mod sha_crypt;
 pub(crate) mod ssh_agent;
 #[cfg(test)]
 pub(crate) mod testing;
