@@ -49,11 +49,23 @@ pub fn schema() -> &'static Schema {
 pub const NS: &str = "Roomler";
 
 /// The actions a policy may name, as the wire and the audit spell them.
-pub const ACTIONS: &[&str] = &[ACTION_ASSUME, ACTION_USE, ACTION_LIST];
+pub const ACTIONS: &[&str] = &[
+    ACTION_ASSUME,
+    ACTION_USE,
+    ACTION_LIST,
+    ACTION_NET_SOCKS,
+    ACTION_NET_FORWARD,
+];
 pub const ACTION_ASSUME: &str = "role:assume";
 pub const ACTION_USE: &str = "secret:use";
 /// P3-4b — a session listing or describing a secret.
 pub const ACTION_LIST: &str = "secret:list";
+/// P3-7 — a session opening a SOCKS5 listener whose flows exit through a
+/// device (`docs/fr/FR-90-hive-agent-sessions.md` §3e, "P3-7, a session's own
+/// egress, as designed").
+pub const ACTION_NET_SOCKS: &str = "net:socks";
+/// P3-7 — a session opening a forward to one destination through a device.
+pub const ACTION_NET_FORWARD: &str = "net:forward";
 
 /// The modes a session may ask a secret in (design §8.5). `raw` is not one:
 /// it is a person's `secret:read`, never a session's use.
@@ -163,6 +175,9 @@ pub struct CheckedPolicy {
     pub effect: &'static str,
     /// The `User` ids it names, for the route to check against membership.
     pub users: BTreeSet<ObjectId>,
+    /// P3-7 — the `Node` ids it names, for the route to check against the
+    /// organization's devices.
+    pub nodes: BTreeSet<ObjectId>,
 }
 
 /// Check one policy before it is stored: exactly one static Cedar policy,
@@ -192,6 +207,7 @@ pub fn check_policy(text: &str, names: &OrgNames) -> Result<CheckedPolicy, Strin
     let mut refs = Vec::new();
     entity_refs(&est, &mut refs);
     let mut users = BTreeSet::new();
+    let mut nodes = BTreeSet::new();
     for (ty, id) in refs {
         match ty.strip_prefix("Roomler::").unwrap_or(&ty) {
             "Secret" | "SecretFolder" => {
@@ -222,6 +238,13 @@ pub fn check_policy(text: &str, names: &OrgNames) -> Result<CheckedPolicy, Strin
                     .map_err(|_| format!("User::{id:?} is not a user id"))?;
                 users.insert(user);
             }
+            // P3-7 — an exit named by its device's id; most policies name
+            // exits by their tags instead.
+            "Node" => {
+                let node = ObjectId::parse_str(&id)
+                    .map_err(|_| format!("Node::{id:?} is not a device id"))?;
+                nodes.insert(node);
+            }
             "Session" => {
                 return Err(
                     "a policy never names one session: name the role sessions assume".into(),
@@ -237,6 +260,7 @@ pub fn check_policy(text: &str, names: &OrgNames) -> Result<CheckedPolicy, Strin
             cedar_policy::Effect::Forbid => "forbid",
         },
         users,
+        nodes,
     })
 }
 
@@ -340,6 +364,42 @@ impl DeviceFacts {
     }
 }
 
+/// P3-7 — a device a session's flow exits through, as its ROW holds it,
+/// never as a request says.
+#[derive(Debug, Clone)]
+pub struct NodeFacts {
+    pub id: ObjectId,
+    /// One of [`OSES`].
+    pub os: String,
+    /// Lowercased by [`NodeFacts::new`].
+    pub tags: Vec<String>,
+    pub owner: ObjectId,
+}
+
+impl NodeFacts {
+    /// As [`DeviceFacts::new`], for the device named `id`.
+    pub fn new(id: ObjectId, os: &str, tags: &[String], owner: ObjectId) -> Result<Self, String> {
+        let d = DeviceFacts::new(os, tags, owner)?;
+        Ok(Self {
+            id,
+            os: d.os,
+            tags: d.tags,
+            owner: d.owner,
+        })
+    }
+
+    /// Its uid, and its entity.
+    fn entity(&self) -> (Value, Value) {
+        let node_uid = uid("Node", &self.id.to_hex());
+        let entity = json!({
+            "uid": node_uid,
+            "attrs": { "os": self.os, "tags": self.tags, "owner": user_ref(self.owner) },
+            "parents": [],
+        });
+        (node_uid, entity)
+    }
+}
+
 /// A secret, as a request names it.
 #[derive(Debug, Clone)]
 pub struct SecretFacts {
@@ -402,6 +462,22 @@ pub enum Ask {
         secret: SecretFacts,
         device: DeviceFacts,
     },
+    /// P3-7 — `net:socks`: may `session`, on `device`, open a SOCKS5
+    /// listener whose flows exit through `node`?
+    NetSocks {
+        session: SessionFacts,
+        node: NodeFacts,
+        device: DeviceFacts,
+    },
+    /// P3-7 — `net:forward`: may `session`, on `device`, open a forward to
+    /// `host:port` through `node`?
+    NetForward {
+        session: SessionFacts,
+        node: NodeFacts,
+        host: String,
+        port: u16,
+        device: DeviceFacts,
+    },
 }
 
 fn uid(ty: &str, id: &str) -> Value {
@@ -440,16 +516,7 @@ fn strings(a: &bson::Array) -> Option<Vec<String>> {
 /// principal, the resource and the entities a `secret:*` request is decided
 /// over.
 fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, Value, Vec<Value>) {
-    let session_uid = uid("Session", &session.id);
-    let mut attrs = json!({ "owner": user_ref(session.owner) });
-    if let Some(p) = &session.playbook {
-        attrs["playbook"] = json!(p);
-    }
-    let parents: Vec<Value> = session.role.iter().map(|r| uid("Role", r)).collect();
-    let mut entities = vec![json!({ "uid": session_uid, "attrs": attrs, "parents": parents })];
-    if let Some(r) = &session.role {
-        entities.push(json!({ "uid": uid("Role", r), "attrs": {}, "parents": [] }));
-    }
+    let (session_uid, mut entities) = session_entities(session);
     let chain = folders(&secret.path);
     let secret_uid = uid("Secret", &format!("{}{}", secret.prefix, secret.path));
     entities.push(json!({
@@ -479,6 +546,22 @@ fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, V
     (session_uid, secret_uid, entities)
 }
 
+/// The session, in the role it assumed: its uid, and the entities, itself and
+/// its role.
+fn session_entities(session: &SessionFacts) -> (Value, Vec<Value>) {
+    let session_uid = uid("Session", &session.id);
+    let mut attrs = json!({ "owner": user_ref(session.owner) });
+    if let Some(p) = &session.playbook {
+        attrs["playbook"] = json!(p);
+    }
+    let parents: Vec<Value> = session.role.iter().map(|r| uid("Role", r)).collect();
+    let mut entities = vec![json!({ "uid": session_uid, "attrs": attrs, "parents": parents })];
+    if let Some(r) = &session.role {
+        entities.push(json!({ "uid": uid("Role", r), "attrs": {}, "parents": [] }));
+    }
+    (session_uid, entities)
+}
+
 /// The folders above a path, innermost first: `a/b/c` → `a/b`, `a`.
 fn folders(path: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -497,6 +580,8 @@ impl Ask {
             Self::AssumeRole { .. } => ACTION_ASSUME,
             Self::UseSecret { .. } => ACTION_USE,
             Self::ListSecret { .. } => ACTION_LIST,
+            Self::NetSocks { .. } => ACTION_NET_SOCKS,
+            Self::NetForward { .. } => ACTION_NET_FORWARD,
         }
     }
 
@@ -524,6 +609,9 @@ impl Ask {
                 "exec_allow": &r.exec_allow,
                 "audiences": &r.audiences,
             }
+        };
+        let node_doc = |n: &NodeFacts| {
+            bson::doc! { "id": n.id, "os": &n.os, "tags": &n.tags, "owner": n.owner }
         };
         match self {
             Self::AssumeRole {
@@ -572,6 +660,30 @@ impl Ask {
                 "secret": secret_doc(secret),
                 "device": device(d),
             },
+            Self::NetSocks {
+                session,
+                node,
+                device: d,
+            } => bson::doc! {
+                "action": ACTION_NET_SOCKS,
+                "session": session_doc(session),
+                "node": node_doc(node),
+                "device": device(d),
+            },
+            Self::NetForward {
+                session,
+                node,
+                host,
+                port,
+                device: d,
+            } => bson::doc! {
+                "action": ACTION_NET_FORWARD,
+                "session": session_doc(session),
+                "node": node_doc(node),
+                "host": host,
+                "port": i32::from(*port),
+                "device": device(d),
+            },
         }
     }
 
@@ -613,6 +725,14 @@ impl Ask {
                 },
             })
         };
+        let node = |n: &bson::Document| -> Option<NodeFacts> {
+            Some(NodeFacts {
+                id: n.get_object_id("id").ok()?,
+                os: n.get_str("os").ok()?.to_string(),
+                tags: strings(n.get_array("tags").ok()?)?,
+                owner: n.get_object_id("owner").ok()?,
+            })
+        };
         let approver = match doc.get_object_id("approver") {
             Ok(id) => Some(Approver {
                 id,
@@ -644,6 +764,18 @@ impl Ask {
             ACTION_LIST => Some(Self::ListSecret {
                 session: session(doc.get_document("session").ok()?)?,
                 secret: secret(doc.get_document("secret").ok()?)?,
+                device: device(doc.get_document("device").ok()?)?,
+            }),
+            ACTION_NET_SOCKS => Some(Self::NetSocks {
+                session: session(doc.get_document("session").ok()?)?,
+                node: node(doc.get_document("node").ok()?)?,
+                device: device(doc.get_document("device").ok()?)?,
+            }),
+            ACTION_NET_FORWARD => Some(Self::NetForward {
+                session: session(doc.get_document("session").ok()?)?,
+                node: node(doc.get_document("node").ok()?)?,
+                host: doc.get_str("host").ok()?.to_string(),
+                port: u16::try_from(doc.get_i32("port").ok()?).ok()?,
                 device: device(doc.get_document("device").ok()?)?,
             }),
             _ => None,
@@ -707,6 +839,38 @@ impl Ask {
                     secret_uid,
                     entities,
                     json!({ "device": device.json() }),
+                )
+            }
+            Self::NetSocks {
+                session,
+                node,
+                device,
+            } => {
+                let (session_uid, mut entities) = session_entities(session);
+                let (node_uid, node_entity) = node.entity();
+                entities.push(node_entity);
+                (
+                    session_uid,
+                    node_uid,
+                    entities,
+                    json!({ "device": device.json() }),
+                )
+            }
+            Self::NetForward {
+                session,
+                node,
+                host,
+                port,
+                device,
+            } => {
+                let (session_uid, mut entities) = session_entities(session);
+                let (node_uid, node_entity) = node.entity();
+                entities.push(node_entity);
+                (
+                    session_uid,
+                    node_uid,
+                    entities,
+                    json!({ "device": device.json(), "host": host, "port": port }),
                 )
             }
         };
@@ -1499,5 +1663,125 @@ mod tests {
         }
         doc.insert("approver_groups", vec![bson::Bson::Int32(1)]);
         assert!(Ask::from_doc(&doc).is_none());
+    }
+
+    fn session(role: Option<&str>) -> SessionFacts {
+        SessionFacts {
+            id: ObjectId::new().to_hex(),
+            owner: ObjectId::new(),
+            role: role.map(String::from),
+            playbook: None,
+        }
+    }
+
+    fn node(tags: &[&str]) -> NodeFacts {
+        let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+        NodeFacts::new(ObjectId::new(), "linux", &tags, ObjectId::new()).unwrap()
+    }
+
+    fn net_socks(role: Option<&str>, tags: &[&str]) -> Ask {
+        Ask::NetSocks {
+            session: session(role),
+            node: node(tags),
+            device: device("macos", &[]),
+        }
+    }
+
+    fn net_forward(role: Option<&str>, tags: &[&str], host: &str, port: u16) -> Ask {
+        Ask::NetForward {
+            session: session(role),
+            node: node(tags),
+            host: host.into(),
+            port,
+            device: device("linux", &[]),
+        }
+    }
+
+    const DEV_SOCKS_THROUGH_OFFICE: &str = r#"permit (principal in Roomler::Role::"dev",
+        action == Roomler::Action::"net:socks",
+        resource) when { resource.tags.contains("office") };"#;
+
+    /// P3-7 — a session's role is permitted SOCKS through an exit by the
+    /// exit's tags, and nothing else follows: another exit, another role, no
+    /// role, or a forward is each denied.
+    #[test]
+    fn a_role_may_open_socks_through_the_exits_a_policy_names() {
+        let set = set_with(&[DEV_SOCKS_THROUGH_OFFICE]);
+        assert!(
+            decide(&set, &net_socks(Some("dev"), &["Office"])).allow,
+            "tags are lowercased"
+        );
+        for (ask, why) in [
+            (net_socks(Some("dev"), &["lab"]), "another exit"),
+            (net_socks(Some("deployer"), &["office"]), "another role"),
+            (net_socks(None, &["office"]), "no role"),
+            (
+                net_forward(Some("dev"), &["office"], "db.internal", 5432),
+                "a forward is not a SOCKS listener",
+            ),
+        ] {
+            assert!(!decide(&set, &ask).allow, "{why}");
+        }
+    }
+
+    /// P3-7 — a forward is decided toward its destination, which a policy
+    /// reads from the context.
+    #[test]
+    fn a_forward_is_decided_toward_its_destination() {
+        let set = set_with(&[r#"permit (principal in Roomler::Role::"dev",
+            action == Roomler::Action::"net:forward",
+            resource) when { context.port == 5432 && context.host like "*.internal" };"#]);
+        assert!(decide(&set, &net_forward(Some("dev"), &[], "db.internal", 5432)).allow);
+        for (host, port) in [("db.internal", 22), ("db.example.com", 5432)] {
+            assert!(
+                !decide(&set, &net_forward(Some("dev"), &[], host, port)).allow,
+                "{host}:{port}"
+            );
+        }
+        assert!(
+            !decide(&set, &net_socks(Some("dev"), &[])).allow,
+            "a forward's permit opens no SOCKS listener"
+        );
+    }
+
+    /// P3-7 — a net request reads back from its record exactly, and decides
+    /// alike; a port past `u16` makes the row unreadable.
+    #[test]
+    fn a_net_request_reads_back_from_its_record() {
+        for ask in [
+            net_socks(Some("dev"), &["office"]),
+            net_forward(Some("dev"), &["office"], "db.internal", 5432),
+        ] {
+            let back = Ask::from_doc(&ask.to_doc()).expect("reads back");
+            assert_eq!(format!("{back:?}"), format!("{ask:?}"));
+            let set = set_with(&[DEV_SOCKS_THROUGH_OFFICE]);
+            assert_eq!(decide(&set, &back), decide(&set, &ask));
+        }
+        let mut doc = net_forward(Some("dev"), &[], "db.internal", 5432).to_doc();
+        doc.insert("port", 70_000_i32);
+        assert!(Ask::from_doc(&doc).is_none());
+    }
+
+    /// P3-7 — a policy may name an exit by its device's id, which the route
+    /// then checks is this organization's; an id that is no device id is
+    /// refused.
+    #[test]
+    fn a_policy_names_an_exit_by_its_device_id() {
+        let id = ObjectId::new();
+        let checked = check_policy(
+            &format!(
+                r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"net:socks",
+                resource == Roomler::Node::"{}");"#,
+                id.to_hex()
+            ),
+            &names(),
+        )
+        .unwrap();
+        assert_eq!(checked.nodes, [id].into_iter().collect());
+        let not_an_id = check_policy(
+            r#"permit (principal, action == Roomler::Action::"net:socks", resource == Roomler::Node::"office");"#,
+            &names(),
+        );
+        assert!(not_an_id.unwrap_err().contains("is not a device id"));
     }
 }
