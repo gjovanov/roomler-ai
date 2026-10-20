@@ -589,7 +589,7 @@ async fn uptime_intervals(
         vec![
             doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
             doc! { "$set": { "id": { "$toString": "$_id" } } },
-            doc! { "$project": { "_id": 0, "id": 1, "name": 1, "last_presence": 1 } },
+            doc! { "$project": { "_id": 0, "id": 1, "name": 1, "display_name": 1, "last_presence": 1 } },
             doc! { "$limit": UPTIME_MAX_AGENTS as i64 },
         ],
     )
@@ -725,6 +725,14 @@ async fn uptime_intervals(
         out.push(serde_json::json!({
             "agent_id": id,
             "name": a.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            // FR-116 D4 — additive: the admin's friendly name, null when the
+            // device has none. `name` stays the machine's name for every
+            // reader that already parses it; the web shows this first (the
+            // `HeartbeatBefore::label` rule), as the device list does.
+            "display_name": a
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
             "intervals": intervals,
         }));
     }

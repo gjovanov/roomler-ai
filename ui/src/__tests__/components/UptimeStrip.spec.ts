@@ -101,4 +101,25 @@ describe('UptimeStrip', () => {
     expect(w.findAll('.uptime-row').length).toBe(1)
     expect(w.text()).toContain('ok')
   })
+
+  // FR-116 D4 — named as the device list names it.
+  it("names a device by its friendly name, else by the machine's", () => {
+    const w = mountStrip([
+      {
+        agent_id: 'named',
+        name: 'build-01',
+        display_name: 'Build server',
+        intervals: [{ from: T0, to: T0 + 2 * HOUR, presence: 'online' }],
+      },
+      {
+        agent_id: 'unnamed',
+        name: 'kiosk-03',
+        display_name: null,
+        intervals: [{ from: T0, to: T0 + HOUR, presence: 'online' }],
+      },
+    ])
+    const labels = w.findAll('.uptime-label').map((l) => l.text())
+    expect(labels).toEqual(['Build server', 'kiosk-03'])
+    expect(w.text()).not.toContain('build-01')
+  })
 })

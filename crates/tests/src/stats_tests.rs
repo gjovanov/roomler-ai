@@ -796,12 +796,16 @@ async fn uptime_intervals_reconstruct_presence_and_admit_ignorance() {
     // never transitioned since the ledger began.
     let flappy = ObjectId::new();
     let quiet = ObjectId::new();
-    for (id, name, presence) in [(flappy, "flappy", "offline"), (quiet, "quiet", "online")] {
+    // FR-116 D4 — `flappy` has a friendly name, `quiet` none.
+    for (id, name, display, presence) in [
+        (flappy, "flappy", Some("Flappy build box"), "offline"),
+        (quiet, "quiet", None, "online"),
+    ] {
         app.state
             .db
             .collection::<Document>("agents")
             .insert_one(doc! {
-                "_id": id, "tenant_id": tid, "name": name,
+                "_id": id, "tenant_id": tid, "name": name, "display_name": display,
                 // `machine_id` is REQUIRED here even though nothing in this
                 // test reads it: `agents` carries a plain (non-partial) unique
                 // index on {tenant_id, machine_id}, so two rows omitting the
@@ -881,6 +885,92 @@ async fn uptime_intervals_reconstruct_presence_and_admit_ignorance() {
     assert!(
         (boundary - (now - 6 * 3600)).abs() <= 5,
         "the unknown stretch must end where the ledger starts, got {boundary}"
+    );
+
+    // FR-116 D4 — the friendly name rides beside the machine name (additive:
+    // `name` keeps meaning the machine's), and a device without one says null.
+    assert_eq!(f["display_name"], serde_json::json!("Flappy build box"));
+    assert!(q["display_name"].is_null(), "got {:?}", q["display_name"]);
+}
+
+// FR-116 D4 — a person's usage names each device by its friendly name too.
+// The machine name stays in `agent_name` (additive), and a device without a
+// friendly name says null rather than repeating the machine's.
+#[tokio::test]
+async fn usage_detail_names_each_device_by_its_display_name() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("statsusage").await;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let uid = ObjectId::parse_str(&seeded.admin.id).unwrap();
+    let now = unix_now();
+
+    let named = ObjectId::new();
+    let unnamed = ObjectId::new();
+    for (id, name, display) in [
+        (named, "build-01", Some("Build server")),
+        (unnamed, "kiosk-03", None),
+    ] {
+        app.state
+            .db
+            .collection::<Document>("agents")
+            .insert_one(doc! {
+                "_id": id, "tenant_id": tid, "name": name, "display_name": display,
+                // The {tenant_id, machine_id} unique index — see the uptime test.
+                "machine_id": format!("machine-{name}"),
+                "deleted_at": bson::Bson::Null,
+            })
+            .await
+            .unwrap();
+    }
+    // One finished remote session against each device, both inside the window.
+    let at = |secs_ago: i64| bson::DateTime::from_millis((now - secs_ago) * 1000);
+    let session = |agent: ObjectId, from: i64, to: i64| {
+        doc! {
+            "_id": ObjectId::new(), "tenant_id": tid, "agent_id": agent,
+            "controller_user_id": uid, "started_at": at(from), "ended_at": at(to),
+        }
+    };
+    app.state
+        .db
+        .collection::<Document>("remote_sessions")
+        .insert_many(vec![
+            session(named, 3 * 3600, 2 * 3600),
+            session(unnamed, 3600, 1800),
+        ])
+        .await
+        .unwrap();
+
+    let r = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/stats/usage/{}?range=24h",
+                seeded.tenant_id, seeded.admin.id
+            ),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let viewing = body["viewing"].as_array().expect("viewing array");
+    let window = |agent: ObjectId| -> serde_json::Value {
+        viewing
+            .iter()
+            .find(|w| w["agent_id"] == serde_json::json!(agent.to_hex()))
+            .cloned()
+            .unwrap_or_else(|| panic!("no window for {agent}: {body}"))
+    };
+
+    let n = window(named);
+    assert_eq!(n["agent_name"], serde_json::json!("build-01"));
+    assert_eq!(n["agent_display_name"], serde_json::json!("Build server"));
+    let u = window(unnamed);
+    assert_eq!(u["agent_name"], serde_json::json!("kiosk-03"));
+    assert!(
+        u["agent_display_name"].is_null(),
+        "got {:?}",
+        u["agent_display_name"]
     );
 }
 

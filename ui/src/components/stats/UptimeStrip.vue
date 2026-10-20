@@ -51,6 +51,8 @@ export interface UptimeInterval {
 export interface UptimeAgent {
   agent_id: string
   name?: string
+  /** FR-116 D4 — the admin's friendly name, shown before the machine's. */
+  display_name?: string | null
   intervals: UptimeInterval[]
 }
 
@@ -134,7 +136,8 @@ const rows = computed<Row[]>(() => {
       })
       return {
         agent_id: a.agent_id,
-        name: a.name,
+        // A device is named as the device list names it (FR-116 D4).
+        name: a.display_name || a.name,
         segments,
         onlinePct: (onlineSecs / span) * 100,
       }
