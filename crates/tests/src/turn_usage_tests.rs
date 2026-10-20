@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use bson::{Document, doc, oid::ObjectId};
 use futures::TryStreamExt;
-use roomler_ai_remote_control::turn_creds::charged;
+use roomler_ai_remote_control::turn_creds::{charged, org_of_username};
+use serde_json::{Value, json};
 
-use crate::fixtures::test_app::TestApp;
+use crate::fixtures::{seed::SeededTenant, test_app::TestApp};
 
 fn attribution_on(s: &mut roomler_ai_config::Settings) {
     s.relay_allowance.turn_attribution = true;
@@ -126,4 +127,101 @@ async fn a_username_naming_no_org_is_not_counted() {
         0,
         "nothing is booked under the node an uncharged pair username ends with"
     );
+}
+
+/// TURN configured, with a secret made at runtime.
+fn turn_on(s: &mut roomler_ai_config::Settings) {
+    s.turn.url = Some("turn:coturn.example:3478".into());
+    s.turn.shared_secret = Some(ObjectId::new().to_hex());
+}
+
+/// Enroll one device into `seeded`'s org; its id.
+async fn enroll(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> String {
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ej: Value = app
+        .client
+        .post(app.url("/api/agent/enroll"))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+            "machine_id": machine_id,
+            "machine_name": machine_id,
+            "os": "linux",
+            "agent_version": "0.1.0",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    ej["agent_id"].as_str().unwrap().to_string()
+}
+
+/// The TURN username a pre-fetch with `query` issues. A pre-fetch is never
+/// refused over whom to charge.
+async fn prefetch_username(app: &TestApp, token: &str, query: &str) -> String {
+    let resp = app
+        .auth_get(&format!("/api/turn/credentials{query}"), token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "pre-fetch {query:?}");
+    let body: Value = resp.json().await.unwrap();
+    body["ice_servers"][1]["username"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The RC viewer builds its peer connection from the session-less
+/// pre-fetch, so that is where the browser leg is charged: to the device's
+/// org, when the caller names it, is a member of it, and the device is live
+/// there. Every other shape is the uncharged credential, as before.
+#[tokio::test]
+async fn the_rc_prefetch_is_charged_to_the_devices_org() {
+    let app = TestApp::spawn_with_settings(turn_on).await;
+    let home = app.seed_tenant("fr115turn3").await;
+    let elsewhere = app.seed_tenant("fr115turn4").await;
+    let device = enroll(&app, &home, "mach-fr115-turn").await;
+    let home_tid = home.tenant_id.clone();
+    let token = home.admin.access_token.clone();
+
+    let named = format!("?tenant_id={home_tid}&agent_id={device}");
+    let u = prefetch_username(&app, &token, &named).await;
+    assert_eq!(org_of_username(&u), Some(home_tid.as_str()), "{u}");
+
+    // Uncharged: nothing named (the pre-FR-115 viewer, an external session).
+    let u = prefetch_username(&app, &token, "").await;
+    assert_eq!(org_of_username(&u), None, "{u}");
+    // Uncharged: an id that does not parse.
+    let u = prefetch_username(
+        &app,
+        &token,
+        &format!("?tenant_id=nothex&agent_id={device}"),
+    )
+    .await;
+    assert_eq!(org_of_username(&u), None, "{u}");
+
+    // Uncharged: the caller names an org they are not a member of.
+    let outsider = elsewhere.admin.access_token.clone();
+    let u = prefetch_username(&app, &outsider, &named).await;
+    assert_eq!(org_of_username(&u), None, "a non-member: {u}");
+    // Uncharged: the caller's own org, with a device that lives elsewhere.
+    let u = prefetch_username(
+        &app,
+        &outsider,
+        &format!("?tenant_id={}&agent_id={device}", elsewhere.tenant_id),
+    )
+    .await;
+    assert_eq!(org_of_username(&u), None, "a device of another org: {u}");
 }

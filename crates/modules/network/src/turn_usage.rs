@@ -45,7 +45,9 @@ pub const CHANNELS: [&str; 2] = [
 /// allocation's life, so a late duplicate is still recognised.
 const COUNTED_TTL_SECS: u64 = 7 * 86_400;
 
-/// Bytes coturn reported under a username that names no org.
+/// Bytes coturn reported under a username that names no org. A diagnostic,
+/// not a ledger: every pod hears every message, and nothing is claimed for
+/// these, so each pod counts all of them.
 pub static TURN_UNATTRIBUTED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// One allocation leg's totals, as coturn published them.
