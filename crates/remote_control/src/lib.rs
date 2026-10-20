@@ -36,6 +36,7 @@
 pub mod audit;
 pub mod connect_code;
 pub mod consent;
+pub mod derp_frame;
 pub mod derp_ticket;
 pub mod error;
 pub mod hive;
