@@ -1,10 +1,20 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-dialog v-model="dialogModel" max-width="600" scrollable>
+  <v-dialog v-model="dialogModel" max-width="600" scrollable :fullscreen="fullscreen">
     <v-card>
       <v-card-title class="d-flex align-center pa-3">
-        <v-icon class="mr-2" size="small">mdi-magnify</v-icon>
+        <!-- Full screen on a phone leaves no scrim to tap: this is the way out. -->
+        <v-btn
+          v-if="fullscreen"
+          icon="mdi-arrow-left"
+          size="small"
+          variant="text"
+          class="mr-1"
+          aria-label="Close search"
+          @click="dialogModel = false"
+        />
+        <v-icon v-else class="mr-2" size="small">mdi-magnify</v-icon>
         <v-text-field
           ref="searchInput"
           v-model="query"
@@ -15,10 +25,11 @@
           density="compact"
           @keydown.esc="dialogModel = false"
         />
-        <v-chip size="x-small" variant="outlined" class="ml-2">ESC</v-chip>
+        <!-- A key a touch keyboard does not have. -->
+        <v-chip v-if="!fullscreen" size="x-small" variant="outlined" class="ml-2">ESC</v-chip>
       </v-card-title>
       <v-divider />
-      <v-card-text style="max-height: 400px; overflow-y: auto;" class="pa-0">
+      <v-card-text :style="fullscreen ? undefined : 'max-height: 400px; overflow-y: auto;'" class="pa-0">
         <div v-if="loading" class="text-center pa-4">
           <v-progress-circular indeterminate size="24" />
         </div>
@@ -95,6 +106,7 @@ import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { useTenantStore } from '@/stores/tenant'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 
 interface SearchMessageResult {
   id: string
@@ -141,6 +153,7 @@ const dialogModel = computed({
 
 const router = useRouter()
 const tenantStore = useTenantStore()
+const { fullscreen } = useResponsiveDialog()
 
 const query = ref('')
 const loading = ref(false)

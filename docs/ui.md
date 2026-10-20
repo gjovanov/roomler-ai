@@ -195,6 +195,26 @@ that one param. Every other route stays unkeyed on purpose — several views rew
 Hide secondary toolbar items below `sm` with `d-none d-sm-inline-flex`, and
 surface a phone fallback alongside.
 
+### Phones and tablets (FR-116)
+
+Three widths matter, and each has its own job. Vuetify's own `mobile` means **narrower than 1280 px**
+here (`plugins/vuetify.ts` sets no `mobileBreakpoint`), so it is the drawer's switch and nothing else's:
+
+```mermaid
+flowchart LR
+    XS["xs · &lt; 600 px<br/>phone: full-screen dialogs,<br/>icon-only bar indicators"] --> SM["sm · 600–959 px<br/>portrait tablet: card layouts<br/>(two columns)"]
+    SM --> MD["md · 960–1279 px<br/>tables and grids;<br/>the drawer still overlays"]
+    MD --> LG["lg · ≥ 1280 px<br/>the permanent drawer"]
+```
+
+| rule | where | why |
+|---|---|---|
+| **The page never scrolls sideways.** `v-main` clips horizontal overflow; a wide table scrolls inside its own box | `AppLayout.vue` `.app-main-no-scroll` | the house `pa-2` (8 px) is narrower than a `v-row`'s 12 px gutters, so every page with a row swayed 4 px under a finger |
+| **A new page opens at its top.** A path change scrolls `v-main` to 0; a query or hash change keeps the place | `AppLayout.vue`, the `route.path` watcher | `v-main` is the scroller, not the window, so `window.scrollTo` and a router `scrollBehavior` do nothing |
+| **The bar's phone budget** (&lt; 600 px): ☰ · title · your call · other calls · unread · search · bell · avatar. The tutorial `?` and the theme toggle move into the avatar menu, and the call and unread indicators become icons with a badge | `AppLayout.vue` `<v-app-bar>` | past ~344 px the avatar menu — and Logout with it — was pushed off-screen |
+| **What the drawer signals reaches the bar** when the drawer is closed: a dot on ☰ for another org's activity, and your call's controls (Return · Mute · Camera · Hang up) as a menu off the call page | `AppLayout.vue`; `composables/useCallControls.ts`, shared with `MiniConference` | the drawer is temporary below 1280 px, so a call kept a live mic with nothing on screen saying so |
+| **A dialog of any substance is full screen below 600 px** and carries its own close control | `composables/useResponsiveDialog.ts` | a centred dialog leaves 264 px of content at 360 px; a full-screen one has no scrim to tap |
+
 ⚠️ `ChatView` and `ConferenceView` own their own custom-flex layout and
 **intentionally do not use `<v-container>`** — do not "fix" them to match.
 

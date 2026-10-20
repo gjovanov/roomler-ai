@@ -8,7 +8,7 @@
       <v-btn
         v-if="store.unreadCount > 0"
         variant="text"
-        size="x-small"
+        size="small"
         @click="store.markAllRead()"
       >
         Mark all read
@@ -41,7 +41,9 @@
             {{ iconFor(notif.notification_type) }}
           </v-icon>
         </template>
-        <v-list-item-title class="text-body-2">{{ notif.title }}</v-list-item-title>
+        <!-- Wraps: the title is the whole notification; one clipped line
+             could only be read by tapping it, which also navigates away. -->
+        <v-list-item-title class="text-body-2 text-wrap">{{ notif.title }}</v-list-item-title>
         <v-list-item-subtitle class="text-caption">
           {{ formatTime(notif.created_at) }}
         </v-list-item-subtitle>
