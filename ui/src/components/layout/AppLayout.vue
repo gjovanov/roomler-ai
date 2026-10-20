@@ -624,6 +624,7 @@ import { useBrand } from '@/composables/useBrand'
 import SpotlightTour from '@/components/tutorial/SpotlightTour.vue'
 import { useSpotlightTour } from '@/composables/useSpotlightTour'
 import { usePageViews } from '@/composables/usePageViews'
+import { useRouteTenantSync } from '@/composables/useRouteTenantSync'
 import { useTenantStore } from '@/stores/tenant'
 import {
   canManageInvites,
@@ -898,18 +899,10 @@ watch(
   { immediate: true },
 )
 
-// Route → store sync: keep tenantStore.current on the org the URL names
-// (nothing watched route.params.tenantId before, so titles/settings/billing
-// showed the alphabetically-first org on deep links).
-watch(
-  () => route.params.tenantId,
-  (id) => {
-    if (typeof id === 'string' && id && id !== tenantStore.current?.id) {
-      const t = tenantStore.tenants.find((x) => x.id === id)
-      if (t) tenantStore.setCurrent(t)
-    }
-  },
-)
+// Route → store sync: keep tenantStore.current on the org the URL names —
+// on a deep link and a reload too, where the param never changes and the org
+// list lands after mount (useRouteTenantSync says why that mattered).
+useRouteTenantSync(route)
 
 // S6 — keep the WS's tenant-affinity key in sync with the active
 // tenant. PR-1 made this LAZY: the store only records the key (the
