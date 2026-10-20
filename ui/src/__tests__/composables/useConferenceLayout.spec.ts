@@ -68,6 +68,15 @@ beforeEach(() => {
 describe('resolveEffectiveMode', () => {
   const base = { hasScreenShare: false, pinnedCount: 0, participantCount: 5 }
 
+  // FR-116 — the sidebar's 280 px strip left a share ~72 px wide on a phone.
+  it('spotlights a screen share on a narrow screen, and keeps the sidebar elsewhere', () => {
+    expect(resolveEffectiveMode('auto', { ...base, hasScreenShare: true, narrow: true })).toBe('spotlight')
+    expect(resolveEffectiveMode('auto', { ...base, hasScreenShare: true, narrow: false })).toBe('sidebar')
+    expect(resolveEffectiveMode('auto', { ...base, hasScreenShare: true })).toBe('sidebar')
+    // An explicit choice stays the user's, narrow or not.
+    expect(resolveEffectiveMode('sidebar', { ...base, hasScreenShare: true, narrow: true })).toBe('sidebar')
+  })
+
   it('passes an explicit mode straight through — the picker is not a suggestion', () => {
     for (const m of ['tiled', 'spotlight', 'sidebar'] as const) {
       expect(resolveEffectiveMode(m, { ...base, hasScreenShare: true })).toBe(m)
