@@ -17,11 +17,19 @@ env:
 
 # A new push to a PR supersedes its previous run: cancel that run instead of
 # letting a stack of stale ones hold the account's concurrent-job slots (one
-# run of this file is 17 jobs). Master runs are never cancelled: each one
+# run of this file is 17 jobs). A RUNNING master run is never cancelled: it
 # verifies a merged commit, and it is the only kind of run that SAVES the
 # cargo caches (see the Rust lanes below).
+#
+# FR-6 wave 25 (#773): master's runs share one group, so GitHub keeps at most
+# one running and one WAITING. A newer push cancels the waiting run, which
+# verified nothing yet, and the newest commit's run covers it. The group used
+# to be per commit, so a burst of merges queued a full run each: on
+# 2026-10-20 ten squash-merges queued ten runs (170 jobs) against the
+# account's 20 concurrent slots, until a session cancelled its own superseded
+# runs by hand. PR jobs waited 20-64 min for a slot on 10-19 and 10-20.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
