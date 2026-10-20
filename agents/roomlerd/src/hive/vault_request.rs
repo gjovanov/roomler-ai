@@ -8,6 +8,7 @@
 //! | the lease | asked for once, decided by the vault's `secret:use` with its guardrails, recorded; held in daemon memory, never handed to the session |
 //! | its use | a later `vault_exec`, `vault_render` or `vault_connect` naming the same secret toward the same audience takes it, while it covers what that call needs, instead of asking again; every such call still asks a person |
 //! | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go |
+//! | a dynamic secret | P3-6b-2b: asked for as a whole in `short-lived`, whatever the use; the first use that takes it mints its credential, and every later one shares it. Not for `proxy`: `vault_connect` serves no dynamic secret |
 //!
 //! A use takes the lease by WHAT it is, not by its id: the call still names
 //! the secret it hands on, so a person approving it reads which.
@@ -16,7 +17,8 @@ use bson::oid::ObjectId;
 use serde_json::{Value, json};
 
 use super::toolbelt::VaultTools;
-use super::vault_exec::{Handle, handle_of};
+use super::vault_exec::{Handle, dynamic_of, handle_of};
+use crate::vault::SHORT_LIVED;
 
 /// How long a lease asked for ahead lasts when the call does not say.
 const DEFAULT_TTL: u32 = 300;
@@ -104,6 +106,42 @@ pub(crate) async fn call(
     args: &Value,
 ) -> Result<Value, String> {
     let req = parse(args)?;
+    // P3-6b-2b — a dynamic secret is asked for as a whole, in `short-lived`,
+    // whatever use it is for: the use that takes it mints its credential,
+    // once, and every use that takes it after shares that credential.
+    if let Some(d) = dynamic_of(vault, session, fence, &req.handle.secret).await? {
+        if req.mode == "proxy" {
+            return Err(format!(
+                "{}: vault_connect does not sign in with a dynamic secret's credential: vault_exec \
+                 and vault_render serve it",
+                req.handle
+            ));
+        }
+        if !req.handle.field.is_empty() && !d.fields.contains(&req.handle.field) {
+            return Err(format!(
+                "{}: {} is a dynamic secret: name a field of the credential minted for it, #{}",
+                req.handle,
+                req.handle.secret,
+                d.fields.join(", #")
+            ));
+        }
+        let all = Handle {
+            secret: req.handle.secret.clone(),
+            field: String::new(),
+        };
+        let lease = vault
+            .lease_ahead(session, fence, &all, SHORT_LIVED, "", req.ttl)
+            .await
+            .map_err(|why| format!("{}: {why}", req.handle))?;
+        let ttl_s = vault.left(&lease).map_or(0, |left| left.as_secs());
+        return Ok(json!({
+            "lease_id": lease,
+            "handle": all.to_string(),
+            "mode": SHORT_LIVED,
+            "provider": d.provider,
+            "ttl_s": ttl_s,
+        }));
+    }
     let lease = vault
         .lease_ahead(
             session,

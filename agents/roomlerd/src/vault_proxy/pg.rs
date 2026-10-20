@@ -300,9 +300,6 @@ where
 }
 
 /// P3-6b-2 — the most a query's answer may hold, in one message.
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 const MAX_RESULT_MESSAGE: usize = 1024 * 1024;
 
 /// P3-6b-2 — the daemon's own session with an upstream, as a dynamic
@@ -310,9 +307,6 @@ const MAX_RESULT_MESSAGE: usize = 1024 * 1024;
 /// sign-in [`authenticate`] does for the proxy, then the server's messages
 /// read to its first `ReadyForQuery`. Every refusal in words, never the
 /// password's.
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn sign_in(up: &Upstream, database: &str) -> Result<TlsStream<TcpStream>, String> {
     if up.user.is_empty() || up.user.contains('\0') || database.contains('\0') {
         return Err("the issuer's user or database is not a name Postgres takes".into());
@@ -362,9 +356,6 @@ pub(crate) async fn sign_in(up: &Upstream, database: &str) -> Result<TlsStream<T
 /// columns as text (`None` for a NULL), or the server's error in its own
 /// words. Several statements in one query run as one transaction, as
 /// Postgres runs them.
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn simple_query(
     s: &mut TlsStream<TcpStream>,
     sql: &str,
@@ -400,9 +391,6 @@ pub(crate) async fn simple_query(
 
 /// A `DataRow`'s columns: a count, then each one's length (-1 for NULL) and
 /// bytes.
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 fn data_row(body: &[u8]) -> Result<Vec<Option<String>>, String> {
     let bad = || "the upstream sent a row that does not parse".to_string();
     let count = u16::from_be_bytes(
@@ -434,9 +422,6 @@ fn data_row(body: &[u8]) -> Result<Vec<Option<String>>, String> {
 }
 
 /// P3-6b-2 — end a session the daemon began (`Terminate`).
-// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
-// minter's tests are.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn terminate(mut s: TlsStream<TcpStream>) {
     let _ = s.write_all(&frame(Some(b'X'), &[])).await;
     let _ = s.shutdown().await;

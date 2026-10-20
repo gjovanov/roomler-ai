@@ -303,9 +303,18 @@ pub(crate) trait VaultTools: Send + Sync {
     /// lease is no longer held.
     #[cfg(feature = "vault")]
     fn stop_with(&self, lease_id: &str, stop: CancellationToken) -> bool;
-    /// The value a held lease holds, while it is held.
+    /// The value a held lease holds, while it is held: never a dynamic
+    /// secret's bundle, which holds its issuer's fields.
     #[cfg(feature = "vault")]
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>>;
+    /// P3-6b-2b — mint the credential a dynamic secret's lease serves, once
+    /// per lease: a second use waits for the first's credential.
+    #[cfg(feature = "vault")]
+    async fn mint(&self, lease_id: &str) -> Result<(), String>;
+    /// P3-6b-2b — one field of the credential minted for a lease, by the name
+    /// a session gives it, while the lease is held.
+    #[cfg(feature = "vault")]
+    fn minted(&self, lease_id: &str, field: &str) -> Option<zeroize::Zeroizing<Vec<u8>>>;
     /// Let go of these leases now.
     #[cfg(feature = "vault")]
     fn release(&self, lease_ids: &[String]);
@@ -562,6 +571,14 @@ impl VaultTools for DaemonVault {
 
     fn value(&self, lease_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
         crate::vault::CLIENT.with_value(lease_id, |v| zeroize::Zeroizing::new(v.to_vec()))
+    }
+
+    async fn mint(&self, lease_id: &str) -> Result<(), String> {
+        crate::vault::CLIENT.mint(lease_id).await
+    }
+
+    fn minted(&self, lease_id: &str, field: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        crate::vault::CLIENT.minted(lease_id, field)
     }
 
     fn release(&self, lease_ids: &[String]) {
@@ -872,11 +889,13 @@ fn vault_tools() -> Vec<Value> {
         "name": "vault_exec",
         "description": "Runs one command with values from the Roomler vault in its environment, \
                         as this session's account, from its folder. argv[0] is the program's bare \
-                        name: it must be on each secret's exec_allow, and installed in the \
+                        name: it must be on each stored secret's exec_allow, and installed in the \
                         system's own directories. env maps each variable to a secret (a path, or \
                         rrn:<org>:secret:<path>, with #<field> for a structured secret's field). \
-                        The output comes back with each value replaced by [vault:NAME]. A person \
-                        approves every call.",
+                        A dynamic secret (vault_describe names its provider) gives each variable \
+                        naming it a field of one credential minted for this call, such as #user \
+                        and #password, taken back when the call ends. The output comes back with \
+                        each value replaced by [vault:NAME]. A person approves every call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -904,8 +923,10 @@ fn vault_tools() -> Vec<Value> {
         "description": "Writes a template with values from the Roomler vault into this session's \
                         secrets directory, as a file only this session's account can read, and \
                         answers its path. Put each secret in the template as {{ a/path }} (or \
-                        {{ rrn:<org>:secret:<path>#<field> }}). The file is removed when its \
-                        lease ends (ttl_s, 30 to 900 seconds). Claude Code's Read tool may not \
+                        {{ rrn:<org>:secret:<path>#<field> }}). A dynamic secret's placeholders \
+                        are written from one credential minted for the file. The file is removed \
+                        when its lease ends (ttl_s, 30 to 900 seconds), and a minted credential \
+                        is taken back with it. Claude Code's Read tool may not \
                         open it: hand its path to the program that needs it. A person approves \
                         every call.",
         "inputSchema": {
@@ -943,7 +964,8 @@ fn vault_tools() -> Vec<Value> {
                         https://host:port; for ssh, ssh://host, ssh://host:port or \
                         ssh://user@host. ca names a secret holding the upstream's CA certificate \
                         (PEM) when the system does not trust it. The endpoint closes with its \
-                        lease (ttl_s, 30 to 900 seconds). A person approves every call.",
+                        lease (ttl_s, 30 to 900 seconds). A dynamic secret is not served here: \
+                        vault_exec and vault_render serve it. A person approves every call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -973,7 +995,10 @@ fn vault_tools() -> Vec<Value> {
                         #host_keys). A later use that names the same \
                         secret toward the same \
                         audience takes this lease instead of asking again, while it lasts \
-                        (ttl_s, 30 to 900 seconds). Each of those calls still asks a person.",
+                        (ttl_s, 30 to 900 seconds). A dynamic secret is asked for whole, in \
+                        short-lived mode, for exec or file alike: its first use mints its \
+                        credential, and every later use shares it. Each of those calls still \
+                        asks a person.",
         "inputSchema": {
             "type": "object",
             "properties": {
