@@ -595,6 +595,413 @@ pub(crate) fn made() -> String {
     format!("made-{:016x}", rand::random::<u64>())
 }
 
+/// P3-6d-1 — the real MySQL a run names, as its `root`'s upstream:
+/// `ROOMLER_TEST_MYSQL` (`host:port`), its CA's PEM at
+/// `ROOMLER_TEST_MYSQL_CA`, and `root`'s sign-in word in the file at
+/// `ROOMLER_TEST_MYSQL_AUTH_FILE`. `None` when the run names none: the tests
+/// that need one are ignored by default.
+pub(crate) fn real_mysql() -> Option<super::pg::Upstream> {
+    let at = std::env::var("ROOMLER_TEST_MYSQL").ok()?;
+    let (host, port) = at.rsplit_once(':')?;
+    let ca = std::fs::read_to_string(std::env::var("ROOMLER_TEST_MYSQL_CA").ok()?).ok()?;
+    let word = std::fs::read_to_string(std::env::var("ROOMLER_TEST_MYSQL_AUTH_FILE").ok()?).ok()?;
+    Some(super::pg::Upstream {
+        host: host.to_string(),
+        port: port.parse().ok()?,
+        user: "root".into(),
+        password: zeroize::Zeroizing::new(word.trim().to_string()),
+        tls: super::tls::connector(Some(&ca)).ok()?,
+    })
+}
+
+/// P3-6d-1 — one user the fake MySQL holds.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct FakeUser {
+    /// `CREATE USER … AS`'s form: `$A$005$`, its salt, its digest.
+    pub(crate) form: String,
+    pub(crate) attribute: Option<String>,
+    pub(crate) grants: Vec<String>,
+    pub(crate) default_roles: bool,
+    pub(crate) locked: bool,
+}
+
+/// The fake MySQL's users, by name.
+pub(crate) type FakeUsers = Arc<std::sync::Mutex<std::collections::BTreeMap<String, FakeUser>>>;
+
+/// What the fake MySQL refuses, as MySQL refuses an issuer short of a
+/// privilege: an event without `EVENT` on the database, a grant without the
+/// role's `ADMIN OPTION`, a `KILL` without `CONNECTION_ADMIN`.
+#[derive(Default)]
+pub(crate) struct MysqlRefuse {
+    pub(crate) event: std::sync::atomic::AtomicBool,
+    pub(crate) grant: std::sync::atomic::AtomicBool,
+    pub(crate) kill: std::sync::atomic::AtomicBool,
+}
+
+/// P3-6d-1 — a MySQL an issuer mints in, over real TLS with a certificate
+/// made for the test. `admin` signs in by the password it was made with; a
+/// user it made, by the form `CREATE USER … AS` gave it, while it is not
+/// locked; a user it does not hold is switched to `sha256_password` and
+/// refused, as MySQL answers one. Every sign-in is the full one, the password
+/// inside the TLS. The minter's statements are answered as MySQL answers
+/// them, each clause read where it stands, and every query kept.
+pub(crate) struct FakeMysql {
+    pub(crate) ca: String,
+    pub(crate) port: u16,
+    pub(crate) saw: mpsc::UnboundedReceiver<String>,
+    pub(crate) users: FakeUsers,
+    pub(crate) events: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    pub(crate) refuse: Arc<MysqlRefuse>,
+    /// How many connections it took: zero for a call refused before
+    /// anything is dialled.
+    pub(crate) dialled: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(crate) async fn fake_mysql(password: &str) -> FakeMysql {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let ca = cert.cert.pem();
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, saw) = mpsc::unbounded_channel();
+    let users: FakeUsers = Arc::default();
+    let events: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let refuse: Arc<MysqlRefuse> = Arc::default();
+    let dialled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mysql = MysqlState {
+        password: password.to_string(),
+        users: users.clone(),
+        events: events.clone(),
+        refuse: refuse.clone(),
+    };
+    let d2 = dialled.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (acceptor, tx, mysql) = (acceptor.clone(), tx.clone(), mysql.clone());
+            tokio::spawn(async move {
+                let _ = serve_mysql(tcp, acceptor, mysql, tx).await;
+            });
+        }
+    });
+    FakeMysql {
+        ca,
+        port,
+        saw,
+        users,
+        events,
+        refuse,
+        dialled,
+    }
+}
+
+/// The one query the fake MySQL answers as a hostile server would: by asking
+/// for a local file (`LOCAL INFILE`'s request, `0xFB` and a path).
+pub(crate) const LOCAL_FILE_PLEASE: &str = "SELECT 'a local file, please'";
+
+/// What every connection of the fake MySQL shares.
+#[derive(Clone)]
+struct MysqlState {
+    password: String,
+    users: FakeUsers,
+    events: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    refuse: Arc<MysqlRefuse>,
+}
+
+/// How the fake MySQL checks one account's password: `admin`'s against the
+/// password the fake was made with, a minted user's against its form.
+type PasswordCheck = Box<dyn Fn(&[u8]) -> bool + Send>;
+
+/// One connection of the fake MySQL: its greeting, TLS, the sign-in, then
+/// queries until `COM_QUIT`.
+async fn serve_mysql(
+    mut tcp: tokio::net::TcpStream,
+    acceptor: TlsAcceptor,
+    mysql: MysqlState,
+    tx: mpsc::UnboundedSender<String>,
+) -> Result<(), String> {
+    use super::mysql::{CACHING_SHA2, CAPS, CLIENT_SSL, SHA256, read_packet, write_packet};
+    let nonce: Vec<u8> = (0..20).map(|_| b'a' + rand::random::<u8>() % 26).collect();
+    let caps = CAPS | CLIENT_SSL;
+    let mut g = vec![10];
+    g.extend(b"8.4.11-fake\0");
+    g.extend(9u32.to_le_bytes());
+    g.extend(&nonce[..8]);
+    g.push(0);
+    g.extend((caps as u16).to_le_bytes());
+    g.push(255);
+    g.extend(2u16.to_le_bytes());
+    g.extend(((caps >> 16) as u16).to_le_bytes());
+    g.push(21);
+    g.extend([0u8; 10]);
+    g.extend(&nonce[8..]);
+    g.push(0);
+    g.extend(CACHING_SHA2.as_bytes());
+    g.push(0);
+    write_packet(&mut tcp, 0, &g).await?;
+    let (_, ssl) = read_packet(&mut tcp, 1024).await?;
+    let asked = u32::from_le_bytes(ssl.get(..4).ok_or("short")?.try_into().unwrap());
+    assert_ne!(asked & CLIENT_SSL, 0, "the client asks for TLS first");
+    let mut s = acceptor.accept(tcp).await.map_err(|e| e.to_string())?;
+    let (got, hello) = read_packet(&mut s, 64 * 1024).await?;
+    let user_end = 32 + hello[32..].iter().position(|b| *b == 0).ok_or("no user")?;
+    let user = String::from_utf8_lossy(&hello[32..user_end]).into_owned();
+    let mut seq = got.wrapping_add(1);
+    let denied = |user: &str| {
+        let mut e = vec![0xFF];
+        e.extend(1045u16.to_le_bytes());
+        e.extend(
+            format!("#28000Access denied for user '{user}'@'localhost' (using password: YES)")
+                .as_bytes(),
+        );
+        e
+    };
+    // The account's check: the password the fake was made with for
+    // `admin`, the form for a user it made, nothing for any other.
+    let check: Option<PasswordCheck> = if user == "admin" {
+        let want = mysql.password.clone().into_bytes();
+        Some(Box::new(move |pw: &[u8]| pw == want.as_slice()))
+    } else {
+        let form = mysql
+            .users
+            .lock()
+            .unwrap()
+            .get(&user)
+            .filter(|u| !u.locked)
+            .map(|u| u.form.clone());
+        form.map(|form| {
+            Box::new(move |pw: &[u8]| {
+                form.len() == 70
+                    && form.starts_with("$A$005$")
+                    && super::sha_crypt::sha256_crypt(
+                        pw,
+                        &form.as_bytes()[7..27],
+                        super::sha_crypt::MYSQL_ROUNDS,
+                    ) == form[27..]
+            }) as PasswordCheck
+        })
+    };
+    let Some(check) = check else {
+        // As MySQL answers a user it does not hold: a switch, then a refusal.
+        let mut switch = vec![0xFE];
+        switch.extend(SHA256.as_bytes());
+        switch.push(0);
+        switch.extend(&nonce);
+        switch.push(0);
+        write_packet(&mut s, seq, &switch).await?;
+        let (got, _) = read_packet(&mut s, 1024).await?;
+        write_packet(&mut s, got.wrapping_add(1), &denied(&user)).await?;
+        return Ok(());
+    };
+    // The full sign-in: the password itself, inside the TLS.
+    write_packet(&mut s, seq, &[0x01, 0x04]).await?;
+    let (got, plain) = read_packet(&mut s, 1024).await?;
+    seq = got.wrapping_add(1);
+    let plain = plain.strip_suffix(&[0]).unwrap_or(&plain);
+    if !check(plain) {
+        write_packet(&mut s, seq, &denied(&user)).await?;
+        return Ok(());
+    }
+    write_packet(&mut s, seq, &[0x00, 0, 0, 2, 0, 0, 0]).await?;
+    loop {
+        let Ok((_, cmd)) = read_packet(&mut s, 1 << 20).await else {
+            return Ok(());
+        };
+        match cmd.first() {
+            Some(0x01) => return Ok(()),
+            Some(0x03) => {
+                let sql = String::from_utf8_lossy(&cmd[1..]).into_owned();
+                let _ = tx.send(sql.clone());
+                for (i, p) in mysql_answer(&sql, &mysql).iter().enumerate() {
+                    write_packet(&mut s, u8::try_from(i + 1).unwrap(), p).await?;
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// How the fake MySQL answers one query: the minter's statements, as MySQL
+/// answers them, each clause read where it stands; anything else, a syntax
+/// error. Packets, in order.
+fn mysql_answer(sql: &str, mysql: &MysqlState) -> Vec<Vec<u8>> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ok = || vec![vec![0x00, 0, 0, 2, 0, 0, 0]];
+    let err = |code: u16, state: &str, msg: &str| {
+        let mut e = vec![0xFF];
+        e.extend(code.to_le_bytes());
+        e.push(b'#');
+        e.extend(state.as_bytes());
+        e.extend(msg.as_bytes());
+        vec![e]
+    };
+    let rows = |column: &str, values: Vec<String>| {
+        let eof = vec![0xFE, 0, 0, 2, 0];
+        let mut def = Vec::new();
+        for part in ["def", "", "", "", column, ""] {
+            def.push(u8::try_from(part.len()).unwrap());
+            def.extend(part.as_bytes());
+        }
+        def.extend([0x0c, 255, 0, 0, 1, 0, 0, 0xFD, 0, 0, 0, 0, 0]);
+        let mut out = vec![vec![1], def, eof.clone()];
+        for v in values {
+            let mut r = vec![u8::try_from(v.len()).unwrap()];
+            r.extend(v.as_bytes());
+            out.push(r);
+        }
+        out.push(eof);
+        out
+    };
+    let quoted_after = |marker: &str| between(sql, marker, '\'').map(String::from);
+    if sql == LOCAL_FILE_PLEASE {
+        let mut p = vec![0xFB];
+        p.extend(b"/etc/hostname");
+        return vec![p];
+    }
+    let mut users = mysql.users.lock().unwrap();
+    if let Some(name) = quoted_after("CREATE USER '").filter(|_| sql.starts_with("CREATE USER '")) {
+        let user = FakeUser {
+            form: quoted_after(" AS '").unwrap_or_default(),
+            attribute: quoted_after(" ATTRIBUTE '"),
+            ..FakeUser::default()
+        };
+        match users.entry(name) {
+            std::collections::btree_map::Entry::Occupied(taken) => err(
+                1396,
+                "HY000",
+                &format!("Operation CREATE USER failed for '{}'@'%'", taken.key()),
+            ),
+            std::collections::btree_map::Entry::Vacant(free) => {
+                free.insert(user);
+                ok()
+            }
+        }
+    } else if sql.starts_with("GRANT '") {
+        if mysql.refuse.grant.load(SeqCst) {
+            return err(
+                1227,
+                "42000",
+                "Access denied; you need (at least one of) the WITH ADMIN OPTION privilege(s) for this operation",
+            );
+        }
+        let role = quoted_after("GRANT '").unwrap_or_default();
+        match quoted_after(" TO '").and_then(|t| users.get_mut(&t)) {
+            Some(u) => {
+                u.grants.push(role);
+                ok()
+            }
+            None => err(3523, "HY000", "Unknown authorization ID"),
+        }
+    } else if sql.starts_with("SET DEFAULT ROLE ALL TO '") {
+        match quoted_after(" TO '").and_then(|t| users.get_mut(&t)) {
+            Some(u) => {
+                u.default_roles = true;
+                ok()
+            }
+            None => err(3523, "HY000", "Unknown authorization ID"),
+        }
+    } else if sql.starts_with("CREATE EVENT ") {
+        if mysql.refuse.event.load(SeqCst) {
+            return err(
+                1044,
+                "42000",
+                "Access denied for user 'admin'@'%' to database 'orders'",
+            );
+        }
+        let name = between(sql, ".`", '`').unwrap_or_default().to_string();
+        mysql.events.lock().unwrap().insert(name);
+        ok()
+    } else if sql
+        .starts_with("SELECT USER FROM information_schema.USER_ATTRIBUTES WHERE USER LIKE ")
+    {
+        // The sweep: a name's prefix (`\_` an underscore), an `until` past
+        // (a user with none is never past it).
+        let prefix = quoted_after("USER LIKE '")
+            .map(|p| p.trim_end_matches('%').replace("\\_", "_"))
+            .unwrap_or_default();
+        let past = sql.contains("AS UNSIGNED) < UNIX_TIMESTAMP()");
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let until = |a: &Option<String>| {
+            a.as_deref()
+                .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                .and_then(|v| v["roomler"]["until"].as_i64())
+        };
+        let ended = users
+            .iter()
+            .filter(|(name, u)| {
+                name.starts_with(&prefix) && (!past || until(&u.attribute).is_some_and(|t| t < now))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        rows("USER", ended)
+    } else if let Some(name) = sql
+        .strip_prefix("SELECT USER FROM information_schema.USER_ATTRIBUTES WHERE USER = '")
+        .and_then(|r| r.strip_suffix('\''))
+    {
+        rows(
+            "USER",
+            users
+                .contains_key(name)
+                .then(|| name.to_string())
+                .into_iter()
+                .collect(),
+        )
+    } else if sql.starts_with("ALTER USER '") && sql.ends_with(" ACCOUNT LOCK") {
+        match quoted_after("ALTER USER '").and_then(|t| users.get_mut(&t)) {
+            Some(u) => {
+                u.locked = true;
+                ok()
+            }
+            None => err(1396, "HY000", "Operation ALTER USER failed"),
+        }
+    } else if let Some(name) = sql
+        .strip_prefix("SELECT ID FROM information_schema.PROCESSLIST WHERE USER = '")
+        .and_then(|r| r.strip_suffix('\''))
+    {
+        // One open session for each user it holds, to end.
+        rows(
+            "ID",
+            users
+                .contains_key(name)
+                .then(|| "17".to_string())
+                .into_iter()
+                .collect(),
+        )
+    } else if sql.starts_with("KILL ") {
+        if mysql.refuse.kill.load(SeqCst) {
+            return err(1095, "HY000", "You are not owner of thread 17");
+        }
+        ok()
+    } else if sql.starts_with("DROP USER IF EXISTS '") {
+        if let Some(name) = quoted_after("DROP USER IF EXISTS '") {
+            users.remove(&name);
+        }
+        ok()
+    } else if sql.starts_with("DROP EVENT IF EXISTS ") {
+        let name = between(sql, ".`", '`').unwrap_or_default().to_string();
+        mysql.events.lock().unwrap().remove(&name);
+        ok()
+    } else {
+        err(1064, "42000", "You have an error in your SQL syntax")
+    }
+}
+
 /// What the proxy sends in the two seconds after a refusal: nothing,
 /// when it hangs up as it should.
 async fn what_follows<S: AsyncRead + Unpin>(s: &mut S) -> Vec<u8> {

@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use serde_json::json;
 
 use super::super::testing::{FakeIssuer, FakeRole, fake_issuer, made};
+use super::super::tls;
 use super::*;
 
 /// `host:port`, as the endpoint's own reader takes it, for these tests.
