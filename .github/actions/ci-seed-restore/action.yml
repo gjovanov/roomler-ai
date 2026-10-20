@@ -50,17 +50,28 @@ runs:
         set -uo pipefail
         # The key covers what third-party build artifacts depend on: the lockfile, the
         # toolchain, the job's own definition (cargo-cache-salt's file, which the calling job
-        # writes first) and the cargo/compiler environment. It only decides whether a save may be
-        # skipped, never what cargo treats as fresh, so a spurious change costs one upload.
+        # writes first), the cargo/compiler environment and every manifest. It only decides
+        # whether a save may be skipped, never what cargo treats as fresh, so a spurious change
+        # costs one upload.
         key=$(
           {
             echo "os=${RUNNER_OS:-?} arch=${RUNNER_ARCH:-?}"
             rustc -vV 2>/dev/null | grep -E '^(release|commit-hash|host):' || true
             env | grep -E '^(CARGO_|RUSTFLAGS=|RUSTDOCFLAGS=|CC=|CXX=|CFLAGS=|CXXFLAGS=)' \
                 | grep -vE '^CARGO_(HOME|TERM_COLOR)=' | LC_ALL=C sort
-            for f in Cargo.lock rust-toolchain.toml rust-toolchain ci-cache-salt/.cargo/config.toml; do
+            for f in Cargo.lock rust-toolchain.toml rust-toolchain .cargo/config.toml ci-cache-salt/.cargo/config.toml; do
               [ -f "$f" ] && printf '%s %s\n' "$f" "$(git hash-object "$f")"
             done
+            # FR-6 wave 23: the manifests too. Their [profile] and feature settings shape the
+            # dependency builds and Cargo.lock records neither, so without them a profile change
+            # would restore "same key", skip the publish, and leave every later run rebuilding
+            # what it changed. Without `version =` lines, so a release bump does not re-publish
+            # every family.
+            printf 'manifests %s\n' "$(git ls-files -z -- Cargo.toml '*/Cargo.toml' | LC_ALL=C sort -z \
+              | while IFS= read -r -d '' m; do
+                  printf '== %s\n' "$m"
+                  tr -d '\r' < "$m" | grep -vE '^[[:space:]]*version[[:space:]]*='
+                done | git hash-object --stdin)"
           } | git hash-object --stdin
         )
         echo "key=$key" >> "$GITHUB_OUTPUT"
