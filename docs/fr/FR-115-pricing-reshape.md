@@ -227,7 +227,7 @@ flowchart LR
 - Throttled, never refused (D4). The tenant analytics page shows usage against the allowance in
   units, never money (FR-20's decision stands).
 
-### P4a, as proposed — the DERP throttle (for the operator's review before any code)
+### P4a — the DERP throttle (approved by the operator 2026-10-20)
 
 **What it must not break.** DERP over TLS :443 is the floor that always connects (pillar 2,
 commitment 2). A throttle that delays a WireGuard handshake past its retry window turns "slow"
@@ -367,7 +367,7 @@ room is piped across workers. That is O4.
 | P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | ✅ merged #2565 (`069981677`) against the fake; proven against Stripe's test mode, including a test-card checkout in a real browser (#2604, AC3 + AC4). A Free `year` price that put annual on every page was fixed by #2603 |
 | P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`73bc6daeb`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
 | P3b | A cross-org session counts against the controller's org (Redis leases); Free gets no support sessions to other orgs | `rc.org_session_cap = false` | ⬜ |
-| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | ⬜ designed (*P4a, as proposed*); waits on the operator's review and O3's measurement |
+| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 design approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616) is on the API pods, shipped dark. P4a-2 (the PoPs, via the signed `/stats` poll) and P4a-3 (the analytics surface) come next, and O3's measurement comes before it is switched on |
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | coturn flag off | ⬜ |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
