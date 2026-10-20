@@ -2757,10 +2757,10 @@ have stopped its model calls:
 
 "Unreachable" means two things at once: the device has no connection on this pod, and its
 row's `last_seen_at` is 230 s old. Every hello stamps that field before the connection is
-registered ([`socket.rs:136`](../crates/modules/fleet/src/socket.rs#L136)), every
-heartbeat on any pod refreshes it ([`agent.rs:525`](../crates/services/src/dao/agent.rs#L525)),
+registered ([`socket.rs:142`](../crates/modules/fleet/src/socket.rs#L142)), every
+heartbeat on any pod refreshes it ([`agent.rs:555`](../crates/services/src/dao/agent.rs#L555)),
 and every teardown stamps it as it marks the device offline
-([`agent.rs:508`](../crates/services/src/dao/agent.rs#L508)). A device with a live
+([`agent.rs:538`](../crates/services/src/dao/agent.rs#L538)). A device with a live
 connection anywhere is never unreachable.
 
 ```mermaid
@@ -3382,7 +3382,7 @@ sequenceDiagram
 | The fork is placed as its record is made, carrying the parent's restricted tags. A placement that cannot be read refuses the fork (500), where a start runs on its primary alone | a fork of a restricted session is restricted (spec §3b). A session placed later (one started while `hive.replicaset` was off, placed at its device's next connection or at a teleport) is placed as a new one, with no tags carried; a fork is made only with the switch on, so it is never one of those | [`placement.rs:361`](../crates/modules/hive/src/placement.rs#L361) `place_new`, [`routes.rs:561`](../crates/modules/hive/src/routes.rs#L561) `begin` |
 | Every start of a fork goes through one path: the route's, a promotion's moved start, a reconnect's re-send. That path sends it only to a connection whose hello advertised `hive-fork`; to any other connection it is not sent and is logged, and the fork stays `starting` | a build before P2f-3a would start the fork empty, a new conversation under the person's fork | [`routes.rs:778`](../crates/modules/hive/src/routes.rs#L778) `push_start`, [`hub.rs:2952`](../crates/modules/fleet/src/hub.rs#L2952) `push_hive_fork`, [`agent_socket.rs:1200`](../crates/modules/hive/src/agent_socket.rs#L1200), [`promote.rs:2038`](../crates/modules/hive/src/promote.rs#L2038) |
 | A promotion or a teleport of a fork is refused `device_unsupported` to a target that does not start forks | its moved start would not be sent, and the lease would have moved to a device that never runs the fork | [`promote.rs:521`](../crates/modules/hive/src/promote.rs#L521) |
-| The fleet's hub keeps, per connection, whether its hello advertised `hive-fork` | the same promise kept per connection as `hive-teleport`: a device that reconnects on an older build loses it | [`socket.rs:212`](../crates/modules/fleet/src/socket.rs#L212), [`hub.rs:2913`](../crates/modules/fleet/src/hub.rs#L2913) |
+| The fleet's hub keeps, per connection, whether its hello advertised `hive-fork` | the same promise kept per connection as `hive-teleport`: a device that reconnects on an older build loses it | [`socket.rs:219`](../crates/modules/fleet/src/socket.rs#L219), [`hub.rs:2913`](../crates/modules/fleet/src/hub.rs#L2913) |
 | The parent's room says who forked it, into what, on which device and folder, and that it goes on as it was; the fork's room opens with what it was forked from. A fork its device refused is told in its own room only | the person reading either room knows there are two conversations now, and only when there are | [`room.rs:256`](../crates/modules/hive/src/room.rs#L256) `forked_note`, [`:269`](../crates/modules/hive/src/room.rs#L269) `forked_from_note` |
 
 ⚠️ **The wait is the member's tip cadence, not the copy's.** A member reports where its copy
@@ -3592,7 +3592,7 @@ stateDiagram-v2
 | The route answers from the asking's own word, never from the record's status | a restored record is `ended`, which any start's answer reads as answered | [`manage.rs:416`](../crates/modules/hive/src/manage.rs#L416) `answer_of` |
 | An unanswered start is sent again on the device's next connection, still saying `from_terminal`; its window counts from the asking. Past it, or when the device comes back as a build without Hive or without `hive-manage`, the adopted session it was, never `lost` | the record's `created_at` is the adoption, made long before; a session `lost` would strand the conversation | [`agent_socket.rs:1114`](../crates/modules/hive/src/agent_socket.rs#L1114), [`:1079`](../crates/modules/hive/src/agent_socket.rs#L1079), [`:1212`](../crates/modules/hive/src/agent_socket.rs#L1212) |
 | Accepted, the room says it was made managed, not "started" | the record's room has held the terminal's turns since its adoption | [`agent_socket.rs:537`](../crates/modules/hive/src/agent_socket.rs#L537) |
-| The hello records `hive-manage` per connection | `hive` is its prefix; a build before it would start the conversation afresh | [`socket.rs:216`](../crates/modules/fleet/src/socket.rs#L216) |
+| The hello records `hive-manage` per connection | `hive` is its prefix; a build before it would start the conversation afresh | [`socket.rs:223`](../crates/modules/fleet/src/socket.rs#L223) |
 
 ⚠️ **Measured between real processes** (`crates/tests/tests/hive_manage.rs`). The real hook client
 adopted a terminal session on the device, reading its transcript where Claude Code keeps it, and
