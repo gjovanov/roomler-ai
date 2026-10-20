@@ -264,6 +264,12 @@ mod vault_activity_tests;
 /// session's room, a driver's answer, and the one lease a yes allows.
 #[cfg(test)]
 mod vault_approval_tests;
+/// FR-90 P3-6b-1 — dynamic secrets, the vault's half: declared with a
+/// provider and one audience, holding the issuer's fields alone, leased in
+/// `short-lived` as one bundle sealed to the device, the kind and its mode
+/// paired by guardrails.
+#[cfg(test)]
+mod vault_dynamic_tests;
 /// FR-90 P3-3a — a device's vault key as the fleet stores it: from every
 /// hello, never a malformed one, and gone with the hello that drops it.
 #[cfg(test)]

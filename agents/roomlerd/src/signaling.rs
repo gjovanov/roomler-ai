@@ -6182,16 +6182,25 @@ async fn handle_server_msg(
             n,
             sealed,
             expires_at_ms,
+            provider,
         } => {
             #[cfg(feature = "vault")]
             if ctx.is_primary {
-                crate::vault::on_leased(&req_id, &lease_id, n, &sealed, expires_at_ms);
+                // P3-6b — with a dynamic secret's provider, if it names one.
+                crate::vault::on_leased(
+                    &req_id,
+                    &lease_id,
+                    n,
+                    &sealed,
+                    expires_at_ms,
+                    provider.as_deref(),
+                );
             } else {
                 debug!(%lease_id, "rc:vault.leased on a secondary org's connection — dropped unopened");
             }
             #[cfg(not(feature = "vault"))]
             {
-                let _ = (req_id, n, sealed, expires_at_ms);
+                let _ = (req_id, n, sealed, expires_at_ms, provider);
                 debug!(%lease_id, "rc:vault.leased ignored — this build takes no leases");
             }
         }
