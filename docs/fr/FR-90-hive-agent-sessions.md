@@ -2292,6 +2292,51 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
   (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
   owner.
 
+**P3-7, a session's own egress, as designed.** A session reaches a private subnet behind a device,
+or the internet from a chosen place, through Roomler's own tunnels (design §7.2). Today a flow a
+daemon opens is `Principal::Agent`, its subject the device's owner
+(`crates/modules/network/src/agent_socket.rs:208`, `crates/modules/network/src/tunnel.rs:1052`),
+and the SOCKS5 front takes no authentication (`crates/tunnel-core/src/socks5.rs:63`). A session
+that used either would appear in `tunnel_audit` as its owner. It would reach whatever its owner
+may, through a listener any local process can share.
+
+```mermaid
+sequenceDiagram
+    participant S as the session's tool
+    participant D as device (roomlerd)
+    participant V as vault
+    participant N as network module
+    participant E as exit device
+    S->>D: net_socks (exit E) or net_forward (exit E, host:port)
+    D->>V: rc:vault.net, believed only from the record's device at its fence
+    V->>V: Cedar net:socks or net:forward for the session's role, recorded
+    V-->>D: a grant, signed: session, fence, owner, origin, exit, destination, end
+    D->>N: rc:tunnel.open toward E, the grant attached
+    N->>N: the grant checked, Principal::Session, tunnel_policies, tunnel_audit
+    N-->>E: the flow, as any other
+    Note over D: a loopback listener served only to the session's account, RFC 1929 for SOCKS
+```
+
+| Piece | Design |
+|---|---|
+| who decides | the vault. It believes a session only from the device its record places it on, at its fence (`crates/modules/vault/src/lease.rs:35`). The network module cannot, because `hive ↔ network` is forbidden both ways (`crates/core/src/graph.rs:103`). Two new Cedar actions, `net:socks` and `net:forward`. Their principal is the `Session`, their resource a new `Node` entity (an enrolled device: its tags, OS and owner), and their context the device the session runs on and, for a forward, the destination. Every decision is recorded in `vault_audit` |
+| the grant | the vault's answer: a token signed by core's auth service (`crates/core/src/state.rs:53`) under an audience of its own, `net_grant`, which no other gate accepts. It names the tenant, the session and its fence, the session's owner, the origin device, the exit, the destination (one `host:port` for a forward, none for SOCKS) and its end, at most the lease ceiling (900 s). The network module verifies it and calls no module, so the graph is unchanged |
+| the principal | `Principal::Session {sid, owner}`: what `tunnel_policies` are evaluated for, and what `tunnel_audit` records, a `session_id` beside `origin_agent_id` (`crates/remote_control/src/models.rs:4520`). Which subjects match it is decision 20 |
+| the listener | one per tool call, on loopback, on a port the system picks. It serves a connection only when the process holding it runs as the session's account, as `vault_connect`'s endpoint does on Linux, macOS and Windows (`agents/roomlerd/src/hive/vault_connect.rs:22`). `net_socks` adds RFC 1929: the username the session's id, the password a capability made for the listener (32 random bytes), so a second session under the same account cannot share it. The SOCKS5 front offers RFC 1929 on session listeners alone. The loopback listeners it already serves keep offering no authentication |
+| the answer | `net_socks`: `socks5h://<session>:<capability>@127.0.0.1:<port>` and its end; `net_forward`: `127.0.0.1:<port>` and its end. The capability lands in the transcript. It is the session's own: refused off the device and to any other account, and gone with its listener |
+| its life | until the grant's end, or the session's run ending on this device: its end, or a move, which the device's own fence ends. A grant is no lease, so no `rc:vault.revoke` names it. A flow the listener opened ends with it, both halves (#2129) |
+| the gates | `vault.tenants`; the device-owned `hive_net`, default off and never pushable; Cedar's `net:*`; `tunnel_policies`; the exit's `forward_acl`. Each refuses on its own |
+
+- ⚠️ **A compromised daemon gains little.** It already holds its agent token, which opens flows as
+  `Principal::Agent`. A grant adds the session's scope, for at most its 900 seconds.
+- ⚠️ **The network module never hears of a revocation.** The device closes the listener and its
+  flows; the grant's end bounds the rest. A grant is asked for each tool call, never kept for a
+  session.
+- ⚠️ **CONNECT only.** A session listener refuses UDP ASSOCIATE: the account check reads TCP
+  sockets.
+- Not in P3-7: the egress proxy (design §7.2's third change), which the sandbox sends every
+  command through, and `roomler connect` (P3-9).
+
 **The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1191`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
@@ -2346,7 +2391,10 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 | P3-6d-3 | SQL Server logins, as decision 19 says | `vault.providers` | — |
 | P3-6e | AWS STS, with a stored AWS key until P7's federation | `vault.providers` | — |
 | P3-6f | a Kubernetes `TokenRequest` | `vault.providers` | — |
-| P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
+| P3-7-0 | P3-7's design (§3e "P3-7, a session's own egress, as designed"), and decision 20 | docs only | — |
+| P3-7-1 | the vault's half: `net:socks` and `net:forward` in Cedar, the `Node` entity, `rc:vault.net` and its grant | `vault.tenants`; no device asks before P3-7-3 | — |
+| P3-7-2 | the network module's half: the grant verified at `rc:tunnel.open`, `Principal::Session`, the subjects decision 20 names, `tunnel_audit.session_id` | `vault.tenants` | — |
+| P3-7-3 | the device's half: RFC 1929 in the SOCKS5 front, the per-session listeners and their account check, `hive_net`, the tools `net_socks` and `net_forward` | device `hive_net = false`; the `vault` feature in no release build | — |
 | P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
 | P3-9 | `roomler connect <handle>` for people (knowhow's `roomler_connect(entity)` waits for P4) | — | — |
 | P3k | the field run in the test org, and `docs/vault.md` | — | AC12, AC13, AC19's vault half |
@@ -2693,7 +2741,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-6b-2b | the minter's caller (`docs/vault.md` §20, "The caller"): the lease client holds the bundle of a provider it mints for (`postgres`; any other's refused unopened, as before), lends it to no tool, mints its credential at the lease's first use, once (`Client::mint`), and takes it back whenever the lease is let go, in the background, a mint that ends after its lease was let go taking its own back; `vault_exec` and `vault_render` describe each secret first, give every name of one dynamic secret ONE `short-lived` lease and its credential's fields, and refuse any other field before anything is leased; `vault_request` asks for a dynamic secret whole, in `short-lived`, its first use minting, and never toward a proxy; the vault keeps a use's report of a `short-lived` lease for any use; `upstream_of` moved into `vault_proxy`. 8 new tests (3 of the client against a fake Postgres, one of them a mint racing its lease's end; 4 of the tools; 1 integration) and 14 negative controls | device `vault_enabled = false`; `vault.providers` | **merged** #2598 `c3b45833f` |
 | P3-6d-0 | P3-6d's design (§3e "P3-6d, MySQL, SQL Server and Redis users, as designed") and decision 19, docs only: three providers minted on the device by P3-6b-2b's caller; each password sent only as the hash its database keeps (MySQL's `caching_sha2_password`, SQL Server's 2012 hash, Redis's SHA-256); MySQL's end an `EVENT` the mint must create, and no end that SQL Server or Redis keeps by itself; each sweep's mark (an `ATTRIBUTE`, a login's age, a name that carries its end); each wire a client of its own in `vault_proxy`; the minter chosen by provider | docs only | **merged** #2600 `195922741` |
 | P3-6d-1a | the MySQL minter (`docs/vault.md` §20, "The MySQL minter"), with no caller yet (P3-6d-1b's is the first). `vault_proxy::mysql`, MySQL's client protocol as a client of its own: a greeting that must offer TLS and the 4.1 protocol or is sent nothing; an `SSLRequest`, then TLS verified as `proxy`'s is; `caching_sha2_password`, its scramble and, for a full sign-in, the password itself inside that TLS; a switch to `sha256_password` followed inside the TLS, any other plugin refused; `CLIENT_LOCAL_FILES` never offered, and a local file's request refused. `vault_proxy::sha_crypt`, SHA-256 crypt, held to Drepper's published vectors and to the form MySQL 8.4.11 keeps for a known password. `vault_proxy::bundle`, the bundle reader both minters share. `vault_proxy::mysql_mint`: one user per lease, `roomler_<lease id>`, created from its password's `caching_sha2_password` form with an `ATTRIBUTE` naming its lease and its end; each grant a `GRANT`, then `SET DEFAULT ROLE ALL`; its end an `EVENT` that drops it, a refused step taking the user back; the ended swept by their `ATTRIBUTE`; a revocation that refuses a name no mint made before it dials, then `ACCOUNT LOCK`, its connections ended where the issuer may, `DROP USER`, `DROP EVENT`. Tested against a fake MySQL over real TLS that keeps its users and signs a minted one in by its form, and against a real MySQL 8.4.11 (two ignored tests); 19 negative controls | the `vault` feature in no release build | **merged** #2613 `bcf430ca2` |
-| P3-6d-1b | the MySQL minter's caller (`docs/vault.md` §20, "The caller"): `mysql` in `vault::providers`, with Postgres's issuer and minted fields, so the vault declares, checks and leases it as it does `postgres`; `vault_proxy::minter`, the list of providers this build mints for (`MINTS`) and the issuer, mint and revocation chosen by the bundle's provider, each database given the lease's end in its own form (RFC 3339, or whole seconds rounded down); the lease client minting through it; `CLIENT_LOCAL_FILES` checked as the daemon builds. Tested by the lease client against a fake MySQL (one user per lease, its end the lease's in whole seconds, the user and its event taken back), the minter's dispatch, the wire's provider list, and an integration test that a `mysql` issuer is leased whole as a bundle naming its provider; 6 negative controls | device `vault_enabled = false`; `vault.providers` | **in review** |
+| P3-6d-1b | the MySQL minter's caller (`docs/vault.md` §20, "The caller"): `mysql` in `vault::providers`, with Postgres's issuer and minted fields, so the vault declares, checks and leases it as it does `postgres`; `vault_proxy::minter`, the list of providers this build mints for (`MINTS`) and the issuer, mint and revocation chosen by the bundle's provider, each database given the lease's end in its own form (RFC 3339, or whole seconds rounded down); the lease client minting through it; `CLIENT_LOCAL_FILES` checked as the daemon builds. Tested by the lease client against a fake MySQL (one user per lease, its end the lease's in whole seconds, the user and its event taken back), the minter's dispatch, the wire's provider list, and an integration test that a `mysql` issuer is leased whole as a bundle naming its provider; 6 negative controls | device `vault_enabled = false`; `vault.providers` | **merged** #2617 `0c1bb97f2` |
+| P3-7-0 | P3-7's design (§3e "P3-7, a session's own egress, as designed") and decision 20, docs only: the vault decides a session's egress (Cedar's `net:socks` and `net:forward` over a new `Node` entity), as it alone can believe a session (`hive ↔ network` is forbidden); its answer a grant signed by core's auth service under its own audience, which the network module verifies without calling a module; `Principal::Session` in `tunnel_policies` and `tunnel_audit`; one loopback listener per tool call, served only to the session's account, with RFC 1929 for SOCKS; the device-owned `hive_net`; which subjects match a session is decision 20 | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3234,6 +3283,22 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - Redis and SQL Server now, their end the issuer's next sweep.
       - What it costs: a daemon that dies holding a lease leaves a credential that signs in until
         the issuer next mints, which may be never.
+
+20. **Which tunnel policies a session's flows match** (P3-7), for the operator to confirm (P3-7-0,
+    §3e "P3-7, a session's own egress, as designed"). Nothing in P3-7-1 depends on the answer.
+    - *Recommended: only policies that name sessions.*
+      - A new subject, `Sessions`, matches every session in the organization, and
+        `SessionRole {role}` a session in that role. `AllUsers`, `UserId`, `RoleId`, `AgentId` and
+        `TunnelClientId` never match one.
+      - No policy written before P3-7 opens anything to a session: a session reaches nothing until
+        an administrator writes a policy for sessions.
+      - What it costs: an organization that wants its sessions to reach what their owners reach
+        writes those policies again.
+    - *Or: a session matches what its owner does.*
+      - `UserId {owner}` and `AllUsers` match a session, as they match its owner's devices today
+        (`crates/modules/network/src/tunnel.rs:1052`); Cedar's `net:*` alone narrows it.
+      - What it costs: an organization with an `AllUsers` policy opens it to every session the
+        moment it permits `net:*`.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
