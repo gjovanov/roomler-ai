@@ -74,6 +74,8 @@ Whether that is a feature or noise depends entirely on whether you wanted it.
 | Mobile clients | **no** | yes |
 | SSO / SCIM | **not yet** | yes |
 | Chat / video conferencing | included | not in scope |
+| Hosted free plan | 10 users, 100 devices, MagicDNS; **commercial use allowed** | 6 users, unlimited personal devices + 50 tagged resources; **non-commercial** |
+| Hosted paid plans | per seat: $8 / €8 a month (Pro), $16 / €16 (Business); a year is two months free | per seat: $8 a month (Standard), $18 (Premium) |
 
 ## Choosing
 
@@ -88,6 +90,7 @@ Whether that is a feature or noise depends entirely on whether you wanted it.
 ---
 
 *Checked 2026-08-29 against Roomler's own source and Tailscale's public
-documentation. If anything here is wrong or has aged,
+documentation; the plan rows on 2026-10-19 against tailscale.com/pricing
+(FR-115). If anything here is wrong or has aged,
 [open an issue](https://github.com/gjovanov/roomler-ai/issues) — we would rather
 fix it than win on a stale fact.*

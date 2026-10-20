@@ -26,11 +26,23 @@ export interface LandingPillar {
   features: LandingFeature[]
 }
 
+/** FR-115 — one seat's price for one interval and currency. */
+export interface PlanPrice {
+  interval: 'month' | 'year'
+  currency: 'usd' | 'eur'
+  unit_amount: number
+}
+
 export interface Plan {
   id: string
   name: string
+  /** One seat for one month, in US cents. */
   price_cents: number
   features: string[]
+  /** FR-115 — every interval and currency on sale; absent from an older server. */
+  prices?: PlanPrice[]
+  per_seat?: boolean
+  commercial_use?: boolean
 }
 
 export const HERO = {
@@ -142,7 +154,9 @@ export const DOWNLOAD = {
 
 export const PRICING = {
   title: 'Simple, per-user pricing',
-  lead: 'Every plan includes the private network and remote desktop. Start free, upgrade for more devices.',
+  lead:
+    'Free for up to 10 users and 100 devices, and that includes commercial use. ' +
+    'Paid plans are per user, monthly or yearly (two months free), in USD or EUR.',
 }
 
 /**
@@ -152,13 +166,68 @@ export const PRICING = {
  * the checkout will not honour.
  */
 export const FALLBACK_PLANS: Plan[] = [
-  { id: 'free', name: 'Free', price_cents: 0, features: ['3 devices', 'Private network (overlay mesh)', 'Chat: 10 members'] },
-  { id: 'pro', name: 'Pro', price_cents: 800, features: ['30 devices', 'Exit nodes + MagicDNS', 'Unlimited members'] },
-  { id: 'business', name: 'Business', price_cents: 1600, features: ['300 devices', 'Everything in Pro', 'Priority support'] },
+  {
+    id: 'free',
+    name: 'Free',
+    price_cents: 0,
+    commercial_use: true,
+    features: [
+      'Free for commercial use',
+      '10 users',
+      '100 devices with remote desktop',
+      'Private network with MagicDNS',
+      '1 remote session at a time',
+      'Meetings up to 60 minutes, 10 people',
+      'Unlimited chat, 1 GB storage',
+    ],
+  },
+  {
+    id: 'pro',
+    name: 'Pro',
+    price_cents: 800,
+    per_seat: true,
+    features: [
+      'Everything in Free, priced per user',
+      '1,000 devices',
+      '1 remote session at a time per user',
+      'Exit nodes',
+      'Meetings with 50 people, no time limit',
+      '25 GB of relay traffic per user each month',
+      '10 GB storage per user',
+    ],
+  },
+  {
+    id: 'business',
+    name: 'Business',
+    price_cents: 1600,
+    per_seat: true,
+    features: [
+      'Everything in Pro',
+      '5,000 devices',
+      'Unlimited remote sessions',
+      'Meetings with 100 people, and recordings',
+      '100 GB of relay traffic per user each month',
+      '50 GB storage per user',
+      'Priority support',
+    ],
+  },
 ]
+
+/** FR-115 — the annual line under a paid price: ten months for twelve. */
+export function annualLine(plan: Plan): string | null {
+  const year = (plan.prices || []).find((p) => p.interval === 'year' && p.currency === 'usd')
+  if (!year) return null
+  const eur = (plan.prices || []).find((p) => p.interval === 'year' && p.currency === 'eur')
+  const usd = `$${year.unit_amount / 100}`
+  return eur
+    ? `or ${usd} / €${eur.unit_amount / 100} per user per year (two months free)`
+    : `or ${usd} per user per year (two months free)`
+}
 
 export const CTA = {
   title: 'Take your devices with you',
-  lead: 'Free for up to 3 devices — remote desktop, private mesh, tunnels, chat and calls.',
+  lead:
+    'Free for up to 10 users and 100 devices, commercial use included: ' +
+    'remote desktop, a private mesh, tunnels, chat and calls.',
   button: 'Create Your Workspace — Free',
 }
