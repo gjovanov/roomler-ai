@@ -39,6 +39,56 @@ mod launch_once;
 
 pub use launch_once::LaunchOwner;
 
+/// FR-117 P1 — on Linux the companion's PACKAGE tracks the daemon. The
+/// decisions are pure and tested everywhere; the I/O is Linux-only.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) mod package_sync;
+
+/// FR-117 P1 — move an installed companion package to this daemon's own
+/// version. Linux only: there the companion is a separate `.deb`/`.rpm` that
+/// nothing else moves (the macOS `.pkg` carries the app; Windows has
+/// [`refresh_if_stale`]). The updater calls it as the host's ROOT update owner;
+/// it is never fatal, and a failure is retried on the updater's next tick.
+#[cfg(target_os = "linux")]
+pub async fn sync_package() {
+    let _ = package_sync::sync().await;
+}
+
+/// FR-117 P1 — would [`sync_package`] move the companion now? A per-user
+/// daemon, which can install nothing, asks it to wake its root helper.
+#[cfg(target_os = "linux")]
+pub fn package_needs_sync() -> bool {
+    package_sync::needs_sync()
+}
+
+/// FR-117 — the switch for what FR-117 added (`ROOMLERD_COMPANION_SYNC=0`): the
+/// Linux package sync and the Windows retry. Windows' refresh at start is older
+/// than FR-117 and stays either way.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn sync_enabled() -> bool {
+    tunnel_core::env::flag("COMPANION_SYNC", true)
+}
+
+/// FR-117 P2 — [`refresh_if_stale`] again every [`REFRESH_RETRY`], for as long
+/// as the process that owns the refresh runs (#1686: the SCM host, or the
+/// worker). Before this a failed refresh waited for the next restart, which on
+/// a laptop that is never restarted is never, and nothing said why (a corp
+/// laptop sat a version behind on 2026-10-20). One file read when the version
+/// marker matches.
+#[cfg(target_os = "windows")]
+pub async fn refresh_periodically(respawn: RespawnContext) {
+    loop {
+        tokio::time::sleep(REFRESH_RETRY).await;
+        if sync_enabled() {
+            refresh_if_stale(respawn).await;
+        }
+    }
+}
+
+/// FR-117 P2 — the retry's period: the updater's own default interval.
+#[cfg(target_os = "windows")]
+const REFRESH_RETRY: std::time::Duration = crate::updater::CHECK_INTERVAL;
+
 /// FR-84 D6 — open the companion ONCE after a fresh install, from whichever
 /// process owns that on this host: the SCM host on a perMachine Windows
 /// install, the worker everywhere else (per-user Scheduled Task, systemd
@@ -247,21 +297,31 @@ const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
 /// Cached for [`VERSION_TTL`]: the answer only changes when a package manager
 /// runs, and the heartbeat is every 30 s.
 pub fn installed_version() -> Option<String> {
-    use std::sync::Mutex;
     use std::time::Instant;
-    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
 
-    if let Some((at, ref v)) = *CACHE.lock().unwrap()
+    if let Some((at, ref v)) = *VERSION_CACHE.lock().unwrap()
         && at.elapsed() < VERSION_TTL
     {
         return v.clone();
     }
     let v = installed_version_inner();
-    *CACHE.lock().unwrap() = Some((Instant::now(), v.clone()));
+    *VERSION_CACHE.lock().unwrap() = Some((Instant::now(), v.clone()));
     v
 }
 
 const VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// [`installed_version`]'s cache: when it last read, and what.
+static VERSION_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// FR-117 — drop the cached version after something moved the companion, so
+/// the next heartbeat reports the new one instead of a 10-minute-old answer
+/// (the grid's skew would otherwise outlive the fix by that long).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn forget_installed_version() {
+    *VERSION_CACHE.lock().unwrap() = None;
+}
 
 /// Windows: the sidecar marker [`refresh_if_stale`] writes on every swap. A
 /// wizard-placed EXE with no marker reads as `None`, which is honest — the
@@ -297,6 +357,14 @@ fn installed_version_inner() -> Option<String> {
 /// upgrades the companion without the daemon noticing.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn installed_version_inner() -> Option<String> {
+    installed_package().map(|(_, v)| v)
+}
+
+/// The companion's package on this host: which database owns it, and its
+/// version as the release it names. FR-117 needs the first half too, because
+/// the format of the package that moves it forward is that database's.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn installed_package() -> Option<(package_sync::PkgDb, String)> {
     // Not installed, or no such tool on this host: "no companion we can name",
     // not an error worth logging every 10 min.
     let query = |cmd: &str, args: &[&str]| -> Option<String> {
@@ -305,14 +373,25 @@ fn installed_version_inner() -> Option<String> {
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    if let Some(raw) = query("dpkg-query", &["-W", "-f=${Version}", "roomler-desktop"]) {
-        // cargo-deb appends a Debian revision (`0.4.16-1`); report the upstream
-        // half so the grid can compare it against `agent_version` directly.
-        return sanitize_version(raw.split('-').next().unwrap_or(""));
+    if let Some(raw) = query(
+        "dpkg-query",
+        &["-W", "-f=${Status}|${Version}", "roomler-desktop"],
+    ) {
+        // ⚠️ `dpkg-query -W` also answers for a package dpkg merely REMEMBERS:
+        // removed with its config kept (`deinstall ok config-files`), version
+        // and all. That is not an installed companion, and FR-117 must never
+        // put back one a person removed.
+        if let Some(v) = package_sync::dpkg_installed_version(&raw) {
+            // cargo-deb appends a Debian revision (`0.4.16-1`); report the
+            // upstream half so the grid can compare it with `agent_version`.
+            return sanitize_version(v.split('-').next().unwrap_or(""))
+                .map(|v| (package_sync::PkgDb::Dpkg, v));
+        }
     }
     // `%{VERSION}` is the upstream half already (the release is its own tag).
     query("rpm", &["-q", "--qf", "%{VERSION}", "roomler-desktop"])
         .and_then(|raw| sanitize_version(&raw))
+        .map(|v| (package_sync::PkgDb::Rpm, v))
 }
 
 /// A version string is about to be persisted on the device row and rendered in

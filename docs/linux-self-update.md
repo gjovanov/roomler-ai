@@ -481,12 +481,53 @@ The phases:
 
 Status and evidence: [FR-96](fr/FR-96-per-user-linux-installs-update-themselves.md).
 
+## The desktop companion follows the daemon (FR-117)
+
+The companion (`roomler-desktop`) is a package of its own, a `.deb`, or an `.rpm` where rpm keeps
+the books ([desktop-companion.md §10.1](desktop-companion.md#101-the-linux-packages-fr-93-p6d-p6e)).
+`install.sh` or the wizard installs it once, from a release asset. With no apt or dnf repository
+nothing upgraded it, so every update below moved the daemon and left the companion where it was.
+FR-117 P1 gives it the daemon's version through the same owner, trust path and cadence:
+
+| Host | Who moves the companion | When |
+|---|---|---|
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3313`) | after every check that installs nothing; at the start after an update (`:3194`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3245`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3880`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3122`, `package_needs_sync`) |
+| non-root daemon, no helper | nobody | one INFO line, never a password prompt |
+
+- **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
+  the same task, one after the other, so two package-manager runs of ours can never fight over
+  dpkg's lock. When a check finds an update, the companion waits for the next daemon, which moves
+  it to ITS version at its start.
+- **The same trust path as the daemon:** `fetch_release_by_tag("agent-v<own>")`, then
+  `download_asset`, which checks the digest, the `.asc` against the pinned key and the version
+  binding. A refusal discards the download, and the companion keeps its version. FR-117 adds the
+  `.rpm` reader (`rpm -qp --qf %{VERSION}`, `verify_rpm`, `artifact_version.rs:343`).
+- **The host's package manager installs it** (`install_commands`,
+  `companion/package_sync.rs:134`): `apt-get` with `--no-remove` (a dependency change that would
+  remove a package aborts instead) and `-o DPkg::Lock::Timeout=60` (unattended-upgrades holds the
+  lock for minutes); for an `.rpm`, the first of `dnf`, `zypper` and `yum`, `install.sh`'s order.
+  Each run is bounded at 10 minutes.
+- ⚠️ **No `dpkg --install` fallback**, unlike the daemon's own ladder. The companion has real
+  dependencies (webkit2gtk, GTK, the tray library). dpkg with one of them unmet leaves the package
+  half-configured, and that breaks apt for the whole host, the daemon's own next update included.
+  A refusal costs one tick instead.
+- ⚠️ **`NEEDRESTART_SUSPEND=1`** on every run (`INSTALL_ENV`, `package_sync.rs:175`). Ubuntu's
+  needrestart runs after every apt transaction and, non-interactive, restarts the services it
+  finds on stale libraries. This daemon is one of them, so the companion's install would end in a
+  restart of the very process that ran it, cutting every session.
+- **Never a downgrade, never a new install**, and the kill switch `ROOMLERD_COMPANION_SYNC=0`.
+  Details and the restart of a running companion:
+  [desktop-companion.md §13](desktop-companion.md#13-one-version-the-companion-follows-the-daemon-fr-117).
+
 ## Deliberately out of scope
 
-- **`.rpm` lane** — the tarball makes self-update work on every distro: for a
+- **`.rpm` lane for the daemon** — the tarball makes self-update work on every distro: for a
   system install directly, and for a per-user one through FR-96's helper. An
   `.rpm` only adds package-DB integration for one distro family. Revisit if a
-  customer needs `dnf` to own the install.
+  customer needs `dnf` to own the install. (The COMPANION's `.rpm` is another matter:
+  it exists, and FR-117 moves it, above.)
 - **musl / Alpine** — the payload is glibc-linked. A musl target is a separate
   build, not a packaging change.
 - **arm64 FFmpeg** — the aarch64 build ships without `ffmpeg-encoder` (no
