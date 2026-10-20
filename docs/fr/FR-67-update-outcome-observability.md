@@ -1,6 +1,6 @@
 # FR-67 — An update's outcome is written, and nothing ever reads it
 
-**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2 shipped; P7 in review) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
+**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P7 field-verified on 0.4.146) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
 
 ## Goal
 
@@ -167,7 +167,7 @@ sequenceDiagram
 | P4 | macOS `AbandonProcessGroup` — **`com.roomler.update.plist`** is the job that matters (`update-helper` is that LaunchDaemon's body and is where `installer -pkg` is spawned) | packaging-only revert | proposed — see the note below |
 | P5 | Fleet answer: report the outcome to the server and show it | render-only; absent field ⇒ today's blank | proposed |
 | P6 | Transient systemd unit — **only if P1 leaves a measurable race** | `update_watcher_escape_cgroup`, default OFF | deferred, evidence-gated |
-| P7 | The dashboard is told which devices will not act on an update ordered from it, and why: `update_mode` in the caps, refused up front with a `refused_code`, marked before the click | revert = today's blind push; an agent without the word is pushed as before | **in review (#2545)** · field check on the release carrying it |
+| P7 | The dashboard is told which devices will not act on an update ordered from it, and why: `update_mode` in the caps, refused up front with a `refused_code`, marked before the click | revert = today's blind push; an agent without the word is pushed as before | **shipped (#2545)** · field-verified on 0.4.146 + `hosted-20261019-e46da07` |
 
 ## Acceptance criteria
 
@@ -186,13 +186,14 @@ sequenceDiagram
       seven days against **zero** `post-install watcher started` (P2, #1427)
 - [ ] A fleet query answers "did this update succeed on each host" without SSH
 - [ ] Windows behaviour is byte-for-byte unchanged
-- [ ] **P7**: an update ordered from a device's **secondary** org is refused with
+- [x] **P7**: an update ordered from a device's **secondary** org is refused with
       `primary_org` and the way out, and never counted delivered. ⚠️ The "before"
       is recorded: on 2026-10-19 the bulk route counted it delivered (field log)
-- [ ] **P7**: a device with auto-update off is refused with `auto_update_off`
-- [ ] **P7**: an agent that predates P7 is pushed exactly as before
-- [ ] **P7**: the word survives a heartbeat re-announce: after a login on the
-      device, its row still carries `update_mode`
+- [x] **P7**: a device with auto-update off is refused with `auto_update_off`
+- [x] **P7**: an agent that predates P7 is pushed exactly as before
+- [x] **P7**: the word survives a heartbeat re-announce: after a login on the
+      device, its row still carries `update_mode` (field-verified with a live
+      config flip as the re-announce, not a login; see the field log)
 
 ## Out of scope
 
@@ -220,6 +221,9 @@ sequenceDiagram
 | 2026-09-02 | ⚠️ Measurement hazard | `pgrep -x roomlerd` matched a **container's** process on a host running containerised test nodes (cgroup `/system.slice/docker-….scope`). A first reading wrongly showed `INVOCATION_ID` absent on Ubuntu. Probe `systemctl show roomlerd -p MainPID` instead |
 | 2026-09-02 | ⛔ First design refuted before implementation | A systemd transient unit was the initial P1. Adversarial review found its safety premise false without `--service-type=exec`, its kill switch inert against the mode it guards, and that it would *create* a PID-reuse false-`Timeout` mode. The real defect is the self-pid wait (`updater.rs:1577` + `post_install.rs:221`) — removing it needs no systemd at all |
 | 2026-10-19 | ❌ P7's "before", on the fleet | The operator's **Update all** counted a two-org aarch64 device (Fedora/Asahi) as pushed three times. Its journal logged `rc:agent.update ignored — only the primary enrollment drives the machine-wide self-updater` three times: the dashboard's org was its secondary enrollment. That day's remedy was `roomlerd org set-primary` on the device, which exposed #2540 (both meshes off; fixed in #2541) |
+| 2026-10-19 | ❌ The "before" on a cell | A kept vmtest Ubuntu cell in two orgs, on 0.4.145 and the then-prod server `hosted-20261019-dd59ede`. A push to its secondary org's row: `HTTP 200 {"delivered":true}`, and in the same second the device logged `rc:agent.update ignored … ignored_total=1` |
+| 2026-10-19 | ✅ **P7 field-verified on 0.4.146** | Server `hosted-20261019-e46da07`, candidate run 39331259421 (its `.deb` byte-identical to the published one). AC1: a push from the secondary org → `HTTP 409` naming `roomlerd org set-primary`, and 0 `rc:agent.update` lines on the device. AC2: `auto_update false` → row `update_mode=off` → `HTTP 409` (`auto_update_off`). AC3: a 0.4.145 agent (no word) → `HTTP 200 delivered`, as before. AC4: a live `keep_busy_enabled` flip made both connections re-announce their caps (`announcing changed capabilities on the heartbeat`), and both rows still carried the word. A lock/unlock first changed no caps, so it re-announced nothing and is not counted. A Win11 SYSTEM install laid over 0.4.145 reads `update_mode=self` |
+| 2026-10-19 | ✅ **The field case itself, on the release** | The two-org aarch64 device from the top of this log, updated to 0.4.146 by its own updater (`.asc` verified against the pinned key; `post-install verdict: SucceededVerified`). Its secondary org's row now reads `update_mode=primary_org`, and a push from that org gets `HTTP 409` with the way out. Earlier the same day the same click was counted delivered three times while the device ignored it |
 
 ## P4 — scoped, and one question left before it is safe to write
 
