@@ -7,7 +7,9 @@
         <span class="text-caption">{{ authorInitial }}</span>
       </v-avatar>
 
-      <div class="flex-grow-1">
+      <!-- min-width: 0 lets a long unbroken string (a link, a hash) wrap
+           inside the bubble instead of widening the whole message list. -->
+      <div class="flex-grow-1" style="min-width: 0">
         <div class="d-flex align-center mb-1">
           <router-link
             v-if="message.author_id"
@@ -27,7 +29,9 @@
             (edited)
           </span>
           <v-spacer />
-          <!-- Action buttons (shown on hover) -->
+          <!-- Mouse: the row of actions, shown on hover or keyboard focus —
+               and inert while hidden (it used to take taps at opacity 0, so a
+               tap near a name could pin a message for the whole room). -->
           <div v-if="!editing" class="message-actions">
             <v-btn icon="mdi-emoticon-outline" size="x-small" variant="text" aria-label="React with emoji" @click="showEmojiPicker = true" />
             <v-btn icon="mdi-reply" size="x-small" variant="text" aria-label="Reply in thread" @click="$emit('reply')" />
@@ -56,6 +60,36 @@
               @click="$emit('pin')"
             />
           </div>
+          <!-- Touch: no hover, so the same actions sit behind one ⋮. -->
+          <v-menu v-if="!editing" location="bottom end">
+            <template #activator="{ props: menuProps }">
+              <v-btn
+                v-bind="menuProps"
+                class="message-actions-touch"
+                icon="mdi-dots-vertical"
+                size="small"
+                variant="text"
+                aria-label="Message actions"
+              />
+            </template>
+            <v-list density="compact" min-width="200">
+              <v-list-item prepend-icon="mdi-emoticon-outline" title="React" @click="showEmojiPicker = true" />
+              <v-list-item prepend-icon="mdi-reply" title="Reply in thread" @click="$emit('reply')" />
+              <v-list-item v-if="editable" prepend-icon="mdi-pencil" title="Edit" @click="startEditing" />
+              <v-list-item
+                :prepend-icon="message.is_pinned ? 'mdi-pin-off' : 'mdi-pin'"
+                :title="message.is_pinned ? 'Unpin' : 'Pin'"
+                @click="$emit('pin')"
+              />
+              <v-list-item
+                v-if="editable"
+                prepend-icon="mdi-delete"
+                title="Delete"
+                base-color="error"
+                @click="showDeleteConfirm = true"
+              />
+            </v-list>
+          </v-menu>
         </div>
 
         <!-- Edit mode -->
@@ -308,11 +342,28 @@ onBeforeUnmount(() => {
 }
 .message-actions {
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.15s;
 }
 .message-bubble:hover .message-actions,
 .message-actions:focus-within {
   opacity: 1;
+  pointer-events: auto;
+}
+.message-actions-touch {
+  display: none;
+}
+/* A touch screen has no hover: the row could never be seen, only hit. */
+@media (hover: none) {
+  .message-actions {
+    display: none;
+  }
+  .message-actions-touch {
+    display: inline-flex;
+  }
+}
+.message-content {
+  overflow-wrap: anywhere;
 }
 
 /* Markdown content styles */
