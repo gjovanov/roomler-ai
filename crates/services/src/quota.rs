@@ -68,8 +68,17 @@ impl Limit {
     /// [`check`] would silently downgrade them to warnings the moment this
     /// lands, because the mode defaults to [`PlanEnforcement::Warn`] — a
     /// billing regression introduced by a refactor that reads as a cleanup.
+    ///
+    /// FR-115 D2 added `MaxMembers`: with per-seat pricing, Free's ten users
+    /// is the line a team crosses into a paid plan, so the operator made it
+    /// a cap rather than an observation. Grandfathering does not arise —
+    /// paid plans have no member cap, and no Free org was over ten when it
+    /// landed (the FR-115 census).
     pub fn is_established(self) -> bool {
-        matches!(self, Limit::MaxDevices | Limit::MaxTunnelClients)
+        matches!(
+            self,
+            Limit::MaxDevices | Limit::MaxTunnelClients | Limit::MaxMembers
+        )
     }
 
     /// The limit's value for a plan, plus the noun used in the refusal message.
@@ -254,15 +263,31 @@ impl Verdict {
 }
 
 /// [`check_delta`]'s decision, with the collision visible even when it does
-/// not refuse. The warn line is written here, once per collision.
+/// not refuse. The warn line is written here, once per collision. One seat —
+/// an org's own check goes through [`evaluate_for`] with its billed seats.
 pub fn evaluate(plan: Plan, mode: PlanEnforcement, limit: Limit, used: u64, delta: u64) -> Verdict {
+    evaluate_for(plan, 1, mode, limit, used, delta)
+}
+
+/// FR-115 — [`evaluate`] for an org billed for `seats` seats: the per-seat
+/// limits (`storage_bytes`, `max_concurrent_sessions`) are scaled by
+/// [`Plan::limits_for`] before the comparison. `roomler_core::quota` passes
+/// `Tenant::billed_seats`.
+pub fn evaluate_for(
+    plan: Plan,
+    seats: u32,
+    mode: PlanEnforcement,
+    limit: Limit,
+    used: u64,
+    delta: u64,
+) -> Verdict {
     // `Off` means no check runs — but never for a limit that was already
     // enforced before FR-32, which the mode was never meant to reach.
     if matches!(mode, PlanEnforcement::Off) && !limit.is_established() {
         return Verdict::pass();
     }
 
-    let limits = plan.limits();
+    let limits = plan.limits_for(seats);
     let (Some(max), noun) = limit.describe(&limits) else {
         return Verdict::pass(); // uncapped for this plan
     };
@@ -315,7 +340,9 @@ pub fn require_feature(plan: Plan, mode: PlanEnforcement, limit: Limit) -> Resul
 mod tests {
     use super::*;
 
-    // Free: max_members = 10, max_devices = 3, recordings = false.
+    // Free (FR-115): video_max_participants = 10 (wired by FR-32, subject to
+    // the mode), max_members = 10 (ESTABLISHED since FR-115), max_devices =
+    // 100, storage 1 GiB, recordings and exit nodes off, MagicDNS on.
 
     #[test]
     fn under_the_cap_always_passes() {
@@ -324,6 +351,7 @@ mod tests {
             PlanEnforcement::Warn,
             PlanEnforcement::Enforce,
         ] {
+            assert!(check(Plan::Free, mode, Limit::VideoMaxParticipants, 9).is_ok());
             assert!(check(Plan::Free, mode, Limit::MaxMembers, 9).is_ok());
         }
     }
@@ -331,21 +359,42 @@ mod tests {
     #[test]
     fn warn_records_but_does_not_refuse() {
         // At the cap: the observe phase must let this through.
-        assert!(check(Plan::Free, PlanEnforcement::Warn, Limit::MaxMembers, 10).is_ok());
+        assert!(
+            check(
+                Plan::Free,
+                PlanEnforcement::Warn,
+                Limit::VideoMaxParticipants,
+                10
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn enforce_refuses_at_the_cap() {
-        let d = check(Plan::Free, PlanEnforcement::Enforce, Limit::MaxMembers, 10)
-            .expect_err("a Free tenant at 10 members must be refused under Enforce");
+        let d = check(
+            Plan::Free,
+            PlanEnforcement::Enforce,
+            Limit::VideoMaxParticipants,
+            10,
+        )
+        .expect_err("a Free call at 10 participants must be refused under Enforce");
         assert_eq!(d.used, 10);
         assert_eq!(d.max, 10);
-        assert_eq!(d.limit, Limit::MaxMembers);
+        assert_eq!(d.limit, Limit::VideoMaxParticipants);
     }
 
     #[test]
     fn off_disables_a_newly_wired_limit() {
-        assert!(check(Plan::Free, PlanEnforcement::Off, Limit::MaxMembers, 999).is_ok());
+        assert!(
+            check(
+                Plan::Free,
+                PlanEnforcement::Off,
+                Limit::VideoMaxParticipants,
+                999
+            )
+            .is_ok()
+        );
     }
 
     /// The regression this whole `is_established` distinction exists to stop:
@@ -360,14 +409,41 @@ mod tests {
             PlanEnforcement::Enforce,
         ] {
             assert!(
-                check(Plan::Free, mode, Limit::MaxDevices, 3).is_err(),
+                check(Plan::Free, mode, Limit::MaxDevices, 100).is_err(),
                 "max_devices must refuse under {mode:?} — it was enforced before FR-32"
             );
             assert!(
-                check(Plan::Free, mode, Limit::MaxTunnelClients, 3).is_err(),
+                check(Plan::Free, mode, Limit::MaxTunnelClients, 100).is_err(),
                 "max_tunnel_clients must refuse under {mode:?} — it was enforced before FR-32"
             );
         }
+    }
+
+    /// FR-115 D2 — Free's ten users is a cap in every mode: per-seat pricing
+    /// makes it the line a team crosses into a paid plan, so `warn` and `off`
+    /// must not soften it the way they soften the FR-32 gates.
+    #[test]
+    fn the_free_member_cap_ignores_the_mode() {
+        for mode in [
+            PlanEnforcement::Off,
+            PlanEnforcement::Warn,
+            PlanEnforcement::Enforce,
+        ] {
+            let d = check(Plan::Free, mode, Limit::MaxMembers, 10)
+                .expect_err("an eleventh member of a Free org must be refused");
+            assert_eq!((d.used, d.max), (10, 10));
+            assert!(check(Plan::Free, mode, Limit::MaxMembers, 9).is_ok());
+        }
+        // A paid plan has no member cap at all: every user is a billed seat.
+        assert!(
+            check(
+                Plan::Pro,
+                PlanEnforcement::Enforce,
+                Limit::MaxMembers,
+                5_000
+            )
+            .is_ok()
+        );
     }
 
     /// A disabled feature must not be described with counting words. "0 of 0
@@ -388,9 +464,15 @@ mod tests {
             "feature gates must not use counting words: {m}"
         );
 
-        // Singular noun agreement — "MagicDNS is", not "MagicDNS are".
-        let d = require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::MagicDns)
-            .expect_err("Free does not include MagicDNS");
+        // Singular noun agreement — "MagicDNS is", not "MagicDNS are". Every
+        // plan has MagicDNS since FR-115, so the denial is built by hand.
+        let d = QuotaDenial {
+            limit: Limit::MagicDns,
+            plan: Plan::Free,
+            used: 0,
+            max: 0,
+            noun: "MagicDNS",
+        };
         assert_eq!(
             d.message(),
             "MagicDNS is not available on the Free plan. Upgrade to enable."
@@ -417,6 +499,9 @@ mod tests {
         assert!(
             require_feature(Plan::Business, PlanEnforcement::Enforce, Limit::Recordings).is_ok()
         );
+        // FR-115 — MagicDNS is on Free; exit nodes wait for the relay throttle.
+        assert!(require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::MagicDns).is_ok());
+        assert!(require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::ExitNodes).is_err());
         // ...and Warn never refuses, even for a feature the plan lacks.
         assert!(require_feature(Plan::Free, PlanEnforcement::Warn, Limit::Recordings).is_ok());
     }
@@ -427,8 +512,8 @@ mod tests {
     #[test]
     fn storage_is_judged_on_the_incoming_size() {
         const MB: u64 = 1024 * 1024;
-        // Free.storage_bytes is 100 MB; sit the tenant 1 MB under it.
-        let used = 99 * MB;
+        // Free.storage_bytes is 1 GiB; sit the tenant 1 MB under it.
+        let used = roomler_ai_db::models::tenant::GIB - MB;
 
         // A 100 KB file still fits...
         assert!(
@@ -555,6 +640,16 @@ mod tests {
             )
             .is_ok()
         );
+        // FR-115 — chat has no cap on Free either.
+        assert!(
+            check(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::MaxChannels,
+                1_000_000
+            )
+            .is_ok()
+        );
         assert!(
             check(
                 Plan::Business,
@@ -568,41 +663,74 @@ mod tests {
         assert!(check(Plan::Free, PlanEnforcement::Enforce, Limit::MaxMembers, 10).is_err());
     }
 
+    /// FR-115 — an org's check is against its BILLED seats: Pro's one
+    /// session per seat lets a three-seat org run three, not four; storage
+    /// scales the same way; a count that is per org (devices) does not.
+    #[test]
+    fn per_seat_limits_are_checked_against_the_billed_seats() {
+        let e = PlanEnforcement::Enforce;
+        assert!(
+            evaluate_for(Plan::Pro, 3, e, Limit::MaxConcurrentSessions, 2, 1)
+                .collision
+                .is_none()
+        );
+        let v = evaluate_for(Plan::Pro, 3, e, Limit::MaxConcurrentSessions, 3, 1);
+        assert_eq!(v.collision.as_ref().map(|d| d.max), Some(3));
+
+        let gib = roomler_ai_db::models::tenant::GIB;
+        assert!(
+            evaluate_for(Plan::Pro, 4, e, Limit::StorageBytes, 35 * gib, gib)
+                .collision
+                .is_none(),
+            "4 seats hold 40 GiB"
+        );
+        assert!(
+            evaluate_for(Plan::Pro, 4, e, Limit::StorageBytes, 40 * gib, 1)
+                .collision
+                .is_some()
+        );
+        assert_eq!(
+            evaluate_for(Plan::Pro, 4, e, Limit::MaxDevices, 1_000, 1)
+                .collision
+                .map(|d| d.max),
+            Some(1_000),
+            "devices are per org, not per seat"
+        );
+        // `evaluate` is one seat.
+        assert_eq!(
+            evaluate(Plan::Pro, e, Limit::MaxConcurrentSessions, 1, 1)
+                .collision
+                .map(|d| d.max),
+            Some(1)
+        );
+    }
+
     /// FR-102 P4 — the verdict shows a collision in `warn` mode too (the
     /// upgrade-intent signal must not depend on enforcement), refuses only
     /// when enforcing, and is empty under the cap or with checks `off`.
     #[test]
     fn a_collision_is_visible_whether_or_not_it_refuses() {
-        let warn = evaluate(Plan::Free, PlanEnforcement::Warn, Limit::MaxMembers, 10, 1);
+        let video = Limit::VideoMaxParticipants;
+        let warn = evaluate(Plan::Free, PlanEnforcement::Warn, video, 10, 1);
         assert!(warn.collision.is_some());
         assert!(!warn.enforced);
         assert!(warn.into_result().is_ok(), "warn lets it through");
 
-        let enforce = evaluate(
-            Plan::Free,
-            PlanEnforcement::Enforce,
-            Limit::MaxMembers,
-            10,
-            1,
-        );
+        let enforce = evaluate(Plan::Free, PlanEnforcement::Enforce, video, 10, 1);
         assert!(enforce.collision.is_some() && enforce.enforced);
         assert!(enforce.into_result().is_err());
 
-        let under = evaluate(
-            Plan::Free,
-            PlanEnforcement::Enforce,
-            Limit::MaxMembers,
-            9,
-            1,
-        );
+        let under = evaluate(Plan::Free, PlanEnforcement::Enforce, video, 9, 1);
         assert!(under.collision.is_none());
 
-        let off = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxMembers, 99, 1);
+        let off = evaluate(Plan::Free, PlanEnforcement::Off, video, 99, 1);
         assert!(off.collision.is_none(), "off runs no check, counts nothing");
 
         // An established limit ignores the mode: off still collides, and refuses.
-        let devices = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxDevices, 3, 1);
+        let devices = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxDevices, 100, 1);
         assert!(devices.collision.is_some() && devices.enforced);
+        let members = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxMembers, 10, 1);
+        assert!(members.collision.is_some() && members.enforced);
     }
 
     /// The `limit` dimension's spellings are stored keys.

@@ -159,8 +159,9 @@ describe('priceLabel', () => {
   it('matches what the SPA shows', () => {
     const plan = (price_cents: number) => ({ id: 'x', name: 'X', price_cents, features: [] })
     expect(priceLabel(plan(0))).toEqual({ amount: '$0', unit: 'forever' })
-    expect(priceLabel(plan(800))).toEqual({ amount: '$8', unit: '/user/mo' })
-    expect(priceLabel(plan(1250))).toEqual({ amount: '$12.50', unit: '/user/mo' })
+    // FR-115 — the same number in USD and EUR, per user per month.
+    expect(priceLabel(plan(800))).toEqual({ amount: '$8', unit: '/ €8 per user / month' })
+    expect(priceLabel(plan(1250))).toEqual({ amount: '$12.50', unit: '/ €12.50 per user / month' })
   })
 })
 
@@ -335,10 +336,33 @@ describe('home.js — live prices', () => {
     await settle()
     const card = doc.querySelector('[data-plan="pro"]')!
     expect(card.querySelector('[data-price]')!.textContent).toBe('$12.50')
-    expect(card.querySelector('[data-unit]')!.textContent).toBe('/user/mo')
+    expect(card.querySelector('[data-unit]')!.textContent).toBe('/ €12.50 per user / month')
     const items = [...card.querySelectorAll('[data-features] li')]
     expect(items.map((li) => li.textContent)).toEqual(['Alpha', '<b>Beta</b>']) // text, never markup
     expect(items.every((li) => li.querySelector('svg'))).toBe(true)
+    // No annual price from this server: the yearly line stays hidden.
+    expect((card.querySelector('[data-annual]') as HTMLElement).hidden).toBe(true)
+  })
+
+  it('shows the yearly line when the server sells annual (FR-115)', async () => {
+    const plans = [
+      {
+        id: 'pro',
+        name: 'Pro',
+        price_cents: 800,
+        features: ['Alpha'],
+        prices: [
+          { interval: 'month', currency: 'usd', unit_amount: 800 },
+          { interval: 'year', currency: 'usd', unit_amount: 8000 },
+          { interval: 'year', currency: 'eur', unit_amount: 8000 },
+        ],
+      },
+    ]
+    const { doc } = runHomeJs({ '/api/capabilities': SAAS, '/api/stripe/plans': { ok: true, body: plans } })
+    await settle()
+    const annual = doc.querySelector('[data-plan="pro"] [data-annual]') as HTMLElement
+    expect(annual.hidden).toBe(false)
+    expect(annual.textContent).toBe('or $80 / €80 per user per year (two months free)')
   })
 
   it('keeps the fallback table when the answer is unusable', async () => {

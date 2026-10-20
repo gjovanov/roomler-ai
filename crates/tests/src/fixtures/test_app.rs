@@ -533,6 +533,11 @@ fn test_settings() -> Settings {
             webhook_secret: String::new(),
             price_pro: String::new(),
             price_business: String::new(),
+            // FR-115 — annual off, real Stripe, and the seat sync as the
+            // config default has it (on); a test that needs a fake Stripe
+            // or annual prices sets them.
+            seat_sync: true,
+            ..Default::default()
         },
         giphy: roomler_ai_config::GiphySettings {
             api_key: String::new(),

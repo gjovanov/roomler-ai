@@ -153,7 +153,8 @@ pub async fn admin_plan_compliance(
     for t in tenants {
         let Some(id) = t.id else { continue };
         let tid = id.to_hex();
-        let limits = t.plan.limits();
+        // FR-115 — the org's own limits, scaled to its billed seats.
+        let limits = t.limits();
         let get = |m: &HashMap<String, u64>| m.get(&tid).copied().unwrap_or(0);
 
         // (variant, measured usage, gated?)
@@ -219,7 +220,7 @@ pub async fn admin_plan_compliance(
         // today (always 1 — the ability is live while unenforced), `max` is 0
         // when the plan excludes it, so `over` means "enforcing would REMOVE
         // something this tenant can do right now" rather than "they exceeded a
-        // quota". Free now has a real cap of 4, so no current plan excludes
+        // quota". Free now has a real cap (10 since FR-115), so no current plan excludes
         // video — but the row stays, because the next plan change could.
         let video_max = quota::Limit::VideoMaxParticipants.describe(&limits).0;
         let video_excluded = video_max == Some(0);
@@ -287,7 +288,9 @@ mod tests {
     fn report_uses_the_same_limit_source_as_the_gates() {
         let free = Plan::Free.limits();
         assert_eq!(quota::Limit::MaxMembers.describe(&free).0, Some(10));
-        assert_eq!(quota::Limit::MaxChannels.describe(&free).0, Some(5));
+        // FR-115 — chat is unlimited on every plan.
+        assert_eq!(quota::Limit::MaxChannels.describe(&free).0, None);
+        assert_eq!(quota::Limit::MaxDevices.describe(&free).0, Some(100));
         // Recordings off on Free ⇒ a cap of zero, so any recording is "over".
         assert_eq!(quota::Limit::Recordings.describe(&free).0, Some(0));
         // Pro's unlimited sentinel must read as uncapped, not as 4294967295.
@@ -317,10 +320,11 @@ mod tests {
     /// `would_break: 0` about a change that would have taken conferencing away
     /// from every Free tenant, back when `Free.video_max_participants` was 0.
     ///
-    /// Free now has a real video cap of **4** (operator decision, 2026-08-29),
-    /// so video is no longer a removal for Free. `recordings` (still excluded
-    /// on Free) carries the property here — the guard keeps a live example
-    /// rather than being deleted along with the value it used to pin.
+    /// Free got a real video cap of 4 (operator decision, 2026-08-29), and 10
+    /// with a 60-minute meeting in FR-115, so video is no longer a removal for
+    /// Free. `recordings` (still excluded on Free) carries the property here —
+    /// the guard keeps a live example rather than being deleted along with the
+    /// value it used to pin.
     #[test]
     fn a_plan_that_excludes_a_capability_is_reported_as_breaking() {
         let free = Plan::Free.limits();
@@ -328,8 +332,8 @@ mod tests {
         // taking a capability away from anyone.
         assert_eq!(
             quota::Limit::VideoMaxParticipants.describe(&free).0,
-            Some(4),
-            "Free has 4 video participants; 0 would mean enforcing REMOVES conferencing"
+            Some(10),
+            "Free has 10 video participants; 0 would mean enforcing REMOVES conferencing"
         );
         // `recordings` carries the excluded-capability property now that
         // `ai_recognition` is gone: excluded ⇒ a zero cap ⇒ the report flags a

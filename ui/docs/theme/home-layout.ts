@@ -24,6 +24,7 @@ import {
   PILLARS,
   PRICING,
   VIDEO_TOUR,
+  annualLine,
   type Plan,
 } from '../../src/utils/landing.ts'
 import type { SiteVideo } from '../../src/utils/videos.ts'
@@ -67,19 +68,24 @@ function iconFor(mdi: string): string {
   return icon(name, { size: 30 })
 }
 
+/** FR-115 — the same number in USD and EUR, per user per month (`home.js`
+ * renders the identical label from the live plans). */
 export function priceLabel(plan: Plan): { amount: string; unit: string } {
   const dollars = plan.price_cents / 100
-  return { amount: `$${Number.isInteger(dollars) ? dollars : dollars.toFixed(2)}`, unit: plan.price_cents > 0 ? '/user/mo' : 'forever' }
+  const n = Number.isInteger(dollars) ? `${dollars}` : dollars.toFixed(2)
+  return { amount: `$${n}`, unit: plan.price_cents > 0 ? `/ €${n} per user / month` : 'forever' }
 }
 
 function planCard(plan: Plan): string {
   const featured = plan.id === 'pro'
   const { amount, unit } = priceLabel(plan)
+  const annual = annualLine(plan)
   return (
     `<div class="home-plan${featured ? ' home-plan--featured' : ''}" data-plan="${escapeHtml(plan.id)}">` +
     (featured ? `<p class="home-plan__badge">Most popular</p>` : '') +
     `<h3 class="home-plan__name">${escapeHtml(plan.name)}</h3>` +
     `<p class="home-plan__price"><span class="home-plan__amount" data-price>${amount}</span> <span class="home-plan__unit" data-unit>${unit}</span></p>` +
+    `<p class="home-plan__annual" data-annual${annual ? '' : ' hidden'}>${escapeHtml(annual ?? '')}</p>` +
     `<ul class="home-plan__features" data-features>${plan.features.map((f) => `<li>${icon('check', { size: 16 })}<span>${escapeHtml(f)}</span></li>`).join('')}</ul>` +
     `<a class="btn ${featured ? 'btn--primary' : 'btn--tonal'} home-plan__cta" href="/register">${plan.price_cents === 0 ? 'Get started free' : 'Start now'}</a>` +
     `</div>`

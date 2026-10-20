@@ -99,36 +99,72 @@ Two things follow immediately:
 ⚠️ **Do not price from this.** The stated sequence is measure first, then reshape
 (§5). One day of data from two tenants, one of them ours, decides nothing.
 
+### Seven weeks later (2026-10-19)
+
+What FR-115 reshaped the ladder on — 30 days of the whole fleet, which is still
+mostly our own (stress lanes, forced-relay runs, corporate laptops that sit on the
+DERP floor by design), so these are a **heavy user's** numbers, not a typical one's:
+
+| Cost driver | 30 days | At `relay-costs.toml` prices |
+|---|---|---|
+| Direct P2P | 373 remote-session hours; 94 % of sessions with a recorded carrier went direct | €0 by construction |
+| `derp_bytes` | ≈ 30 GB (79 GB since 2026-08-30); median day 0.3 GB | ≈ €0.30 |
+| coturn (fleet total, not per tenant) | ≤ ≈ 950 GB host egress on the central coturn workers; 41 allocations on average | ≤ ≈ €9.50 |
+| `sfu_participant_seconds` | ≈ 0 | ≈ €0 |
+
+The whole product's variable cost is about **€10 a month**, and the largest part is the
+one relay no tenant can be charged for yet (coturn, FR-20 P3 deferred). Devices,
+direct traffic and chat cost nothing measurable. That is what the FR-115 ladder below
+is built on: give away what costs nothing, cap what does.
+
 ---
 
 ## 4. The ladder today
 
-Prices are USD/user/month, live in Stripe since 2026-07-27. Plan ids
-(`free`/`pro`/`business`) are stored in tenant documents and matched in the
+**FR-115** ([#2557](https://github.com/gjovanov/roomler-ai/issues/2557)), operator
+decisions 2026-10-19. Paid plans are **per seat** (a seat is a member who accepted),
+monthly or **annual at two months free**, in **USD or EUR** at the same number. Plan
+ids (`free`/`pro`/`business`) are stored in tenant documents and matched in the
 webhook, so **renaming one is a migration**, not a copy change.
 
-| | Free | Pro $8 | Business $16 |
+| | Free | Pro | Business |
 |---|---|---|---|
-| Devices | 3 | 30 | 300 |
-| Tunnel clients | 3 | 30 | 300 |
-| Concurrent RC sessions | 1 | 5 | ∞ |
-| Members | 10 | ∞ | ∞ |
-| Storage | 100 MB | 10 GB | 100 GB |
-| Video participants | 4 | 10 | 100 |
-| Exit nodes / MagicDNS | — | ✅ | ✅ |
-| Recordings / AI | — | — | ✅ |
-| Overlay mesh | ✅ | ✅ | ✅ |
+| Price per seat | 0, **commercial use allowed** | $8 / €8 a month · $80 / €80 a year | $16 / €16 a month · $160 / €160 a year |
+| Users | 10, enforced | per seat | per seat |
+| Devices · tunnel clients | 100 · 100 | 1,000 · 1,000 | 5,000 · 5,000 |
+| MagicDNS | ✅ | ✅ | ✅ |
+| Exit nodes | from FR-115 P4d | ✅ | ✅ |
+| Concurrent remote sessions | 1 per org | 1 per seat | ∞ (fair use) |
+| Relay (DERP + TURN) at full speed | 10 GB / month | 25 GB per seat | 100 GB per seat |
+| Meetings | 10 people, 60 minutes | 50 people | 100 people + recordings |
+| Storage | 1 GB | 10 GB per seat | 50 GB per seat |
+| Chat channels, history | unlimited | unlimited | unlimited |
+| Overlay mesh, own relays (FR-19) | ✅ | ✅ | ✅ |
+
+The code is `Plan::limits_for(seats)` (`crates/db/src/models/tenant.rs`): the
+published matrix is one seat's numbers, and an org's own limits scale by the seats its
+subscription bills (`Tenant::billed_seats`).
 
 Notes that matter more than the numbers:
 
-- **The mesh is on every tier, including Free.** It is the product's spine and
-  costs nothing when it goes direct.
+- **The mesh is on every tier, including Free**, and since FR-115 so is every mesh
+  feature that costs nothing (MagicDNS). Exit nodes join Free once the relay throttle
+  exists: an exit whose path falls to DERP is the one way Free could cost real money.
+- **Free fences by objective limits, never by "personal use" detection** — one
+  concurrent remote session, ten users, no support sessions to other orgs (FR-52).
+  The remote-desktop vendors fence free with commercial-use detection; we allow
+  commercial use outright and say so.
 - `Enterprise` exists in the `Plan` enum with Business's limits and price and is
-  never returned by `get_plans()`. It is a **placeholder, not a tier.**
+  never returned by `get_plans()`. It is still a **placeholder, not a tier.**
 - Free's `video_max_participants` was `0` until FR-32 and enforced nowhere, so
-  Free tenants have always held calls. It is now **4** — enforcing `0` would have
-  removed a capability people already use, which is a different act from holding
-  a line.
+  Free tenants have always held calls. It went to **4**, and to **10** with a
+  60-minute meeting in FR-115 — enforcing `0` would have removed a capability
+  people already use, which is a different act from holding a line.
+- ⚠️ Before FR-115, checkout sold **one unit per org** whatever its size while the
+  site said "per user", and a plan switch ran a second checkout that started a
+  second subscription. Both are fixed: checkout bills `quantity = seats`, a
+  15-minute reconcile keeps it equal to the member count with proration, and a plan
+  change moves the existing subscription's item (`POST /api/stripe/change-plan`).
 
 ### Enforcement posture
 
@@ -152,7 +188,7 @@ admitting the numbers were not researched against our cost base.
 |---|---|---|
 | **P1** | Make the advertised limits true — enforce all fourteen, log every denial | ✅ FR-32 |
 | **P2** | Meter the real cost drivers per tenant; expose, don't bill | ✅ FR-20 |
-| **P3** | **Reshape tiers on measured cost** — and only then decide currency, the free-device cap, and whether an MSP tier exists | ⬜ needs ~a month of P2 data |
+| **P3** | **Reshape tiers on measured cost** — and only then decide currency, the free-device cap, and whether an MSP tier exists | ✅ decided 2026-10-19 — [FR-115](fr/FR-115-pricing-reshape.md), shipping in phases |
 | **P4** | Offline Ed25519 licence keys for self-hosted Enterprise | ⬜ when someone asks to buy one |
 
 Denials from P1 are the other half of the input: they are the **best
@@ -172,6 +208,13 @@ upgrade-intent signal available**, and they come free with enforcement.
   marginal cost and the least differentiation.
 - **USD or EUR**, and whether `Enterprise` becomes real or is deleted.
 
+**How FR-115 answered them:** per seat for the bundle, with **concurrent remote
+sessions** as the fence on Free and a per-seat allowance on Pro (the metric the
+remote-desktop vendors sell, without making three technicians buy five hundred
+seats); Free at **100 devices**; conferencing **stays**, fenced on Free by meeting
+length (the meeting vendors' own fence); **both** currencies; `Enterprise` still a
+placeholder. An MSP tier waits for an MSP to ask.
+
 ---
 
 ## 6. Rules that do not change with the price list
@@ -182,9 +225,13 @@ upgrade-intent signal available**, and they come free with enforcement.
 3. **Bill only on what the server or its own relays measured.** `tunnel_audit`'s
    byte columns are reported by the client endpoint — a claim by a host we do not
    control. They inform analytics and never the ledger.
-4. **Never kill a live session over billing.** Quota exhausted ⇒ relayed
-   connections refused with a message naming the quota; direct connections keep
-   working. Someone debugging a production box at 2 a.m. must be told *why*.
+4. **Never kill a live session over billing.** Past a relay allowance, relayed
+   traffic is **throttled, never refused** (FR-115 D4, which replaced "refused"):
+   for a host behind symmetric NAT or a full-tunnel VPN the relay is the only path,
+   so refusing it would mean the product stops working. Direct connections and an
+   org's own relays are never counted. A refused *new* session (a concurrency cap)
+   names what holds the slot. Someone debugging a production box at 2 a.m. must be
+   told *why*.
 5. **Failed payment degrades, never deletes.** Grace period → Free entitlements.
    Devices and org data survive.
 6. **Nothing is removed from the community edition** to make a paid tier look
@@ -196,7 +243,7 @@ upgrade-intent signal available**, and they come free with enforcement.
 
 | # | Decision | Blocked on |
 |---|---|---|
-| 1 | Tier reshape — metric, prices, currency | ~a month of FR-20 data |
+| ~~1~~ | ~~Tier reshape — metric, prices, currency~~ — **decided 2026-10-19 in [FR-115](fr/FR-115-pricing-reshape.md)**: per seat, USD and EUR, annual at two months free, Free at 100 devices and 10 users with commercial use allowed | — |
 | 2 | Price the AGPL exception | first real enquiry |
 | 3 | `Enterprise`: make real or delete | #1 |
 | ~~4~~ | ~~HEVC patent pool~~ — **decided 2026-09-01: HEVC stays ON by default.** Only vendor hardware encoders ship (`*_nvenc`/`*_qsv`/`*_amf`/`*_videotoolbox`); we distribute no HEVC implementation, and the vendor licenses the silicon. Reasoning + the three things that keep it true in [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) | — |

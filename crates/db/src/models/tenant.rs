@@ -143,7 +143,7 @@ pub struct RcSessionLimits {
     pub idle_secs: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
     #[default]
@@ -343,6 +343,92 @@ pub struct BillingInfo {
     pub status: SubscriptionStatus,
     #[serde(default)]
     pub cancel_at_period_end: bool,
+    /// FR-115 — the subscription's quantity: the seats the org is billed
+    /// for, as Stripe last reported them. `None` on every row from before
+    /// per-seat billing and until the first subscription event lands; the
+    /// limits then count one seat ([`Tenant::billed_seats`]), so a missing
+    /// number can only under-grant.
+    #[serde(default)]
+    pub seats: Option<u32>,
+    /// FR-115 — `month` or `year`, as the subscription's price says. Stored
+    /// as the wire string and read through [`BillingInterval::parse`], so a
+    /// value this build does not know can never fail the tenant document.
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// FR-115 — `usd` or `eur`, the subscription's currency. Same storage
+    /// rule as `interval` ([`BillingCurrency::parse`]).
+    #[serde(default)]
+    pub currency: Option<String>,
+}
+
+impl BillingInfo {
+    /// The interval, when it is one this build knows.
+    pub fn interval(&self) -> Option<BillingInterval> {
+        self.interval.as_deref().and_then(BillingInterval::parse)
+    }
+
+    /// The currency, when it is one this build knows.
+    pub fn currency(&self) -> Option<BillingCurrency> {
+        self.currency.as_deref().and_then(BillingCurrency::parse)
+    }
+}
+
+/// FR-115 — how often a paid plan is billed. Annual is two months free:
+/// the price of ten months ([`Plan::price_cents`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingInterval {
+    Month,
+    Year,
+}
+
+impl BillingInterval {
+    pub const ALL: [BillingInterval; 2] = [BillingInterval::Month, BillingInterval::Year];
+
+    /// The wire spelling — Stripe's `recurring.interval`, and ours.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BillingInterval::Month => "month",
+            BillingInterval::Year => "year",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "month" => Some(BillingInterval::Month),
+            "year" => Some(BillingInterval::Year),
+            _ => None,
+        }
+    }
+}
+
+/// FR-115 — the currencies a paid plan is sold in. The amounts are the same
+/// number in both ([`Plan::price_cents`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingCurrency {
+    Usd,
+    Eur,
+}
+
+impl BillingCurrency {
+    pub const ALL: [BillingCurrency; 2] = [BillingCurrency::Usd, BillingCurrency::Eur];
+
+    /// The wire spelling — Stripe's lower-case ISO 4217 code, and ours.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BillingCurrency::Usd => "usd",
+            BillingCurrency::Eur => "eur",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "usd" => Some(BillingCurrency::Usd),
+            "eur" => Some(BillingCurrency::Eur),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -372,13 +458,44 @@ pub struct OAuthCredential {
 
 impl Tenant {
     pub const COLLECTION: &'static str = "tenants";
+
+    /// FR-115 — the seats this org's limits are computed for: the
+    /// subscription's quantity on a paid plan, at least one; one on Free,
+    /// which has no seats. A paid org whose first subscription event has not
+    /// landed counts one seat — a missing number may only under-grant.
+    pub fn billed_seats(&self) -> u32 {
+        match self.plan {
+            Plan::Free => 1,
+            _ => self
+                .billing
+                .as_ref()
+                .and_then(|b| b.seats)
+                .unwrap_or(1)
+                .max(1),
+        }
+    }
+
+    /// FR-115 — this org's limits: its plan's, scaled to its billed seats.
+    pub fn limits(&self) -> PlanLimits {
+        self.plan.limits_for(self.billed_seats())
+    }
 }
 
-/// S5 pivot — the plan matrix is per-user priced with DEVICE caps
-/// (Tailscale-style): the fleet limits lead, the collaboration limits
-/// ride along. Serialized into `/api/stripe/plans`, snapshot-locked by
-/// `crates/tests/src/billing_tests.rs` + `ui/e2e/billing.spec.ts` (update
-/// them in tandem with any change here).
+/// One gigabyte of relayed traffic. Decimal, as network volumes are counted;
+/// storage stays binary (`GIB`), as it always was.
+pub const GB: u64 = 1_000_000_000;
+/// One gibibyte of storage.
+pub const GIB: u64 = 1024 * 1024 * 1024;
+
+/// FR-115 — the plan matrix: priced PER SEAT, with the network given away
+/// (Tailscale-style device counts, every mesh feature on Free) and the
+/// limits on what costs money or grows with the customer — concurrent
+/// remote sessions, relayed bytes, meeting time, seats. Serialized into
+/// `/api/stripe/plans`, snapshot-locked by `crates/tests/src/billing_tests.rs`
+/// + `ui/e2e/billing.spec.ts` (update them in tandem with any change here).
+///
+/// ⚠️ "Unlimited" is `u32::MAX` for a count (and `-1` for history), never an
+/// `Option` — `services::quota::count_cap` is what reads it as uncapped.
 #[derive(Debug, Serialize)]
 pub struct PlanLimits {
     // ── Fleet (primary) ─────────────────────────────────────────────
@@ -390,87 +507,307 @@ pub struct PlanLimits {
     /// Overlay mesh membership (private network between the tenant's
     /// nodes). On for every plan — it's the product's spine.
     pub overlay_mesh: bool,
-    /// Exit nodes (route a node's whole egress through a mesh peer).
+    /// Exit nodes (route a node's whole egress through a mesh peer). Free
+    /// gets them once the relay throttle exists (FR-115 P4d): an exit node
+    /// whose path falls to DERP is the one way Free could cost real money.
     pub exit_nodes: bool,
     /// MagicDNS (tenant overlay DNS domain).
     pub magic_dns: bool,
-    /// Concurrent remote-control sessions per tenant. Advisory in S5
-    /// (surfaced in the matrix; enforcement is a follow-up).
+    /// Concurrent remote-control sessions per tenant (FR-115 P3 enforces
+    /// it). Per seat on a `per_seat` plan.
     pub max_concurrent_sessions: u32,
+    /// FR-115 — relayed bytes (DERP + TURN) a month at full speed; past it
+    /// the org is throttled, never refused (decision D4). Direct traffic and
+    /// the org's own relays are never counted. Per seat on a `per_seat`
+    /// plan. Enforced from FR-115 P4.
+    pub relay_bytes_per_month: u64,
     // ── Collaboration (bundled) ─────────────────────────────────────
     pub max_members: u32,
     pub max_channels: u32,
     pub max_message_history: i64,
+    /// Per seat on a `per_seat` plan.
     pub storage_bytes: u64,
     pub video_max_participants: u32,
+    /// FR-115 — the longest meeting, in minutes; `u32::MAX` = no cap.
+    /// Enforced from FR-115 P5.
+    pub meeting_max_minutes: u32,
     pub cloud_integrations: bool,
     pub recordings: bool,
+    /// FR-115 — `storage_bytes`, `max_concurrent_sessions` and
+    /// `relay_bytes_per_month` are per seat on this plan: the values above
+    /// are ONE seat's, and [`Plan::limits_for`] scales them. Free has no
+    /// seats, so its values are the org's.
+    pub per_seat: bool,
 }
 
 impl Plan {
+    /// One seat's limits — what `/api/stripe/plans` publishes, the number a
+    /// person reads as "per user". An org's own limits are
+    /// [`Tenant::limits`].
     pub fn limits(&self) -> PlanLimits {
-        match self {
+        self.limits_for(1)
+    }
+
+    /// The limits for an org billed for `seats` seats (at least one). The
+    /// per-seat numbers multiply, saturating; an unlimited one stays
+    /// unlimited.
+    pub fn limits_for(&self, seats: u32) -> PlanLimits {
+        let mut limits = match self {
             Plan::Free => PlanLimits {
-                max_devices: 3,
-                max_tunnel_clients: 3,
+                // FR-115 — devices cost nothing on a direct path, so Free
+                // matches what the mesh vendors give away (it was 3).
+                max_devices: 100,
+                max_tunnel_clients: 100,
                 overlay_mesh: true,
                 exit_nodes: false,
-                magic_dns: false,
+                magic_dns: true,
                 max_concurrent_sessions: 1,
+                relay_bytes_per_month: 10 * GB,
+                // FR-115 D2 — ten users, and ESTABLISHED: enforced whatever
+                // `plan_enforcement` says (`services::quota::Limit`).
                 max_members: 10,
-                max_channels: 5,
-                max_message_history: 5_000,
-                storage_bytes: 100 * 1024 * 1024,
-                // FR-32 — Free gets 4 video participants (operator decision,
-                // 2026-08-29). It was 0, i.e. "Free has no conferencing at
-                // all", which was never enforced — so Free tenants have always
-                // been able to hold calls, and enforcing 0 would have taken
-                // that away rather than held a line. 4 is a real cap that the
-                // gate can enforce without removing a capability people use.
-                video_max_participants: 4,
+                max_channels: u32::MAX,
+                max_message_history: -1,
+                storage_bytes: GIB,
+                // FR-32 moved Free from 0 to 4 participants because 0 was
+                // never enforced and people held calls; FR-115 moves it to 10
+                // with a 60-minute meeting, the free-tier norm.
+                video_max_participants: 10,
+                meeting_max_minutes: 60,
                 cloud_integrations: false,
                 recordings: false,
+                per_seat: false,
             },
             Plan::Pro => PlanLimits {
-                max_devices: 30,
-                max_tunnel_clients: 30,
+                max_devices: 1_000,
+                max_tunnel_clients: 1_000,
                 overlay_mesh: true,
                 exit_nodes: true,
                 magic_dns: true,
-                max_concurrent_sessions: 5,
+                max_concurrent_sessions: 1,
+                relay_bytes_per_month: 25 * GB,
                 max_members: u32::MAX,
                 max_channels: u32::MAX,
                 max_message_history: -1,
-                storage_bytes: 10 * 1024 * 1024 * 1024,
-                video_max_participants: 10,
+                storage_bytes: 10 * GIB,
+                video_max_participants: 50,
+                meeting_max_minutes: u32::MAX,
                 cloud_integrations: true,
                 recordings: false,
+                per_seat: true,
             },
             Plan::Business | Plan::Enterprise => PlanLimits {
-                max_devices: 300,
-                max_tunnel_clients: 300,
+                max_devices: 5_000,
+                max_tunnel_clients: 5_000,
                 overlay_mesh: true,
                 exit_nodes: true,
                 magic_dns: true,
                 max_concurrent_sessions: u32::MAX,
+                relay_bytes_per_month: 100 * GB,
                 max_members: u32::MAX,
                 max_channels: u32::MAX,
                 max_message_history: -1,
-                storage_bytes: 100 * 1024 * 1024 * 1024,
+                storage_bytes: 50 * GIB,
                 video_max_participants: 100,
+                meeting_max_minutes: u32::MAX,
                 cloud_integrations: true,
                 recordings: true,
+                per_seat: true,
             },
+        };
+        if limits.per_seat {
+            let seats = seats.max(1);
+            if limits.max_concurrent_sessions != u32::MAX {
+                limits.max_concurrent_sessions =
+                    limits.max_concurrent_sessions.saturating_mul(seats);
+            }
+            limits.storage_bytes = limits.storage_bytes.saturating_mul(u64::from(seats));
+            limits.relay_bytes_per_month = limits
+                .relay_bytes_per_month
+                .saturating_mul(u64::from(seats));
+        }
+        limits
+    }
+
+    /// The list price of one seat for a month, in US cents — what the MRR
+    /// estimate multiplies (`routes::cost::mrr_estimate_cents`).
+    pub fn price_monthly_cents(&self) -> u32 {
+        self.price_cents(BillingInterval::Month, BillingCurrency::Usd)
+    }
+
+    /// FR-115 — the list price of one seat for one `interval`, in the
+    /// minor unit of `currency`. The same number in USD and EUR; annual is
+    /// two months free (ten months' price). Stripe's Prices are created to
+    /// match these, and `billing_tests.rs` locks them.
+    pub fn price_cents(&self, interval: BillingInterval, _currency: BillingCurrency) -> u32 {
+        let month = match self {
+            Plan::Free => 0,
+            Plan::Pro => 800,
+            Plan::Business | Plan::Enterprise => 1600,
+        };
+        match interval {
+            BillingInterval::Month => month,
+            BillingInterval::Year => month * 10,
         }
     }
 
-    pub fn price_monthly_cents(&self) -> u32 {
+    /// The wire id stored in tenant documents and matched in the webhook.
+    pub fn id(&self) -> &'static str {
         match self {
-            Plan::Free => 0,
-            Plan::Pro => 800,
-            Plan::Business => 1600,
-            Plan::Enterprise => 1600,
+            Plan::Free => "free",
+            Plan::Pro => "pro",
+            Plan::Business => "business",
+            Plan::Enterprise => "enterprise",
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn tenant(plan: Plan, seats: Option<u32>) -> Tenant {
+        Tenant {
+            id: None,
+            name: "t".into(),
+            slug: "t".into(),
+            description: None,
+            icon: None,
+            owner_id: bson::oid::ObjectId::new(),
+            plan,
+            features: vec![],
+            settings: TenantSettings::default(),
+            billing: seats.map(|s| BillingInfo {
+                customer_id: None,
+                subscription_id: None,
+                current_period_end: None,
+                status: SubscriptionStatus::Active,
+                cancel_at_period_end: false,
+                seats: Some(s),
+                interval: None,
+                currency: None,
+            }),
+            integrations: None,
+            is_archived: false,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            deleted_at: None,
+        }
+    }
+
+    /// FR-115 — the Free plan gives the network away and fences what costs.
+    #[test]
+    fn free_gives_devices_and_mesh_and_fences_concurrency() {
+        let free = Plan::Free.limits();
+        assert_eq!(free.max_devices, 100);
+        assert_eq!(free.max_tunnel_clients, 100);
+        assert!(free.magic_dns);
+        assert!(
+            !free.exit_nodes,
+            "exit nodes wait for the relay throttle (P4d)"
+        );
+        assert_eq!(free.max_concurrent_sessions, 1);
+        assert_eq!(free.max_members, 10);
+        assert_eq!(free.relay_bytes_per_month, 10 * GB);
+        assert_eq!(free.meeting_max_minutes, 60);
+        assert!(!free.per_seat);
+    }
+
+    /// Per-seat numbers multiply with the seats; unlimited stays unlimited;
+    /// the counts that are not per seat do not move.
+    #[test]
+    fn per_seat_limits_scale_with_seats() {
+        let one = Plan::Pro.limits_for(1);
+        let five = Plan::Pro.limits_for(5);
+        assert_eq!(
+            five.max_concurrent_sessions,
+            5 * one.max_concurrent_sessions
+        );
+        assert_eq!(five.storage_bytes, 5 * one.storage_bytes);
+        assert_eq!(five.relay_bytes_per_month, 5 * one.relay_bytes_per_month);
+        assert_eq!(five.max_devices, one.max_devices, "devices are per org");
+
+        let biz = Plan::Business.limits_for(40);
+        assert_eq!(
+            biz.max_concurrent_sessions,
+            u32::MAX,
+            "unlimited stays unlimited"
+        );
+
+        // Free has no seats: a seat count changes nothing.
+        assert_eq!(Plan::Free.limits_for(7).max_concurrent_sessions, 1);
+        assert_eq!(Plan::Free.limits_for(7).storage_bytes, GIB);
+    }
+
+    /// Zero and absurd seat counts are clamped and saturate — never a wrap.
+    #[test]
+    fn seat_scaling_never_wraps() {
+        assert_eq!(
+            Plan::Pro.limits_for(0).max_concurrent_sessions,
+            1,
+            "zero seats counts as one"
+        );
+        let huge = Plan::Business.limits_for(u32::MAX);
+        assert_eq!(huge.storage_bytes, u64::MAX, "50 GiB x u32::MAX saturates");
+        assert_eq!(huge.relay_bytes_per_month, u64::MAX);
+        assert_eq!(
+            Plan::Pro.limits_for(u32::MAX).max_concurrent_sessions,
+            u32::MAX
+        );
+    }
+
+    /// A tenant's limits read its billed seats; a paid org with no seat
+    /// count yet counts one, and Free always one.
+    #[test]
+    fn a_tenant_is_limited_by_its_billed_seats() {
+        assert_eq!(
+            tenant(Plan::Pro, Some(3)).limits().max_concurrent_sessions,
+            3
+        );
+        assert_eq!(tenant(Plan::Pro, None).billed_seats(), 1);
+        assert_eq!(tenant(Plan::Pro, Some(0)).billed_seats(), 1);
+        assert_eq!(tenant(Plan::Free, Some(9)).billed_seats(), 1);
+    }
+
+    /// Annual is two months free, and the same number in both currencies.
+    #[test]
+    fn annual_is_ten_months_and_eur_matches_usd() {
+        for plan in [Plan::Pro, Plan::Business] {
+            let m = plan.price_cents(BillingInterval::Month, BillingCurrency::Usd);
+            assert_eq!(
+                plan.price_cents(BillingInterval::Year, BillingCurrency::Usd),
+                10 * m
+            );
+            for i in BillingInterval::ALL {
+                assert_eq!(
+                    plan.price_cents(i, BillingCurrency::Eur),
+                    plan.price_cents(i, BillingCurrency::Usd)
+                );
+            }
+        }
+        assert_eq!(Plan::Pro.price_monthly_cents(), 800);
+        assert_eq!(Plan::Business.price_monthly_cents(), 1600);
+    }
+
+    /// An interval or currency a newer server wrote reads as unknown, and
+    /// the tenant document still loads.
+    #[test]
+    fn unknown_interval_and_currency_never_fail_the_document() {
+        let b: BillingInfo = serde_json::from_value(serde_json::json!({
+            "customer_id": null, "subscription_id": null, "current_period_end": null,
+            "interval": "fortnight", "currency": "jpy"
+        }))
+        .unwrap();
+        assert_eq!(b.interval(), None);
+        assert_eq!(b.currency(), None);
+        assert_eq!(b.seats, None);
+        let b: BillingInfo = serde_json::from_value(serde_json::json!({
+            "customer_id": null, "subscription_id": null, "current_period_end": null,
+            "seats": 4, "interval": "year", "currency": "eur"
+        }))
+        .unwrap();
+        assert_eq!(b.interval(), Some(BillingInterval::Year));
+        assert_eq!(b.currency(), Some(BillingCurrency::Eur));
     }
 }
 

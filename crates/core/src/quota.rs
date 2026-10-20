@@ -42,8 +42,11 @@ pub fn check_delta(
     current: u64,
     delta: u64,
 ) -> Result<(), QuotaDenial> {
-    let verdict = quota::evaluate(
+    // FR-115 — against the org's BILLED seats, so a per-seat limit
+    // (concurrency, storage) is the org's, not one seat's.
+    let verdict = quota::evaluate_for(
         tenant.plan.clone(),
+        tenant.billed_seats(),
         tenant.settings.plan_enforcement,
         limit,
         current,

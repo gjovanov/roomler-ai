@@ -1271,12 +1271,31 @@ pub struct TurnSettings {
     pub ttl_secs: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct StripeSettings {
     pub secret_key: String,
     pub webhook_secret: String,
+    /// The MONTHLY Prices, one unit per seat (FR-115). Each carries a USD
+    /// amount and an EUR `currency_options` entry.
     pub price_pro: String,
     pub price_business: String,
+    /// FR-115 — the ANNUAL Prices (two months free). Empty = annual is not
+    /// offered: `/api/stripe/plans` says so and checkout refuses `year`.
+    /// Env: `ROOMLER__STRIPE__PRICE_PRO_ANNUAL`, `…__PRICE_BUSINESS_ANNUAL`.
+    #[serde(default)]
+    pub price_pro_annual: String,
+    #[serde(default)]
+    pub price_business_annual: String,
+    /// FR-115 — the Stripe API's base URL; empty = `https://api.stripe.com`.
+    /// Tests point it at a fake. Env: `ROOMLER__STRIPE__API_BASE`.
+    #[serde(default)]
+    pub api_base: String,
+    /// FR-115 P2's kill switch: keep each subscription's quantity equal to
+    /// the org's seat count (a reconcile every 15 minutes, with proration).
+    /// Off = the quantity is set at checkout and never moved.
+    /// Env: `ROOMLER__STRIPE__SEAT_SYNC`.
+    #[serde(default)]
+    pub seat_sync: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1528,6 +1547,10 @@ impl Settings {
             .set_default("stripe.webhook_secret", "")?
             .set_default("stripe.price_pro", "")?
             .set_default("stripe.price_business", "")?
+            .set_default("stripe.price_pro_annual", "")?
+            .set_default("stripe.price_business_annual", "")?
+            .set_default("stripe.api_base", "")?
+            .set_default("stripe.seat_sync", true)?
             .set_default("giphy.api_key", "")?
             .set_default("email.api_key", "")?
             .set_default("email.from_email", "noreply@roomler.ai")?

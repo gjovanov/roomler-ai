@@ -10,7 +10,8 @@ use bson::oid::ObjectId;
 use serde::Deserialize;
 
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_services::stripe::{StripeEvent, StripeService};
+use roomler_ai_db::models::tenant::{BillingCurrency, BillingInterval};
+use roomler_ai_services::stripe::{BillingSummary, CheckoutParams, StripeEvent, StripeService};
 use roomler_core::{ApiError, Core, extractors::auth::AuthUser};
 
 // ---- Request types -------------------------------------------------------
@@ -19,8 +20,51 @@ use roomler_core::{ApiError, Core, extractors::auth::AuthUser};
 pub struct CheckoutRequest {
     pub tenant_id: String,
     pub plan: String,
+    /// FR-115 — `month` (the default, and what a pre-FR-115 client sends by
+    /// omission) or `year`.
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// FR-115 — `usd` (the default) or `eur`.
+    #[serde(default)]
+    pub currency: Option<String>,
     pub success_url: String,
     pub cancel_url: String,
+}
+
+/// FR-115 — move a live subscription to another plan and/or interval.
+#[derive(Debug, Deserialize)]
+pub struct ChangePlanRequest {
+    pub tenant_id: String,
+    pub plan: String,
+    #[serde(default)]
+    pub interval: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SummaryQuery {
+    pub tenant_id: String,
+}
+
+fn parse_interval(raw: Option<&str>) -> Result<BillingInterval, ApiError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(BillingInterval::Month),
+        Some(s) => BillingInterval::parse(s).ok_or_else(|| {
+            stripe_err(roomler_ai_services::stripe::StripeError::InvalidInterval(
+                s.to_string(),
+            ))
+        }),
+    }
+}
+
+fn parse_currency(raw: Option<&str>) -> Result<BillingCurrency, ApiError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(BillingCurrency::Usd),
+        Some(s) => BillingCurrency::parse(&s.to_ascii_lowercase()).ok_or_else(|| {
+            stripe_err(roomler_ai_services::stripe::StripeError::InvalidCurrency(
+                s.to_string(),
+            ))
+        }),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,8 +75,10 @@ pub struct PortalRequest {
 
 // ---- GET /api/stripe/plans (public) --------------------------------------
 
-pub async fn get_plans() -> Json<Vec<roomler_ai_services::stripe::PlanInfo>> {
-    Json(StripeService::get_plans())
+pub async fn get_plans(
+    State(state): State<Core>,
+) -> Json<Vec<roomler_ai_services::stripe::PlanInfo>> {
+    Json(StripeService::get_plans(&state.settings.stripe))
 }
 
 // ---- POST /api/stripe/checkout (authenticated, MANAGE_TENANT) ------------
@@ -44,21 +90,115 @@ pub async fn create_checkout(
 ) -> Result<Json<roomler_ai_services::stripe::CheckoutResponse>, ApiError> {
     let tenant_id = parse_oid(&body.tenant_id)?;
     require_manage_tenant(&state, tenant_id, auth.user_id).await?;
+    let interval = parse_interval(body.interval.as_deref())?;
+    let currency = parse_currency(body.currency.as_deref())?;
 
+    // FR-115 — one unit per seat: the members who accepted, at least one.
+    let seats = StripeService::count_seats(&state.db, &tenant_id)
+        .await
+        .map_err(stripe_err)?;
     let stripe = StripeService::new(&state.settings.stripe);
     let result = stripe
         .create_checkout_session(
             &state.db,
             &tenant_id,
-            &body.plan,
-            &auth.email,
-            &body.success_url,
-            &body.cancel_url,
+            &CheckoutParams {
+                plan: &body.plan,
+                interval,
+                currency,
+                seats,
+                email: &auth.email,
+                success_url: &body.success_url,
+                cancel_url: &body.cancel_url,
+            },
         )
         .await
         .map_err(stripe_err)?;
 
     Ok(Json(result))
+}
+
+// ---- POST /api/stripe/change-plan (authenticated, MANAGE_TENANT) ---------
+
+/// FR-115 — move the org's live subscription to another plan or interval,
+/// with a proration; never a second checkout (which billed an org twice).
+pub async fn change_plan(
+    State(state): State<Core>,
+    auth: AuthUser,
+    Json(body): Json<ChangePlanRequest>,
+) -> Result<Json<BillingSummary>, ApiError> {
+    let tenant_id = parse_oid(&body.tenant_id)?;
+    require_manage_tenant(&state, tenant_id, auth.user_id).await?;
+    let interval = parse_interval(body.interval.as_deref())?;
+    let stripe = StripeService::new(&state.settings.stripe);
+    let summary = stripe
+        .change_plan(&state.db, &tenant_id, &body.plan, interval)
+        .await
+        .map_err(stripe_err)?;
+    tracing::info!(
+        user = %auth.user_id, tenant = %tenant_id, plan = %body.plan,
+        interval = interval.as_str(), "plan change requested"
+    );
+    Ok(Json(summary))
+}
+
+// ---- GET /api/stripe/summary?tenant_id= (authenticated, MANAGE_TENANT) ---
+
+/// FR-115 — the billing page's view: plan, billed and current seats,
+/// interval, currency, status.
+pub async fn summary(
+    State(state): State<Core>,
+    auth: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<SummaryQuery>,
+) -> Result<Json<BillingSummary>, ApiError> {
+    let tenant_id = parse_oid(&q.tenant_id)?;
+    require_manage_tenant(&state, tenant_id, auth.user_id).await?;
+    let stripe = StripeService::new(&state.settings.stripe);
+    let summary = stripe
+        .summary(&state.db, &tenant_id)
+        .await
+        .map_err(stripe_err)?;
+    Ok(Json(summary))
+}
+
+// ---- the seat reconcile (FR-115 P2) --------------------------------------
+
+/// How often the seat reconcile runs: membership changes reach Stripe
+/// within this, with a proration from the moment Stripe is told.
+pub const SEAT_SYNC_INTERVAL_SECS: u64 = 15 * 60;
+
+/// FR-115 — keep every subscription's quantity equal to its org's seats.
+/// One pod per tick (the Redis claim in `pull_schedule::spawn_hourly`), and
+/// only with a secret key and `stripe.seat_sync` on (the kill switch).
+pub fn spawn_seat_sync(core: Core) {
+    let s = &core.settings.stripe;
+    if s.secret_key.trim().is_empty() || !s.seat_sync {
+        tracing::info!(
+            configured = !s.secret_key.trim().is_empty(),
+            seat_sync = s.seat_sync,
+            "stripe seat sync not started"
+        );
+        return;
+    }
+    crate::pull_schedule::spawn_hourly(
+        core,
+        "billing-seat-sync",
+        120,
+        SEAT_SYNC_INTERVAL_SECS,
+        |core| async move {
+            let stripe = StripeService::new(&core.settings.stripe);
+            match stripe.reconcile_seats(&core.db).await {
+                Ok(r) if r.changed > 0 || r.failed > 0 => tracing::info!(
+                    orgs = r.orgs,
+                    changed = r.changed,
+                    failed = r.failed,
+                    "stripe seat sync"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(%e, "stripe seat sync failed"),
+            }
+        },
+    );
 }
 
 // ---- POST /api/stripe/portal (authenticated, MANAGE_TENANT) --------------
@@ -258,6 +398,12 @@ fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
         StripeError::InvalidSignature => {
             ApiError::Unauthorized("Invalid webhook signature".to_string())
         }
+        // FR-115 — a second checkout would bill the org twice.
+        e @ StripeError::AlreadySubscribed => ApiError::Conflict(e.to_string()),
+        e @ (StripeError::NotSubscribed
+        | StripeError::InvalidInterval(_)
+        | StripeError::InvalidCurrency(_)
+        | StripeError::CurrencyNotOffered(_)) => ApiError::BadRequest(e.to_string()),
         StripeError::ApiError(msg) => ApiError::Internal(format!("Stripe API error: {msg}")),
         StripeError::Mongo(e) => ApiError::Internal(e.to_string()),
         StripeError::Storage(msg) => ApiError::Internal(msg),
