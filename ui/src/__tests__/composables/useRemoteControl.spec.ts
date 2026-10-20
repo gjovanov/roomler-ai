@@ -86,6 +86,7 @@ import {
   RC_REHOME_MAX_REDIALS,
   rehomeRetryDecision,
   expectedOrgTid,
+  turnCredsPath,
   friendlyRcError,
   nextDirPath,
   parseControlInbound,
@@ -4682,6 +4683,25 @@ describe('PR-1 rehome: expectedOrgTid', () => {
     expect(expectedOrgTid(null, '/dashboard')).toBeNull()
     expect(expectedOrgTid(null, '/tenant/nothex/agent')).toBeNull()
     expect(expectedOrgTid(null, '')).toBeNull()
+  })
+})
+
+describe('FR-115 P4b: turnCredsPath', () => {
+  const org = '69a1dbbad2000f26adc875ce'
+  const agent = '6a975e17971e2d55ddcdeda1'
+
+  it('names the device and its org, for the server to charge', () => {
+    expect(turnCredsPath(agent, org)).toBe(
+      `/turn/credentials?tenant_id=${org}&agent_id=${agent}`,
+    )
+  })
+
+  it('falls back to the plain path without both ids', () => {
+    expect(turnCredsPath(agent, null)).toBe('/turn/credentials')
+    expect(turnCredsPath(agent, 'not-hex')).toBe('/turn/credentials')
+    // An external session names its device by a connect code, not an id.
+    expect(turnCredsPath('ABCD-1234', org)).toBe('/turn/credentials')
+    expect(turnCredsPath('', org)).toBe('/turn/credentials')
   })
 })
 

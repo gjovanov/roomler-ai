@@ -19,11 +19,11 @@ use roomler_ai_remote_control::{
     models::{RemoteAuditEvent, RemoteSession, SessionFeedback, SessionFeedbackRequest},
     permissions::Permissions,
     signaling::IceServer,
-    turn_creds::ice_servers_for,
+    turn_creds::{self, ice_servers_for},
 };
 use roomler_ai_services::dao::{base::PaginationParams, session_feedback::Recorded};
 use roomler_core::guards::require_permission;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -355,18 +355,59 @@ pub async fn relay_regions(
     }))
 }
 
+/// FR-115 P4b — the device a controller is about to connect to, and its org.
+#[derive(Debug, Default, Deserialize)]
+pub struct TurnCredentialsQuery {
+    pub tenant_id: Option<String>,
+    pub agent_id: Option<String>,
+}
+
 /// GET /api/turn/credentials — user-scoped, returns short-lived (10 min) TURN
 /// creds plus a STUN fallback. Used by the browser controller and by the
 /// native agent when it needs to trickle ICE.
+///
+/// FR-115 P4b — `?tenant_id=…&agent_id=…` charges the credentials to the
+/// device's org ([`charge_org`]). The RC viewer builds its peer connection
+/// from THESE credentials, not from the ones `rc:ready` carries, so without
+/// this the browser leg of every relayed session is unattributed.
 pub async fn turn_credentials(
     State(state): State<RemoteState>,
     auth: AuthUser,
+    Query(q): Query<TurnCredentialsQuery>,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
     // This route is session-less (a pre-fetch), so it issues the default
     // region's generic URL list; the per-session same-worker affinity and the
     // region pick happen on the Hub's issuance paths.
-    let ice_servers = ice_servers_for(&auth.user_id.to_hex(), state.turn_map.cfg_for(None));
+    let user = match charge_org(&state, auth.user_id, &q).await {
+        Some(org) => turn_creds::charged(&auth.user_id.to_hex(), &org.to_hex()),
+        None => auth.user_id.to_hex(),
+    };
+    let ice_servers = ice_servers_for(&user, state.turn_map.cfg_for(None));
     Ok(Json(TurnCredentialsResponse { ice_servers }))
+}
+
+/// FR-115 P4b — the org a pre-fetch is charged to: the named org, when the
+/// caller is a member of it and the named device is live in it. Any miss (an
+/// id missing or malformed, not a member, a device elsewhere or removed, a
+/// lookup error) is `None`, and the credentials are issued uncharged, as
+/// before: a pre-fetch is never refused over whom to charge.
+async fn charge_org(
+    state: &RemoteState,
+    user_id: ObjectId,
+    q: &TurnCredentialsQuery,
+) -> Option<ObjectId> {
+    let tid = ObjectId::parse_str(q.tenant_id.as_deref()?).ok()?;
+    let aid = ObjectId::parse_str(q.agent_id.as_deref()?).ok()?;
+    if !state.tenants.is_member(tid, user_id).await.ok()? {
+        return None;
+    }
+    state
+        .fleet
+        .agents
+        .find_live_in_tenant(tid, aid)
+        .await
+        .ok()?;
+    Some(tid)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -6,6 +6,13 @@
 //! Username format:  `<unix_expiry>:<user_id>`
 //! Password:         base64( HMAC-SHA1(shared_secret, username) )
 //!
+//! FR-115 P4b — where the issuer knows the org that pays for the relay, the
+//! `user_id` part is [`charged`]: `<principal>:org-<org>`, so the username
+//! reads `<unix_expiry>:<principal>:org-<org>` and coturn's own statistics
+//! name the org ([`org_of_username`]). coturn reads the expiry before the
+//! FIRST `:` and HMACs the whole username, so neither it nor any client sees
+//! a difference.
+//!
 //! The shared secret is the value passed as `--static-auth-secret` to coturn,
 //! also set as `RC_TURN_SECRET` in roomler env.
 
@@ -367,6 +374,31 @@ pub fn select_pair_region(
     Some(chosen)
 }
 
+/// FR-115 P4b — the marker before the org in a charged username.
+const ORG_MARK: &str = "org-";
+
+/// FR-115 P4b — the `user_id` to issue under when the org that pays for the
+/// relay is known: `<principal>:org-<org>`. The username then reads
+/// `<expiry>:<principal>:org-<org>`, and coturn's statistics name the org.
+///
+/// ⚠️ The `org-` marker is what makes the org readable, not its position: an
+/// overlay pair's principal is itself `<node>:<node>` (`overlay::pair_key`),
+/// so an uncharged pair username ends in an ObjectId too — a node's, which a
+/// "last hex part" rule would book as an org.
+pub fn charged(principal: &str, org_hex: &str) -> String {
+    format!("{principal}:{ORG_MARK}{org_hex}")
+}
+
+/// FR-115 P4b — the org a coturn username names, when it was issued
+/// [`charged`]: the last `:`-separated part, if it is `org-` and a 24-hex
+/// ObjectId. `None` for an uncharged username (`<expiry>:<user>`, the
+/// session-less pre-fetch), whose bytes are counted as unattributed and never
+/// guessed.
+pub fn org_of_username(username: &str) -> Option<&str> {
+    let org = username.rsplit(':').next()?.strip_prefix(ORG_MARK)?;
+    (org.len() == 24 && org.bytes().all(|b| b.is_ascii_hexdigit())).then_some(org)
+}
+
 /// Convenience: also include public STUN servers so trickle ICE has something
 /// to work with even before TURN auth completes.
 pub fn ice_servers_for(user_id: &str, turn: Option<&TurnConfig>) -> Vec<IceServer> {
@@ -436,6 +468,42 @@ pub fn ice_servers_for_session_with_ttl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-115 P4b — a charged username names its org at the end, and an
+    /// uncharged one names none. The expiry stays first, so coturn's REST
+    /// check reads it as before.
+    #[test]
+    fn a_charged_username_names_its_org() {
+        let org = "6a975e17971e2d55ddcdedb2";
+        let cfg = TurnConfig {
+            urls: vec!["turn:example.test:3478".into()],
+            workers: vec![],
+            shared_secret: "s".into(),
+            ttl_secs: 600,
+        };
+        let charged_user = charged("6a975e17971e2d55ddcdedb0", org);
+        let server = cfg.issue(&charged_user);
+        let username = server.username.unwrap();
+        assert!(
+            username.split(':').next().unwrap().parse::<u64>().is_ok(),
+            "the expiry stays before the first ':' ({username})"
+        );
+        assert_eq!(org_of_username(&username), Some(org));
+        // An overlay pair's principal is `<node>:<node>`, charged the same way.
+        let (a, b) = ("6a975e17971e2d55ddcdeda1", "6a975e17971e2d55ddcdeda2");
+        let pair = format!("{a}:{b}");
+        assert_eq!(
+            org_of_username(&format!("1792000000:{}", charged(&pair, org))),
+            Some(org)
+        );
+        // ⚠️ Uncharged, that pair ends in a node's ObjectId: not an org.
+        assert_eq!(org_of_username(&format!("1792000000:{pair}")), None);
+        // Uncharged (the session-less pre-fetch), or not an org at the end.
+        assert_eq!(org_of_username("1792000000:6a975e17971e2d55ddcdedb0"), None);
+        assert_eq!(org_of_username("1792000000:u:org-not-an-org"), None);
+        assert_eq!(org_of_username(&format!("1792000000:u:org-{org}x")), None);
+        assert_eq!(org_of_username("garbage"), None);
+    }
 
     fn affinity_cfg() -> TurnConfig {
         TurnConfig {
