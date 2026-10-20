@@ -31,54 +31,78 @@
       </div>
 
       <!-- A card per entry below 600 px (table-stack-xs): the result and the
-           command or detail sat about three screens to the right. -->
-      <v-table v-else density="compact" class="table-stack-xs">
-        <thead>
-          <tr>
-            <th>When</th>
-            <th>Device</th>
-            <th>Who</th>
-            <th>Via</th>
-            <th>Command</th>
-            <th>Result</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="e in entries" :key="e.request_id">
-            <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
-            <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
-            <td data-label="Who" class="text-no-wrap">{{ userName(e.user_id) }}</td>
-            <td data-label="Via">
-              <v-chip size="x-small" variant="tonal">{{ e.source }}</v-chip>
-            </td>
-            <td data-label="Command">
-              <code class="audit-cmd" :title="e.command">{{ e.command }}</code>
-            </td>
-            <td data-label="Result" class="text-no-wrap">
-              <v-chip size="x-small" :color="resultColor(e)" variant="flat">
-                {{ resultLabel(e) }}
-              </v-chip>
-              <v-chip
-                v-if="ranAsLabel(e)"
-                size="x-small"
-                variant="outlined"
-                class="ml-1"
-                :title="ranAsTitle(e)"
-              >
-                {{ ranAsLabel(e) }}
-              </v-chip>
-            </td>
-          </tr>
-        </tbody>
-      </v-table>
+           command or detail sat about three screens to the right. Compact
+           (labels beside short values), 20 cards at a time, and a long
+           command clamped until tapped: 100 full cards were 43,398 px. -->
+      <template v-else>
+        <v-table density="compact" class="table-stack-xs table-stack-xs--compact">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Device</th>
+              <th>Who</th>
+              <th>Via</th>
+              <th>Command</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="e in visible" :key="e.request_id">
+              <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
+              <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
+              <td data-label="Who" class="text-no-wrap">{{ userName(e.user_id) }}</td>
+              <td data-label="Via">
+                <v-chip size="x-small" variant="tonal">{{ e.source }}</v-chip>
+              </td>
+              <td data-label="Command" class="stack-block">
+                <code
+                  class="audit-cmd"
+                  :class="{ 'audit-cmd--open': openCommands.has(e.request_id) }"
+                  :title="e.command"
+                >{{ e.command }}</code>
+                <button
+                  v-if="xs && isLongCommand(e.command)"
+                  type="button"
+                  class="audit-more text-caption"
+                  :aria-expanded="openCommands.has(e.request_id)"
+                  @click="toggleCommand(e.request_id)"
+                >
+                  {{ openCommands.has(e.request_id) ? 'Show less' : 'Show all' }}
+                </button>
+              </td>
+              <td data-label="Result" class="text-no-wrap">
+                <v-chip size="x-small" :color="resultColor(e)" variant="flat">
+                  {{ resultLabel(e) }}
+                </v-chip>
+                <v-chip
+                  v-if="ranAsLabel(e)"
+                  size="x-small"
+                  variant="outlined"
+                  class="ml-1"
+                  :title="ranAsTitle(e)"
+                >
+                  {{ ranAsLabel(e) }}
+                </v-chip>
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+        <div v-if="remaining" class="text-center mt-2">
+          <v-btn variant="tonal" size="small" data-testid="audit-show-more" @click="showMore">
+            Show {{ nextCount }} more
+          </v-btn>
+        </div>
+      </template>
     </v-card-text>
   </v-card>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useDisplay } from 'vuetify'
 import { useAgentStore, type ExecAuditEntry } from '@/stores/agents'
 import { deviceLabel } from '@/composables/useHideDeviceName'
+import { usePhoneSlice } from '@/composables/usePhoneSlice'
 
 const props = defineProps<{
   tenantId: string
@@ -90,6 +114,22 @@ const agentStore = useAgentStore()
 const entries = ref<ExecAuditEntry[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
+
+// FR-116 P3d — a phone shows 20 cards at a time, each command clamped to
+// three lines until tapped (`title` is the desktop's way to the whole of it,
+// and a touch screen has no hover).
+const { xs } = useDisplay()
+const { visible, remaining, nextCount, showMore } = usePhoneSlice(entries)
+const openCommands = ref(new Set<string>())
+function isLongCommand(cmd: string): boolean {
+  return cmd.length > 120 || cmd.includes('\n')
+}
+function toggleCommand(id: string) {
+  const next = new Set(openCommands.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  openCommands.value = next
+}
 
 /** Human wording for each refusal, so a reader learns WHICH gate said no.
  *  "Denied" alone would throw away the only useful part of the record. */
@@ -205,13 +245,37 @@ defineExpose({ load })
   vertical-align: bottom;
 }
 /* A phone stacks the row into a card (table-stack-xs), so the command has
-   the card's whole width and nothing to blow out: show all of it. The
-   clamp hid it on every width — `title` (above) is the desktop's way in. */
+   the card's whole width and nothing to blow out. It shows three lines; a
+   longer one opens on "Show all" (`title`, above, is the desktop's way in,
+   and a touch screen has no hover). A script showed in full ran to
+   1,936 px in one card. */
 @media (max-width: 599.98px) {
   .audit-cmd {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
     max-width: 100%;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  .audit-cmd--open {
+    display: block;
+    -webkit-line-clamp: unset;
+    line-clamp: none;
+  }
+}
+.audit-more {
+  display: block;
+  margin-top: 2px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: rgb(var(--v-theme-primary));
+  cursor: pointer;
+}
+.audit-more:focus-visible {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
 }
 </style>

@@ -53,4 +53,20 @@
     letter-spacing: 0.0333em;
     color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
   }
+
+  /*
+   * `table-stack-xs--compact`, for lists read row after row (the audit
+   * lists): a short cell's label sits BESIDE its value rather than above it,
+   * so a six-cell card is about half as tall. A cell whose value runs long (a
+   * command, a detail) keeps the label on its own line with `stack-block`.
+   */
+  .table-stack-xs--compact tbody tr > td[data-label]:not(.stack-block) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 8px;
+  }
+  .table-stack-xs--compact tbody tr > td[data-label]:not(.stack-block)::before {
+    flex: 0 0 4.5rem;
+  }
 }
