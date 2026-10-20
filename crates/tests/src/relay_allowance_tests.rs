@@ -288,3 +288,101 @@ async fn the_org_page_says_when_the_throttle_is_on() {
         "self-hosting has no allowance"
     );
 }
+
+/// FR-115 P4a-2 — the API half of the push to the PoPs. On its `/stats`
+/// poll, the pod signs the over-allowance set the job published and POSTs it
+/// to every endpoint; a fake PoP records what arrives. What it receives must
+/// verify with the ticket key's PUBLIC half (all a PoP holds) and carry the
+/// published set, with a lifetime of three polls; an absent set is pushed
+/// as an empty one, which is how the kill switch reaches a PoP.
+#[tokio::test]
+async fn the_poller_pushes_the_signed_set_to_the_pops() {
+    use base64::Engine as _;
+    use roomler_ai_remote_control::derp_ticket::{self, DerpTicketSigner};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // A fake PoP: the GET answers a minimal snapshot, the POST is recorded.
+    let pushed: Arc<Mutex<Vec<String>>> = Arc::default();
+    let pop = {
+        let pushed = pushed.clone();
+        axum::Router::new().route(
+            "/stats",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "cpus": 1 })) }).post(
+                move |body: String| {
+                    let pushed = pushed.clone();
+                    async move {
+                        pushed.lock().unwrap().push(body);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pop_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, pop).await.unwrap() });
+
+    let pkcs8 =
+        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let private_b64 = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
+    let configured = private_b64.clone();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.turn.url = Some("turn:coturn.example:3478".into());
+        s.turn.shared_secret = Some(ObjectId::new().to_hex());
+        s.relay.regions_enabled = true;
+        s.relay.regions = Some(format!(
+            r#"[{{"id":"pop-test","turn_url":"turn:coturn-pop.example:3478","stats_urls":["http://{pop_addr}/stats"]}}]"#
+        ));
+        s.relay.stats_poll_secs = 1;
+        s.relay.derp_ticket_private_key = Some(configured);
+    })
+    .await;
+    let Some(redis) = net(&app).redis_pubsub.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let key = relay_allowance::set_key(app.db.name());
+    let network = ObjectId::new().to_hex();
+
+    // The PoP's half: the public key, exactly as a PoP is configured.
+    let signer = DerpTicketSigner::from_pkcs8_b64(&private_b64).unwrap();
+    let public = derp_ticket::decoding_key_from_public_b64(signer.public_key_b64()).unwrap();
+    let newest = |want_network: bool| {
+        pushed.lock().unwrap().iter().rev().find_map(|t| {
+            derp_ticket::verify_allowance_set(t, &public)
+                .ok()
+                .filter(|c| c.set.contains_key(&network) == want_network)
+        })
+    };
+
+    // The module's own job runs at startup and, with the switch off, deletes
+    // the set: write it again on every wait.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let claims = loop {
+        redis
+            .kv_set_ex(&key, &format!(r#"{{"{network}":125000}}"#), 900)
+            .await
+            .unwrap();
+        if let Some(c) = newest(true) {
+            break c;
+        }
+        assert!(Instant::now() < deadline, "no signed set reached the PoP");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert_eq!(claims.set.get(&network), Some(&125_000));
+    assert_eq!(claims.ttl, 3, "a PoP keeps it three polls of 1 s");
+
+    // No set published: an empty one is pushed, and the PoP lets go.
+    pushed.lock().unwrap().clear();
+    redis.kv_del(&key).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let empty = loop {
+        if let Some(c) = newest(false) {
+            break c;
+        }
+        assert!(Instant::now() < deadline, "no empty set reached the PoP");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(empty.set.is_empty(), "{empty:?}");
+}

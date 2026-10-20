@@ -58,11 +58,9 @@ static OVER_LEN: AtomicUsize = AtomicUsize::new(0);
 static BUCKETS: LazyLock<DashMap<ObjectId, std::sync::Mutex<(f64, Instant)>>> =
     LazyLock::new(DashMap::new);
 
-/// The Redis key of the published set, scoped to the database so two
-/// deployments that share a Redis never read each other's.
-pub fn set_key(db_name: &str) -> String {
-    format!("roomler:relay_over_allowance:{db_name}")
-}
+/// The Redis key of the published set, scoped to the database (in
+/// `roomler-ai-services`: the push to the PoPs reads it too, FR-115 P4a-2).
+pub use roomler_ai_services::relay_allowance::set_key;
 
 /// The throttled rate for `network_id` (bytes/s), while its org is over.
 pub fn rate_of(network_id: &ObjectId) -> Option<u64> {
@@ -74,11 +72,9 @@ pub fn rate_of(network_id: &ObjectId) -> Option<u64> {
 
 /// A bulk frame: WireGuard transport data (type 4), or anything that is
 /// neither WireGuard nor disco (the tunnel-class payloads). A handshake
-/// (types 1–3) and disco are control, and pass whatever the allowance.
-pub fn frame_is_bulk(payload: &[u8]) -> bool {
-    !tunnel_core::transport::derp::payload_is_wg_or_disco(payload)
-        || matches!(payload, [4, 0, 0, 0, ..])
-}
+/// (types 1–3) and disco are control, and pass whatever the allowance. The
+/// PoPs read frames by the same definition (`remote_control::derp_frame`).
+pub use roomler_ai_remote_control::derp_frame::frame_is_bulk;
 
 /// Debit `len` bytes from the network's bucket at `rate` bytes/s; `false`
 /// means over the rate, and the frame is dropped, as R4 drops a tunnel frame.

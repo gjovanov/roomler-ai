@@ -24,6 +24,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 /// jsonwebtoken (no version drift between mint and verify).
 pub use jsonwebtoken;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Ticket lifetime. Long — admission is checked at accept-time only (exactly
@@ -121,6 +122,73 @@ pub fn verify(token: &str, key: &DecodingKey) -> Result<DerpTicketClaims, String
         .map_err(|e| format!("derp ticket verify: {e}"))
 }
 
+/// FR-115 P4a-2 — the audience of a signed over-allowance set. Distinct from
+/// a ticket's, so neither can stand in for the other: a set admits nobody,
+/// and a ticket says nothing about a throttle.
+pub const ALLOWANCE_AUDIENCE: &str = "derp-allowance";
+/// Clock-skew tolerance on a set's `exp`. Small, unlike a ticket's: a set is
+/// re-pushed every poll and lives a few of them, and a PoP times it from
+/// ARRIVAL anyway, so the leeway only bounds how long a captured set replays.
+pub const ALLOWANCE_LEEWAY_SECS: u64 = 30;
+
+/// FR-115 P4a-2 — the over-allowance set as the API pushes it to a regional
+/// PoP, on the `/stats` poll it already makes, signed with the key the PoP
+/// already verifies tickets with. The PoP stays DB-free: it is told which
+/// networks to hold back, and at what rate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowanceSetClaims {
+    /// Always [`ALLOWANCE_AUDIENCE`].
+    pub aud: String,
+    /// When the API signed it (unix seconds). A PoP never replaces the set it
+    /// holds with an OLDER one, so a captured set cannot be replayed over a
+    /// newer one.
+    pub iat: u64,
+    pub exp: u64,
+    /// How long a PoP keeps the set after it ARRIVES, unless a newer one
+    /// replaces it; then it lapses and nothing is throttled (fail open).
+    pub ttl: u64,
+    /// Overlay network id (hex) → throttled rate (bytes/s). Empty: nobody is
+    /// throttled, which is also how the API's kill switch reaches a PoP.
+    pub set: BTreeMap<String, u64>,
+}
+
+impl DerpTicketSigner {
+    /// FR-115 P4a-2 — sign the over-allowance set for the PoPs. It lapses
+    /// `ttl_secs` after a PoP receives it, and expires (bounding a replay)
+    /// `ttl_secs` after it was signed.
+    pub fn sign_allowance_set(
+        &self,
+        set: BTreeMap<String, u64>,
+        ttl_secs: u64,
+    ) -> Result<String, String> {
+        let iat = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let claims = AllowanceSetClaims {
+            aud: ALLOWANCE_AUDIENCE.to_string(),
+            iat,
+            exp: iat + ttl_secs,
+            ttl: ttl_secs,
+            set,
+        };
+        jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &self.enc)
+            .map_err(|e| format!("allowance set sign: {e}"))
+    }
+}
+
+/// FR-115 P4a-2 — verify a pushed set: EdDSA signature by the ticket key,
+/// `aud == "derp-allowance"`, unexpired within [`ALLOWANCE_LEEWAY_SECS`]. The
+/// CALLER keeps the newest `iat` and times the set from its arrival.
+pub fn verify_allowance_set(token: &str, key: &DecodingKey) -> Result<AllowanceSetClaims, String> {
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&[ALLOWANCE_AUDIENCE]);
+    validation.leeway = ALLOWANCE_LEEWAY_SECS;
+    jsonwebtoken::decode::<AllowanceSetClaims>(token, key, &validation)
+        .map(|d| d.claims)
+        .map_err(|e| format!("allowance set verify: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +221,47 @@ mod tests {
         let mut tampered = token.clone();
         tampered.pop();
         assert!(verify(&tampered, &other_key).is_err());
+    }
+
+    /// FR-115 P4a-2 — a set round-trips under the ticket key, and a ticket
+    /// and a set can never stand in for each other.
+    #[test]
+    fn an_allowance_set_is_its_own_audience() {
+        let (signer, key) = test_signer();
+        let set = BTreeMap::from([("6a54bf440b4fd609a7356f97".to_string(), 125_000u64)]);
+        let token = signer.sign_allowance_set(set.clone(), 90).unwrap();
+        let claims = verify_allowance_set(&token, &key).expect("a fresh set verifies");
+        assert_eq!(claims.aud, ALLOWANCE_AUDIENCE);
+        assert_eq!(claims.set, set);
+        assert_eq!((claims.ttl, claims.exp - claims.iat), (90, 90));
+
+        assert!(verify(&token, &key).is_err(), "a set admits nobody");
+        let (ticket, _) = signer.mint("6a54bf440b4fd609a7356f97", "cHVia2V5").unwrap();
+        assert!(
+            verify_allowance_set(&ticket, &key).is_err(),
+            "a ticket is not a set"
+        );
+        let (_, other_key) = test_signer();
+        assert!(
+            verify_allowance_set(&token, &other_key).is_err(),
+            "a foreign key"
+        );
+    }
+
+    /// A set signed long ago is refused past the small leeway.
+    #[test]
+    fn an_expired_allowance_set_is_refused() {
+        let (signer, key) = test_signer();
+        let claims = AllowanceSetClaims {
+            aud: ALLOWANCE_AUDIENCE.to_string(),
+            iat: 1_000,
+            exp: 1_090,
+            ttl: 90,
+            set: BTreeMap::new(),
+        };
+        let token =
+            jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &signer.enc).unwrap();
+        assert!(verify_allowance_set(&token, &key).is_err());
     }
 
     #[test]
