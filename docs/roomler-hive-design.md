@@ -480,7 +480,7 @@ boundary.
 every agent mid-turn.
 
 - Linux: `hive-host` runs as a transient unit outside the daemon's cgroup
-  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:603-643`),
+  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:682-722`),
   so `systemctl restart roomlerd` leaves it running, and it reconnects to the daemon's
   per-uid socket.
 - macOS: `hive-host` starts in the user's bootstrap context (`launchctl asuser`, as

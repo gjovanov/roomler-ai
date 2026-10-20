@@ -39,7 +39,7 @@ Where an indicator exists today, by install:
 | the greeter and the lock screen, anywhere | ❌ none | FR-93 D1b (`FR-93-wayland-out-of-the-box.md:559`), deferred |
 
 A root daemon whose prompt has nowhere to show already says so: `no_prompt_surface`
-(`agents/roomlerd/src/signaling.rs:234`, `companion.rs:174`). That is the hook this FR uses.
+(`agents/roomlerd/src/signaling.rs:234`, `companion.rs:224`). That is the hook this FR uses.
 
 ## 3. Key design
 

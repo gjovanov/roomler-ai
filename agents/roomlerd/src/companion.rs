@@ -969,12 +969,12 @@ pub async fn refresh_if_stale(respawn: RespawnContext) {
         //
         // This function exists because the Windows companion is a standalone
         // EXE placed BESIDE the daemon by the wizard / install.ps1, in neither
-        // MSI, so nothing else would ever move it forward. Everywhere else the
-        // packaging owns it: the macOS .pkg carries `/Applications/Roomler.app`
-        // and its postinstall re-bootstraps the LaunchAgent, and on Linux the
-        // companion is its own `roomler-desktop` .deb that apt upgrades. A
-        // daemon reaching in to swap those would be fighting the package
-        // manager for a file it does not own.
+        // MSI, so nothing else would ever move it forward. The macOS .pkg
+        // carries `/Applications/Roomler.app`. On Linux the companion is its
+        // own `.deb`/`.rpm`, which ⚠️ NOTHING upgraded (there is no apt or dnf
+        // repository): FR-117 moves it through the host's package manager, in
+        // the updater's loop (`sync_package`), never by swapping a file the
+        // package manager owns.
         let _ = respawn;
     }
 }
