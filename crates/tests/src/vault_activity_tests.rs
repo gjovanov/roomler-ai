@@ -7,8 +7,9 @@
 //! Driven through the lease tests' raw agent socket. What these lock:
 //!
 //! - a report is kept only when every lease it names was released to that
-//!   device, for that session, in the use's mode and toward its target;
-//!   anything else is dropped, answered with nothing;
+//!   device, for that session, in the use's mode and toward its target, or
+//!   (P3-6b-2b) in `short-lived`, which serves any use; anything else is
+//!   dropped, answered with nothing;
 //! - a kept report records no decision: `vault_audit` does not move;
 //! - only an administrator reads the reports, newest first, by session or by
 //!   lease.
@@ -20,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
+use crate::vault_dynamic_tests::{Issuer, dynamic_secret, short_lived};
 use crate::vault_lease_tests::{
     Device, TAKES_LEASES, ask, device, lease_app, rows, seed_vault, send, start,
 };
@@ -239,6 +241,53 @@ async fn a_report_is_kept_only_for_leases_released_to_that_device_for_that_use()
         "both valid reports kept within 10 s: {got:?}"
     );
     assert_eq!(got.len(), 2, "only the two valid reports: {got:?}");
+}
+
+/// P3-6b-2b — a `short-lived` lease serves any use: a report naming it is
+/// kept for a command and for a file alike, whatever the target, since its
+/// audience is where its credential was minted. A stored secret's lease
+/// beside it is still held to its own mode and target: a report naming it
+/// toward another program is dropped, short-lived lease and all.
+#[tokio::test]
+async fn a_short_lived_lease_is_reported_by_any_use() {
+    let app = lease_app().await;
+    let t = app.seed_tenant("vaultact4").await;
+    seed_vault(&app, &t).await;
+    allow_exec(&app, &t).await;
+    dynamic_secret(&app, &t, &Issuer::made(), true).await;
+    let mut dev = device(&app, &t, "act-dyn", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/act-dyn", Some("dev")).await;
+    let answer = ask(&mut dev, "s1", short_lived(&sid, fence)).await;
+    assert_eq!(answer["t"], "rc:vault.leased", "{answer}");
+    let short = answer["lease_id"].as_str().unwrap().to_string();
+    let exec = exec_lease(&mut dev, "x1", &sid, fence, "psql").await;
+
+    // Handled in order on one connection: the two kept prove this dropped.
+    send(
+        &mut dev.ws,
+        report(&sid, fence, "exec", &[&short, &exec], "kubectl"),
+    )
+    .await;
+    send(
+        &mut dev.ws,
+        report(&sid, fence, "exec", &[&short, &exec], "psql"),
+    )
+    .await;
+    send(
+        &mut dev.ws,
+        report(&sid, fence, "render", &[&short], "pg.env"),
+    )
+    .await;
+    let got = reports(&app, &t, 2).await;
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0]["kind"], "render", "newest first: {got:?}");
+    assert_eq!(got[0]["target"], "pg.env");
+    assert_eq!(got[0]["lease_ids"], json!([short]));
+    assert_eq!(got[1]["kind"], "exec");
+    assert_eq!(got[1]["target"], "psql");
+    let mut both = vec![short, exec];
+    both.sort();
+    assert_eq!(got[1]["lease_ids"], json!(both));
 }
 
 /// Only an administrator reads what devices report.

@@ -7,7 +7,7 @@
 //! |---|---|
 //! | the request | `argv` (1 to 64 items, `argv[0]` a program's BARE name), `env` (1 to 8 `NAME: handle`), `timeout_s` (1 to 300) |
 //! | the program | found only in the system's own directories ([`SYSTEM_DIRS`]), and refused unless root (or this daemon) owns it and neither group nor other can write it: a program the session's account could replace is never handed a value |
-//! | the leases | one per env entry, mode `exec`, audience the program's name: the vault's `exec-only-allowed-programs` guardrail refuses a program off the secret's `exec_allow`, and `windows-proxy-only` refuses every exec on Windows (AC13) |
+//! | the leases | one per env entry, mode `exec`, audience the program's name: the vault's `exec-only-allowed-programs` guardrail refuses a program off the secret's `exec_allow`, and `windows-proxy-only` refuses every exec on Windows (AC13). P3-6b-2b — every entry naming one dynamic secret shares one lease of it in `short-lived`, and the credential minted for that lease ([`leased_values`]) |
 //! | the run | as the session's account (decision 13), from its folder, in its own process group, with a clean environment, stdin closed, output capped, the group killed at the timeout |
 //! | the answer | the exit, stdout and stderr, each value replaced by `[vault:<NAME>]`, then the daemon's own redactor |
 //! | after | every lease let go at once, whatever happened |
@@ -20,6 +20,7 @@
 //! ⚠️ Scrubbing is a seatbelt, not a boundary: a value printed in another
 //! encoding (base64, split across lines) passes it.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bson::oid::ObjectId;
@@ -27,6 +28,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::toolbelt::VaultTools;
+use crate::vault::SHORT_LIVED;
 
 /// How long a command may run when its call names no timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -441,26 +443,20 @@ pub(crate) async fn call(
         vault,
         leases: Vec::with_capacity(req.env.len()),
     };
-    let mut leases = Vec::with_capacity(req.env.len());
-    for (name, handle) in &req.env {
-        // P3-4c-3 — a lease asked for ahead for this program, covering the
-        // command's whole run, is taken as it is: kept when the call ends.
-        if let Some(lease) = vault.ahead(session, fence, handle, "exec", &program, req.timeout) {
-            leases.push(lease);
-            continue;
-        }
-        let lease = vault
-            .lease(session, fence, handle, "exec", &program, ttl)
-            .await
-            .map_err(|why| format!("{name}: {why}"))?;
-        held.leases.push(lease.clone());
-        leases.push(lease);
-    }
-    let mut values = Vec::with_capacity(leases.len());
-    for ((name, _), lease) in req.env.iter().zip(&leases) {
-        let value = vault
-            .value(lease)
-            .ok_or_else(|| format!("{name}: the lease ended before the command ran"))?;
+    // P3-4c-3 — a lease asked for ahead for this program, covering the
+    // command's whole run, is taken as it is: kept when the call ends.
+    // P3-6b-2b — a dynamic secret's names share one lease and its credential.
+    let handles: Vec<(&str, &Handle)> = req.env.iter().map(|(n, h)| (n.as_str(), h)).collect();
+    let to = Use {
+        mode: "exec",
+        audience: &program,
+        ttl,
+        covers: req.timeout,
+        before: "the command ran",
+    };
+    let (leases, leased) = leased_values(vault, session, fence, &handles, &to, &mut held).await?;
+    let mut values = Vec::with_capacity(req.env.len());
+    for ((name, _), value) in req.env.iter().zip(leased) {
         if value.contains(&0) {
             return Err(format!(
                 "{name}: the value holds a NUL and cannot go in an environment"
@@ -505,6 +501,148 @@ impl Drop for Releasing<'_> {
             self.vault.release(&self.leases);
         }
     }
+}
+
+/// P3-6b-2b — a dynamic secret, as a session's tools learn it from its
+/// metadata: its provider, and the fields its minted credential has, the
+/// only ones a session may name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Dynamic {
+    pub(crate) provider: String,
+    pub(crate) fields: Vec<String>,
+}
+
+/// P3-6b-2b — whether `secret` is dynamic, by its metadata (decided and
+/// recorded by the vault's `secret:list`). `None` for a stored secret, or
+/// for one the session's role may not describe: its lease is asked for and
+/// decided as before. Err for a dynamic secret of a provider this build
+/// mints nothing for.
+pub(crate) async fn dynamic_of(
+    vault: &dyn VaultTools,
+    session: ObjectId,
+    fence: u64,
+    secret: &str,
+) -> Result<Option<Dynamic>, String> {
+    let Ok(meta) = vault.describe(session, fence, secret).await else {
+        return Ok(None);
+    };
+    let Some(provider) = meta.get("provider").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !crate::vault::MINTS.contains(&provider) {
+        return Err(format!(
+            "{secret} is a dynamic secret of {provider}, a provider this device mints nothing for"
+        ));
+    }
+    let fields = meta
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|f| {
+            f.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(Dynamic {
+        provider: provider.to_string(),
+        fields,
+    }))
+}
+
+/// P3-6b-2b — what a call leases toward: a stored secret's `mode` and
+/// `audience`, the TTL it asks for, how long a lease asked for ahead must
+/// still cover, and what a lease that ends too soon came before (for its
+/// error).
+pub(crate) struct Use<'a> {
+    pub(crate) mode: &'a str,
+    pub(crate) audience: &'a str,
+    pub(crate) ttl: u32,
+    pub(crate) covers: Duration,
+    pub(crate) before: &'a str,
+}
+
+/// P3-6b-2b — the leases a call's values come from, each once, and each
+/// handle's value in the order of `handles` (`(label, handle)`, the label
+/// what an error names). Each secret is described first ([`dynamic_of`]).
+/// A stored secret's handle takes a lease asked for ahead that covers the
+/// call, or one of its own in `to.mode` toward `to.audience`. Every handle of
+/// one dynamic secret shares ONE lease of the secret as a whole, in
+/// `short-lived`, and the credential minted for it (design §3e: one
+/// credential per lease). The leases the call asks for itself go in `held`.
+pub(crate) async fn leased_values(
+    vault: &dyn VaultTools,
+    session: ObjectId,
+    fence: u64,
+    handles: &[(&str, &Handle)],
+    to: &Use<'_>,
+    held: &mut Releasing<'_>,
+) -> Result<(Vec<String>, Vec<Zeroizing<Vec<u8>>>), String> {
+    let mut kinds: HashMap<&str, Option<Dynamic>> = HashMap::new();
+    for (_, h) in handles {
+        if !kinds.contains_key(h.secret.as_str()) {
+            let kind = dynamic_of(vault, session, fence, &h.secret).await?;
+            kinds.insert(&h.secret, kind);
+        }
+    }
+    let mut leases = Vec::with_capacity(handles.len());
+    // A dynamic secret's one lease in this call, by secret.
+    let mut whole: HashMap<&str, String> = HashMap::new();
+    let mut sources = Vec::with_capacity(handles.len());
+    for (label, h) in handles {
+        let (asked, mode, audience) = match &kinds[h.secret.as_str()] {
+            Some(d) => {
+                if !d.fields.contains(&h.field) {
+                    return Err(format!(
+                        "{label}: {} is a dynamic secret: name a field of the credential minted \
+                         for it, #{}",
+                        h.secret,
+                        d.fields.join(", #")
+                    ));
+                }
+                if let Some(lease) = whole.get(h.secret.as_str()) {
+                    sources.push(lease.clone());
+                    continue;
+                }
+                let all = Handle {
+                    secret: h.secret.clone(),
+                    field: String::new(),
+                };
+                (all, SHORT_LIVED, "")
+            }
+            None => ((*h).clone(), to.mode, to.audience),
+        };
+        let lease = match vault.ahead(session, fence, &asked, mode, audience, to.covers) {
+            Some(lease) => lease,
+            None => {
+                let lease = vault
+                    .lease(session, fence, &asked, mode, audience, to.ttl)
+                    .await
+                    .map_err(|why| format!("{label}: {why}"))?;
+                held.leases.push(lease.clone());
+                lease
+            }
+        };
+        if mode == SHORT_LIVED {
+            vault
+                .mint(&lease)
+                .await
+                .map_err(|why| format!("{label}: {why}"))?;
+            whole.insert(&h.secret, lease.clone());
+        }
+        leases.push(lease.clone());
+        sources.push(lease);
+    }
+    let mut values = Vec::with_capacity(handles.len());
+    for ((label, h), lease) in handles.iter().zip(&sources) {
+        let value = if kinds[h.secret.as_str()].is_some() {
+            vault.minted(lease, &h.field)
+        } else {
+            vault.value(lease)
+        };
+        values.push(value.ok_or_else(|| format!("{label}: the lease ended before {}", to.before))?);
+    }
+    Ok((leases, values))
 }
 
 /// Run the checked call with its values, and answer it.
