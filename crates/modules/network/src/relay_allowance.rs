@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 //! FR-115 P4a — the relay allowance on DERP (`docs/fr/FR-115-pricing-reshape.md`,
-//! *P4a, as proposed*).
+//! *P4a — the DERP throttle*).
 //!
 //! An org past its plan's monthly relay allowance keeps its DERP floor, the
 //! path that always connects, at a throttled rate, and for **bulk** frames
