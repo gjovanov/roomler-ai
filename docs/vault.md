@@ -41,9 +41,10 @@ People use it too.
 > kubeconfig with no credential in its answer; P3-5f-1, the SSH agent,
 > which signs only a sign-in to a host the secret names; P3-5f-2,
 > `vault_connect` serving it, `SSH_AUTH_SOCK` and the host's keys in its
-> answer; P3-5f-3, the same agent on Windows, on a named pipe (§19); and
+> answer; P3-5f-3, the same agent on Windows, on a named pipe (§19);
 > P3-6b-1, the vault's half of `short-lived`: dynamic secrets, their
-> providers, and a lease sealed as one bundle (§20).**
+> providers, and a lease sealed as one bundle (§20); and P3-6b-2a, the
+> daemon's Postgres minter, which nothing calls yet (§20).**
 > No released
 > agent asks for a lease yet: no release build carries the `vault` feature.
 
@@ -1114,12 +1115,12 @@ sequenceDiagram
 | Step | What the engine does | Where |
 |---|---|---|
 | the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:100` |
-| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:318` |
+| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:482` |
 | its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:136` |
-| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:282`, `agents/roomlerd/src/vault_proxy/tls.rs:72` |
-| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts; bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3) | `pg.rs:177`, `pg.rs:189`, `pg.rs:195`, `pg.rs:238` |
-| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:256`, `pg.rs:263` |
-| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:272` |
+| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:446`, `agents/roomlerd/src/vault_proxy/tls.rs:72` |
+| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts; bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3) | `pg.rs:198`, `pg.rs:210`, `pg.rs:216`, `pg.rs:258` |
+| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:280`, `pg.rs:290` |
+| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:153` |
 
 > ⚠️ **The client never authenticates.** The endpoint is its credential: a
 > socket only the session's account can reach (P3-5b-2). The client is never
@@ -1130,7 +1131,7 @@ sequenceDiagram
 
 | What | The refusal says |
 |---|---|
-| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:305`) |
+| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:469`) |
 | a certificate that no root and no `ca` vouches for | "TLS to *host*: …" |
 | a cleartext or MD5 password asked for, or Kerberos, GSSAPI or SSPI | "the upstream asked for …; the proxy authenticates with SCRAM-SHA-256 only" |
 | SASL without SCRAM-SHA-256 | "the upstream offers no SCRAM-SHA-256" |
@@ -1139,7 +1140,7 @@ sequenceDiagram
 | a client asking for a replication connection | refused before any upstream is dialled |
 
 The proxy's refusals reach the client as Postgres writes a fatal error
-(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:409`). An upstream's own
+(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:573`). An upstream's own
 error, such as a wrong password or an unknown database, is relayed as the
 upstream wrote it.
 
@@ -1542,8 +1543,9 @@ for that long; it never sees the issuer. The design is the spec's §3e "P3-6,
 `short-lived`, as designed".
 
 P3-6b-1 builds the vault's half: dynamic secrets, their providers, and a lease
-sealed as one bundle. Nothing mints yet. P3-6b-2 gives the daemon its first
-provider, and until then a daemon refuses a bundle unopened.
+sealed as one bundle. P3-6b-2a builds the daemon's first provider, a Postgres
+minter, which nothing calls yet. P3-6b-2b gives it the daemon's lease client,
+and until then a daemon refuses a bundle unopened.
 
 ```mermaid
 sequenceDiagram
@@ -1554,7 +1556,7 @@ sequenceDiagram
     D->>V: rc:vault.lease {secret: db/dyn, mode: short-lived} (no field: the secret as a whole)
     V->>V: the pairing guardrails, then Cedar's secret:use toward the secret's one audience
     V-->>D: rc:vault.leased {provider: postgres, n: 0, sealed: {audience, fields}}
-    Note over D: P3-6b-2: a user minted with the issuer's fields,<br/>and only that user handed to the command
+    Note over D: P3-6b-2b: a user minted with the issuer's fields,<br/>and only that user handed to the command
 ```
 
 | Piece | Built |
@@ -1568,7 +1570,7 @@ sequenceDiagram
 | its row | `field: ""`, `n: 0`, and `bundle`: each field at the version it carried. It ends at its TTL, or at the first of its versions' `expires_at` |
 | its standing | a new version of any of the issuer's fields takes it back. The write takes back every lease of the secret at once, and a sweep compares each field with the bundle's ([`revoke.rs:236`](../crates/modules/vault/src/revoke.rs#L236)). A provider this build cannot name stands for nothing |
 | the kill switch | `vault.providers` (`ROOMLER__VAULT__PROVIDERS`): empty or `*` is every provider built, and a list only those ([`dynamic.rs:31`](../crates/modules/vault/src/dynamic.rs#L31)). A word that names none serves nothing, so `none` turns them all off. Per secret, `disabled` |
-| a daemon before P3-6b-2 | refuses a lease whose frame names a provider, unopened, as `unsupported`: it never takes a bundle for a stored value ([`vault.rs:528`](../agents/roomlerd/src/vault.rs#L528)) |
+| a daemon before P3-6b-2b | refuses a lease whose frame names a provider, unopened, as `unsupported`: it never takes a bundle for a stored value ([`vault.rs:528`](../agents/roomlerd/src/vault.rs#L528)) |
 
 - ⚠️ **The vault never mints.** For `postgres` the device does: only it
   reaches the database, as for `proxy`. The bundle carries the issuer's fields
@@ -1579,6 +1581,40 @@ sequenceDiagram
 - ⚠️ **The prod guardrail does not refuse it.** That guardrail keeps a stored
   value from materializing; a credential minted for minutes is what it pushes
   toward.
+
+### The Postgres minter (P3-6b-2a)
+
+`vault_proxy::pg_mint` mints a Postgres user for one lease, and takes it back.
+It has no caller yet: P3-6b-2b gives it the daemon's lease client.
+
+```mermaid
+sequenceDiagram
+    participant D as device (roomlerd)
+    participant P as Postgres at the secret's audience
+    D->>P: TLS against the issuer's ca, SCRAM-SHA-256 as admin_user, to its database
+    D->>P: the expired: named roomler_…, past VALID UNTIL, commented "roomler lease …"
+    D->>P: each of them dropped, as a revocation drops one
+    D->>P: CREATE ROLE roomler_(lease id) LOGIN PASSWORD (its verifier) VALID UNTIL (the lease's end) IN ROLE (the grants), with its COMMENT, in one transaction
+    Note over D: the session gets user, password, host, port, database
+    D->>P: at the lease's end: the role looked up, NOLOGIN, its sessions ended, REASSIGN and DROP OWNED, DROP ROLE
+```
+
+| Step | Built |
+|---|---|
+| the issuer | the bundle's `admin_user` and `admin_password`, signed in by SCRAM-SHA-256 over TLS verified against its `ca` (or the system's roots), to its `database`, at the secret's one audience. A bundle that does not parse, or lacks one of those three, is refused before anything is dialled, in words that name no value. The parsed fields are zeroed when they drop, so the parse leaves no copy of the password behind ([`pg_mint.rs:76`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L76)). The sign-in is the proxy's own handshake, with no client behind it ([`pg.rs:316`](../agents/roomlerd/src/vault_proxy/pg.rs#L316)) |
+| the sweep | first, at every mint: each role named `roomler_…`, past its `VALID UNTIL`, whose comment is `roomler lease …`, dropped where the issuer may. That is what a daemon that died before revoking left ([`pg_mint.rs:225`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L225)) |
+| the mint | `CREATE ROLE "roomler_<lease id>" LOGIN PASSWORD '<verifier>' VALID UNTIL '<the lease's end>' IN ROLE <grants>`, and `COMMENT ON ROLE … IS 'roomler lease <lease id>'`, sent as one query and so run as one transaction ([`pg_mint.rs:175`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L175)). The grants are the issuer's `grants` field, one role per line |
+| the password | 32 random bytes, base64url, one per lease. Postgres is sent its SCRAM-SHA-256 verifier, `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, never the password, so a database that logs its statements logs no password ([`scram.rs:245`](../agents/roomlerd/src/vault_proxy/scram.rs#L245)) |
+| the revocation | the role looked up, and a role already gone is done; `NOLOGIN`; its sessions ended (`pg_terminate_backend`); what it owns in the issuer's database given to the issuer (`REASSIGN OWNED`, then `DROP OWNED`); `DROP ROLE` ([`pg_mint.rs:254`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L254)). Ending its sessions and giving back what it owns are best effort, each refusal logged: `NOLOGIN` has already refused any new session |
+| the names | every name quoted as an identifier, and every value as a literal. A role is dropped only if its name is `roomler_` and 24 hex characters, a lease's id. That is checked before a revocation dials, and again before each drop, which covers whatever the sweep's query returns ([`pg_mint.rs:154`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L154)) |
+
+- ⚠️ **The issuer needs `CREATEROLE`**, and on Postgres 16 and later
+  `ADMIN OPTION` on each role in `grants`. Ending a minted role's sessions
+  needs `pg_signal_backend` (or the role's own privileges). Without it, a
+  revocation still drops the role, but a session open at that moment runs
+  until it closes.
+- ⚠️ **`VALID UNTIL` bounds the password, not a session.** Postgres checks it
+  only at sign-in. Revoking at the lease's end is what takes the role away.
 
 ## 21. Audit
 
@@ -1653,5 +1689,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6b-2 to P3-9 | the daemon's first provider, a Postgres user minted per lease; GitHub App tokens, where decision 18 says; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
+| P3-6b-2b to P3-9 | the minter's caller: `vault_exec` and `vault_render` serving a dynamic secret, a Postgres user minted for each lease and revoked at its end; GitHub App tokens, where decision 18 says; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
