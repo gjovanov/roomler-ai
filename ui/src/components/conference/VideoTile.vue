@@ -12,7 +12,11 @@
     elevation="2"
     @dblclick="$emit('spotlight', streamKey)"
   >
-    <div class="video-container" style="aspect-ratio: 16/9; position: relative; overflow: hidden">
+    <div
+      class="video-container"
+      style="aspect-ratio: 16/9; position: relative; overflow: hidden"
+      @click="onTileTap"
+    >
       <!-- Video element — always in DOM and visible so Chrome autoplay works.
            The avatar overlay covers it when there's no video track. -->
       <video
@@ -70,10 +74,14 @@
         mdi-microphone-off
       </v-icon>
 
-      <!-- Hover action overlay -->
+      <!-- Action overlay: shown on hover with a mouse, by a tap on a touch
+           screen (which has no hover). Inert while hidden — it used to sit
+           over the whole tile at opacity 0, so a tap in the middle hit an
+           invisible picture-in-picture button. -->
       <div
         v-if="showActions"
         class="action-overlay d-flex align-center justify-center ga-1"
+        :class="{ 'action-overlay--open': touchActionsOpen }"
       >
         <v-btn
           icon
@@ -85,6 +93,7 @@
           <v-icon size="18">{{ isPinned ? 'mdi-pin-off' : 'mdi-pin' }}</v-icon>
         </v-btn>
         <v-btn
+          v-if="pipSupported"
           icon
           size="small"
           variant="flat"
@@ -162,6 +171,19 @@ const videoRef = ref<HTMLVideoElement | null>(null)
 // fullscreen with Esc rather than the button.
 const tileRef = ref<{ $el?: HTMLElement } | null>(null)
 const fullscreenSupported = typeof document !== 'undefined' && !!document.fullscreenEnabled
+// Like the call toolbar's own PiP button (`usePictureInPicture().isSupported`):
+// only where the browser has it. Elsewhere it was a dead control that answered
+// with "Picture-in-picture is disabled in this browser".
+const pipSupported = typeof document !== 'undefined' && !!document.pictureInPictureEnabled
+
+// FR-116 — a touch screen has no hover: a tap on the tile shows its actions,
+// another tap (or one on the dimmed background) hides them. The buttons stop
+// their own clicks, so pressing one never toggles the overlay.
+const hoverNone = typeof window !== 'undefined' && !!window.matchMedia?.('(hover: none)').matches
+const touchActionsOpen = ref(false)
+function onTileTap() {
+  if (hoverNone && props.showActions) touchActionsOpen.value = !touchActionsOpen.value
+}
 const isFullscreen = ref(false)
 const isPiP = computed(() =>
   typeof document !== 'undefined' && document.pictureInPictureElement === videoRef.value,
@@ -377,7 +399,19 @@ defineExpose({ videoRef })
   z-index: 3;
 }
 
-.video-container:hover .action-overlay {
+.action-overlay {
+  pointer-events: none;
+}
+.video-container:hover .action-overlay,
+.action-overlay--open {
   opacity: 1;
+  pointer-events: auto;
+}
+/* A touch screen's sticky hover must not reveal (or arm) it: the tap does. */
+@media (hover: none) {
+  .video-container:hover .action-overlay:not(.action-overlay--open) {
+    opacity: 0;
+    pointer-events: none;
+  }
 }
 </style>

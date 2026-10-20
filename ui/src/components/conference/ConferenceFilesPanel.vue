@@ -11,8 +11,11 @@
         icon="mdi-upload"
         variant="text"
         size="small"
+        aria-label="Upload a file"
         @click="triggerUpload"
       />
+      <!-- Below 960 px the panel covers the video: this is the way back. -->
+      <v-btn class="d-md-none" icon="mdi-close" variant="text" size="small" aria-label="Close files" @click="$emit('close')" />
     </v-toolbar>
     <v-divider />
 
@@ -96,6 +99,7 @@ const props = defineProps<{
 
 defineEmits<{
   play: [file: FileEntry]
+  close: []
 }>()
 
 const roomStore = useRoomStore()
@@ -158,5 +162,18 @@ function formatDate(iso: string): string {
   min-width: 280px;
   border-left: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
   background: rgb(var(--v-theme-surface));
+}
+/* Below 960 px: an overlay of the call's content area, like the chat panel. */
+@media (max-width: 959.98px) {
+  .files-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    min-width: 0;
+    z-index: 5;
+    border-left: 0;
+  }
 }
 </style>

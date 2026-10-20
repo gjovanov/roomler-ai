@@ -28,11 +28,17 @@
           <!-- Chat is room chat — usable before joining the call too
                (a refreshed /call page used to show no chat until re-join) -->
           <v-btn
-            :icon="showChat ? 'mdi-message-text' : 'mdi-message-text-outline'"
+            icon
             variant="text"
             :color="showChat ? 'primary' : undefined"
+            :aria-label="chatDot ? 'Chat, new messages' : 'Chat'"
+            data-testid="call-chat-toggle"
             @click="showChat = !showChat"
-          />
+          >
+            <v-badge :model-value="chatDot" dot color="error">
+              <v-icon>{{ showChat ? 'mdi-message-text' : 'mdi-message-text-outline' }}</v-icon>
+            </v-badge>
+          </v-btn>
           <v-chip size="small" :color="statusColor">
             {{ roomStore.current?.conference_status }}
           </v-chip>
@@ -40,15 +46,16 @@
 
         <v-divider />
 
-        <!-- Main content area -->
-        <div class="flex-grow-1 d-flex overflow-hidden">
+        <!-- Main content area. position-relative: below 960 px the chat and
+             files panels overlay it instead of squeezing the video. -->
+        <div class="flex-grow-1 d-flex overflow-hidden position-relative">
           <!-- Video grid -->
           <div class="flex-grow-1 d-flex align-center justify-center bg-black position-relative">
             <!-- Pre-join state -->
             <div v-if="!joined" class="text-center text-white">
               <v-icon size="64" class="mb-4">mdi-video</v-icon>
               <div class="text-h5">Ready to join?</div>
-              <div class="mt-4" style="width: 300px; margin: 0 auto;">
+              <div class="mt-4" style="width: 300px; max-width: 100%; margin: 0 auto;">
                 <v-select
                   v-model="conferenceStore.selectedAudioDeviceId"
                   :items="audioInputs"
@@ -103,6 +110,7 @@
             :tenant-id="tenantId"
             :room-id="roomId"
             @play="handlePlayFile"
+            @close="showFiles = false"
           />
 
           <!-- Chat panel (unified with room messages; available pre-join) -->
@@ -114,6 +122,9 @@
               <v-toolbar-title class="text-body-1">
                 {{ $t('call.chat') }}
               </v-toolbar-title>
+              <v-spacer />
+              <!-- Below 960 px the panel covers the video: this is the way back. -->
+              <v-btn class="d-md-none" icon="mdi-close" size="small" aria-label="Close chat" @click="showChat = false" />
             </v-toolbar>
             <v-divider />
 
@@ -171,7 +182,12 @@
             :color="!conferenceStore.isVideoOn ? 'error' : undefined"
             @click="conferenceStore.toggleVideo()"
           />
+          <!-- Only where the browser can share a screen: phone browsers have
+               no getDisplayMedia, and the button answered a tap with "Screen
+               share failed: navigator.mediaDevices.getDisplayMedia is not a
+               function". -->
           <v-btn
+            v-if="canScreenShare"
             :icon="conferenceStore.isScreenSharing ? 'mdi-monitor-off' : 'mdi-monitor-share'"
             :color="conferenceStore.isScreenSharing ? 'success' : undefined"
             @click="handleScreenShare"
@@ -210,6 +226,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick, type Component } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import { useAuthStore } from '@/stores/auth'
 import { useRoomStore } from '@/stores/rooms'
 import { useMessageStore } from '@/stores/messages'
@@ -263,6 +280,29 @@ const joined = ref(false)
 const joining = ref(false)
 const showChat = ref(false)
 const showFiles = ref(false)
+// FR-116 — below 960 px the chat and files panels overlay the video, so the
+// chat starts closed there (it opened on every join, covering the call) and
+// only one panel is open at a time.
+const { smAndDown } = useDisplay()
+const canScreenShare = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia
+// A closed chat — the phone's default now — still says when someone wrote: a
+// dot on its button. The WS handler never bumps the unread count of the room
+// you are in, so arrivals are noticed here (once the first load is in, which
+// is not news); the server's count covers what came before the page opened.
+const chatUnseen = ref(false)
+let chatPrimed = false
+const chatDot = computed(
+  () => !showChat.value && (chatUnseen.value || (roomStore.unreadCounts[roomId.value] ?? 0) > 0),
+)
+watch(showChat, async (open) => {
+  if (!open) return
+  chatUnseen.value = false
+  if (smAndDown.value) showFiles.value = false
+  // The panel is v-if'd: one opened after the page loaded rendered at its
+  // top, the OLDEST message — the scroll on mount and join found no list.
+  await nextTick()
+  scrollChatToBottom()
+})
 const showSwitchDialog = ref(false)
 const chatEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 const chatListRef = ref<HTMLElement | null>(null)
@@ -300,7 +340,11 @@ const layoutCtrl = useConferenceLayout(
   activeSpeakerKeyRef,
   getDisplayName,
   localDisplayName,
-  { video: conferenceStore.remoteVideoPaused, audio: conferenceStore.remoteAudioPaused },
+  {
+    video: conferenceStore.remoteVideoPaused,
+    audio: conferenceStore.remoteAudioPaused,
+    narrow: smAndDown,
+  },
 )
 
 const layoutComponent = computed<Component>(() => {
@@ -398,7 +442,12 @@ function scrollChatToBottom() {
 // Auto-scroll when new messages arrive
 watch(
   () => messageStore.messages.length,
-  async () => {
+  async (n, o) => {
+    // FR-116 — someone else wrote while the chat was closed: its dot.
+    const last = messageStore.messages[n - 1]
+    if (chatPrimed && !showChat.value && n > o && last && last.author_id !== currentUserId.value) {
+      chatUnseen.value = true
+    }
     await nextTick()
     scrollChatToBottom()
   },
@@ -456,7 +505,7 @@ async function handleJoin() {
   // If returning to the same call, just show the full UI
   if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
     joined.value = true
-    showChat.value = true
+    showChat.value = !smAndDown.value
     window.addEventListener('beforeunload', warnBeforeLeave)
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
@@ -506,7 +555,7 @@ async function doJoin() {
     await messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
 
     joined.value = true
-    showChat.value = true
+    showChat.value = !smAndDown.value
     window.addEventListener('beforeunload', warnBeforeLeave)
 
     // Scroll chat to latest message after joining
@@ -559,6 +608,8 @@ async function handleLeave() {
 
 function toggleFiles() {
   showFiles.value = !showFiles.value
+  // One overlay at a time below 960 px (FR-116).
+  if (showFiles.value && smAndDown.value) showChat.value = false
   if (showFiles.value) {
     roomStore.fetchRoomFiles(tenantId.value, roomId.value)
   }
@@ -624,11 +675,13 @@ onMounted(async () => {
 
   // Room chat is available pre-join too: a refreshed /call page used to
   // render no chat (and fetch none) until the user re-joined the call.
-  showChat.value = true
+  showChat.value = !smAndDown.value
   fetchRoomMembers()
   await messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
   await nextTick()
   scrollChatToBottom()
+  // From here a new message is news (the closed chat's dot, FR-116).
+  chatPrimed = true
 
   // If already in call for this room (returned from mini-view), restore full view
   if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
@@ -674,5 +727,20 @@ onUnmounted(() => {
   min-height: 0;
   border-left: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
   background: rgb(var(--v-theme-surface));
+}
+/* A 320 px column beside the video squeezed it to nothing on a phone (and
+   pushed the chat's own editor off the edge): below 960 px it overlays the
+   call's content area instead. */
+@media (max-width: 959.98px) {
+  .chat-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    min-width: 0;
+    z-index: 5;
+    border-left: 0;
+  }
 }
 </style>

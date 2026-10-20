@@ -120,11 +120,13 @@ defineEmits<{
   flex-shrink: 0;
 }
 
+/* FR-116 — at most 30% of the call's width: a fixed 200 px covered over
+   half of a phone's video. */
 .floating-self-view {
   position: absolute;
   bottom: 16px;
   left: 16px;
-  width: 200px;
+  width: clamp(96px, 30%, 200px);
   z-index: 10;
   border-radius: 8px;
   overflow: hidden;
