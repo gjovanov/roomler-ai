@@ -68,13 +68,13 @@
   GNOME on Xorg the chip reports and there is no picker: GNOME Shell puts a group locked from outside it back within
   20 ms (measured on the field cell, §8).
 - P3e-2, display match on a person's own X11 display (a per-user install in an X11 session: the one active output
-  switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand), built
+  switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand), merged
   (#2623), field-verified red → green on a GNOME 46 Xorg cell (§8). It found the viewer offering the toggle on
   Windows only, by OS, which had also hidden FR-108 P2's virtual desktop since 0.4.143; the viewer now follows the
   device's `unavailable["display-match"]`.
 - P3e-3a, copied images on X11: the clipboard watcher's change gate on an X11 session is XFixes' selection-owner
   events (Windows' sequence number in another form), so copied images are watched there and text is no longer
-  polled every second; built (#P3E3PR). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
+  polled every second; built (#2632). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -711,7 +711,7 @@ test of the SIGKILL property itself.
     Wayland), and the viewer follows that word; an agent from before P0c keeps the old gate.
   - *Measured first:* mutter on Xorg keeps an `xrandr` mode set from outside it (it does not keep an outside XKB
     group lock, P3e-1).
-  - *As built, P3e-3a (copied images, #P3E3PR):* the clipboard worker opens an XFixes connection with its first
+  - *As built, P3e-3a (copied images, #2632):* the clipboard worker opens an XFixes connection with its first
     watcher and selects the CLIPBOARD selection's owner changes; one counter per tick serves every watcher, and a
     watcher whose counter did not move reads nothing. Images are watched only behind that gate (each read is a full
     transfer and a PNG encode), and the hello stops saying `not-watched` where it opens. With no watcher the gate
@@ -1004,7 +1004,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
-| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, built #2623). *P3e-3a* (copied images, built #P3E3PR); *P3e-3b* (RTF) not built | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0`; P3e-3a: `ROOMLERD_CLIPBOARD_X11_WATCH=0` | the lab; P3e-1, P3e-2 and P3e-3a: a vmtest Ubuntu cell on Xorg, a per-user install | M |
+| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, merged #2623). *P3e-3a* (copied images, built #2632); *P3e-3b* (RTF) not built | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0`; P3e-3a: `ROOMLERD_CLIPBOARD_X11_WATCH=0` | the lab; P3e-1, P3e-2 and P3e-3a: a vmtest Ubuntu cell on Xorg, a per-user install | M |
 | **P3f** | uinput text on any layout, through the host's own XKB keymap (merged #2558) | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts, red on 0.4.145 | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
