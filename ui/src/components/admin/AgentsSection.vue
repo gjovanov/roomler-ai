@@ -374,19 +374,36 @@
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
           <template #item.consent="{ item }">
-            <DeviceAccessPolicyFields
-              v-if="item.kind === 'agent' && agentFor(item)"
-              :agent="agentFor(item)!"
-              :busy="consentBusy === item.id"
-              :owned-by-me="isOwnedByMe(agentFor(item)!)"
-              variant="plain"
-              @consent="(m: ConsentMode) => onConsentModeChange(agentFor(item)!, m)"
-              @prompt-owner="(v: boolean) => onPromptOwnerChange(agentFor(item)!, v)"
-              @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
-              @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
-              @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
-              @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
-            />
+            <!-- FR-116 D1 — the six access controls on demand, as on a phone:
+                 the row shows the policy's summary (the card's Access line)
+                 and the chevron opens the controls in place. Every control
+                 open kept each row ~210 px tall. -->
+            <template v-if="item.kind === 'agent' && agentFor(item)">
+              <button
+                type="button"
+                class="consent-toggle"
+                :aria-expanded="consentOpen.has(item.id)"
+                :data-testid="`consent-toggle-${item.id}`"
+                @click="toggleConsent(item.id)"
+              >
+                <span class="text-body-2">{{ consentSummary(agentFor(item)!) }}</span>
+                <v-icon size="small">{{ consentOpen.has(item.id) ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
+              </button>
+              <DeviceAccessPolicyFields
+                v-if="consentOpen.has(item.id)"
+                class="mt-1"
+                :agent="agentFor(item)!"
+                :busy="consentBusy === item.id"
+                :owned-by-me="isOwnedByMe(agentFor(item)!)"
+                variant="plain"
+                @consent="(m: ConsentMode) => onConsentModeChange(agentFor(item)!, m)"
+                @prompt-owner="(v: boolean) => onPromptOwnerChange(agentFor(item)!, v)"
+                @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
+                @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
+                @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
+                @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+              />
+            </template>
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
           <template #item.codecs="{ item }">
@@ -1779,6 +1796,23 @@ async function performTunnelDelete() {
 // the cards); each change lands here as one full-policy PUT.
 // Agent id whose consent mode is mid-update (disables + spins that row's select).
 const consentBusy = ref<string | null>(null)
+// FR-116 D1 — the grid rows whose access controls are open (all closed by
+// default: the row shows the summary). A new Set on each toggle, so the
+// template re-reads it.
+const consentOpen = ref(new Set<string>())
+function toggleConsent(id: string) {
+  const next = new Set(consentOpen.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  consentOpen.value = next
+}
+/** The card's Access line, wrapping only BETWEEN its parts ("Prompt on
+ *  host · skipped for you"), so a long policy grows the row, not the column. */
+function consentSummary(a: Agent): string {
+  return policySummary(a.access_policy, isOwnedByMe(a))
+    .map((p) => p.replace(/ /g, ' '))
+    .join(' · ')
+}
 async function onConsentModeChange(a: Agent, mode: ConsentMode) {
   if ((a.access_policy.consent_mode ?? 'prompt') === mode) return
   consentBusy.value = a.id
@@ -2591,6 +2625,27 @@ watch(() => props.tenantId, (tid) => {
 </script>
 
 <style scoped>
+/* FR-116 D1 — the Consent cell's summary is its toggle: text-styled, a focus
+   ring for the keyboard. */
+.consent-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 240px;
+  white-space: normal;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.consent-toggle:focus-visible {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
 /* Action column: keep it leftmost AND narrow so mid-width viewports never
    push it off-screen. Two icon buttons fit in ~96px. */
 .agents-table :deep(th.agents-actions-col),
