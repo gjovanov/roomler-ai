@@ -37,7 +37,7 @@ use roomler_ai_remote_control::signaling::{
     ServerMsg,
 };
 use roomler_ai_remote_control::turn_creds::{
-    RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
+    self, RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
 };
 
 const SERVER_TX_CAPACITY: usize = 64;
@@ -1279,6 +1279,13 @@ impl Hub {
             .and_then(|arc| arc.value().lock().relay_region.clone())
     }
 
+    /// FR-115 P4b — the TURN `user_id` for a session's credentials: the
+    /// controller, charged to the org that pays for the session's relay (the
+    /// session's org), so coturn's statistics name it.
+    fn turn_user(user_id: ObjectId, org: ObjectId) -> String {
+        turn_creds::charged(&user_id.to_hex(), &org.to_hex())
+    }
+
     // ─── session lifecycle ────────────────────────────────────────────
 
     /// Controller asked to start a session against `agent_id`.
@@ -1923,7 +1930,7 @@ impl Hub {
                     // pushes read it so both ICE ends land on one PoP.
                     let region = self.session_relay_region(session_id);
                     let ice = ice_servers_for_session(
-                        &user_id.to_hex(),
+                        &Self::turn_user(user_id, tenant_id),
                         &session_id.to_hex(),
                         self.inner.turn.cfg_for(region.as_deref()),
                     );
@@ -2065,20 +2072,22 @@ impl Hub {
         // device signs its answer against. The hub never reads it.
         peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthOffer>,
     ) -> Result<()> {
-        let (agent_id, local_relay, rc_overlay, region) = self.with_session(session_id, |s| {
-            // Also what stands the negotiating reaper down: once an offer
-            // exists, the ICE layer owns liveness.
-            s.admit_offer()?;
-            Ok((
-                s.agent_id,
-                s.local_relay.clone(),
-                s.rc_overlay,
-                s.relay_region.clone(),
-            ))
-        })?;
+        let (agent_id, local_relay, rc_overlay, region, org) =
+            self.with_session(session_id, |s| {
+                // Also what stands the negotiating reaper down: once an offer
+                // exists, the ICE layer owns liveness.
+                s.admit_offer()?;
+                Ok((
+                    s.agent_id,
+                    s.local_relay.clone(),
+                    s.rc_overlay,
+                    s.relay_region.clone(),
+                    s.tenant_id,
+                ))
+            })?;
         let user_id = self.controller_for(session_id).unwrap_or_default();
         let mut ice = ice_servers_for_session(
-            &user_id.to_hex(),
+            &Self::turn_user(user_id, org),
             &session_id.to_hex(),
             self.inner.turn.cfg_for(region.as_deref()),
         );
@@ -2150,7 +2159,7 @@ impl Hub {
         peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthAnswer>,
         peer_auth_verdict: Option<String>,
     ) -> Result<()> {
-        let (controller_tx, user_id, region) = {
+        let (controller_tx, user_id, region, org) = {
             let arc = self
                 .inner
                 .sessions
@@ -2161,11 +2170,12 @@ impl Hub {
                 s.controller_tx.clone(),
                 s.controller_user_id,
                 s.relay_region.clone(),
+                s.tenant_id,
             )
         };
         let tx = controller_tx.ok_or(Error::SendFailed)?;
         let ice = ice_servers_for_session(
-            &user_id.to_hex(),
+            &Self::turn_user(user_id, org),
             &session_id.to_hex(),
             self.inner.turn.cfg_for(region.as_deref()),
         );
