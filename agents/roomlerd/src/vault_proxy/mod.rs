@@ -21,6 +21,8 @@
 pub(crate) mod http;
 pub(crate) mod mongo;
 pub(crate) mod pg;
+// P3-6b-2 — a Postgres user minted per lease, by a dynamic secret's issuer.
+pub(crate) mod pg_mint;
 pub(crate) mod scram;
 pub(crate) mod ssh_agent;
 #[cfg(test)]
