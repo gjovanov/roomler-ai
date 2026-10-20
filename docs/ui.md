@@ -149,6 +149,33 @@ stays silent when the data is missing:
 ⚠️ The age is the oldest missed release's, not the newest's. Releases can come 12 h apart: measured from the
 newest, a device stalled for weeks would lose its chip at every release.
 
+### The Devices page at every width (FR-116 P1)
+
+One feed, one menu, one set of policy controls; only the presentation changes with the width.
+
+```mermaid
+flowchart LR
+    F["deviceStore.items<br/>GET …/device (search · kind · page)"] --> W{"width"}
+    W -->|"≥ 960 px"| G["the grid<br/>(v-data-table-server)"]
+    W -->|"&lt; 960 px"| C["cards: 1 column &lt; 600 px,<br/>2 columns to 960 px"]
+    G & C --> M["DeviceActionsMenu"] -->|"action key"| D["onDeviceAction → the page's dialogs"]
+    G & C --> P["DeviceAccessPolicyFields"] -->|"one PUT per change"| A["…/access-policy"]
+```
+
+| piece | role |
+|---|---|
+| `components/admin/DeviceActionsMenu.vue` | the only action menu for a device row. It emits an action key and opens nothing itself, so the grid and the cards cannot offer different things (the cards' own copy had lost "Edit name & tags", and its overlay links the tenant id) |
+| `components/admin/DeviceAccessPolicyFields.vue` | the six access-policy controls: `variant="plain"` in the grid's Consent cell, `outlined` and labelled in a card's **Access** panel, where the hints that live in `title=` (never shown on touch) are spelled out on demand |
+| `components/admin/devicePolicy.ts` | the choices, the hints, and `policySummary()` — the collapsed **Access** panel's one line: the consent mode always, then only what differs from the defaults |
+| a card | the device's identity (`deviceLabel()`, then the machine name unless hidden, OS, version, last seen), its status, every "needs a person" chip, its tags; **Access** and **Details** (overlay addresses, MagicDNS, keys, ids, codecs) open on demand; Connect and the menu |
+
+Tunnel clients are rows of the same feed (the kind filter), never a separate table. The grid did not change:
+master and P1 screenshot to the same pixels at 1300 and 2400 px.
+
+⚠️ **A device is named by `deviceLabel()`** (`composables/useHideDeviceName.ts`): its display name when one is
+set, else the machine name — in every list, card, dialog title and notice a person reads. The technical `name`
+stays wherever a machine reads it back: a MagicDNS label, an `overlay_exit_node = "…"` line, a CLI selector.
+
 ## Everything else
 
 - **Chat**: TipTap v3 editor (markdown, mentions, emoji via emoji-mart, Giphy

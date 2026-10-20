@@ -16,9 +16,20 @@
       >
         Update all
       </v-btn>
-      <!-- ONE enroll entry point for both kinds — the tunnel-clients card
-           (and its enroll button) is mobile-only now that desktop rows are
-           unified into the grid. -->
+      <!-- The phone fallback (docs/ui.md: a toolbar item hidden below sm
+           keeps a way in): the same action, icon-only. -->
+      <v-btn
+        icon="mdi-update"
+        variant="tonal"
+        size="small"
+        density="comfortable"
+        class="mr-2 d-sm-none"
+        :disabled="agentStore.agents.length === 0"
+        aria-label="Update all"
+        title="Update all"
+        @click="updateAllDialogOpen = true"
+      />
+      <!-- ONE enroll entry point for both kinds, at every width. -->
       <v-menu>
         <template #activator="{ props: menuProps }">
           <v-btn
@@ -64,69 +75,68 @@
         {{ updateNotice }}
       </v-alert>
 
-      <!-- Mobile-only initial spinner — the desktop grid carries its own
-           :loading state and must render during the first fetch. -->
-      <div
-        v-if="mobile && agentStore.loading && agentStore.agents.length === 0"
-        class="d-flex justify-center pa-8"
-      >
-        <v-progress-circular indeterminate />
+      <!-- ONE toolbar for the grid and the cards: the same search, the same
+           kind filter and the same count at every width. Phones used to get
+           none of it (an unsearchable list of every device, then a separate
+           tunnel-clients table). -->
+      <div class="d-flex align-center mb-2 flex-wrap" :class="{ 'ga-2': mobile }">
+        <v-text-field
+          v-model="gridSearch"
+          data-tour="device-search"
+          density="compact"
+          variant="outlined"
+          hide-details
+          clearable
+          prepend-inner-icon="mdi-magnify"
+          placeholder="Search name, tag, IP, MagicDNS…"
+          :class="mobile ? 'device-search--full' : undefined"
+          :style="mobile ? undefined : 'max-width: 340px'"
+          aria-label="Search devices"
+        />
+        <!-- Kind filter. Default = devices WITHOUT tunnel clients — the
+             remote-desktop fleet is what this page is about day-to-day;
+             tunnels are one radio away. Server-side (`kind` param). -->
+        <v-radio-group
+          v-model="gridKind"
+          inline
+          hide-details
+          density="compact"
+          :class="mobile ? 'flex-grow-0' : 'ml-4 flex-grow-0'"
+          aria-label="Filter by device kind"
+        >
+          <v-radio label="Devices" value="agent" density="compact" />
+          <v-radio label="Tunnels" value="tunnel_client" density="compact" />
+          <v-radio label="Both" value="both" density="compact" />
+        </v-radio-group>
+        <v-spacer />
+        <span class="text-caption text-medium-emphasis mr-2">
+          {{ deviceStore.total }}
+          {{ gridKind === 'tunnel_client' ? (deviceStore.total === 1 ? 'tunnel' : 'tunnels') : deviceStore.total === 1 ? 'device' : 'devices' }}
+        </span>
+        <!-- Columns are a grid concept; the cards have none. -->
+        <v-btn
+          v-if="!mobile"
+          icon="mdi-cog-outline"
+          size="small"
+          variant="text"
+          :color="colsCustomized ? 'primary' : undefined"
+          title="Configure columns"
+          aria-label="Configure columns"
+          @click="colDialogOpen = true"
+        />
       </div>
 
-      <!-- Desktop / tablet (≥ sm): the UNIFIED server-driven grid — agents +
-           tunnel clients in ONE v-data-table-server. Search / sort /
+      <!-- Desktop / landscape tablet (≥ md): the UNIFIED server-driven grid —
+           agents + tunnel clients in ONE v-data-table-server. Search / sort /
            pagination run on the SERVER (GET /tenant/{tid}/device — q matches
            across the overlay join incl. IP + MagicDNS), and column
            visibility/order are per-user (useGridColumns → localStorage).
            The grid rows are the lean DeviceRow feed; rich agent-only cells
            (consent, codecs, the action menu) look the full Agent up from
            agentStore by id. Action column stays LEFTMOST so it never falls
-           off the right edge (field bug 2026-05-01). Below sm the dedicated
-           card lists render further down. -->
-      <template v-else-if="!mobile">
-        <div class="d-flex align-center mb-2 flex-wrap">
-          <v-text-field
-            v-model="gridSearch"
-            data-tour="device-search"
-            density="compact"
-            variant="outlined"
-            hide-details
-            clearable
-            prepend-inner-icon="mdi-magnify"
-            placeholder="Search name, tag, IP, MagicDNS…"
-            style="max-width: 340px"
-            aria-label="Search devices"
-          />
-          <!-- Kind filter. Default = devices WITHOUT tunnel clients — the
-               remote-desktop fleet is what this page is about day-to-day;
-               tunnels are one radio away. Server-side (`kind` param). -->
-          <v-radio-group
-            v-model="gridKind"
-            inline
-            hide-details
-            density="compact"
-            class="ml-4 flex-grow-0"
-            aria-label="Filter by device kind"
-          >
-            <v-radio label="Devices" value="agent" density="compact" />
-            <v-radio label="Tunnels" value="tunnel_client" density="compact" />
-            <v-radio label="Both" value="both" density="compact" />
-          </v-radio-group>
-          <v-spacer />
-          <span class="text-caption text-medium-emphasis mr-2">
-            {{ deviceStore.total }}
-            {{ gridKind === 'tunnel_client' ? (deviceStore.total === 1 ? 'tunnel' : 'tunnels') : deviceStore.total === 1 ? 'device' : 'devices' }}
-          </span>
-          <v-btn
-            icon="mdi-cog-outline"
-            size="small"
-            variant="text"
-            :color="colsCustomized ? 'primary' : undefined"
-            title="Configure columns"
-            aria-label="Configure columns"
-            @click="colDialogOpen = true"
-          />
-        </div>
+           off the right edge (field bug 2026-05-01). Below md the SAME rows
+           render as cards further down. -->
+      <template v-if="!mobile">
         <v-data-table-server
           data-tour="device-grid"
           v-model:page="gridPage"
@@ -151,159 +161,20 @@
                 color="primary"
                 :disabled="!item.is_online"
                 :to="{ name: 'agent-remote', params: { tenantId, agentId: item.id } }"
-                :aria-label="`Connect to agent ${item.name}`"
+                :aria-label="`Connect to ${deviceLabel(item)}`"
               />
-              <v-menu v-if="item.kind === 'agent' && agentFor(item)">
-                <template #activator="{ props: menuProps }">
-                  <v-btn
-                    v-bind="menuProps"
-                    icon="mdi-dots-vertical"
-                    size="small"
-                    variant="text"
-                    :aria-label="`Actions for ${item.name}`"
-                  />
-                </template>
-                <v-list density="compact" min-width="230">
-                  <v-list-subheader>Maintenance</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-update"
-                    title="Update now"
-                    :subtitle="updateBlockedText(agentFor(item))"
-                    :disabled="updateBusy === item.id || !!updateBlockedText(agentFor(item))"
-                    @click="triggerUpdate(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    v-if="caps.has('network')"
-                    prepend-icon="mdi-key-change"
-                    title="Rotate overlay key…"
-                    :disabled="rotateKeyBusy === item.id"
-                    @click="openRotateKey(agentFor(item)!)"
-                  />
-                  <v-list-subheader>Diagnostics</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-alert-circle-outline"
-                    title="Crash reports"
-                    @click="openCrashes(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-text-box-search-outline"
-                    title="Agent logs"
-                    @click="openLogs(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-console"
-                    title="Device console"
-                    @click="openConsole(agentFor(item)!)"
-                  />
-                  <v-list-subheader>Access</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-rename-box"
-                    title="Edit name &amp; tags"
-                    @click="openEdit(item)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-domain-plus"
-                    title="Add to another organization"
-                    @click="openJoinOrg(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-account-switch"
-                    title="Reassign owner"
-                    @click="openReassign(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-shield-key-outline"
-                    title="Execution policy"
-                    @click="openExecPolicy(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    v-if="caps.has('network')"
-                    prepend-icon="mdi-console-network-outline"
-                    title="SSH policy"
-                    @click="openSshPolicy(agentFor(item)!)"
-                  />
-                  <!-- FR-52 gate 2. Distinct from every policy above
-                       it: those decide what a COLLEAGUE may do, this
-                       one admits someone outside the organization. -->
-                  <v-list-item
-                    prepend-icon="mdi-account-arrow-right-outline"
-                    title="External access"
-                    @click="openExternalAccess(agentFor(item)!)"
-                  />
-                  <!-- Writes an INTENT the device may refuse (step 5 of
-                       docs/remote-config.md) — unlike the two policies above,
-                       which take effect the moment they save. The dialog leads
-                       with that difference. -->
-                  <v-list-item
-                    prepend-icon="mdi-cog-transfer-outline"
-                    title="Device configuration"
-                    @click="openRemoteConfig(agentFor(item)!)"
-                  />
-                  <v-list-subheader>Network</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-ip-network-outline"
-                    title="Tunnel mesh routes"
-                    @click="openRoutes(agentFor(item)!)"
-                  />
-                  <v-list-item
-                    v-if="nodeForAgent(item.id)"
-                    prepend-icon="mdi-lan-disconnect"
-                    :title="nodeForAgent(item.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
-                    @click="confirmEvict(nodeForAgent(item.id)!)"
-                  />
-                  <v-list-item
-                    v-if="nodeForAgent(item.id)"
-                    prepend-icon="mdi-lan-connect"
-                    title="Overlay routes"
-                    :to="{ path: `/tenant/${tenantId}/network/subnet-routes`, query: { node: nodeForAgent(item.id)!.id } }"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-shield-lock-outline"
-                    title="Overlay ACL"
-                    :to="{ path: `/tenant/${tenantId}/network/acl`, query: { tab: 'overlay' } }"
-                  />
-                  <v-divider />
-                  <v-list-item
-                    prepend-icon="mdi-delete"
-                    title="Delete device"
-                    base-color="error"
-                    @click="confirmDelete(agentFor(item)!)"
-                  />
-                </v-list>
-              </v-menu>
-              <v-menu v-else-if="item.kind === 'tunnel_client'">
-                <template #activator="{ props: menuProps }">
-                  <v-btn
-                    v-bind="menuProps"
-                    icon="mdi-dots-vertical"
-                    size="small"
-                    variant="text"
-                    :aria-label="`Actions for ${item.name}`"
-                  />
-                </template>
-                <v-list density="compact" min-width="230">
-                  <v-list-item
-                    prepend-icon="mdi-rename-box"
-                    title="Edit name &amp; tags"
-                    @click="openEdit(item)"
-                  />
-                  <v-list-subheader>Network</v-list-subheader>
-                  <v-list-item
-                    v-if="nodeForTunnelClient(item.id)"
-                    prepend-icon="mdi-lan-disconnect"
-                    :title="nodeForTunnelClient(item.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
-                    @click="confirmEvict(nodeForTunnelClient(item.id)!)"
-                  />
-                  <v-divider />
-                  <v-list-item
-                    v-if="clientFor(item)"
-                    prepend-icon="mdi-delete"
-                    title="Delete tunnel client"
-                    base-color="error"
-                    @click="confirmTunnelDelete(clientFor(item)!)"
-                  />
-                </v-list>
-              </v-menu>
+              <DeviceActionsMenu
+                :tenant-id="tenantId"
+                :row="item"
+                :agent="agentFor(item)"
+                :client="clientFor(item)"
+                :node="nodeFor(item)"
+                :network-mounted="caps.has('network')"
+                :update-busy="updateBusy === item.id"
+                :rotate-key-busy="rotateKeyBusy === item.id"
+                :update-blocked="updateBlockedText(agentFor(item))"
+                @action="(a: DeviceAction) => onDeviceAction(item, a)"
+              />
             </div>
           </template>
           <template #item.name="{ item }">
@@ -316,7 +187,7 @@
               >
                 {{ rowPresenceIcon(item) }}
               </v-icon>
-              <span class="font-weight-medium">{{ item.display_name || item.name }}</span>
+              <span class="font-weight-medium">{{ deviceLabel(item) }}</span>
               <!-- FR-51 — the vanishing must never be a surprise: this device
                    removes itself (reaped after silence; immediately on a clean
                    stop), and a later enrollment is a NEW device. -->
@@ -338,7 +209,7 @@
                 :color="copiedAgentId === item.id ? 'success' : undefined"
                 class="ml-1"
                 @click="copyAgentId(item.id)"
-                :aria-label="`Copy device ID for ${item.name}`"
+                :aria-label="`Copy device ID for ${deviceLabel(item)}`"
                 :title="copiedAgentId === item.id ? 'Copied!' : 'Copy device ID'"
               />
             </div>
@@ -478,7 +349,7 @@
                 variant="text"
                 class="ml-1"
                 @click="copyAgentId(item.magic_dns_fqdn!)"
-                :aria-label="`Copy MagicDNS name for ${item.name}`"
+                :aria-label="`Copy MagicDNS name for ${deviceLabel(item)}`"
               />
             </div>
             <span v-else-if="item.magic_dns_name" class="text-caption font-mono" title="Tenant has no MagicDNS domain configured — bare overlay label">
@@ -503,92 +374,19 @@
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
           <template #item.consent="{ item }">
-            <template v-if="item.kind === 'agent' && agentFor(item)">
-              <v-select
-                :model-value="agentFor(item)!.access_policy.consent_mode ?? 'prompt'"
-                :items="CONSENT_MODE_ITEMS"
-                density="compact"
-                variant="plain"
-                hide-details
-                :disabled="consentBusy === item.id"
-                :loading="consentBusy === item.id"
-                class="consent-select"
-                :aria-label="`Consent mode for ${item.name}`"
-                @update:model-value="(m) => onConsentModeChange(agentFor(item)!, m as ConsentMode)"
-              />
-              <!-- FR-27 — the owner shortcut, made visible. Controlling your
-                   OWN device auto-consents server-side BEFORE this mode is
-                   read, so on a fleet where one person owns everything the
-                   select above had no observable effect and nothing said so.
-                   Shown only on devices YOU own; for everyone else the mode
-                   already applies and the row would be noise. -->
-              <v-checkbox
-                v-if="isOwnedByMe(agentFor(item)!)"
-                :model-value="agentFor(item)!.access_policy.prompt_owner ?? false"
-                density="compact"
-                hide-details
-                :disabled="consentBusy === item.id"
-                :label="ownerPromptLabel(agentFor(item)!)"
-                :aria-label="`Apply the consent mode to me, the owner of ${item.name}`"
-                class="consent-owner-toggle"
-                @update:model-value="(v) => onPromptOwnerChange(agentFor(item)!, v === true)"
-              />
-              <!-- P6 — multi-user input mode (free-for-all | exclusive). -->
-              <v-select
-                :model-value="agentFor(item)!.access_policy.input_mode ?? 'free'"
-                :items="INPUT_MODE_ITEMS"
-                density="compact"
-                variant="plain"
-                hide-details
-                :disabled="consentBusy === item.id"
-                class="consent-select"
-                :aria-label="`Input mode for ${item.name}`"
-                @update:model-value="(m) => onInputModeChange(agentFor(item)!, m as 'free' | 'exclusive')"
-              />
-              <!-- FR-101 P4b-2b — this device's own idle limit. The shorter of
-                   it and the organization's applies, so it can tighten the
-                   org's but never loosen it; the device keeps it. -->
-              <v-select
-                :model-value="agentFor(item)!.access_policy.auto_terminate_idle_minutes ?? 0"
-                :items="idleMinuteItems(agentFor(item)!.access_policy.auto_terminate_idle_minutes)"
-                density="compact"
-                variant="plain"
-                hide-details
-                :disabled="consentBusy === item.id"
-                class="consent-select"
-                :title="IDLE_LIMIT_HINT"
-                :aria-label="`Idle limit for ${item.name}`"
-                @update:model-value="(m) => onIdleMinutesChange(agentFor(item)!, m as number)"
-              />
-              <!-- FR-99 P3b — ask this device to lock its screen when the last
-                   remote session ends. The device takes the stricter of this and
-                   its owner's own setting, so it can only tighten it. -->
-              <v-select
-                :model-value="agentFor(item)!.access_policy.lock_on_end ?? 'never'"
-                :items="LOCK_ON_END_ITEMS"
-                density="compact"
-                variant="plain"
-                hide-details
-                :disabled="consentBusy === item.id"
-                class="consent-select"
-                :title="LOCK_ON_END_HINT"
-                :aria-label="`Lock ${item.name} when its remote sessions end`"
-                @update:model-value="(m) => onLockOnEndChange(agentFor(item)!, m as LockOnEnd)"
-              />
-              <!-- #1882 — may a session to this device ride the mesh? Off by
-                   default: the agent keeps overlay addresses out of its ICE. -->
-              <v-checkbox
-                :model-value="agentFor(item)!.access_policy.rc_overlay ?? false"
-                density="compact"
-                hide-details
-                :disabled="consentBusy === item.id"
-                label="Remote desktop over the mesh"
-                :title="RC_OVERLAY_HINT"
-                :aria-label="`Let remote desktop to ${item.name} use the mesh (overlay)`"
-                class="consent-owner-toggle"
-                @update:model-value="(v) => onRcOverlayChange(agentFor(item)!, v === true)"
-              />
-            </template>
+            <DeviceAccessPolicyFields
+              v-if="item.kind === 'agent' && agentFor(item)"
+              :agent="agentFor(item)!"
+              :busy="consentBusy === item.id"
+              :owned-by-me="isOwnedByMe(agentFor(item)!)"
+              variant="plain"
+              @consent="(m: ConsentMode) => onConsentModeChange(agentFor(item)!, m)"
+              @prompt-owner="(v: boolean) => onPromptOwnerChange(agentFor(item)!, v)"
+              @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
+              @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
+              @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
+              @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+            />
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
           <template #item.codecs="{ item }">
@@ -674,494 +472,378 @@
         </v-data-table-server>
       </template>
 
-      <!-- Mobile: stacked card list. Each card is a tappable target;
-           Connect / Delete actions are full-width buttons at the bottom
-           of the card so the rightmost item is reachable on a narrow
-           viewport (the field bug from the field-test host 2026-05-01: "cannot
-           select the last Laptop in the list, not possible to scroll").
-           Codecs / version / last-seen drop to small lines so the
-           card stays compact at ~120px tall. -->
-      <v-list
-        v-else-if="agentStore.agents.length > 0 && mobile"
-        density="compact"
-        class="pa-0"
-      >
-        <v-card
-          v-for="a in agentStore.agents"
-          :key="a.id"
-          variant="outlined"
-          class="mb-2"
+      <!-- Phone and portrait tablet (< md): the SAME server rows as the grid,
+           as cards — the same search, kind filter, pagination and action menu,
+           so a device is never named or offered differently by width. A card
+           shows what identifies the device and what needs a person; its access
+           policy and its technical details open on demand. (It used to list
+           every device, unpaged, each card ~500 px tall with all six policy
+           controls open, the machine's name where the grid shows the display
+           name, and a separate 7-column tunnel-clients table below.) -->
+      <div v-else data-tour="device-grid" class="device-cards">
+        <div
+          v-if="deviceStore.loading && deviceStore.items.length === 0"
+          class="d-flex justify-center pa-8"
         >
-          <v-card-text class="pa-3">
-            <div class="d-flex align-center mb-1">
-              <v-icon
-                :color="presenceColor(a)"
-                size="small"
-                class="mr-2"
-                :title="presenceTitle(a)"
-              >
-                {{ presenceIcon(a) }}
-              </v-icon>
-              <span class="font-weight-medium">{{ a.name }}</span>
-              <v-btn
-                :icon="copiedAgentId === a.id ? 'mdi-check' : 'mdi-content-copy'"
-                size="x-small"
-                variant="text"
-                :color="copiedAgentId === a.id ? 'success' : undefined"
-                class="ml-1"
-                @click="copyAgentId(a.id)"
-                :aria-label="`Copy agent ID for ${a.name}`"
-                :title="copiedAgentId === a.id ? 'Copied!' : 'Copy agent ID'"
-              />
-              <v-btn
-                icon="mdi-update"
-                size="x-small"
-                variant="text"
-                color="primary"
-                class="ml-1"
-                :disabled="updateBusy === a.id || !!updateBlockedText(a)"
-                :loading="updateBusy === a.id"
-                @click="triggerUpdate(a)"
-                :aria-label="`Update agent ${a.name} now`"
-                :title="
-                  updateBlockedText(a)
-                    ? `Not updated from here: ${updateBlockedText(a)}`
-                    : 'Update agent now'
-                "
-              />
-              <v-spacer />
-              <v-chip
-                size="x-small"
-                :color="statusColor(a)"
-                variant="flat"
-                :title="presenceTitle(a)"
-              >
-                {{ statusLabel(a) }}
-              </v-chip>
-              <v-chip
-                v-if="remoteConfigChip(a)"
-                size="x-small"
-                variant="tonal"
-                class="ml-1"
-                :color="remoteConfigChip(a)!.color"
-                :prepend-icon="remoteConfigChip(a)!.icon"
-                :title="remoteConfigChip(a)!.tooltip"
-                @click="openRemoteConfig(a)"
-              >
-                {{ remoteConfigChip(a)!.text }}
-              </v-chip>
-              <v-chip
-                v-if="keyRotationChip(a)"
-                size="x-small"
-                variant="tonal"
-                class="ml-1"
-                :color="keyRotationChip(a)!.color"
-                :prepend-icon="keyRotationChip(a)!.icon"
-                :title="keyRotationChip(a)!.tooltip"
-              >
-                {{ keyRotationChip(a)!.text }}
-              </v-chip>
-            </div>
-            <div class="text-caption text-medium-emphasis mb-2">
-              <span :title="`Agent ID: ${a.id}`">id: {{ shortId(a.id) }}</span>
-              <span class="mx-1">·</span>
-              <span :title="`machine_id: ${a.machine_id}`">{{ shortId(a.machine_id) }}</span>
-            </div>
-            <div class="d-flex flex-wrap gap-1 mb-2">
-              <v-chip
-                size="x-small"
-                :prepend-icon="osIcon(a.os)"
-                variant="tonal"
-              >
-                {{ a.os }}
-              </v-chip>
-              <v-chip
-                v-if="a.agent_version"
-                size="x-small"
-                variant="tonal"
-              >
-                v{{ a.agent_version }}
-              </v-chip>
-              <!-- FR-106 — the same chip as the table view's. -->
-              <v-chip
-                v-if="stallChip(a)"
-                size="x-small"
-                variant="tonal"
-                prepend-icon="mdi-update"
-                :color="stallChip(a)!.color"
-                :title="stallChip(a)!.tooltip"
-                data-testid="agent-update-stall-chip"
-              >
-                {{ stallChip(a)!.text }}
-              </v-chip>
-              <!-- FR-27 — same rule as the grid caption: only when the
-                   companion disagrees with the daemon. Warning-coloured
-                   because a skew here means the desktop is running code the
-                   daemon has moved past, which is what the operator hit. -->
-              <v-chip
-                v-if="a.companion_version && a.companion_version !== a.agent_version"
-                size="x-small"
-                color="warning"
-                variant="tonal"
-                :title="`roomler-desktop is on v${a.companion_version} while the daemon is on v${a.agent_version} — the companion updates separately`"
-              >
-                desktop v{{ a.companion_version }}
-              </v-chip>
-              <!-- FR-92 P5b — keep busy, only while it is ON: an org that
-                   denies it, or simply wants to know, can see which devices
-                   are being kept awake and by whom. The device's claim, shown
-                   as such; off or unknown shows nothing. -->
-              <v-chip
-                v-if="a.keep_busy?.on"
-                size="x-small"
-                color="info"
-                variant="tonal"
-                prepend-icon="mdi-cursor-default-gesture-outline"
-                :title="keepBusyBriefTitle(a.keep_busy)"
-                data-testid="agent-keep-busy-chip"
-              >
-                keep busy · {{ a.keep_busy.phase }}
-              </v-chip>
-              <v-chip
-                v-for="codec in codecChips(a)"
-                :key="codec.label"
-                size="x-small"
-                :color="codec.color"
-                variant="tonal"
-                :title="codec.tooltip"
-              >
-                {{ codec.label }}
-              </v-chip>
-            </div>
-            <div class="text-caption text-medium-emphasis mb-2">
-              Last seen: {{ fmtDate(a.last_seen_at) }}
-            </div>
-            <v-select
-              :model-value="a.access_policy.consent_mode ?? 'prompt'"
-              :items="CONSENT_MODE_ITEMS"
-              label="Consent"
-              density="compact"
+          <v-progress-circular indeterminate />
+        </div>
+        <div
+          v-else-if="deviceStore.items.length === 0"
+          class="text-center pa-4 pa-md-6 pa-lg-8 text-medium-emphasis"
+        >
+          <template v-if="gridSearch">
+            No devices match "{{ gridSearch }}".
+          </template>
+          <template v-else>
+            <v-icon size="64" color="grey-lighten-1" class="mb-2">mdi-desktop-classic</v-icon>
+            <p class="mb-2">No devices enrolled yet.</p>
+            <p class="text-body-2">
+              Tap "Enroll" for a one-line installer per platform — the
+              machine appears here as soon as it enrolls.
+            </p>
+            <v-btn
+              size="small"
+              variant="text"
+              color="primary"
+              prepend-icon="mdi-school-outline"
+              :to="{ name: 'tutorial', params: { tenantId }, hash: '#devices' }"
+              class="mt-2"
+            >
+              Walk me through it
+            </v-btn>
+          </template>
+        </div>
+        <v-row v-else dense>
+          <v-col
+            v-for="item in deviceStore.items"
+            :key="`${item.kind}:${item.id}`"
+            cols="12"
+            sm="6"
+          >
+            <v-card
               variant="outlined"
-              hide-details
-              :disabled="consentBusy === a.id"
-              :loading="consentBusy === a.id"
-              class="mb-2"
-              :aria-label="`Consent mode for ${a.name}`"
-              @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
-            />
-            <!-- FR-27 — see the desktop table above: the owner shortcut is
-                 applied before the mode is read, so it has to be visible. -->
-            <v-checkbox
-              v-if="isOwnedByMe(a)"
-              :model-value="a.access_policy.prompt_owner ?? false"
-              density="compact"
-              hide-details
-              :disabled="consentBusy === a.id"
-              :label="ownerPromptLabel(a)"
-              :aria-label="`Apply the consent mode to me, the owner of ${a.name}`"
-              class="mb-2"
-              @update:model-value="(v) => onPromptOwnerChange(a, v === true)"
-            />
-            <!-- P6 — multi-user input mode. -->
-            <v-select
-              :model-value="a.access_policy.input_mode ?? 'free'"
-              :items="INPUT_MODE_ITEMS"
-              label="Input"
-              density="compact"
-              variant="outlined"
-              hide-details
-              :disabled="consentBusy === a.id"
-              class="mb-2"
-              :aria-label="`Input mode for ${a.name}`"
-              @update:model-value="(m) => onInputModeChange(a, m as 'free' | 'exclusive')"
-            />
-            <!-- FR-101 P4b-2b — see the desktop table: this device's own idle
-                 limit, which can only shorten the organization's. -->
-            <v-select
-              :model-value="a.access_policy.auto_terminate_idle_minutes ?? 0"
-              :items="idleMinuteItems(a.access_policy.auto_terminate_idle_minutes)"
-              label="Idle limit"
-              density="compact"
-              variant="outlined"
-              hide-details
-              :disabled="consentBusy === a.id"
-              class="mb-2"
-              :title="IDLE_LIMIT_HINT"
-              :aria-label="`Idle limit for ${a.name}`"
-              @update:model-value="(m) => onIdleMinutesChange(a, m as number)"
-            />
-            <!-- FR-99 P3b — see the desktop table: it can only tighten the
-                 device owner's own setting. -->
-            <v-select
-              :model-value="a.access_policy.lock_on_end ?? 'never'"
-              :items="LOCK_ON_END_ITEMS"
-              label="Lock when sessions end"
-              density="compact"
-              variant="outlined"
-              hide-details
-              :disabled="consentBusy === a.id"
-              class="mb-2"
-              :title="LOCK_ON_END_HINT"
-              :aria-label="`Lock ${a.name} when its remote sessions end`"
-              @update:model-value="(m) => onLockOnEndChange(a, m as LockOnEnd)"
-            />
-            <!-- #1882 — see the desktop table: off by default. -->
-            <v-checkbox
-              :model-value="a.access_policy.rc_overlay ?? false"
-              density="compact"
-              hide-details
-              :disabled="consentBusy === a.id"
-              label="Remote desktop over the mesh"
-              :title="RC_OVERLAY_HINT"
-              :aria-label="`Let remote desktop to ${a.name} use the mesh (overlay)`"
-              class="mb-2"
-              @update:model-value="(v) => onRcOverlayChange(a, v === true)"
-            />
-            <div class="d-flex gap-2">
-              <v-btn
-                size="small"
-                variant="tonal"
-                color="primary"
-                prepend-icon="mdi-remote-desktop"
-                :disabled="!a.is_online"
-                :to="{ name: 'agent-remote', params: { tenantId, agentId: a.id } }"
-                :aria-label="`Connect to agent ${a.name}`"
-                class="flex-grow-1"
-              >
-                Connect
-              </v-btn>
-              <!-- Same grouped menu as the desktop table — the mobile card
-                   used to carry its own DIVERGED subset (no Reassign owner). -->
-              <v-menu>
-                <template #activator="{ props: menuProps }">
-                  <v-btn
-                    v-bind="menuProps"
-                    icon="mdi-dots-vertical"
-                    size="small"
-                    variant="text"
-                    :aria-label="`Actions for ${a.name}`"
-                  />
-                </template>
-                <v-list density="compact" min-width="230">
-                  <v-list-subheader>Maintenance</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-update"
-                    title="Update now"
-                    :subtitle="updateBlockedText(a)"
-                    :disabled="updateBusy === a.id || !!updateBlockedText(a)"
-                    @click="triggerUpdate(a)"
-                  />
-                  <v-list-item
-                    v-if="caps.has('network')"
-                    prepend-icon="mdi-key-change"
-                    title="Rotate overlay key…"
-                    :disabled="rotateKeyBusy === a.id"
-                    @click="openRotateKey(a)"
-                  />
-                  <v-list-subheader>Diagnostics</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-alert-circle-outline"
-                    title="Crash reports"
-                    @click="openCrashes(a)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-text-box-search-outline"
-                    title="Agent logs"
-                    @click="openLogs(a)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-console"
-                    title="Device console"
-                    @click="openConsole(a)"
-                  />
-                  <v-list-subheader>Access</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-domain-plus"
-                    title="Add to another organization"
-                    @click="openJoinOrg(a)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-account-switch"
-                    title="Reassign owner"
-                    @click="openReassign(a)"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-shield-key-outline"
-                    title="Execution policy"
-                    @click="openExecPolicy(a)"
-                  />
-                  <v-list-item
-                    v-if="caps.has('network')"
-                    prepend-icon="mdi-console-network-outline"
-                    title="SSH policy"
-                    @click="openSshPolicy(a)"
-                  />
-                  <!-- FR-52 gate 2. Distinct from every policy above
-                       it: those decide what a COLLEAGUE may do, this
-                       one admits someone outside the organization. -->
-                  <v-list-item
-                    prepend-icon="mdi-account-arrow-right-outline"
-                    title="External access"
-                    @click="openExternalAccess(a)"
-                  />
-                  <!-- Writes an INTENT the device may refuse (step 5 of
-                       docs/remote-config.md) — unlike the two policies above,
-                       which take effect the moment they save. The dialog leads
-                       with that difference. -->
-                  <v-list-item
-                    prepend-icon="mdi-cog-transfer-outline"
-                    title="Device configuration"
-                    @click="openRemoteConfig(a)"
-                  />
-                  <v-list-subheader>Network</v-list-subheader>
-                  <v-list-item
-                    prepend-icon="mdi-ip-network-outline"
-                    title="Tunnel mesh routes"
-                    @click="openRoutes(a)"
-                  />
-                  <v-list-item
-                    v-if="nodeForAgent(a.id)"
-                    prepend-icon="mdi-lan-disconnect"
-                    :title="nodeForAgent(a.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
-                    @click="confirmEvict(nodeForAgent(a.id)!)"
-                  />
-                  <v-list-item
-                    v-if="nodeForAgent(a.id)"
-                    prepend-icon="mdi-lan-connect"
-                    title="Overlay routes"
-                    :to="{ path: `/tenant//network/subnet-routes`, query: { node: nodeForAgent(a.id)!.id } }"
-                  />
-                  <v-list-item
-                    prepend-icon="mdi-shield-lock-outline"
-                    title="Overlay ACL"
-                    :to="{ path: `/tenant//network/acl`, query: { tab: 'overlay' } }"
-                  />
-                  <v-divider />
-                  <v-list-item
-                    prepend-icon="mdi-delete"
-                    title="Delete device"
-                    base-color="error"
-                    @click="confirmDelete(a)"
-                  />
-                </v-list>
-              </v-menu>
-            </div>
-          </v-card-text>
-        </v-card>
-      </v-list>
-
-      <div v-else class="text-center pa-4 pa-md-6 pa-lg-8 text-medium-emphasis">
-        <v-icon size="64" color="grey-lighten-1" class="mb-2">mdi-desktop-classic</v-icon>
-        <p class="mb-2">No devices enrolled yet.</p>
-        <p class="text-body-2">
-          Click "Enroll device" for a one-line installer per platform — the
-          machine appears here as soon as it enrolls.
-        </p>
-      </div>
-    </v-card-text>
-  </v-card>
-
-  <!-- Tunnel clients — MOBILE ONLY since the unified desktop grid absorbed
-       their rows (kind=tunnel). CLI-only endpoints, no remote-desktop/
-       consent/codec cells. -->
-  <v-card v-if="mobile" class="mt-4">
-    <v-card-title class="d-flex align-center">
-      <span>Tunnel clients</span>
-      <v-spacer />
-      <v-btn
-        prepend-icon="mdi-key-plus"
-        variant="tonal"
-        size="small"
-        @click="openTunnelEnrollDialog"
-      >
-        Enroll tunnel client
-      </v-btn>
-    </v-card-title>
-    <v-card-text>
-      <v-table v-if="tunnelClientStore.clients.length > 0" density="compact">
-        <thead>
-          <tr>
-            <th class="agents-actions-col">Actions</th>
-            <th>Name</th>
-            <th>Status</th>
-            <th>OS</th>
-            <th>Overlay</th>
-            <th>Version</th>
-            <th>Last seen</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="c in tunnelClientStore.clients" :key="c.id">
-            <td class="agents-actions-col">
-              <v-menu>
-                <template #activator="{ props: menuProps }">
-                  <v-btn
-                    v-bind="menuProps"
-                    icon="mdi-dots-vertical"
-                    size="small"
-                    variant="text"
-                    :aria-label="`Actions for ${c.name}`"
-                  />
-                </template>
-                <v-list density="compact" min-width="230">
-                  <v-list-subheader>Network</v-list-subheader>
-                  <v-list-item
-                    v-if="nodeForTunnelClient(c.id)"
-                    prepend-icon="mdi-lan-disconnect"
-                    :title="nodeForTunnelClient(c.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
-                    @click="confirmEvict(nodeForTunnelClient(c.id)!)"
-                  />
-                  <v-divider />
-                  <v-list-item
-                    prepend-icon="mdi-delete"
-                    title="Delete tunnel client"
-                    base-color="error"
-                    @click="confirmTunnelDelete(c)"
-                  />
-                </v-list>
-              </v-menu>
-            </td>
-            <td class="font-weight-medium">{{ c.name }}</td>
-            <td>
-              <v-chip
-                size="small"
-                :color="c.status === 'online' ? 'success' : 'grey'"
-                variant="flat"
-              >
-                {{ c.status }}
-              </v-chip>
-            </td>
-            <td>
-              <v-chip size="x-small" variant="tonal">{{ c.os }}</v-chip>
-            </td>
-            <td>
-              <template v-if="nodeForTunnelClient(c.id)">
-                <div class="text-caption font-mono">
-                  {{ nodeForTunnelClient(c.id)!.overlay_ip }}
-                </div>
-                <div
-                  class="text-caption text-medium-emphasis font-mono"
-                  :title="deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip) ?? undefined"
+              class="device-card h-100 d-flex flex-column"
+              :data-testid="`device-card-${item.id}`"
+            >
+              <!-- Who it is: the name a person knows it by, then what the
+                   machine calls itself (unless hidden), OS, version, last seen. -->
+              <div class="d-flex align-start ga-2 pa-3 pb-2">
+                <v-icon
+                  :color="rowPresenceColor(item)"
+                  size="small"
+                  class="mt-1 flex-shrink-0"
+                  :title="rowPresenceTitle(item)"
                 >
-                  {{ deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip) }}
+                  {{ rowPresenceIcon(item) }}
+                </v-icon>
+                <div class="flex-grow-1 device-card__head">
+                  <div class="font-weight-medium text-break">{{ deviceLabel(item) }}</div>
+                  <div class="text-caption text-medium-emphasis text-break">
+                    <span v-if="secondaryDeviceName(item, hideNameWhenDisplay)">{{ item.name }} · </span>
+                    <v-icon size="x-small" :icon="osIcon(item.os)" class="mr-1" />{{ item.os }}
+                    <span v-if="item.version"> · v{{ item.version }}</span>
+                    <span :title="fmtDate(item.last_seen_at)"> · {{ fmtRelative(item.last_seen_at) }}</span>
+                  </div>
                 </div>
-              </template>
-              <span v-else class="text-caption text-medium-emphasis">—</span>
-            </td>
-            <td class="text-caption">{{ c.client_version || '—' }}</td>
-            <td class="text-caption" :title="fmtDate(c.last_seen_at)">
-              {{ fmtRelative(c.last_seen_at) }}
-            </td>
-          </tr>
-        </tbody>
-      </v-table>
-      <div v-else class="text-center pa-4 text-medium-emphasis">
-        <p class="mb-1">No tunnel clients enrolled.</p>
-        <p class="text-body-2">
-          Tunnel clients are CLI-only endpoints (SOCKS5 / port forwards) with
-          no remote-desktop — enroll one with the command from "Enroll tunnel
-          client".
-        </p>
+                <v-chip
+                  size="small"
+                  :color="rowStatusColor(item)"
+                  variant="flat"
+                  class="flex-shrink-0"
+                  :title="rowPresenceTitle(item)"
+                >
+                  {{ rowStatusLabel(item) }}
+                </v-chip>
+              </div>
+              <!-- What needs a person, and the device's own labels: the chips
+                   the grid shows (docs/ui.md "needs a person"), never a chip
+                   that is only a fact. -->
+              <div v-if="cardHasChips(item)" class="d-flex flex-wrap ga-1 px-3 pb-2">
+                <v-chip
+                  v-if="item.kind === 'tunnel_client'"
+                  size="x-small"
+                  variant="tonal"
+                  color="secondary"
+                >
+                  tunnel
+                </v-chip>
+                <!-- FR-51 — the vanishing must never be a surprise. -->
+                <v-chip
+                  v-if="item.ephemeral"
+                  size="x-small"
+                  color="warning"
+                  variant="tonal"
+                  prepend-icon="mdi-clock-fast"
+                  title="Ephemeral device — removes itself after inactivity or on clean shutdown; removal is final"
+                >
+                  ephemeral
+                </v-chip>
+                <template v-if="agentFor(item)">
+                  <!-- FR-103 — only when the device's credential needs someone. -->
+                  <v-chip
+                    v-if="credentialChip(agentFor(item)!.token_expires_at)"
+                    size="x-small"
+                    variant="tonal"
+                    prepend-icon="mdi-key-alert"
+                    :color="credentialChip(agentFor(item)!.token_expires_at)!.color"
+                    :title="credentialChip(agentFor(item)!.token_expires_at)!.tooltip"
+                  >
+                    {{ credentialChip(agentFor(item)!.token_expires_at)!.text }}
+                  </v-chip>
+                  <!-- FR-106 — the same chip as the table view's. -->
+                  <v-chip
+                    v-if="stallChip(agentFor(item)!)"
+                    size="x-small"
+                    variant="tonal"
+                    prepend-icon="mdi-update"
+                    :color="stallChip(agentFor(item)!)!.color"
+                    :title="stallChip(agentFor(item)!)!.tooltip"
+                    data-testid="agent-update-stall-chip"
+                  >
+                    {{ stallChip(agentFor(item)!)!.text }}
+                  </v-chip>
+                  <v-chip
+                    v-if="remoteConfigChip(agentFor(item)!)"
+                    size="x-small"
+                    variant="tonal"
+                    :color="remoteConfigChip(agentFor(item)!)!.color"
+                    :prepend-icon="remoteConfigChip(agentFor(item)!)!.icon"
+                    :title="remoteConfigChip(agentFor(item)!)!.tooltip"
+                    @click="openRemoteConfig(agentFor(item)!)"
+                  >
+                    {{ remoteConfigChip(agentFor(item)!)!.text }}
+                  </v-chip>
+                  <v-chip
+                    v-if="keyRotationChip(agentFor(item)!)"
+                    size="x-small"
+                    variant="tonal"
+                    :color="keyRotationChip(agentFor(item)!)!.color"
+                    :prepend-icon="keyRotationChip(agentFor(item)!)!.icon"
+                    :title="keyRotationChip(agentFor(item)!)!.tooltip"
+                  >
+                    {{ keyRotationChip(agentFor(item)!)!.text }}
+                  </v-chip>
+                  <!-- FR-27 — only when the companion disagrees with the
+                       daemon: the desktop is running code the daemon has
+                       moved past. -->
+                  <v-chip
+                    v-if="companionSkew(item)"
+                    size="x-small"
+                    color="warning"
+                    variant="tonal"
+                    :title="`roomler-desktop is on v${companionSkew(item)} while the daemon is on v${item.version} — the companion updates separately`"
+                  >
+                    desktop v{{ companionSkew(item) }}
+                  </v-chip>
+                  <!-- FR-92 P5b — keep busy, only while it is ON: the device's
+                       claim, shown as such; off or unknown shows nothing. -->
+                  <v-chip
+                    v-if="agentFor(item)!.keep_busy?.on"
+                    size="x-small"
+                    color="info"
+                    variant="tonal"
+                    prepend-icon="mdi-cursor-default-gesture-outline"
+                    :title="keepBusyBriefTitle(agentFor(item)!.keep_busy)"
+                    data-testid="agent-keep-busy-chip"
+                  >
+                    keep busy · {{ agentFor(item)!.keep_busy!.phase }}
+                  </v-chip>
+                  <!-- A device the OS has muzzled looks identical to a healthy
+                       one until you connect and get a black screen. -->
+                  <v-chip
+                    v-for="w in permissionWarnings(agentFor(item)!)"
+                    :key="w.label"
+                    size="x-small"
+                    color="warning"
+                    variant="tonal"
+                    :title="w.tooltip"
+                  >
+                    {{ w.label }}
+                  </v-chip>
+                </template>
+                <v-chip
+                  v-for="t in (item.tags ?? []).slice(0, 3)"
+                  :key="`tag-${t}`"
+                  size="x-small"
+                  variant="outlined"
+                  prepend-icon="mdi-tag-outline"
+                >
+                  {{ t }}
+                </v-chip>
+                <v-chip
+                  v-if="(item.tags?.length ?? 0) > 3"
+                  size="x-small"
+                  variant="outlined"
+                  :title="(item.tags ?? []).slice(3).join(', ')"
+                >
+                  +{{ (item.tags?.length ?? 0) - 3 }}
+                </v-chip>
+              </div>
+              <!-- On demand: the policy (six controls that used to be open on
+                   every card) and the technical facts. Each title says what is
+                   inside, so a collapsed card still answers "how is this set?". -->
+              <v-expansion-panels
+                variant="accordion"
+                multiple
+                flat
+                tile
+                class="device-card__panels mt-auto"
+              >
+                <v-expansion-panel v-if="agentFor(item)" value="access">
+                  <v-expansion-panel-title>
+                    <div class="device-card__panel-title">
+                      <span class="text-body-2 font-weight-medium flex-shrink-0">
+                        <v-icon size="small" class="mr-1">mdi-shield-account-outline</v-icon>Access
+                      </span>
+                      <span class="text-caption text-medium-emphasis device-card__panel-summary">
+                        {{ policySummary(agentFor(item)!.access_policy, isOwnedByMe(agentFor(item)!)).join(' · ') }}
+                      </span>
+                    </div>
+                  </v-expansion-panel-title>
+                  <v-expansion-panel-text>
+                    <DeviceAccessPolicyFields
+                      :agent="agentFor(item)!"
+                      :busy="consentBusy === item.id"
+                      :owned-by-me="isOwnedByMe(agentFor(item)!)"
+                      variant="outlined"
+                      @consent="(m: ConsentMode) => onConsentModeChange(agentFor(item)!, m)"
+                      @prompt-owner="(v: boolean) => onPromptOwnerChange(agentFor(item)!, v)"
+                      @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
+                      @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
+                      @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
+                      @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+                    />
+                  </v-expansion-panel-text>
+                </v-expansion-panel>
+                <v-expansion-panel value="details">
+                  <v-expansion-panel-title>
+                    <div class="device-card__panel-title">
+                      <span class="text-body-2 font-weight-medium flex-shrink-0">
+                        <v-icon size="small" class="mr-1">mdi-information-outline</v-icon>Details
+                      </span>
+                      <span class="text-caption text-medium-emphasis device-card__panel-summary">
+                        {{ item.overlay_ip || 'no overlay address' }}
+                      </span>
+                    </div>
+                  </v-expansion-panel-title>
+                  <v-expansion-panel-text>
+                    <dl class="device-card__facts text-caption">
+                      <template v-if="item.overlay_ip">
+                        <dt>Overlay</dt>
+                        <dd class="text-mono">
+                          {{ item.overlay_ip }}<br />{{ deriveOverlayV6(item.overlay_ip) }}
+                        </dd>
+                      </template>
+                      <template v-if="item.magic_dns_fqdn || item.magic_dns_name">
+                        <dt>MagicDNS</dt>
+                        <dd class="text-mono">
+                          {{ item.magic_dns_fqdn || item.magic_dns_name }}
+                          <v-btn
+                            v-if="item.magic_dns_fqdn"
+                            :icon="copiedAgentId === item.magic_dns_fqdn ? 'mdi-check' : 'mdi-content-copy'"
+                            size="x-small"
+                            variant="text"
+                            density="comfortable"
+                            :aria-label="`Copy MagicDNS name for ${deviceLabel(item)}`"
+                            @click="copyAgentId(item.magic_dns_fqdn!)"
+                          />
+                        </dd>
+                      </template>
+                      <!-- FR-40 — the node's public key, so a rotation is
+                           visible as a changed key rather than trusted from a
+                           chip. -->
+                      <template v-if="item.overlay_public_key">
+                        <dt>Overlay key</dt>
+                        <dd class="text-mono">
+                          {{ item.overlay_public_key.slice(0, 10) }}… · epoch {{ item.overlay_key_epoch ?? 0 }}
+                        </dd>
+                      </template>
+                      <dt>Device ID</dt>
+                      <dd class="text-mono">
+                        {{ shortId(item.id) }}
+                        <v-btn
+                          :icon="copiedAgentId === item.id ? 'mdi-check' : 'mdi-content-copy'"
+                          size="x-small"
+                          variant="text"
+                          density="comfortable"
+                          :color="copiedAgentId === item.id ? 'success' : undefined"
+                          :aria-label="`Copy device ID for ${deviceLabel(item)}`"
+                          @click="copyAgentId(item.id)"
+                        />
+                      </dd>
+                      <dt>Machine ID</dt>
+                      <dd class="text-mono">{{ shortId(item.machine_id) }}</dd>
+                      <!-- FR-100 P1a — the device's own key, as a person reads
+                           it, so what a browser pins can be checked here. -->
+                      <template v-if="agentFor(item)?.peer_auth_fingerprint">
+                        <dt>Device key</dt>
+                        <dd class="text-mono">{{ agentFor(item)!.peer_auth_fingerprint }}</dd>
+                      </template>
+                      <template v-if="agentFor(item) && codecChips(agentFor(item)!).length > 0">
+                        <dt>Codecs</dt>
+                        <dd class="d-flex flex-wrap ga-1">
+                          <v-chip
+                            v-for="codec in codecChips(agentFor(item)!)"
+                            :key="codec.label"
+                            size="x-small"
+                            :color="codec.color"
+                            variant="tonal"
+                            :title="codec.tooltip"
+                          >
+                            {{ codec.label }}
+                          </v-chip>
+                        </dd>
+                      </template>
+                      <dt>Last seen</dt>
+                      <dd>{{ fmtDate(item.last_seen_at) }}</dd>
+                    </dl>
+                  </v-expansion-panel-text>
+                </v-expansion-panel>
+              </v-expansion-panels>
+              <v-card-actions class="px-3 pt-1 pb-2">
+                <v-btn
+                  v-if="item.kind === 'agent'"
+                  size="small"
+                  variant="tonal"
+                  color="primary"
+                  prepend-icon="mdi-remote-desktop"
+                  :disabled="!item.is_online"
+                  :to="{ name: 'agent-remote', params: { tenantId, agentId: item.id } }"
+                  :aria-label="`Connect to ${deviceLabel(item)}`"
+                  class="flex-grow-1"
+                >
+                  Connect
+                </v-btn>
+                <v-spacer v-else />
+                <DeviceActionsMenu
+                  :tenant-id="tenantId"
+                  :row="item"
+                  :agent="agentFor(item)"
+                  :client="clientFor(item)"
+                  :node="nodeFor(item)"
+                  :network-mounted="caps.has('network')"
+                  :update-busy="updateBusy === item.id"
+                  :rotate-key-busy="rotateKeyBusy === item.id"
+                  :update-blocked="updateBlockedText(agentFor(item))"
+                  @action="(a: DeviceAction) => onDeviceAction(item, a)"
+                />
+              </v-card-actions>
+            </v-card>
+          </v-col>
+        </v-row>
+        <div
+          v-if="deviceStore.totalPages > 1"
+          class="d-flex flex-column align-center mt-3"
+        >
+          <v-pagination
+            v-model="gridPage"
+            :length="deviceStore.totalPages"
+            :total-visible="xs ? 3 : 5"
+            density="comfortable"
+            size="small"
+          />
+          <span class="text-caption text-medium-emphasis">{{ pageRangeText }}</span>
+        </div>
       </div>
     </v-card-text>
   </v-card>
@@ -1224,8 +906,8 @@
     <v-card>
       <v-card-title>
         {{ evictTarget?.will_rejoin
-          ? `Force a new overlay address for “${evictTarget?.name}”?`
-          : `Remove “${evictTarget?.name}” from the mesh?` }}
+          ? `Force a new overlay address for “${nodeLabel(evictTarget)}”?`
+          : `Remove “${nodeLabel(evictTarget)}” from the mesh?` }}
       </v-card-title>
       <v-card-text>
         <ul class="text-body-2 mb-3 ps-4">
@@ -1240,7 +922,7 @@
             be assigned to a <strong>different</strong> machine.
           </li>
           <li v-if="evictTarget?.will_rejoin">
-            <strong>{{ evictTarget?.name }}</strong> is still enrolled, so it
+            <strong>{{ nodeLabel(evictTarget) }}</strong> is still enrolled, so it
             rejoins automatically on its next connect — with a
             <strong>different</strong> overlay address. This does not revoke
             access; to remove the device for good, delete the agent or tunnel
@@ -1271,7 +953,7 @@
     <v-card>
       <v-card-title>Delete tunnel client?</v-card-title>
       <v-card-text>
-        <p class="font-weight-medium mb-2">{{ tunnelDeleteTarget?.name }}</p>
+        <p class="font-weight-medium mb-2">{{ deviceLabel(tunnelDeleteTarget) }}</p>
         <p class="text-body-2">
           Its access token is revoked and, if it joined the overlay, its node
           is evicted and the overlay address released. The CLI stays installed
@@ -1298,7 +980,7 @@
     v-model="crashesDialogOpen"
     :tenant-id="tenantId"
     :agent-id="crashesTarget?.id ?? ''"
-    :agent-name="crashesTarget?.name ?? ''"
+    :agent-name="deviceLabel(crashesTarget)"
   />
 
   <!-- Logs viewer modal (centralized agent-log upload, rc.58/rc.59) -->
@@ -1306,7 +988,7 @@
     v-model="logsDialogOpen"
     :tenant-id="tenantId"
     :agent-id="logsTarget?.id ?? ''"
-    :agent-name="logsTarget?.name ?? ''"
+    :agent-name="deviceLabel(logsTarget)"
   />
 
   <!-- Fleet RPC — run a command on the device, and edit the policy that
@@ -1348,7 +1030,7 @@
   <!-- FR-40 — rotate-overlay-key confirmation -->
   <v-dialog v-model="rotateKeyDialogOpen" max-width="520">
     <v-card>
-      <v-card-title>Rotate the overlay key of {{ rotateKeyTarget?.name }}?</v-card-title>
+      <v-card-title>Rotate the overlay key of {{ deviceLabel(rotateKeyTarget) }}?</v-card-title>
       <v-card-text>
         The device mints a fresh WireGuard key <strong>on the device</strong>, saves it and
         re-joins the mesh under it. Every peer picks the new key up within seconds and the old
@@ -1391,7 +1073,7 @@
           {{ wontUpdateHere.length }} will not take it from here:
           <ul class="ml-4">
             <li v-for="x in wontUpdateHere" :key="x.a.id">
-              <strong>{{ x.a.name }}</strong> — {{ refusalShort(x.code) }}
+              <strong>{{ deviceLabel(x.a) }}</strong> — {{ refusalShort(x.code) }}
             </li>
           </ul>
         </div>
@@ -1411,7 +1093,7 @@
     <v-card>
       <v-card-title>Remove this device from the tenant?</v-card-title>
       <v-card-text>
-        <p class="font-weight-medium mb-3">{{ deleteTarget?.name }}</p>
+        <p class="font-weight-medium mb-3">{{ deviceLabel(deleteTarget) }}</p>
         <ul class="text-body-2 mb-3 ps-4">
           <li>
             It is evicted from the overlay mesh immediately — peers drop its
@@ -1453,7 +1135,7 @@
       <v-card-title>Add to another organization</v-card-title>
       <v-card-text>
         <p class="text-body-2 mb-3">
-          <strong>{{ joinOrgTarget?.name }}</strong> keeps its current enrollment and gains a
+          <strong>{{ deviceLabel(joinOrgTarget) }}</strong> keeps its current enrollment and gains a
           second one. The device connects to both organizations at once; each sees only its
           own sessions, and the new org gets its own encryption key.
         </p>
@@ -1546,7 +1228,7 @@
       <v-card-title>Reassign device owner</v-card-title>
       <v-card-text>
         <p class="text-body-2 mb-3">
-          Owner of <strong>{{ reassignTarget?.name }}</strong>. The owner self-controls
+          Owner of <strong>{{ deviceLabel(reassignTarget) }}</strong>. The owner self-controls
           without an allowlist entry, and consent (email / push) routes to them.
         </p>
         <v-select
@@ -1580,7 +1262,7 @@
       <v-card-title>Tunnel mesh routes</v-card-title>
       <v-card-text>
         <p class="text-body-2 mb-3">
-          CIDRs that <strong>{{ routesTarget?.name }}</strong> advertises for the
+          CIDRs that <strong>{{ deviceLabel(routesTarget) }}</strong> advertises for the
           mesh (<code>roomler socks5</code>). A LAN target IP matching one of
           these routes is dialed by this agent, so the mesh can reach non-agent
           devices behind it (a NAS, a printer, a database host). Access is still
@@ -1690,9 +1372,16 @@ import {
 import { useDeviceStore, type DeviceRow } from '@/stores/devices'
 import { useAuthStore } from '@/stores/auth'
 import { useGridColumns } from '@/composables/useGridColumns'
-import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
+import {
+  deviceLabel,
+  secondaryDeviceName,
+  useHideDeviceName,
+} from '@/composables/useHideDeviceName'
 import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
 import DeviceEditDialog, { type EditableDevice } from '@/components/admin/DeviceEditDialog.vue'
+import DeviceActionsMenu, { type DeviceAction } from './DeviceActionsMenu.vue'
+import DeviceAccessPolicyFields from './DeviceAccessPolicyFields.vue'
+import { policySummary } from './devicePolicy'
 
 const props = defineProps<{ tenantId: string }>()
 
@@ -1860,6 +1549,68 @@ const clientById = computed(() => {
 function clientFor(row: DeviceRow): TunnelClient | undefined {
   return row.kind === 'tunnel_client' ? clientById.value.get(row.id) : undefined
 }
+/** The row's overlay node, joined on the wire's FK (never on the name). */
+function nodeFor(row: DeviceRow): OverlayNode | undefined {
+  return row.kind === 'agent' ? nodeForAgent(row.id) : nodeForTunnelClient(row.id)
+}
+
+/** The one place a menu pick becomes a dialog or a request — the grid and the
+ *  cards render the same `DeviceActionsMenu`, so they cannot offer different
+ *  things for the same device. */
+function onDeviceAction(row: DeviceRow, action: DeviceAction) {
+  const a = agentFor(row)
+  const node = nodeFor(row)
+  switch (action) {
+    case 'edit': return openEdit(row)
+    case 'evict': return node ? confirmEvict(node) : undefined
+    case 'delete-tunnel': {
+      const c = clientFor(row)
+      return c ? confirmTunnelDelete(c) : undefined
+    }
+  }
+  if (!a) return
+  switch (action) {
+    case 'update': return void triggerUpdate(a)
+    case 'rotate-key': return openRotateKey(a)
+    case 'crashes': return openCrashes(a)
+    case 'logs': return openLogs(a)
+    case 'console': return openConsole(a)
+    case 'join-org': return void openJoinOrg(a)
+    case 'reassign': return openReassign(a)
+    case 'exec-policy': return openExecPolicy(a)
+    case 'ssh-policy': return openSshPolicy(a)
+    case 'external-access': return openExternalAccess(a)
+    case 'remote-config': return openRemoteConfig(a)
+    case 'routes': return openRoutes(a)
+    case 'delete': return confirmDelete(a)
+  }
+}
+
+/** Whether a card has any chip to show — an empty chip row would only add
+ *  padding. Mirrors the chip row's own conditions. */
+function cardHasChips(row: DeviceRow): boolean {
+  if (row.kind === 'tunnel_client' || row.ephemeral || (row.tags?.length ?? 0) > 0) return true
+  const a = agentFor(row)
+  if (!a) return false
+  return !!(
+    credentialChip(a.token_expires_at) ||
+    stallChip(a) ||
+    remoteConfigChip(a) ||
+    keyRotationChip(a) ||
+    companionSkew(row) ||
+    a.keep_busy?.on ||
+    permissionWarnings(a).length > 0
+  )
+}
+
+/** "11–20 of 22" under the cards' pager. */
+const pageRangeText = computed(() => {
+  const total = deviceStore.total
+  if (total === 0) return ''
+  const first = (gridPage.value - 1) * gridPerPage.value + 1
+  const last = Math.min(gridPage.value * gridPerPage.value, total)
+  return `${first}–${last} of ${total}`
+})
 
 // Row-level presence rendering (DeviceRow carries presence directly).
 function rowPresenceColor(r: DeviceRow): string {
@@ -1878,7 +1629,9 @@ function rowPresenceTitle(r: DeviceRow): string {
   return r.presence === 'online'
     ? 'Online — a control socket is registered'
     : r.presence === 'stale'
-      ? 'Stale — heartbeat fresh but no socket registered'
+      ? 'Stale — heartbeat fresh but no socket registered (a half-open network leg or a ' +
+        'recent server roll). It should heal within minutes; otherwise restart the Roomler ' +
+        'service on the machine.'
       : 'Offline'
 }
 function rowStatusColor(r: DeviceRow): string {
@@ -1938,6 +1691,15 @@ function nodeForAgent(agentId: string): OverlayNode | undefined {
 }
 function nodeForTunnelClient(tcId: string): OverlayNode | undefined {
   return nodesByTunnelClientId.value.get(tcId)
+}
+/** A node by the name a person knows its device by. `node.name` is a lossy
+ *  DNS label, so the device is found on the wire's FK; the label is only the
+ *  fallback (a node whose device is gone). */
+function nodeLabel(n: OverlayNode | null | undefined): string {
+  if (!n) return ''
+  const agent = n.agent_id ? agentById.value.get(n.agent_id) : undefined
+  const client = n.tunnel_client_id ? clientById.value.get(n.tunnel_client_id) : undefined
+  return deviceLabel(agent ?? client ?? n)
 }
 
 // ── Overlay eviction (lifted from MachinesSection) ───────────────
@@ -2012,18 +1774,9 @@ async function performTunnelDelete() {
   }
 }
 
-// Per-device consent mode. Email/Push route the request to the device OWNER
-// (approve-link) for unattended hosts. `prompt_then_email` runs BOTH legs in
-// parallel — first answer wins — with the on-host modal bounded to the attended
-// window while the emailed link keeps the full async one; a host that goes
-// unanswered hands over to the owner rather than ending the session.
-const CONSENT_MODE_ITEMS: { title: string; value: ConsentMode }[] = [
-  { title: 'Prompt on host (attended)', value: 'prompt' },
-  { title: 'Auto-grant (unattended)', value: 'auto' },
-  { title: 'Email the owner', value: 'email' },
-  { title: 'Push to the owner', value: 'push' },
-  { title: 'Prompt host + email owner', value: 'prompt_then_email' },
-]
+// The access-policy writes. The controls and their choices live in
+// `DeviceAccessPolicyFields` / `devicePolicy.ts` (one copy for the grid and
+// the cards); each change lands here as one full-policy PUT.
 // Agent id whose consent mode is mid-update (disables + spins that row's select).
 const consentBusy = ref<string | null>(null)
 async function onConsentModeChange(a: Agent, mode: ConsentMode) {
@@ -2050,21 +1803,6 @@ function isOwnedByMe(a: Agent): boolean {
   return !!auth.user?.id && a.owner_user_id === auth.user.id
 }
 
-/** The label says what is TRUE right now, not what the checkbox is called —
- *  "you own this device, so consent is currently skipped" is the fact an
- *  operator needs; "Ask me too" alone would leave them guessing what the
- *  unchecked state means. */
-function ownerPromptLabel(a: Agent): string {
-  const mode = a.access_policy.consent_mode ?? 'prompt'
-  return a.access_policy.prompt_owner
-    ? `Ask me too (you own this device; "${consentModeTitle(mode)}" applies to you)`
-    : 'Ask me too (you own this device, so consent is skipped for you)'
-}
-
-function consentModeTitle(mode: ConsentMode): string {
-  return CONSENT_MODE_ITEMS.find((i) => i.value === mode)?.title ?? mode
-}
-
 async function onPromptOwnerChange(a: Agent, prompt_owner: boolean) {
   if ((a.access_policy.prompt_owner ?? false) === prompt_owner) return
   consentBusy.value = a.id
@@ -2080,13 +1818,6 @@ async function onPromptOwnerChange(a: Agent, prompt_owner: boolean) {
   }
 }
 
-// P6 — per-device multi-user input arbitration mode. `free` (default) =
-// every INPUT-granted viewer injects (agent-fenced); `exclusive` = one
-// floor holder with request/grant. Applies to NEW sessions.
-const INPUT_MODE_ITEMS: { title: string; value: 'free' | 'exclusive' }[] = [
-  { title: 'Free-for-all (fenced)', value: 'free' },
-  { title: 'Exclusive (one controller)', value: 'exclusive' },
-]
 async function onInputModeChange(a: Agent, mode: 'free' | 'exclusive') {
   if ((a.access_policy.input_mode ?? 'free') === mode) return
   consentBusy.value = a.id
@@ -2102,29 +1833,8 @@ async function onInputModeChange(a: Agent, mode: 'free' | 'exclusive') {
   }
 }
 
-// FR-101 P4b-2b — this device's own idle limit, in minutes
-// (`AccessPolicy.auto_terminate_idle_minutes`). `0` in the select is "none of
-// its own" (stored as null), so the organization's limit alone applies.
-const IDLE_MINUTE_PRESETS = [5, 15, 30, 60, 120]
-/** The presets, plus a stored value that is none of them (set through the
- *  API), so the select never shows blank for a limit that is in force. */
-function idleMinuteItems(current: number | null | undefined): { title: string; value: number }[] {
-  const minutes = [...IDLE_MINUTE_PRESETS]
-  if (typeof current === 'number' && current > 0 && !minutes.includes(current)) {
-    minutes.push(current)
-    minutes.sort((a, b) => a - b)
-  }
-  return [
-    { title: 'Idle: org limit only', value: 0 },
-    ...minutes.map((m) => ({ title: `Idle: ${m} min`, value: m })),
-  ]
-}
-const IDLE_LIMIT_HINT =
-  'End a remote-desktop session to this device after this long with no input and no ' +
-  'change on its screen. The shorter of this and the organization’s limit applies, so it ' +
-  'can only tighten the org’s. The device keeps it: an agent that predates it does not. ' +
-  'Applies to the next session.'
-
+// FR-101 P4b-2b — `0` from the select is "none of its own" (stored as null),
+// so the organization's limit alone applies.
 async function onIdleMinutesChange(a: Agent, minutes: number) {
   const next = minutes > 0 ? minutes : null
   if ((a.access_policy.auto_terminate_idle_minutes ?? null) === next) return
@@ -2141,22 +1851,8 @@ async function onIdleMinutesChange(a: Agent, minutes: number) {
   }
 }
 
-// FR-99 P3b — what this device's sessions ask of it when the last one ends
-// (`AccessPolicy.lock_on_end`). `never` in the select asks nothing (stored as
-// null), so the device owner's own setting alone applies.
-const LOCK_ON_END_ITEMS: { title: string; value: LockOnEnd }[] = [
-  { title: 'Lock: the device decides', value: 'never' },
-  { title: 'Lock: if locked or idle at the start', value: 'auto' },
-  { title: 'Lock: always', value: 'always' },
-]
-const LOCK_ON_END_HINT =
-  'Lock this device’s screen when the last remote-desktop session to it ends. ' +
-  '“If locked or idle at the start” locks it again only if it was locked, or nobody was ' +
-  'at it, when the session began. The device takes the stricter of this and its owner’s ' +
-  'own setting, so this can only tighten it. Honoured by service installs on Windows and ' +
-  'Linux, where a session can unlock the screen again; a per-user install, or an agent that ' +
-  'predates it, does not take it. Applies to the next session.'
-
+// FR-99 P3b — `never` from the select asks nothing (stored as null), so the
+// device owner's own setting alone applies.
 async function onLockOnEndChange(a: Agent, lock: LockOnEnd) {
   const next = lock === 'never' ? null : lock
   if ((a.access_policy.lock_on_end ?? null) === next) return
@@ -2173,14 +1869,6 @@ async function onLockOnEndChange(a: Agent, lock: LockOnEnd) {
   }
 }
 
-/** #1882 — what the "Remote desktop over the mesh" switch does, for its
- *  tooltip. */
-const RC_OVERLAY_HINT =
-  'Off (default): remote desktop never rides the WireGuard mesh; it connects ' +
-  'over the LAN, a direct path or a TURN relay. On: it may take the mesh when ' +
-  'that is the best path, and inherits the mesh’s outages. Applies to the ' +
-  'next session.'
-
 async function onRcOverlayChange(a: Agent, rc_overlay: boolean) {
   if ((a.access_policy.rc_overlay ?? false) === rc_overlay) return
   consentBusy.value = a.id
@@ -2196,10 +1884,19 @@ async function onRcOverlayChange(a: Agent, rc_overlay: boolean) {
   }
 }
 
-// `mobile` flips below sm (~600px) so the table stays usable on tablets
-// and small laptops; `lgAndDown` (≤1280) drives the codec-chip rollup so
-// mid-width viewports don't blow past the Actions column.
-const { smAndDown: mobile, lgAndDown } = useDisplay()
+// `mobile` is below md (< 960 px): phones and portrait tablets get the cards
+// (one column on a phone, two from sm), wider screens the grid. `lgAndDown`
+// (≤1280) drives the codec-chip rollup so mid-width viewports don't blow past
+// the Actions column.
+const { smAndDown: mobile, xs, lgAndDown } = useDisplay()
+
+// The cards have no v-data-table-server to fire @update:options, so below md a
+// page change fetches here. Guarded by `mobile`: on the grid the table's
+// options event is the one fetch per change, and a second one would
+// double-load.
+watch(gridPage, () => {
+  if (mobile.value) fetchGrid()
+})
 
 const enrollDialogOpen = ref(false)
 const enrollLoading = ref(false)
@@ -2241,8 +1938,8 @@ async function doRotateKey() {
   try {
     const res = await agentStore.rotateOverlayKey(props.tenantId, a.id)
     updateNotice.value = res.delivered
-      ? `Key rotation ordered on ${a.name} — it mints a new key, re-joins the mesh and reports back within seconds.`
-      : `${a.name} is offline — the key rotation is queued and runs on its next connect.`
+      ? `Key rotation ordered on ${deviceLabel(a)} — it mints a new key, re-joins the mesh and reports back within seconds.`
+      : `${deviceLabel(a)} is offline — the key rotation is queued and runs on its next connect.`
     rotateKeyDialogOpen.value = false
     await agentStore.fetchAgents(props.tenantId)
     fetchGrid()
@@ -2331,8 +2028,8 @@ async function triggerUpdate(a: Agent) {
   try {
     const delivered = await agentStore.triggerUpdate(props.tenantId, a.id)
     updateNotice.value = delivered
-      ? `Update pushed to ${a.name} — it will download, install, and restart shortly.`
-      : `${a.name} is offline — it will update on its next periodic check instead.`
+      ? `Update pushed to ${deviceLabel(a)} — it will download, install, and restart shortly.`
+      : `${deviceLabel(a)} is offline — it will update on its next periodic check instead.`
   } catch (e) {
     agentStore.error = (e as Error).message
   } finally {
@@ -2359,7 +2056,7 @@ async function doUpdateAll() {
   updatingAll.value = true
   try {
     const res = await agentStore.triggerUpdateAll(props.tenantId)
-    const names = new Map(agentStore.agents.map((a) => [a.id, a.name]))
+    const names = new Map(agentStore.agents.map((a) => [a.id, deviceLabel(a)]))
     const skipped = res.results.filter((r) => r.refused_code)
     let notice =
       `Update pushed to ${res.delivered} of ${res.requested} agents — ` +
@@ -2509,49 +2206,6 @@ function osIcon(os: string) {
     case 'windows': return 'mdi-microsoft-windows'
     default: return 'mdi-desktop-classic'
   }
-}
-
-/** Phase A-1 — tolerate older API responses without `presence`. */
-function presenceOf(a: Agent): 'online' | 'stale' | 'offline' {
-  return a.presence ?? (a.is_online ? 'online' : 'offline')
-}
-
-function presenceColor(a: Agent) {
-  const p = presenceOf(a)
-  if (p === 'online') return 'success'
-  if (p === 'stale') return 'warning'
-  return 'grey'
-}
-
-function presenceIcon(a: Agent) {
-  const p = presenceOf(a)
-  if (p === 'online') return 'mdi-circle'
-  if (p === 'stale') return 'mdi-circle-half-full'
-  return 'mdi-circle-outline'
-}
-
-function presenceTitle(a: Agent): string {
-  if (presenceOf(a) !== 'stale') return ''
-  return (
-    'Socket stale — the agent heartbeats but no server holds its live connection ' +
-    '(half-open network leg or a recent server roll). It should self-heal within ' +
-    'minutes; otherwise restart the Roomler service on the machine.'
-  )
-}
-
-function statusColor(a: Agent) {
-  const p = presenceOf(a)
-  if (p === 'online') return 'success'
-  if (p === 'stale') return 'warning'
-  if (a.status === 'quarantined') return 'error'
-  return 'grey'
-}
-
-function statusLabel(a: Agent): string {
-  const p = presenceOf(a)
-  if (p === 'online') return 'Online'
-  if (p === 'stale') return 'Stale'
-  return a.status
 }
 
 function fmtDate(iso: string): string {
@@ -2753,8 +2407,8 @@ async function confirmJoinOrg() {
     // The device enrolls itself a beat later; say what actually happened
     // rather than implying the row is already there.
     const base = res.already_enrolled
-      ? `${joinOrgTarget.value.name} was already in that organization — its enrollment was refreshed.`
-      : `${joinOrgTarget.value.name} is joining as "${res.label}". It appears in that organization's device list shortly.`
+      ? `${deviceLabel(joinOrgTarget.value)} was already in that organization — its enrollment was refreshed.`
+      : `${deviceLabel(joinOrgTarget.value)} is joining as "${res.label}". It appears in that organization's device list shortly.`
     // Say the quiet part: the enrollment landed, the MESH did not.
     updateNotice.value = res.restart_required
       ? `${base} Mesh access is configured but starts after the device's agent restarts — the next auto-update delivers that.`
@@ -2912,8 +2566,11 @@ function loadNetworkStores(tid: string) {
 }
 
 onMounted(() => {
-  // The GRID's own fetch fires from @update:options on mount — these load
-  // the rich per-device stores the action menus and mobile cards read.
+  // The GRID's own fetch fires from @update:options on mount; the cards have
+  // no such event, so below md the first page is fetched here.
+  if (mobile.value) fetchGrid()
+  // The rich per-device stores the action menus and the cards' agent-only
+  // fields read.
   agentStore.fetchAgents(props.tenantId)
   agentStore.fetchTenantMembers(props.tenantId)
   loadNetworkStores(props.tenantId)
@@ -2968,6 +2625,56 @@ watch(() => props.tenantId, (tid) => {
 /* FR-27 — the companion-version skew note. Warning-toned so it reads as
    "something here is behind", not as a second neutral fact next to the
    daemon version. */
+/* The phone/tablet cards. Panel titles are one line — the policy summary
+   truncates rather than pushing every card a line taller. */
+.device-search--full {
+  flex: 1 1 100%;
+}
+.device-card__head {
+  min-width: 0;
+}
+.device-card__panels :deep(.v-expansion-panel-title) {
+  min-height: 44px;
+  padding: 8px 12px;
+}
+.device-card__panels :deep(.v-expansion-panel-title--active) {
+  min-height: 44px;
+}
+.device-card__panels :deep(.v-expansion-panel-text__wrapper) {
+  padding: 4px 12px 12px;
+}
+.device-card__panels :deep(.v-expansion-panel) {
+  border-top: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.device-card__panel-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+.device-card__panel-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.device-card__facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 12px;
+  row-gap: 4px;
+  margin: 0;
+}
+.device-card__facts dt {
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+}
+.device-card__facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .companion-skew {
   color: rgb(var(--v-theme-warning));
 }
