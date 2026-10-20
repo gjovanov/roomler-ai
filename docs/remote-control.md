@@ -384,7 +384,7 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:745`](../agents/roomlerd/src/encode/caps.rs#L745)), applied in
+([`caps.rs:763`](../agents/roomlerd/src/encode/caps.rs#L763)), applied in
 `detect()` ([`caps.rs:624`](../agents/roomlerd/src/encode/caps.rs#L624))
 after the config lists, over plain `HostFacts`
 ([`caps.rs:636`](../agents/roomlerd/src/encode/caps.rs#L636)), so it runs and
@@ -394,7 +394,7 @@ is tested on every OS.
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3244`](../agents/roomlerd/src/signaling.rs#L3244)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:726`](../agents/roomlerd/src/encode/caps.rs#L726)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:744`](../agents/roomlerd/src/encode/caps.rs#L744)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone reports copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -437,7 +437,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:684`](../agents/roomlerd/src/encode/caps.rs#L684)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:702`](../agents/roomlerd/src/encode/caps.rs#L702)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | nothing yet (ScreenCaptureKit audio is FR-97 P2a) | the hello offers no track (`no-backend`, §5.1b) |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -528,10 +528,10 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:12441`](../agents/roomlerd/src/peer.rs#L12441)) sends it
+The pump ([`peer.rs:12483`](../agents/roomlerd/src/peer.rs#L12483)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5421`](../agents/roomlerd/src/peer.rs#L5421); the viewer parses it
+[`peer.rs:5447`](../agents/roomlerd/src/peer.rs#L5447); the viewer parses it
 at [`useRemoteControl.ts:1445`](../ui/src/composables/useRemoteControl.ts#L1445)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3190`](../ui/src/views/remote/RemoteControl.vue#L3190)).
@@ -568,7 +568,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:331`](../agents/roomlerd/src/lock_state.rs#L331)); GNOME, KDE and light-locker set it | P2d |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | — |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9357`](../agents/roomlerd/src/peer.rs#L9357)), retried until the control DC carries it | — |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9383`](../agents/roomlerd/src/peer.rs#L9383)), retried until the control DC carries it | — |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" ([`RemoteControl.vue:98`](../ui/src/views/remote/RemoteControl.vue#L98)) | — |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
 
@@ -1747,7 +1747,7 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12362`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12340`). An offer with no `m=video` is answered without the track |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12404`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12382`). An offer with no `m=video` is answered without the track |
 | Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3783`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12371`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:574`), on both ends' `rc:terminate` and in the `session_ended` audit row |
@@ -2230,7 +2230,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1682`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1708`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:257` joins it), and sessions
@@ -2695,6 +2695,64 @@ to drop straight to VK_PACKET (which conhost ignores). Now
   activates arbitrary wire input); runs on a fresh desktop-rebound
   thread; the re-sampled `rc:layout` push is the implicit ack.
 - **Caps**: `AgentCaps.layout = ["report","set"]` gates the UI.
+- **FR-97 P3e, on both platforms:** `rc:layout.set` goes through the input
+  arbiter, which refuses a session that may not type, and in exclusive mode
+  anyone but the floor holder, as keep busy's switch does
+  (`agents/roomlerd/src/input/arbiter.rs:810`). Before, a view-only session
+  could switch the host's layout. And the current snapshot goes out once when
+  the control DC opens (`agents/roomlerd/src/peer.rs:1259`): the emitter
+  starts before the channel does, so the snapshot it starts with found no
+  channel, and went out again only on the next change.
+
+### 18.3.2 The keyboard layout on X11 (FR-97 P3e)
+
+The same chip and picker on an X11 desktop, through the same two messages. On
+Linux `input::layout` *is* `input::layout_x11`
+(`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
+(`agents/roomlerd/src/peer.rs:1520`) and its `rc:layout.set` arm
+(`agents/roomlerd/src/peer.rs:10110`) serve both platforms.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as Viewer
+    participant P as Agent: control DC
+    participant A as Input arbiter
+    participant R as Layout reader thread
+    participant X as X server (XKB)
+    P->>R: subscribe(), as the session starts
+    loop every 500 ms, only while a session watches
+        R->>X: GetState (the locked group), _XKB_RULES_NAMES, the group names
+        R-->>P: a snapshot, when it changed
+    end
+    P-->>V: rc:layout {active_hkl, active, installed}
+    V->>P: rc:layout.set {hkl}
+    P->>A: layout_set(session, token)
+    Note over A: may this session type?<br/>exclusive mode: the floor holder only
+    A->>X: LatchLockState(group) on a fresh connection, read back
+    R-->>V: the next snapshot is the answer: a refused switch snaps the picker back
+```
+
+| | Windows (rc.227) | X11 (FR-97 P3e) |
+|---|---|---|
+| A layout is | an installed HKL | one of the keymap's XKB groups, at most four |
+| The list | `GetKeyboardLayoutList` | the root window's `_XKB_RULES_NAMES`, and the keymap's names for its groups |
+| The one in use | the foreground thread's HKL | XKB's locked group |
+| The token (`hkl`) | the HKL, 8 hex | the layout's FNV-1a hash (8 hex) and its group (1 hex), so a click that arrives after the desktop changed its layouts is refused (`agents/roomlerd/src/input/layout_x11.rs:450`) |
+| The tag (`active`) | BCP-47, from the LANGID | BCP-47 for a plain layout the table knows (`de` → `de-DE`, `layout_x11.rs:480`); otherwise the keymap's own name, `German (no dead keys)` (`layout_x11.rs:461`) |
+| Read | on input events, on the injector thread | polled every 500 ms on a thread of its own, and only while a session watches (`layout_x11.rs:143`) |
+| Switch | `WM_INPUTLANGCHANGEREQUEST` to the foreground window | `XkbLatchLockState`, then read back for up to 300 ms (`layout_x11.rs:332`) |
+| Switch while typing | yes, per character | no: typing on X11 (`enigo.text`, over XTest) maps each character to a spare keycode, and reaches it on any layout |
+| Offered | in every session | in an X11 session: `DISPLAY` set and no `WAYLAND_DISPLAY` (`layout_x11.rs:58`) |
+| Kill switch | `ROOMLERD_AUTO_LAYOUT=0` (the auto-switch only) | `ROOMLERD_X11_LAYOUT=0`: no `layout` in the hello, so no chip |
+
+⚠️ **Not under Wayland, nor on a system install.** Under Wayland the layout is
+the compositor's, and no protocol the desktops share reads or sets it.
+Xwayland's XKB group is a copy of what the compositor sends, and locking it
+does not reach the compositor. A system install reaches the screen through DRM
+and has no X connection (FR-113). Both leave `layout` out of the hello
+(`agents/roomlerd/src/encode/caps.rs:803`), with no reason in `unavailable`:
+there is no control to grey, so the chip does not appear, as before P3e.
 
 ### 18.4 Input fix — Windows VK path (0.1.34)
 

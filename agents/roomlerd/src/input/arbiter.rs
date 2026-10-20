@@ -626,6 +626,19 @@ enum Cmd {
         session: ObjectId,
         request: crate::keep_busy::SetRequest,
     },
+    /// FR-97 P3e — a controller's `rc:layout.set`. Switching the host's
+    /// layout changes what the person at it types, so it takes keep busy's
+    /// rule: a session that may type, and in exclusive mode the floor holder.
+    /// Before P3e the control arm switched for any session, a view-only one's
+    /// included.
+    #[cfg(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    ))]
+    LayoutSet {
+        session: ObjectId,
+        token: String,
+    },
 }
 
 /// FR-92 — a keep-busy request, answered on `reply` from the arbiter thread
@@ -772,6 +785,42 @@ impl Arbiter {
     pub fn keep_busy_set(&self, session: ObjectId, request: crate::keep_busy::SetRequest) {
         let _ = self.tx.try_send(Cmd::KeepBusySet { session, request });
     }
+
+    /// FR-97 P3e — a controller's `rc:layout.set` ([`Cmd::LayoutSet`]).
+    #[cfg(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    ))]
+    pub fn layout_set(&self, session: ObjectId, token: String) {
+        let _ = self.tx.try_send(Cmd::LayoutSet { session, token });
+    }
+}
+
+/// FR-97 P3e — [`Cmd::LayoutSet`]'s decision, apart from the worker so a test
+/// holds it: `switch` runs only for a session keep busy's rule lets act. A
+/// refusal sends nothing: the picker is bound to the reported layout, which did
+/// not change, so it snaps back.
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    )
+))]
+fn layout_set_if_allowed(
+    state: &ArbiterState,
+    session: ObjectId,
+    token: String,
+    switch: impl FnOnce(String),
+) {
+    match state.keep_busy_may_set(session) {
+        Ok(_) => switch(token),
+        Err(refusal) => tracing::info!(
+            %session,
+            refusal = refusal.wire(),
+            "layout: a session's switch refused"
+        ),
+    }
 }
 
 fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
@@ -904,6 +953,16 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                     });
                 }
             }
+            #[cfg(all(
+                any(target_os = "windows", target_os = "linux"),
+                feature = "enigo-input"
+            ))]
+            Cmd::LayoutSet { session, token } => layout_set_if_allowed(
+                &state,
+                session,
+                token,
+                crate::input::layout::request_set_layout,
+            ),
             Cmd::RequestFloor { session } => {
                 let (granted, releases) = state.request_floor(session, Instant::now());
                 tracing::info!(%session, granted, "input arbiter: floor request");
@@ -1732,6 +1791,31 @@ mod tests {
         assert_eq!(st.keep_busy_may_set(sid()), Err(KeepBusyRefusal::Unknown));
         assert!(st.set_mode(a, Mode::Free));
         assert_eq!(st.keep_busy_may_set(b), Ok("B".to_string()));
+    }
+
+    /// FR-97 P3e — switching the host's keyboard layout changes what the person
+    /// at it types, so it takes keep busy's rule. Before P3e every session's
+    /// `rc:layout.set` reached the switch, a view-only one's included.
+    #[test]
+    fn a_layout_switch_needs_the_input_grant_and_the_floor() {
+        let mut st = ArbiterState::default();
+        let (a, b, viewer) = (sid(), sid(), sid());
+        let now = Instant::now();
+        st.open(a, "A".into(), true, Some(Mode::Exclusive), now);
+        st.open(b, "B".into(), true, None, now);
+        st.open(viewer, "V".into(), false, None, now);
+        let switched = |st: &ArbiterState, s| {
+            let mut got = None;
+            layout_set_if_allowed(st, s, "the-token".into(), |t| got = Some(t));
+            got
+        };
+        assert_eq!(switched(&st, a).as_deref(), Some("the-token"));
+        assert_eq!(switched(&st, b), None, "not the floor holder");
+        assert_eq!(switched(&st, viewer), None, "view-only");
+        assert_eq!(switched(&st, sid()), None, "an unknown session");
+        assert!(st.set_mode(a, Mode::Free));
+        assert_eq!(switched(&st, b).as_deref(), Some("the-token"));
+        assert_eq!(switched(&st, viewer), None, "view-only, in free mode too");
     }
 
     /// FR-92 — a keep-busy move spliced into a controller's drag would drag
