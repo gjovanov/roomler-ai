@@ -243,7 +243,7 @@
                    until the device sends one. -->
               <span
                 v-if="item.kind === 'agent' && agentFor(item)?.peer_auth_fingerprint"
-                class="ml-1 font-mono"
+                class="ml-1 text-mono"
                 :title="`Device key fingerprint: ${agentFor(item)!.peer_auth_fingerprint}`"
               >
                 · key {{ agentFor(item)!.peer_auth_fingerprint!.slice(0, 9) }}…
@@ -321,9 +321,9 @@
           </template>
           <template #item.overlay_ip="{ item }">
             <template v-if="item.overlay_ip">
-              <div class="text-caption font-mono">{{ item.overlay_ip }}</div>
+              <div class="text-caption text-mono">{{ item.overlay_ip }}</div>
               <div
-                class="text-caption text-medium-emphasis font-mono"
+                class="text-caption text-medium-emphasis text-mono"
                 :title="deriveOverlayV6(item.overlay_ip) ?? undefined"
               >
                 {{ deriveOverlayV6(item.overlay_ip) }}
@@ -332,7 +332,7 @@
                    changed key rather than trusted from a chip. -->
               <div
                 v-if="item.overlay_public_key"
-                class="text-caption text-medium-emphasis font-mono"
+                class="text-caption text-medium-emphasis text-mono"
                 :title="`Overlay public key, epoch ${item.overlay_key_epoch ?? 0}: ${item.overlay_public_key}`"
               >
                 key {{ item.overlay_public_key.slice(0, 10) }}… · e{{ item.overlay_key_epoch ?? 0 }}
@@ -342,7 +342,7 @@
           </template>
           <template #item.magic_dns="{ item }">
             <div v-if="item.magic_dns_fqdn" class="d-flex align-center">
-              <span class="text-caption font-mono">{{ item.magic_dns_fqdn }}</span>
+              <span class="text-caption text-mono">{{ item.magic_dns_fqdn }}</span>
               <v-btn
                 :icon="copiedAgentId === item.magic_dns_fqdn ? 'mdi-check' : 'mdi-content-copy'"
                 size="x-small"
@@ -352,13 +352,13 @@
                 :aria-label="`Copy MagicDNS name for ${deviceLabel(item)}`"
               />
             </div>
-            <span v-else-if="item.magic_dns_name" class="text-caption font-mono" title="Tenant has no MagicDNS domain configured — bare overlay label">
+            <span v-else-if="item.magic_dns_name" class="text-caption text-mono" title="Tenant has no MagicDNS domain configured — bare overlay label">
               {{ item.magic_dns_name }}
             </span>
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
           <template #item.tags="{ item }">
-            <div v-if="item.tags?.length" class="d-flex flex-nowrap gap-1">
+            <div v-if="item.tags?.length" class="d-flex flex-nowrap ga-1">
               <v-chip v-for="t in item.tags.slice(0, 3)" :key="t" size="x-small" variant="tonal">
                 {{ t }}
               </v-chip>
@@ -392,7 +392,7 @@
           <template #item.codecs="{ item }">
             <template v-if="item.kind === 'agent' && agentFor(item)">
               <div v-if="codecChips(agentFor(item)!).length === 0" class="text-caption text-medium-emphasis">—</div>
-              <div v-else-if="lgAndDown" class="d-flex flex-nowrap gap-1 align-center">
+              <div v-else-if="lgAndDown" class="d-flex flex-nowrap ga-1 align-center">
                 <v-chip
                   size="x-small"
                   :color="codecChips(agentFor(item)!)[0].color"
@@ -410,7 +410,7 @@
                   +{{ codecChips(agentFor(item)!).length - 1 }}
                 </v-chip>
               </div>
-              <div v-else class="d-flex flex-nowrap gap-1">
+              <div v-else class="d-flex flex-nowrap ga-1">
                 <v-chip
                   v-for="codec in codecChips(agentFor(item)!)"
                   :key="codec.label"
@@ -425,7 +425,7 @@
               <!-- A device the OS has muzzled looks identical to a healthy one
                    until you connect and get a black screen, because macOS
                    reports success either way. Say it here instead. -->
-              <div v-if="permissionWarnings(agentFor(item)!).length" class="d-flex flex-nowrap gap-1 mt-1">
+              <div v-if="permissionWarnings(agentFor(item)!).length" class="d-flex flex-nowrap ga-1 mt-1">
                 <v-chip
                   v-for="w in permissionWarnings(agentFor(item)!)"
                   :key="w.label"
@@ -1270,7 +1270,7 @@
           doesn't authorize it.
         </p>
 
-        <div v-if="routesDraft.length" class="d-flex flex-wrap gap-2 mb-3">
+        <div v-if="routesDraft.length" class="d-flex flex-wrap ga-2 mb-3">
           <v-chip
             v-for="cidr in routesDraft"
             :key="cidr"
@@ -1292,7 +1292,7 @@
           <p class="text-caption text-medium-emphasis mb-1">
             Advertised by the agent — click to approve into the routes above:
           </p>
-          <div class="d-flex flex-wrap gap-2">
+          <div class="d-flex flex-wrap ga-2">
             <v-chip
               v-for="cidr in advertisedSuggestions"
               :key="cidr"
