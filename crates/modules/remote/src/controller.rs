@@ -461,10 +461,14 @@ pub(crate) async fn refusal_message(
         (None, Some(d)) => format!("a session to {d} is open right now"),
         (None, None) => "a session is open right now".to_string(),
     };
-    format!(
-        "Your organization's plan runs {at_a_time}, and {holder}. End that session, \
-         or upgrade the plan for one remote session per user."
-    )
+    // A cap above one is Pro's, one per billed seat: it already has "one per
+    // user", so the way past it is a session ending or Business.
+    let way_out = if *cap == 1 {
+        "End that session, or upgrade the plan for one remote session per user."
+    } else {
+        "End a session, or move to Business for sessions without a cap."
+    };
+    format!("Your organization's plan runs {at_a_time}, and {holder}. {way_out}")
 }
 
 /// Result of the session authz gate: the effective consent mode plus a VALIDATED

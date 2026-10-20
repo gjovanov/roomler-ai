@@ -264,6 +264,8 @@ fn trail(body: &Value) -> Vec<(String, Option<String>)> {
 async fn privacy_activity_is_kept_only_for_a_session_that_could_curtain() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr99p1d").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let other = app.seed_tenant("fr99p1dx").await;
     let (a, mut a_ws) = connect_agent(&app, &seeded, "mach-fr99-p1d-a").await;
     let (b, mut b_ws) = connect_agent(&app, &seeded, "mach-fr99-p1d-b").await;
@@ -355,6 +357,8 @@ async fn privacy_activity_is_kept_only_for_a_session_that_could_curtain() {
 async fn a_worker_exit_is_kept_after_its_session_ended() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr99p1de").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (a, mut a_ws) = connect_agent(&app, &seeded, "mach-fr99-p1d-e").await;
 
     let (owner_ws, with, granted) = ask(

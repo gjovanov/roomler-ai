@@ -217,6 +217,8 @@ async fn give_member(app: &TestApp, seeded: &SeededTenant, name: &str, mask: u64
 async fn record_survives_only_for_an_allowed_controller_on_an_opted_in_device() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr85rec1").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (serves, _serves_ws) =
         connect_agent(&app, &seeded, "mach-fr85-serves", &["available", "remote"]).await;
     let (plain, _plain_ws) = connect_agent(&app, &seeded, "mach-fr85-plain", &["available"]).await;
@@ -272,6 +274,8 @@ async fn record_survives_only_for_an_allowed_controller_on_an_opted_in_device() 
 async fn an_administrator_may_record_but_never_under_break_glass() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr85rec2").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (serves, _ws) = connect_agent(&app, &seeded, "mach-fr85-bg", &["remote"]).await;
     // The member becomes an ADMINISTRATOR who does not own the device.
     give_member(&app, &seeded, "admins", ADMINISTRATOR).await;
@@ -424,6 +428,8 @@ async fn report(ws: &mut Ws, session_id: &str, kind: &str) {
 async fn recording_activity_is_kept_only_for_a_session_that_could_record() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr85rec3").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (a, mut a_ws) = connect_agent(&app, &seeded, "mach-fr85-a", &["remote"]).await;
     let (b, mut b_ws) = connect_agent(&app, &seeded, "mach-fr85-b", &["remote"]).await;
 

@@ -169,6 +169,10 @@ mod newsletter_tests;
 mod notification_tests;
 #[cfg(test)]
 mod oauth_tests;
+/// FR-115 P3 — an organization's concurrent remote-session cap: refused at
+/// start with the holder named, per seat on Pro, carried across pods.
+#[cfg(test)]
+mod org_session_cap_tests;
 #[cfg(test)]
 mod overlay_growth_tests;
 #[cfg(test)]
