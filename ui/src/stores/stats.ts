@@ -37,6 +37,8 @@ export interface SeriesPayload {
   uptime?: Array<{
     agent_id: string
     name?: string
+    /** FR-116 D4 — the admin's friendly name; null when the device has none. */
+    display_name?: string | null
     intervals: Array<{ from: number; to: number; presence: string }>
   }>
   /** machines endpoint: overlay + tunnel BYTES moved per bucket (wave 3).
@@ -248,6 +250,8 @@ export interface UsageViewingWindow {
   session_id: string
   agent_id: string
   agent_name?: string
+  /** FR-116 D4 — the admin's friendly name; null when the device has none. */
+  agent_display_name?: string | null
   tenant_id: string
   tenant_name?: string
   started_at: number
@@ -286,6 +290,7 @@ export interface UsageDetailPayload {
     session_id?: string
     agent_id?: string
     agent_name?: string
+    agent_display_name?: string | null
     tenant_id?: string
     tenant_name?: string
     started_at: number
