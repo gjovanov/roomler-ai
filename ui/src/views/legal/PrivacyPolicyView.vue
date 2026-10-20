@@ -9,7 +9,7 @@
           Back to home
         </router-link>
 
-        <h1 class="text-h3 font-weight-bold mb-2">Privacy Policy</h1>
+        <h1 class="text-h4 text-md-h3 font-weight-bold mb-2">Privacy Policy</h1>
         <p class="text-body-2 legal-muted mb-8">Last updated: October 2026</p>
 
         <section class="mb-8">
