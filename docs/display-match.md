@@ -57,7 +57,7 @@ sequenceDiagram
 [`display_match.rs:880`](../agents/roomlerd/src/display_match.rs#L880) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:905`](../agents/roomlerd/src/display_match.rs#L905) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:9812`](../agents/roomlerd/src/peer.rs#L9812)).
+control-channel arm sends the answer ([`peer.rs:9848`](../agents/roomlerd/src/peer.rs#L9848)).
 
 ### The answers
 
@@ -98,7 +98,7 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3032`](../crates/localapi/src/lib.rs#L3032)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:8947`](../crates/remote_control/src/models.rs#L8947)). A server that could set it could
+  push it ([`models.rs:8964`](../crates/remote_control/src/models.rs#L8964)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:810`](../agents/roomlerd/src/display_match.rs#L810)
   `set_device_policy`).
@@ -144,7 +144,7 @@ An unattended office PC is usually locked, so this is the main path, not an edge
 
 At the session's unlock the device decides again
 ([`display_match.rs:987`](../agents/roomlerd/src/display_match.rs#L987) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1394`](../agents/roomlerd/src/peer.rs#L1394)):
+session's lock watcher, [`peer.rs:1411`](../agents/roomlerd/src/peer.rs#L1411)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -159,7 +159,7 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1482`](../agents/roomlerd/src/peer.rs#L1482), Windows only). It hands the screen back at once
+([`peer.rs:1499`](../agents/roomlerd/src/peer.rs#L1499), Windows only). It hands the screen back at once
 and tells the viewer ([`display_match.rs:1020`](../agents/roomlerd/src/display_match.rs#L1020)
 `on_tick`):
 
@@ -262,8 +262,8 @@ sequenceDiagram
 | The modes | the display's own list | the one active output's list in `xrandr --current`; none is added, this is someone's monitor ([`display_match.rs:285`](../agents/roomlerd/src/display_match.rs#L285) `parse_xrandr_outputs`) |
 | Several displays | the primary only | more than one active output answers `unsupported` |
 | After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:340`](../agents/roomlerd/src/display_match.rs#L340) `guard_undoes`, [`display_match.rs:496`](../agents/roomlerd/src/display_match.rs#L496) `recover`) |
-| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1433`](../agents/roomlerd/src/peer.rs#L1433)) |
-| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1469`](../agents/roomlerd/src/peer.rs#L1469)) |
+| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1450`](../agents/roomlerd/src/peer.rs#L1450)) |
+| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1486`](../agents/roomlerd/src/peer.rs#L1486)) |
 | Kill switch | `display_match = never` | `ROOMLERD_X11_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - ⚠️ **The X server says how long ago, not when.** "Now minus the idle time" moves by each read's latency,

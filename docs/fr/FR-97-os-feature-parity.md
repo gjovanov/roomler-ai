@@ -67,6 +67,11 @@
   not type no longer switches the host's layout, and the current layout goes out when the control DC opens. Under
   GNOME on Xorg the chip reports and there is no picker: GNOME Shell puts a group locked from outside it back within
   20 ms (measured on the field cell, §8).
+- P3e-2, display match on a person's own X11 display (a per-user install in an X11 session: the one active output
+  switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand), built
+  (#P3E2PR), field-verified red → green on a GNOME 46 Xorg cell (§8). It found the viewer offering the toggle on
+  Windows only, by OS, which had also hidden FR-108 P2's virtual desktop since 0.4.143; the viewer now follows the
+  device's `unavailable["display-match"]`.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -142,7 +147,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:2591`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2601`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -159,7 +164,7 @@ prevent, and the guard re-asserts it on every tick.
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:1989`).
+  although every agent row has one (`models.rs:1999`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:2549`). A client accepts any peer whose fanned routes hold `/0`
@@ -199,9 +204,9 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ❌ | Windows-only cap (`caps.rs:1570-1574` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:1615-1622`), and on Linux only in an X11 session, without `set` under GNOME (`:820`) | P2d, P3e |
-| R7 | Match remote display | ✅ | ❌ | ❌ | `display_match.rs:247` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1591-1599`) | P0c, P2e, P3e |
+| R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ❌ | Windows-only cap (`caps.rs:1570-1574` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:1650-1657`), and on Linux only in an X11 session, without `set` under GNOME (`:839`) | P2d, P3e |
+| R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ❌ | `display_match.rs:531`. *P3e-2:* `agents/roomlerd/src/display_match.rs:262` `x11_offered`; the viewer's toggle followed the OS until P3e-2 | P2d, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ❌ | ❌ | Forced off (`clipboard.rs:818-822`) ✔ while advertised (`caps.rs:1626-1634`) | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:792` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9646-9649`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
@@ -253,7 +258,7 @@ and the consent chain's fallbacks.
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`) | P7b |
 
-The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1968`), so it cannot count the
+The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1978`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
 `IsWow64Process2`'s native machine, because an x64 build under emulation would otherwise report x86_64.
 
@@ -292,8 +297,8 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1875`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:78-81`, `agents/roomlerd/src/encode/caps.rs:1906`, `crates/tunnel-core/src/overlay/tun.rs:3926-3927`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4697` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1910`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:78-81`, `agents/roomlerd/src/encode/caps.rs:1941`, `crates/tunnel-core/src/overlay/tun.rs:3926-3927`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4701` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -384,14 +389,14 @@ matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked 
 
 An agent before P0c sends no map, and an absent key never means "unavailable": its lists say what it claims.
 
-**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:780`), applied
+**The decision** is one daemon-side seam, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:799`), applied
 in `detect()` (`:624`) after the config lists, over plain `HostFacts` (`:636`). It runs, and is tested, on every
 OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
 | `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:78`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3098`); `unavailable.audio = no-backend` |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:761`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:780`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone keeps image events (`clipboard.rs:817-822`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
 | `sas` | Linux | `keys-only`: the same keys, which the desktop binds (GNOME and KDE to log out), so the button says so rather than going |
@@ -690,6 +695,19 @@ test of the SIGKILL property itself.
     without `set`: the chip, which follows GNOME's own switches, and no picker that would only snap back. Pressing
     GNOME's own Super+Space from the viewer switches it. And GNOME configures its sources `us, de` as the groups
     `us,de,us`, the locale's layout appended for its shortcuts; each layout is offered once.
+  - *As built, P3e-2 (display match, #P3E2PR):* `display_match`'s `x11` arm switches the one active output of a
+    person's own X11 display to the largest mode it already lists inside the viewer's stage (none is added; several
+    active outputs are `unsupported`), under FR-108's decision. `presence` reads the X idle clock (MIT-SCREEN-SAVER)
+    held steady across each read's jitter, and logind's lock hint as the session's P3b emitter reads it, never a
+    `loginctl` of its own. An X11 mode outlives the process that set it, so a restore guard goes to
+    `$XDG_RUNTIME_DIR` before the switch, and the next start undoes it only while the screen still shows ours
+    (`docs/display-match.md`). The "person comes back" watcher and the unlock's re-decision run on Linux too.
+  - *Found building it:* the production viewer offered the toggle only when the agent's OS started with `win`, so
+    no Linux host was ever asked: FR-108 P2's virtual desktop had been unreachable from the viewer since 0.4.143.
+    The agent now says `unavailable["display-match"]` where it cannot switch (macOS, a Linux system install,
+    Wayland), and the viewer follows that word; an agent from before P0c keeps the old gate.
+  - *Measured first:* mutter on Xorg keeps an `xrandr` mode set from outside it (it does not keep an outside XKB
+    group lock, P3e-1).
 - **P3f, uinput text on any layout.** `dlopen` libxkbcommon (the libpipewire pattern) and map char → keycode under the
   host's keymap.
   - *As built (#2558):* the keymap is compiled from the layout `detect` finds and its variant from the same source
@@ -976,7 +994,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
-| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, built #2618) | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0` | the lab; P3e-1: a vmtest Ubuntu cell on Xorg, a per-user install, two layouts | M |
+| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, built #P3E2PR) | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0` | the lab; P3e-1 and P3e-2: a vmtest Ubuntu cell on Xorg, a per-user install | M |
 | **P3f** | uinput text on any layout, through the host's own XKB keymap (merged #2558) | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts, red on 0.4.145 | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
@@ -1067,7 +1085,10 @@ one depends on it.
   `aqé1à€` character for character; and again on the 0.4.147 release's bytes, red on 0.4.146. The layout clause
   holds for GNOME on Xorg as a report (P3e-1, §8): the chip follows GNOME's own switches, and GNOME puts a switch
   from outside it back, so there is no picker. The picker on a desktop that keeps an outside lock (KDE, XFCE) is
-  still owed a field run; CI's Xvfb test is its only evidence.)*
+  still owed a field run; CI's Xvfb test is its only evidence. The display-match clause is field-verified on
+  P3e-2's candidates, §8: 0.4.147 answered `unsupported`; the candidate switched a GNOME Xorg display and handed it
+  back to a person within a third of a second, and its restore guard undid a mode a kill -9 stranded, never a
+  person's own. Image sync (P3e-3) is still owed.)*
 - [ ] **AC10 (P3g):** a Fedora system install and an arm64 install show the "being viewed" banner and answer a
   consent prompt.
 - [x] **AC11 (P4a–P4d):** Ctrl+Alt+Del reaches a Windows lock screen that requires it; SFTP as `console_user` writes
@@ -1285,3 +1306,5 @@ one depends on it.
 | 2026-10-20 | released 0.4.146, then the 0.4.147 candidate (as above) | the FR-93 lab's GNOME 50 system install (`wlab-gnome-sys`), under its lock, the layout `de` then `fr`; restored after to 0.4.138, `us`, and shut off | 🔴→🟢 **P3f on the 0.4.147 release.** 0.4.146, `de`: 0 key events and `WARN uinput: no verified key table … detected="de"`. The candidate: `zyäöüß@€<>\|` exactly (30 key events) and `aqé1à€` exactly (16), its log saying `the host's XKB keymap de` and `fr`. ⚠️ The first `de` run after the guest's cold boot typed into nothing, twice (0 probe events, the keymap engaged); the next run, on the warm guest, was exact. The rig clicks the probe window first, and GNOME opens its overview at login, so most likely the first click lands there; not proven |
 | 2026-10-20 | — (libX11's own `XkbLockGroup` and `XkbGetState`, the agent out of the loop) | the P3a cell, GNOME's input sources set to `us, de` | **GNOME puts a group lock from outside it back.** `XkbLockGroup(1)`: group 1 at 0 ms, group 0 again at 20 ms and every read after, to 2 s. And `_XKB_RULES_NAMES` for the sources `us, de` reads `"evdev", "pc105+inet", "us,de,us", ",,"`: GNOME appends the locale's layout as a group of its own. These are why P3e-1 offers `report` without `set` under GNOME, and each layout once |
 | 2026-10-20 | the 0.4.147 candidate, then the P3e-1 candidates `fa852012…` and `e7f80124…` (release-profile builds of the branch without `ffmpeg-encoder`) | the same cell and sources; the production viewer (Playwright) tapping its control channel and sending keys as the viewer does; libX11's `XkbGetState` as the oracle | 🔴→🟢 **P3e-1, the layout chip.** 0.4.147: no `layout` in the caps, no `rc:layout`, no chip. The first candidate: `layout: report, set`, `rc:layout` 10 ms after the control DC opened, the chip `en-US`; its picker's `de-DE` did not take (`the switch did not take (the desktop put its own back?)`), which the row above explains. The second, with that fix: `layout: report`, `rc:layout` listing `en-US, de-DE` 1 ms after the control DC opened, in a first and a second session of one daemon; GNOME's own Super+Space, sent from the viewer, moved the chip to `de-DE` and back, with GNOME's own indicator; a crafted `rc:layout.set` refused (`under GNOME, which puts its own layout back`) with XKB untouched; with `ROOMLERD_X11_LAYOUT=0`, no `layout`, no `rc:layout`, no chip |
+| 2026-10-20 | — (`xrandr` on the guest, the agent out of the loop) | the P3a cell (GNOME 46 on Xorg), one output `Virtual-1` at 1280×800 with 21 modes | **mutter keeps a mode set from outside it.** `xrandr --output Virtual-1 --mode 5120x2160` held at +0.2 s, +1 s and +3 s, then the start mode was put back. Unlike an outside XKB group lock (P3e-1 above), so P3e-2 switches through RandR |
+| 2026-10-20 | released 0.4.147 (`1698a76e…`), then the P3e-2 candidates `51efd792…` and `1a975163…` (release-profile builds of the branch without `ffmpeg-encoder`) | the same cell; the production viewer (Playwright) sending the request a 1366×768 stage makes, because the deployed viewer offered the toggle on Windows only; a local XTest pointer move on the guest as the person; `kill -9` of the per-user daemon, its unit restarting it | 🔴→🟢 **P3e-2, display match on a person's X11 display.** 0.4.147: `refused: unsupported`, the display untouched. The candidate: `on: true, mode 1360x768` 20 ms after the request, the picture following to 1360×768, the restore guard written first (`start 1280x800`, `ours 1360x768`); the person's pointer move handed the screen back within 0.3 s (`refused: attended`, 1280×800, the guard removed), and for five minutes after it every request was `attended`. A `kill -9` while switched: the next start logged `a switch the last run left in force is undone` and the display was 1280×800 again. A mode the person set by hand (1024×768) before the `kill -9`: the next start left it (`the screen no longer shows its mode — left as it is`). `unavailable.display-match` absent on this host, and `unsupported` with its reason under `ROOMLERD_X11_DISPLAY_MATCH=0`, the request answered `unsupported` |
