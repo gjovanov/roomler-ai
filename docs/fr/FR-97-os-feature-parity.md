@@ -69,7 +69,7 @@
   20 ms (measured on the field cell, §8).
 - P3e-2, display match on a person's own X11 display (a per-user install in an X11 session: the one active output
   switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand), built
-  (#P3E2PR), field-verified red → green on a GNOME 46 Xorg cell (§8). It found the viewer offering the toggle on
+  (#2623), field-verified red → green on a GNOME 46 Xorg cell (§8). It found the viewer offering the toggle on
   Windows only, by OS, which had also hidden FR-108 P2's virtual desktop since 0.4.143; the viewer now follows the
   device's `unavailable["display-match"]`.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
@@ -695,7 +695,7 @@ test of the SIGKILL property itself.
     without `set`: the chip, which follows GNOME's own switches, and no picker that would only snap back. Pressing
     GNOME's own Super+Space from the viewer switches it. And GNOME configures its sources `us, de` as the groups
     `us,de,us`, the locale's layout appended for its shortcuts; each layout is offered once.
-  - *As built, P3e-2 (display match, #P3E2PR):* `display_match`'s `x11` arm switches the one active output of a
+  - *As built, P3e-2 (display match, #2623):* `display_match`'s `x11` arm switches the one active output of a
     person's own X11 display to the largest mode it already lists inside the viewer's stage (none is added; several
     active outputs are `unsupported`), under FR-108's decision. `presence` reads the X idle clock (MIT-SCREEN-SAVER)
     held steady across each read's jitter, and logind's lock hint as the session's P3b emitter reads it, never a
@@ -994,7 +994,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
-| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, built #P3E2PR) | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0` | the lab; P3e-1 and P3e-2: a vmtest Ubuntu cell on Xorg, a per-user install | M |
+| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, built #2623) | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0` | the lab; P3e-1 and P3e-2: a vmtest Ubuntu cell on Xorg, a per-user install | M |
 | **P3f** | uinput text on any layout, through the host's own XKB keymap (merged #2558) | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts, red on 0.4.145 | M |
 | **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
 | **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
