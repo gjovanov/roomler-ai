@@ -18,7 +18,8 @@ that is greyed out always carries the device's own reason.
 - **⛔ Ruled out** icon:danger — the OS itself prevents it. The reason is below.
 :::
 
-These tables describe agent 0.4.145. The engineering record behind them, with
+These tables describe agent 0.4.146; a row that names 0.4.147 is coming in the
+next release. The engineering record behind them, with
 the code each verdict comes from, is
 [`docs/platform-support.md`](https://github.com/gjovanov/roomler-ai/blob/master/docs/platform-support.md).
 
@@ -61,10 +62,10 @@ organization chooses it with `roomler org overlay <org> netstack`
 | Ctrl+Alt+Del | ✅ the real one, from a Machine — system install where policy allows | ⛔ sent as ordinary keys, which GNOME and KDE use to log out | ⛔ hidden: it means nothing on a Mac |
 | An approval panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the desktop app asks | ❌ the desktop app asks |
 | "The host is locked" before you connect | ✅ | ✅ | ❌ |
-| The host's own cursor shape | ✅ | 🟡 | ❌ the cursor is part of the picture |
+| The host's cursor, drawn by your browser | ✅ | ✅ system installs, and X11 desktops from agent 0.4.147; a per-user Wayland desktop draws it into the picture | ❌ the cursor is part of the picture |
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ❌ |
 | Show and switch the keyboard layout | ✅ | ❌ | ❌ |
-| Typing text on a non-US layout | ✅ | 🟡 a system install types only on a US layout, and refuses rather than mistype | ✅ |
+| Typing text on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
 | Match the remote display to your window | ✅ | 🟡 the agent's own virtual desktop | ❌ |
 | Clipboard: text, formatted text and images | ✅ | ✅ per-user · ❌ a system install | ✅ |
 | A copied image arrives by itself | ✅ | ❌ on request | ❌ on request |
