@@ -151,6 +151,14 @@ USD amount and an EUR `currency_options` entry, so one id serves both currencies
 names the currency. An absent annual id hides the annual option rather than failing checkout,
 the same contract as an empty monthly id today (`crates/services/src/stripe.rs:141`).
 
+A currency is on sale only once `stripe.currencies` names it (`ROOMLER__STRIPE__CURRENCIES`,
+default `usd`, `usd,eur` once O1 lands). The billing page starts a European browser on EUR,
+so a currency the live Prices cannot charge in must stay off the page, not just be refused at
+checkout. `get_plans` lists only the currencies on sale, the page shows its currency toggle
+only when there is a choice, and checkout refuses any other before it reads anything from
+Stripe. A promote therefore does not wait for O1: EUR and annual appear when the operator
+switches them on.
+
 ### The concurrency fence
 
 Counted **in the hub**, at session start, after the authz gate and the FR-101 ceiling
@@ -244,7 +252,7 @@ number is advertised beyond what the current single-worker room is known to carr
 
 | # | Question | Default until answered |
 |---|---|---|
-| O1 | Live Stripe prices: create the annual Prices and the EUR currency options in the live account | operator; test mode carries everything until then |
+| O1 | Live Stripe prices: create the annual Prices and the EUR currency options in the live account, then set `ROOMLER__STRIPE__PRICE_PRO_ANNUAL`, `…__PRICE_BUSINESS_ANNUAL` and `ROOMLER__STRIPE__CURRENCIES=usd,eur` | operator. Until then the deployment sells monthly USD only, and the page offers nothing else |
 | O2 | Do pending invites count toward Free's 10? | no — a seat is a member who accepted |
 | O3 | Throttled rate for an over-allowance org | 1 Mbps per org on Free, 4 Mbps on paid plans, measured before it ships |
 

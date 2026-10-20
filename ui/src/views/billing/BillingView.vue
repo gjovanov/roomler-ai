@@ -75,6 +75,7 @@
         <v-btn value="year">Annual · 2 months free</v-btn>
       </v-btn-toggle>
       <v-btn-toggle
+        v-if="currenciesOnSale.length > 1"
         v-model="currency"
         mandatory
         density="comfortable"
@@ -110,7 +111,7 @@
             </v-chip>
           </div>
           <div class="my-4" :data-testid="`price-${plan.id}`">
-            <span class="text-h4 font-weight-bold">{{ money(unitAmount(plan), currency) }}</span>
+            <span class="text-h4 font-weight-bold">{{ money(unitAmount(plan), shownCurrency) }}</span>
             <span v-if="unitAmount(plan) > 0" class="text-body-2 text-medium-emphasis">
               per user / {{ shownInterval(plan) === 'year' ? 'year' : 'month' }}
             </span>
@@ -119,11 +120,11 @@
               v-if="unitAmount(plan) > 0 && shownInterval(plan) === 'year'"
               class="text-body-2 text-medium-emphasis"
             >
-              {{ money(Math.round(unitAmount(plan) / 12), currency) }} per user / month, two months free
+              {{ money(Math.round(unitAmount(plan) / 12), shownCurrency) }} per user / month, two months free
             </div>
             <div v-if="unitAmount(plan) > 0" class="text-body-2 text-medium-emphasis">
               {{ seatsNow }} {{ seatsNow === 1 ? 'user' : 'users' }} in this organization:
-              {{ money(unitAmount(plan) * seatsNow, currency) }} / {{ shownInterval(plan) === 'year' ? 'year' : 'month' }}
+              {{ money(unitAmount(plan) * seatsNow, shownCurrency) }} / {{ shownInterval(plan) === 'year' ? 'year' : 'month' }}
             </div>
           </div>
           <v-divider class="mb-4" />
@@ -196,11 +197,11 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useTenantStore } from '@/stores/tenant'
 import { api } from '@/api/client'
+import { type Currency, currenciesOnSale as onSaleIn, shownCurrency as pickShownCurrency } from '@/utils/billingCurrency'
 
 const tenantStore = useTenantStore()
 
 type Interval = 'month' | 'year'
-type Currency = 'usd' | 'eur'
 
 interface PlanPrice {
   interval: Interval
@@ -272,6 +273,13 @@ const seatsNow = computed(() => Math.max(1, summary.value?.seats_now ?? 1))
 const annualOnSale = computed(() =>
   plans.value.some((p) => (p.prices || []).some((x) => x.interval === 'year')),
 )
+/** The currencies on sale here (`stripe.currencies` on the server); the
+ * toggle shows only when there is a choice. */
+const currenciesOnSale = computed(() => onSaleIn(plans.value))
+/** The currency shown and asked for at checkout (`utils/billingCurrency`). */
+const shownCurrency = computed(() =>
+  pickShownCurrency(currency.value, currenciesOnSale.value, subscribed.value ? summary.value?.currency : null),
+)
 
 const seatsLine = computed(() => {
   const s = summary.value
@@ -334,7 +342,7 @@ function shownInterval(plan: PlanInfo): Interval {
 
 function unitAmount(plan: PlanInfo): number {
   const want = shownInterval(plan)
-  const hit = (plan.prices || []).find((p) => p.interval === want && p.currency === currency.value)
+  const hit = (plan.prices || []).find((p) => p.interval === want && p.currency === shownCurrency.value)
   return hit ? hit.unit_amount : plan.price_cents
 }
 
@@ -418,7 +426,7 @@ async function checkout(planId: string) {
       tenant_id: currentTenant.value.id,
       plan: planId,
       interval: interval.value,
-      currency: currency.value,
+      currency: shownCurrency.value,
       success_url: `${window.location.origin}/tenant/${currentTenant.value.id}/billing?success=true`,
       cancel_url: `${window.location.origin}/tenant/${currentTenant.value.id}/billing?canceled=true`,
     })
