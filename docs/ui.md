@@ -242,6 +242,7 @@ flowchart LR
 | **What the drawer signals reaches the bar** when the drawer is closed: a dot on ☰ for another org's activity, and your call's controls (Return · Mute · Camera · Hang up) as a menu off the call page | `AppLayout.vue`; `composables/useCallControls.ts`, shared with `MiniConference` | the drawer is temporary below 1280 px, so a call kept a live mic with nothing on screen saying so |
 | **A dialog of any substance is full screen below 600 px** and carries its own close control | `composables/useResponsiveDialog.ts` | a centred dialog leaves 264 px of content at 360 px; a full-screen one has no scrim to tap |
 | **A plain `v-table` with actions or results on its right is a card per row below 600 px**: `class="table-stack-xs"` on the table and `data-label="…"` on each cell. One template for both widths; above 600 px nothing changes. A `v-data-table` uses Vuetify's own mobile rows instead (next row) | `styles/responsive.css` (imported in `main.ts`); the ACL lists, Overlay routes, the audit lists, Roles, enrollment keys | the rightmost columns — Save, Edit/Delete, Result, the command — sat off-screen behind a sideways scroll nobody finds |
+| **A list read row after row is compact on a phone, a screenful at a time**: `table-stack-xs--compact` puts a short cell's label beside its value (`stack-block` keeps a long cell's label above it), `usePhoneSlice()` shows 20 rows and then **Show N more**, and a long command or detail shows three lines until **Show all** | `ExecAuditSection.vue`, `SshAuditSection.vue`, `SshActivitySection.vue` (FR-116 P3d) | 100 audit rows as full cards were 43,398 px at 360 px on production; one script alone took 1,936 px. Now 20 cards of ~205–270 px |
 | **A `v-data-table(-server)` takes `:mobile="xs"`**, and any natural-width rule on it (`width: max-content`, `white-space: nowrap`) is scoped to `:not(.<table>--stacked)`, with `overflow-wrap: anywhere` on a stacked value | `MembersSection.vue`, `InviteManageView.vue`, `FilesBrowser.vue` | with the desktop rules left on, every stacked value sat past the right edge — the rows showed their titles and nothing else — and one unbroken email widened a row past the screen |
 | **A page of independent settings is one expansion panel per setting below 600 px, titled with its current state** ("On", "Allowed", "Files: ask · Audio: off"); an unknown state shows nothing, never a guess | `components/admin/SettingsGate.vue`, used by `SettingsSection.vue` | Settings was ~4 screens of warnings and captions before its last switch; now one screen of decisions, each opening on demand. From 600 px up the gate renders the card it always was |
 | **Nothing is hover-only on a touch screen** (`(hover: none)`): what a tooltip or a hover reveals is reachable by a tap, or shown as a persistent hint — and a control hidden until hover takes no taps while hidden (`pointer-events: none`) | `RolesSection.vue` (grants on tap; descriptions as hints) · `MessageBubble.vue` (a ⋮ menu) · `VideoTile.vue` (a tap shows the tile's actions) · the viewer's files drawer (a › into a folder, "Upload here") | a permission's description was a tooltip on its label, so the tap meant to read it toggled the permission; a message's invisible hover buttons pinned it for the whole room; a tap on a face in a call hit an invisible picture-in-picture button |
@@ -269,11 +270,21 @@ flowchart TD
     Q1 -- no --> Q2{"a v-data-table?"}
     Q2 -- yes --> MOB[":mobile=&quot;xs&quot;, and scope its<br/>natural-width rules away"]
     Q2 -- no --> STACK["table-stack-xs +<br/>data-label on each cell"]
+    STACK --> Q4{"read row after row,<br/>dozens of rows?"}
+    Q4 -- yes --> COMPACT["table-stack-xs--compact +<br/>usePhoneSlice: 20 at a time"]
+    Q4 -- no --> Q3
+    COMPACT --> Q3
     MOB --> Q3{"a row longer<br/>than a screen?"}
-    STACK --> Q3
     Q3 -- no --> DONE["done"]
     Q3 -- yes --> DEMAND["show what decides —<br/>the rest opens on a tap"]
 ```
+
+⚠️ **A phone-only line never sits between a `v-if` and its `v-else`.** Vue pairs
+`v-else` with the nearest `v-if` sibling. P3a put the refusal's reason line (a
+`d-sm-none` element with its own `v-if`) between the SSH audit's refusal chip and
+its "granted" chip, so a refusal without a message read **granted** as well, on
+every width. Wrap the branch and its phone-only extras in one `<template v-if>`
+(fixed in P3d; `auditPhoneLists.spec.ts` fails on the old template).
 
 ⚠️ **Prove "the desktop is unchanged" with pixels, against the branch's own
 base served beside it** — and grep each dev server's served module for a
