@@ -104,6 +104,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 23c | 10-19 | The release-asset cache key covers every manifest: profile and feature settings shape the dependency builds, and Cargo.lock records neither | #2544 |
 | 23d | 10-19 | The crypto crates (Argon2, OPAQUE, the curve and AEAD crates) build at `opt-level = 3` in the dev and test profiles: the integration suite's test time −34% | #2544 |
 | 24 | 10-20 | **The integration suite runs as three shards**, each on its own runner with its own mongod at 2 threads. Each shard lists the same binaries, sorts the (test, binary) pairs and runs every third with `--exact`; each must report every test it was handed. Only the first shard publishes the cargo cache | #2596 |
+| 25 | 10-20 | **A merge burst queues one run, not one per commit**: `ci.yml`, `integration-tests.yml` and `installer-smoke.yml` group master's runs by branch, so GitHub keeps one running (never cancelled) and one waiting, and a newer push cancels the waiting one. PR pushes cancel their superseded run; a dispatch gets a group of its own | #2624 |
 
 ## Acceptance criteria
 
@@ -627,3 +628,15 @@ itself on the affected run's page. Baseline when the program started: releases t
     master republishes, a warm build is ~2–2.5 min and a shard ~10 min.
   - The partition was dry-run first with two fake libtest binaries (103 tests): union ==
     listing, no duplicates, the skipped test excluded, a module's tests spread 8/8/9.
+- 2026-10-20, evening: **the shards on master, and the queue** (wave 25).
+  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (35fa314ba
+    through e918d9e56), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
+    min: builds 1.9–3.8 min, suites 5.4–8.2. The sixth took 24.8 min: its shards queued
+    3–7 min, and one shard's build ran 10.1 min. The build does not drop to ~2 min,
+    because the cache holds third-party crates only and every shard rebuilds the workspace
+    crates. The lane stays above the 10-min goal; the levers left are in Open decisions.
+  - The queue mattered more than any job. CI and integration runs were grouped per commit,
+    and ten FR-116 squash-merges queued ten full CI runs (170 jobs) against the account's
+    20 concurrent slots. A session cancelled its own superseded runs by hand, and #2596's
+    own CI took 58 min, most of it waiting for slots. Wave 25 groups master's runs by
+    branch, so a burst queues one run while the running one finishes.
