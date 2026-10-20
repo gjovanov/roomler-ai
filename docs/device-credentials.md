@@ -12,6 +12,7 @@ Every enrolled device and every `roomler` tunnel client holds a long-lived crede
 | **Agent token** (`aud = agent`) | `POST /api/agent/enroll` | 365 days (`rc.agent_token_ttl_secs`) | **the device** (`POST /api/agent/self/renew`) | the device is removed (generation), or it lapses past the grace | the daemon's `config.toml` (`agent_token`, or `[[orgs]].agent_token`) |
 | **Tunnel-client token** (`aud = tunnel-client`) | `POST /api/tunnel-client/enroll` | 365 days | **the `roomler` CLI** (`POST /api/tunnel-client/renew`) | the client is removed (generation), or it lapses past the grace | the CLI's `config.toml`, `0600` |
 | **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | `%ProgramData%\roomler\roomler\exec-service\anchor.json`, SYSTEM + Administrators only |
+| **Egress grant** (`net_grant`, FR-90 P3-7-1b) | the vault, answering `rc:vault.net` for one agent session | at most 900 s, with no leeway past its end | never: a session asks again for each tool call | its end; the network module will believe it only from the device it names as the origin (P3-7-2) | the daemon that asked, once one does (P3-7-3) ([`vault.md`](vault.md) §21) |
 
 FR-104 adds one variation on the first row: an enrollment token minted with `anchor: true` may also anchor the device it enrolled, once ([`fleet-rpc.md`](fleet-rpc.md) § Anchoring).
 
@@ -77,7 +78,7 @@ sequenceDiagram
 When the server refuses the token at the socket (`signaling.rs:838`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
-2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:104`). On the renew routes only; every other route enforces `exp` as before.
+2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:110`). On the renew routes only; every other route enforces `exp` as before.
 
 Either earns one prompt retry. A refusal straight after a recovery waits out the normal ladder, so a server that renews a token its socket then refuses cannot spin the loop.
 

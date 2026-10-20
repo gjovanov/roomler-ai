@@ -1564,6 +1564,39 @@ pub enum ClientMsg {
         timed_out: bool,
     },
 
+    /// FR-90 P3-7-1b — a session on this device asks for its own egress
+    /// through `exit`: a SOCKS5 listener, or a forward to `host:port`
+    /// ([`crate::vault::NetKind`]). Believed as a lease request is (the
+    /// session's record, at its fence, on this device), decided by Cedar's
+    /// `net:socks` or `net:forward`, and answered with
+    /// [`ServerMsg::VaultNetGranted`] or [`ServerMsg::VaultRefused`], naming
+    /// `req_id`.
+    ///
+    /// ⚠️ `tenant_id` and the origin device come from the authenticated WS,
+    /// NOT from this frame.
+    #[serde(rename = "rc:vault.net")]
+    VaultNet {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The device the flows exit through.
+        #[serde(with = "oid_hex")]
+        exit: ObjectId,
+        /// A [`crate::vault::NetKind`] word.
+        kind: String,
+        /// A forward's destination; empty for SOCKS. The vault decides and
+        /// grants it as [`crate::vault::canonical_net_host`] spells it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        host: String,
+        /// A forward's destination port; absent for SOCKS.
+        #[serde(default, skip_serializing_if = "is_zero_u16")]
+        port: u16,
+        /// How long the session wants it, in seconds. The vault clamps it to
+        /// a lease's bounds ([`crate::vault::lease_limits`]).
+        ttl_secs: u32,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2371,6 +2404,11 @@ pub enum ClientMsg {
     },
 }
 
+/// FR-90 P3-7-1b — serde's test for a port that is absent: SOCKS names none.
+fn is_zero_u16(port: &u16) -> bool {
+    *port == 0
+}
+
 /// FR-52 P4 — carried in `rc:request` when the session is an EXTERNAL one:
 /// opened on a verified login, not on org membership.
 ///
@@ -2472,6 +2510,7 @@ impl ClientMsg {
             ClientMsg::VaultList { .. } => "rc:vault.list",
             ClientMsg::VaultDescribe { .. } => "rc:vault.describe",
             ClientMsg::VaultActivity { .. } => "rc:vault.activity",
+            ClientMsg::VaultNet { .. } => "rc:vault.net",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2596,7 +2635,8 @@ impl ClientMsg {
             ClientMsg::VaultLease { .. }
             | ClientMsg::VaultList { .. }
             | ClientMsg::VaultDescribe { .. }
-            | ClientMsg::VaultActivity { .. } => Owner::Vault,
+            | ClientMsg::VaultActivity { .. }
+            | ClientMsg::VaultNet { .. } => Owner::Vault,
         }
     }
 }
@@ -2646,6 +2686,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.list", Owner::Vault),
     ("rc:vault.describe", Owner::Vault),
     ("rc:vault.activity", Owner::Vault),
+    ("rc:vault.net", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -4602,6 +4643,29 @@ pub enum ServerMsg {
         req_id: String,
         secret: crate::vault::VaultSecretMeta,
     },
+
+    /// FR-90 P3-7-1b — the vault granted a session's egress
+    /// ([`ClientMsg::VaultNet`]): `grant`, a token signed by the server under
+    /// its own audience (`net_grant`), which the device attaches when it
+    /// opens the tunnel (P3-7-2). Sent only on the connection that asked,
+    /// never pushed. A grant carries no value and is no lease: nothing
+    /// revokes it, and it ends at `expires_at_ms`.
+    #[serde(rename = "rc:vault.net.granted")]
+    VaultNetGranted {
+        req_id: String,
+        /// The grant's id, as the vault records its allow (`grant:<id>`).
+        grant_id: String,
+        grant: String,
+        /// When it ends, in whole seconds as the grant names it.
+        expires_at_ms: i64,
+        /// A forward's destination exactly as granted: the host in
+        /// [`crate::vault::canonical_net_host`]'s spelling, which the device
+        /// dials. Absent for SOCKS.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        host: String,
+        #[serde(default, skip_serializing_if = "is_zero_u16")]
+        port: u16,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -5433,6 +5497,78 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// FR-90 P3-7-1b — a session's egress request and its grant, as they
+    /// cross the wire: a SOCKS request names no destination, so it is the
+    /// smaller frame, and both read back the same.
+    #[test]
+    fn vault_net_wire_shape_is_locked() {
+        let (sid, exit) = (ObjectId::new(), ObjectId::new());
+        let socks = ClientMsg::VaultNet {
+            req_id: "n1".into(),
+            session_id: sid,
+            fence: 4,
+            exit,
+            kind: crate::vault::NetKind::Socks.wire().into(),
+            host: String::new(),
+            port: 0,
+            ttl_secs: 300,
+        };
+        assert_eq!(
+            serde_json::to_value(&socks).unwrap(),
+            serde_json::json!({
+                "t": "rc:vault.net", "req_id": "n1", "session_id": sid.to_hex(),
+                "fence": 4, "exit": exit.to_hex(), "kind": "socks", "ttl_secs": 300,
+            })
+        );
+        let forward: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:vault.net", "req_id": "n2", "session_id": sid.to_hex(),
+            "fence": 4, "exit": exit.to_hex(), "kind": "forward",
+            "host": "db.internal", "port": 5432, "ttl_secs": 60,
+        }))
+        .unwrap();
+        assert!(matches!(
+            forward,
+            ClientMsg::VaultNet { ref host, port: 5432, exit: e, .. }
+                if host == "db.internal" && e == exit
+        ));
+        assert_eq!(forward.namespace(), Owner::Vault);
+
+        let granted = ServerMsg::VaultNetGranted {
+            req_id: "n2".into(),
+            grant_id: "g1".into(),
+            grant: "the-signed-grant".into(),
+            expires_at_ms: 1_700_000_060_000,
+            host: "db.internal".into(),
+            port: 5432,
+        };
+        let v = serde_json::to_value(&granted).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:vault.net.granted", "req_id": "n2", "grant_id": "g1",
+                "grant": "the-signed-grant", "expires_at_ms": 1_700_000_060_000_i64,
+                "host": "db.internal", "port": 5432,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::VaultNetGranted { port: 5432, .. }
+        ));
+        let socks_granted = ServerMsg::VaultNetGranted {
+            req_id: "n1".into(),
+            grant_id: "g2".into(),
+            grant: "another".into(),
+            expires_at_ms: 1,
+            host: String::new(),
+            port: 0,
+        };
+        let v = serde_json::to_value(&socks_granted).unwrap();
+        assert!(
+            v.get("host").is_none() && v.get("port").is_none(),
+            "SOCKS names no destination: {v}"
+        );
     }
 
     /// FR-83 — the ack's wire shape. "Recorded" is the ABSENCE of `refused`,

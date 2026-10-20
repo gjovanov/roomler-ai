@@ -17,7 +17,9 @@
 //! lease (P3-4d) is kept apart, in `vault_activity`: a claim, never one of
 //! the vault's decisions. A policy may ask for a person's yes before a value
 //! is released (P3-4e, [`approval`]): a card in the session's room, answered
-//! by one of its drivers.
+//! by one of its drivers. A session's own egress is the vault's to decide
+//! too (P3-7-1b, [`net`]): a grant, signed under its own audience, that the
+//! network module checks without calling the vault.
 //!
 //! The module's switch defaults OFF (`[modules] vault`), and a
 //! `vault.tenants` list both switches it on and limits it to the
@@ -43,6 +45,7 @@ pub mod gate;
 pub mod lease;
 pub mod meta;
 pub mod model;
+pub mod net;
 pub mod policy;
 pub mod policy_routes;
 pub mod revoke;
