@@ -13,6 +13,7 @@ pub mod oauth;
 pub mod purestat;
 pub mod push;
 pub mod quota;
+pub mod relay_allowance;
 pub mod sendgrid;
 pub mod stripe;
 

@@ -155,6 +155,35 @@
                     right now. Traffic that connected directly is never
                     measured, so it is not counted here.
                   </p>
+                  <div v-if="relayAllowance" class="mt-4" data-testid="relay-allowance">
+                    <div class="d-flex justify-space-between text-body-2">
+                      <span>Mesh relay this month</span>
+                      <span>{{ relayAllowance.usage }}</span>
+                    </div>
+                    <v-progress-linear
+                      v-if="relayAllowance.percent !== null"
+                      :model-value="relayAllowance.percent"
+                      :color="relayAllowance.throttledNote ? 'warning' : 'primary'"
+                      height="6"
+                      rounded
+                      class="mt-1"
+                    />
+                    <v-alert
+                      v-if="relayAllowance.throttledNote"
+                      type="warning"
+                      density="compact"
+                      variant="tonal"
+                      class="mt-2"
+                    >
+                      {{ relayAllowance.throttledNote }}
+                    </v-alert>
+                    <p
+                      v-else-if="relayAllowance.policyNote"
+                      class="text-caption text-medium-emphasis mt-1 mb-0"
+                    >
+                      {{ relayAllowance.policyNote }}
+                    </p>
+                  </div>
                 </v-card-text>
               </v-card>
             </v-col>
@@ -339,6 +368,7 @@ import {
   type SeriesPoint,
 } from '@/stores/stats'
 import { canQueryAnalytics } from '@/utils/permissions'
+import { relayAllowanceView } from '@/utils/relayAllowance'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 import UptimeStrip from '@/components/stats/UptimeStrip.vue'
 import UsagePanel from '@/components/stats/UsagePanel.vue'
@@ -380,6 +410,12 @@ const sfuHours = computed(() => {
 const storedBytes = computed(() => {
   const b = resources.value?.storage?.bytes
   return typeof b === 'number' ? fmtBytes(b) : '—'
+})
+// FR-115 P4a — the month's relay against the plan's allowance; absent where
+// plans are not sold (self-hosting has none).
+const relayAllowance = computed(() => {
+  const q = resources.value?.quota?.relay
+  return q ? relayAllowanceView(q) : null
 })
 
 const callMinutesSeries = computed<SeriesPoint[]>(() =>
