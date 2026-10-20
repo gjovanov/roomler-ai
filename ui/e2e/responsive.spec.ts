@@ -78,8 +78,16 @@ test.describe('Responsive Layout', () => {
     await page.setViewportSize({ width: 375, height: 667 })
     await page.goto(`/tenant/${tenantId}/room/${roomId}`)
 
-    // Try to open a side panel (files panel)
-    const filesBtn = page.locator('[data-testid="files-btn"], button:has(.mdi-paperclip), button:has(.mdi-attachment), button:has(.mdi-file)')
+    // Try to open a side panel (files panel). Below 600 px Files sits in the
+    // room toolbar's ⋮ menu (FR-116 P4a), so open that first.
+    const panelsMenu = page.locator('button[aria-label="Room panels"]')
+    if (await panelsMenu.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await panelsMenu.click()
+    }
+    // By its test id only: the menu's item renders in the overlay container,
+    // AFTER the composer, so a `button:has(.mdi-paperclip)` fallback would
+    // pick the composer's attach button first.
+    const filesBtn = page.locator('[data-testid="files-btn"]')
     const hasPanelBtn = await filesBtn.first().isVisible({ timeout: 5000 }).catch(() => false)
 
     if (hasPanelBtn) {

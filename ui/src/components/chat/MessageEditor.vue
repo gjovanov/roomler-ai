@@ -24,6 +24,11 @@
 
       <v-divider vertical class="mx-1" />
 
+      <!-- The formatting buttons scroll on their own: in one no-wrap row they
+           needed ~596 px, and on a phone attach, emoji, GIF and Send were cut
+           off past the editor's edge, with no other way to send on a soft
+           keyboard. -->
+      <div class="editor-format d-flex align-center ga-1">
       <template v-if="mode === 'rich'">
         <v-btn
           icon="mdi-format-bold"
@@ -105,9 +110,11 @@
           @click="toggleLink"
         />
       </template>
+      </div>
 
       <v-spacer />
 
+      <div class="d-flex align-center ga-1 flex-shrink-0">
       <v-btn
         icon="mdi-paperclip"
         size="x-small"
@@ -120,24 +127,35 @@
         variant="text"
         @click="$emit('open-emoji-picker')"
       />
+      <!-- `mdi-gif` is not in the bundled @mdi/font (7.x), so this button drew
+           nothing at any width. -->
       <v-btn
-        icon="mdi-gif"
+        icon="mdi-file-gif-box"
         size="x-small"
         variant="text"
+        aria-label="GIF"
         @click="$emit('open-giphy-picker')"
       />
+      <!-- In both modes: minimal mode sends on Enter, but a phone's keyboard
+           is no place to learn that, and rich mode needs Ctrl+Enter, which a
+           soft keyboard does not have. -->
       <v-btn
-        v-if="mode === 'rich'"
         icon="mdi-send"
         size="x-small"
         variant="text"
         color="primary"
+        aria-label="Send"
         @click="handleSend"
       >
+        <!-- Explicit: a v-btn renders its default slot INSTEAD of its `icon`,
+             and the tooltip below is slot content — so this button used to
+             draw no icon at all. -->
+        <v-icon>mdi-send</v-icon>
         <v-tooltip activator="parent" location="top">
-          Send (Ctrl+Enter)
+          {{ mode === 'rich' ? 'Send (Ctrl+Enter)' : 'Send (Enter)' }}
         </v-tooltip>
       </v-btn>
+      </div>
     </div>
 
     <editor-content :editor="editor" class="editor-content" />
@@ -373,6 +391,8 @@ const editor = useEditor({
     }),
   ],
   editorProps: {
+    // A phone's return key reads "send" where Enter sends (minimal mode).
+    attributes: () => ({ enterkeyhint: mode.value === 'minimal' ? 'send' : 'enter' }),
     handleKeyDown(_view, event) {
       // In minimal mode: Enter sends, Shift+Enter inserts newline
       if (mode.value === 'minimal' && event.key === 'Enter' && !event.shiftKey) {
@@ -585,6 +605,14 @@ onBeforeUnmount(() => {
 .editor-toolbar {
   border-bottom: 1px solid rgba(var(--v-theme-on-surface), 0.08);
   background: rgba(var(--v-theme-on-surface), 0.02);
+}
+.editor-format {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.editor-format::-webkit-scrollbar {
+  display: none;
 }
 .editor-content {
   min-height: 40px;
