@@ -65,8 +65,8 @@ async fn get_plans_free_plan_has_correct_data() {
     assert_eq!(free["limits"]["magic_dns"], true);
     assert_eq!(free["limits"]["max_concurrent_sessions"], 1);
     assert_eq!(free["limits"]["relay_bytes_per_month"], 10_000_000_000_u64);
-    // Monthly only (no annual Prices configured on a test server), both
-    // currencies, zero.
+    // Monthly only (no annual Prices configured on a test server), in the
+    // currencies on sale, zero.
     let prices = free["prices"].as_array().unwrap();
     assert!(prices.iter().all(|p| p["unit_amount"] == 0));
 }
@@ -105,14 +105,19 @@ async fn get_plans_pro_plan_has_correct_data() {
     assert_eq!(pro["limits"]["relay_bytes_per_month"], 25_000_000_000_u64);
     assert_eq!(pro["limits"]["storage_bytes"], 10 * 1024_u64 * 1024 * 1024);
     let prices = pro["prices"].as_array().unwrap();
-    for currency in ["usd", "eur"] {
-        assert!(
-            prices.iter().any(|p| p["interval"] == "month"
-                && p["currency"] == currency
-                && p["unit_amount"] == 800),
-            "{currency} monthly price missing: {prices:?}"
-        );
-    }
+    assert!(
+        prices
+            .iter()
+            .any(|p| p["interval"] == "month" && p["currency"] == "usd" && p["unit_amount"] == 800),
+        "usd monthly price missing: {prices:?}"
+    );
+    // The deployed default sells USD alone (`stripe.currencies`): EUR waits
+    // until the live Prices carry it. The fake-Stripe tests below put both on
+    // sale, as the operator will after O1.
+    assert!(
+        prices.iter().all(|p| p["currency"] == "usd"),
+        "EUR is not on sale by default: {prices:?}"
+    );
     assert!(
         prices.iter().all(|p| p["interval"] == "month"),
         "annual is offered only once its Prices are configured: {prices:?}"
@@ -1150,6 +1155,8 @@ mod fr115 {
             s.stripe.price_business_annual = PRICE_BIZ_YEAR.into();
         }
         s.stripe.api_base = base.into();
+        // Both currencies on sale, as after O1; the default is USD alone.
+        s.stripe.currencies = "usd,eur".into();
     }
 
     /// Bring the tenant to exactly `seats` accepted members, plus one
@@ -1351,6 +1358,52 @@ mod fr115 {
         )
         .await;
         assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    /// `stripe.currencies` puts a currency on sale. One left out is absent
+    /// from the plans the billing page reads, so a European browser is not
+    /// started on it, and a checkout asking for it anyway is refused before
+    /// any Stripe call: not even the Price is read.
+    #[tokio::test]
+    async fn a_currency_not_on_sale_is_neither_shown_nor_sold() {
+        let fake = Fake::default();
+        let base = fake_stripe(fake.clone()).await;
+        let app = TestApp::spawn_with_settings(|s| {
+            configure(s, &base, false);
+            s.stripe.currencies = "usd".into();
+        })
+        .await;
+        let t = app.seed_tenant("fr115-eur-off").await;
+
+        let plans: serde_json::Value = app
+            .client
+            .get(app.url("/api/stripe/plans"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for plan in plans.as_array().unwrap() {
+            for price in plan["prices"].as_array().unwrap() {
+                assert_eq!(price["currency"], "usd", "{}: {price}", plan["id"]);
+            }
+        }
+
+        let resp = checkout(
+            &app,
+            &t,
+            serde_json::json!({ "plan": "pro", "currency": "eur" }),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 400);
+        let body = resp.text().await.unwrap_or_default();
+        assert!(body.contains("not sold in EUR"), "got: {body}");
+        assert!(
+            fake.calls().is_empty(),
+            "a currency not on sale never reaches Stripe: {:?}",
+            fake.calls()
+        );
     }
 
     /// The double-billing bug: "Switch to Business" used to run a second
