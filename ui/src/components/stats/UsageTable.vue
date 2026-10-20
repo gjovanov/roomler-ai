@@ -11,11 +11,13 @@
         clearable
         prepend-inner-icon="mdi-magnify"
         placeholder="Filter by user"
-        style="max-width: 260px"
+        :style="xs ? 'flex: 1 1 100%' : 'max-width: 260px'"
       />
       <v-spacer />
       <span v-if="rows.length" class="text-caption text-medium-emphasis">
-        {{ rows.length }} {{ rows.length === 1 ? 'user' : 'users' }} active in this range
+        {{ rows.length }} {{ rows.length === 1 ? 'user' : 'users' }} active in this range<span
+          v-if="xs"
+        > · tap one for the breakdown</span>
       </span>
     </div>
 
@@ -87,6 +89,7 @@
 // Per-user usage rows. Clicking a row opens that user's timeline — the
 // table answers "who used what, how much", the timeline answers "when".
 import { computed, ref } from 'vue'
+import { useDisplay } from 'vuetify'
 import { formatBytes, formatMinutes } from '@/utils/format'
 import type { UsageUserRow } from '@/stores/stats'
 
@@ -104,12 +107,22 @@ const props = withDefaults(
 const emit = defineEmits<{ (e: 'select', userId: string): void }>()
 
 const search = ref('')
+const { xs } = useDisplay()
 const fmtBytes = formatBytes
 const fmtMinutes = formatMinutes
 
 const rows = computed(() => props.users)
 
 const headers = computed(() => {
+  // FR-116 — on a phone: who, and how much in total. Eight columns put
+  // everything after the name behind a sideways scroll; the per-category
+  // minutes and traffic are one tap away (a row opens the person's detail).
+  if (xs.value) {
+    return [
+      { title: 'User', key: 'name', sortable: true },
+      { title: 'Total', key: 'total_minutes' },
+    ]
+  }
   const base = [
     { title: 'User', key: 'name', sortable: true },
     { title: 'Remote desktop', key: 'rc_minutes', value: (i: UsageUserRow) => i.rc.minutes },

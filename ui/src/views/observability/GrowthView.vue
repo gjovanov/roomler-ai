@@ -20,7 +20,10 @@
     </v-alert>
 
     <template v-else>
-      <v-tabs v-model="tab" density="compact" class="mb-3">
+      <!-- FR-116: `show-arrows` — eleven tabs, and below 1280 px Vuetify hides
+           the arrows unless asked, so a phone saw ~4 tabs and no sign of the
+           rest. -->
+      <v-tabs v-model="tab" density="compact" class="mb-3" show-arrows>
         <v-tab value="overview">Overview</v-tab>
         <v-tab value="campaigns">Campaigns</v-tab>
         <v-tab value="channels">Channels</v-tab>
@@ -38,7 +41,10 @@
         {{ message }}
       </v-alert>
 
-      <v-window v-model="tab">
+      <!-- FR-116: no swipe. A sideways swipe across a wide table (the funnel's
+           breakdown, the cohort grid) switched the TAB instead of scrolling
+           the table; the tabs above are the way to switch. -->
+      <v-window v-model="tab" :touch="false">
         <!-- ── Overview ──────────────────────────────────────────────── -->
         <v-window-item value="overview">
           <!-- P10 — the alerts open now, and the ones cleared recently. -->
@@ -46,13 +52,20 @@
           <v-row dense>
             <v-col cols="12" md="7">
               <v-card>
+                <!-- FR-116: on a phone the caption and the number move into
+                     the card's text — a title never wraps, so at 360 px the
+                     caption pushed the north-star number off the card. -->
                 <v-card-title class="text-subtitle-1 d-flex align-center">
                   Weekly active orgs
-                  <span class="text-caption text-medium-emphasis ml-2">north star · a value event in the week</span>
+                  <span class="text-caption text-medium-emphasis ml-2 d-none d-sm-inline">north star · a value event in the week</span>
                   <v-spacer />
-                  <span v-if="waoLatest" class="text-h6">{{ waoLatest.active_orgs }}</span>
+                  <span v-if="waoLatest" class="text-h6 d-none d-sm-inline">{{ waoLatest.active_orgs }}</span>
                 </v-card-title>
                 <v-card-text>
+                  <div class="d-sm-none mb-2">
+                    <span v-if="waoLatest" class="text-h6 mr-2">{{ waoLatest.active_orgs }}</span>
+                    <span class="text-caption text-medium-emphasis">north star · a value event in the week</span>
+                  </div>
                   <time-series-chart
                     v-if="waoPoints.length"
                     :points="waoPoints"
@@ -90,7 +103,7 @@
           <v-card class="mt-3">
             <v-card-title class="text-subtitle-1 d-flex align-center flex-wrap" style="gap: 8px">
               The account funnel
-              <span v-if="funnel" class="text-caption text-medium-emphasis">
+              <span v-if="funnel" class="text-caption text-medium-emphasis text-wrap">
                 {{ shortDate(funnel.since) }} → {{ shortDate(funnel.until) }} · org ≤
                 {{ funnel.windows.org_days }}d · device ≤ {{ funnel.windows.activation_days }}d · value ≤
                 {{ funnel.windows.value_days }}d
@@ -405,10 +418,21 @@
       </v-window>
     </template>
 
-    <!-- The org timeline drawer. -->
-    <v-navigation-drawer v-model="timelineOpen" location="right" temporary width="440">
+    <!-- The org timeline drawer. FR-116: full width on a phone, with a close
+         button — at 440 px it covered a 390 px screen whole, leaving no scrim
+         to tap and no way out. -->
+    <v-navigation-drawer
+      v-model="timelineOpen"
+      location="right"
+      temporary
+      :width="xs ? displayWidth : 440"
+    >
       <template v-if="timeline">
-        <v-list-item :title="timeline.name" :subtitle="`${timeline.plan}${timeline.billing_status ? ' · ' + timeline.billing_status : ''}`" />
+        <v-list-item :title="timeline.name" :subtitle="`${timeline.plan}${timeline.billing_status ? ' · ' + timeline.billing_status : ''}`">
+          <template v-if="xs" #append>
+            <v-btn icon="mdi-close" variant="text" size="small" aria-label="Close" @click="timelineOpen = false" />
+          </template>
+        </v-list-item>
         <v-divider />
         <v-timeline v-if="timeline.events.length" density="compact" side="end" class="pa-3">
           <v-timeline-item
@@ -459,6 +483,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { useAuthStore } from '@/stores/auth'
 import {
   useGrowthStore,
@@ -492,6 +517,9 @@ import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 
 const authStore = useAuthStore()
 const store = useGrowthStore()
+// FR-116 — the phone layout: the north-star number under its title, and the
+// org timeline drawer full width with its own close button.
+const { xs, width: displayWidth } = useDisplay()
 const isPlatformAdmin = computed(() => authStore.user?.is_platform_admin === true)
 
 const tab = ref('overview')
@@ -711,11 +739,14 @@ async function pickDay(d: string) {
   await loadDigest()
 }
 
-// Load each tab's data the first time it is opened.
+// Load each tab's data the first time it is opened. Watches the admin flag
+// too: the shell renders before `/auth/me` answers (stores/auth.ts), so on a
+// hard refresh or a deep link the first run met an unknown user, returned —
+// and nothing ran it again until the tab changed, leaving the Overview empty.
 const loaded = new Set<string>()
 watch(
-  tab,
-  async (t) => {
+  [tab, isPlatformAdmin],
+  async ([t]) => {
     if (!isPlatformAdmin.value || loaded.has(t)) return
     loaded.add(t)
     if (t === 'overview') {
