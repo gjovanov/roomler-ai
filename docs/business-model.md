@@ -184,6 +184,10 @@ if I turned this on?"* as a **snapshot**, not from denial logs — a tenant sitt
 at 40 members on a 10-member plan that nobody adds to this month emits no denials
 at all and would be flipped straight into a wall.
 
+**All of this binds only where plans are sold.** A self-hosted server is built
+without the `saas` module, sells no plans, and holds no org to any limit. An org
+there is `free` in name only (`Core::plans_sold`, FR-115).
+
 ---
 
 ## 5. The sequence, and why this order

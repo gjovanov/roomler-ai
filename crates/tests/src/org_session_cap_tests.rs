@@ -249,6 +249,23 @@ async fn a_business_org_runs_several_at_once() {
     created(&answer);
 }
 
+/// A server without the hosted `saas` module sells no plans (the self-hosted
+/// image is built that way), so it caps nobody's sessions: a Free org runs
+/// several at once.
+#[tokio::test]
+async fn a_server_that_sells_no_plans_caps_no_sessions() {
+    let app = TestApp::spawn_with_settings(|s| s.modules.saas = false).await;
+    let seeded = app.seed_tenant("fr115cap6").await;
+    let (a, _a_ws) = connect_agent(&app, &seeded, "mach-fr115-cap6-a").await;
+    let (b, _b_ws) = connect_agent(&app, &seeded, "mach-fr115-cap6-b").await;
+    let token = &seeded.admin.access_token;
+
+    let (_one, answer) = ask(&app, token, &a).await;
+    created(&answer);
+    let (_two, answer) = ask(&app, token, &b).await;
+    created(&answer);
+}
+
 #[tokio::test]
 async fn the_kill_switch_lifts_the_cap() {
     let app = TestApp::spawn_with_settings(|s| s.rc.org_session_cap = false).await;

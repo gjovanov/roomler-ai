@@ -99,7 +99,9 @@ pub struct Swept {
 /// never ends a meeting on a guess, and the next sweep reads it again.
 pub async fn sweep(state: &ConferenceState, now: DateTime) -> Swept {
     let mut swept = Swept::default();
-    if !state.settings.meetings.free_cap {
+    // The kill switch, and a server that sells no plans (`Core::plans_sold`:
+    // a self-hosted org is `free` only in name, and no meeting of its ends).
+    if !state.settings.meetings.free_cap || !state.plans_sold {
         return swept;
     }
     let Some(earliest) = earliest_warn_minutes() else {

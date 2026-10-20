@@ -42,6 +42,13 @@ pub fn check_delta(
     current: u64,
     delta: u64,
 ) -> Result<(), QuotaDenial> {
+    // FR-115 — a server that sells no plans holds no org to one: on a
+    // self-hosted server every org is `free` only because nobody sold it
+    // anything, and self-hosting is free and unlimited (`Core::plans_sold`).
+    // Nothing is counted either: no limit was hit.
+    if !core.plans_sold {
+        return Ok(());
+    }
     // FR-115 — against the org's BILLED seats, so a per-seat limit
     // (concurrency, storage) is the org's, not one seat's.
     let verdict = quota::evaluate_for(

@@ -5,9 +5,10 @@ tags: [self-hosting, install, docker, getting-started, operations]
 order: 15
 ---
 
-Self-hosting is a first-class path, not a stripped-down one. The same image that
-runs the hosted service runs on your own box, with **no feature held back** and
-no device limit imposed by us.
+Self-hosting is a first-class path, not a stripped-down one. The same server that
+runs the hosted service runs on your own box, minus its billing, with **no feature
+held back** and no plan limits: no device or user count, no cap on remote
+sessions, no meeting length.
 
 ## What you are about to run
 

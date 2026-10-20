@@ -280,6 +280,9 @@ impl AppState {
             relay_load: relay_load.clone(),
             hooks: roomler_core::HookRegistry::default(),
             agent_socket: roomler_core::AgentSocketRegistry::default(),
+            // FR-115 — plans bind only where they are sold (`saas` compiled
+            // in and switched on); self-hosting stays free and unlimited.
+            plans_sold: cfg!(feature = "saas") && settings.modules.saas,
         };
         // FR-69 P2 — the module crates, after the core and before the host
         // state that mounts them.
