@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { ref } from 'vue'
 import {
+  deviceLabel,
   hideDeviceNameKey,
   secondaryDeviceName,
   useHideDeviceName,
@@ -71,5 +72,19 @@ describe('secondaryDeviceName', () => {
     expect(secondaryDeviceName({ name: 'DESKTOP-8F3K2L', display_name: '' }, false)).toBeNull()
     expect(secondaryDeviceName({ name: 'pc', display_name: 'pc' }, false)).toBeNull()
     expect(secondaryDeviceName(null, false)).toBeNull()
+  })
+})
+
+describe('deviceLabel', () => {
+  it('is the display name when one is set, else the machine name', () => {
+    expect(deviceLabel({ name: 'build-01', display_name: 'Build Server' })).toBe('Build Server')
+    expect(deviceLabel({ name: 'build-01' })).toBe('build-01')
+    expect(deviceLabel({ name: 'build-01', display_name: '' })).toBe('build-01')
+    expect(deviceLabel({ name: 'build-01', display_name: null })).toBe('build-01')
+  })
+
+  it('is empty, never "undefined", for no device', () => {
+    expect(deviceLabel(null)).toBe('')
+    expect(deviceLabel(undefined)).toBe('')
   })
 })
