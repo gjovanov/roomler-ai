@@ -1736,5 +1736,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
+| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; MySQL, SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; session SOCKS, `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |

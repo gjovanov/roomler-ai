@@ -2213,6 +2213,44 @@ never sees the issuer.
     `short-lived` cannot promise").
   - Not built: a revocation that fails is logged on the device, not reported to the vault.
 
+**P3-6d, MySQL, SQL Server and Redis users, as designed.** Each is a provider in `vault::providers`,
+minted on the device as `postgres` is, by the same caller (P3-6b-2b): one lease for a dynamic
+secret's names, the credential minted at its first use, taken back when the lease is let go. What
+differs is each database's accounts, how it ends one, and its wire.
+
+| | MySQL (8.0.21+) | SQL Server (2016+) | Redis (6.0+) |
+|---|---|---|---|
+| the issuer's fields | `admin_user`, `admin_password`, `database`, `grants` (its roles, one per line), and optionally `ca` | `admin_user`, `admin_password`, `database`, `grants` (database roles, one per line), and optionally `ca` | `admin_user`, `admin_password`, `rules` (ACL rules, one per line), and optionally `ca` |
+| the minted fields | `user`, `password`, `host`, `port`, `database` | `user`, `password`, `host`, `port`, `database` | `user`, `password`, `host`, `port` |
+| the account | `CREATE USER 'roomler_<lease>'@'%' IDENTIFIED WITH caching_sha2_password AS '<hash>' DEFAULT ROLE <grants> ATTRIBUTE '{"roomler": {"lease": …, "until": …}}'` | `CREATE LOGIN [roomler_<lease>] WITH PASSWORD = <hash> HASHED, CHECK_POLICY = OFF`, then in `database` `CREATE USER … FOR LOGIN …` and `ALTER ROLE … ADD MEMBER …` | `ACL SETUSER roomler_<lease>_<end> reset on #<hash> <rules>` |
+| the password, which is never sent | its `caching_sha2_password` hash: `$A$005$`, a 20-byte salt, SHA-256 crypt at 5000 rounds | its hash as SQL Server 2012+ keeps it: `0x0200`, a 4-byte salt, SHA-512 of the UTF-16 password and the salt | its SHA-256 (`#…`), which is what Redis keeps |
+| its end, by the database itself | an `EVENT … ON SCHEDULE AT '<the lease's end>' … DO DROP USER`, created with the user. The mint fails without it | none: a login has no end shorter than a day | none: an ACL user has no end |
+| the sweep's mark | the user's `ATTRIBUTE` (`INFORMATION_SCHEMA.USER_ATTRIBUTES`) | a `roomler_` login more than `MAX_TTL_SECS` and a minute old (`sys.server_principals.create_date`) | the name, which carries its end in seconds |
+| the revocation | `ACCOUNT LOCK`, `KILL` its connections, `DROP USER`, `DROP EVENT` | `ALTER LOGIN … DISABLE`, `KILL` its sessions, `DROP USER`, `DROP LOGIN` | `ACL DELUSER`, which also closes its connections |
+| the wire | MySQL's protocol: TLS after `SSLRequest`; `caching_sha2_password`, its full sign-in inside verified TLS; `COM_QUERY` | TDS 7.4 (TLS within `PRELOGIN`) and TDS 8 (TLS first); `LOGIN7`; SQL batches | RESP over verified TLS; `AUTH <user> <password>` |
+
+- ⚠️ **No database here ends a credential the way `VALID UNTIL` does.** Postgres refuses a sign-in
+  once the lease has ended, whoever is left to clean up. Of these three, only MySQL can end one by
+  itself, and only through an event the mint creates. A SQL Server login or a Redis user signs in
+  until something drops it. If the daemon that minted it dies first, that is the issuer's next
+  sweep, whenever a mint next comes. Decision 19 says which to build first.
+- ⚠️ **MySQL's DDL is not transactional.** `CREATE USER` commits before `CREATE EVENT` runs, so a
+  refused event means the user is dropped at once and the mint is refused. The same holds for
+  SQL Server's three statements, and for Redis, which has no transactions for `ACL`.
+- ⚠️ **Redis keeps ACLs per node**, and does not replicate them. The provider mints on the one node
+  its audience names, so it is not for a cluster, or for a client that reads from replicas.
+- ⚠️ **SQL Server refuses `DROP LOGIN` while the login is signed in.** Where the issuer may not
+  `KILL` (`ALTER ANY CONNECTION`), the login stays disabled, unable to sign in again, and the sweep
+  drops it later.
+- ⚠️ **A dropped account's open sessions run on** in MySQL and SQL Server, as in Postgres: ending
+  them is the revocation's second step, where the issuer may. Redis closes them as it deletes the
+  user.
+- **Each wire is a client of its own** in `vault_proxy` (`mysql`, `tds`, `redis`), dialled only
+  toward the secret's one audience, its TLS verified as `proxy`'s is. Each signs in as the issuer
+  only. A `vault_connect` engine for any of them is a later step.
+- **The minter is chosen by the provider:** the lease client's `mint` dispatches on the bundle's
+  provider (today it calls `pg_mint` alone).
+
 **Audit.** `vault_audit` holds every decision the server makes, allow and deny, with the 90-day TTL
 of the network module's audits (`crates/modules/network/src/lib.rs:748`). `vault_activity` is the
 device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
@@ -2271,7 +2309,10 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 | P3-6b-2a | the Postgres minter on the device, with no caller yet: one user per lease, its password sent as its SCRAM verifier, the expired ones swept at each mint, a revocation that drops only a role a mint made | the `vault` feature in no release build | — |
 | P3-6b-2b | its caller: `vault_exec` and `vault_render` serving a dynamic secret, a user minted for each lease and revoked at its end | device `vault_enabled = false`; `vault.providers` | — |
 | P3-6c | GitHub App tokens, minted where decision 18 says | `vault.providers` | — |
-| P3-6d | MySQL, SQL Server and Redis users | `vault.providers` | — |
+| P3-6d-0 | P3-6d's design (§3e "P3-6d, MySQL, SQL Server and Redis users, as designed"), and decision 19 | docs only | — |
+| P3-6d-1 | MySQL users, ended by the database: the wire's client half, the minter, an `EVENT` at the lease's end; the lease client's mint chosen by provider | `vault.providers` | — |
+| P3-6d-2 | Redis users, as decision 19 says | `vault.providers` | — |
+| P3-6d-3 | SQL Server logins, as decision 19 says | `vault.providers` | — |
 | P3-6e | AWS STS, with a stored AWS key until P7's federation | `vault.providers` | — |
 | P3-6f | a Kubernetes `TokenRequest` | `vault.providers` | — |
 | P3-7 | authenticated session SOCKS, `Principal::Session`, `net_forward` and `net_socks` | `vault.tenants` | — |
@@ -2619,6 +2660,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-6b-1 | the vault's half of `short-lived` (`docs/vault.md` §20): the `dynamic` kind, naming a provider (`vault::providers`, in the wire crate: `postgres`) and one audience, and holding its issuer's fields alone; two guardrails pairing the kind with its mode (`dynamic-only-short-lived`, `short-lived-only-dynamic`); a lease of the secret as a whole (a field named refused), its provider known and served (`vault.providers`) and its required fields present, every issuer field opened and sealed as one bundle (`{"audience", "fields"}`), the frame's `provider` and `n: 0`, the row's `bundle` holding each field's version; a new version of any field taking it back, at the write and at a sweep (`revoke::changed`); the metadata naming the minted fields; a daemon before P3-6b-2 refusing a bundle unopened | `vault.tenants`; `vault.providers` | **merged** #2578 `fb6ff54ab` |
 | P3-6b-2a | the Postgres minter (`docs/vault.md` §20), with no caller yet (P3-6b-2b's is the first): `vault_proxy::pg_mint`; the issuer read from a lease's bundle (its parsed fields zeroed when they drop), signed in as its `admin_user` by SCRAM-SHA-256 over TLS verified against its `ca` (`pg::sign_in`: the proxy's own handshake, `authenticate`, lifted out to run with no client behind it); one role per lease, `roomler_<lease id>`, `LOGIN`, `VALID UNTIL` the lease's end, in the issuer's `grants` (one per line, each quoted as a name), commented `roomler lease <id>`, in one transaction; its password 32 random bytes, sent only as its SCRAM-SHA-256 verifier (`scram::verifier`, checked against `ring`'s PBKDF2 and HMAC); the expired swept at each mint, found by name, expiry and comment; a revocation that refuses a name no mint made before it dials, then `NOLOGIN`, its sessions ended and what it owns given to the issuer where the issuer may, `DROP ROLE`. Tested against a fake Postgres over real TLS that keeps its roles, signs a minted one in by the verifier it was given, applies each of the sweep's clauses, and refuses as Postgres refuses an issuer short of a privilege; 15 negative controls | the `vault` feature in no release build | **merged** #2585 `fc3a818c8` |
 | P3-6b-2b | the minter's caller (`docs/vault.md` §20, "The caller"): the lease client holds the bundle of a provider it mints for (`postgres`; any other's refused unopened, as before), lends it to no tool, mints its credential at the lease's first use, once (`Client::mint`), and takes it back whenever the lease is let go, in the background, a mint that ends after its lease was let go taking its own back; `vault_exec` and `vault_render` describe each secret first, give every name of one dynamic secret ONE `short-lived` lease and its credential's fields, and refuse any other field before anything is leased; `vault_request` asks for a dynamic secret whole, in `short-lived`, its first use minting, and never toward a proxy; the vault keeps a use's report of a `short-lived` lease for any use; `upstream_of` moved into `vault_proxy`. 8 new tests (3 of the client against a fake Postgres, one of them a mint racing its lease's end; 4 of the tools; 1 integration) and 14 negative controls | device `vault_enabled = false`; `vault.providers` | **in review** |
+| P3-6d-0 | P3-6d's design (§3e "P3-6d, MySQL, SQL Server and Redis users, as designed") and decision 19, docs only: three providers minted on the device by P3-6b-2b's caller; each password sent only as the hash its database keeps (MySQL's `caching_sha2_password`, SQL Server's 2012 hash, Redis's SHA-256); MySQL's end an `EVENT` the mint must create, and no end that SQL Server or Redis keeps by itself; each sweep's mark (an `ATTRIBUTE`, a login's age, a name that carries its end); each wire a client of its own in `vault_proxy`; the minter chosen by provider | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3144,6 +3186,21 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - nothing new leaves the server.
       - What it costs: every device the policy lets lease the App holds its key in daemon memory
         while the lease lasts.
+19. **A credential its database cannot end** (P3-6d), for the operator to confirm (P3-6d-0, §3e
+    "P3-6d, MySQL, SQL Server and Redis users, as designed"). Nothing in P3-6d-1 depends on the
+    answer: MySQL ends what it mints, through an event.
+    - *Recommended: mint only where the database ends the credential, or the vault can.*
+      - MySQL now, its end an `EVENT` the mint must create.
+      - Redis and SQL Server after a revocation that survives the daemon. The device reports each
+        credential it took back. At a device's next hello, the vault seals to it again the bundle of
+        each dynamic lease it never reported, so the restarted daemon signs in as the issuer and
+        drops what it minted.
+      - What it costs: that report and that re-seal, a protocol step of their own, before Redis or
+        SQL Server.
+    - *Or: the sweep is enough.*
+      - Redis and SQL Server now, their end the issuer's next sweep.
+      - What it costs: a daemon that dies holding a lease leaves a credential that signs in until
+        the issuer next mints, which may be never.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
