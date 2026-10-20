@@ -137,14 +137,6 @@ where
     params.insert(0, ("user".into(), up.user.clone()));
 
     let mut upstream = connect(up).await.map_err(Refusal::Tell)?;
-    // P3-5b-3 — the binding data of the channel just verified: the
-    // certificate the upstream presented, hashed as RFC 5929 says.
-    let bindable = upstream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .and_then(tls::server_end_point);
     let mut body = version.to_be_bytes().to_vec();
     for (k, v) in &params {
         body.extend(k.as_bytes());
@@ -157,14 +149,43 @@ where
         .write_all(&frame(None, &body))
         .await
         .map_err(|e| Refusal::Tell(format!("the upstream: {e}")))?;
+    let held = authenticate(&mut upstream, &up.password, Some(&mut *client)).await?;
+    let mut ok = frame(Some(b'R'), &0u32.to_be_bytes());
+    ok.extend(held);
+    client
+        .write_all(&ok)
+        .await
+        .map_err(|e| Refusal::Told(e.to_string()))?;
+    Ok(Some(upstream))
+}
 
-    // Authenticate. What the upstream says meanwhile reaches the client
-    // where a client reads it.
+/// Authenticate a connection the proxy began, SCRAM-SHA-256 only: the server's
+/// signature checked, and bound to the certificate the proxy verified where the
+/// upstream offers `-PLUS` (P3-5b-3). What the upstream says meanwhile that a
+/// client reads (a protocol negotiation, its own error) goes to `client` where
+/// there is one; P3-6b-2's minter has none. A notice is held for after the
+/// `AuthenticationOk`, and answered.
+async fn authenticate<C>(
+    upstream: &mut TlsStream<TcpStream>,
+    password: &str,
+    mut client: Option<&mut C>,
+) -> Result<Vec<u8>, Refusal>
+where
+    C: AsyncWrite + Unpin,
+{
+    // P3-5b-3 — the binding data of the channel just verified: the
+    // certificate the upstream presented, hashed as RFC 5929 says.
+    let bindable = upstream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .and_then(tls::server_end_point);
     let mut scram: Option<ScramClient> = None;
     let mut verified = false;
     let mut held = Vec::new();
     loop {
-        let (tag, body) = read_message(&mut upstream, MAX_AUTH_MESSAGE)
+        let (tag, body) = read_message(upstream, MAX_AUTH_MESSAGE)
             .await
             .map_err(Refusal::Tell)?;
         match tag {
@@ -206,13 +227,12 @@ where
                                 ));
                             }
                         };
-                        let c =
-                            ScramClient::bound("", &up.password, binding).map_err(Refusal::Tell)?;
+                        let c = ScramClient::bound("", password, binding).map_err(Refusal::Tell)?;
                         let first = c.client_first();
                         let mut msg = format!("{mechanism}\0").into_bytes();
                         msg.extend((first.len() as u32).to_be_bytes());
                         msg.extend(first.as_bytes());
-                        send(&mut upstream, b'p', &msg).await?;
+                        send(upstream, b'p', &msg).await?;
                         scram = Some(c);
                     }
                     11 => {
@@ -223,7 +243,7 @@ where
                             Refusal::Tell("the upstream's SCRAM is not text".into())
                         })?;
                         let fin = c.client_final(server_first).map_err(Refusal::Tell)?;
-                        send(&mut upstream, b'p', fin.as_bytes()).await?;
+                        send(upstream, b'p', fin.as_bytes()).await?;
                     }
                     12 => {
                         let c = scram.as_ref().ok_or_else(|| {
@@ -244,19 +264,26 @@ where
                 }
             }
             b'E' => {
-                let _ = client.write_all(&frame(Some(b'E'), &body)).await;
-                return Err(Refusal::Told(format!(
-                    "the upstream refused: {}",
-                    error_message(&body)
-                )));
+                let why = format!("the upstream refused: {}", error_message(&body));
+                return Err(match client.as_deref_mut() {
+                    Some(c) => {
+                        let _ = c.write_all(&frame(Some(b'E'), &body)).await;
+                        Refusal::Told(why)
+                    }
+                    // P3-6b-2 — no client: the minter says it itself.
+                    None => Refusal::Tell(why),
+                });
             }
             // A protocol negotiation answers the client's own startup, which
             // went upstream as the client wrote it: passed on now, since a
             // client takes one only before its `AuthenticationOk`.
-            b'v' => client
-                .write_all(&frame(Some(b'v'), &body))
-                .await
-                .map_err(|e| Refusal::Told(e.to_string()))?,
+            b'v' => {
+                if let Some(c) = client.as_deref_mut() {
+                    c.write_all(&frame(Some(b'v'), &body))
+                        .await
+                        .map_err(|e| Refusal::Told(e.to_string()))?;
+                }
+            }
             // A notice waits for the `AuthenticationOk`: before it, a client
             // takes only an authentication request, a negotiation or an
             // error.
@@ -269,13 +296,150 @@ where
             }
         }
     }
-    let mut ok = frame(Some(b'R'), &0u32.to_be_bytes());
-    ok.extend(held);
-    client
-        .write_all(&ok)
+    Ok(held)
+}
+
+/// P3-6b-2 — the most a query's answer may hold, in one message.
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_RESULT_MESSAGE: usize = 1024 * 1024;
+
+/// P3-6b-2 — the daemon's own session with an upstream, as a dynamic
+/// secret's issuer: TCP, TLS verified, a startup naming `database`, the
+/// sign-in [`authenticate`] does for the proxy, then the server's messages
+/// read to its first `ReadyForQuery`. Every refusal in words, never the
+/// password's.
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn sign_in(up: &Upstream, database: &str) -> Result<TlsStream<TcpStream>, String> {
+    if up.user.is_empty() || up.user.contains('\0') || database.contains('\0') {
+        return Err("the issuer's user or database is not a name Postgres takes".into());
+    }
+    let started = tokio::time::timeout(START_DEADLINE, async {
+        let mut upstream = connect(up).await?;
+        let mut body = (3u32 << 16).to_be_bytes().to_vec();
+        for (k, v) in [
+            ("user", up.user.as_str()),
+            ("database", database),
+            ("application_name", "roomlerd vault"),
+        ] {
+            body.extend(k.as_bytes());
+            body.push(0);
+            body.extend(v.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        upstream
+            .write_all(&frame(None, &body))
+            .await
+            .map_err(|e| format!("the upstream: {e}"))?;
+        authenticate(&mut upstream, &up.password, None::<&mut tokio::io::Sink>)
+            .await
+            .map_err(|r| match r {
+                Refusal::Tell(why) | Refusal::Told(why) => why,
+            })?;
+        // Its parameters and its cancel key, then ready.
+        loop {
+            let (tag, body) = read_message(&mut upstream, MAX_AUTH_MESSAGE).await?;
+            match tag {
+                b'Z' => return Ok(upstream),
+                b'E' => return Err(format!("the upstream refused: {}", error_message(&body))),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    started.unwrap_or_else(|_| {
+        Err(format!(
+            "the issuer's session did not start within {START_DEADLINE:?}"
+        ))
+    })
+}
+
+/// P3-6b-2 — one simple query (`Q`) on a signed-in session: each row's
+/// columns as text (`None` for a NULL), or the server's error in its own
+/// words. Several statements in one query run as one transaction, as
+/// Postgres runs them.
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn simple_query(
+    s: &mut TlsStream<TcpStream>,
+    sql: &str,
+) -> Result<Vec<Vec<Option<String>>>, String> {
+    if sql.contains('\0') {
+        return Err("a query holds no NUL".into());
+    }
+    let mut q = sql.as_bytes().to_vec();
+    q.push(0);
+    s.write_all(&frame(Some(b'Q'), &q))
         .await
-        .map_err(|e| Refusal::Told(e.to_string()))?;
-    Ok(Some(upstream))
+        .map_err(|e| format!("the upstream: {e}"))?;
+    let mut rows = Vec::new();
+    let mut error = None;
+    loop {
+        let (tag, body) = read_message(s, MAX_RESULT_MESSAGE).await?;
+        match tag {
+            b'D' => rows.push(data_row(&body)?),
+            // The first error ends the query; the rest of it never ran.
+            b'E' => {
+                error.get_or_insert_with(|| error_message(&body));
+            }
+            b'Z' => break,
+            // Its columns, a command's completion, an empty query, a notice.
+            _ => {}
+        }
+    }
+    match error {
+        Some(why) => Err(why),
+        None => Ok(rows),
+    }
+}
+
+/// A `DataRow`'s columns: a count, then each one's length (-1 for NULL) and
+/// bytes.
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+fn data_row(body: &[u8]) -> Result<Vec<Option<String>>, String> {
+    let bad = || "the upstream sent a row that does not parse".to_string();
+    let count = u16::from_be_bytes(
+        body.get(..2)
+            .ok_or_else(bad)?
+            .try_into()
+            .map_err(|_| bad())?,
+    );
+    let mut rest = &body[2..];
+    let mut columns = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let len = i32::from_be_bytes(
+            rest.get(..4)
+                .ok_or_else(bad)?
+                .try_into()
+                .map_err(|_| bad())?,
+        );
+        rest = &rest[4..];
+        if len < 0 {
+            columns.push(None);
+            continue;
+        }
+        let len = usize::try_from(len).map_err(|_| bad())?;
+        let value = rest.get(..len).ok_or_else(bad)?;
+        columns.push(Some(String::from_utf8_lossy(value).into_owned()));
+        rest = &rest[len..];
+    }
+    Ok(columns)
+}
+
+/// P3-6b-2 — end a session the daemon began (`Terminate`).
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn terminate(mut s: TlsStream<TcpStream>) {
+    let _ = s.write_all(&frame(Some(b'X'), &[])).await;
+    let _ = s.shutdown().await;
 }
 
 /// TCP to the upstream, its `SSLRequest` accepted, and TLS verified.
@@ -788,5 +952,72 @@ mod tests {
         assert!(parse_params(b"user\0a\0").is_err(), "no end");
         assert!(parse_params(b"user\0").is_err(), "no value");
         assert!(parse_params(b"us\xffer\0a\0\0").is_err(), "not text");
+    }
+
+    /// P3-6b-2 — the daemon's own session, as a dynamic secret's issuer: a
+    /// startup naming its database, the sign-in the proxy does, its queries
+    /// answered in order, and every refusal in words.
+    #[tokio::test]
+    async fn an_issuer_signs_in_and_its_queries_are_answered() {
+        let password = made();
+        let (ca, port, mut saw) = fake(Upstreams::Scram(password.clone())).await;
+        let mut s = sign_in(&upstream(Some(&ca), port, &password), "orders")
+            .await
+            .unwrap();
+        assert_eq!(
+            saw.recv().await.unwrap(),
+            Saw::Startup(vec![
+                ("user".into(), "app".into()),
+                ("database".into(), "orders".into()),
+                ("application_name".into(), "roomlerd vault".into()),
+            ])
+        );
+        // This upstream answers each query as a command with no rows.
+        assert_eq!(simple_query(&mut s, "SELECT 1").await, Ok(Vec::new()));
+        assert_eq!(saw.recv().await.unwrap(), Saw::Query("SELECT 1".into()));
+        assert!(
+            simple_query(&mut s, "a\0b").await.is_err(),
+            "no NUL in a query"
+        );
+        terminate(s).await;
+
+        let wrong = sign_in(
+            &upstream(Some(&ca), port, &format!("{password}x")),
+            "orders",
+        )
+        .await
+        .unwrap_err();
+        assert!(wrong.contains("password authentication failed"), "{wrong}");
+        assert!(!wrong.contains(password.as_str()));
+        for how in [Upstreams::Cleartext, Upstreams::NoTls] {
+            let (ca, port, _saw) = fake(how).await;
+            assert!(
+                sign_in(&upstream(Some(&ca), port, &password), "orders")
+                    .await
+                    .is_err()
+            );
+        }
+        let up = upstream(Some(&ca), port, &password);
+        assert!(
+            sign_in(&up, "a\0b").await.is_err(),
+            "no NUL in a database's name"
+        );
+    }
+
+    /// P3-6b-2 — a row's columns as text, a NULL as `None`; one cut short
+    /// is refused.
+    #[test]
+    fn a_row_parses_with_its_nulls() {
+        let mut d = 3u16.to_be_bytes().to_vec();
+        d.extend(2i32.to_be_bytes());
+        d.extend(b"ab");
+        d.extend((-1i32).to_be_bytes());
+        d.extend(0i32.to_be_bytes());
+        assert_eq!(
+            data_row(&d),
+            Ok(vec![Some("ab".into()), None, Some(String::new())])
+        );
+        assert!(data_row(&d[..5]).is_err());
+        assert!(data_row(&[0]).is_err());
     }
 }

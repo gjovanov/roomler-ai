@@ -226,6 +226,41 @@ fn escape(name: &str) -> String {
     name.replace('=', "=3D").replace(',', "=2C")
 }
 
+/// P3-6b-2 — the iterations a minted password's verifier is made with:
+/// Postgres's own default (`scram_iterations`).
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const VERIFIER_ITERATIONS: u32 = 4096;
+
+/// P3-6b-2 — the SCRAM-SHA-256 verifier Postgres stores for `password`:
+/// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, its own
+/// `pg_authid` form. `CREATE ROLE … PASSWORD` is given this rather than the
+/// password, which so never reaches the database, nor a statement log there.
+/// The password is SASLprepped as a client's sign-in prepares it, so the
+/// keys are those a sign-in derives.
+// P3-6b-2b gives it its caller (the daemon's lease client): until then, the
+// minter's tests are.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn verifier(password: &str, salt: &[u8], iterations: u32) -> Result<String, String> {
+    if salt.is_empty() || iterations == 0 || iterations > MAX_ITERATIONS {
+        return Err("a verifier needs a salt and a sane iteration count".into());
+    }
+    let password = stringprep::saslprep(password)
+        .map_err(|_| "the password is not one SCRAM can use (SASLprep refused it)")?;
+    let mut salted = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, salted.as_mut());
+    let client_key = Zeroizing::new(hmac(salted.as_ref(), b"Client Key"));
+    let stored_key: [u8; 32] = Sha256::digest(client_key.as_ref()).into();
+    let server_key = hmac(salted.as_ref(), b"Server Key");
+    Ok(format!(
+        "SCRAM-SHA-256${iterations}:{}${}:{}",
+        B64.encode(salt),
+        B64.encode(stored_key),
+        B64.encode(server_key)
+    ))
+}
+
 /// The server's half, for the proxies' tests: what an upstream checks and
 /// answers, from the same RFC.
 #[cfg(test)]
@@ -236,7 +271,10 @@ pub(crate) mod server {
     /// `iterations`; P3-5b-3: with `binds`, the binding data of its own TLS
     /// channel, it supports channel binding as Postgres does.
     pub(crate) struct ScramServer {
-        salted: [u8; 32],
+        /// What a server keeps: never the password, nor the salted one
+        /// (RFC 5802 §3).
+        stored_key: [u8; 32],
+        server_key: [u8; 32],
         salt: Vec<u8>,
         iterations: u32,
         nonce: String,
@@ -253,8 +291,10 @@ pub(crate) mod server {
             let password = stringprep::saslprep(password).unwrap();
             let mut salted = [0u8; 32];
             pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut salted);
+            let client_key = hmac(&salted, b"Client Key");
             Self {
-                salted,
+                stored_key: Sha256::digest(client_key).into(),
+                server_key: hmac(&salted, b"Server Key"),
                 salt: salt.to_vec(),
                 iterations,
                 nonce: nonce.to_string(),
@@ -264,6 +304,38 @@ pub(crate) mod server {
                 client_first_bare: String::new(),
                 server_first: String::new(),
             }
+        }
+
+        /// P3-6b-2 — a server that knows the user by the verifier it stores
+        /// (`SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`), as
+        /// Postgres knows a role whose password it was given hashed.
+        pub(crate) fn from_verifier(verifier: &str, nonce: &str) -> Result<Self, String> {
+            let rest = verifier
+                .strip_prefix("SCRAM-SHA-256$")
+                .ok_or("not a SCRAM-SHA-256 verifier")?;
+            let (params, keys) = rest.split_once('$').ok_or("no keys")?;
+            let (iterations, salt) = params.split_once(':').ok_or("no salt")?;
+            let (stored, server) = keys.split_once(':').ok_or("no server key")?;
+            let key = |s: &str| -> Result<[u8; 32], String> {
+                B64.decode(s)
+                    .map_err(|_| "a key does not decode".to_string())?
+                    .try_into()
+                    .map_err(|_| "a key is not 32 bytes".to_string())
+            };
+            Ok(Self {
+                stored_key: key(stored)?,
+                server_key: key(server)?,
+                salt: B64.decode(salt).map_err(|_| "the salt does not decode")?,
+                iterations: iterations
+                    .parse()
+                    .map_err(|_| "the iterations are not a number")?,
+                nonce: nonce.to_string(),
+                binds: None,
+                gs2: String::new(),
+                refusal: None,
+                client_first_bare: String::new(),
+                server_first: String::new(),
+            })
         }
 
         /// A server whose TLS channel has this binding data.
@@ -333,22 +405,19 @@ pub(crate) mod server {
                 "{},{},{without_proof}",
                 self.client_first_bare, self.server_first
             );
-            let client_key = hmac(&self.salted, b"Client Key");
-            let stored_key: [u8; 32] = Sha256::digest(client_key).into();
-            let signature = hmac(&stored_key, auth_message.as_bytes());
+            let signature = hmac(&self.stored_key, auth_message.as_bytes());
             let proof = B64.decode(proof).unwrap();
             let recovered: Vec<u8> = proof
                 .iter()
                 .zip(signature.iter())
                 .map(|(p, s)| p ^ s)
                 .collect();
-            if Sha256::digest(&recovered).as_slice() != stored_key {
+            if Sha256::digest(&recovered).as_slice() != self.stored_key {
                 return Err("e=invalid-proof".into());
             }
-            let server_key = hmac(&self.salted, b"Server Key");
             Ok(format!(
                 "v={}",
-                B64.encode(hmac(&server_key, auth_message.as_bytes()))
+                B64.encode(hmac(&self.server_key, auth_message.as_bytes()))
             ))
         }
     }
@@ -356,6 +425,7 @@ pub(crate) mod server {
 
 #[cfg(test)]
 mod tests {
+    use super::super::testing::made;
     use super::server::ScramServer;
     use super::*;
 
@@ -497,5 +567,60 @@ mod tests {
         assert_eq!(exchange(Binding::No, None), Ok(Ok(())));
         let headers = [Binding::No, Binding::Unoffered, bound()].map(|b| b.gs2_header());
         assert_eq!(headers, ["n,,", "y,,", "p=tls-server-end-point,,"]);
+    }
+
+    /// P3-6b-2 — a verifier is what Postgres stores, its keys derived as
+    /// RFC 5802 derives them, here checked by another implementation
+    /// (`ring`'s), not this module's own.
+    #[test]
+    fn a_verifier_holds_the_keys_a_server_keeps() {
+        let password = made();
+        let salt: [u8; 16] = rand::random();
+        let v = verifier(&password, &salt, VERIFIER_ITERATIONS).unwrap();
+
+        let mut salted = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(VERIFIER_ITERATIONS).unwrap(),
+            &salt,
+            password.as_bytes(),
+            &mut salted,
+        );
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &salted);
+        let client_key = ring::hmac::sign(&key, b"Client Key");
+        let stored_key = ring::digest::digest(&ring::digest::SHA256, client_key.as_ref());
+        let server_key = ring::hmac::sign(&key, b"Server Key");
+        assert_eq!(
+            v,
+            format!(
+                "SCRAM-SHA-256$4096:{}${}:{}",
+                B64.encode(salt),
+                B64.encode(stored_key.as_ref()),
+                B64.encode(server_key.as_ref())
+            )
+        );
+        assert!(!v.contains(&password), "the verifier holds no password");
+        assert!(verifier(&password, &[], VERIFIER_ITERATIONS).is_err());
+        assert!(verifier(&password, &salt, 0).is_err());
+    }
+
+    /// P3-6b-2 — and a server that knows the user by the verifier alone lets
+    /// the password's holder in, and no one else.
+    #[test]
+    fn a_sign_in_checks_against_the_verifier_alone() {
+        let password = made();
+        let v = verifier(&password, &rand::random::<[u8; 16]>(), VERIFIER_ITERATIONS).unwrap();
+        let sign_in = |with: &str| {
+            let mut s = server::ScramServer::from_verifier(&v, "srvnonce").unwrap();
+            let mut c = ScramClient::new("", with).unwrap();
+            let first = s.server_first(&c.client_first());
+            let fin = c.client_final(&first).unwrap();
+            s.server_final(&fin).map(|v| c.verify_server_final(&v))
+        };
+        assert_eq!(sign_in(&password), Ok(Ok(())));
+        assert_eq!(
+            sign_in(&format!("{password}x")),
+            Err("e=invalid-proof".into())
+        );
     }
 }
