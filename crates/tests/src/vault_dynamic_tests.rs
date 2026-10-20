@@ -59,16 +59,34 @@ pub(crate) async fn dynamic_secret(
     issuer: &Issuer,
     with_password: bool,
 ) -> String {
+    dynamic_secret_of(
+        app,
+        t,
+        issuer,
+        ("postgres", "db.internal:5432"),
+        with_password,
+    )
+    .await
+}
+
+/// P3-6d-1b — `db/dyn`, an issuer of `provider` toward `audience`; its id.
+pub(crate) async fn dynamic_secret_of(
+    app: &TestApp,
+    t: &SeededTenant,
+    issuer: &Issuer,
+    (provider, audience): (&str, &str),
+    with_password: bool,
+) -> String {
     let (code, body) = post(
         app,
         t,
         "/vault/secret",
-        json!({ "path": "db/dyn", "kind": "dynamic", "provider": "postgres",
-                "audiences": ["db.internal:5432"] }),
+        json!({ "path": "db/dyn", "kind": "dynamic", "provider": provider,
+                "audiences": [audience] }),
     )
     .await;
     assert_eq!(code, 201, "{body}");
-    assert_eq!(body["provider"], "postgres", "{body}");
+    assert_eq!(body["provider"], provider, "{body}");
     let id = body["id"].as_str().unwrap().to_string();
     assert_eq!(put(app, t, &id, "admin_user", &issuer.user).await, 200);
     if with_password {
@@ -140,6 +158,35 @@ async fn a_dynamic_secret_is_leased_whole_its_issuer_sealed_to_the_device() {
             assert!(!text.contains(&issuer.password), "{collection}: {text}");
         }
     }
+}
+
+/// P3-6d-1b — a MySQL issuer is declared, held and leased as Postgres's is:
+/// its provider named on the secret and on the lease's frame, its bundle the
+/// issuer's fields and the audience to mint toward.
+#[tokio::test]
+async fn a_mysql_issuer_is_leased_whole_as_a_bundle_naming_its_provider() {
+    let app = lease_app().await;
+    let t = app.seed_tenant("vaultdynmy").await;
+    seed_vault(&app, &t).await;
+    let issuer = Issuer::made();
+    dynamic_secret_of(&app, &t, &issuer, ("mysql", "db.internal:3306"), true).await;
+    let mut dev = device(&app, &t, "dyn-mysql", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/dynmy", Some("dev")).await;
+
+    let answer = ask(&mut dev, "m-1", short_lived(&sid, fence)).await;
+    assert_eq!(answer["provider"], "mysql", "{answer}");
+    assert_eq!(answer["n"], 0, "a bundle spans its fields: {answer}");
+    let bundle: Value = serde_json::from_str(&opened(&dev, &answer)).unwrap();
+    assert_eq!(bundle["audience"], "db.internal:3306", "{bundle}");
+    let fields = bundle["fields"].as_object().unwrap();
+    let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["admin_password", "admin_user", "database"]);
+    assert_eq!(fields["admin_user"], issuer.user.as_str());
+    assert_eq!(fields["database"], "orders");
+    let lease = rows(&app, "vault_leases", doc! {}).await;
+    assert_eq!(lease.len(), 1);
+    assert_eq!(lease[0].get_str("audience").unwrap(), "db.internal:3306");
 }
 
 /// The guardrails pair the kind with its mode, whatever a policy permits: a
@@ -276,7 +323,7 @@ async fn a_dynamic_secret_is_declared_with_its_provider_and_one_audience() {
             "no provider",
         ),
         (
-            json!({ "path": "db/b", "kind": "dynamic", "provider": "mysql", "audiences": ["db:3306"] }),
+            json!({ "path": "db/b", "kind": "dynamic", "provider": "from_a_newer_build", "audiences": ["db:3306"] }),
             "a provider this build cannot name",
         ),
         (

@@ -163,7 +163,7 @@ pub fn bundle_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use providers::POSTGRES;
+    use providers::{MYSQL, POSTGRES};
 
     fn fields(of: &[(&str, i64)]) -> BTreeMap<String, FieldState> {
         of.iter()
@@ -187,6 +187,13 @@ mod tests {
         }
         for raw in ["none", "mysql", "Postgres", "-"] {
             assert!(!ProviderScope::parse(raw).serves(&POSTGRES), "{raw:?}");
+        }
+        // P3-6d-1b — each provider by its own name, and only by it.
+        for raw in ["", "*", "mysql", "mysql, postgres"] {
+            assert!(ProviderScope::parse(raw).serves(&MYSQL), "{raw:?}");
+        }
+        for raw in ["postgres", "MySQL", "none"] {
+            assert!(!ProviderScope::parse(raw).serves(&MYSQL), "{raw:?}");
         }
     }
 

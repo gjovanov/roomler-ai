@@ -14,10 +14,6 @@
 //! ⚠️ The client never offers `CLIENT_LOCAL_FILES`. A server that asks for a
 //! local file anyway is refused, and is sent no byte of one.
 
-// P3-6d-1b gives the minter its caller (the daemon's lease client): until
-// then, its tests are.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -50,6 +46,9 @@ pub(super) const CAPS: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_SECURE_CONNECTION
     | CLIENT_PLUGIN_AUTH
     | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+
+// The client never offers a local file, checked as it builds.
+const _: () = assert!(CAPS & CLIENT_LOCAL_FILES == 0);
 
 /// What a server must offer for the client to go on.
 const NEEDS: u32 = CLIENT_PROTOCOL_41 | CLIENT_SSL | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;

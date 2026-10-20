@@ -372,8 +372,20 @@ pub mod providers {
         mints_on: MintsOn::Device,
     };
 
+    /// P3-6d-1b — a MySQL user, made for the lease by the issuer's account
+    /// and ended by an event the mint creates. Its fields are Postgres's:
+    /// `grants` names roles (`role` or `role@host`, one per line), and the
+    /// minted `host`, `port` and `database` say where it signs in.
+    pub const MYSQL: Provider = Provider {
+        name: "mysql",
+        issuer: &["admin_user", "admin_password", "database", "grants", "ca"],
+        required: &["admin_user", "admin_password", "database"],
+        minted: &["user", "password", "host", "port", "database"],
+        mints_on: MintsOn::Device,
+    };
+
     /// Every provider this build knows.
-    pub const ALL: &[Provider] = &[POSTGRES];
+    pub const ALL: &[Provider] = &[POSTGRES, MYSQL];
 
     /// The provider a secret names. `None` for a name this build cannot
     /// name, which nothing mints for.
@@ -523,19 +535,26 @@ mod tests {
     fn a_providers_names_are_locked() {
         use providers::*;
         let names: Vec<&str> = ALL.iter().map(|p| p.name).collect();
-        assert_eq!(names, ["postgres"]);
-        assert_eq!(
-            (POSTGRES.issuer, POSTGRES.required, POSTGRES.minted),
-            (
-                &["admin_user", "admin_password", "database", "grants", "ca"][..],
-                &["admin_user", "admin_password", "database"][..],
-                &["user", "password", "host", "port", "database"][..],
-            )
-        );
+        assert_eq!(names, ["postgres", "mysql"]);
+        for p in [POSTGRES, MYSQL] {
+            assert_eq!(
+                (p.issuer, p.required, p.minted),
+                (
+                    &["admin_user", "admin_password", "database", "grants", "ca"][..],
+                    &["admin_user", "admin_password", "database"][..],
+                    &["user", "password", "host", "port", "database"][..],
+                ),
+                "{}",
+                p.name
+            );
+            assert_eq!(p.mints_on, MintsOn::Device, "{}", p.name);
+        }
         assert_eq!(named("postgres"), Some(&POSTGRES));
+        assert_eq!(named("mysql"), Some(&MYSQL));
         assert_eq!(named("Postgres"), None, "one spelling");
+        assert_eq!(named("MySQL"), None, "one spelling");
         assert_eq!(
-            named("mysql"),
+            named("mssql"),
             None,
             "nothing mints for a name this build cannot name"
         );
