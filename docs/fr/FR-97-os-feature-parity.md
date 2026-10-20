@@ -63,10 +63,11 @@
 - P3f, typed text on any layout for uinput (the host's own XKB keymap, through a dlopen'd libxkbcommon), merged
   (#2558): red on 0.4.145, which dropped German text; green on its candidate, German and French on the lab (§8).
 - P3e-1, the keyboard layout on X11 (the XKB group in use, reported to the viewer's chip and switched from its
-  picker), built (#2618). The switch now goes through the input arbiter on both platforms, so a session that may
+  picker), merged (#2618). The switch now goes through the input arbiter on both platforms, so a session that may
   not type no longer switches the host's layout, and the current layout goes out when the control DC opens. Under
   GNOME on Xorg the chip reports and there is no picker: GNOME Shell puts a group locked from outside it back within
-  20 ms (measured on the field cell, §8).
+  20 ms (measured on the field cell, §8). XFCE keeps such a lock, and there the viewer's own picker, clicked,
+  switched the host to `de-DE` and back (field-verified, §8).
 - P3e-2, display match on a person's own X11 display (a per-user install in an X11 session: the one active output
   switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand), merged
   (#2623), field-verified red → green on a GNOME 46 Xorg cell (§8). It found the viewer offering the toggle on
@@ -74,7 +75,9 @@
   device's `unavailable["display-match"]`.
 - P3e-3a, copied images on X11: the clipboard watcher's change gate on an X11 session is XFixes' selection-owner
   events (Windows' sequence number in another form), so copied images are watched there and text is no longer
-  polled every second; built (#2632). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
+  polled every second; merged (#2632). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
+- P3g needed no build of its own: FR-93 P6d and P6e ship the companion as an `.rpm` and for aarch64 (since
+  0.4.138), and AC10 is field-verified in FR-93's lab. A tarball for a host with neither dpkg nor rpm waits on D17.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -227,7 +230,7 @@ and the consent chain's fallbacks.
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`); arm64 and Arch still have none | P3g (with FR-93 D5/D6, FR-95) |
+| D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2735-2646`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
@@ -698,6 +701,9 @@ test of the SIGKILL property itself.
     without `set`: the chip, which follows GNOME's own switches, and no picker that would only snap back. Pressing
     GNOME's own Super+Space from the viewer switches it. And GNOME configures its sources `us, de` as the groups
     `us,de,us`, the locale's layout appended for its shortcuts; each layout is offered once.
+  - *Found on a second field desktop, XFCE 4.18 on Xorg (§8):* XFCE keeps a group locked from outside it (held
+    for 2 s both ways, measured the same way), so the hello carries `set` there, and the picker in the viewer's
+    Settings, clicked, switched the host's group, which held. The picker lives on the Settings dialog's Session tab.
   - *As built, P3e-2 (display match, #2623):* `display_match`'s `x11` arm switches the one active output of a
     person's own X11 display to the largest mode it already lists inside the viewer's stage (none is added; several
     active outputs are `unsupported`), under FR-108's decision. `presence` reads the X idle clock (MIT-SCREEN-SAVER)
@@ -730,6 +736,12 @@ test of the SIGKILL property itself.
     which GNOME can set apart from it; P3f types for what the system names, as the table did.
 - **P3g, a companion where there is none** (with FR-93 D5/D6 and FR-95): an arm64 `.deb` and a tarball build;
   `install.sh` already has the hook (`scripts/install.sh:777-785`).
+  - *Done by FR-93 (checked 2026-10-20):* P6e builds the companion for aarch64 as a `.deb` and an `.rpm` on the
+    arm64 runner (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138, and `install.sh` picks
+    either by the host's package manager (`scripts/install.sh:841-851`). AC10 is field-verified in FR-93's lab.
+  - *Not built, the tarball:* a host with neither dpkg nor rpm gets no companion (`install.sh` says so and skips
+    it). FR-93 P6f's notification prompt still answers consent there; what such a host lacks is the banner under
+    Wayland and the tray. Whether to build it is D17.
 - **P3h, DNS without systemd-resolved.** NetworkManager when it owns `resolv.conf`, else a managed `resolv.conf` with a
   restore. Evidence first: which fleet distros lack resolved.
   - *The census (2026-10-19, read-only, §8):* none does. The fleet lists 8 Linux rows; the 3 offline are stale rows of
@@ -1004,9 +1016,9 @@ model on Windows, so the three agree on what the mode means.
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
 | **P3d** | Linux system-install files land as the seat user (merged, #2496). Red on 0.4.143 (`/tmp`, `root:root`), green on its branch and on the 0.4.144 candidate (§8); the root-only tests run under `sudo` in CI | `ROOMLERD_FILES_AS_SEAT_USER=0` | a vmtest Ubuntu system guest, the deployed viewer | M |
-| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, merged #2623). *P3e-3a* (copied images, built #2632); *P3e-3b* (RTF) not built | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0`; P3e-3a: `ROOMLERD_CLIPBOARD_X11_WATCH=0` | the lab; P3e-1, P3e-2 and P3e-3a: a vmtest Ubuntu cell on Xorg, a per-user install | M |
+| **P3e** | Linux X11 layout, display-match, clipboard images + RTF. *P3e-1* (the layout, merged #2618). *P3e-2* (display match, merged #2623). *P3e-3a* (copied images, merged #2632); *P3e-3b* (RTF) not built | per-verb; P3e-1: `ROOMLERD_X11_LAYOUT=0`; P3e-2: `ROOMLERD_X11_DISPLAY_MATCH=0`; P3e-3a: `ROOMLERD_CLIPBOARD_X11_WATCH=0` | the lab; P3e-1, P3e-2 and P3e-3a: a vmtest Ubuntu cell on Xorg, a per-user install | M |
 | **P3f** | uinput text on any layout, through the host's own XKB keymap (merged #2558) | `ROOMLERD_UINPUT_XKB=0` | the lab, German and French layouts, red on 0.4.145 | M |
-| **P3g** | Linux companion for arm64 + tarball | — (a package) | the FR-93 lab, an arm64 vmtest guest | M |
+| **P3g** | Linux companion for arm64 + tarball. *The arm64 `.deb` and `.rpm`: FR-93 P6e (#2257), in every release since 0.4.138.* *The tarball: not built (D17)* | — (a package) | the FR-93 lab (`wlab-kde-sys`, `wlab-asahi`) | M |
 | **P3h** | Linux DNS without systemd-resolved. *The evidence (§8, 2026-10-19):* no fleet host lacks resolved, and a WSL instance bypasses it, so P3h opens with reporting that. *P3h-1 (merged #2515, in 0.4.145):* a steer that nothing asks is reported `steered but BYPASSED`, with where lookups go instead | `ROOMLERD_DNS_NM=0` (P3h-1 is report only) | the fleet census; a vmtest Ubuntu guest with a static `resolv.conf`, as WSL has, red on 0.4.144 | M |
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
 | **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
@@ -1084,25 +1096,45 @@ one depends on it.
   microphone.
 - [ ] **AC8 (P2b–P2e):** on a Mac, the native consent panel answers; Remote Apps lists, focuses and launches; the
   locked-host hint arrives; layout switching and display-match work and restore; copied images reach the viewer.
-- [ ] **AC9 (P3a–P3f):** on the Linux lab, the cursor shape follows; the locked hint arrives; a session holds sleep
+- [x] **AC9 (P3a–P3f):** on the Linux lab, the cursor shape follows; the locked hint arrives; a session holds sleep
   off; session audio is never a microphone; received files land as the seat user; layout, display-match and image
   sync work on X11; uinput types a German and a French string.
-  *(The files clause is field-verified, §8: red on 0.4.143, where an upload landed in `/tmp` as `root:root`; green
-  on P3d's branch and again on the 0.4.144 candidate, in the seat user's `~/Downloads` and owned by them. The cursor
-  clause on X11 is field-verified on P3a's candidate, §8: 0.4.145 sent one `cursor:hide` and nothing else, the
-  candidate the shape and its positions; and again on the 0.4.147 release's bytes, red on 0.4.146. The German and
-  French clause is field-verified on P3f's candidate, §8: 0.4.145 dropped `zyäöüß@€<>|`, the candidate typed it and
-  `aqé1à€` character for character; and again on the 0.4.147 release's bytes, red on 0.4.146. The layout clause
-  holds for GNOME on Xorg as a report (P3e-1, §8): the chip follows GNOME's own switches, and GNOME puts a switch
-  from outside it back, so there is no picker. The picker on a desktop that keeps an outside lock (KDE, XFCE) is
-  still owed a field run; CI's Xvfb test is its only evidence. The display-match clause is field-verified on
-  P3e-2's candidates, §8: 0.4.147 answered `unsupported`; the candidate switched a GNOME Xorg display and handed it
-  back to a person within a third of a second, and its restore guard undid a mode a kill -9 stranded, never a
-  person's own. The image-sync clause is field-verified on P3e-3a's candidate, §8: on 0.4.147 a copied image
-  reached nobody (`not-watched`); on the candidate it reached the viewer unasked within a second, and the deployed
-  viewer subscribes to images by itself.)*
-- [ ] **AC10 (P3g):** a Fedora system install and an arm64 install show the "being viewed" banner and answer a
+  *(Every clause is field-verified, red first, §8:*
+  - *The cursor on X11, on P3a's candidate: 0.4.145 sent one `cursor:hide` and nothing else, the candidate the
+    shape and its positions; and again on the 0.4.147 release's bytes, red on 0.4.146.*
+  - *The locked hint and sleep, on P3b's candidate (2026-10-17), a system install: 0.4.142 sent no
+    `rc:host_locked`, and logind held no block inhibitor of the daemon's. The candidate sent the lock 1 s after it
+    and the unlock 1 s after that, and held `sleep:idle` as a block inhibitor while the session lasted. A per-user
+    daemon takes `idle` only (polkit refuses it a `sleep` block) and was not run.*
+  - *The audio, on P3c-1's and P3c-2's candidates: 0.4.142 recorded the microphone. The candidates recorded the
+    sound server's monitor, per-user and as root, with the microphone suspended in every sample, or nothing at all
+    and the reason.*
+  - *The files: red on 0.4.143, where an upload landed in `/tmp` as `root:root`; green on P3d's branch and again on
+    the 0.4.144 candidate, in the seat user's `~/Downloads` and owned by them.*
+  - *The layout, on P3e-1's candidates: 0.4.147 offered none on Linux. Under GNOME on Xorg it is a report: the
+    chip follows GNOME's own switches, and GNOME puts a switch from outside it back, so there is no picker. On
+    XFCE 4.18 on Xorg, which keeps an outside lock, it is a switch: the viewer's own Settings picker, clicked,
+    switched the host to `de-DE` and back, and the X server's group followed and held.*
+  - *Display match, on P3e-2's candidates: 0.4.147 answered `unsupported`; the candidate switched a GNOME Xorg
+    display and handed it back to a person within a third of a second, and its restore guard undid a mode a
+    kill -9 stranded, never a person's own. On XFCE 4.18 on Xorg the switch held through the session and was put
+    back when it closed.*
+  - *Image sync, on P3e-3a's candidate: on 0.4.147 a copied image reached nobody (`not-watched`); on the candidate
+    it reached the viewer unasked within a second, and the deployed viewer subscribes to images by itself.*
+  - *German and French, on P3f's candidate: 0.4.145 dropped `zyäöüß@€<>|`, the candidate typed it and `aqé1à€`
+    character for character; and again on the 0.4.147 release's bytes, red on 0.4.146.*
+  - *P3e-1, P3e-2 and P3e-3a ride 0.4.148.)*
+- [x] **AC10 (P3g):** a Fedora system install and an arm64 install show the "being viewed" banner and answer a
   consent prompt.
+  *(Field-verified in FR-93's lab, red first, its §8:*
+  - *A Fedora system install, `wlab-kde-sys` (Fedora 44, KDE Plasma 6.7), 2026-10-15. On 0.4.136, with no
+    companion: "no desktop companion on this host", and nothing on screen. With the companion's `.rpm` (FR-93 P6d),
+    `dnf` resolved its dependencies from Fedora's repositories. The next request started the companion and its
+    window asked; Approve gave `Granted`, and its "Being viewed by vmtest admin · keyboard + mouse" banner showed.*
+  - *An arm64 install, `wlab-asahi` (an Apple M2 Pro on Fedora Asahi Remix 42, aarch64), a per-user install by the
+    served `install.sh` with the aarch64 companion (FR-93 P6e), 2026-10-16. On 0.4.138, Approve gave `Granted`,
+    then the companion's banner. On the 0.4.139 release, the banner was at the top centre under GNOME 48 and Plasma
+    6.6. Before P6e an aarch64 host had no companion to show either (FR-93 D5).)*
 - [x] **AC11 (P4a–P4d):** Ctrl+Alt+Del reaches a Windows lock screen that requires it; SFTP as `console_user` writes
   files owned by the signed-in user; Hive adopts a terminal session on Windows; a perUser ephemeral device removes
   itself on a clean stop. *(Field-verified on the released 0.4.143, 2026-10-18, §8, on two throwaway Win11 guests:*
@@ -1172,6 +1204,7 @@ one depends on it.
 | **D14** | How Linux captures the computer's sound (P3c-2) | **Decided (per recommendation, 2026-10-17):** Pulse's client library (`libpulse-simple.so.0`), loaded at run time, recording `@DEFAULT_MONITOR@`: PulseAudio and PipeWire's Pulse server both resolve it, and the library is on nearly every desktop, where the ALSA `pulse` plugin often is not. Rejected: ALSA `pulse` with `PULSE_SOURCE` set by the daemon (an environment variable is process-wide and unsafe to set in a threaded process, and it would also redirect a recording's microphone); a `parec` child (one more binary to depend on). A root daemon records in the seat user's session helper, because PulseAudio admits a client by uid or cookie |
 | **D15** | How a per-user Windows daemon hears a stop (P4d) | **Decided (per recommendation, 2026-10-18):** the daemon hears both stops itself: its own config-keyed event for `roomlerd service stop`, and a hidden window for the session's end. It is not the companion setting the event, as first planned: the companion has no stop action, it need not be running, and the session's end, the case it would have covered, reaches the daemon directly. Never a leave: Restart Manager's `ENDSESSION_CLOSEAPP` (or a manual MSI upgrade would unenroll an ephemeral device), `WM_CLOSE` (`taskkill` without `/F`), and `service uninstall`, which a major upgrade runs from the outgoing binary |
 | **D16** | How a Windows hook reaches the daemon, and whom each end trusts (P4c) | **Decided (per recommendation, 2026-10-18):** a named pipe, `\\.\pipe\roomler-hive-adopt`, checked from both ends through the kernel. The daemon names a client by its token, taken by impersonation after its first line, never by its pid: the pipe admits every person, and a pid can name another process by the time it is read. The hook reads the pipe's owner and sends nothing unless it is SYSTEM, Administrators or the hook's own account, because a pipe name is global and can be taken first, and a person cannot make SYSTEM or Administrators the owner of a pipe they create. (The first candidate read the server process's token instead, which a person may not open for a SYSTEM process: it refused the real daemon in the field.) A person gets `0x12008b`, never `FILE_CREATE_PIPE_INSTANCE`; SYSTEM, Administrators and the daemon's own account add instances. The hook entry is the bare `roomler.exe hive hook` on PATH: Claude Code runs a hook through Git Bash, or PowerShell without it, and no quoted absolute path runs in both. Considered and not taken: `"shell": "powershell"` with `& '<path>'`, since a Claude Code that ignores the field runs bash, which rejects `&`; and the toolbelt pipe's pid-based identity, whose DACL admits one account where this one admits every person |
+| **D17** | A companion for a Linux host with neither dpkg nor rpm (Arch and the like): P3g's tarball | Not now. FR-93 P6f's notification prompt already answers consent on such a host, so what it lacks is the banner under Wayland and the tray. Build the tarball (the binary, its desktop entry, and the libraries it needs, named for the person to install) when a user asks for it |
 
 ## 7. Out of scope
 
@@ -1321,3 +1354,5 @@ one depends on it.
 | 2026-10-20 | — (`xrandr` on the guest, the agent out of the loop) | the P3a cell (GNOME 46 on Xorg), one output `Virtual-1` at 1280×800 with 21 modes | **mutter keeps a mode set from outside it.** `xrandr --output Virtual-1 --mode 5120x2160` held at +0.2 s, +1 s and +3 s, then the start mode was put back. Unlike an outside XKB group lock (P3e-1 above), so P3e-2 switches through RandR |
 | 2026-10-20 | released 0.4.147 (`1698a76e…`), then the P3e-2 candidates `51efd792…` and `1a975163…` (release-profile builds of the branch without `ffmpeg-encoder`) | the same cell; the production viewer (Playwright) sending the request a 1366×768 stage makes, because the deployed viewer offered the toggle on Windows only; a local XTest pointer move on the guest as the person; `kill -9` of the per-user daemon, its unit restarting it | 🔴→🟢 **P3e-2, display match on a person's X11 display.** 0.4.147: `refused: unsupported`, the display untouched. The candidate: `on: true, mode 1360x768` 20 ms after the request, the picture following to 1360×768, the restore guard written first (`start 1280x800`, `ours 1360x768`); the person's pointer move handed the screen back within 0.3 s (`refused: attended`, 1280×800, the guard removed), and for five minutes after it every request was `attended`. A `kill -9` while switched: the next start logged `a switch the last run left in force is undone` and the display was 1280×800 again. A mode the person set by hand (1024×768) before the `kill -9`: the next start left it (`the screen no longer shows its mode — left as it is`). `unavailable.display-match` absent on this host, and `unsupported` with its reason under `ROOMLERD_X11_DISPLAY_MATCH=0`, the request answered `unsupported` |
 | 2026-10-20 | released 0.4.147, then the P3e-3a candidate `160c1a3e…` (a release-profile build of the branch without `ffmpeg-encoder`) | the same cell; the production viewer (Playwright) subscribed to text and image events on its clipboard channel; a person copying a 96×64 image on the guest with GTK | 🔴→🟢 **P3e-3a, a copied image reaches the viewer by itself.** 0.4.147: `clipboard-image-events: not-watched`, and after the copy no push, no binary frame. The candidate: the word gone, and 1 s after the copy `clipboard:img-begin {w: 96, h: 64, bytes: 216, format: png, req_id: null}`, its 216-byte frame and `clipboard:img-end`, unasked. With `ROOMLERD_CLIPBOARD_X11_WATCH=0`: `not-watched` again, no push. The daemon's log shows the deployed viewer subscribing with `image=true` by itself, so it takes these pushes with no viewer change |
+| 2026-10-20 | — (libX11's own `XkbLockGroup`, the agent out of the loop), then released 0.4.147 (`1698a76e…`), then the P3e-3a candidate `160c1a3e…` (P3e-1 as merged) | the same cell, its seat user's session switched to **XFCE 4.18 on Xorg** (GDM autologin), the layouts `us,de` set with `setxkbmap`; the production viewer (Playwright), the switch made by clicking its own picker | 🔴→🟢 **AC9's layout picker, on a desktop that keeps an outside lock.** Measured first: XFCE keeps a group locked from outside it. `XkbLockGroup(1)` held from 0 ms to 2 s, and `XkbLockGroup(0)` the same; GNOME put one back within 20 ms. 0.4.147: `caps.layout = null`, no `rc:layout`, no chip. The candidate ran with the daemon's `XDG_CURRENT_DESKTOP=XFCE`: `caps.layout = ["report","set"]`, and `rc:layout` (`en-US`, `de-DE`) 1 ms after the control DC opened, with the chip on `en-US`. The picker is under Viewer settings → Session → "Remote keyboard layout"; it offered `American English (en-US)` and `German (Germany) (de-DE)`. Clicking `de-DE` made the page send `rc:layout.set`, and the host reported `de-DE` 567 ms after the click. The chip followed, and the X server's locked group read 1 at once and again 5 s later. Back to `en-US` took 407 ms, at group 0. The daemon logged `layout: manual switch applied` for each. ⚪ The rig: the seat user lingers, so the user manager kept GNOME's `SESSION_MANAGER`, and GDM handed it to the XFCE session. xfce4-session refused to start ("Another session manager is already running") until that variable was cleared |
+| 2026-10-20 | — (`xrandr` on the guest, the agent out of the loop), then the P3e-3a candidate `160c1a3e…` (P3e-2 as merged) | the same cell on XFCE 4.18 on Xorg, nobody touching it since its session started; the production viewer (Playwright) sending the request a 1366×768 stage makes; the mode read through XFCE's session | 🟢 **P3e-2 on a second X11 desktop.** Measured first: XFCE keeps an outside `xrandr --mode 5120x2160` at +0.2 s, +1 s and +4 s, like mutter. The candidate answered `on: true, mode 1360x768` 23 ms after the request, with the restore guard on disk. The screen still read `Virtual-1 1360x768` 4 s and 9 s later, and the picture followed for the 25 s the session held. When the session closed, the daemon logged `the display's own mode is back … start=1280x800` and `restored on session close (owner)`, the screen read 1280x800 again, and the guard was gone |
