@@ -34,8 +34,9 @@ use crate::VaultState;
 use crate::dao::{MAX_POLICIES, MAX_ROLES, is_name_taken};
 use crate::model::{VaultPolicy, VaultRole};
 use crate::policy::{
-    self, ACTION_ASSUME, ACTION_LIST, ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS,
-    MODES, OSES, OrgNames, SecretFacts, SessionFacts, Verdict,
+    self, ACTION_ASSUME, ACTION_LIST, ACTION_NET_FORWARD, ACTION_NET_SOCKS, ACTION_USE, ACTIONS,
+    Ask as Request, DeviceFacts, GUARDRAILS, MODES, NodeFacts, OSES, OrgNames, SecretFacts,
+    SessionFacts, Verdict,
 };
 use crate::routes::{
     Ask, check_description, decide, live_secret, member_tenant, org_slug, record_allow, rfc3339,
@@ -71,6 +72,29 @@ async fn org_names(state: &VaultState, tid: ObjectId) -> Result<OrgNames, ApiErr
     })
 }
 
+/// P3-7 — a node a simulated request names: a live device of this
+/// organization, its facts read from its row.
+async fn live_node(state: &VaultState, tid: ObjectId, raw: &str) -> Result<NodeFacts, ApiError> {
+    let id = ObjectId::parse_str(raw)
+        .map_err(|_| ApiError::BadRequest("resource.node_id is not a device id".into()))?;
+    let agent = match state.agents.find_live_in_tenant(tid, id).await {
+        Ok(agent) => agent,
+        Err(DaoError::NotFound) => {
+            return Err(ApiError::BadRequest(
+                "resource.node_id is not a device of this organization".into(),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    NodeFacts::new(
+        id,
+        crate::lease::os_name(agent.os),
+        &agent.tags,
+        agent.owner_user_id,
+    )
+    .map_err(ApiError::BadRequest)
+}
+
 /// Check a policy's text for this organization, its named users included.
 async fn check_for_org(
     state: &VaultState,
@@ -85,6 +109,21 @@ async fn check_for_org(
                 "User::\"{}\" is not a member of this organization",
                 user.to_hex()
             )));
+        }
+    }
+    // P3-7 — an exit named by id is a live device of THIS organization: a
+    // policy that named another's would permit nothing here, and would say
+    // that it exists.
+    for node in &checked.nodes {
+        match state.agents.find_live_in_tenant(tid, *node).await {
+            Ok(_) => {}
+            Err(DaoError::NotFound) => {
+                return Err(ApiError::BadRequest(format!(
+                    "Node::\"{}\" is not a device of this organization",
+                    node.to_hex()
+                )));
+            }
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(checked)
@@ -571,6 +610,10 @@ pub struct SimResource {
     /// `secret:use`: the secret.
     #[serde(default)]
     pub secret_id: Option<String>,
+    /// P3-7 — `net:socks`, `net:forward`: the device the flows exit through,
+    /// read from its row.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 /// `POST …/vault/simulate`.
@@ -591,6 +634,11 @@ pub struct Simulate {
     pub ttl_s: Option<i64>,
     #[serde(default)]
     pub approver_id: Option<String>,
+    /// P3-7 — `net:forward`: the destination, through the node.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
     /// Policies to decide WITH, as if added: checked like a write.
     #[serde(default)]
     pub with: Vec<String>,
@@ -765,6 +813,50 @@ pub async fn simulate(
                     audiences: secret.audiences.clone(),
                 },
                 device,
+            }
+        }
+        // P3-7 — whether a session in a role, on that device, may open a
+        // SOCKS5 listener, or a forward to one destination, through a node.
+        ACTION_NET_SOCKS | ACTION_NET_FORWARD => {
+            let Some(raw) = &body.principal.owner_id else {
+                return Err(ApiError::BadRequest(
+                    "principal.owner_id is required".into(),
+                ));
+            };
+            let session_owner = parse_user(raw, "principal.owner_id")?;
+            let role = match &body.principal.role {
+                Some(r) => Some(known_role(r)?),
+                None => None,
+            };
+            let Some(raw) = &body.resource.node_id else {
+                return Err(ApiError::BadRequest("resource.node_id is required".into()));
+            };
+            let node = live_node(&state, tid, raw).await?;
+            let session = SessionFacts {
+                id: "simulated".into(),
+                owner: session_owner,
+                role,
+                playbook: body.principal.playbook.clone(),
+            };
+            if body.action == ACTION_NET_SOCKS {
+                Request::NetSocks {
+                    session,
+                    node,
+                    device,
+                }
+            } else {
+                let (Some(host), Some(port)) = (&body.host, body.port) else {
+                    return Err(ApiError::BadRequest(
+                        "net:forward needs host and port".into(),
+                    ));
+                };
+                Request::NetForward {
+                    session,
+                    node,
+                    host: host.clone(),
+                    port,
+                    device,
+                }
             }
         }
         other => {

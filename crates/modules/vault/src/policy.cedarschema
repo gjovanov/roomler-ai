@@ -47,6 +47,16 @@ namespace Roomler {
     owner: User,
   };
 
+  // P3-7 — a device a session's flow exits through, named by its id, as its
+  // row holds it: `os` and `tags` as for `Device`, and its owner. A policy
+  // names exits by their tags (`resource.tags.contains("office")`), or one
+  // by its id.
+  entity Node = {
+    os: String,
+    tags: Set<String>,
+    owner: User,
+  };
+
   // A person answered an approval card in the session's room.
   type Approval = {
     approver: User,
@@ -83,6 +93,29 @@ namespace Roomler {
       ttl_s: Long,
       device: Device,
       approval?: Approval,
+    },
+  };
+
+  // P3-7 — a session opening a SOCKS5 listener on the device it runs on,
+  // its flows exiting through `resource`: to whatever destination the
+  // tunnel policies allow there. Nothing implies it.
+  action "net:socks" appliesTo {
+    principal: [Session],
+    resource: [Node],
+    context: {
+      device: Device,
+    },
+  };
+
+  // P3-7 — a session opening a forward to one destination through
+  // `resource`.
+  action "net:forward" appliesTo {
+    principal: [Session],
+    resource: [Node],
+    context: {
+      device: Device,
+      host: String,
+      port: Long,
     },
   };
 }
