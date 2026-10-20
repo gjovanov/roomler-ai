@@ -6,7 +6,9 @@
 # shipped auth bugs. This script keeps it honest from the build host.
 #
 # What it does, in order:
-#   1. Fast-forwards the repo clone (spec source of truth).
+#   1. Fast-forwards the repo clone: the source of THIS script and of the
+#      expected-failures list. The SPECS come from the image's own commit
+#      (step 4), never from master.
 #   2. Points the e2e stack's roomler2 at the CURRENT PROD image tag (read
 #      from the deploy repo's prod overlay) via `kubectl set image` — the
 #      e2e namespace is deliberately NOT ArgoCD-managed.
@@ -18,7 +20,8 @@
 #      and a WS upgrade is not subject to CORS), which silently disarmed every
 #      realtime spec for a week. Both live in the deploy repo's e2e overlay,
 #      so they move together.
-#   4. Copies the spec tree into that sidecar and runs the suite there (minus
+#   4. Copies the spec tree AT THE COMMIT THE IMAGE WAS BUILT FROM into that
+#      sidecar and runs the suite there (minus
 #      e2e/video/ — that spec is bun-only syntax).
 #   5. Diffs the failing specs against scripts/e2e-expected-failures.txt and
 #      writes ~/e2e-nightly/LATEST (one summary line) + a dated full log.
@@ -59,7 +62,7 @@ cd "$REPO" || fail_hard "repo missing"
 # what the cron should point REPO at.
 git fetch origin --quiet || note "git fetch failed — running with the existing checkout"
 git checkout --quiet --detach origin/master || note "could not detach at origin/master — running with the existing checkout"
-note "specs at $(git log --oneline -1)"
+note "repo at $(git log --oneline -1) (this script and the expected-failures list)"
 
 # ── 1b. run the script step 1 just checked out, not the one bash opened ──────
 # bash reads a script as it executes it. When the checkout above changes THIS
@@ -154,8 +157,31 @@ else
 fi
 
 # ── 4. run the suite ─────────────────────────────────────────────────
+# The specs come from the commit the image under test was built from: the
+# server runs that commit, so its specs are the ones that describe it. Master's
+# can run ahead of the image. Measured 2026-10-20 (#2573): FR-115's billing
+# specs, merged nine minutes before the run, ran against an image that
+# predated them, and the lane filed a "regression" for a feature that had not
+# shipped. The SCRIPT and the expected-failures list stay master's, so a fix
+# to the lane itself still applies the same night. A tag that names no commit
+# this clone knows falls back to master's specs, and the log says so.
+SPEC_SRC="$REPO/ui"
+SPEC_TREE="$OUT/ui-at-image"
+IMG_SHA="${PRODTAG##*-}"
+if [[ "$PRODTAG" =~ ^hosted-[0-9]{8}-[0-9a-f]{7,40}$ ]] \
+  && IMG_COMMIT=$(git -C "$REPO" rev-parse --verify --quiet "${IMG_SHA}^{commit}"); then
+  if rm -rf "$SPEC_TREE" && mkdir -p "$SPEC_TREE" \
+    && git -C "$REPO" archive "$IMG_COMMIT" ui | tar -x -C "$SPEC_TREE"; then
+    SPEC_SRC="$SPEC_TREE/ui"
+    note "specs at ${IMG_COMMIT:0:9}, the commit ${PRODTAG} was built from ($(git -C "$REPO" rev-list --count "$IMG_COMMIT..HEAD") behind master)"
+  else
+    note "could not stage the specs at ${IMG_SHA}: running master's"
+  fi
+else
+  note "the image tag ${PRODTAG} names no commit this clone knows: running master's specs"
+fi
 WORK="$OUT/ui-work"
-rsync -a --delete --exclude node_modules --exclude dist --exclude test-results   --exclude playwright-report --exclude e2e/video "$REPO/ui/" "$WORK/"
+rsync -a --delete --exclude node_modules --exclude dist --exclude test-results   --exclude playwright-report --exclude e2e/video "$SPEC_SRC/" "$WORK/"
 # The sidecar keeps nothing between runs, so ship the tree and install there.
 kubectl -n "$NS" exec "$POD" -c pwrunner -- rm -rf /work
 kubectl -n "$NS" cp "$WORK" "$POD":/work -c pwrunner >/dev/null 2>&1   || fail_hard "could not copy the spec tree into the runner"
