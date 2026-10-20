@@ -349,14 +349,14 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1680`):
+(`updater.rs:1690`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|
-| `.msi` | `ProductVersion` in the `Property` table | the Windows Installer database API | `artifact_version.rs:429` |
-| `.deb` | `Version` in its control file, `0.4.142-1` — the Debian revision (cargo-deb's `-1`) and any epoch dropped, a `~` read back as `-` | `dpkg-deb --field`, from the dpkg the updater requires before it picks a `.deb` | `artifact_version.rs:287` |
-| `.pkg` | `version` on the component `PackageInfo`'s `<pkg-info identifier="com.roomler.agent">` | `pkgutil --expand` into a fresh directory | `artifact_version.rs:376` |
-| tarball | its one top directory, `roomlerd-<version>-<target>` | `tar -tzf`, which the tarball install runs anyway | `artifact_version.rs:333` |
+| `.msi` | `ProductVersion` in the `Property` table | the Windows Installer database API | `artifact_version.rs:482` |
+| `.deb` | `Version` in its control file, `0.4.142-1` — the Debian revision (cargo-deb's `-1`) and any epoch dropped, a `~` read back as `-` | `dpkg-deb --field`, from the dpkg the updater requires before it picks a `.deb` | `artifact_version.rs:288` |
+| `.pkg` | `version` on the component `PackageInfo`'s `<pkg-info identifier="com.roomler.agent">` | `pkgutil --expand` into a fresh directory | `artifact_version.rs:429` |
+| tarball | its one top directory, `roomlerd-<version>-<target>` | `tar -tzf`, which the tarball install runs anyway | `artifact_version.rs:386` |
 
 ```mermaid
 flowchart LR

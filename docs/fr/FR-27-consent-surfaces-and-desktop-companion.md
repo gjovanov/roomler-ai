@@ -106,7 +106,7 @@ Every line below was read on `origin/master` at `861d4557`.
    and exits, so there is nothing to wait for).
 9. **`companion::refresh_if_stale` is Windows-only** and nothing reports the
    companion's version to the server, so "Update all" cannot tell anyone the
-   desktop stayed behind. — `agents/roomlerd/src/companion.rs:65`
+   desktop stayed behind. — `agents/roomlerd/src/companion.rs:115`
 10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:529`),
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.
