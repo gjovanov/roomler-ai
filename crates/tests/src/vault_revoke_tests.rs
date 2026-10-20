@@ -24,7 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
-use crate::tunnel_tests::wait_agent_online;
+use crate::tunnel_tests::{wait_agent_offline, wait_agent_online};
 use crate::vault_lease_tests::{
     Device, RUNS_HIVE, TAKES_LEASES, ask, device, fresh_kek, rows, seed_vault, start,
 };
@@ -131,7 +131,10 @@ async fn secret_id(app: &TestApp, t: &SeededTenant, path: &str) -> String {
 
 /// Dial again as the same enrolled device: its next hello, with `rpc`, and
 /// a vault key — a new one when `new_key` (a restarted daemon), the old one
-/// otherwise (a reconnect of the same process) — when `with_key`.
+/// otherwise (a reconnect of the same process) — when `with_key`. The old
+/// connection's teardown is waited out first ([`wait_agent_offline`]); the
+/// vault takes nothing back when a device goes, so what a hello takes back
+/// is the same either way.
 async fn reconnect(
     app: &TestApp,
     t: &SeededTenant,
@@ -141,6 +144,7 @@ async fn reconnect(
     new_key: bool,
 ) {
     let _ = dev.ws.close(None).await;
+    wait_agent_offline(app, t, &dev.agent_id).await;
     if new_key {
         dev.key = crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng);
     }
