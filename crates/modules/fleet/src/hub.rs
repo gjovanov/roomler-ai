@@ -1338,6 +1338,7 @@ impl Hub {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1387,6 +1388,9 @@ impl Hub {
         // principal's verified login and checked the device advertises
         // `external-session`; `dispatch` always passes `None`.
         external: Option<roomler_ai_remote_control::signaling::ExternalGrant>,
+        // FR-115 P3 — how many remote sessions the device's organization may
+        // run at once (`DispatchCtx::org_session_cap`). `None` = no cap.
+        org_session_cap: Option<u32>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -1503,6 +1507,49 @@ impl Hub {
                 idle_secs: existing_idle_secs,
             });
             return Ok(existing_id);
+        }
+
+        // FR-115 P3 — the organization's concurrent-session cap. After the
+        // duplicate coalesce above (a retry on the same connection re-points
+        // at its own session and spends no slot), before the device's slot
+        // is taken below. Counted on this hub, the one that owns the device:
+        // under tenant affinity that is every live session of the device's
+        // org, and the cross-pod relay brings a request from the other pod
+        // here with its cap. It refuses only the NEW session; a live one is
+        // never ended (business-model §6 rule 4).
+        // ⚠️ The count and the insert below are not one atomic step, so two
+        // starts in the same instant can both pass: at worst an org runs one
+        // session over its plan for that session's life, which a plan fence
+        // can afford and a lock on every session start could not.
+        if let Some(cap) = org_session_cap {
+            let org = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .map(|a| a.tenant_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            let mut live: u32 = 0;
+            let mut holder: Option<(ObjectId, ObjectId)> = None;
+            for e in self.inner.sessions.iter() {
+                let s = e.value().lock();
+                if s.tenant_id == org && s.phase != SessionPhase::Closed {
+                    live = live.saturating_add(1);
+                    holder.get_or_insert((s.controller_user_id, s.agent_id));
+                }
+            }
+            if live >= cap {
+                let (holder_user, holder_agent) = holder.unwrap_or((controller_user_id, agent_id));
+                info!(
+                    org = %org.to_hex(), cap, live,
+                    controller = %controller_user_id.to_hex(), agent = %agent_id.to_hex(),
+                    "rc:session.request refused: the organization is at its plan's session cap"
+                );
+                return Err(Error::OrgSessionLimit {
+                    cap,
+                    holder_user: holder_user.to_hex(),
+                    holder_agent: holder_agent.to_hex(),
+                });
+            }
         }
 
         let (
@@ -3596,6 +3643,15 @@ pub struct DispatchCtx {
     /// session landing on the other pod would drop the ask. `None` = nothing
     /// asked. Ignored for non-request messages and agent-role dispatch.
     pub lock_on_end: Option<LockOnEnd>,
+    /// FR-115 P3 — how many remote sessions the DEVICE's organization may run
+    /// at once, from its plan and billed seats (`Tenant::limits`), resolved by
+    /// the API WS layer's authz gate. `create_session` counts the org's live
+    /// sessions on this hub — the one that owns the device, so the count is
+    /// the org's under tenant affinity — and refuses a new one at the cap.
+    /// ⚠️ The cross-pod relay carries it too, or a session landing on the
+    /// other pod would skip the cap. `None` = no cap (an unlimited plan, the
+    /// kill switch, or an unreadable tenant row: never refuse on a guess).
+    pub org_session_cap: Option<u32>,
 }
 
 impl Hub {
@@ -3695,6 +3751,9 @@ impl Hub {
                     // frame a controller sends can make a session external,
                     // or an external one ordinary.
                     None,
+                    // FR-115 P3 — the device org's session cap, from the
+                    // authz gate (or the relay, for the other pod).
+                    ctx.org_session_cap,
                 )?;
                 Ok(())
             }
@@ -4015,6 +4074,7 @@ mod tests {
             None,
             None,
             Some(grant.clone()),
+            None,
         )
         .unwrap();
         match ctl_rx.recv().await {
@@ -4403,6 +4463,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
             )
             .unwrap()
         };
@@ -4480,6 +4541,7 @@ mod tests {
                 idle,
                 None,
                 None, // external (FR-52 P4)
+                None,
             )
             .unwrap()
         };
@@ -4533,6 +4595,7 @@ mod tests {
             max_duration: None,
             idle_secs: None,
             lock_on_end: None,
+            org_session_cap: None,
         };
         hub.dispatch(
             &device,
@@ -4683,6 +4746,7 @@ mod tests {
             max_duration: None,
             idle_secs: None,
             lock_on_end: None,
+            org_session_cap: None,
         };
         let offer = || ClientMsg::SdpOffer {
             session_id: sid,
@@ -4800,6 +4864,7 @@ mod tests {
             max_duration: None,
             idle_secs: None,
             lock_on_end: None,
+            org_session_cap: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -4971,6 +5036,7 @@ mod tests {
             max_duration: None,
             idle_secs: None,
             lock_on_end: None,
+            org_session_cap: None,
         };
         let device = ctx_for(Role::Agent, None, Some(agent_id));
         let viewer = ctx_for(Role::Controller, Some(owner), None);
@@ -5119,6 +5185,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
             )
             .unwrap();
             match rx.try_recv().unwrap() {
@@ -5225,6 +5292,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
             )
             .unwrap()
         };
@@ -5398,6 +5466,7 @@ mod tests {
                 external.then(|| roomler_ai_remote_control::signaling::ExternalGrant {
                     attempt_id: "a1".into(),
                 }),
+                None,
             )
             .unwrap();
             let (granted, why) = match rx.try_recv().unwrap() {
@@ -5735,6 +5804,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
             )
             .unwrap();
             let (granted, refused) = match rx.try_recv().unwrap() {
@@ -5812,6 +5882,7 @@ mod tests {
             None,
             None,
             None, // external (FR-52 P4)
+            None,
         )
         .unwrap();
         match rx.try_recv().unwrap() {
@@ -6206,6 +6277,91 @@ mod tests {
         );
     }
 
+    /// FR-115 P3 — the org's concurrent-session cap. With a cap of one: a
+    /// second session to ANOTHER device of the same org is refused, naming a
+    /// session that holds the slot; a device of another org is not affected;
+    /// the holder's own retry on its connection coalesces instead of being
+    /// refused; ending the session frees the slot; and no cap (`None`, an
+    /// unlimited plan or the kill switch) refuses nothing.
+    #[tokio::test]
+    async fn the_org_session_cap_counts_live_sessions_of_the_devices_org() {
+        let hub = test_hub().await;
+        let org = ObjectId::new();
+        let (dev_a, dev_b, dev_other) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let _a = hub.register_agent(dev_a, org, ObjectId::new(), OsKind::Linux, 2, false, false);
+        let _b = hub.register_agent(dev_b, org, ObjectId::new(), OsKind::Linux, 2, false, false);
+        let _o = hub.register_agent(
+            dev_other,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            2,
+            false,
+            false,
+        );
+        let start = |agent: ObjectId, user: ObjectId, tx: ClientTx, cap: Option<u32>| {
+            hub.create_session_full(
+                agent,
+                user,
+                "user".into(),
+                tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                false,
+                None,
+                None,
+                false,
+                OrgPolicy::Read(SessionPolicy::default()),
+                None,
+                None,
+                None,
+                None,
+                cap,
+            )
+        };
+        let (holder, other_user) = (ObjectId::new(), ObjectId::new());
+        let (tx1, _rx1) = mpsc::channel(8);
+        let first = start(dev_a, holder, tx1.clone(), Some(1)).expect("the first session fits");
+
+        // A second session in the same org, to another device: refused.
+        let (tx2, _rx2) = mpsc::channel(8);
+        match start(dev_b, other_user, tx2.clone(), Some(1)) {
+            Err(Error::OrgSessionLimit {
+                cap,
+                holder_user,
+                holder_agent,
+            }) => {
+                assert_eq!(cap, 1);
+                assert_eq!(holder_user, holder.to_hex());
+                assert_eq!(holder_agent, dev_a.to_hex());
+            }
+            other => panic!("expected OrgSessionLimit, got {other:?}"),
+        }
+
+        // Another org's device keeps its own count.
+        let (tx3, _rx3) = mpsc::channel(8);
+        start(dev_other, other_user, tx3, Some(1)).expect("another org has its own count");
+
+        // The holder's retry on the same connection coalesces onto its session.
+        assert_eq!(start(dev_a, holder, tx1.clone(), Some(1)).unwrap(), first);
+
+        // Ending the session frees the slot for a new one.
+        let _ = hub.terminate(first, EndReason::ControllerHangup);
+        assert!(hub.session_snapshot(first).is_none());
+        start(dev_b, other_user, tx2, Some(1)).expect("the freed slot fits a new session");
+
+        // No cap refuses nothing, even with the org's one slot taken.
+        let (tx4, _rx4) = mpsc::channel(8);
+        start(dev_a, ObjectId::new(), tx4, None).expect("no cap, no refusal");
+    }
+
     /// #1045 — a DUPLICATE `rc:session.request` on the SAME controller
     /// connection (the viewer's reconnect ladder re-firing while the first
     /// session still awaits consent, on the same WS socket) must COALESCE onto
@@ -6382,6 +6538,7 @@ mod tests {
                 None,
                 None,
                 None, // external (FR-52 P4)
+                None,
             )
             .unwrap();
 

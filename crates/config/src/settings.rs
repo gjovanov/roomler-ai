@@ -970,6 +970,13 @@ pub struct RcSettings {
     /// Env: `ROOMLER__RC__REMOVAL_GOODBYE`.
     #[serde(default = "default_true")]
     pub removal_goodbye: bool,
+    /// FR-115 P3 — refuse a NEW remote session once the device's org runs as
+    /// many at once as its plan allows (Free: one, Pro: one per seat).
+    /// Default **true**. `false` is the kill switch: no cap, as before
+    /// FR-115. A live session is never ended either way.
+    /// Env: `ROOMLER__RC__ORG_SESSION_CAP`.
+    #[serde(default = "default_true")]
+    pub org_session_cap: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -998,6 +1005,7 @@ impl Default for RcSettings {
             token_generation_check: true,
             agent_token_ttl_secs: default_agent_token_ttl_secs(),
             removal_goodbye: true,
+            org_session_cap: true,
         }
     }
 }
@@ -1500,6 +1508,7 @@ impl Settings {
             .set_default("rc.token_generation_check", true)?
             .set_default("rc.agent_token_ttl_secs", 365 * 24 * 60 * 60)?
             .set_default("rc.removal_goodbye", true)?
+            .set_default("rc.org_session_cap", true)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

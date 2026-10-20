@@ -124,6 +124,7 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
         authz.max_duration,
         authz.idle_secs,
         authz.lock_on_end,
+        authz.org_session_cap,
         frame.dialed_tid,
         frame.conn_established_ms,
         frame.connection_id,
@@ -161,6 +162,8 @@ pub async fn dispatch_controller_rc(
     idle_secs: Option<u32>,
     // FR-99 P3b — the device's lock ask (the same gate).
     lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
+    // FR-115 P3 — the device org's concurrent-session cap (the same gate).
+    org_session_cap: Option<u32>,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -191,6 +194,7 @@ pub async fn dispatch_controller_rc(
         max_duration,
         idle_secs,
         lock_on_end,
+        org_session_cap,
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
@@ -243,6 +247,7 @@ pub async fn dispatch_controller_rc(
                     max_duration,
                     idle_secs,
                     lock_on_end,
+                    org_session_cap,
                     &frame_val,
                 )
                 .await
@@ -393,14 +398,72 @@ pub async fn dispatch_controller_rc(
         // Surface the failure to the controller so the UI can exit its
         // "Requesting session…" spinner instead of hanging. Best-effort —
         // the controller may already be closing.
+        let message = refusal_message(state, &e).await;
         let _ = controller_tx.try_send(ServerMsg::Error {
             session_id: error_session_id(&e),
             code: error_code(&e).to_string(),
-            message: e.to_string(),
+            message,
             open_nonce: None,
         });
     }
     true
+}
+
+/// The message a refused controller reads. `e.to_string()` for every error
+/// but FR-115's session cap, where the hub hands over only ids: those become
+/// who holds the slot and on which device, so the person asking can end
+/// that session or upgrade. A lookup that fails falls back to the plain
+/// sentence, never to an error of its own.
+pub(crate) async fn refusal_message(
+    state: &RemoteState,
+    e: &roomler_ai_remote_control::Error,
+) -> String {
+    let roomler_ai_remote_control::Error::OrgSessionLimit {
+        cap,
+        holder_user,
+        holder_agent,
+    } = e
+    else {
+        return e.to_string();
+    };
+    let who = match ObjectId::parse_str(holder_user) {
+        Ok(uid) => state
+            .users
+            .base
+            .find_by_id(uid)
+            .await
+            .ok()
+            .map(|u| u.display_name)
+            .filter(|n| !n.trim().is_empty()),
+        Err(_) => None,
+    };
+    let device = match ObjectId::parse_str(holder_agent) {
+        Ok(aid) => state
+            .fleet
+            .agents
+            .base
+            .find_by_id(aid)
+            .await
+            .ok()
+            .map(|a| a.display_name.unwrap_or(a.name))
+            .filter(|n| !n.trim().is_empty()),
+        Err(_) => None,
+    };
+    let at_a_time = if *cap == 1 {
+        "one remote session at a time".to_string()
+    } else {
+        format!("{cap} remote sessions at a time")
+    };
+    let holder = match (who, device) {
+        (Some(w), Some(d)) => format!("{w} is connected to {d} right now"),
+        (Some(w), None) => format!("{w} is in a session right now"),
+        (None, Some(d)) => format!("a session to {d} is open right now"),
+        (None, None) => "a session is open right now".to_string(),
+    };
+    format!(
+        "Your organization's plan runs {at_a_time}, and {holder}. End that session, \
+         or upgrade the plan for one remote session per user."
+    )
 }
 
 /// Result of the session authz gate: the effective consent mode plus a VALIDATED
@@ -453,6 +516,12 @@ pub struct SessionAuthz {
     /// owner and break-glass included: it describes the device, not who is
     /// asking. `None` when nothing is asked and on the early-out paths.
     pub lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
+    /// FR-115 P3 — how many remote sessions the device's org may run at once
+    /// ([`org_session_cap_of`]), counted by the hub that owns the device. It
+    /// binds every controller, the owner and break-glass included. `None`
+    /// for an unlimited plan, with the kill switch off, on the early-out
+    /// paths, and when the tenant row could not be read.
+    pub org_session_cap: Option<u32>,
 }
 
 impl SessionAuthz {
@@ -468,6 +537,7 @@ impl SessionAuthz {
             max_duration: None,
             idle_secs: None,
             lock_on_end: None,
+            org_session_cap: None,
         }
     }
     fn allow_with_input(
@@ -488,6 +558,7 @@ impl SessionAuthz {
             max_duration: None,
             idle_secs: None,
             lock_on_end: None,
+            org_session_cap: None,
         }
     }
     /// FR-85 P3 — set whether this allowed controller may record.
@@ -514,6 +585,21 @@ impl SessionAuthz {
         self.lock_on_end = lock_on_end;
         self
     }
+    /// FR-115 P3 — set the org's concurrent-session cap.
+    fn capped(mut self, org_session_cap: Option<u32>) -> Self {
+        self.org_session_cap = org_session_cap;
+        self
+    }
+}
+
+/// FR-115 P3 — an org's concurrent-session cap from its plan and billed seats
+/// (Free: one; Pro: one per seat); `None` for an unlimited plan.
+/// ESTABLISHED like the device cap: `plan_enforcement` does not soften it.
+/// It landed with no org over it (the FR-115 census: peaks of four and three,
+/// both on unlimited plans), so no grandfathering arises.
+pub(crate) fn org_session_cap_of(t: &roomler_ai_db::models::Tenant) -> Option<u32> {
+    let n = t.limits().max_concurrent_sessions;
+    (n != u32::MAX).then_some(n)
 }
 
 /// Authorization + consent-mode gate for `rc:session.request` — the Hub can't
@@ -599,6 +685,15 @@ pub async fn resolve_session_authz(
         tenant.as_ref().and_then(|t| t.settings.rc_limits.idle_secs),
         agent.access_policy.idle_limit_secs(),
     );
+    // FR-115 P3 — the org's concurrent-session cap, from its plan and billed
+    // seats; the hub that owns the device counts against it. A row we could
+    // not see is no cap (never refuse on a guess), and `rc.org_session_cap`
+    // is the kill switch.
+    let org_session_cap = if state.settings.rc.org_session_cap {
+        tenant.as_ref().and_then(org_session_cap_of)
+    } else {
+        None
+    };
     let tenant_name = tenant.map(|t| t.name);
 
     // Controlling your OWN device is always allowed. Whether it also
@@ -624,7 +719,8 @@ pub async fn resolve_session_authz(
         )
         .recording(true)
         .limited(max_duration, idle_secs)
-        .lock_ask(lock_on_end));
+        .lock_ask(lock_on_end)
+        .capped(org_session_cap));
     }
 
     // The effective mode for an allowed non-owner controller (attended default).
@@ -660,6 +756,10 @@ pub async fn resolve_session_authz(
                 // FR-99 P3b — and the lock ask: a forced session is the one
                 // whose end most needs the screen locked behind it.
                 lock_on_end,
+                // FR-115 P3 — and the org's session cap: break-glass is a
+                // session like any other, and the refusal names the session
+                // holding the slot, which an ADMINISTRATOR can end.
+                org_session_cap,
             });
         }
         return Ok(SessionAuthz::allow_with_input(
@@ -671,7 +771,8 @@ pub async fn resolve_session_authz(
         )
         .recording(true)
         .limited(max_duration, idle_secs)
-        .lock_ask(lock_on_end));
+        .lock_ask(lock_on_end)
+        .capped(org_session_cap));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -692,7 +793,8 @@ pub async fn resolve_session_authz(
         )
         .recording(may_record)
         .limited(max_duration, idle_secs)
-        .lock_ask(lock_on_end));
+        .lock_ask(lock_on_end)
+        .capped(org_session_cap));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
         return Ok(SessionAuthz::allow_with_input(
@@ -704,7 +806,8 @@ pub async fn resolve_session_authz(
         )
         .recording(may_record)
         .limited(max_duration, idle_secs)
-        .lock_ask(lock_on_end));
+        .lock_ask(lock_on_end)
+        .capped(org_session_cap));
     }
     let role_ids = state
         .tenants
@@ -721,7 +824,8 @@ pub async fn resolve_session_authz(
         )
         .recording(may_record)
         .limited(max_duration, idle_secs)
-        .lock_ask(lock_on_end));
+        .lock_ask(lock_on_end)
+        .capped(org_session_cap));
     }
     Err("you're not on this device's control allowlist".to_string())
 }
@@ -734,6 +838,9 @@ pub fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
         AgentOffline(_) => "agent_offline",
         AgentNotFound(_) => "agent_not_found",
         AgentBusy => "agent_busy",
+        // FR-115 P3 — a code of its own: the action is "end a session or
+        // upgrade", not "the device is busy", and the viewer must not retry.
+        OrgSessionLimit { .. } => "org_session_limit",
         SessionNotFound(_) => "session_not_found",
         BadPhase(_, _) => "bad_phase",
         ConsentDenied => "consent_denied",

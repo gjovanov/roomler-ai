@@ -709,6 +709,15 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
       return 'This device is offline. Check that it is powered on and connected.'
     case 'agent_busy':
       return 'This device has reached its concurrent session limit. Try again in a moment.'
+    // FR-115 P3 — the org's plan cap on sessions at once. The server's
+    // sentence names who holds the slot and on which device (our own
+    // words, built from names, never internals), so it is shown as is.
+    // Not retryable: waiting does not free a slot someone is using.
+    case 'org_session_limit':
+      return (
+        (typeof serverMessage === 'string' && serverMessage)
+        || "Your organization's plan runs one remote session at a time, and one is open now. End it, or upgrade the plan for one remote session per user."
+      )
     case 'forbidden':
       return 'You do not have permission to control this device.'
     case 'invalid_token':

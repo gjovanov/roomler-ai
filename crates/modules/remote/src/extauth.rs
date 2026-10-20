@@ -946,6 +946,7 @@ pub async fn handle_session(
         Some(ExternalGrant {
             attempt_id: attempt_id.clone(),
         }),
+        None,
     );
     match session {
         Ok(session_id) => {
