@@ -307,7 +307,7 @@ room is piped across workers. That is O4.
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
 | P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | 🟡 merged #2583 (`5679857cc`); AC9 on prod waits for the promote; the SFU measurement found nothing to measure (O4) |
 | P6 | Announcement email to real users, once P1 + P2 are live | — | ⬜ |
-| P7 | **Docs**: `business-model.md` (§4 ladder, §6 rule 4, §7), `compare/vs-tailscale.md`, a plans-and-limits page, with diagrams, linked from `docs/README.md` | — | ⬜ |
+| P7 | **Docs**: `business-model.md` (§4 ladder, §6 rule 4, §7), `compare/vs-tailscale.md`, a plans-and-limits page, with diagrams, linked from `docs/README.md` | — | 🟡 `business-model.md` and `vs-tailscale.md` landed with P0/P1; [`plans-and-limits.md`](../plans-and-limits.md) in review; P4's docs come with P4 |
 
 ## Acceptance criteria
 
