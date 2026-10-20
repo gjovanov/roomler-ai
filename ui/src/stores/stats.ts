@@ -134,8 +134,26 @@ export interface ResourcesPayload {
     basis?: string
     window?: string
   } | null
-  /** null until quotas exist; the slot renders dark rather than as satisfied */
-  quota?: unknown | null
+  /** null where plans are not sold; the slot renders dark rather than as satisfied */
+  quota?: { relay?: RelayAllowance | null } | null
+}
+
+/**
+ * FR-115 P4a — the org's relay allowance this month, by the throttle's own
+ * arithmetic: bytes relayed through DERP since the first of the month (UTC)
+ * against the plan's allowance for its seats. Units, never money.
+ */
+export interface RelayAllowance {
+  month_start: string
+  resets_at: string
+  used_bytes: number
+  /** null = the plan has no allowance (unlimited) */
+  allowance_bytes: number | null
+  /** the rate past the allowance: relay slows to it, it is never cut off */
+  rate_kbps: number | null
+  /** the throttle is on for this deployment; off, the allowance is only shown */
+  enforced: boolean
+  throttled: boolean
 }
 
 export interface OrgsPayload {
