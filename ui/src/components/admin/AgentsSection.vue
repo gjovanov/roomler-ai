@@ -730,13 +730,13 @@
                     <dl class="device-card__facts text-caption">
                       <template v-if="item.overlay_ip">
                         <dt>Overlay</dt>
-                        <dd class="font-mono">
+                        <dd class="text-mono">
                           {{ item.overlay_ip }}<br />{{ deriveOverlayV6(item.overlay_ip) }}
                         </dd>
                       </template>
                       <template v-if="item.magic_dns_fqdn || item.magic_dns_name">
                         <dt>MagicDNS</dt>
-                        <dd class="font-mono">
+                        <dd class="text-mono">
                           {{ item.magic_dns_fqdn || item.magic_dns_name }}
                           <v-btn
                             v-if="item.magic_dns_fqdn"
@@ -754,12 +754,12 @@
                            chip. -->
                       <template v-if="item.overlay_public_key">
                         <dt>Overlay key</dt>
-                        <dd class="font-mono">
+                        <dd class="text-mono">
                           {{ item.overlay_public_key.slice(0, 10) }}… · epoch {{ item.overlay_key_epoch ?? 0 }}
                         </dd>
                       </template>
                       <dt>Device ID</dt>
-                      <dd class="font-mono">
+                      <dd class="text-mono">
                         {{ shortId(item.id) }}
                         <v-btn
                           :icon="copiedAgentId === item.id ? 'mdi-check' : 'mdi-content-copy'"
@@ -772,12 +772,12 @@
                         />
                       </dd>
                       <dt>Machine ID</dt>
-                      <dd class="font-mono">{{ shortId(item.machine_id) }}</dd>
+                      <dd class="text-mono">{{ shortId(item.machine_id) }}</dd>
                       <!-- FR-100 P1a — the device's own key, as a person reads
                            it, so what a browser pins can be checked here. -->
                       <template v-if="agentFor(item)?.peer_auth_fingerprint">
                         <dt>Device key</dt>
-                        <dd class="font-mono">{{ agentFor(item)!.peer_auth_fingerprint }}</dd>
+                        <dd class="text-mono">{{ agentFor(item)!.peer_auth_fingerprint }}</dd>
                       </template>
                       <template v-if="agentFor(item) && codecChips(agentFor(item)!).length > 0">
                         <dt>Codecs</dt>
