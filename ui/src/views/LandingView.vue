@@ -4,21 +4,47 @@
   <v-theme-provider theme="light">
   <div class="landing-page">
     <!-- Navbar -->
+    <!-- FR-116: below 960 px the section links live in a ☰ menu (with Log In,
+         on a phone) — they were hidden there with no other way to reach them,
+         and the bar still squeezed the wordmark to "Roo". From 960 px up the
+         bar is unchanged. -->
     <v-app-bar flat color="transparent" class="landing-nav">
-      <v-toolbar-title class="font-weight-bold text-h5">
+      <v-toolbar-title class="font-weight-bold text-h5 flex-0-0">
         <img :src="BRAND_LOGO_LIGHT" alt="Roomler" width="127" height="36" class="landing-brand-logo" />
       </v-toolbar-title>
       <v-spacer />
-      <v-btn variant="text" href="#features" class="d-none d-sm-inline-flex">Features</v-btn>
-      <v-btn variant="text" href="#download" class="d-none d-sm-inline-flex">Download</v-btn>
-      <v-btn variant="text" href="#pricing" class="d-none d-sm-inline-flex">Pricing</v-btn>
+      <v-btn variant="text" href="#features" class="d-none d-md-inline-flex">Features</v-btn>
+      <v-btn variant="text" href="#download" class="d-none d-md-inline-flex">Download</v-btn>
+      <v-btn variant="text" href="#pricing" class="d-none d-md-inline-flex">Pricing</v-btn>
       <!-- FR-60: `href`, not `:to` — /docs is statically generated HTML served
            by nginx, not a route in this SPA's router. A router-link would
            resolve to the 404 view. -->
       <v-btn variant="text" href="/docs/" class="d-none d-md-inline-flex">Docs</v-btn>
-      <v-btn variant="outlined" color="primary" :to="{ name: 'login' }" class="mx-2">Log In</v-btn>
+      <v-btn variant="outlined" color="primary" :to="{ name: 'login' }" class="mx-2 d-none d-sm-inline-flex">Log In</v-btn>
       <v-btn color="primary" :to="{ name: 'register' }" class="d-none d-sm-inline-flex">Get Started Free</v-btn>
       <v-btn color="primary" :to="{ name: 'register' }" class="d-sm-none" size="small">Sign Up</v-btn>
+      <v-menu location="bottom end">
+        <template #activator="{ props: menuProps }">
+          <v-btn
+            v-bind="menuProps"
+            icon="mdi-menu"
+            variant="text"
+            class="d-md-none ml-1"
+            aria-label="Menu"
+            data-testid="landing-menu"
+          />
+        </template>
+        <v-list density="comfortable" min-width="200">
+          <v-list-item href="#features" title="Features" />
+          <v-list-item href="#download" title="Download" />
+          <v-list-item href="#pricing" title="Pricing" />
+          <v-list-item href="/docs/" title="Docs" />
+          <template v-if="xs">
+            <v-divider class="my-1" />
+            <v-list-item :to="{ name: 'login' }" title="Log In" prepend-icon="mdi-login" />
+          </template>
+        </v-list>
+      </v-menu>
     </v-app-bar>
 
     <!-- Hero -->
@@ -229,6 +255,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import { useDisplay } from 'vuetify'
 import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
@@ -240,6 +267,9 @@ import VideoFacade from '@/components/common/VideoFacade.vue'
 import videoTourPoster from '@/assets/tutorial/video-C1YdfmhbAKM.jpg'
 
 const route = useRoute()
+// FR-116 — on a phone Log In moves into the ☰ menu, leaving the bar the
+// wordmark, Sign Up and the menu.
+const { xs } = useDisplay()
 
 // FR-87: the copy and the plan table live in `@/utils/landing`, shared with
 // the static homepage the docs generator writes for `/`.
