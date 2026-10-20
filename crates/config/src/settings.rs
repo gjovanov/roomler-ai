@@ -61,6 +61,9 @@ pub struct Settings {
     /// #1731 — the stall watchdog. Absent ⇒ on, with its defaults.
     #[serde(default)]
     pub diag: DiagSettings,
+    /// FR-115 P5 — the plan's meeting-length cap. Absent ⇒ on.
+    #[serde(default)]
+    pub meetings: MeetingsSettings,
 }
 
 /// FR-90 P3-1 — `[vault]`, env `ROOMLER__VAULT__*`.
@@ -283,6 +286,29 @@ impl Default for DiagSettings {
             stall_watchdog: None,
             stall_threshold_secs: diag_default_threshold_secs(),
             stall_dump_dir: diag_default_dump_dir(),
+        }
+    }
+}
+
+/// FR-115 P5 — `[meetings]`, env `ROOMLER__MEETINGS__*`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MeetingsSettings {
+    /// A plan's meeting-length cap: a Free meeting is warned five minutes
+    /// before its sixty and ended at them. `false` lets every meeting run
+    /// as long as it likes — the P5 kill switch. Default **on**.
+    /// Env: `ROOMLER__MEETINGS__FREE_CAP`.
+    #[serde(default = "meetings_default_on")]
+    pub free_cap: bool,
+}
+
+fn meetings_default_on() -> bool {
+    true
+}
+
+impl Default for MeetingsSettings {
+    fn default() -> Self {
+        Self {
+            free_cap: meetings_default_on(),
         }
     }
 }

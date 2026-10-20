@@ -501,6 +501,9 @@ fn test_settings() -> Settings {
         // #1731 — inert here: the stall watchdog is armed by the binary's
         // `main`, which these in-process servers never run.
         diag: roomler_ai_config::DiagSettings::default(),
+        // FR-115 P5 — the meeting cap ON, as a deployment without
+        // `[meetings]`; the tests drive its sweep by hand.
+        meetings: roomler_ai_config::MeetingsSettings::default(),
         // P2b — blocks OFF by default, exactly like a fresh deployment. The
         // renumber tests carve explicitly; the block-carve test flips the
         // flag via `spawn_with_settings`.
