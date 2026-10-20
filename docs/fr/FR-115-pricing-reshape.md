@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
-| **Status** | in progress — P0 and P0-ops done 2026-10-19; P1+P2 and P3 merged 2026-10-20, not yet promoted; P5 in review |
+| **Status** | in progress — P0 and P0-ops done 2026-10-19; P1+P2, P3, P5 and the EUR guard merged 2026-10-20, not yet promoted |
 | **Arc** | P3 of the pricing sequence in [`../business-model.md`](../business-model.md) §5 (enforce → meter → **reshape** → keys) |
 | **Related** | [FR-32](FR-32-plan-limit-enforcement.md) (the one decision point), [FR-20](FR-20-per-tenant-relay-cost-metering.md) (the ledger), [FR-19](FR-19-peer-relays.md) (org relays), [FR-52](FR-52-cross-org-remote-access.md) (support sessions to other orgs), [FR-102](FR-102-growth-observability.md) (revenue view) |
 | **Private annex** | `roomler-ai-docs/gtm/pricing/FR-115-annex-census-2026-10-19.md` — per-org census, account counts, competitor detail |
@@ -124,6 +124,25 @@ allowances (concurrency, relay, storage) need the billed seat count, so the tena
 `BillingInfo` gains `seats` (the subscription quantity, written by the webhook) and the
 limits are computed from `(plan, seats)`. Free has no seats; a paid org whose webhook has not
 landed yet is computed at one seat, the floor, so a missing number can only under-grant.
+
+### Plans bind only where they are sold
+
+Every org is created on `free` (`crates/services/src/dao/tenant.rs:284`), on every server.
+On the hosted service that is a plan; on a self-hosted server it is only the absence of
+one. So `Core::plans_sold` (`crates/core/src/state.rs:127`) is true only where the hosted
+`saas` module is compiled in and switched on (`crates/api/src/state.rs:285`). The published
+self-host image and the compose build are both built without it. With it false, the one
+decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
+two fences that read the plan outside it stand down too: the session cap
+(`crates/modules/remote/src/controller.rs:698`) and the meeting sweep
+(`crates/modules/conference/src/meeting_cap.rs:104`).
+
+⚠️ Found while documenting P5, after P1 and P3 had merged. Without the flag, P1's
+established member cap, P3's one session at a time and P5's 60-minute meeting would have
+bound every self-hosted org from the next self-host image on. By the same code, the device
+cap had bound self-hosted orgs since FR-32 (three devices), which the README's "unlimited
+devices" contradicted. The self-host image is published by hand, last on 2026-10-12, so no
+self-hosted server ran any of FR-115's caps.
 
 ### Per-seat checkout and the quantity sync
 
@@ -286,7 +305,7 @@ room is piped across workers. That is O4.
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | coturn flag off | ⬜ |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
-| P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | 🟡 in review (#2583); the SFU measurement found nothing to measure (O4) |
+| P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | 🟡 merged #2583 (`5679857cc`); AC9 on prod waits for the promote; the SFU measurement found nothing to measure (O4) |
 | P6 | Announcement email to real users, once P1 + P2 are live | — | ⬜ |
 | P7 | **Docs**: `business-model.md` (§4 ladder, §6 rule 4, §7), `compare/vs-tailscale.md`, a plans-and-limits page, with diagrams, linked from `docs/README.md` | — | ⬜ |
 
@@ -328,3 +347,4 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-19 | P0-ops — the orphaned orgs | Selection: a missing owner account, outside the exclusion set, no live member, and no devices, overlay, messages or files: **62**, all created 2026-02. Exported with their 100 memberships, 62 rooms, 83 room members and 310 roles to a private backup on the ops host, and the file checked before any write. Recomputed at write time and matched the backup (62 = 62); `deleted_at` + `is_archived` set on 62 of 62. Live orgs went from 77 to 15 |
 | 2026-10-19 | Found while building P2 | Two live billing bugs beyond the ones in *Root cause*. (1) A Pro org's "Switch to Business" ran a **second checkout**, which starts a second subscription: two bills. (2) `customer.subscription.updated` wrote only the status, so a plan changed in Stripe's portal **never reached the org**. Both fixed in P2: a live subscription refuses checkout (409) and changes go through `change-plan`; the webhook maps the price to the plan. No org's billing record shows a second subscription |
 | 2026-10-20 | P5's SFU measurement — read-only prod census of `call_sessions` and `stats_call`, 30 and 90 days | **Nothing to measure**: too little conferencing in the window to fit a unit cost from, so `sfu_participant_hour` stays unverified. Neither fence would have changed a meeting in it — none on a capped plan ran past 60 minutes or held more than 10 people. Counts in the private annex; the consequence is O4 |
+| 2026-10-20 | Found while documenting P5 | **Plan limits bound self-hosted servers.** Every org is created `free`, and nothing exempted a server that sells no plans. P1's member cap, P3's session cap and P5's meeting cap would have reached self-hosters with the next self-host image (published by hand, last on 2026-10-12, so none did); the device cap always had. Fixed by `Core::plans_sold` (*Plans bind only where they are sold*), with an integration test per fence on a server without `saas` |

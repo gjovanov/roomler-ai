@@ -341,6 +341,24 @@ async fn a_sweep_never_touches_the_next_meeting_in_the_room() {
     assert!(!rooms.end_call_if_current(oid(rid), second).await.unwrap());
 }
 
+/// A server without the hosted `saas` module sells no plans (the self-hosted
+/// image is built that way), so no meeting on it ends on a plan's clock.
+#[tokio::test]
+async fn a_server_that_sells_no_plans_ends_no_meeting() {
+    let app = TestApp::spawn_with_settings(|s| s.modules.saas = false).await;
+    let t = app.seed_tenant("capselfhost").await;
+    let (tid, rid, token) = (&t.tenant_id, &t.rooms[0].id, &t.admin.access_token);
+    let call = start_call(&app, tid, rid, token).await;
+
+    started_ago(&app, rid, 61).await;
+    let swept = meeting_cap::sweep(conf(&app), DateTime::now()).await;
+    assert_eq!(swept, meeting_cap::Swept::default());
+    let r = room(&app, rid).await;
+    assert_eq!(r.get_str("conference_status").unwrap(), "in_progress");
+    assert_eq!(r.get_object_id("current_call_id").unwrap(), call);
+    assert!(r.get("cap_warned_call_id").is_none());
+}
+
 #[tokio::test]
 async fn the_kill_switch_lets_a_free_meeting_run() {
     let app = TestApp::spawn_with_settings(|s| s.meetings.free_cap = false).await;

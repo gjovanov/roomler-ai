@@ -326,6 +326,15 @@ re-enroll.
 
 ---
 
+## No plan limits
+
+A self-hosted server holds no organization to a plan limit: no device or user
+count, no cap on concurrent remote sessions, no meeting length. Plans are sold only
+by the hosted service, through a module the self-hosted image is built without.
+Every organization still shows `free` in the database, because nobody sold it
+anything; on this server that name carries no limits (`Core::plans_sold`,
+[FR-115](fr/FR-115-pricing-reshape.md)).
+
 ## Known limitations, stated plainly
 
 - **No prebuilt image yet.** First run compiles from source. Tracked in
