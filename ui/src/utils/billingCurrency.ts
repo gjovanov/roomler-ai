@@ -23,6 +23,15 @@ export function currenciesOnSale(plans: Array<{ prices?: Array<{ currency: Curre
   return seen
 }
 
+/** Whether annual billing is on sale: a PAID plan lists a yearly price. A
+ * free plan's yearly entry is not a sale, and counting it put an Annual
+ * toggle on the page while nothing was sold annually (prod, 2026-10-20). */
+export function annualOnSale(
+  plans: Array<{ price_cents: number; prices?: Array<{ interval: string }> }>,
+): boolean {
+  return plans.some((p) => p.price_cents > 0 && (p.prices || []).some((x) => x.interval === 'year'))
+}
+
 /** A subscription's own currency; else the person's choice while it is on
  * sale; else the first currency that is. Nothing listed yet: the choice. */
 export function shownCurrency(choice: Currency, onSale: Currency[], subscription?: Currency | null): Currency {

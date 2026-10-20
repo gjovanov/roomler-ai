@@ -217,6 +217,8 @@ export const FALLBACK_PLANS: Plan[] = [
 
 /** FR-115 — the annual line under a paid price: ten months for twelve. */
 export function annualLine(plan: Plan): string | null {
+  // A free plan has nothing to save by the year: never "or $0 per user per year".
+  if (plan.price_cents <= 0) return null
   const year = (plan.prices || []).find((p) => p.interval === 'year' && p.currency === 'usd')
   if (!year) return null
   const eur = (plan.prices || []).find((p) => p.interval === 'year' && p.currency === 'eur')
