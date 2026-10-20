@@ -159,9 +159,19 @@ describe('priceLabel', () => {
   it('matches what the SPA shows', () => {
     const plan = (price_cents: number) => ({ id: 'x', name: 'X', price_cents, features: [] })
     expect(priceLabel(plan(0))).toEqual({ amount: '$0', unit: 'forever' })
-    // FR-115 — the same number in USD and EUR, per user per month.
-    expect(priceLabel(plan(800))).toEqual({ amount: '$8', unit: '/ €8 per user / month' })
-    expect(priceLabel(plan(1250))).toEqual({ amount: '$12.50', unit: '/ €12.50 per user / month' })
+    // FR-115 — per user per month; no euro figure until EUR is on sale.
+    expect(priceLabel(plan(800))).toEqual({ amount: '$8', unit: 'per user / month' })
+    expect(priceLabel(plan(1250))).toEqual({ amount: '$12.50', unit: 'per user / month' })
+    // Once the plan lists an EUR price, the same number in both currencies.
+    const withEur = (price_cents: number) => ({
+      ...plan(price_cents),
+      prices: [
+        { interval: 'month' as const, currency: 'usd' as const, unit_amount: price_cents },
+        { interval: 'month' as const, currency: 'eur' as const, unit_amount: price_cents },
+      ],
+    })
+    expect(priceLabel(withEur(800))).toEqual({ amount: '$8', unit: '/ €8 per user / month' })
+    expect(priceLabel(withEur(1250))).toEqual({ amount: '$12.50', unit: '/ €12.50 per user / month' })
   })
 })
 
@@ -336,7 +346,8 @@ describe('home.js — live prices', () => {
     await settle()
     const card = doc.querySelector('[data-plan="pro"]')!
     expect(card.querySelector('[data-price]')!.textContent).toBe('$12.50')
-    expect(card.querySelector('[data-unit]')!.textContent).toBe('/ €12.50 per user / month')
+    // No EUR price from this server: no euro figure (FR-115).
+    expect(card.querySelector('[data-unit]')!.textContent).toBe('per user / month')
     const items = [...card.querySelectorAll('[data-features] li')]
     expect(items.map((li) => li.textContent)).toEqual(['Alpha', '<b>Beta</b>']) // text, never markup
     expect(items.every((li) => li.querySelector('svg'))).toBe(true)
@@ -363,6 +374,8 @@ describe('home.js — live prices', () => {
     const annual = doc.querySelector('[data-plan="pro"] [data-annual]') as HTMLElement
     expect(annual.hidden).toBe(false)
     expect(annual.textContent).toBe('or $80 / €80 per user per year (two months free)')
+    // EUR on sale: the monthly label carries the euro figure too.
+    expect(doc.querySelector('[data-plan="pro"] [data-unit]')!.textContent).toBe('/ €8 per user / month')
   })
 
   it('keeps the fallback table when the answer is unusable', async () => {

@@ -156,7 +156,9 @@ export const PRICING = {
   title: 'Simple, per-user pricing',
   lead:
     'Free for up to 10 users and 100 devices, and that includes commercial use. ' +
-    'Paid plans are per user, monthly or yearly (two months free), in USD or EUR.',
+    // FR-115 — no interval or currency named here: each card says what the
+    // server has on sale (`/api/stripe/plans`), which a static line cannot.
+    'Paid plans are priced per user.',
 }
 
 /**
