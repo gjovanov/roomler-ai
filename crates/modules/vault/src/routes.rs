@@ -32,7 +32,7 @@ use axum::{
 };
 use bson::{DateTime, Document, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::vault::RevokeReason;
+use roomler_ai_remote_control::vault::{RevokeReason, providers};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::parse_tid};
 use serde::{Deserialize, Serialize};
@@ -44,8 +44,8 @@ use crate::VaultState;
 use crate::crypto::{Binding, KekState};
 use crate::dao::{MAX_VERIFY, VersionMeta, is_path_taken};
 use crate::model::{
-    FieldState, KIND_STATIC, KIND_STRUCTURED, KINDS, VaultAuditEvent, VaultSecret, VaultVersion,
-    binary,
+    FieldState, KIND_DYNAMIC, KIND_STATIC, KIND_STRUCTURED, KINDS, VaultAuditEvent, VaultSecret,
+    VaultVersion, binary,
 };
 use crate::rrn::{STATIC_FIELD, check_field, check_path, check_tag, secret_rrn};
 
@@ -244,6 +244,9 @@ pub struct SecretView {
     pub rrn: String,
     pub path: String,
     pub kind: String,
+    /// P3-6b — a dynamic secret's provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub description: String,
     /// The fields that hold a value, and which version is current.
     pub fields: Vec<FieldView>,
@@ -272,6 +275,7 @@ impl SecretView {
             rrn: secret_rrn(slug, &s.path),
             path: s.path.clone(),
             kind: s.kind.clone(),
+            provider: s.provider.clone(),
             description: s.description.clone(),
             fields: s
                 .fields
@@ -497,6 +501,9 @@ pub async fn list(
 pub struct CreateSecret {
     pub path: String,
     pub kind: String,
+    /// P3-6b — a dynamic secret's provider, and only a dynamic secret's.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -536,6 +543,35 @@ pub async fn create(
     }
     check_description(&body.description)?;
     check_entries("audiences", &body.audiences)?;
+    // P3-6b — a dynamic secret names a provider this build knows, and one
+    // audience; no other kind names a provider at all.
+    let provider = match (body.kind.as_str(), &body.provider) {
+        (KIND_DYNAMIC, Some(p)) => {
+            let Some(p) = providers::named(p) else {
+                return Err(ApiError::BadRequest(format!(
+                    "provider must be one of {}",
+                    providers::ALL
+                        .iter()
+                        .map(|p| p.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            };
+            crate::dynamic::check_audiences(&body.audiences).map_err(ApiError::BadRequest)?;
+            Some(p.name.to_string())
+        }
+        (KIND_DYNAMIC, None) => {
+            return Err(ApiError::BadRequest(
+                "a dynamic secret names its provider".into(),
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "only a dynamic secret names a provider".into(),
+            ));
+        }
+        (_, None) => None,
+    };
     check_programs(&body.exec_allow)?;
     check_tags(&body.tags)?;
     if let Some(d) = body.rotation_days {
@@ -555,6 +591,7 @@ pub async fn create(
         tenant_id: tid,
         path: path.to_string(),
         kind: body.kind.clone(),
+        provider,
         description: body.description.clone(),
         fields: Default::default(),
         audiences: body.audiences.clone(),
@@ -677,6 +714,12 @@ pub async fn update(
     }
 
     let secret = live_secret(&state, tid, id).await?;
+    // P3-6b — a dynamic secret keeps its one audience.
+    if secret.kind == KIND_DYNAMIC
+        && let Some(a) = &body.audiences
+    {
+        crate::dynamic::check_audiences(a).map_err(ApiError::BadRequest)?;
+    }
     let slug = org_slug(&state, tid).await?;
     ask.rrn = Some(secret_rrn(&slug, &secret.path));
     record_allow(&state, tid, &auth, &ask).await?;
@@ -792,6 +835,18 @@ async fn put_value_inner(
                 )));
             }
         }
+        // P3-6b — the issuer's fields, as its provider names them.
+        KIND_DYNAMIC => match crate::dynamic::provider_of(&secret) {
+            Some(p) => {
+                crate::dynamic::check_issuer_field(p, field).map_err(ApiError::BadRequest)?
+            }
+            None => {
+                return Err(ApiError::BadRequest(format!(
+                    "this server cannot write a secret of provider {}",
+                    secret.provider.as_deref().unwrap_or("")
+                )));
+            }
+        },
         other => {
             return Err(ApiError::BadRequest(format!(
                 "this server cannot write a secret of kind {other}"
@@ -861,9 +916,15 @@ async fn put_value_inner(
         }
         return Err(ApiError::NotFound("no such secret".into()));
     }
-    // P3-3c — the field's leases of older versions are taken back.
-    crate::revoke::secret_changed(state, id, Some(field), Some(n), RevokeReason::ValueChanged)
-        .await;
+    // P3-3c — the field's leases of older versions are taken back; (P3-6b)
+    // a dynamic secret's, every lease of it, since each bundle carried every
+    // field.
+    if secret.kind == KIND_DYNAMIC {
+        crate::revoke::secret_changed(state, id, None, None, RevokeReason::ValueChanged).await;
+    } else {
+        crate::revoke::secret_changed(state, id, Some(field), Some(n), RevokeReason::ValueChanged)
+            .await;
+    }
     if n > KEEP_VERSIONS
         && let Err(e) = state.versions.prune(id, field, n - KEEP_VERSIONS + 1).await
     {

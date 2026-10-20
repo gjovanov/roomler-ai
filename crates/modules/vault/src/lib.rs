@@ -38,6 +38,7 @@ use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCt
 pub mod approval;
 pub mod crypto;
 pub mod dao;
+pub mod dynamic;
 pub mod gate;
 pub mod lease;
 pub mod meta;
@@ -78,6 +79,9 @@ pub struct VaultState {
     pub approvals: Arc<dao::VaultApprovalDao>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
+    /// P3-6b — the providers a dynamic secret is leased for
+    /// (`vault.providers`).
+    pub providers: Arc<dynamic::ProviderScope>,
     /// The KEK, or why there is none: read once at boot.
     pub kek: crypto::KekState,
 }
@@ -111,6 +115,8 @@ impl Module for VaultState {
         let db = &core.db;
         let scope = scope::TenantScope::parse(&settings.vault.tenants);
         scope.log();
+        let providers = dynamic::ProviderScope::parse(&settings.vault.providers);
+        providers.log();
         // Never a boot refusal: a missing or unusable KEK leaves the
         // metadata routes working and answers 503 where the key is needed.
         let kek = crypto::KekState::load(&settings.vault);
@@ -130,6 +136,7 @@ impl Module for VaultState {
             activity_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             approvals: Arc::new(dao::VaultApprovalDao::new(db)),
             scope: Arc::new(scope),
+            providers: Arc::new(providers),
             kek,
             core,
         };

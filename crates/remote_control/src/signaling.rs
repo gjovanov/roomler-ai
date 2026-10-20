@@ -4547,10 +4547,17 @@ pub enum ServerMsg {
         /// The vault's id for this lease (`vault_leases.lease_id`).
         lease_id: String,
         /// The version leased, as the vault numbers a field's versions.
+        /// `0` for a dynamic secret's bundle, which spans its fields.
         n: i64,
         sealed: String,
         /// When the device must drop it.
         expires_at_ms: i64,
+        /// P3-6b — a dynamic secret's provider (`crate::vault::providers`).
+        /// Then `sealed` opens to a bundle, a JSON object of the issuer's
+        /// fields, for the device to mint with. Absent for a stored value,
+        /// as from every earlier server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
 
     /// FR-90 P3-3b — the vault refused a lease, in one word from

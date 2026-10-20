@@ -47,6 +47,8 @@
 //! there is no session to name yet, and a device's flood of them must not
 //! become audit rows.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use base64::Engine;
 use bson::{DateTime, oid::ObjectId};
@@ -55,29 +57,33 @@ use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
 use roomler_ai_remote_control::{
     models::{Agent, OsKind, RpcCap},
     signaling::{ClientMsg, ServerMsg},
-    vault::{LeaseRefusal, VaultActivityKind, lease_limits, program_name_ok},
+    vault::{LeaseRefusal, VaultActivityKind, lease_limits, program_name_ok, providers::Provider},
 };
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use crate::VaultState;
 use crate::approval::{self, Next};
 use crate::crypto::{self, Binding};
 use crate::dao::ApprovalKey;
-use crate::model::{VaultActivity, VaultAuditEvent, VaultLease, VaultSecret};
+use crate::dynamic;
+use crate::model::{KIND_DYNAMIC, VaultActivity, VaultAuditEvent, VaultLease, VaultSecret};
 use crate::policy::{self, Ask, DeviceFacts, SecretFacts, SessionFacts, Verdict};
 use crate::policy_routes::decide_for_org;
 use crate::revoke;
 use crate::rrn;
 
-/// The modes a lease may be asked in: those that hand the daemon the STORED
-/// value. `identity` releases nothing (the session authenticates as itself),
-/// `short-lived` mints a credential rather than reading one (P3-6), and
-/// `placeholder` is P3b's: a lease in any of them would release a value the
-/// policy that permits the mode never meant to.
-pub const LEASE_MODES: &[&str] = &["proxy", "file", "env", "exec"];
+/// The modes a lease may be asked in: those that hand the daemon a STORED
+/// value, and (P3-6b) `short-lived`, which hands it a dynamic secret's
+/// issuer to mint a credential with. `identity` releases nothing (the
+/// session authenticates as itself), and `placeholder` is P3b's: a lease in
+/// either would release a value the policy that permits the mode never
+/// meant to. Which kind each mode leases is the guardrails' to decide
+/// (`dynamic-only-short-lived`, `short-lived-only-dynamic`).
+pub const LEASE_MODES: &[&str] = &["proxy", "file", "env", "exec", "short-lived"];
 
 /// One `rc:vault.lease`, as it arrived.
 #[derive(Debug, Clone)]
@@ -170,6 +176,8 @@ pub struct Leased {
     pub n: i64,
     pub sealed: Vec<u8>,
     pub expires_at: DateTime,
+    /// P3-6b — a dynamic secret's provider: `sealed` is then its bundle.
+    pub provider: Option<&'static str>,
 }
 
 /// The connection a request arrived on: whose device, in which organization.
@@ -333,6 +341,7 @@ async fn answer_in_order(
                         n: l.n,
                         sealed: base64::engine::general_purpose::STANDARD.encode(&l.sealed),
                         expires_at_ms: l.expires_at.timestamp_millis(),
+                        provider: l.provider.map(String::from),
                     }
                 }
                 Err(refused) => ServerMsg::VaultRefused {
@@ -789,16 +798,23 @@ async fn decide_and_release(
     let Some(secret_id) = secret.id else {
         return Err(rec.refuse(LeaseRefusal::Unavailable, "secret_unread").await);
     };
-    let field = if req.field.is_empty() {
-        rrn::STATIC_FIELD
-    } else {
+    // P3-6b — a dynamic secret is leased as a whole: its issuer's fields in
+    // one bundle. Every other secret, one field at a time.
+    let dynamic = secret.kind == KIND_DYNAMIC;
+    let field = if dynamic || !req.field.is_empty() {
         req.field.as_str()
+    } else {
+        rrn::STATIC_FIELD
     };
-    let n = secret
-        .fields
-        .get(field)
-        .map(|f| f.current)
-        .filter(|n| *n > 0);
+    let n = if dynamic {
+        None
+    } else {
+        secret
+            .fields
+            .get(field)
+            .map(|f| f.current)
+            .filter(|n| *n > 0)
+    };
     rec.secret = Some((
         secret_id,
         rrn::secret_rrn(&slug, &secret.path),
@@ -809,9 +825,19 @@ async fn decide_and_release(
         let why = LeaseRefusal::Disabled;
         return Err(rec.refuse(why, why.wire()).await);
     }
-    let Some(n) = n else {
-        let why = LeaseRefusal::NoValue;
-        return Err(rec.refuse(why, why.wire()).await);
+    let leasing = if dynamic {
+        bundle_for(state, rec, &secret, &req.field).await?
+    } else {
+        let Some(n) = n else {
+            let why = LeaseRefusal::NoValue;
+            return Err(rec.refuse(why, why.wire()).await);
+        };
+        Leasing::Field { field, n }
+    };
+    // What the lease is recorded as: a bundle names no field, and no version.
+    let (field, n, audience) = match &leasing {
+        Leasing::Field { field, n } => (*field, *n, req.audience.as_str()),
+        Leasing::Bundle { audience, .. } => ("", 0, *audience),
     };
     let Some(kek) = state.kek.ready() else {
         return Err(rec.refuse(LeaseRefusal::Unavailable, "no_kek").await);
@@ -833,7 +859,7 @@ async fn decide_and_release(
         &secret,
         device,
         &req.mode,
-        &req.audience,
+        audience,
         i64::from(ttl),
     );
     let mut verdict = decide_for_org(state, tid, &ask).await;
@@ -848,7 +874,7 @@ async fn decide_and_release(
             secret_id,
             field,
             mode: &req.mode,
-            audience: &req.audience,
+            audience,
         };
         let rrn = rrn::secret_rrn(&slug, &secret.path);
         match approval::after_deny(state, session, &key, &rrn, i64::from(ttl), &ask).await {
@@ -891,48 +917,44 @@ async fn decide_and_release(
         return Err(LeaseRefusal::Denied);
     }
 
-    // Allowed: open the version and seal it for the device, BEFORE the allow
-    // is recorded, so a recorded allow is one that was ready to release.
-    let version = match state.versions.get(secret_id, field, n).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return Err(rec.refuse(LeaseRefusal::NoValue, "version_gone").await),
-        Err(_) => {
-            return Err(rec
-                .refuse(LeaseRefusal::Unavailable, "version_unread")
-                .await);
-        }
-    };
-    // P3-3c — a version past the `expires_at` its writer gave is never
-    // released (P3-1 promised it of the first step to use a value, and P3-3b
-    // did not keep the promise).
-    if version.expires_at.is_some_and(|t| t <= DateTime::now()) {
-        return Err(rec.refuse(LeaseRefusal::NoValue, "version_expired").await);
-    }
-    let at = Binding {
-        tenant_id: tid,
-        secret_id,
-        field,
-        n,
-    };
-    let sealed = {
-        let value = match kek.open(
-            &at,
-            &version.ciphertext.bytes,
-            &version.nonce.bytes,
-            &version.dek_wrapped.bytes,
-            &version.kek,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let reason = format!("open: {}", e.as_str());
-                return Err(rec.refuse(LeaseRefusal::Unavailable, &reason).await);
+    // Allowed: open the value and seal it for the device, BEFORE the allow is
+    // recorded, so a recorded allow is one that was ready to release.
+    let (sealed, until) = match &leasing {
+        Leasing::Field { field, n } => {
+            let (value, until) = open_one(state, rec, kek, secret_id, field, *n).await?;
+            match crypto::seal_for_device(&agent.vault_key, &value) {
+                Ok(s) => (s, until),
+                Err(_) => return Err(rec.refuse(LeaseRefusal::Unavailable, "seal").await),
             }
-        };
-        match crypto::seal_for_device(&agent.vault_key, &value) {
-            Ok(s) => s,
-            Err(_) => return Err(rec.refuse(LeaseRefusal::Unavailable, "seal").await),
+            // `value` is zeroed here, when it drops.
         }
-        // `value` is zeroed here, when it drops.
+        // P3-6b — every issuer field the bundle carries, each at its version,
+        // sealed together: the lease ends no later than the first of them.
+        Leasing::Bundle {
+            versions, audience, ..
+        } => {
+            let mut opened = Vec::with_capacity(versions.len());
+            let mut until: Option<DateTime> = None;
+            for (f, n) in versions {
+                let (value, ends) = open_one(state, rec, kek, secret_id, f, *n).await?;
+                until = match (until, ends) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                opened.push((f.as_str(), value));
+            }
+            let pairs: Vec<(&str, &[u8])> =
+                opened.iter().map(|(f, v)| (*f, v.as_slice())).collect();
+            let bundle = match dynamic::bundle_json(audience, &pairs) {
+                Ok(b) => b,
+                Err(why) => return Err(rec.refuse(LeaseRefusal::Unavailable, why).await),
+            };
+            match crypto::seal_for_device(&agent.vault_key, &bundle) {
+                Ok(s) => (s, until),
+                Err(_) => return Err(rec.refuse(LeaseRefusal::Unavailable, "seal").await),
+            }
+            // The values and the bundle are zeroed here, when they drop.
+        }
     };
 
     let lease_id = ObjectId::new();
@@ -964,24 +986,31 @@ async fn decide_and_release(
         DateTime::from_millis(issued_at.timestamp_millis() + i64::from(ttl) * 1000);
     // P3-3c — and no lease outlives its version: a policy that read the
     // asked TTL allowed at least this much.
-    if let Some(until) = version.expires_at
+    if let Some(until) = until
         && until < expires_at
     {
         expires_at = until;
     }
+    let (bundle, provider) = match leasing {
+        Leasing::Field { .. } => (None, None),
+        Leasing::Bundle {
+            provider, versions, ..
+        } => (Some(versions), Some(provider.name)),
+    };
     let row = VaultLease {
         id: Some(lease_id),
         tenant_id: tid,
         secret_id,
         field: field.to_string(),
         n,
+        bundle,
         session_id: req.session_id,
         fence: session.fence,
         device_id: rec.conn.device_id,
         owner_id: session.owner_id,
         sealed_to: agent.vault_key.clone(),
         mode: req.mode.clone(),
-        audience: req.audience.clone(),
+        audience: audience.to_string(),
         issued_at,
         expires_at,
         revoked_at: None,
@@ -999,7 +1028,103 @@ async fn decide_and_release(
         n,
         sealed,
         expires_at,
+        provider,
     })
+}
+
+/// What a lease releases.
+enum Leasing<'a> {
+    /// One field of a stored secret, at its current version.
+    Field { field: &'a str, n: i64 },
+    /// P3-6b — a dynamic secret as a whole: its issuer's fields, each at the
+    /// version leased, for the device to mint toward `audience`.
+    Bundle {
+        provider: &'static Provider,
+        versions: BTreeMap<String, i64>,
+        audience: &'a str,
+    },
+}
+
+/// P3-6b — a dynamic secret's lease, before any policy reads it: the secret
+/// as a whole, since a field named is no session's to have; a provider this
+/// build knows and the vault serves; the one audience it mints toward; and
+/// every field no mint can do without.
+async fn bundle_for<'a>(
+    state: &VaultState,
+    rec: &Record<'_>,
+    secret: &'a VaultSecret,
+    asked_field: &str,
+) -> Result<Leasing<'a>, LeaseRefusal> {
+    if !asked_field.is_empty() {
+        return Err(rec
+            .refuse(LeaseRefusal::NoValue, "dynamic_names_no_field")
+            .await);
+    }
+    let Some(provider) = dynamic::provider_of(secret) else {
+        return Err(rec.refuse(LeaseRefusal::NoValue, "provider_unknown").await);
+    };
+    if !state.providers.serves(provider) {
+        return Err(rec
+            .refuse(LeaseRefusal::NotServed, "provider_not_served")
+            .await);
+    }
+    let [audience] = secret.audiences.as_slice() else {
+        return Err(rec.refuse(LeaseRefusal::NoValue, "audience_not_one").await);
+    };
+    let versions = dynamic::bundle_of(provider, &secret.fields);
+    if let Some(missing) = dynamic::missing_required(provider, &versions) {
+        let reason = format!("issuer_lacks_{missing}");
+        return Err(rec.refuse(LeaseRefusal::NoValue, &reason).await);
+    }
+    Ok(Leasing::Bundle {
+        provider,
+        versions,
+        audience,
+    })
+}
+
+/// One stored version, opened for a lease, and the `expires_at` its writer
+/// gave it. A version past that is never released (P3-3c: P3-1 promised it of
+/// the first step to use a value, and P3-3b did not keep the promise).
+async fn open_one(
+    state: &VaultState,
+    rec: &Record<'_>,
+    kek: &crypto::Kek,
+    secret_id: ObjectId,
+    field: &str,
+    n: i64,
+) -> Result<(Zeroizing<Vec<u8>>, Option<DateTime>), LeaseRefusal> {
+    let version = match state.versions.get(secret_id, field, n).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return Err(rec.refuse(LeaseRefusal::NoValue, "version_gone").await),
+        Err(_) => {
+            return Err(rec
+                .refuse(LeaseRefusal::Unavailable, "version_unread")
+                .await);
+        }
+    };
+    if version.expires_at.is_some_and(|t| t <= DateTime::now()) {
+        return Err(rec.refuse(LeaseRefusal::NoValue, "version_expired").await);
+    }
+    let at = Binding {
+        tenant_id: rec.conn.tenant_id,
+        secret_id,
+        field,
+        n,
+    };
+    match kek.open(
+        &at,
+        &version.ciphertext.bytes,
+        &version.nonce.bytes,
+        &version.dek_wrapped.bytes,
+        &version.kek,
+    ) {
+        Ok(value) => Ok((value, version.expires_at)),
+        Err(e) => {
+            let reason = format!("open: {}", e.as_str());
+            Err(rec.refuse(LeaseRefusal::Unavailable, &reason).await)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1028,8 +1153,8 @@ mod tests {
                 ..req()
             }));
         }
-        // Modes a policy may name that release no stored value.
-        for mode in ["identity", "short-lived", "placeholder", "raw", ""] {
+        // Modes a policy may name that release no value to a daemon.
+        for mode in ["identity", "placeholder", "raw", "shortlived", ""] {
             assert!(
                 !within_bounds(&LeaseRequest {
                     mode: mode.into(),
