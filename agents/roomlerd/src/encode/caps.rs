@@ -654,6 +654,14 @@ pub(crate) struct HostFacts {
     pub(crate) watches_clipboard_images: bool,
     /// This process has a clipboard to reach at all.
     pub(crate) clipboard_reachable: bool,
+    /// The keyboard layout is this process's to read and switch: on Windows
+    /// always; on Linux in an X11 session (FR-97 P3e,
+    /// `input::layout_x11::offered`); on macOS not before P2d.
+    pub(crate) layout_reachable: bool,
+    /// A layout switch stays switched: not under GNOME, which puts its own
+    /// back (FR-97 P3e, `input::layout_x11::switchable`). There the chip
+    /// reports and the picker is not offered.
+    pub(crate) layout_switchable: bool,
 }
 
 impl HostFacts {
@@ -674,7 +682,34 @@ impl HostFacts {
             linux_audio_refusal,
             watches_clipboard_images: cfg!(target_os = "windows"),
             clipboard_reachable: clipboard_reachable(),
+            layout_reachable: layout_reachable(),
+            layout_switchable: layout_switchable(),
         }
+    }
+}
+
+/// FR-97 P3e — see [`HostFacts::layout_switchable`].
+fn layout_switchable() -> bool {
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    {
+        crate::input::layout_x11::switchable()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    {
+        cfg!(target_os = "windows")
+    }
+}
+
+/// FR-97 P3e — see [`HostFacts::layout_reachable`]. Under Wayland the layout
+/// is the compositor's, and a system install has no X connection at all.
+fn layout_reachable() -> bool {
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    {
+        crate::input::layout_x11::offered()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    {
+        cfg!(target_os = "windows")
     }
 }
 
@@ -778,6 +813,15 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
                 "Copied images are not watched on this host, so they do not sync on their own: send or fetch one with the clipboard buttons",
             ),
         );
+    }
+    // FR-97 P3e — the layout chip and picker only where the layout can be
+    // read and switched. No reason in `unavailable`: there is no control to
+    // grey, the chip simply does not appear, as on a host before P3e.
+    if !facts.layout_reachable {
+        caps.layout.clear();
+    } else if !facts.layout_switchable {
+        // GNOME on Xorg: the chip reports; a picker would only snap back.
+        caps.layout.retain(|w| w != "set");
     }
     // The viewer's button types three ordinary keys everywhere.
     let sas = match facts.os {
@@ -1564,10 +1608,14 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
     };
 
     // Keyboard-layout integration (rc.227) — status reporting +
-    // manual set ride the control DC; both are Windows-only code in
-    // `input::layout` behind enigo-input. The browser gates its
-    // layout chip + picker on these.
-    let layout: Vec<String> = if cfg!(all(target_os = "windows", feature = "enigo-input")) {
+    // manual set ride the control DC: Windows code in `input::layout`
+    // behind enigo-input, and (FR-97 P3e) X11's in `input::layout_x11`,
+    // which `with_honest_words` takes out where there is no X11 session.
+    // The browser gates its layout chip + picker on these.
+    let layout: Vec<String> = if cfg!(all(
+        any(target_os = "windows", target_os = "linux"),
+        feature = "enigo-input"
+    )) {
         vec!["report".into(), "set".into()]
     } else {
         Vec::new()
@@ -2634,6 +2682,8 @@ mod tests {
             linux_audio_refusal: None,
             watches_clipboard_images: true,
             clipboard_reachable: true,
+            layout_reachable: true,
+            layout_switchable: true,
         }
     }
 
@@ -2747,6 +2797,39 @@ mod tests {
     }
 
     #[test]
+    fn the_layout_is_offered_only_where_it_can_be_switched() {
+        use roomler_ai_remote_control::models::OsKind;
+        let with_layout = || AgentCaps {
+            layout: vec!["report".into(), "set".into()],
+            ..p0c_caps()
+        };
+        // FR-97 P3e — an X11 session, and every Windows host.
+        for os in [OsKind::Linux, OsKind::Windows] {
+            let c = with_honest_words(with_layout(), &p0c_facts(os));
+            assert_eq!(c.layout, ["report", "set"], "{os:?}");
+        }
+        // Wayland, or a system install: no chip, and nothing greyed to explain.
+        let wayland = with_honest_words(
+            with_layout(),
+            &HostFacts {
+                layout_reachable: false,
+                ..p0c_facts(OsKind::Linux)
+            },
+        );
+        assert!(wayland.layout.is_empty(), "{:?}", wayland.layout);
+        assert!(!wayland.unavailable.contains_key("layout"));
+        // GNOME on Xorg puts its own layout back: the chip, and no picker.
+        let gnome = with_honest_words(
+            with_layout(),
+            &HostFacts {
+                layout_switchable: false,
+                ..p0c_facts(OsKind::Linux)
+            },
+        );
+        assert_eq!(gnome.layout, ["report"]);
+    }
+
+    #[test]
     fn ctrl_alt_del_says_what_the_keys_reach_and_goes_on_a_mac() {
         use roomler_ai_remote_control::models::{OsKind, Unavailable};
         for os in [OsKind::Windows, OsKind::Linux] {
@@ -2771,6 +2854,8 @@ mod tests {
                         linux_audio_refusal: None,
                         watches_clipboard_images: false,
                         clipboard_reachable: reachable,
+                        layout_reachable: reachable,
+                        layout_switchable: reachable,
                     },
                 );
                 for (key, why) in &c.unavailable {
@@ -2803,6 +2888,11 @@ mod tests {
             assert!(!f.audio_backend, "macOS until FR-97 P2a");
         }
         assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
+        if cfg!(target_os = "windows") {
+            assert!(f.layout_reachable && f.layout_switchable);
+        } else if cfg!(target_os = "macos") {
+            assert!(!f.layout_reachable, "macOS until FR-97 P2d");
+        }
     }
 
     /// #1672 (review of #1679) — the daemon's side of the split, locked. The
