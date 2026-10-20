@@ -517,6 +517,7 @@ pub async fn handle_agent_socket(
         max_duration: None,
         idle_secs: None,
         lock_on_end: None,
+        org_session_cap: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's

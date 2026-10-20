@@ -163,6 +163,13 @@ pub fn wire_rc_relay(state: &RemoteState) {
                 // gate. Absent or null (an older origin pod, or nothing
                 // asked) is no ask, what that pod would have applied itself.
                 let lock_on_end = lock_ask_from_relay(body.get("lock_on_end"));
+                // FR-115 P3 — the device org's session cap, resolved by the
+                // same gate. Absent (an older origin pod) or null is no cap,
+                // what that pod would have applied itself.
+                let org_session_cap = body
+                    .get("org_session_cap")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok());
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -235,13 +242,16 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     max_duration,
                     idle_secs,
                     lock_on_end,
+                    org_session_cap,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
                     Err(e) => Ok(serde_json::json!({
                         "dispatched": false,
                         "code": crate::controller::error_code(&e),
-                        "message": e.to_string(),
+                        // FR-115 P3 — the same words the local path sends
+                        // (who holds the slot, on which device).
+                        "message": crate::controller::refusal_message(&state, &e).await,
                     })),
                 }
             })
@@ -386,6 +396,10 @@ pub async fn relay_rc_frame(
     // FR-99 P3b — the device's lock ask; the owner pod's hub sends it to an
     // agent that honours it.
     lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
+    // FR-115 P3 — the device org's concurrent-session cap; the owner pod's
+    // hub counts the org's live sessions against it. ⚠️ Without it a
+    // session landing on the other pod would skip the cap.
+    org_session_cap: Option<u32>,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -409,6 +423,7 @@ pub async fn relay_rc_frame(
         "max_secs": max_duration.map(|d| d.as_secs()),
         "idle_secs": idle_secs,
         "lock_on_end": lock_on_end,
+        "org_session_cap": org_session_cap,
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {

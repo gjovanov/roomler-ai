@@ -74,10 +74,18 @@ impl Limit {
     /// a cap rather than an observation. Grandfathering does not arise —
     /// paid plans have no member cap, and no Free org was over ten when it
     /// landed (the FR-115 census).
+    ///
+    /// FR-115 P3 added `MaxConcurrentSessions`, the fence on Free that
+    /// replaces "personal use" detection. The hub enforces it at session
+    /// start (`Hub::create_session_full`); listing it here keeps any future
+    /// check through this function from softening it under `warn`.
     pub fn is_established(self) -> bool {
         matches!(
             self,
-            Limit::MaxDevices | Limit::MaxTunnelClients | Limit::MaxMembers
+            Limit::MaxDevices
+                | Limit::MaxTunnelClients
+                | Limit::MaxMembers
+                | Limit::MaxConcurrentSessions
         )
     }
 
@@ -415,6 +423,10 @@ mod tests {
             assert!(
                 check(Plan::Free, mode, Limit::MaxTunnelClients, 100).is_err(),
                 "max_tunnel_clients must refuse under {mode:?} — it was enforced before FR-32"
+            );
+            assert!(
+                check(Plan::Free, mode, Limit::MaxConcurrentSessions, 1).is_err(),
+                "FR-115 P3 — Free's one session at a time holds under {mode:?}"
             );
         }
     }

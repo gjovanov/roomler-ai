@@ -4292,6 +4292,26 @@ describe('S3 resilience: isRetryableRcErrorCode', () => {
     expect(isRetryableRcErrorCode(undefined)).toBe(false)
     expect(isRetryableRcErrorCode('')).toBe(false)
   })
+
+  // FR-115 P3 — waiting does not free a slot someone is using, so the
+  // ladder must not keep asking: the person ends that session or upgrades.
+  it('never retries the org session cap', () => {
+    expect(isRetryableRcErrorCode('org_session_limit')).toBe(false)
+  })
+})
+
+describe('FR-115 P3: friendlyRcError for the org session cap', () => {
+  it("shows the server's sentence, which names who holds the slot", () => {
+    const sentence =
+      "Your organization's plan runs one remote session at a time, and Ana is connected to Office PC right now. End that session, or upgrade the plan for one remote session per user."
+    expect(friendlyRcError('org_session_limit', sentence)).toBe(sentence)
+  })
+
+  it('still says what to do when the server sent no message', () => {
+    const msg = friendlyRcError('org_session_limit', null)
+    expect(msg).toContain('one remote session at a time')
+    expect(msg).toContain('upgrade')
+  })
 })
 
 describe('2026-08-05 consent wedge: readyRecoveryAction', () => {

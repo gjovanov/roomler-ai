@@ -470,6 +470,8 @@ async fn ask_needs_a_prompt_that_names_the_feature() {
 async fn the_strip_is_audited_on_the_session_request() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr101p2audit").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let (agent, mut agent_ws) = connect_agent(&app, &seeded, "mach-fr101-audit", &[]).await;
     let owner = seeded.admin.access_token.clone();
 

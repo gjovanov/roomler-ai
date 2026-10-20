@@ -301,6 +301,10 @@ async fn forward(
             None,
             None,
             None,
+            // FR-115 — nor the org's concurrent-session cap: `handle_session`
+            // opens an outsider's session uncapped (P3b decides whose plan it
+            // counts against).
+            None,
             frame,
         )
         .await,
@@ -946,6 +950,7 @@ pub async fn handle_session(
         Some(ExternalGrant {
             attempt_id: attempt_id.clone(),
         }),
+        None,
     );
     match session {
         Ok(session_id) => {

@@ -422,6 +422,8 @@ async fn audit_event(app: &TestApp, seeded: &SeededTenant, sid: &str, kind: &str
 async fn the_idle_limit_reaches_the_device_and_only_a_keeping_device_tells_the_viewer() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr101p4b2gate").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let admin = seeded.admin.access_token.clone();
     let resp = app
         .client
@@ -555,6 +557,8 @@ async fn set_access_policy(
 async fn the_lock_ask_reaches_only_a_device_that_honours_it() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("fr99p3bask").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
     let admin = seeded.admin.access_token.clone();
 
     // A device that honours it, asked for `always`.
