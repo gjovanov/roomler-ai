@@ -687,6 +687,12 @@ export interface ExternalSessionAuth {
   connectCode: string
   attemptId: string
   appKey: Uint8Array
+  /**
+   * FR-115 P3b (O6) — the org (hex) the outsider runs this session for: its
+   * concurrent-session slots are the ones the session takes. Absent: the
+   * server takes their only org, or counts the account with Free's quota.
+   */
+  chargeOrg?: string | null
 }
 
 /** An external viewer asked to offer or answer with no login in hand. */
@@ -8120,7 +8126,13 @@ export function useRemoteControl(
       if (!externalMode || phase.value !== 'requesting' || !externalAuth) return
       if (msg.attempt_id != null && msg.attempt_id !== externalAuth.attemptId) return
       if (msg.refused === undefined || msg.refused === null) return
-      failWith(friendlyExtauthRefusal(msg.refused, msg.retry_after_secs))
+      // FR-115 P3b — the slot count's refusal carries the server's own words
+      // (who holds the slot, on which device); every other reason does not.
+      failWith(
+        msg.refused === 'session_limit' && typeof msg.message === 'string' && msg.message
+          ? msg.message
+          : friendlyExtauthRefusal(msg.refused, msg.retry_after_secs),
+      )
     })
     on('rc:ready', async (msg) => {
       // (2026-08-05 winhost-a wedge) NEVER drop rc:ready silently: the server
@@ -10381,6 +10393,8 @@ export function useRemoteControl(
             attempt_id: externalAuth.attemptId,
             permissions,
             browser_caps: browserCaps,
+            // FR-115 P3b — whose session slots it takes, when chosen.
+            ...(externalAuth.chargeOrg ? { charge_org: externalAuth.chargeOrg } : {}),
           }
         : {
             t: 'rc:session.request',

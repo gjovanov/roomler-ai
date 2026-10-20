@@ -177,6 +177,45 @@ pub async fn dispatch_controller_rc(
         return false;
     };
     let is_session_request = matches!(&parsed, ClientMsg::SessionRequest { .. });
+    // FR-115 P3b — on the pod that owns the device, the org's cap is a
+    // cluster-wide slot, claimed here because the hub is synchronous: the
+    // org's own sessions and the external ones run for it share one count.
+    // A device on another pod is claimed for there, when the relay lands.
+    let mut org_session_cap = org_session_cap;
+    let mut slot = None;
+    if let ClientMsg::SessionRequest { agent_id, .. } = &parsed
+        && let Some(cap) = org_session_cap
+        && crate::slots::enabled(state)
+        && let Some(org) = hub.agent_org(*agent_id)
+    {
+        use crate::slots::SlotDecision;
+        use roomler_core::cluster::session_slots::SlotScope;
+        match crate::slots::claim(state, SlotScope::Org(org), user_id, *agent_id, cap).await {
+            SlotDecision::Claimed(lease) => {
+                slot = Some(lease);
+                org_session_cap = None; // the slot IS the count
+            }
+            SlotDecision::Fallback => {}
+            SlotDecision::Full {
+                cap,
+                holder_user,
+                holder_agent,
+            } => {
+                let e = roomler_ai_remote_control::Error::OrgSessionLimit {
+                    cap,
+                    holder_user,
+                    holder_agent,
+                };
+                let _ = controller_tx.try_send(ServerMsg::Error {
+                    session_id: None,
+                    code: error_code(&e).to_string(),
+                    message: refusal_message(state, &e).await,
+                    open_nonce: None,
+                });
+                return true;
+            }
+        }
+    }
     let ctx = DispatchCtx {
         role: Role::Controller,
         user_id: Some(user_id),
@@ -195,10 +234,18 @@ pub async fn dispatch_controller_rc(
         idle_secs,
         lock_on_end,
         org_session_cap,
+        slot: slot.clone(),
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
-    if let Err(e) = hub.dispatch(&ctx, parsed) {
+    let dispatched = hub.dispatch(&ctx, parsed);
+    // FR-115 P3b — a slot the hub did not take (it refused, or coalesced the
+    // request into a session that already exists) goes back now.
+    if let Some(lease) = &slot {
+        let created = hub.session_snapshot(lease.session).map(|_| lease.session);
+        crate::slots::release_unused(state, lease, created).await;
+    }
+    if let Err(e) = dispatched {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
         // C-2 rehome: a SessionRequest that missed the LOCAL hub while a
         // FOREIGN pod holds a fresh presence record is a cross-pod split,
