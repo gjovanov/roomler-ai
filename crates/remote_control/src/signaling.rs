@@ -2368,6 +2368,14 @@ pub enum ClientMsg {
         chunk_framing: Option<bool>,
         #[serde(default)]
         audio_enabled: bool,
+        /// FR-115 P3b (O6) — the org (hex) the outsider runs this session
+        /// for: one of their own orgs, whose concurrent-session slots it
+        /// takes. Honoured only for an org the principal belongs to; absent
+        /// (or not theirs), the server takes their only org, or, with none or
+        /// several, counts it against the account with Free's quota. It rides
+        /// this frame because the frame is what crosses to the device's pod.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charge_org: Option<String>,
     },
 }
 
@@ -2817,6 +2825,7 @@ mod namespace_tests {
                 chroma_pref: None,
                 chunk_framing: None,
                 audio_enabled: false,
+                charge_org: Some("6a975e17971e2d55ddcdedb2".into()),
             },
         ];
         for m in &samples {
@@ -3935,6 +3944,10 @@ pub enum ServerMsg {
         refused: Option<crate::models::ExtauthRefusal>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_secs: Option<u32>,
+        /// FR-115 P3b — words for the person, with `session_limit`: whose
+        /// session holds the slot. Absent on every other refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 
     // ─── Hive (rc:hive.*) — FR-90 ─────────────────────────────────────
@@ -7070,11 +7083,19 @@ mod tests {
                 attempt_id: None,
                 refused: Some(ExtauthRefusal::Unavailable),
                 retry_after_secs: None,
+                message: None,
             },
             ServerMsg::ExtauthResult {
                 attempt_id: Some("a1".into()),
                 refused: Some(ExtauthRefusal::Throttled),
                 retry_after_secs: Some(30),
+                message: None,
+            },
+            ServerMsg::ExtauthResult {
+                attempt_id: Some("a1".into()),
+                refused: Some(ExtauthRefusal::SessionLimit),
+                retry_after_secs: None,
+                message: Some("Your organization's plan runs one remote session at a time.".into()),
             },
         ];
         for m in server_frames {

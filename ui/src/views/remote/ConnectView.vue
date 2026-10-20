@@ -28,6 +28,19 @@
             autocomplete="off"
             :disabled="busy"
           />
+          <v-select
+            v-if="orgs.length > 1"
+            v-model="chargeOrg"
+            :items="orgs"
+            item-title="name"
+            item-value="id"
+            label="Run this session for"
+            hint="It uses this organization's remote-session quota."
+            persistent-hint
+            :disabled="busy"
+            class="mb-4"
+            data-testid="connect-charge-org"
+          />
           <v-alert v-if="error" type="error" variant="tonal" class="mb-4">{{ error }}</v-alert>
           <div class="d-flex justify-end">
             <v-btn
@@ -58,9 +71,10 @@
  * ⚠️ No automatic retry, anywhere: every login the device answers costs it a
  * guess (spec §4b), so a retry is the person's decision, not the page's.
  */
-import { ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useTenantStore } from '@/stores/tenant'
 import { useWsStore } from '@/stores/ws'
 import {
   externalLogin,
@@ -77,6 +91,26 @@ const code = ref(typeof route.query.code === 'string' ? route.query.code : '')
 const password = ref('')
 const busy = ref(false)
 const error = ref<string | null>(null)
+
+/**
+ * FR-115 P3b (O6) — the orgs this session may be run for: every one the
+ * outsider belongs to, Free included, since no paid org is needed. The
+ * session takes one of the chosen org's concurrent-session slots. With one
+ * org there is nothing to ask; with none, the server counts the account
+ * itself, with Free's quota.
+ */
+const tenantStore = useTenantStore()
+const orgs = computed(() => tenantStore.tenants.map((t) => ({ id: t.id, name: t.name })))
+const chargeOrg = ref<string | null>(null)
+watch(
+  orgs,
+  (list) => {
+    if (!chargeOrg.value || !list.some((o) => o.id === chargeOrg.value)) {
+      chargeOrg.value = tenantStore.current?.id ?? list[0]?.id ?? null
+    }
+  },
+  { immediate: true },
+)
 
 /**
  * Who is logging in. The layout fetches the signed-in user only after it
@@ -128,6 +162,7 @@ async function submit() {
       connectCode,
       attemptId: result.attemptId,
       appKey: result.appKey,
+      chargeOrg: chargeOrg.value,
     })
     await router.push({ name: 'connect-session', query: { code: connectCode } })
   } catch {

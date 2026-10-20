@@ -64,6 +64,12 @@ pub static RC_RELAY_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// SPLIT EVIDENCE. Core's since P7b so the status snapshot reads every
 /// counter from one place while the relay itself is the network module's.
 pub static DERP_REHOME_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// FR-115 P3b — session-slot claims Redis could not answer: the request fell
+/// back to P3's count on the device's hub (or, external, ran uncounted).
+pub static RC_SLOT_CLAIM_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// FR-115 P3b — session requests refused because every slot of the payer
+/// (an org, or an account in no org) was held.
+pub static RC_SLOT_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);

@@ -52,6 +52,7 @@ pub mod extauth;
 pub mod relay;
 pub mod routes;
 pub mod session_policy;
+pub mod slots;
 pub mod touch_presets;
 
 /// The module's state: the core, the fleet module it is built on, and what

@@ -99,6 +99,10 @@ pub struct Core {
     pub pod: PodIdentity,
     /// Entity → owning-pod records (LWW / NX namespaces).
     pub cluster_directory: Option<OwnershipDirectory>,
+    /// FR-115 P3b — the cluster-wide count of concurrent remote sessions per
+    /// payer (`cluster::session_slots`). `None` without Redis, and every
+    /// claim then falls back to P3's count on the hub that owns the device.
+    pub session_slots: Option<crate::cluster::session_slots::SessionSlots>,
     /// Per-pod request/reply bus.
     pub cluster_bus: Option<Arc<PodBus>>,
 

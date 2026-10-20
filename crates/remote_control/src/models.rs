@@ -4222,6 +4222,11 @@ pub enum ExtauthRefusal {
     /// KE3 for an attempt the device does not have in flight — never started,
     /// expired, or already finished.
     UnknownAttempt,
+    /// FR-115 P3b — the org the session is for (or the account, when it is in
+    /// no org) already runs as many remote sessions as its plan allows. Sent
+    /// by the server only, with a `message` naming who holds the slot, so the
+    /// outsider can end that session or run this one for another org.
+    SessionLimit,
     /// A reason this build does not know. Still a refusal.
     Other,
 }

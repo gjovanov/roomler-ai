@@ -68,6 +68,8 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "agent_nudge_refused_total": AGENT_NUDGE_REFUSED_TOTAL.load(Ordering::Relaxed),
             "agent_nudge_stuck_total": AGENT_NUDGE_STUCK_TOTAL.load(Ordering::Relaxed),
             "rc_relay_total": RC_RELAY_TOTAL.load(Ordering::Relaxed),
+            "rc_slot_claim_failed_total": RC_SLOT_CLAIM_FAILED_TOTAL.load(Ordering::Relaxed),
+            "rc_slot_full_total": RC_SLOT_FULL_TOTAL.load(Ordering::Relaxed),
         },
         "local": {
             // FR-69 P7b — fleet's and network's gauges; zero when a module

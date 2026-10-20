@@ -205,6 +205,43 @@ impl Module for FleetState {
             Some(consent_tx),
             core.relay_load.clone(),
         ));
+        // FR-115 P3b — the hub keeps its sessions' slots: renews this pod's
+        // leases every round, and gives a slot back when its session ends.
+        // Empty until `rc.session_slots` has a caller claim one.
+        if let Some(slots) = core.session_slots.clone() {
+            rc_hub.set_session_slots(slots.clone());
+            let hub = rc_hub.clone();
+            let pod_id = core.pod.pod_id.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                    roomler_core::cluster::session_slots::SLOT_RENEW_SECS,
+                ));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let leases = hub.slot_leases();
+                    match slots.renew(&leases).await {
+                        // A lease Redis no longer had: put it back only for a
+                        // session this hub still holds (a Redis restart), never
+                        // for one released while the round was in flight.
+                        Ok(missing) => {
+                            let live: Vec<_> = missing
+                                .into_iter()
+                                .filter(|l| hub.session_snapshot(l.session).is_some())
+                                .collect();
+                            if let Err(e) = slots.restore(&live, &pod_id).await {
+                                tracing::warn!(%e, "session slots: restoring lost leases failed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            %e,
+                            leases = leases.len(),
+                            "session slots: renewal failed; the leases expire unless the next round lands"
+                        ),
+                    }
+                }
+            });
+        }
         consent_consumer::spawn_consent_consumer(
             consent_rx,
             consent_consumer::ConsentConsumerDeps {
