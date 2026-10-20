@@ -210,18 +210,25 @@ for path in /docs/fr87-smoke-missing/ /blog/fr87-smoke-missing/ /links/fr88-smok
 done
 
 # 3. HTML is revalidated, so it is never the stale half of a hashed-asset pair.
-cc="$(header "$BASE/docs/" cache-control)"
-case "$cc" in
-  *no-cache*) ok "/docs/ Cache-Control: $cc" ;;
-  *) bad "/docs/ Cache-Control: '${cc:-none}' (want no-cache)" ;;
-esac
+#    The SPA shell too: every app route is index.html through `location /`,
+#    and a shell cached without a Cache-Control kept drawing the previous
+#    build after a promote, its chunks already 404s (2026-10-20).
+for p in /docs/ /login /tenant/smoke-check/devices; do
+  cc="$(header "$BASE$p" cache-control)"
+  case "$cc" in
+    *no-cache*) ok "$p Cache-Control: $cc" ;;
+    *) bad "$p Cache-Control: '${cc:-none}' (want no-cache)" ;;
+  esac
+done
 
 # 4. Security headers identical to `/` on every static page family.
 ROOT_SET="$(secset "$BASE/")"
 if [ -z "$ROOT_SET" ]; then
   bad "/ carries none of the security headers — cannot compare"
 else
-  pages="/docs/ /docs/start/ /links/"
+  # `/login` is the SPA shell (`location /`), which carries `expires` and must
+  # never gain an `add_header` that would drop the set.
+  pages="/docs/ /docs/start/ /links/ /login"
   [ "$(status "$BASE/blog/")" = "200" ] && pages="$pages /blog/"
   for path in $pages; do
     got="$(secset "$BASE$path")"

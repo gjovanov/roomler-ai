@@ -10,6 +10,7 @@ import router from '@/plugins/router'
 import App from '@/App.vue'
 import { clearLegacyTokens } from '@/api/session'
 import { loadAnalytics } from '@/utils/analytics'
+import { installStaleBuildRecovery } from '@/utils/staleBuild'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 
 // Delete the tokens earlier versions kept in localStorage — an access token
@@ -37,5 +38,8 @@ app.use(pinia)
 // blocks the mount and never throws — an unanswered server fails OPEN.
 void useCapabilitiesStore().load()
 app.use(router)
+// A tab left open across a promote asks for chunks the new image no longer
+// has: load the page the server serves now, once (utils/staleBuild.ts).
+installStaleBuildRecovery(window, router)
 
 app.mount('#app')
