@@ -162,6 +162,21 @@ message naming the session that holds the slot (device and person) so the person
 a live session is **never** ended by the fence (`business-model.md` §6 rule 4). Established,
 like the device cap: no org is over it today.
 
+**As built (P3).** The authz gate reads the cap from the device's org
+(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:605`) and hands it to the hub
+in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
+hub counts that org's live sessions after its coalesce, so a re-asked session is not a
+second one (`crates/modules/fleet/src/hub.rs:1524`). Tenant affinity puts an org's devices
+and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
+only for the one case affinity cannot place: a session to **another** org's device, which
+must count against the controller's org. That is **P3b**; until it lands, a cross-org session
+counts against the device's org, and an outsider's session (FR-52's extauth path) opens
+uncapped. A refusal is `org_session_limit`
+(`crates/remote_control/src/error.rs:41`), which the viewer does not retry
+(`ui/src/composables/useRemoteControl.ts:716`). It names the person and the device holding
+the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
+session ending or Business. Kill switch `rc.org_session_cap = false`.
+
 ### The relay allowance
 
 ```mermaid
@@ -200,7 +215,8 @@ number is advertised beyond what the current single-worker room is known to carr
 | P0-ops | Tombstone the orphaned orgs (owner account gone), with an export first | restore from the export | ✅ 2026-10-19 21:32Z — 62 of 62, backup verified first |
 | P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | 🟡 implemented, in review |
 | P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | 🟡 implemented against the fake; test-mode run waits for test keys |
-| P3 | Concurrency fence (hub + Redis leases, established, start-only, names the holder) | `quota.concurrency_gate = false` | ⬜ |
+| P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | 🟡 in review (#2571) |
+| P3b | A cross-org session counts against the controller's org (Redis leases); Free gets no support sessions to other orgs | `rc.org_session_cap = false` | ⬜ |
 | P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | ⬜ |
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | coturn flag off | ⬜ |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
