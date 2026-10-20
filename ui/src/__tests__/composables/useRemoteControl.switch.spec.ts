@@ -21,37 +21,95 @@ describe('sessionCreatedAction (#1631)', () => {
     agent_id === undefined ? { session_id } : { session_id, agent_id }
 
   it("while requesting, a create for ANOTHER agent is terminated — the old inline logic adopted it (A's late create landing in B's viewer)", () => {
-    expect(sessionCreatedAction('requesting', created('s1', 'agentA'), null, 'agentB')).toBe('terminate')
+    expect(sessionCreatedAction('requesting', created('s1', 'agentA'), null, 'agentB', false)).toBe('terminate')
   })
 
   it('while requesting, a create for the requested agent is adopted', () => {
-    expect(sessionCreatedAction('requesting', created('s1', 'agentB'), null, 'agentB')).toBe('adopt')
+    expect(sessionCreatedAction('requesting', created('s1', 'agentB'), null, 'agentB', false)).toBe('adopt')
   })
 
   it('while requesting, a create with no agent_id is adopted (pre-field servers; refuse only what is provably foreign)', () => {
-    expect(sessionCreatedAction('requesting', created('s1'), null, 'agentB')).toBe('adopt')
-    expect(sessionCreatedAction('requesting', { session_id: 's1', agent_id: '' }, null, 'agentB')).toBe('adopt')
+    expect(sessionCreatedAction('requesting', created('s1'), null, 'agentB', false)).toBe('adopt')
+    expect(sessionCreatedAction('requesting', { session_id: 's1', agent_id: '' }, null, 'agentB', false)).toBe('adopt')
   })
 
   it('while requesting with no known requested agent, a create is adopted rather than terminated (fail-open, as before)', () => {
-    expect(sessionCreatedAction('requesting', created('s1', 'agentA'), null, null)).toBe('adopt')
+    expect(sessionCreatedAction('requesting', created('s1', 'agentA'), null, null, false)).toBe('adopt')
   })
 
   it('outside requesting, the #1045 coalesce echo for the tracked session is ignored, never terminated', () => {
-    expect(sessionCreatedAction('awaiting_consent', created('s1', 'agentB'), 's1', 'agentB')).toBe('ignore')
-    expect(sessionCreatedAction('connected', created('s1', 'agentB'), 's1', 'agentB')).toBe('ignore')
+    expect(sessionCreatedAction('awaiting_consent', created('s1', 'agentB'), 's1', 'agentB', false)).toBe('ignore')
+    expect(sessionCreatedAction('connected', created('s1', 'agentB'), 's1', 'agentB', false)).toBe('ignore')
   })
 
   it('outside requesting, any other create is a ghost and is terminated', () => {
-    expect(sessionCreatedAction('awaiting_consent', created('s2', 'agentB'), 's1', 'agentB')).toBe('terminate')
-    expect(sessionCreatedAction('idle', created('s1', 'agentA'), null, null)).toBe('terminate')
-    expect(sessionCreatedAction('closed', created('s1', 'agentA'), null, null)).toBe('terminate')
-    expect(sessionCreatedAction('error', created('s1', 'agentA'), null, null)).toBe('terminate')
-    expect(sessionCreatedAction('reconnecting', created('s1', 'agentA'), null, 'agentA')).toBe('terminate')
+    expect(sessionCreatedAction('awaiting_consent', created('s2', 'agentB'), 's1', 'agentB', false)).toBe('terminate')
+    expect(sessionCreatedAction('idle', created('s1', 'agentA'), null, null, false)).toBe('terminate')
+    expect(sessionCreatedAction('closed', created('s1', 'agentA'), null, null, false)).toBe('terminate')
+    expect(sessionCreatedAction('error', created('s1', 'agentA'), null, null, false)).toBe('terminate')
+    expect(sessionCreatedAction('reconnecting', created('s1', 'agentA'), null, 'agentA', false)).toBe('terminate')
   })
 
   it('a create with no session id outside requesting is not mistaken for the echo of an untracked session', () => {
-    expect(sessionCreatedAction('idle', {}, null, null)).toBe('terminate')
+    expect(sessionCreatedAction('idle', {}, null, null, false)).toBe('terminate')
+  })
+})
+
+// FR-52 P4f field run (2026-10-20, prod, connect code 21ZC-RE79-BYTM): a real
+// outsider's external session was torn down by this composable on its OWN
+// create, every single time (3/3), logged as "releasing the ghost session" —
+// then looped forever retrying. An external session's agent_id is always the
+// all-zero placeholder (crates/modules/fleet/src/hub.rs — an outsider never
+// learns the device's real id), while the client's own requestedAgentId for
+// an external request is `ext:<connectCode>` (connectExternal(), this file).
+// Those two strings can never be equal, so the pre-fix foreign-agent guard
+// terminated every legitimate external session unconditionally.
+describe('sessionCreatedAction — external sessions (FR-52 field bug)', () => {
+  const ZERO_AGENT_ID = '000000000000000000000000'
+
+  it('an external create (zero-placeholder agent_id) while requesting is adopted, not terminated', () => {
+    expect(
+      sessionCreatedAction(
+        'requesting',
+        { session_id: 's1', agent_id: ZERO_AGENT_ID },
+        null,
+        'ext:21ZC-RE79-BYTM',
+        true,
+      ),
+    ).toBe('adopt')
+  })
+
+  it('negative control: the identical create is terminated when isExternal is false — proving the fix, not the zero id alone, is what adopts it', () => {
+    expect(
+      sessionCreatedAction(
+        'requesting',
+        { session_id: 's1', agent_id: ZERO_AGENT_ID },
+        null,
+        'ext:21ZC-RE79-BYTM',
+        false,
+      ),
+    ).toBe('terminate')
+  })
+
+  it('outside requesting, external sessions keep the #1045 coalesce-echo/ghost rules unchanged (keyed by session_id, never agent_id)', () => {
+    expect(
+      sessionCreatedAction(
+        'awaiting_consent',
+        { session_id: 's1', agent_id: ZERO_AGENT_ID },
+        's1',
+        'ext:21ZC-RE79-BYTM',
+        true,
+      ),
+    ).toBe('ignore')
+    expect(
+      sessionCreatedAction(
+        'awaiting_consent',
+        { session_id: 's2', agent_id: ZERO_AGENT_ID },
+        's1',
+        'ext:21ZC-RE79-BYTM',
+        true,
+      ),
+    ).toBe('terminate')
   })
 })
 

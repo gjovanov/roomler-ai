@@ -482,6 +482,7 @@ export function sessionCreatedAction(
   msg: { session_id?: unknown; agent_id?: unknown },
   trackedSessionId: string | null,
   requestedAgentId: string | null,
+  isExternal: boolean,
 ): SessionCreatedAction {
   if (phase !== 'requesting') {
     if (typeof msg.session_id === 'string' && msg.session_id === trackedSessionId) {
@@ -489,6 +490,15 @@ export function sessionCreatedAction(
     }
     return 'terminate'
   }
+  // FR-52 — an external session's agent_id is always the all-zero placeholder
+  // (an outsider never learns the device's real id), so it can never equal
+  // `requestedAgentId` ("ext:<code>"), and the foreign-agent guard below would
+  // terminate every legitimate external session the instant it's created. The
+  // device-switch race that guard exists for (#1631) has no external
+  // equivalent: connect() only ever has one external request in flight per
+  // composable, and a late create from an abandoned EARLIER attempt is the
+  // abandoned-requests registry's job, not this live-phase check's.
+  if (isExternal) return 'adopt'
   if (
     typeof msg.agent_id === 'string'
     && msg.agent_id !== ''
@@ -7983,6 +7993,7 @@ export function useRemoteControl(
         msg,
         sessionId.value,
         lastConnectArgs?.agentId ?? null,
+        externalMode,
       )
       if (action === 'ignore') return
       if (action === 'terminate') {
