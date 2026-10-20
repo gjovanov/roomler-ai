@@ -558,7 +558,7 @@ On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
 `ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:2977`,
-`virtual_desktop.rs:679`) starts an X server at
+`virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
 (FR-108 P2, `docs/display-match.md`), else Xvfb — with the window manager named by
@@ -2043,6 +2043,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 | `uinput` | `ROOMLERD_UINPUT` | off | inject through `/dev/uinput`, below the compositor — the input pair of `drm_capture` on Wayland. Host-global: it injects into whatever has focus, the greeter included |
 | — | `ROOMLERD_UINPUT_XKB` | **on** | FR-97 P3f (§3): uinput types text through the host's own XKB keymap, any layout. Off = the US table only, and other layouts drop typed text, as before P3f |
 | — | `ROOMLERD_X11_LAYOUT` | **on** | FR-97 P3e (`docs/remote-control.md` §18.3.2): in an X11 session the viewer's layout chip shows the XKB group in use and its picker switches it. Off = no `layout` in the hello and no chip, as before P3e |
+| — | `ROOMLERD_X11_DISPLAY_MATCH` | **on** | FR-97 P3e-2 (`docs/display-match.md`): a per-user install in an X11 session switches the person's own display to the viewer's stage, under the owner's `display_match`, with presence from the X idle clock. Off = `unsupported`, as before P3e-2 |
 | `portal_capture` | `ROOMLERD_PORTAL_CAPTURE` | off | the portal arm (§4). **Attended**: a logged-in user and a consent dialog on first use; tried after DRM, before X11. A per-user daemon in its own Wayland session uses the portal by itself where mutter is absent (§1.2, P2d-3), so there this key only forces it (`true`) or keeps it off (`false`) |
 | `portal_input` | `ROOMLERD_PORTAL_INPUT` | off for a configured arm; **on** for the automatic portal | input through the portal's RemoteDesktop, on the same session. A configured `portal_capture` takes input only with it `true`. The automatic portal (§1.2) asks for remote control unless it is `false` (FR-93 P4b). On GNOME the dialog's own *Allow Remote Interaction* switch must also be flipped. On a configured mutter arm (`mutter_capture`) it means mutter's own RemoteDesktop (§5.2) |
 | `mutter_input` | `ROOMLERD_MUTTER_INPUT` | **on** | FR-93 P4 (§5.2): a mutter screencast is driven by mutter's own RemoteDesktop, which takes the viewer's input. **It asks nobody**, like the screencast. The automatic arm carries it; a configured one only with `portal_input`. Off = mutter capture is view-only, the behaviour before P4 |
