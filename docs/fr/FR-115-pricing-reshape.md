@@ -227,6 +227,69 @@ flowchart LR
 - Throttled, never refused (D4). The tenant analytics page shows usage against the allowance in
   units, never money (FR-20's decision stands).
 
+### P4a, as proposed — the DERP throttle (for the operator's review before any code)
+
+**What it must not break.** DERP over TLS :443 is the floor that always connects (pillar 2,
+commitment 2). A throttle that delays a WireGuard handshake past its retry window turns "slow"
+into "down" for exactly the hosts that have no other path: symmetric NAT, full-tunnel VPNs. So
+the throttle shapes **bulk only**:
+
+| Frame class (`crates/tunnel-core/src/transport/derp.rs:269`) | Throttled when over allowance? |
+|---|---|
+| WireGuard types 1–3 (handshake initiation, response, cookie) | **never**: tiny, and the handshake must complete |
+| disco (`DISCO_MAGIC`), the path-upgrade probes | **never**: they are how a pair climbs back off DERP |
+| WireGuard type 4 (transport data) | yes |
+| tunnel-class payloads (`quic-derp-v1`) | yes, on top of R4's existing ~3 Mbit/s per-source cap |
+
+**The pieces.**
+
+```mermaid
+flowchart LR
+    FL["usage flush, every pod<br/>(derp.rs:178)"] --> L[("stats_usage")]
+    PP["PoP /stats poll<br/>(relay_load.rs:216)"] --> L
+    L --> J["allowance job, one pod, every 5 min:<br/>month-to-date per org vs<br/>relay_bytes_per_month × seats"]
+    J -->|plans_sold only| S[("over-allowance set<br/>(Redis, networks of flagged orgs)")]
+    S --> A["each API pod: refresh every 60 s<br/>→ DashSet lookup in forward_frame"]
+    S --> P["each PoP: pushed on the /stats poll,<br/>signed with the ticket key"]
+    A & P --> TB["per-network token bucket<br/>at the O3 rate"]
+```
+
+- **Month-to-date** is the ledger FR-20 already writes: `derp_bytes` from both collection
+  points (the API pods' forward path, the PoPs' `/stats`), summed per org since the first of
+  the month (UTC). One pod computes it every 5 minutes under a Redis claim, the same shape as
+  the seat reconcile, and only where `Core::plans_sold`.
+- **The set is per network**, because that is what `forward_frame` holds; the job resolves
+  org → networks. An org leaves the set when its month rolls over or its plan's allowance grows
+  (an upgrade takes effect within one job period).
+- **API pods** refresh a local `DashSet<network_id>` every 60 s. The forward path adds one
+  lock-free lookup, and only for frames already past the ACL; it is measured with FR-20's bench
+  (`crates/modules/network/src/derp.rs:704`) against FR-18's latency budget before it ships.
+- **PoPs are DB-free and must stay so.** Tickets cannot carry the flag: they live 24 h and are
+  checked once, at connect (`crates/remote_control/src/derp_ticket.rs:32`). Instead the API,
+  which already polls each PoP's `/stats`, sends the PoP the set on that poll, signed with the
+  ticket signer, which the PoP already verifies (`crates/derp-relay/src/main.rs:47`). A PoP
+  that has not heard a fresh set within 3 poll periods drops it: it fails open, never closed.
+- **The bucket** is per network (the org's mesh), at O3's rate: 1 Mbit/s on Free, 4 Mbit/s on
+  paid plans. Over the bucket, a frame is dropped, as R4 already does for tunnels: WireGuard
+  rides UDP semantics, and TCP inside it backs off to the rate.
+
+**The measurement O3 asks for, before it ships.** On the fleet, a pair held on DERP (UDP
+between the two hosts blocked, so only the floor carries), at 1 and 4 Mbit/s: a 100 MB copy
+over the mesh (roomler SSH), an interactive shell's keystroke latency, and a remote-desktop
+session riding the org's overlay (#1882's `rc_overlay`: its ICE may use the WireGuard overlay).
+A session's own WebRTC path relays through TURN, not DERP, so only an overlay-riding session
+meets this throttle; TURN's is P4c. Then a WireGuard handshake storm (restart one side) to show
+the handshake path stays unthrottled. If 1 Mbit/s makes the mesh unusable, the Free rate goes
+up, not the policy.
+
+**Kill switch:** `relay_allowance.enabled = false` (empty set, no job). **Surface:** the org's
+analytics page shows relayed bytes against the allowance in units, never money (FR-20), and
+says when the throttle is on.
+
+**Not in P4a:** TURN (P4b attributes coturn bytes per org with `--redis-statsdb`, P4c moves an
+over-allowance org's credentials to a rate-capped realm), and exit nodes on Free (P4d, after
+the throttle exists).
+
 ### Meetings
 
 Free meetings end at 60 minutes with a warning at 55; the participant caps become
@@ -304,7 +367,7 @@ room is piped across workers. That is O4.
 | P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | ✅ merged #2565 (`069981677`) against the fake; proven against Stripe's test mode, including a test-card checkout in a real browser (#2604, AC3 + AC4). A Free `year` price that put annual on every page was fixed by #2603 |
 | P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`73bc6daeb`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
 | P3b | A cross-org session counts against the controller's org (Redis leases); Free gets no support sessions to other orgs | `rc.org_session_cap = false` | ⬜ |
-| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | ⬜ |
+| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | ⬜ designed (*P4a, as proposed*); waits on the operator's review and O3's measurement |
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | coturn flag off | ⬜ |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
