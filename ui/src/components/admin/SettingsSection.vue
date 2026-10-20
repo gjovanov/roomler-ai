@@ -1,417 +1,413 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <div class="d-flex flex-column ga-4">
-    <v-card>
-      <v-card-title>Workspace Settings</v-card-title>
-      <v-card-text>
-        <v-text-field
-          :model-value="tenantStore.current?.name"
-          label="Workspace Name"
-          disabled
-        />
-        <v-text-field
-          :model-value="tenantStore.current?.slug"
-          label="Slug"
-          disabled
-        />
-      </v-card-text>
-    </v-card>
+  <!-- FR-116 — from 600 px up a column of cards, as always; on a phone a list
+       of expansion panels, each titled with its gate's current state. -->
+  <component
+    :is="xs ? VExpansionPanels : 'div'"
+    :class="{ 'd-flex flex-column ga-4': !xs }"
+    :multiple="xs || undefined"
+  >
+    <SettingsGate title="Workspace Settings" :summary="tenantStore.current?.name ?? ''">
+      <v-text-field
+        :model-value="tenantStore.current?.name"
+        label="Workspace Name"
+        disabled
+      />
+      <v-text-field
+        :model-value="tenantStore.current?.slug"
+        label="Slug"
+        disabled
+      />
+    </SettingsGate>
 
     <!-- Fleet RPC gate 1. Deliberately here rather than in the device list:
          this one switch governs every device in the org, so it belongs with
          org settings and needs MANAGE_TENANT, not fleet-admin rights. -->
-    <v-card>
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-console-network-outline" color="primary" class="mr-2" />
-        Remote command execution
-      </v-card-title>
-      <v-card-text>
-        <v-alert
-          type="warning"
-          variant="tonal"
-          density="compact"
-          class="mb-4"
-          icon="mdi-shield-alert-outline"
-        >
-          When enabled, users holding the <strong>EXEC_DEVICE</strong>
-          permission can run commands on devices that individually opt in.
-          Commands run as <strong>root</strong> (Linux) or, on Windows, as
-          <strong>SYSTEM</strong> through the device's service once an
-          administrator has anchored it. A Windows device that is not anchored
-          runs them as the <strong>signed-in user</strong> on an attended
-          install, and as SYSTEM in SystemContext mode. They are all recorded in
-          the audit log.
-        </v-alert>
+    <SettingsGate
+      title="Remote command execution"
+      icon="mdi-console-network-outline"
+      :summary="onOff(agentStore.orgExecEnabled)"
+    >
+      <v-alert
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        icon="mdi-shield-alert-outline"
+      >
+        When enabled, users holding the <strong>EXEC_DEVICE</strong>
+        permission can run commands on devices that individually opt in.
+        Commands run as <strong>root</strong> (Linux) or, on Windows, as
+        <strong>SYSTEM</strong> through the device's service once an
+        administrator has anchored it. A Windows device that is not anchored
+        runs them as the <strong>signed-in user</strong> on an attended
+        install, and as SYSTEM in SystemContext mode. They are all recorded in
+        the audit log.
+      </v-alert>
 
+      <v-switch
+        :model-value="agentStore.orgExecEnabled === true"
+        :loading="saving"
+        :disabled="saving || agentStore.orgExecEnabled === null"
+        color="primary"
+        density="compact"
+        hide-details
+        label="Allow remote command execution in this organization"
+        @update:model-value="onToggle"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        Off by default. Turning it on does not enable any device on its own —
+        each device must also be allowed individually, and the device's own
+        <code>exec_enabled</code> setting must permit it.
+      </div>
+
+      <v-alert v-if="error" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ error }}
+      </v-alert>
+
+      <!-- FR-94 — absent on a server from before it (`null`), so hidden
+           rather than shown as a switch that cannot be read. -->
+      <template v-if="agentStore.orgExecRequireSystem !== null">
         <v-switch
-          :model-value="agentStore.orgExecEnabled === true"
-          :loading="saving"
-          :disabled="saving || agentStore.orgExecEnabled === null"
+          :model-value="agentStore.orgExecRequireSystem === true"
+          :loading="savingRequire"
+          :disabled="savingRequire || agentStore.orgExecEnabled === null"
           color="primary"
           density="compact"
           hide-details
-          label="Allow remote command execution in this organization"
-          @update:model-value="onToggle"
+          class="mt-4"
+          label="Windows: require SYSTEM"
+          data-testid="exec-require-system"
+          @update:model-value="onToggleRequireSystem"
         />
         <div class="text-caption text-medium-emphasis mt-1">
-          Off by default. Turning it on does not enable any device on its own —
-          each device must also be allowed individually, and the device's own
-          <code>exec_enabled</code> setting must permit it.
+          A Windows device runs commands as SYSTEM once an administrator has
+          anchored it (<code>roomlerd anchor create</code>, elevated). With
+          this on, a device that is not anchored refuses commands instead of
+          running them as whoever is signed in.
         </div>
-
-        <v-alert v-if="error" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ error }}
+        <v-alert
+          v-if="requireError"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mt-3"
+        >
+          {{ requireError }}
         </v-alert>
-
-        <!-- FR-94 — absent on a server from before it (`null`), so hidden
-             rather than shown as a switch that cannot be read. -->
-        <template v-if="agentStore.orgExecRequireSystem !== null">
-          <v-switch
-            :model-value="agentStore.orgExecRequireSystem === true"
-            :loading="savingRequire"
-            :disabled="savingRequire || agentStore.orgExecEnabled === null"
-            color="primary"
-            density="compact"
-            hide-details
-            class="mt-4"
-            label="Windows: require SYSTEM"
-            data-testid="exec-require-system"
-            @update:model-value="onToggleRequireSystem"
-          />
-          <div class="text-caption text-medium-emphasis mt-1">
-            A Windows device runs commands as SYSTEM once an administrator has
-            anchored it (<code>roomlerd anchor create</code>, elevated). With
-            this on, a device that is not anchored refuses commands instead of
-            running them as whoever is signed in.
-          </div>
-          <v-alert
-            v-if="requireError"
-            type="error"
-            variant="tonal"
-            density="compact"
-            class="mt-3"
-          >
-            {{ requireError }}
-          </v-alert>
-        </template>
-      </v-card-text>
-    </v-card>
+      </template>
+    </SettingsGate>
 
     <!-- Roomler SSH gate 1. A SEPARATE card from remote execution above, and
          a separate switch server-side: allowing bounded diagnostic commands
          is not the same decision as allowing interactive sessions, and one
          control must never read as the other. -->
-    <v-card>
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-console-network-outline" color="primary" class="mr-2" />
-        Roomler SSH
-      </v-card-title>
-      <v-card-text>
-        <v-alert
-          type="warning"
-          variant="tonal"
-          density="compact"
-          class="mb-4"
-          icon="mdi-shield-alert-outline"
-        >
-          When enabled, users holding the <strong>SSH_DEVICE</strong>
-          permission can open an interactive shell on devices that
-          individually opt in. A session lasts, unlike a single command — and
-          which account it runs as is set per device.
-        </v-alert>
+    <SettingsGate
+      title="Roomler SSH"
+      icon="mdi-console-network-outline"
+      :summary="onOff(agentStore.orgSshEnabled)"
+    >
+      <v-alert
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        icon="mdi-shield-alert-outline"
+      >
+        When enabled, users holding the <strong>SSH_DEVICE</strong>
+        permission can open an interactive shell on devices that
+        individually opt in. A session lasts, unlike a single command — and
+        which account it runs as is set per device.
+      </v-alert>
 
-        <v-switch
-          :model-value="agentStore.orgSshEnabled === true"
-          :loading="savingSsh"
-          :disabled="savingSsh || agentStore.orgSshEnabled === null"
-          color="primary"
-          density="compact"
-          hide-details
-          label="Allow SSH sessions in this organization"
-          @update:model-value="onToggleSsh"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          Off by default. Turning it on does not enable any device on its own —
-          each device must also be allowed individually, and the device's own
-          <code>ssh_enabled</code> setting must permit it.
-        </div>
+      <v-switch
+        :model-value="agentStore.orgSshEnabled === true"
+        :loading="savingSsh"
+        :disabled="savingSsh || agentStore.orgSshEnabled === null"
+        color="primary"
+        density="compact"
+        hide-details
+        label="Allow SSH sessions in this organization"
+        @update:model-value="onToggleSsh"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        Off by default. Turning it on does not enable any device on its own —
+        each device must also be allowed individually, and the device's own
+        <code>ssh_enabled</code> setting must permit it.
+      </div>
 
-        <v-alert v-if="sshError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ sshError }}
-        </v-alert>
-      </v-card-text>
-    </v-card>
+      <v-alert v-if="sshError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ sshError }}
+      </v-alert>
+    </SettingsGate>
 
     <!-- FR-52 gate 1. A THIRD card, and a third server-side switch, for a
          reason stronger than the one separating the two above: those decide
          what a MEMBER of this organization may do, and this one decides
          whether someone who is not a member may do anything at all. -->
-    <v-card>
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-account-arrow-right-outline" color="primary" class="mr-2" />
-        External access
-      </v-card-title>
-      <v-card-text>
-        <v-alert
-          type="warning"
-          variant="tonal"
-          density="compact"
-          class="mb-4"
-          icon="mdi-shield-account-outline"
-        >
-          When enabled, people <strong>outside this organization</strong> can
-          control devices that individually opt in — the way a support
-          technician reaches a machine they do not administer. They need the
-          device's connect code and a password held
-          <strong>on the device itself</strong>, which this server never sees.
-        </v-alert>
+    <SettingsGate
+      title="External access"
+      icon="mdi-account-arrow-right-outline"
+      :summary="onOff(agentStore.orgExternalAccessEnabled)"
+    >
+      <v-alert
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        icon="mdi-shield-account-outline"
+      >
+        When enabled, people <strong>outside this organization</strong> can
+        control devices that individually opt in — the way a support
+        technician reaches a machine they do not administer. They need the
+        device's connect code and a password held
+        <strong>on the device itself</strong>, which this server never sees.
+      </v-alert>
 
-        <v-switch
-          :model-value="agentStore.orgExternalAccessEnabled === true"
-          :loading="savingExternal"
-          :disabled="savingExternal || agentStore.orgExternalAccessEnabled === null"
-          color="primary"
-          density="compact"
-          hide-details
-          label="Allow people outside this organization to control devices"
-          @update:model-value="onToggleExternal"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          Off by default, and turning it on opens nothing by itself. Each
-          device must be approved individually, its owner must enable it on
-          the machine and set a password there, and whoever is at the device
-          is still asked before a session starts.
-        </div>
+      <v-switch
+        :model-value="agentStore.orgExternalAccessEnabled === true"
+        :loading="savingExternal"
+        :disabled="savingExternal || agentStore.orgExternalAccessEnabled === null"
+        color="primary"
+        density="compact"
+        hide-details
+        label="Allow people outside this organization to control devices"
+        @update:model-value="onToggleExternal"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        Off by default, and turning it on opens nothing by itself. Each
+        device must be approved individually, its owner must enable it on
+        the machine and set a password there, and whoever is at the device
+        is still asked before a session starts.
+      </div>
 
-        <v-alert v-if="externalError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ externalError }}
-        </v-alert>
-      </v-card-text>
-    </v-card>
+      <v-alert v-if="externalError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ externalError }}
+      </v-alert>
+    </SettingsGate>
 
     <!-- FR-92 — keep busy. Unlike the cards above this is ON by default
          (operator decision) and the switch is the org's DENY, shown as
          "allow" so on reads as on. The device enforces it; a deny also stops
          a keep busy already running. -->
-    <v-card data-testid="org-keep-busy-card">
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-cursor-default-gesture-outline" color="primary" class="mr-2" />
-        Keep busy
-      </v-card-title>
-      <v-card-text>
-        <p class="text-body-2 mb-3">
-          A controller with input can leave a device's pointer moving in a pattern so it stays
-          active: no screensaver, idle lock or "Away". It pauses whenever someone uses the
-          device. Some organizations do not allow this because it defeats a screen-lock policy.
-        </p>
-        <v-switch
-          :model-value="agentStore.orgKeepBusyDenied === false"
-          :loading="savingKeepBusy"
-          :disabled="savingKeepBusy || agentStore.orgKeepBusyDenied === null"
-          color="primary"
-          density="compact"
-          hide-details
-          label="Allow keep busy in this organization"
-          data-testid="org-keep-busy-switch"
-          @update:model-value="onToggleKeepBusy"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          On by default. Turning it off stops keep busy on every device in the organization,
-          immediately for devices that are online and at the next connect for the rest. A
-          device's owner can also turn it off on that device (<code>keep_busy_enabled</code>).
-        </div>
+    <SettingsGate
+      title="Keep busy"
+      icon="mdi-cursor-default-gesture-outline"
+      :summary="keepBusySummary"
+      data-testid="org-keep-busy-card"
+    >
+      <p class="text-body-2 mb-3">
+        A controller with input can leave a device's pointer moving in a pattern so it stays
+        active: no screensaver, idle lock or "Away". It pauses whenever someone uses the
+        device. Some organizations do not allow this because it defeats a screen-lock policy.
+      </p>
+      <v-switch
+        :model-value="agentStore.orgKeepBusyDenied === false"
+        :loading="savingKeepBusy"
+        :disabled="savingKeepBusy || agentStore.orgKeepBusyDenied === null"
+        color="primary"
+        density="compact"
+        hide-details
+        label="Allow keep busy in this organization"
+        data-testid="org-keep-busy-switch"
+        @update:model-value="onToggleKeepBusy"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        On by default. Turning it off stops keep busy on every device in the organization,
+        immediately for devices that are online and at the next connect for the rest. A
+        device's owner can also turn it off on that device (<code>keep_busy_enabled</code>).
+      </div>
 
-        <!-- FR-92 P8 — the org's default pattern. A preference, never a
-             policy: it never reaches a device, and a person's own last
-             choice for a device wins over it in the viewer. -->
-        <v-select
-          :model-value="agentStore.orgKeepBusyDefaultPattern ?? 'circle'"
-          :items="patternItems"
-          :label="t('keepBusy.defaultPattern.label')"
-          :loading="savingKeepBusyPattern"
-          :disabled="savingKeepBusyPattern || agentStore.orgKeepBusyDenied === null"
-          density="compact"
-          hide-details
-          class="mt-4"
-          style="max-width: 320px"
-          data-testid="org-keep-busy-default-pattern"
-          @update:model-value="onDefaultPattern"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          {{ t('keepBusy.defaultPattern.hint') }}
-        </div>
+      <!-- FR-92 P8 — the org's default pattern. A preference, never a
+           policy: it never reaches a device, and a person's own last
+           choice for a device wins over it in the viewer. -->
+      <v-select
+        :model-value="agentStore.orgKeepBusyDefaultPattern ?? 'circle'"
+        :items="patternItems"
+        :label="t('keepBusy.defaultPattern.label')"
+        :loading="savingKeepBusyPattern"
+        :disabled="savingKeepBusyPattern || agentStore.orgKeepBusyDenied === null"
+        density="compact"
+        hide-details
+        class="mt-4"
+        style="max-width: 320px"
+        data-testid="org-keep-busy-default-pattern"
+        @update:model-value="onDefaultPattern"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        {{ t('keepBusy.defaultPattern.hint') }}
+      </div>
 
-        <v-alert v-if="keepBusyError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ keepBusyError }}
-        </v-alert>
+      <v-alert v-if="keepBusyError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ keepBusyError }}
+      </v-alert>
 
-        <v-divider class="my-4" />
-        <!-- FR-92 P7 — the permanent history. MANAGE_AGENTS server-side; a
-             refusal shows inside the list and ends nothing. -->
-        <KeepBusyHistorySection :tenant-id="tenantId" />
-      </v-card-text>
-    </v-card>
+      <v-divider class="my-4" />
+      <!-- FR-92 P7 — the permanent history. MANAGE_AGENTS server-side; a
+           refusal shows inside the list and ends nothing. -->
+      <KeepBusyHistorySection :tenant-id="tenantId" />
+    </SettingsGate>
 
     <!-- FR-101 P2 — what a remote-desktop session in this org may carry.
          Each feature on / ask / off; the stricter of this and a device's own
          setting wins, and the device enforces it whatever the server sends.
          A change applies to sessions that start after it. -->
-    <v-card data-testid="org-rc-session-card">
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-shield-lock-outline" color="primary" class="mr-2" />
-        Remote session features
-      </v-card-title>
-      <v-card-text>
-        <p class="text-body-2 mb-3">
-          Choose what a remote-desktop session in this organization may use. <strong>Ask</strong>
-          allows a feature only when the person at the device approves the session on a prompt
-          that names it; a session nobody there is asked about (an unattended device, your own
-          device, an administrator's forced session) goes without it.
-        </p>
-        <v-select
-          v-for="f in rcFeatureRows"
-          :key="f.key"
-          :model-value="agentStore.orgRcSessionPolicy?.[f.key] ?? null"
-          :items="rcPolicyItems"
-          :label="f.label"
-          :loading="savingRcFeature === f.key"
-          :disabled="savingRcFeature !== null || agentStore.orgRcSessionPolicy === null"
-          density="compact"
-          hide-details
-          class="mb-3"
-          style="max-width: 320px"
-          :data-testid="`org-rc-session-${f.key}`"
-          @update:model-value="(v: RcFeaturePolicy | null) => onRcFeature(f.key, v)"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          On by default. A device's owner can also turn each one off on that device
-          (<code>rc_clipboard</code>, <code>rc_files</code>, <code>rc_audio</code>). A change applies
-          to sessions that start after it.
-        </div>
-        <v-alert v-if="rcSessionError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ rcSessionError }}
-        </v-alert>
-      </v-card-text>
-    </v-card>
+    <SettingsGate
+      title="Remote session features"
+      icon="mdi-shield-lock-outline"
+      :summary="rcFeaturesSummary"
+      data-testid="org-rc-session-card"
+    >
+      <p class="text-body-2 mb-3">
+        Choose what a remote-desktop session in this organization may use. <strong>Ask</strong>
+        allows a feature only when the person at the device approves the session on a prompt
+        that names it; a session nobody there is asked about (an unattended device, your own
+        device, an administrator's forced session) goes without it.
+      </p>
+      <v-select
+        v-for="f in rcFeatureRows"
+        :key="f.key"
+        :model-value="agentStore.orgRcSessionPolicy?.[f.key] ?? null"
+        :items="rcPolicyItems"
+        :label="f.label"
+        :loading="savingRcFeature === f.key"
+        :disabled="savingRcFeature !== null || agentStore.orgRcSessionPolicy === null"
+        density="compact"
+        hide-details
+        class="mb-3"
+        style="max-width: 320px"
+        :data-testid="`org-rc-session-${f.key}`"
+        @update:model-value="(v: RcFeaturePolicy | null) => onRcFeature(f.key, v)"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        On by default. A device's owner can also turn each one off on that device
+        (<code>rc_clipboard</code>, <code>rc_files</code>, <code>rc_audio</code>). A change applies
+        to sessions that start after it.
+      </div>
+      <v-alert v-if="rcSessionError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ rcSessionError }}
+      </v-alert>
+    </SettingsGate>
 
     <!-- FR-51 gate 1. Its own card and its own server-side switch, like the
          two above: a standing credential that mints device identities is its
          own grant, not an implication of exec or SSH. -->
-    <v-card>
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-clock-fast" color="primary" class="mr-2" />
-        Ephemeral enrollment keys
-      </v-card-title>
-      <v-card-text>
-        <v-alert
-          type="warning"
-          variant="tonal"
-          density="compact"
-          class="mb-4"
-          icon="mdi-shield-alert-outline"
-        >
-          When enabled, fleet admins can mint <strong>reusable</strong>
-          enrollment keys that create <strong>self-removing</strong> devices
-          (CI runners, containers). A key is a standing credential: anyone
-          holding it can enroll devices into this organization until it is
-          revoked, exhausted, or expired.
-        </v-alert>
+    <SettingsGate
+      title="Ephemeral enrollment keys"
+      icon="mdi-clock-fast"
+      :summary="onOff(agentStore.orgEphemeralKeysEnabled)"
+    >
+      <v-alert
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        icon="mdi-shield-alert-outline"
+      >
+        When enabled, fleet admins can mint <strong>reusable</strong>
+        enrollment keys that create <strong>self-removing</strong> devices
+        (CI runners, containers). A key is a standing credential: anyone
+        holding it can enroll devices into this organization until it is
+        revoked, exhausted, or expired.
+      </v-alert>
 
-        <v-switch
-          :model-value="agentStore.orgEphemeralKeysEnabled === true"
-          :loading="savingKeys"
-          :disabled="savingKeys || agentStore.orgEphemeralKeysEnabled === null"
-          color="primary"
-          density="compact"
-          hide-details
-          label="Allow ephemeral enrollment keys in this organization"
-          @update:model-value="onToggleKeys"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          Off by default. Turning it OFF is an org-wide revocation: every
-          outstanding key stops working on its next use. Devices already
-          minted are untouched — they remove themselves by their own deadline.
-        </div>
+      <v-switch
+        :model-value="agentStore.orgEphemeralKeysEnabled === true"
+        :loading="savingKeys"
+        :disabled="savingKeys || agentStore.orgEphemeralKeysEnabled === null"
+        color="primary"
+        density="compact"
+        hide-details
+        label="Allow ephemeral enrollment keys in this organization"
+        @update:model-value="onToggleKeys"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        Off by default. Turning it OFF is an org-wide revocation: every
+        outstanding key stops working on its next use. Devices already
+        minted are untouched — they remove themselves by their own deadline.
+      </div>
 
-        <v-alert v-if="keysError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ keysError }}
-        </v-alert>
-      </v-card-text>
-    </v-card>
+      <v-alert v-if="keysError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ keysError }}
+      </v-alert>
+    </SettingsGate>
 
     <!-- FR-101 P4b — how long a remote-desktop session in this org may last.
          The hub ends a session that reaches it (the viewer is told which limit
          it was). Off for existing organizations (operator decision). -->
-    <v-card data-testid="org-rc-limits-card">
-      <v-card-title class="d-flex align-center">
-        <v-icon icon="mdi-timer-sand" color="primary" class="mr-2" />
-        Remote session limits
-      </v-card-title>
-      <v-card-text>
-        <v-select
-          :model-value="agentStore.orgRcMaxSessionSecs === undefined ? null : agentStore.orgRcMaxSessionSecs ?? 0"
-          :items="maxSessionOptions()"
-          label="Maximum session length"
-          :loading="savingMaxSession"
-          :disabled="savingMaxSession || agentStore.orgRcMaxSessionSecs === undefined"
-          density="compact"
-          hide-details
-          style="max-width: 320px"
-          data-testid="org-rc-max-session"
-          @update:model-value="onMaxSession"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          A session ends this long after it started, and the person controlling it is told why.
-          No limit by default. A change applies to sessions that start after it.
-        </div>
-        <v-alert v-if="maxSessionError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ maxSessionError }}
-        </v-alert>
-        <!-- FR-101 P4b-2 — the idle limit. The DEVICE keeps it (only it sees
-             both the input and the screen), so devices too old to advertise
-             it ignore it; a device's own setting may shorten it. -->
-        <v-select
-          :model-value="agentStore.orgRcIdleSecs === undefined ? null : agentStore.orgRcIdleSecs ?? 0"
-          :items="idleOptions()"
-          label="End a session after no activity for"
-          :loading="savingIdle"
-          :disabled="savingIdle || agentStore.orgRcIdleSecs === undefined"
-          density="compact"
-          hide-details
-          class="mt-4"
-          style="max-width: 320px"
-          data-testid="org-rc-idle"
-          @update:model-value="onIdle"
-        />
-        <div class="text-caption text-medium-emphasis mt-1">
-          No input from the person controlling it and no change on the screen for this long. They
-          are warned shortly before the end. The device keeps this limit, so a device whose agent
-          predates it does not. No limit by default.
-        </div>
-        <v-alert v-if="idleError" type="error" variant="tonal" density="compact" class="mt-3">
-          {{ idleError }}
-        </v-alert>
-      </v-card-text>
-    </v-card>
+    <SettingsGate
+      title="Remote session limits"
+      icon="mdi-timer-sand"
+      :summary="limitsSummary"
+      data-testid="org-rc-limits-card"
+    >
+      <v-select
+        :model-value="agentStore.orgRcMaxSessionSecs === undefined ? null : agentStore.orgRcMaxSessionSecs ?? 0"
+        :items="maxSessionOptions()"
+        label="Maximum session length"
+        :loading="savingMaxSession"
+        :disabled="savingMaxSession || agentStore.orgRcMaxSessionSecs === undefined"
+        density="compact"
+        hide-details
+        style="max-width: 320px"
+        data-testid="org-rc-max-session"
+        @update:model-value="onMaxSession"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        A session ends this long after it started, and the person controlling it is told why.
+        No limit by default. A change applies to sessions that start after it.
+      </div>
+      <v-alert v-if="maxSessionError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ maxSessionError }}
+      </v-alert>
+      <!-- FR-101 P4b-2 — the idle limit. The DEVICE keeps it (only it sees
+           both the input and the screen), so devices too old to advertise
+           it ignore it; a device's own setting may shorten it. -->
+      <v-select
+        :model-value="agentStore.orgRcIdleSecs === undefined ? null : agentStore.orgRcIdleSecs ?? 0"
+        :items="idleOptions()"
+        label="End a session after no activity for"
+        :loading="savingIdle"
+        :disabled="savingIdle || agentStore.orgRcIdleSecs === undefined"
+        density="compact"
+        hide-details
+        class="mt-4"
+        style="max-width: 320px"
+        data-testid="org-rc-idle"
+        @update:model-value="onIdle"
+      />
+      <div class="text-caption text-medium-emphasis mt-1">
+        No input from the person controlling it and no change on the screen for this long. They
+        are warned shortly before the end. The device keeps this limit, so a device whose agent
+        predates it does not. No limit by default.
+      </div>
+      <v-alert v-if="idleError" type="error" variant="tonal" density="compact" class="mt-3">
+        {{ idleError }}
+      </v-alert>
+    </SettingsGate>
 
     <!-- The exec/SSH audit + activity sections moved to /tenant/{id}/audit
          (2026-08-26) — history review is its own nav destination now. -->
-  </div>
+  </component>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useDisplay } from 'vuetify'
+import { VExpansionPanels } from 'vuetify/components'
 import { useTenantStore } from '@/stores/tenant'
 import { useAgentStore, type RcFeaturePolicy, type RcSessionPolicy } from '@/stores/agents'
 import { KEEP_BUSY_PATTERNS } from '@/composables/keepBusy'
 import KeepBusyHistorySection from '@/components/admin/KeepBusyHistorySection.vue'
+import SettingsGate from '@/components/admin/SettingsGate.vue'
 
 const props = defineProps<{ tenantId: string }>()
 const { t } = useI18n()
 const tenantStore = useTenantStore()
 const agentStore = useAgentStore()
+const { xs } = useDisplay()
 
 const saving = ref(false)
 const error = ref<string | null>(null)
@@ -515,10 +511,10 @@ async function onDefaultPattern(pattern: string | null) {
 
 // FR-101 P2 — the org's session policy, one select per feature. Its own error,
 // and the feature being saved, so a failure never renders under another card.
-const rcFeatureRows: { key: keyof RcSessionPolicy; label: string }[] = [
-  { key: 'clipboard', label: 'Clipboard' },
-  { key: 'files', label: 'File transfer' },
-  { key: 'audio', label: "The device's audio" },
+const rcFeatureRows: { key: keyof RcSessionPolicy; label: string; short: string }[] = [
+  { key: 'clipboard', label: 'Clipboard', short: 'Clipboard' },
+  { key: 'files', label: 'File transfer', short: 'Files' },
+  { key: 'audio', label: "The device's audio", short: 'Audio' },
 ]
 const rcPolicyItems: { title: string; value: RcFeaturePolicy }[] = [
   { title: 'On', value: 'on' },
@@ -624,6 +620,41 @@ async function onIdle(secs: number | null) {
     savingIdle.value = false
   }
 }
+
+// FR-116 — each gate's state, for its collapsed panel on a phone. Empty while
+// it is unknown: not loaded yet, or not readable with the caller's rights.
+function onOff(v: boolean | null): string {
+  return v === null ? '' : v ? 'On' : 'Off'
+}
+/** A multi-part summary wraps only between parts ("Files: ask · Audio: off"),
+ *  never inside one. */
+function joinParts(parts: string[]): string {
+  return parts.map((p) => p.replace(/ /g, ' ')).join(' · ')
+}
+const keepBusySummary = computed(() =>
+  agentStore.orgKeepBusyDenied === null ? '' : agentStore.orgKeepBusyDenied ? 'Not allowed' : 'Allowed',
+)
+const rcFeaturesSummary = computed(() => {
+  const p = agentStore.orgRcSessionPolicy
+  if (!p) return ''
+  const limited = rcFeatureRows
+    .filter((f) => p[f.key] === 'ask' || p[f.key] === 'off')
+    .map((f) => `${f.short}: ${p[f.key]}`)
+  return limited.length ? joinParts(limited) : 'All on'
+})
+const limitsSummary = computed(() => {
+  const max = agentStore.orgRcMaxSessionSecs
+  const idle = agentStore.orgRcIdleSecs
+  if (max === undefined && idle === undefined) return ''
+  const parts: string[] = []
+  if (typeof max === 'number' && max > 0) {
+    parts.push(`${maxSessionOptions().find((i) => i.value === max)?.title} max`)
+  }
+  if (typeof idle === 'number' && idle > 0) {
+    parts.push(`${idleOptions().find((i) => i.value === idle)?.title} idle`)
+  }
+  return parts.length ? joinParts(parts) : 'No limits'
+})
 
 onMounted(() => {
   void agentStore.fetchOrgRcSessionLimits(props.tenantId)

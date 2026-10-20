@@ -5,7 +5,9 @@
     <v-card-title class="d-flex align-center flex-wrap ga-2">
       <span>Members</span>
       <v-spacer />
-      <!-- FR-11: server-side search over display name / email / nickname. -->
+      <!-- FR-11: server-side search over display name / email / nickname.
+           FR-116: a row of its own on a phone, where 260 px beside the
+           title left it ~100 px ("Searc"). -->
       <v-text-field
         v-model="gridSearch"
         density="compact"
@@ -13,8 +15,8 @@
         clearable
         prepend-inner-icon="mdi-magnify"
         placeholder="Search name or email"
-        style="max-width: 260px"
-        class="flex-grow-0"
+        :style="xs ? 'flex: 1 1 100%' : 'max-width: 260px'"
+        :class="xs ? 'order-last' : 'flex-grow-0'"
       />
       <v-btn
         icon="mdi-table-cog"
@@ -79,7 +81,9 @@
         :items-per-page-options="[10, 25, 50, 100]"
         density="compact"
         class="members-table"
+        :class="{ 'members-table--stacked': xs }"
         item-value="id"
+        :mobile="xs"
         @update:options="onGridOptions"
       >
         <template #item.name="{ item }">
@@ -253,6 +257,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { useMembersStore, type Member } from '@/stores/members'
 import { useRoleStore, type Role } from '@/stores/role'
 import { useTenantStore } from '@/stores/tenant'
@@ -270,6 +275,10 @@ const roleStore = useRoleStore()
 const tenantStore = useTenantStore()
 const auth = useAuthStore()
 const { rules } = useValidation()
+// FR-116 — below 600 px each member is a stacked row (Vuetify's mobile
+// rows, from the same headers): the Roles column and the Roles / Remove
+// actions were behind a sideways scroll inside the table.
+const { xs } = useDisplay()
 
 const myUserId = computed(() => auth.user?.id)
 const ownerId = computed(() => tenantStore.current?.owner_id)
@@ -468,16 +477,23 @@ async function toggleRole(role: Role, on: boolean) {
 
 /* Never squeeze the columns into the viewport — cells keep their natural
    width and the WRAPPER scrolls horizontally (house rule: wide tables
-   scroll in their own container). */
+   scroll in their own container). FR-116: the desktop layout only — in the
+   stacked rows of a phone these rules pushed every value off the edge. */
 .members-table :deep(.v-table__wrapper) {
   overflow-x: auto;
 }
-.members-table :deep(table) {
+.members-table:not(.members-table--stacked) :deep(table) {
   width: max-content;
   min-width: 100%;
 }
-.members-table :deep(th),
-.members-table :deep(td) {
+.members-table:not(.members-table--stacked) :deep(th),
+.members-table:not(.members-table--stacked) :deep(td) {
   white-space: nowrap;
+}
+/* FR-116 — a stacked row's value can be one long unbroken token (an email,
+   a file name): it wraps rather than widening the row past the screen. */
+.members-table--stacked :deep(.v-data-table__td-value) {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 </style>
