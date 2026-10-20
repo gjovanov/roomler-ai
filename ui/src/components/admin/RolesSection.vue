@@ -46,7 +46,9 @@
         No roles yet — create one to start delegating permissions.
       </p>
 
-      <v-table v-else density="compact">
+      <!-- FR-116: `table-stack-xs` — on a phone each role is a block, with
+           its actions on screen (the delete button sat past the edge). -->
+      <v-table v-else density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>Role</th>
@@ -74,7 +76,7 @@
                 </div>
               </div>
             </td>
-            <td>
+            <td data-label="Permissions">
               <v-chip
                 v-if="isAdministrator(role.permissions)"
                 size="x-small"
@@ -83,14 +85,40 @@
               >
                 Administrator (all)
               </v-chip>
-              <v-tooltip v-else location="bottom" max-width="420">
-                <template #activator="{ props: tip }">
-                  <span v-bind="tip" class="text-body-2">
-                    {{ permissionSummary(role.permissions) }}
-                  </span>
-                </template>
-                <span>{{ describePermissions(role.permissions).join(' · ') || 'No permissions' }}</span>
-              </v-tooltip>
+              <template v-else>
+                <!-- FR-116 — what a role grants was a hover tooltip and
+                     nothing else, so a touch screen could not read it. A tap
+                     (or Enter) now lists the grants under the count, at every
+                     width; a mouse still gets the tooltip. -->
+                <v-tooltip location="bottom" max-width="420" :disabled="touchOnly">
+                  <template #activator="{ props: tip }">
+                    <span
+                      v-bind="tip"
+                      class="text-body-2 grants-toggle"
+                      role="button"
+                      tabindex="0"
+                      :aria-expanded="openGrants === role.id"
+                      :data-testid="`role-grants-${role.id}`"
+                      @click="toggleGrants(role.id)"
+                      @keydown.enter.prevent="toggleGrants(role.id)"
+                      @keydown.space.prevent="toggleGrants(role.id)"
+                    >
+                      {{ permissionSummary(role.permissions) }}
+                    </span>
+                  </template>
+                  <span>{{ describePermissions(role.permissions).join(' · ') || 'No permissions' }}</span>
+                </v-tooltip>
+                <div v-if="openGrants === role.id" class="d-flex flex-wrap ga-1 mt-1">
+                  <v-chip
+                    v-for="grant in describePermissions(role.permissions)"
+                    :key="grant"
+                    size="x-small"
+                    variant="tonal"
+                  >
+                    {{ grant }}
+                  </v-chip>
+                </div>
+              </template>
             </td>
             <td class="text-right text-no-wrap">
               <v-btn
@@ -116,7 +144,15 @@
   </v-card>
 
   <!-- Create / edit dialog -->
-  <v-dialog v-model="editDialog" max-width="900" persistent>
+  <!-- FR-116: full screen on a phone, scrolling inside so Save and Cancel stay
+       on screen below ~30 permission boxes. -->
+  <v-dialog
+    v-model="editDialog"
+    max-width="900"
+    persistent
+    :fullscreen="fullscreen"
+    :scrollable="fullscreen"
+  >
     <v-card>
       <v-card-title>{{ editingId ? 'Edit Role' : 'New Role' }}</v-card-title>
       <v-card-text>
@@ -173,8 +209,11 @@
           />
         </div>
 
-        <div class="d-flex align-center mt-4 mb-1">
-          <span class="text-caption text-medium-emphasis">Permissions</span>
+        <div class="d-flex align-center flex-wrap mt-4 mb-1">
+          <span
+            class="text-caption text-medium-emphasis"
+            :style="fullscreen ? 'flex-basis: 100%' : undefined"
+          >Permissions</span>
           <v-spacer />
           <v-btn size="x-small" variant="text" @click="applyPreset(DEFAULT_MEMBER)">Member defaults</v-btn>
           <v-btn size="x-small" variant="text" @click="applyPreset(DEFAULT_ADMIN)">Admin defaults</v-btn>
@@ -195,16 +234,21 @@
         <v-row dense>
           <v-col v-for="group in PERMISSION_GROUPS" :key="group" cols="12" sm="6" md="4">
             <div class="text-caption font-weight-medium mb-1">{{ group }}</div>
+            <!-- FR-116 — on a touch screen the description is a hint under
+                 the box: as a tooltip on the label, the tap meant to read it
+                 toggled the permission instead. -->
             <v-checkbox
               v-for="flag in flagsFor(group)"
               :key="flag.key"
               :model-value="maskHas(form.permissions, flag.bit)"
               :label="flag.label"
               density="compact"
-              hide-details
+              :hide-details="touchOnly && flag.description ? 'auto' : true"
+              :hint="touchOnly ? flag.description : undefined"
+              :persistent-hint="touchOnly"
               @update:model-value="toggleFlag(flag.bit, $event as boolean)"
             >
-              <template v-if="flag.description" #label>
+              <template v-if="flag.description && !touchOnly" #label>
                 <v-tooltip location="bottom" max-width="360">
                   <template #activator="{ props: tip }">
                     <span v-bind="tip">{{ flag.label }}</span>
@@ -246,6 +290,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoleStore, type Role } from '@/stores/role'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import {
   ADMINISTRATOR,
   DEFAULT_ADMIN,
@@ -261,6 +306,15 @@ import {
 const props = defineProps<{ tenantId: string }>()
 
 const roleStore = useRoleStore()
+const { fullscreen } = useResponsiveDialog()
+
+// FR-116 — a touch screen has no hover: tooltips give way to a tap that
+// lists a role's grants, and to hints under the permission boxes.
+const touchOnly = typeof window !== 'undefined' && !!window.matchMedia?.('(hover: none)').matches
+const openGrants = ref<string | null>(null)
+function toggleGrants(roleId: string) {
+  openGrants.value = openGrants.value === roleId ? null : roleId
+}
 
 const sortedRoles = computed(() =>
   [...roleStore.roles].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
@@ -426,5 +480,8 @@ onMounted(() => roleStore.fetchRoles(props.tenantId))
 .swatch-selected {
   outline: 2px solid rgb(var(--v-theme-primary));
   outline-offset: 1px;
+}
+.grants-toggle {
+  cursor: pointer;
 }
 </style>

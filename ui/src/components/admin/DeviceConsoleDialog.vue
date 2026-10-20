@@ -51,7 +51,7 @@
           {{ blockedReason }}
         </v-alert>
 
-        <div class="d-flex align-center flex-wrap gap-2 mb-3">
+        <div class="d-flex align-center flex-wrap ga-2 mb-3">
           <v-select
             v-model="shell"
             :items="shellOptions"
@@ -115,7 +115,7 @@
         </v-alert>
 
         <div v-for="(entry, i) in history" :key="entry.request_id || i" class="mb-4">
-          <div class="d-flex align-center flex-wrap gap-2 mb-1">
+          <div class="d-flex align-center flex-wrap ga-2 mb-1">
             <v-chip size="small" :color="statusColor(entry)" variant="flat">
               {{ statusLabel(entry) }}
             </v-chip>
