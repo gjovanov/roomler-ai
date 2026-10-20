@@ -198,6 +198,7 @@ actions inside the viewport.
 | **P1** — #2563 | the Devices page (§3.2) | revert the PR: UI only, no server or agent state, no stored preference changed | the operator's org at 390 px on production after a promote, red then green; the desktop grid pixel-identical | M |
 | **P2** — #2567 | the shell (§3.3) | revert | a route sweep at 360/390 px | M |
 | **P3** — P3a #2570 · P3b #2572 · P3c #2582 (a stack on #2567) | admin, network, audit, device dialogs | revert | the same sweep; the ACL editors and Overlay routes by hand | L |
+| **P3d** — #2607 | the audit lists on a phone: compact cards, 20 at a time, a long command clamped until tapped; and the SSH audit's refusal that also read "granted" (P3a) | revert: UI only | the exec audit at 360 px with 100 rows: 47,997 → 4,822 px in the harness; production after a promote | S |
 | **P4** — P4a #2574 (chat) · P4b #2580 (calls) | chat and conference | revert | a two-browser call with one at phone width | L |
 | **P5** — #2577 · P5b #2588 (the files drawer; a stack on #2577) | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
 | **P6** — P6a #2584 (UI) · P6b #2586 (D4, the server); hive's rows are FR-90's and stay open | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |

@@ -50,61 +50,87 @@
       </div>
 
       <!-- A card per entry below 600 px (table-stack-xs): the result and the
-           command or detail sat about three screens to the right. -->
-      <v-table v-else density="compact" class="table-stack-xs">
-        <thead>
-          <tr>
-            <th>When</th>
-            <th>Device</th>
-            <th>What</th>
-            <th>Detail</th>
-            <th>Result</th>
-            <th>Who</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(e, i) in entries" :key="e.id ?? `${e.at}-${i}`">
-            <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
-            <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
-            <td data-label="What" class="text-no-wrap">
-              <v-chip size="x-small" :color="kindColor(e.kind)" variant="tonal">
-                {{ kindLabel(e.kind) }}
-              </v-chip>
-            </td>
-            <td data-label="Detail" class="text-truncate" style="max-width: 26rem">
-              <code v-if="e.detail" class="text-caption">{{ e.detail }}</code>
-              <span v-else class="text-medium-emphasis">—</span>
-            </td>
-            <td data-label="Result" class="text-no-wrap">
-              <!-- A refused forward is the row an operator most wants to find,
-                   so it gets the loud treatment rather than a neutral dash. -->
-              <v-chip v-if="!e.allowed" size="x-small" color="error" variant="flat">
-                refused
-              </v-chip>
-              <v-chip
-                v-else-if="e.exit_code !== null && e.exit_code !== undefined"
-                size="x-small"
-                :color="e.exit_code === 0 ? 'success' : 'warning'"
-                variant="flat"
-              >
-                exit {{ e.exit_code }}
-              </v-chip>
-              <span v-else class="text-medium-emphasis">—</span>
-            </td>
-            <td data-label="Who" class="text-no-wrap text-caption text-medium-emphasis">
-              {{ shortCaller(e.caller) }}
-            </td>
-          </tr>
-        </tbody>
-      </v-table>
+           command or detail sat about three screens to the right. Compact
+           (labels beside short values), 20 cards at a time, and a long
+           detail clamped until tapped. -->
+      <template v-else>
+        <v-table density="compact" class="table-stack-xs table-stack-xs--compact">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Device</th>
+              <th>What</th>
+              <th>Detail</th>
+              <th>Result</th>
+              <th>Who</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(e, i) in visible" :key="e.id ?? `${e.at}-${i}`">
+              <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
+              <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
+              <td data-label="What" class="text-no-wrap">
+                <v-chip size="x-small" :color="kindColor(e.kind)" variant="tonal">
+                  {{ kindLabel(e.kind) }}
+                </v-chip>
+              </td>
+              <td data-label="Detail" class="text-truncate stack-block" style="max-width: 26rem">
+                <template v-if="e.detail">
+                  <code
+                    class="text-caption activity-detail"
+                    :class="{ 'activity-detail--open': openDetails.has(rowKey(e, i)) }"
+                    :title="e.detail"
+                  >{{ e.detail }}</code>
+                  <button
+                    v-if="xs && e.detail.length > 120"
+                    type="button"
+                    class="activity-more text-caption"
+                    :aria-expanded="openDetails.has(rowKey(e, i))"
+                    @click="toggleDetail(rowKey(e, i))"
+                  >
+                    {{ openDetails.has(rowKey(e, i)) ? 'Show less' : 'Show all' }}
+                  </button>
+                </template>
+                <span v-else class="text-medium-emphasis">—</span>
+              </td>
+              <td data-label="Result" class="text-no-wrap">
+                <!-- A refused forward is the row an operator most wants to find,
+                     so it gets the loud treatment rather than a neutral dash. -->
+                <v-chip v-if="!e.allowed" size="x-small" color="error" variant="flat">
+                  refused
+                </v-chip>
+                <v-chip
+                  v-else-if="e.exit_code !== null && e.exit_code !== undefined"
+                  size="x-small"
+                  :color="e.exit_code === 0 ? 'success' : 'warning'"
+                  variant="flat"
+                >
+                  exit {{ e.exit_code }}
+                </v-chip>
+                <span v-else class="text-medium-emphasis">—</span>
+              </td>
+              <td data-label="Who" class="text-no-wrap text-caption text-medium-emphasis">
+                {{ shortCaller(e.caller) }}
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+        <div v-if="remaining" class="text-center mt-2">
+          <v-btn variant="tonal" size="small" data-testid="audit-show-more" @click="showMore">
+            Show {{ nextCount }} more
+          </v-btn>
+        </div>
+      </template>
     </v-card-text>
   </v-card>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useDisplay } from 'vuetify'
 import { useAgentStore, type SshActivityEntry, type SshActivityKind } from '@/stores/agents'
 import { deviceLabel } from '@/composables/useHideDeviceName'
+import { usePhoneSlice } from '@/composables/usePhoneSlice'
 
 const props = defineProps<{
   tenantId: string
@@ -117,6 +143,21 @@ const props = defineProps<{
 
 const agentStore = useAgentStore()
 const entries = ref<SshActivityEntry[]>([])
+// FR-116 P3d — a phone shows 20 cards at a time, each long detail clamped to
+// three lines until tapped (`title` is the desktop's way in; a touch screen
+// has no hover).
+const { xs } = useDisplay()
+const { visible, remaining, nextCount, showMore } = usePhoneSlice(entries)
+const openDetails = ref(new Set<string>())
+function rowKey(e: SshActivityEntry, i: number): string {
+  return e.id ?? `${e.at}-${i}`
+}
+function toggleDetail(key: string) {
+  const next = new Set(openDetails.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  openDetails.value = next
+}
 const loading = ref(false)
 const error = ref<string | null>(null)
 
@@ -190,3 +231,38 @@ onMounted(() => {
 
 defineExpose({ load })
 </script>
+
+<style scoped>
+/* A phone stacks the row into a card (table-stack-xs); a long detail shows
+   three lines and opens on "Show all". Wider screens keep the one-line
+   truncation with the whole of it in `title`. */
+@media (max-width: 599.98px) {
+  .activity-detail {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    overflow: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .activity-detail--open {
+    display: block;
+    -webkit-line-clamp: unset;
+    line-clamp: none;
+  }
+}
+.activity-more {
+  display: block;
+  margin-top: 2px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: rgb(var(--v-theme-primary));
+  cursor: pointer;
+}
+.activity-more:focus-visible {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
+}
+</style>

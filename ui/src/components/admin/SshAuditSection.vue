@@ -40,59 +40,69 @@
       </div>
 
       <!-- A card per entry below 600 px (table-stack-xs): the result and the
-           command or detail sat about three screens to the right. -->
-      <v-table v-else density="compact" class="table-stack-xs">
-        <thead>
-          <tr>
-            <th>When</th>
-            <th>Device</th>
-            <th>Who</th>
-            <th>Via</th>
-            <th>As</th>
-            <th>Result</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(e, i) in entries" :key="e.id ?? `${e.at}-${i}`">
-            <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
-            <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
-            <td data-label="Who" class="text-no-wrap">{{ userName(e.user_id) }}</td>
-            <td data-label="Via">
-              <v-chip size="x-small" variant="tonal">{{ e.source }}</v-chip>
-            </td>
-            <td data-label="As" class="text-no-wrap">
-              <v-chip
-                v-if="asChip(e)"
-                size="x-small"
-                :color="asChip(e)?.color"
-                :title="asChip(e)?.title"
-                variant="tonal"
-              >
-                {{ asChip(e)?.label }}
-              </v-chip>
-              <span v-else class="text-medium-emphasis">—</span>
-            </td>
-            <td data-label="Result" class="text-no-wrap">
-              <v-tooltip v-if="e.denied" :text="e.denied_message ?? ''" location="top">
-                <template #activator="{ props: tip }">
-                  <v-chip v-bind="tip" size="x-small" color="error" variant="flat">
-                    {{ denyLabel(e) }}
-                  </v-chip>
+           command or detail sat about three screens to the right. Compact
+           (labels beside short values) and 20 cards at a time. -->
+      <template v-else>
+        <v-table density="compact" class="table-stack-xs table-stack-xs--compact">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Device</th>
+              <th>Who</th>
+              <th>Via</th>
+              <th>As</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(e, i) in visible" :key="e.id ?? `${e.at}-${i}`">
+              <td data-label="When" class="text-no-wrap">{{ fmtWhen(e.at) }}</td>
+              <td data-label="Device" class="text-no-wrap">{{ deviceName(e.agent_id) }}</td>
+              <td data-label="Who" class="text-no-wrap">{{ userName(e.user_id) }}</td>
+              <td data-label="Via">
+                <v-chip size="x-small" variant="tonal">{{ e.source }}</v-chip>
+              </td>
+              <td data-label="As" class="text-no-wrap">
+                <v-chip
+                  v-if="asChip(e)"
+                  size="x-small"
+                  :color="asChip(e)?.color"
+                  :title="asChip(e)?.title"
+                  variant="tonal"
+                >
+                  {{ asChip(e)?.label }}
+                </v-chip>
+                <span v-else class="text-medium-emphasis">—</span>
+              </td>
+              <td data-label="Result" class="text-no-wrap">
+                <!-- One v-if / v-else pair around the whole refusal: the
+                     reason line must not sit between them, or a refusal
+                     without a message also showed "granted". -->
+                <template v-if="e.denied">
+                  <v-tooltip :text="e.denied_message ?? ''" location="top">
+                    <template #activator="{ props: tip }">
+                      <v-chip v-bind="tip" size="x-small" color="error" variant="flat">
+                        {{ denyLabel(e) }}
+                      </v-chip>
+                    </template>
+                  </v-tooltip>
+                  <!-- A touch screen never hovers: the server's own reason,
+                       spelled out on the phone card. -->
+                  <div v-if="e.denied_message" class="text-caption text-medium-emphasis d-sm-none">
+                    {{ e.denied_message }}
+                  </div>
                 </template>
-              </v-tooltip>
-              <!-- A touch screen never hovers: the server's own reason, spelled
-                   out on the phone card. -->
-              <div
-                v-if="e.denied && e.denied_message"
-                class="text-caption text-medium-emphasis d-sm-none"
-              >
-                {{ e.denied_message }}
-              </div>
-              <v-chip v-else size="x-small" color="success" variant="flat">granted</v-chip>
-            </td>
-          </tr>
-        </tbody>
-      </v-table>
+                <v-chip v-else size="x-small" color="success" variant="flat">granted</v-chip>
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+        <div v-if="remaining" class="text-center mt-2">
+          <v-btn variant="tonal" size="small" data-testid="audit-show-more" @click="showMore">
+            Show {{ nextCount }} more
+          </v-btn>
+        </div>
+      </template>
     </v-card-text>
   </v-card>
 </template>
@@ -101,6 +111,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useAgentStore, type SshAuditEntry } from '@/stores/agents'
 import { deviceLabel } from '@/composables/useHideDeviceName'
+import { usePhoneSlice } from '@/composables/usePhoneSlice'
 import { sshAsChip, type SshAsChip } from '@/utils/sshIdentity'
 
 const props = defineProps<{
@@ -111,6 +122,8 @@ const props = defineProps<{
 
 const agentStore = useAgentStore()
 const entries = ref<SshAuditEntry[]>([])
+// FR-116 P3d — a phone shows 20 cards at a time.
+const { visible, remaining, nextCount, showMore } = usePhoneSlice(entries)
 const loading = ref(false)
 const error = ref<string | null>(null)
 
