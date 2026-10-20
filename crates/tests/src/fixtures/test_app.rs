@@ -504,6 +504,9 @@ fn test_settings() -> Settings {
         // FR-115 P5 — the meeting cap ON, as a deployment without
         // `[meetings]`; the tests drive its sweep by hand.
         meetings: roomler_ai_config::MeetingsSettings::default(),
+        // FR-115 P4a — the relay allowance OFF, as a deployment without
+        // `[relay_allowance]`; its tests switch it on and drive the job by hand.
+        relay_allowance: roomler_ai_config::RelayAllowanceSettings::default(),
         // P2b — blocks OFF by default, exactly like a fresh deployment. The
         // renumber tests carve explicitly; the block-carve test flips the
         // flag via `spawn_with_settings`.

@@ -213,6 +213,8 @@ mod rc_session_limits_tests;
 #[cfg(test)]
 mod rc_session_policy_tests;
 #[cfg(test)]
+mod relay_allowance_tests;
+#[cfg(test)]
 mod relay_region_tests;
 #[cfg(test)]
 mod remote_control_tests;

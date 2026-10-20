@@ -30,6 +30,8 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 bson.workspace = true
+# FR-115 P4a — the relay allowance's month boundary (UTC).
+chrono.workspace = true
 dashmap.workspace = true
 # Subnet / static-endpoint validation in the overlay ACL and relay routes (not a workspace dep).
 ipnet = "2"

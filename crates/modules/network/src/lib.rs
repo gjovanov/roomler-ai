@@ -59,6 +59,7 @@ pub mod ephemeral;
 pub mod hooks;
 pub mod org_relay;
 pub mod overlay;
+pub mod relay_allowance;
 pub mod ssh_grant_acks;
 pub mod tunnel;
 pub mod routes {
@@ -336,6 +337,10 @@ impl Module for NetworkState {
         // each writes only the bytes it relayed, into the same deterministic
         // `_id`, and `$inc` sums them.
         derp::spawn_derp_usage_flush(state.clone());
+        // FR-115 P4a — the relay allowance: the over-allowance job (one pod
+        // per tick) and every pod's refresh. Throttles nothing unless
+        // `relay_allowance.enabled`, and never on a server that sells no plans.
+        relay_allowance::spawn(state.clone());
         // C-3/C-5 — the directory heartbeat for this module's classes
         // (tunnel sessions, derp registrations). The agent-presence half is
         // fleet's, spawned by its init.
