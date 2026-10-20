@@ -71,7 +71,7 @@ compiles Rust and mediasoup, measured 6 minutes on a 16-core laptop, 15–20 on 
 small VPS.
 
 **Hosted** — create a workspace at [roomler.ai](https://roomler.ai) and skip to
-the next step. Free for 3 devices.
+the next step. Free for 10 users and 100 devices, commercial use included.
 
 ### Add a machine
 
