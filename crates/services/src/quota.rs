@@ -37,6 +37,10 @@ pub enum Limit {
     MagicDns,
     Recordings,
     CloudIntegrations,
+    // ── Wired by FR-115 ──────────────────────────────────────────────
+    /// How long one meeting may run, in minutes — "may it run one more
+    /// minute?", so `used` is the minutes it has already run.
+    MeetingMinutes,
 }
 
 impl Limit {
@@ -55,6 +59,7 @@ impl Limit {
             Limit::MagicDns => "magic_dns",
             Limit::Recordings => "recordings",
             Limit::CloudIntegrations => "cloud_integrations",
+            Limit::MeetingMinutes => "meeting_max_minutes",
         }
     }
 
@@ -79,6 +84,12 @@ impl Limit {
     /// replaces "personal use" detection. The hub enforces it at session
     /// start (`Hub::create_session_full`); listing it here keeps any future
     /// check through this function from softening it under `warn`.
+    ///
+    /// FR-115 P5 added the two meeting fences, `VideoMaxParticipants` and
+    /// `MeetingMinutes`: "10 people, 60 minutes" is what the Free ladder
+    /// sells, and a fence that `warn` (every new org's default) lets through
+    /// is not one. The participant count can only under-count (it reads the
+    /// owner pod's room), so the cap fails open, never on a seat that exists.
     pub fn is_established(self) -> bool {
         matches!(
             self,
@@ -86,6 +97,8 @@ impl Limit {
                 | Limit::MaxTunnelClients
                 | Limit::MaxMembers
                 | Limit::MaxConcurrentSessions
+                | Limit::VideoMaxParticipants
+                | Limit::MeetingMinutes
         )
     }
 
@@ -113,6 +126,10 @@ impl Limit {
             Limit::MagicDns => (bool_cap(limits.magic_dns), "MagicDNS"),
             Limit::Recordings => (bool_cap(limits.recordings), "recordings"),
             Limit::CloudIntegrations => (bool_cap(limits.cloud_integrations), "cloud integrations"),
+            Limit::MeetingMinutes => (
+                count_cap(limits.meeting_max_minutes),
+                "minutes of meeting time",
+            ),
         }
     }
 }
@@ -348,9 +365,12 @@ pub fn require_feature(plan: Plan, mode: PlanEnforcement, limit: Limit) -> Resul
 mod tests {
     use super::*;
 
-    // Free (FR-115): video_max_participants = 10 (wired by FR-32, subject to
-    // the mode), max_members = 10 (ESTABLISHED since FR-115), max_devices =
-    // 100, storage 1 GiB, recordings and exit nodes off, MagicDNS on.
+    // Free (FR-115): storage 1 GiB (wired by FR-32, subject to the mode);
+    // max_members = 10, video_max_participants = 10 and meetings of 60
+    // minutes (ESTABLISHED since FR-115); max_devices = 100; recordings and
+    // exit nodes off, MagicDNS on.
+
+    const GIB: u64 = roomler_ai_db::models::tenant::GIB;
 
     #[test]
     fn under_the_cap_always_passes() {
@@ -359,20 +379,22 @@ mod tests {
             PlanEnforcement::Warn,
             PlanEnforcement::Enforce,
         ] {
-            assert!(check(Plan::Free, mode, Limit::VideoMaxParticipants, 9).is_ok());
+            assert!(check_delta(Plan::Free, mode, Limit::StorageBytes, GIB - 10, 10).is_ok());
             assert!(check(Plan::Free, mode, Limit::MaxMembers, 9).is_ok());
+            assert!(check(Plan::Free, mode, Limit::VideoMaxParticipants, 9).is_ok());
         }
     }
 
     #[test]
     fn warn_records_but_does_not_refuse() {
-        // At the cap: the observe phase must let this through.
+        // Over the cap: the observe phase must let this through.
         assert!(
-            check(
+            check_delta(
                 Plan::Free,
                 PlanEnforcement::Warn,
-                Limit::VideoMaxParticipants,
-                10
+                Limit::StorageBytes,
+                GIB,
+                1
             )
             .is_ok()
         );
@@ -380,29 +402,66 @@ mod tests {
 
     #[test]
     fn enforce_refuses_at_the_cap() {
-        let d = check(
+        let d = check_delta(
             Plan::Free,
             PlanEnforcement::Enforce,
-            Limit::VideoMaxParticipants,
-            10,
+            Limit::StorageBytes,
+            GIB,
+            1,
         )
-        .expect_err("a Free call at 10 participants must be refused under Enforce");
-        assert_eq!(d.used, 10);
-        assert_eq!(d.max, 10);
-        assert_eq!(d.limit, Limit::VideoMaxParticipants);
+        .expect_err("a full Free org's next byte must be refused under Enforce");
+        assert_eq!(d.used, GIB);
+        assert_eq!(d.max, GIB);
+        assert_eq!(d.limit, Limit::StorageBytes);
     }
 
     #[test]
     fn off_disables_a_newly_wired_limit() {
         assert!(
-            check(
+            check_delta(
                 Plan::Free,
                 PlanEnforcement::Off,
-                Limit::VideoMaxParticipants,
-                999
+                Limit::StorageBytes,
+                999 * GIB,
+                1
             )
             .is_ok()
         );
+    }
+
+    /// FR-115 P5 — "10 people, 60 minutes" is what Free sells, so neither
+    /// fence may soften under `warn`, every new org's default. A meeting
+    /// asks "may I run one more minute?", so `used` is the minutes it has
+    /// run: 59 passes, 60 is the end.
+    #[test]
+    fn the_free_meeting_fences_ignore_the_mode() {
+        for mode in [
+            PlanEnforcement::Off,
+            PlanEnforcement::Warn,
+            PlanEnforcement::Enforce,
+        ] {
+            let d = check(Plan::Free, mode, Limit::VideoMaxParticipants, 10)
+                .expect_err("an eleventh person in a Free meeting must be refused");
+            assert_eq!((d.used, d.max), (10, 10));
+
+            assert!(check(Plan::Free, mode, Limit::MeetingMinutes, 59).is_ok());
+            let d = check(Plan::Free, mode, Limit::MeetingMinutes, 60)
+                .expect_err("a Free meeting ends at 60 minutes");
+            assert_eq!((d.used, d.max), (60, 60));
+        }
+        // Paid meetings have no length cap at all (the unlimited sentinel).
+        for plan in [Plan::Pro, Plan::Business, Plan::Enterprise] {
+            assert!(
+                check(
+                    plan.clone(),
+                    PlanEnforcement::Enforce,
+                    Limit::MeetingMinutes,
+                    100_000
+                )
+                .is_ok(),
+                "{plan:?} meetings must not end on a clock"
+            );
+        }
     }
 
     /// The regression this whole `is_established` distinction exists to stop:
@@ -722,27 +781,32 @@ mod tests {
     /// when enforcing, and is empty under the cap or with checks `off`.
     #[test]
     fn a_collision_is_visible_whether_or_not_it_refuses() {
-        let video = Limit::VideoMaxParticipants;
-        let warn = evaluate(Plan::Free, PlanEnforcement::Warn, video, 10, 1);
+        let storage = Limit::StorageBytes;
+        let warn = evaluate(Plan::Free, PlanEnforcement::Warn, storage, GIB, 1);
         assert!(warn.collision.is_some());
         assert!(!warn.enforced);
         assert!(warn.into_result().is_ok(), "warn lets it through");
 
-        let enforce = evaluate(Plan::Free, PlanEnforcement::Enforce, video, 10, 1);
+        let enforce = evaluate(Plan::Free, PlanEnforcement::Enforce, storage, GIB, 1);
         assert!(enforce.collision.is_some() && enforce.enforced);
         assert!(enforce.into_result().is_err());
 
-        let under = evaluate(Plan::Free, PlanEnforcement::Enforce, video, 9, 1);
+        let under = evaluate(Plan::Free, PlanEnforcement::Enforce, storage, GIB - 1, 1);
         assert!(under.collision.is_none());
 
-        let off = evaluate(Plan::Free, PlanEnforcement::Off, video, 99, 1);
+        let off = evaluate(Plan::Free, PlanEnforcement::Off, storage, 99 * GIB, 1);
         assert!(off.collision.is_none(), "off runs no check, counts nothing");
 
         // An established limit ignores the mode: off still collides, and refuses.
-        let devices = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxDevices, 100, 1);
-        assert!(devices.collision.is_some() && devices.enforced);
-        let members = evaluate(Plan::Free, PlanEnforcement::Off, Limit::MaxMembers, 10, 1);
-        assert!(members.collision.is_some() && members.enforced);
+        for (limit, at) in [
+            (Limit::MaxDevices, 100),
+            (Limit::MaxMembers, 10),
+            (Limit::VideoMaxParticipants, 10),
+            (Limit::MeetingMinutes, 60),
+        ] {
+            let v = evaluate(Plan::Free, PlanEnforcement::Off, limit, at, 1);
+            assert!(v.collision.is_some() && v.enforced, "{limit:?} at {at}");
+        }
     }
 
     /// The `limit` dimension's spellings are stored keys.
@@ -753,5 +817,10 @@ mod tests {
         assert_eq!(Limit::StorageBytes.as_str(), "storage_bytes");
         assert_eq!(Limit::MagicDns.as_str(), "magic_dns");
         assert_eq!(Limit::CloudIntegrations.as_str(), "cloud_integrations");
+        assert_eq!(
+            Limit::VideoMaxParticipants.as_str(),
+            "video_max_participants"
+        );
+        assert_eq!(Limit::MeetingMinutes.as_str(), "meeting_max_minutes");
     }
 }

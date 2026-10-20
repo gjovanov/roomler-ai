@@ -100,6 +100,11 @@ pub struct Room {
     /// status/start/end triple above is overwritten by every new call).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_call_id: Option<ObjectId>,
+    /// FR-115 P5 — the call the meeting-length warning went out for: the
+    /// sweep warns once per call, by winning the write that sets this. It
+    /// outlives its call; only a match on `current_call_id` means anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_warned_call_id: Option<ObjectId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meeting_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

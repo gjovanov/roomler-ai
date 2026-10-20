@@ -54,7 +54,8 @@ JSON messages, `{"type": "...", ...}`.
 |---|---|
 | `message:create` / `update` / `delete` / `reaction` | Live chat |
 | `call:message:create` | In-call chat |
-| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list |
+| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list. A `call_ended` the plan's meeting-length cap caused carries `reason: "plan_limit"`, `max_minutes` and `plan` |
+| `room:call_ending_soon` | FR-115 P5 — the plan's meeting-length cap (Free: 60 minutes) warns the room's members five minutes before it ends the meeting: `ends_at` (epoch ms), `max_minutes`, `plan`. Shown only to those in that call |
 | `typing:start` | Typing indicators |
 | `notification:new` / `notification:unread_count` | Notification bell |
 | `task:update` | Background-task progress |
@@ -64,6 +65,15 @@ JSON messages, `{"type": "...", ...}`.
 The mediasoup signalling (`media:*`) carries router RTP capabilities, transport
 parameters, and producer/consumer ids — the SFU forwards RTP between participants
 without decoding it.
+
+The meeting-length cap is a **sweep, not a timer** (FR-115 P5): every pod reads
+the calls in progress every 30 s and decides each against the org's plan, and the
+two writes it can make — the warning and the end — are conditional on the call it
+read, so two pods warn and end a meeting once
+(`crates/modules/conference/src/meeting_cap.rs:100`). A timer would have lived in the
+pod that started the call and died with it on a rolling deploy. The design, its guards
+and its one known gap are in
+[FR-115 *Meetings, as built*](fr/FR-115-pricing-reshape.md#meetings-as-built-p5).
 
 The viewer peer's signalling (`hive:view.*`, FR-90) is a view grant and the SDP
 and ICE of a **data-only** WebRTC peer between the browser and the device that

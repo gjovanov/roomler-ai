@@ -12,6 +12,8 @@ import { useTenantStore } from './tenant'
 import { useOrgBadgesStore } from './orgBadges'
 import { useAgentStore } from './agents'
 import { useDeviceStore } from './devices'
+import { useSnackbar } from '@/composables/useSnackbar'
+import { callEndedByPlanMessage, callEndingSoonMessage } from '@/utils/meetingCap'
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
 
@@ -318,12 +320,30 @@ export const useWsStore = defineStore('ws', () => {
         window.dispatchEvent(new CustomEvent('room:call_started', { detail: csData }))
         break
       }
+      case 'room:call_ending_soon': {
+        // FR-115 P5 — the plan's meeting-length cap warns before it ends the
+        // meeting; only that meeting's participants are told.
+        const soon = msg.data as { room_id: string; ends_at: number; max_minutes: number; plan?: string }
+        const confStore = useConferenceStore()
+        if (confStore.isInCall && confStore.roomId === soon.room_id) {
+          useSnackbar().showSnackbar(
+            callEndingSoonMessage(soon.ends_at, soon.max_minutes, soon.plan),
+            'warning',
+            20000,
+          )
+        }
+        break
+      }
       case 'room:call_ended': {
-        const ceData = msg.data as { room_id: string }
+        const ceData = msg.data as { room_id: string; reason?: string; max_minutes?: number; plan?: string }
         roomStore.updateRoomCallStatus(ceData.room_id, null, 0)
         // Auto-teardown conference if the ended call matches the active one
         const confStore = useConferenceStore()
         if (confStore.isInCall && confStore.roomId === ceData.room_id) {
+          // FR-115 P5 — ended by the plan's cap, not by a person: say so.
+          if (ceData.reason === 'plan_limit' && ceData.max_minutes) {
+            useSnackbar().showSnackbar(callEndedByPlanMessage(ceData.max_minutes, ceData.plan), 'info', 10000)
+          }
           confStore.leaveRoom()
         }
         break
