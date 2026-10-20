@@ -63,6 +63,19 @@ on:
         description: 'Only run tests matching this substring (empty = whole suite)'
         required: false
         default: ''
+      # FR-6 wave 23 (#773): the knobs the suite's runtime was measured with.
+      threads:
+        description: 'Test threads (empty = the lane default)'
+        required: false
+        default: ''
+      mongo_tmpfs:
+        description: 'MongoDB data directory on tmpfs: true, false, or empty for the lane default'
+        required: false
+        default: ''
+      report_time:
+        description: "Print every test's duration and the slowest ones (true/false)"
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -142,8 +155,14 @@ jobs:
         #
         # Port 27019 on the host, not 27017: `TestApp` and the local
         # docker-compose both use 27019, so the tests need no override.
+        env:
+          MONGO_TMPFS: ${{ github.event.inputs.mongo_tmpfs || 'false' }}
         run: |
           set -euo pipefail
+          data=()
+          if [ "$MONGO_TMPFS" = true ]; then
+            data=(--tmpfs /data/db:rw,size=6g)
+          fi
           # ⚠️ --ulimit nofile FIXED NOTHING, and the record should say so.
           # I added it after run 32673736740 died on
           #   "couldn't open [/proc/1/stat] Too many open files"
@@ -161,13 +180,17 @@ jobs:
           # MongoDB's own documented production minimum.
           docker run -d --name roomler-test-mongo -p 27019:27017 \
             --ulimit nofile=64000:64000 \
+            "${data[@]}" \
             --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'" \
             --health-interval 5s --health-timeout 5s --health-retries 20 \
             mongo:7 --wiredTigerCacheSizeGB 0.5
           for i in $(seq 1 40); do
             if docker exec roomler-test-mongo mongosh --quiet \
                  --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
-              echo "mongo ready after ${i} attempt(s)"; exit 0
+              echo "mongo ready after ${i} attempt(s)"
+              # Prove where the data directory is, rather than trust the flag.
+              docker exec roomler-test-mongo sh -c "grep ' /data/db ' /proc/mounts" || true
+              exit 0
             fi
             sleep 2
           done
@@ -243,6 +266,8 @@ jobs:
         id: run
         env:
           FILTER: ${{ github.event.inputs.filter }}
+          THREADS: ${{ github.event.inputs.threads || '2' }}
+          REPORT_TIME: ${{ github.event.inputs.report_time || 'false' }}
           # FR-69 P4/P5a — the test binary is a DEBUG build whose frames are
           # enormous, and `peer_relay_mint_tests::every_refusal_is_audited…`
           # builds SEVEN servers in one body. On the harness's default 2 MiB
@@ -280,9 +305,27 @@ jobs:
           # ⚠️ Adding a third skip should feel expensive. If this list grows,
           # the lane is drifting back toward the unfalsifiable state it
           # replaced.
-          cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads=2 \
-            --skip conference_tests::call_leave_cleans_up_participant_media \
-            2>&1 | tee /tmp/itest.log
+          skip=(--skip conference_tests::call_leave_cleans_up_participant_media)
+          if [ "$REPORT_TIME" != true ]; then
+            cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads="$THREADS" \
+              "${skip[@]}" 2>&1 | tee /tmp/itest.log
+          else
+            # FR-6 wave 23 (#773): libtest prints each test's duration only
+            # under `-Z unstable-options --report-time`, which a stable test
+            # binary accepts when RUSTC_BOOTSTRAP is set in ITS environment.
+            # So set it there alone: run the binaries cargo would run, from
+            # the directory cargo runs them in, and the build never sees it.
+            # (The crate has no doc tests to lose.)
+            mapfile -t bins < <(cargo test -p roomler-ai-tests --no-run --message-format=json 2>/dev/null \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
+            echo "test binaries: ${#bins[@]}"
+            [ "${#bins[@]}" -gt 0 ] || { echo "::error::cargo listed no test binaries"; exit 1; }
+            (cd crates/tests && for b in "${bins[@]}"; do
+                echo "     Running ${b##*/}"
+                RUSTC_BOOTSTRAP=1 "$b" ${FILTER:+"$FILTER"} --test-threads="$THREADS" \
+                  -Z unstable-options --report-time "${skip[@]}"
+              done) 2>&1 | tee /tmp/itest.log
+          fi
 
       - name: The mongod watch log (READ THIS FIRST on a failure)
         # The curve, not the corpse. Read the last sample before the numbers
@@ -291,6 +334,32 @@ jobs:
         run: |
           echo "--- mongod descriptors + leaked databases over the run ---"
           cat /tmp/mongo-watch.log || echo "(watcher produced nothing)"
+
+      - name: Where the suite's time went (report_time)
+        if: always() && github.event.inputs.report_time == 'true'
+        env:
+          THREADS: ${{ github.event.inputs.threads || '2' }}
+          MONGO_TMPFS: ${{ github.event.inputs.mongo_tmpfs || 'false' }}
+        run: |
+          set -uo pipefail
+          sed -nE 's/^test ([^ ]+) \.\.\. ([A-Za-z]+) <([0-9.]+)s>.*/\3 \2 \1/p' /tmp/itest.log \
+            | sort -rn > /tmp/test-times.txt
+          peak() { grep -oE "$1=[0-9]+" /tmp/mongo-watch.log | cut -d= -f2 | sort -n | tail -1; }
+          {
+            echo "### Test durations: threads=$THREADS, mongo_tmpfs=$MONGO_TMPFS"
+            awk '{ s += $1 } END { printf "%d tests, %.0f s of test time\n", NR, s }' /tmp/test-times.txt
+            echo "mongod peaks: fds=$(peak fds) wt_files=$(peak wt_files) dhandles=$(peak dhandles)"
+            echo '#### Slowest 40'
+            echo '```'
+            head -40 /tmp/test-times.txt
+            echo '```'
+            echo '#### Seconds per module (sum, count)'
+            echo '```'
+            awk '{ split($3, p, "::"); s[p[1]] += $1; c[p[1]]++ }
+                 END { for (m in s) printf "%8.1f %4d %s\n", s[m], c[m], m }' /tmp/test-times.txt \
+              | sort -rn | head -40
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Assert the suite actually ran
         # ⚠️ THE POINT OF THIS STEP. A test lane that silently executes

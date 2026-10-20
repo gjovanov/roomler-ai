@@ -2,8 +2,9 @@ name: cargo-cache-salt
 description: >-
   Rotates the calling job's Swatinem/rust-cache key whenever that job's own
   definition changes, while the restore still falls back to the previous
-  generation. Run it after checkout and right before the rust-cache step.
-  FR-6 wave 16 (#773).
+  generation, and keeps the runner image's own Rust toolchains out of that
+  key. Run it after checkout and right before the rust-cache step.
+  FR-6 waves 16 and 23 (#773).
 
 # Why this exists
 #
@@ -44,6 +45,24 @@ description: >-
 #
 # ⚠️ Place it AFTER actions/checkout, whose clean step would delete the file,
 #   and BEFORE rust-cache, which reads it once, when it computes the key.
+#
+# Why it also removes the runner image's toolchains (wave 23)
+#
+#   rust-cache's env hash covers `rustc -vV` of EVERY installed toolchain
+#   (`rustup toolchain list`, `getRustVersions` in its src/config.ts), not only
+#   the pinned one, so the `stable` that GitHub preinstalls on the runner image
+#   is part of every key. Image 20261018.339.1 moved it from 1.99.0 to 1.99.1.
+#   While GitHub rolled that image out, a job landed on either version, so one
+#   cache family had two keys (`…-6a930126-…` and `…-013f3a70-…`). Each miss
+#   built cold and saved, and the janitor then deleted the other key as
+#   superseded, so the next job on the other image was cold too. On 2026-10-19
+#   the janitor deleted `ci-lint` three times in 80 minutes, and PR run
+#   39288740822 spent 22.5 min on lint and 19.2 on the unit tests, against a
+#   warm 4-6. Removing every toolchain except the active one leaves the
+#   rust-toolchain.toml pin as the only Rust version in the key, so an image
+#   update no longer moves it. Linux only: the macOS and Windows callers
+#   restore from the release-asset store (ci-seed-restore), whose key already
+#   hashes the active toolchain alone.
 
 inputs:
   workflow:
@@ -62,6 +81,26 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Keep the runner image's own toolchains out of the cache key
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Never fails the job: a step that cannot prune leaves the key as it
+        # was before wave 23, which costs cache hits, not correctness.
+        active=$(rustup show active-toolchain 2>/dev/null | awk '{ print $1 }') || true
+        # The default first, so a cargo run outside the workspace (no
+        # rust-toolchain.toml above it) still finds a toolchain afterwards.
+        if [ -z "$active" ] || ! rustup default "$active" >/dev/null; then
+          echo "::warning title=cargo cache salt::no usable active toolchain ('$active'), so the runner image's own toolchains stay in this job's cargo cache key"
+          exit 0
+        fi
+        for t in $(rustup toolchain list | awk '{ print $1 }'); do
+          [ "$t" = "$active" ] && continue
+          rustup toolchain uninstall "$t" >/dev/null \
+            || echo "::warning title=cargo cache salt::could not remove toolchain $t, so its Rust version stays in this job's cargo cache key"
+        done
+        echo "toolchains in the cargo cache key: $(rustup toolchain list | awk '{ print $1 }' | tr '\n' ' ')"
+
     - name: Write the salt
       shell: bash
       env:
