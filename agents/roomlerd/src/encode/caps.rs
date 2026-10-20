@@ -649,8 +649,10 @@ pub(crate) struct HostFacts {
     /// Linux: why there is no way to the computer's sound, by the route's own
     /// code ([`linux_audio_refusal`]). `None` elsewhere, and where there is one.
     pub(crate) linux_audio_refusal: Option<crate::audio_source::AudioUnavailableCode>,
-    /// The clipboard watcher reports copied images: Windows only
-    /// (`clipboard::install_watcher` drops image events elsewhere).
+    /// The clipboard watcher reports copied images: Windows, and (FR-97
+    /// P3e-3a) a Linux X11 session whose server takes the change gate
+    /// (`clipboard::x11_gate`); `clipboard::install_watcher` drops image
+    /// events elsewhere.
     pub(crate) watches_clipboard_images: bool,
     /// This process has a clipboard to reach at all.
     pub(crate) clipboard_reachable: bool,
@@ -684,7 +686,7 @@ impl HostFacts {
             audio_backend: cfg!(target_os = "windows")
                 || (cfg!(target_os = "linux") && linux_audio_refusal.is_none()),
             linux_audio_refusal,
-            watches_clipboard_images: cfg!(target_os = "windows"),
+            watches_clipboard_images: watches_clipboard_images(),
             clipboard_reachable: clipboard_reachable(),
             layout_reachable: layout_reachable(),
             layout_switchable: layout_switchable(),
@@ -713,6 +715,19 @@ fn layout_reachable() -> bool {
         crate::input::layout_x11::offered()
     }
     #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    {
+        cfg!(target_os = "windows")
+    }
+}
+
+/// FR-97 P3e-3a — see [`HostFacts::watches_clipboard_images`]. Asks the X
+/// server once (a connection and XFixes' version), for the hello.
+fn watches_clipboard_images() -> bool {
+    #[cfg(all(target_os = "linux", feature = "clipboard"))]
+    {
+        crate::clipboard::x11_gate::available()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "clipboard")))]
     {
         cfg!(target_os = "windows")
     }
@@ -2948,6 +2963,13 @@ mod tests {
         } else {
             assert!(!f.audio_backend, "macOS until FR-97 P2a");
         }
+        // FR-97 P3e-3a — on Linux, wherever the X11 change gate opens.
+        #[cfg(all(target_os = "linux", feature = "clipboard"))]
+        assert_eq!(
+            f.watches_clipboard_images,
+            crate::clipboard::x11_gate::available()
+        );
+        #[cfg(not(all(target_os = "linux", feature = "clipboard")))]
         assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
         if cfg!(target_os = "windows") {
             assert!(f.layout_reachable && f.layout_switchable);

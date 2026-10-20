@@ -620,7 +620,9 @@ enigo-input = ["dep:enigo", "dep:x11rb"]
 # Linux pulls x11rb which we already use for enigo. `dep:clipboard-win`
 # is Windows-target-only (same pattern as mf-encoder's `dep:windows`);
 # enabling it here is a no-op on other platforms.
-clipboard = ["dep:arboard", "dep:png", "dep:clipboard-win"]
+# FR-97 P3e-3a adds `dep:x11rb` (Linux-only, already in the lockfile): the
+# change gate for an X11 clipboard is XFixes' selection-owner events.
+clipboard = ["dep:arboard", "dep:png", "dep:clipboard-win", "dep:x11rb"]
 # Enables the Windows viewer-indicator overlay — topmost layered
 # click-through window drawn on the controlled host to signal "someone
 # is watching". Excluded from screen capture via SetWindowDisplayAffinity

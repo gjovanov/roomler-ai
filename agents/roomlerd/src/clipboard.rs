@@ -182,12 +182,26 @@ impl Clipboard {
                 // pre-existing clipboard as a "change".
                 let mut watchers: std::collections::HashMap<u64, WatcherState> =
                     std::collections::HashMap::new();
+                // FR-97 P3e-3a — the X11 change gate, opened with the first
+                // watcher and kept; `None` outside an X11 session.
+                #[cfg(target_os = "linux")]
+                let mut gate: Option<x11_gate::Gate> = None;
+                #[cfg(target_os = "linux")]
+                let mut gate_tried = false;
                 loop {
                     // Block indefinitely when nothing is watching (the
                     // pre-v2 behavior — zero idle wakeups); poll at the
                     // tick cadence while any watcher is installed.
+                    #[cfg(target_os = "linux")]
+                    let tick = if gate.is_some() {
+                        GATED_TICK
+                    } else {
+                        WATCH_TICK
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let tick = WATCH_TICK;
                     let cmd = if !watchers.is_empty() {
-                        match rx.recv_timeout(WATCH_TICK) {
+                        match rx.recv_timeout(tick) {
                             Ok(c) => Some(c),
                             Err(std_mpsc::RecvTimeoutError::Timeout) => None,
                             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
@@ -225,7 +239,17 @@ impl Clipboard {
                             let _ = reply.send(worker_write_native(&mut cb, &payload, &mut marks));
                         }
                         Some(ClipboardCmd::Watch { id, events, tx }) => {
-                            watchers.insert(id, install_watcher(&mut cb, events, tx));
+                            #[cfg(target_os = "linux")]
+                            let gate_seq = {
+                                if gate.is_none() && !gate_tried {
+                                    gate_tried = true;
+                                    gate = x11_gate::Gate::open();
+                                }
+                                gate_tick(&mut gate)
+                            };
+                            #[cfg(not(target_os = "linux"))]
+                            let gate_seq = None;
+                            watchers.insert(id, install_watcher(&mut cb, events, tx, gate_seq));
                         }
                         Some(ClipboardCmd::Unwatch { id }) => {
                             watchers.remove(&id);
@@ -236,10 +260,23 @@ impl Clipboard {
                             // explicit unsubscribe) are dropped so the
                             // worker can fall back to blocking recv.
                             watchers.retain(|_, w| !w.receiver_gone());
+                            // One read of the gate per tick, for every watcher.
+                            #[cfg(target_os = "linux")]
+                            let gate_seq = gate_tick(&mut gate);
+                            #[cfg(not(target_os = "linux"))]
+                            let gate_seq = None;
                             for w in watchers.values_mut() {
-                                watch_tick(&mut cb, w, &marks);
+                                watch_tick(&mut cb, w, &marks, gate_seq);
                             }
                         }
+                    }
+                    // FR-97 P3e-3a — no watcher, no gate: an idle worker
+                    // blocks on its commands and would read no events, and
+                    // an X server buffers what a client does not read.
+                    #[cfg(target_os = "linux")]
+                    if watchers.is_empty() && gate.is_some() {
+                        gate = None;
+                        gate_tried = false;
                     }
                 }
             })
@@ -498,6 +535,11 @@ const WATCH_TICK: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(not(windows))]
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// FR-97 P3e-3a — behind the X11 change gate an unchanged tick is one event
+/// drain on a local socket, so it runs at Windows' cadence.
+#[cfg(target_os = "linux")]
+const GATED_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Content the worker itself last wrote to the OS clipboard. The
 /// change watcher treats matching state as "our own write" and stays
 /// silent — one half of the echo-suppression loop (the browser holds
@@ -528,7 +570,9 @@ struct SelfMarks {
 struct WatcherState {
     events: WatchEvents,
     tx: tokio::sync::mpsc::Sender<ClipboardChange>,
-    #[cfg(windows)]
+    /// Windows' sequence number, or (FR-97 P3e-3a) the X11 change gate's
+    /// counter, as this watcher last saw it.
+    #[cfg(any(windows, target_os = "linux"))]
     last_seen_seq: u32,
     last_text_hash: u64,
     last_img_hash: u64,
@@ -555,6 +599,129 @@ impl WatcherState {
 #[cfg(windows)]
 fn win_clipboard_seq() -> Option<u32> {
     clipboard_win::raw::seq_num().map(|n| n.get())
+}
+
+/// FR-97 P3e-3a — the gate's counter for this tick; a gate whose connection
+/// broke is dropped, and its watchers fall back to the ungated path.
+#[cfg(target_os = "linux")]
+fn gate_tick(gate: &mut Option<x11_gate::Gate>) -> Option<u32> {
+    let seq = gate.as_mut().and_then(x11_gate::Gate::seq);
+    if seq.is_none() {
+        *gate = None;
+    }
+    seq
+}
+
+/// FR-97 P3e-3a — the X11 clipboard's change gate, Windows' sequence number
+/// for an X11 session: XFixes reports every change of the CLIPBOARD
+/// selection's owner, and a copy is exactly that. A tick that saw no event
+/// reads nothing, so copied images can be watched (each read is a full
+/// transfer and a PNG encode, which a blind 1 Hz poll could not afford) and
+/// text no longer costs a read and a hash every second.
+///
+/// - **Only an X11 session**: an X display and no Wayland one. Under Wayland
+///   the clipboard is the compositor's, and Xwayland's copy of it is
+///   unmeasured, so images stay unwatched there, as before.
+/// - **Our own writes** change the owner too; the content hashes in
+///   [`SelfMarks`] still swallow them, as on every OS.
+/// - A connection that breaks drops the gate, and the watcher falls back to
+///   reading text every tick and leaving images alone.
+///
+/// Kill switch `ROOMLERD_CLIPBOARD_X11_WATCH=0`: no gate, as before P3e-3a.
+#[cfg(target_os = "linux")]
+pub(crate) mod x11_gate {
+    use std::sync::OnceLock;
+
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xfixes::{self, ConnectionExt as _};
+    use x11rb::protocol::xproto::{self, ConnectionExt as _};
+    use x11rb::rust_connection::RustConnection;
+
+    /// FR-97 P3e-3a — kill switch `ROOMLERD_CLIPBOARD_X11_WATCH=0`.
+    pub fn enabled() -> bool {
+        tunnel_core::env::flag("CLIPBOARD_X11_WATCH", true)
+    }
+
+    fn x11_session() -> bool {
+        std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
+            && std::env::var_os("WAYLAND_DISPLAY").is_none_or(|w| w.is_empty())
+    }
+
+    pub struct Gate {
+        conn: RustConnection,
+        clipboard: xproto::Atom,
+        seq: u32,
+    }
+
+    impl Gate {
+        /// `None` outside an X11 session, with the switch off, or without
+        /// XFixes.
+        pub fn open() -> Option<Self> {
+            if !enabled() || !x11_session() {
+                return None;
+            }
+            Self::connect()
+        }
+
+        /// The gate on `$DISPLAY`'s server, whatever session this is: what
+        /// [`Gate::open`] does once it decided to (and what the real-X test
+        /// drives, since a WSLg shell names a Wayland display too).
+        pub(super) fn connect() -> Option<Self> {
+            let (conn, screen) = x11rb::connect(None)
+                .map_err(|e| tracing::info!(%e, "clipboard: no X connection for the change gate"))
+                .ok()?;
+            let root = conn.setup().roots.get(screen)?.root;
+            conn.xfixes_query_version(5, 0).ok()?.reply().ok()?;
+            let clipboard = conn
+                .intern_atom(false, b"CLIPBOARD")
+                .ok()?
+                .reply()
+                .ok()?
+                .atom;
+            conn.xfixes_select_selection_input(
+                root,
+                clipboard,
+                xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                    | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+            )
+            .ok()?
+            .check()
+            .ok()?;
+            Some(Self {
+                conn,
+                clipboard,
+                // Never 0: the watcher reads 0 as "no counter".
+                seq: 1,
+            })
+        }
+
+        /// The change counter, one more for every owner change since the
+        /// last call. `None` once the connection broke.
+        pub fn seq(&mut self) -> Option<u32> {
+            loop {
+                match self.conn.poll_for_event() {
+                    Ok(Some(Event::XfixesSelectionNotify(e))) if e.selection == self.clipboard => {
+                        self.seq = self.seq.wrapping_add(1).max(1);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Some(self.seq),
+                    Err(e) => {
+                        tracing::info!(%e, "clipboard: the change gate's X connection broke");
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether copied images on this host are watched: an X11 session whose
+    /// server takes the gate. Asked once, for the hello.
+    pub fn available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| Gate::open().is_some())
+    }
 }
 
 /// FNV-1a 64 over raw bytes. Mirrors the browser-side
@@ -800,10 +967,12 @@ fn install_watcher(
     cb: &mut arboard::Clipboard,
     events: WatchEvents,
     tx: tokio::sync::mpsc::Sender<ClipboardChange>,
+    gate_seq: Option<u32>,
 ) -> WatcherState {
     // Image watching needs the Windows sequence-number gate to bound
-    // `get_image` calls; without it (non-Windows, or a window station
-    // that denies clipboard access) fall back to text-only watching.
+    // `get_image` calls; without it (a window station that denies
+    // clipboard access) fall back to text-only watching. FR-97 P3e-3a —
+    // on Linux, the X11 change gate (`gate_seq`, `None` without one).
     #[cfg(windows)]
     let events = if events.image && win_clipboard_seq().is_none() {
         tracing::warn!("clipboard: no sequence-number access — image watching disabled");
@@ -814,11 +983,22 @@ fn install_watcher(
     } else {
         events
     };
-    #[cfg(not(windows))]
+    #[cfg(windows)]
+    let _ = gate_seq;
+    #[cfg(target_os = "linux")]
     let events = WatchEvents {
-        image: false,
+        image: events.image && gate_seq.is_some(),
         native: false,
         ..events
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let events = {
+        let _ = gate_seq;
+        WatchEvents {
+            image: false,
+            native: false,
+            ..events
+        }
     };
     let text_hash = match cb.get_text() {
         Ok(t) => fnv1a64(host_to_wire(&t).as_bytes()),
@@ -844,6 +1024,8 @@ fn install_watcher(
         tx,
         #[cfg(windows)]
         last_seen_seq: win_clipboard_seq().unwrap_or(0),
+        #[cfg(target_os = "linux")]
+        last_seen_seq: gate_seq.unwrap_or(0),
         last_text_hash: text_hash,
         last_img_hash: 0,
         last_html_hash: html_hash,
@@ -855,9 +1037,15 @@ fn install_watcher(
 /// One watcher tick. Cheap when nothing changed (Windows: one
 /// syscall; elsewhere: one text read + hash). Text wins over image
 /// when both are present.
-fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMarks) {
+fn watch_tick(
+    cb: &mut arboard::Clipboard,
+    w: &mut WatcherState,
+    marks: &SelfMarks,
+    gate_seq: Option<u32>,
+) {
     #[cfg(windows)]
     {
+        let _ = gate_seq;
         if let Some(seq) = win_clipboard_seq() {
             if !w.retry && seq == w.last_seen_seq {
                 return;
@@ -871,6 +1059,21 @@ fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMar
         }
         // Sequence number unavailable → hash polling below still works.
     }
+    // FR-97 P3e-3a — the X11 change gate: no owner change, nothing read.
+    // Our own writes pass it and are swallowed by the hashes below.
+    #[cfg(target_os = "linux")]
+    match gate_seq {
+        Some(seq) => {
+            if !w.retry && seq == w.last_seen_seq {
+                return;
+            }
+            w.last_seen_seq = seq;
+        }
+        // No gate, or it broke: text is read every tick, images never.
+        None => w.events.image = false,
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = gate_seq;
     w.retry = false;
     // v2.2 — richest format wins, native (RTF) on top: only RTF
     // carries a document's EMBEDDED images. Below it: html (carries a
@@ -956,16 +1159,17 @@ fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMar
             // Forwarder task gone — an Unwatch is on its way; stay quiet.
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
-        // Load-bearing on Windows, where the `#[cfg(windows)]` image block
-        // below follows; redundant everywhere else, where it is the last
-        // statement of the function. Scoped rather than removed — deleting it
-        // would fall through into the image path on Windows.
-        #[cfg_attr(not(windows), allow(clippy::needless_return))]
+        // Load-bearing on Windows and Linux, where the image block below
+        // follows; redundant everywhere else, where it is the last statement
+        // of the function. Scoped rather than removed — deleting it would
+        // fall through into the image path.
+        #[cfg_attr(not(any(windows, target_os = "linux")), allow(clippy::needless_return))]
         return;
     }
-    // Empty text — maybe an image. Windows-only: the seq gate above
-    // bounds how often we pay for a full image read + PNG encode.
-    #[cfg(windows)]
+    // Empty text — maybe an image. Only behind a change gate (Windows'
+    // sequence number; FR-97 P3e-3a, the X11 gate), which bounds how often
+    // we pay for a full image read + PNG encode.
+    #[cfg(any(windows, target_os = "linux"))]
     if w.events.image {
         let img = match cb.get_image() {
             Ok(i) => i,
@@ -1589,6 +1793,78 @@ pub(crate) fn split_into_chunks(text: &str) -> Vec<&str> {
         start = end;
     }
     out
+}
+
+/// FR-97 P3e-3a — the change gate against a real X server (CI's Xvfb step,
+/// `ROOMLERD_TEST_X11=1`): another client takes CLIPBOARD, as a copy does, and
+/// the gate counts it and then holds. Only under `ROOMLERD_TEST_X11=1`: taking
+/// CLIPBOARD empties the clipboard of whoever is at that display.
+#[cfg(all(test, target_os = "linux"))]
+mod x11_gate_tests {
+    use super::x11_gate::Gate;
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    #[test]
+    fn x11_real_the_gate_counts_a_copy() {
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        let mut gate = Gate::connect().expect("ROOMLERD_TEST_X11=1 but the gate did not open");
+        let before = gate.seq().expect("a counter");
+        let (conn, screen) = x11rb::connect(None).expect("the same X server");
+        let root = conn.setup().roots[screen].root;
+        let win = conn.generate_id().unwrap();
+        conn.create_window(
+            0,
+            win,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &CreateWindowAux::new(),
+        )
+        .unwrap();
+        let clipboard = conn
+            .intern_atom(false, b"CLIPBOARD")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
+            .unwrap();
+        conn.sync().unwrap();
+        let mut after = before;
+        for _ in 0..50 {
+            after = gate.seq().expect("a counter");
+            if after != before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_ne!(after, before, "the owner change was counted");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Only an owner change moves it. The lane runs one test at a time; a
+        // parallel run may have another test take CLIPBOARD meanwhile, so a
+        // later count must come with an owner other than ours.
+        let later = gate.seq().expect("a counter");
+        if later != after {
+            let owner = conn
+                .get_selection_owner(clipboard)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .owner;
+            assert_ne!(owner, win, "the counter moved while CLIPBOARD stayed ours");
+        }
+        eprintln!("x11-real: the clipboard gate counted an owner change ({before} → {after})");
+    }
 }
 
 #[cfg(test)]
