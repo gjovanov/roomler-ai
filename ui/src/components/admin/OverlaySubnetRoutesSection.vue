@@ -59,7 +59,10 @@
         No node is advertising subnet routes or offering to be an exit node yet.
       </p>
 
-      <v-table v-else density="compact">
+      <!-- A card per node below 600 px (table-stack-xs): the exit-node switch
+           and Save were ~300 px off-screen on a phone, so ticking a route
+           changed nothing anyone could see. -->
+      <v-table v-else density="compact" class="table-stack-xs">
         <thead>
           <tr>
             <th>Node</th>
@@ -71,9 +74,9 @@
         </thead>
         <tbody>
           <tr v-for="n in advertisingNodes" :key="n.id">
-            <td>
+            <td data-label="Node">
               <div class="font-weight-medium">
-                {{ n.name || '(unnamed)' }}
+                {{ nodeLabel(n) || '(unnamed)' }}
                 <v-chip
                   size="x-small"
                   :color="n.online ? 'success' : undefined"
@@ -93,13 +96,13 @@
               </div>
               <div class="text-caption text-medium-emphasis">{{ n.kind }}</div>
             </td>
-            <td>
+            <td data-label="Overlay IP">
               <div>{{ n.overlay_ip }}</div>
               <div class="text-caption text-medium-emphasis">
                 {{ deriveOverlayV6(n.overlay_ip) }}
               </div>
             </td>
-            <td>
+            <td data-label="Advertised routes">
               <span
                 v-if="n.advertised_routes.length === 0"
                 class="text-caption text-medium-emphasis"
@@ -116,7 +119,7 @@
                 @update:model-value="(v) => toggle(n.id, cidr, v)"
               />
             </td>
-            <td>
+            <td data-label="Exit node">
               <v-switch
                 :model-value="n.is_exit_node"
                 :disabled="(!n.can_be_exit_node && !n.is_exit_node) || exitSaving === n.id"
@@ -173,6 +176,7 @@ import {
   useOverlayRoutesStore,
   type OverlayNode,
 } from '@/stores/overlayRoutes'
+import { useNodeLabel } from '@/composables/useNodeLabel'
 
 const props = defineProps<{ tenantId: string }>()
 const store = useOverlayRoutesStore()
@@ -188,9 +192,13 @@ const exitSaving = ref<string | null>(null)
 const route = useRoute()
 const router = useRouter()
 const nodeFilter = computed(() => (route.query.node as string) || null)
-const filteredNodeName = computed(
-  () => store.nodes.find((n) => n.id === nodeFilter.value)?.name ?? null,
-)
+// Nodes by their device's name, as the Devices row the deep link came from
+// showed it (FR-116) — `node.name` is a lossy DNS label.
+const { nodeLabel, ensureLoaded } = useNodeLabel()
+const filteredNodeName = computed(() => {
+  const n = store.nodes.find((x) => x.id === nodeFilter.value)
+  return n ? nodeLabel(n) : null
+})
 function clearNodeFilter() {
   router.replace({ query: { ...route.query, node: undefined } })
 }
@@ -260,6 +268,7 @@ async function toggleExitNode(n: OverlayNode, enabled: boolean | null) {
 }
 
 async function refresh() {
+  ensureLoaded(props.tenantId, { tunnels: true })
   await store.fetchNodes(props.tenantId)
 }
 
