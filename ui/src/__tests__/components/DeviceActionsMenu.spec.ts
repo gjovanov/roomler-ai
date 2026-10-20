@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//
+// The Devices page's one action menu, shared by the desktop grid and the
+// phone cards. Each used to carry its own copy: the phone's had lost "Edit
+// name & tags", and its two overlay links had lost the tenant id
+// (`/tenant//network/acl`).
+import { afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { createVuetify } from 'vuetify'
+import * as components from 'vuetify/components'
+import * as directives from 'vuetify/directives'
+import { createMemoryHistory, createRouter } from 'vue-router'
+import DeviceActionsMenu from '@/components/admin/DeviceActionsMenu.vue'
+import type { Agent } from '@/stores/agents'
+import type { DeviceRow } from '@/stores/devices'
+import type { OverlayNode } from '@/stores/overlayRoutes'
+import type { TunnelClient } from '@/stores/tunnelClients'
+
+const vuetify = createVuetify({ components, directives })
+const router = createRouter({
+  history: createMemoryHistory(),
+  routes: [{ path: '/:pathMatch(.*)*', component: { template: '<div />' } }],
+})
+
+beforeAll(() => {
+  // Vuetify overlays measure themselves against the viewport; jsdom has
+  // neither a ResizeObserver nor a visualViewport.
+  const g = globalThis as unknown as Record<string, unknown>
+  if (!('ResizeObserver' in g)) {
+    g.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+  }
+  if (!('visualViewport' in g)) {
+    g.visualViewport = {
+      width: 390,
+      height: 844,
+      offsetLeft: 0,
+      offsetTop: 0,
+      pageLeft: 0,
+      pageTop: 0,
+      scale: 1,
+      addEventListener() {},
+      removeEventListener() {},
+    }
+  }
+})
+
+let wrapper: VueWrapper | null = null
+afterEach(() => {
+  wrapper?.unmount()
+  wrapper = null
+  document.body.innerHTML = ''
+})
+
+const TID = 'aaaaaaaaaaaaaaaaaaaaaaaa'
+
+function row(over: Partial<DeviceRow> = {}): DeviceRow {
+  return {
+    kind: 'agent',
+    id: 'c00000000000000000000001',
+    owner_user_id: 'u1',
+    name: 'build-01',
+    display_name: 'Build Server',
+    machine_id: 'm1',
+    os: 'linux',
+    version: '0.4.146',
+    status: 'online',
+    presence: 'online',
+    is_online: true,
+    last_seen_at: '2026-10-19T12:00:00Z',
+    created_at: '2026-09-01T12:00:00Z',
+    ...over,
+  }
+}
+
+const node = { id: 'd00000000000000000000001', name: 'build-01', will_rejoin: true } as OverlayNode
+
+interface MenuProps {
+  row: DeviceRow
+  agent?: Agent
+  client?: TunnelClient
+  node?: OverlayNode
+  networkMounted?: boolean
+  updateBlocked?: string
+}
+
+async function openMenu(props: MenuProps) {
+  wrapper = mount(DeviceActionsMenu, {
+    props: { tenantId: TID, ...props },
+    global: { plugins: [vuetify, router] },
+    attachTo: document.body,
+  })
+  await wrapper.find('button').trigger('click')
+  await flushPromises()
+  return [...document.body.querySelectorAll('.v-list-item')] as HTMLElement[]
+}
+
+function titles(items: HTMLElement[]): string[] {
+  return items.map((i) => i.querySelector('.v-list-item-title')?.textContent?.trim() ?? '')
+}
+
+describe('DeviceActionsMenu', () => {
+  it('names the device in its button label by the name a person knows it by', () => {
+    wrapper = mount(DeviceActionsMenu, {
+      props: { tenantId: TID, row: row(), agent: { id: 'a' } as Agent },
+      global: { plugins: [vuetify, router] },
+    })
+    expect(wrapper.find('button').attributes('aria-label')).toBe('Actions for Build Server')
+  })
+
+  it('offers an agent every action, Edit name & tags included', async () => {
+    const items = await openMenu({ row: row(), agent: { id: 'a' } as Agent, node, networkMounted: true })
+    expect(titles(items)).toEqual([
+      'Update now',
+      'Rotate overlay key…',
+      'Crash reports',
+      'Agent logs',
+      'Device console',
+      'Edit name & tags',
+      'Add to another organization',
+      'Reassign owner',
+      'Execution policy',
+      'SSH policy',
+      'External access',
+      'Device configuration',
+      'Tunnel mesh routes',
+      'Evict / reassign overlay address',
+      'Overlay routes',
+      'Overlay ACL',
+      'Delete device',
+    ])
+  })
+
+  it('keeps the tenant id in both overlay links', async () => {
+    const items = await openMenu({ row: row(), agent: { id: 'a' } as Agent, node, networkMounted: true })
+    const hrefs = items.map((i) => i.getAttribute('href')).filter(Boolean)
+    expect(hrefs).toEqual([
+      `/tenant/${TID}/network/subnet-routes?node=${node.id}`,
+      `/tenant/${TID}/network/acl?tab=overlay`,
+    ])
+    expect(hrefs.join(' ')).not.toContain('/tenant//')
+  })
+
+  it('leaves out what the server does not mount (FR-69 P9)', async () => {
+    const items = await openMenu({ row: row(), agent: { id: 'a' } as Agent, networkMounted: false })
+    expect(titles(items)).not.toContain('Rotate overlay key…')
+    expect(titles(items)).not.toContain('SSH policy')
+    // No overlay node: nothing to evict, no node to filter the routes by.
+    expect(titles(items)).not.toContain('Evict / reassign overlay address')
+    expect(titles(items)).not.toContain('Overlay routes')
+  })
+
+  it('says why Update now will not take, and greys it', async () => {
+    const items = await openMenu({
+      row: row(),
+      agent: { id: 'a' } as Agent,
+      updateBlocked: 'auto-update is off on the device',
+    })
+    const update = items.find((i) => i.textContent?.includes('Update now'))!
+    expect(update.textContent).toContain('auto-update is off on the device')
+    expect(update.className).toContain('v-list-item--disabled')
+  })
+
+  it('renders no menu for an agent row whose full record has not loaded', () => {
+    wrapper = mount(DeviceActionsMenu, {
+      props: { tenantId: TID, row: row() },
+      global: { plugins: [vuetify, router] },
+    })
+    expect(wrapper.find('button').exists()).toBe(false)
+  })
+
+  it('gives a tunnel client its own short menu, Edit name & tags included', async () => {
+    const items = await openMenu({
+      row: row({ kind: 'tunnel_client', name: 'neo-laptop', display_name: 'My laptop' }),
+      client: { id: 'c' } as TunnelClient,
+      node,
+    })
+    expect(titles(items)).toEqual([
+      'Edit name & tags',
+      'Evict / reassign overlay address',
+      'Delete tunnel client',
+    ])
+  })
+
+  it('says which action was picked, and nothing more', async () => {
+    const items = await openMenu({ row: row(), agent: { id: 'a' } as Agent, node, networkMounted: true })
+    items.find((i) => i.textContent?.includes('Edit name'))!.click()
+    items.find((i) => i.textContent?.includes('Delete device'))!.click()
+    expect(wrapper!.emitted('action')).toEqual([['edit'], ['delete']])
+  })
+})
