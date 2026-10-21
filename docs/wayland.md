@@ -105,7 +105,7 @@ sequenceDiagram
     participant V as the viewer
     H->>D: the screen locks / the display goes dark / another session takes the seat
     D->>V: rc:media-waiting (what for, a hint)
-    Note over V: the overlay says why; the media watchdog holds
+    Note over V: the overlay says why, the media watchdog holds
     H->>D: unlocked / woken / back on the seat
     D->>V: frames — the first one clears the notice
 ```

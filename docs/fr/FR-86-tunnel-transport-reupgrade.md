@@ -79,7 +79,7 @@ sequenceDiagram
     S->>L: new connections → B
     Note over A: DRAINING — no new connections, established ones untouched
     A-->>S: last connection ended
-    S->>X: rc:tunnel.terminate (A) — the #1754 guard
+    S->>X: rc:tunnel.terminate (A) — the #35;1754 guard
 ```
 
 - **Probe:** only while the active carrier's transport is below the best allowed. The first probe goes 60 s

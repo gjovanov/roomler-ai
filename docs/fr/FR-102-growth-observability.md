@@ -230,7 +230,7 @@ sequenceDiagram
     H->>S: GET install.sh · install.ps1 · installer (UA: curl · PowerShell · roomler-setup · browser)
     S->>S: growth_daily +1 {asset, client class, os} — no UA, no IP stored
     H->>S: POST /api/agent/enroll {…, install: {method, scope}}
-    S->>S: agents.install; enroll_token_issued.redeemed_at
+    S->>S: agents.install, enroll_token_issued.redeemed_at
     H->>S: WS hello → stats_events presence=online (first online)
     A->>S: first remote-desktop session → remote_sessions
 ```

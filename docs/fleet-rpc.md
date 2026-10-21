@@ -131,10 +131,10 @@ sequenceDiagram
   participant W as worker (session 1, the user)
   participant V as service (session 0, SYSTEM)
   A->>S: POST /api/tenant/{tid}/agent/{id}/exec
-  S->>S: gates 1–3; exec_pending {request_id, command, run_as, claim_by}
+  S->>S: gates 1–3, exec_pending {request_id, command, run_as, claim_by}
   S->>W: rc:rpc.exec {request_id, …, via_service: true}
   W->>W: the person's exec_enabled, then consent
-  W->>V: doorbell {request_id} (a pipe; no authority at all)
+  W->>V: doorbell {request_id} (a pipe, no authority at all)
   V->>V: the anchor's exec_enabled
   V->>S: POST /api/agent/service/rpc/{request_id}/claim (the anchor's credential)
   S-->>V: the command (single use, this device only, inside the claim window)

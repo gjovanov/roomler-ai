@@ -768,7 +768,7 @@ sequenceDiagram
     K->>P: open: read and write data only, identification level
     K->>K: the pipe owned by SYSTEM, Administrators or me? else send nothing
     K->>D: Hello {harness session, cwd, event}
-    D->>D: impersonate the client just long enough to take its token:<br/>its SID and account; a service account or nobody is refused
+    D->>D: impersonate the client just long enough to take its token:<br/>its SID and account, a service account or nobody is refused
     D-->>K: Reply, then lines as on Unix
 ```
 
@@ -3677,11 +3677,11 @@ sequenceDiagram
     S->>D: rc:hive.purge {purge_id, session_id}
     Note over D: under the start lock: no start of it races the purge
     D->>D: a run of it here fenced out and stopped, waited for until it lets go
-    D->>D: a terminal mirroring it stops; what was kept of its ended terminal goes
-    D->>D: Store::purge (its id kept; Store::purge_copy for leaving: true, nothing kept) — the workplace moves into purge_debts, in the same transaction
+    D->>D: a terminal mirroring it stops, what was kept of its ended terminal goes
+    D->>D: Store::purge (its id kept, Store::purge_copy for leaving: true, nothing kept) — the workplace moves into purge_debts, in the same transaction
     D->>D: its runtime directory, hosted entry, in-memory moves, streams and follow
     D->>C: the debt's {session, state_dir, folder}, on stdin
-    C->>C: refs/hive/<sid>/* and hive-<sid>.index in the folder's repository; then ~/.roomler/hive/<sid>
+    C->>C: refs/hive/<sid>/* and hive-<sid>.index in the folder's repository, then ~/.roomler/hive/<sid>
     C-->>D: {state_dir, refs, index}
     D-->>S: rc:hive.purge_ack {store, account, detail}
 ```
@@ -3815,7 +3815,7 @@ sequenceDiagram
     R->>P1: every other pod applies it
     P1->>D: rc:hive.purge {purge_id, session_id}
     D-->>P1: rc:hive.purge_ack
-    P1->>P1: the answer on D's entry; nothing pending: complete
+    P1->>P1: the answer on D's entry, nothing pending: complete
 ```
 
 | Rule | Why | Where |
@@ -3841,7 +3841,7 @@ sequenceDiagram
     participant D as device (a member, or the primary)
     participant S as server (hive)
     D->>S: rc:hive.retain_ask {sessions}: at each connection, after taking one up, daily
-    S->>S: records that name the device, no tombstone; the org's retention_days
+    S->>S: records that name the device, no tombstone, the org's retention_days
     S-->>D: rc:hive.retain {words: [{session_id, days, ended_at_ms?}]}
     Note over D: the device's own clock (P2g-3d)
     D->>S: rc:hive.replica.manifest {sessions, purged: [{session_id, at_ms}]}
@@ -3928,8 +3928,8 @@ sequenceDiagram
     S->>D: rc:hive.stop {reason: device_removed}, for each session it runs
     S->>D: rc:hive.purge_all {purge_id}, from this pod
     S->>R: or hive_purge_all {tenant, agent, purge}, for the pod that holds its socket
-    S->>S: its pending parts closed device_removed; a purge that waited on it alone completes
-    S->>S: placement lets it go; its row tombstoned; the kick, last
+    S->>S: its pending parts closed device_removed, a purge that waited on it alone completes
+    S->>S: placement lets it go, its row tombstoned, the kick, last
     D->>D: each session it holds, one at a time under the start lock: P2g-1's parts
 ```
 

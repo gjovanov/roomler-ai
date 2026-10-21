@@ -310,13 +310,13 @@ sequenceDiagram
     participant B as Viewer
     participant H as API pod (hub)
     participant A as Agent (CORPLAP-2)
-    Note over A: :27.9 MAJOR network change — "probing the control WS now"<br/>the WS is now half-open; the probe does not conclude
+    Note over A: :27.9 MAJOR network change — "probing the control WS now"<br/>the WS is now half-open, the probe does not conclude
     Note over B,A: :33 the live session's ICE pair moves — media stops
     B->>H: :36.05 rc:terminate controller_hangup (ladder, after the 4 s pc grace)
     B->>H: :36.36 rc:session.request — attempt 2, after_drop
     H-->>B: rc:session.created (+24 ms) → mark session_created
     H--xA: rc:request written into the dead socket — never arrives
-    Note over A: :45–:50 ws read → WSAECONNRESET; peer close overruns its 5 s budget
+    Note over A: :45–:50 ws read → WSAECONNRESET, peer close overruns its 5 s budget
     A->>H: :50.2 redial · :51.80 rc:agent.hello
     H->>A: :51.86 the pending rc:request — 54 ms after hello
     A->>H: rc:consent granted (AutoGrant, 0 ms)

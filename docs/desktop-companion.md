@@ -276,7 +276,7 @@ sequenceDiagram
     R->>S: with the root half's token
     S-->>R: the netmap's devices · overlay = ok
     R-->>U: DevicesPage
-    U-->>G: the root half's answer, when it is `ok`; its own otherwise
+    U-->>G: the root half's answer, when it is `ok`, its own otherwise
 ```
 
 - **Only a `no_node` answer off root asks** (`person_socket::machine_view_wanted`), and only an

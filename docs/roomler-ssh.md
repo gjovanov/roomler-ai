@@ -548,7 +548,7 @@ sequenceDiagram
   S-->>C: dial the overlay address on port 2223, pin the SERVICE's host key
   C->>W: TCP to port 2223 (intercepted by SplitTun, no socket bound)
   W->>V: the SSH pipe: Data frames, ciphertext only
-  V-->>C: authenticated by the grant key; a shell as SYSTEM (session 0) or the console user
+  V-->>C: authenticated by the grant key, a shell as SYSTEM (session 0) or the console user
 ```
 
 - **The pipe** is `\\.\pipe\roomler-ssh-service`: the doorbell's DACL, created
@@ -1340,7 +1340,7 @@ sequenceDiagram
     D->>N: rc:ssh.request {target, public key, session_secs, ssh_ticket}
     N-->>D: rc:ssh.response {address, port, host_pubkey, ssh_ticket_id}
     D->>D: the echo is this ticket's, and a host key is named? (else nothing dials)
-    D->>T: dial the overlay address; pin the host key; one exec
+    D->>T: dial the overlay address, pin the host key, one exec
     T-->>D: exit status, stdout, stderr
 ```
 
