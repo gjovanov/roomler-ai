@@ -573,6 +573,14 @@ mod client {
             self.takes.store(takes, Ordering::Relaxed);
         }
 
+        /// FR-90 P3-8-2b-2 — that queue, for a frame asked under a vault
+        /// answer that must leave on the connection the answer came on: a
+        /// session's `rc:ssh.request`, whose ticket names this device. None
+        /// before the first hello.
+        pub fn outbound(&self) -> Option<mpsc::Sender<ClientMsg>> {
+            lock(&self.outbound).clone()
+        }
+
         /// P3-4b — whether the primary connection takes leases: what offers a
         /// session its vault tools.
         pub fn takes_leases(&self) -> bool {

@@ -73,7 +73,7 @@ it. Do not shift these anchors with code that moved later.*
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
 | pipe server | `crates/localapi/src/lib.rs:1735-1810` | ONE listening instance; the next is created only after `connect()` returns |
 | pipe client | `crates/localapi/src/lib.rs:2062-2082` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
-| settings list | `crates/agent-core/src/config_surface.rs:42-828` | 150 `(key, kind, description)` tuples, no grouping; `restart_required` hard-coded `true` (`:21, :827, :841`) |
+| settings list | `crates/agent-core/src/config_surface.rs:42-836` | 150 `(key, kind, description)` tuples, no grouping; `restart_required` hard-coded `true` (`:21, :827, :841`) |
 | live keys | `agents/roomler-desktop/src/front/settings.js:60-63` | a hand-kept `LIVE_KEYS` list the daemon does not know about |
 | restart | — | nothing in the desktop or on the LocalAPI can restart the daemon |
 | encoder caps | `agents/roomlerd/src/encode/caps.rs:37, 548-559` | a process OnceLock filled at the first `rc:agent.hello`; never on the LocalAPI |

@@ -96,6 +96,10 @@ mod procs;
 mod purger;
 mod resume_note;
 mod sidecar;
+/// FR-90 P3-8-2b-2 — `ssh_run`: one command on another device of the
+/// organization, through this daemon's own SSH client.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+mod ssh_tools;
 mod store;
 mod sudo;
 mod supervisor;
