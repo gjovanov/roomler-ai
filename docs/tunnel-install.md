@@ -451,13 +451,35 @@ roomler self-update            # download + verify + swap the running exe
 roomler self-update --check    # report the latest version without installing
 ```
 
-It polls `roomler.ai/api/tunnel/latest-release`, downloads the matching build
-through the same corp-AV-friendly proxy, verifies the SHA-256, and swaps the
-binary (Windows today; other OSes are pointed at the manual re-download). This is
-the single updater for tunnel-only hosts.
+It polls `roomler.ai/api/tunnel/latest-release` and downloads the matching build
+through the same corp-AV-friendly proxy. Before it swaps anything it checks two
+things (FR-97 P6b):
+
+- **The signature.** The artifact's detached `.asc` must verify against the
+  release key **pinned in the binary** (tunnel-core's `pgp_verify`, the same check
+  the agent's updater makes), on every OS. The manifest's SHA-256 is checked too,
+  but it comes from the same server as the download, so it proves the transport,
+  not the origin.
+- **The version.** A Linux or macOS archive must name, inside its signed bytes,
+  the version it was offered as: the tarball's top-level dir, the `.deb`'s control
+  `Version`. So an older signed release cannot be passed off as the newest.
+
+Then it installs by host:
+
+| Host | Installs |
+|---|---|
+| Windows | the zip's `roomler.exe` replaces the running exe |
+| macOS, and Linux where no package owns the binary | the tarball's `roomler`, written beside the running binary and renamed over it, so the swap is atomic |
+| Linux where the binary came from the `.deb` (`install.sh --role tunnel` on Debian and Ubuntu) | `dpkg -i` of the verified `.deb`, so dpkg's record names the version on disk |
+
+A binary in a root-owned directory needs root to replace, and `dpkg -i` always
+does: run `sudo roomler self-update`. The Linux and macOS install works from the
+first tunnel release after P6b; an older CLI there points at the manual download.
+This is the single updater for tunnel-only hosts.
 
 **Daemon hosts** (installed a "be-accessed" role — the agent MSI) do NOT need
 this: since the node-stack unification the daemon MSI *carries* `roomler.exe`, so
 the daemon's own auto-update refreshes the CLI alongside `roomlerd` on every MSI
-upgrade. Running `roomler self-update` on such a host still works but is
-redundant — the MSI is the source of truth there.
+upgrade. `roomler self-update` there is refused, and names `roomlerd self-update`
+instead: that `roomler` is a shim over the daemon, and the MSI is the source of
+truth.

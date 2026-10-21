@@ -49,6 +49,9 @@
 - P6c, `service install --as-service` (alias `--system`) on Linux and macOS, merged (#2488): field-verified on a
   vmtest Ubuntu guest against 0.4.143's refusal and again on the 0.4.144 candidate, and the macOS stop's mechanism
   measured on a tart Mac (§8).
+- P6b, `roomler self-update` on Linux and macOS, and the pinned `.asc` check on every OS, built (#P6BPR). The CLI
+  had checked only the manifest's SHA-256, and skipped that when the manifest had none. Its field proof waits for
+  the first tunnel release that carries it; until then a stand-in proxy proves the refusals (§8).
 - P8-1, every §2.8 doc correction but two, each re-checked against master first, merged (#2489). P8-2 (#2548):
   `docs/platform-support.md` and its user page, the stale code comments and W7c's last leftovers. AC16 waits only
   on the two public Wayland pages of #2533.
@@ -261,7 +264,7 @@ and the consent chain's fallbacks.
 |---|---|---|---|---|---|---|
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
-| O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
+| O3 | Tunnel CLI `roomler self-update` | ✅ | 🟡 built (P6b) | 🟡 built (P6b) | Was: Windows only, with the manifest's SHA-256 the only check. *P6b:* the `.asc` against the pinned key on every OS (`agents/roomler-cli/src/update.rs:223`); a tarball, or the `.deb` where dpkg owns the binary, by host (`:258`); the version named inside the signed archive (`:363`, `:533`) | P6b |
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:902`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
@@ -910,15 +913,34 @@ model on Windows, so the three agree on what the mode means.
   - ⚠️ A wrong reader refuses every update fleet-wide: the three sit behind `ROOMLERD_ARTIFACT_VERSION_CHECK=0` (the
     MSI's does not), and each was read against the last three releases' real artifacts before it shipped (§8). A hidden
     `roomlerd artifact-version <file> <tag>` runs the updater's check on a file, for that proof and its re-runs.
-- **P6b, `roomler self-update` on Unix.** Download → verify → `rename(2)` over the binary. The pinned PGP check moves to
-  `tunnel-core` so the CLI can share it (CLAUDE.md's known issue; mind the `windows-sys` 0.59 / 0.61 split).
+- **P6b, `roomler self-update` on Linux and macOS, and the pinned check on every OS (built, #P6BPR).**
+  - *The signature, every OS.* The artifact's detached `.asc` must verify against the release key pinned in the
+    binary (`agents/roomler-cli/src/update.rs:223`). It is the agent updater's own check, `pgp_verify`, moved to
+    `crates/tunnel-core` so both binaries carry it; the agent re-exports it. `code_signature.rs` stays in the agent:
+    no OS needs WinTrust here, so the `windows-sys` 0.59 / 0.61 split never comes up. The manifest's SHA-256 is
+    still checked where it has one. Before P6b that was the only check, and a missing digest skipped it (CLAUDE.md's
+    LOW issue).
+  - *The version, from inside the signed bytes.* A signature does not say which release the bytes are. A tarball
+    must hold `roomler-tunnel-<offered>-<triple>/roomler` (`:363`, `:373`), and a `.deb`'s control `Version` must
+    be the offered one (`:533`). The Windows zip names no version inside, so there the offer stands once the
+    signature does.
+  - *Install, by host* (`:258`). Windows as before. macOS, and Linux where no package owns the binary: the
+    tarball's `roomler`, read in memory, so nothing is extracted and no directory is created or chowned. It is
+    written beside the binary with `O_EXCL`, then renamed over it (`:449`). Linux where dpkg owns the binary:
+    `dpkg -i` of the verified `.deb`, from a private directory (`:485`), so dpkg's record stays true. Root where the
+    directory or dpkg needs it; the command says `sudo`.
+  - *Not a daemon host's updater.* There `roomler` is a shim over `roomlerd cli`, which refuses `self-update` and
+    names `roomlerd self-update` (`agents/roomler-cli/src/cli.rs:997`).
+  - *Tested.* A new CI step runs the CLI's lib tests, which no lane had run (127 on Linux). The moved check
+    verified the real 0.4.148 agent `.deb`'s `.asc` and refused it with one byte flipped.
   - *Found while scoping it (2026-10-18).* There was nothing to update from. Every tunnel install and `self-update`
     had 404'd since ~09-07, because the server's release cache lost the tunnel family to depth (#2468, fixed by
     #2469 and live).
   - The newest tunnel release, `tunnel-v0.3.0-rc.266` (07-28), has no `.asc`. Its `.deb` installs only on Debian
     13 / Ubuntu 24.04+ (#2472).
-  - So P6b ships after a new, operator-approved tunnel release: `release-tunnel.yml` signs `.asc` now, and #2474 has
-    the CLI declare both libssl names.
+  - So P6b's field proof waits for a new, operator-approved tunnel release: `release-tunnel.yml` signs `.asc` now,
+    and #2474 has the CLI declare both libssl names. Only a published release carries a signature: a rehearsal
+    never signs, and must not, since a signature on unreviewed branch bytes would be a supply-chain hole.
 - **P6c, `roomlerd service install --as-service` (alias `--system`) on Linux and macOS (merged, #2488).** The verb Windows has
   had for the SCM now registers the root daemon the package ships, under the OS's own manager. `uninstall`, `status`,
   `start` and `stop` follow it (`service.rs`: the cfg-free `pub mod system` and the two per-OS halves).
@@ -1081,7 +1103,7 @@ model on Windows, so the three agree on what the mode means.
 | **P5a** | `console_user` on Linux + macOS: the person at seat0 or owning the console, by the `named` drop, for SSH and exec's `run_as` (built) | the device's `ssh_account_mode`; the exec policy's `run_as` | the lab + a Mac | S–M |
 | **P5b** | A person's SSH session starts in their home: the shell, a command and `sftp` for `named` and `console_user` on Linux + macOS, and Windows `console_user`'s shell and commands in the profile (as `sftp` since P4b); the `chdir` after the drop, where sshd does it (built) | `ROOMLERD_SSH_START_IN_HOME=0` | the lab + a Win11 SystemContext guest | S |
 | **P6a** | Artifact version binding: `.deb`, `.pkg`, tarball (built) | `ROOMLERD_ARTIFACT_VERSION_CHECK=0` | the last three releases' real artifacts; a hostile feed, red on 0.4.143 | S–M |
-| **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
+| **P6b** | `roomler self-update` on Unix + the pinned PGP check on every OS (built, #P6BPR; its field proof waits for a tunnel release) | — (a new path on Linux and macOS; on Windows the install is unchanged and the `.asc` becomes required) | Linux + Mac tunnel-only hosts; until a release, a stand-in proxy for the refusals | M |
 | **P6c** | `service install --as-service` (alias `--system`) on Linux + macOS (merged, #2488) | — (a new verb) | a vmtest Ubuntu guest, red on 0.4.143; the 0.4.144 candidate; the macOS stop's mechanism on a tart Mac | S |
 | **P6d** | `install.sh --uninstall [--keep-config]` (built) | — (a new flag; the install path is unchanged) | six throwaway containers on four distros, a vmtest Ubuntu guest per install type, a tart Mac with both halves; red on the served script | S |
 | **P6e** | macOS supervisor crash capture (P6e-2: built, #2655); #1538 (P6e-1, never die on a log sink: built) | P6e-1: — (a liveness fix). P6e-2: the FR-43 supervisor's own `macos_supervise_gui_worker` (default off) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143. P6e-2: a tart Mac with both halves, its worker SIGKILLed, red on 0.4.148 | S |
