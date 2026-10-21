@@ -325,6 +325,20 @@ impl Pipeline {
         best
     }
 
+    /// FR-119 P2b-2 — floor-merge of the frame-rate ask: the smallest across
+    /// the viewers, and a viewer that asked nothing asks for today's rate
+    /// (`None` wins). A viewer on a 60 Hz screen never receives a heavier
+    /// stream than it asked for.
+    pub fn merged_fps_ask(&self, own: Option<u32>) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+        inner.followers.iter().fold(own, |merged, f| {
+            match (merged, f.sink.viewer_report.fps_ask()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                _ => None,
+            }
+        })
+    }
+
     /// Floor-merge of the Priority dial's relay resolution cap: the smallest
     /// cap across viewers (None = uncapped for that viewer).
     pub fn merged_priority_cap(&self, own_cap: Option<u32>, constrained: bool) -> Option<u32> {
@@ -1115,6 +1129,23 @@ mod tests {
         );
         // Quality: min.
         assert_eq!(owner.min_quality(2), 0);
+    }
+
+    /// FR-119 P2b-2 — the frame-rate ask merges to the smallest, and a viewer
+    /// that asked nothing holds the stream at today's rate.
+    #[tokio::test]
+    async fn the_frame_rate_ask_takes_the_floor() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-FPS");
+        let owner = Pipeline::register(key, ObjectId::new());
+        assert_eq!(owner.merged_fps_ask(Some(144)), Some(144), "alone");
+        let s = sink(ObjectId::new());
+        let follower_report = s.viewer_report.clone();
+        let _g = try_join(key, s, 60).expect("join");
+        assert_eq!(owner.merged_fps_ask(Some(144)), None, "it asked nothing");
+        follower_report.store_fps_ask(120);
+        assert_eq!(owner.merged_fps_ask(Some(144)), Some(120));
+        assert_eq!(owner.merged_fps_ask(None), None);
     }
 
     // P8 Phase 4 — the mixed-dial predicate: false with no followers,

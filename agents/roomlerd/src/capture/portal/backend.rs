@@ -607,6 +607,13 @@ impl ScreenCapture for PortalCapture {
         })
     }
 
+    /// FR-119 P2b — the arm's own name. The pace is the helper's, negotiated
+    /// at the open, so `set_target_fps` keeps the default: a trial above it
+    /// fails on what the helper delivers.
+    fn backend(&self) -> &'static str {
+        if self.mutter { "mutter" } else { "portal" }
+    }
+
     /// FR-93 P5f — this user's session is away from its seat: the pumps tell
     /// the controller, and keep no keepalive while it lasts.
     fn waits_for(&self) -> Option<crate::capture::WaitFor> {

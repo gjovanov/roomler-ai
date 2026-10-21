@@ -2223,6 +2223,13 @@ impl RebuiltEncoder {
     pub fn dims(&self) -> (u32, u32) {
         (self.spec.width, self.spec.height)
     }
+
+    /// FR-119 P2b — the frame rate this replacement was opened at: a rate
+    /// swap opened before an fps swap was adopted is stale, as one opened for
+    /// dims the session has left is.
+    pub fn fps(&self) -> u32 {
+        self.spec.fps.max(1) as u32
+    }
 }
 
 impl FfmpegEncoder {
@@ -2287,15 +2294,22 @@ impl FfmpegEncoder {
         })
     }
 
-    /// FR-70 M2 — the spec for a replacement at NEW dims: the same backend,
-    /// fps, cq and chroma, the rate coarsened as `rebuild_spec` does. Never
-    /// `None` — a dims change always needs a fresh encoder.
-    pub(crate) fn rebuild_spec_at_dims(&self, width: u32, height: u32, bps: u32) -> RebuildSpec {
+    /// FR-70 M2 — the spec for a replacement at NEW dims, and since FR-119 P2b
+    /// at a new frame rate, or both: the same backend, cq and chroma, the rate
+    /// coarsened as `rebuild_spec` does. Never `None` — either change always
+    /// needs a fresh encoder (the frame rate is fixed at open).
+    pub(crate) fn rebuild_spec_at(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bps: u32,
+    ) -> RebuildSpec {
         RebuildSpec {
             name: self.encoder_name,
             width,
             height,
-            fps: self.fps,
+            fps: fps.clamp(1, i32::MAX as u32) as i32,
             maxrate_bps: crate::encode::aimd::coarsen_bitrate(bps) as usize,
             cq: self.cq,
             chroma444: self.chroma444,
@@ -2351,6 +2365,9 @@ impl FfmpegEncoder {
         self.hw = rebuilt.hw;
         self.width = spec.width;
         self.height = spec.height;
+        // FR-119 P2b — and the frame rate it was opened at, which every later
+        // spec copies (a rate swap, the synchronous rebuild).
+        self.fps = spec.fps;
         self.maxrate_bps = spec.maxrate_bps;
         self.frame_count = 0;
         self.force_keyframe = true;
