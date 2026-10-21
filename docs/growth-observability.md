@@ -2009,7 +2009,7 @@ addresses.
 ⚠️ **An overlay pair needs the device to allow it.** #1882's `access_policy.rc_overlay` is off unless
 the device opts in, and with it off the agent drops every overlay candidate. With it on, an agent
 whose overlay interface is named `roomler*` still never gathers on it: the interface-name rule
-(`is_overlay_iface`, [`peer.rs:12789`](../agents/roomlerd/src/peer.rs)) applies whatever
+(`is_overlay_iface`, [`peer.rs:12797`](../agents/roomlerd/src/peer.rs)) applies whatever
 `rc_overlay` says. So an overlay carrier comes from `rc_overlay` on AND either a macOS agent, whose
 `utunN` the name rule cannot see, or a controller whose route to the agent runs through the mesh.
 Measured on 2026-10-19 (FR-102 §8): a controller on the vmtest org's mesh viewing a Linux agent

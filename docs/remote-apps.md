@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:9190`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:9195`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -72,7 +72,7 @@ Three properties of the wire are load-bearing:
 - 🔑 **Every path returns a well-formed `*.reply`**, including a panic in the
   handler (`peer.rs` catches the join error and answers `ok:false`). A request
   that got no answer is how the viewer detects an agent too old to speak
-  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:6586`).
+  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:6599`).
 
 ## 2. How the Linux backend finds a desktop — and as whom
 
@@ -249,7 +249,7 @@ restart changes it. That is why P6 added a fourth value:
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
   (`ui/src/views/remote/RemoteControl.vue:4566` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
-  or the reason (`useRemoteControl.ts:9588`, the `apps_list_reply` arm). A greyed button with no tooltip
+  or the reason (`useRemoteControl.ts:9601`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
 - 🔑 **`availability_for()` is the single source for both** (`mod.rs:321`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
@@ -271,7 +271,7 @@ restart changes it. That is why P6 added a fourth value:
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
-  `useRemoteControl.ts:1261`) rather than papering over it — inventing a reason
+  `useRemoteControl.ts:1266`) rather than papering over it — inventing a reason
   would be the same lie in the other direction.
 
 ## 5. Launch, and the tmux session model
@@ -400,7 +400,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2866`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2880`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.

@@ -210,6 +210,18 @@ pushing it cannot grant anything. The device's opt-in (`remote_config_enabled`)
 still applies, because the opt-in is about accepting pushed config at all, not
 about any one key. ⚠️ A blank value from the dialog is "not managed"; a pushed
 empty string CLEARS the device's key back to the built-in list.
+
+**A second one (FR-119 P2b).** `fps_deny`, the frame-rate denylist
+(comma-separated `name:fps` entries, `*` for every encoder, or `none`), rides
+the same document on the same terms: `MANAGE_AGENTS` alone, because it only
+ever *removes* rates above 60 a device would otherwise grant;
+`needs_restart`, because the pump reads it through the config fallbacks,
+registered once per process; audited like the rest. Unset on the device denies
+nothing, so `none` is how a push says the same thing while a blank box hands the
+key back to the device. A pushed value is not validated by the server, as with
+`encoder_cells_deny`: an entry the device cannot parse is skipped, never widened
+into a match, and `roomler config set fps_deny` refuses it locally.
+
 ## 7. What this does not do
 
 - **No bootstrapping problem.** Enabling `exec_enabled` remotely does not

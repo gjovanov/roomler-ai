@@ -48,7 +48,7 @@ ships — works the way a Windows or macOS host does: install, enroll, connect, 
 
 | | **per-user** — the desktop default (`SYSTEM=0`, `scripts/install.sh:63`; `README.Debian:12-13`) | **system** — `--system` / `.deb` root unit |
 |---|---|---|
-| Capture | scrap connects to Xwayland's `DISPLAY` and streams Xwayland's empty root: **a live black stream, no reason** (#1719 measured `backend=scrap`, ~1.2 KB/s of black VP9) | the root unit has no `DISPLAY` (`packaging/linux/roomlerd.service:20-53`), scrap's `xcb_connect(NULL)` fails, and the FR-80 classifier says **`no_display` — "headless, or no desktop session"**, false for this host (`capture/mod.rs:649-657`, hint `:528-529`). DRM and the portal are skipped without a log line (`:847-908`) |
+| Capture | scrap connects to Xwayland's `DISPLAY` and streams Xwayland's empty root: **a live black stream, no reason** (#1719 measured `backend=scrap`, ~1.2 KB/s of black VP9) | the root unit has no `DISPLAY` (`packaging/linux/roomlerd.service:20-53`), scrap's `xcb_connect(NULL)` fails, and the FR-80 classifier says **`no_display` — "headless, or no desktop session"**, false for this host (`capture/mod.rs:660-668`, hint `:539-540`). DRM and the portal are skipped without a log line (`:858-919`) |
 | Input | enigo/XTest reaches **Xwayland clients only**; native windows (Settings, Files, the shell) get nothing and nothing says so (`input/mod.rs:344-346`) | no `DISPLAY` ⇒ `NoopInjector`, which returns `Ok(())` for every event (`input/mod.rs:279-288`) |
 | What the viewer is told about input | `has_input_permission = true`, hard-coded off macOS (`encode/caps.rs:1538-1540`, `:937-946`, `:965-974`) | the same |
 | Cursor | none — the Linux cursor tracker is unwired (`capture/cursor.rs:88-94`); the viewer paints the controller's initials badge | none |
@@ -85,7 +85,7 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
 5. **DRM selection is first-wins and its failures are mute**: the first card with a CRTC (`:116-137`), the
    first bound plane with no `type` check (`:146-164`), `monitor_count()` = 1; a non-linear modifier, no
    scanout or no `CAP_SYS_ADMIN` never reaches the viewer — only the last arm's error is classified
-   (`capture/mod.rs:915-934`); a blanked panel **freezes the last frame** instead of saying so
+   (`capture/mod.rs:926-945`); a blanked panel **freezes the last frame** instead of saying so
    (`drm_backend.rs:359-361` → the keepalive).
 6. DRM's mapping cache is keyed on `(fb id, len)` (`:384`) — a recycled id for a new same-size buffer reuses a
    stale mapping (inference).
@@ -108,11 +108,11 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
 14. The companion was never field-run as a **consent** window on Wayland; its banner cannot auto-hide there
     (`agents/roomler-desktop/src/panels.rs:195-198`); `pgrep -x` has no `-u` (`companion.rs:556`).
 15. `capture-smoke` ignores `config.toml` (the bridge is registered only in `run_cmd`, `main.rs:2925-2972`)
-    and parks ~1 h on `NoopCapture` (`capture/mod.rs:606-610`).
+    and parks ~1 h on `NoopCapture` (`capture/mod.rs:617-621`).
 16. Keep busy (FR-92, every phase merged 2026-10-11, unreleased) reports a Wayland desktop `unavailable`
     with reason `wayland` (`keep_busy/engine.rs:197-198`) — right, and a **fifth** hand-rolled logind
     parser (`keep_busy/logind.rs:91-110`).
-17. Docs drift: `docs/linux-capture.md` anchors (`open_default` is `capture/mod.rs:721`, not `:704`;
+17. Docs drift: `docs/linux-capture.md` anchors (`open_default` is `capture/mod.rs:732`, not `:715`;
     `spawn_child` is `portal/mod.rs:764`, not `:755`); `README.Debian:86-91`; `docs/remote-control.md:159,175`
     name files that do not exist; `CLAUDE.md` says GNOME/KDE Wayland get "no native overlay" while
     `indicator/x11.rs:33-39` describes the Xwayland one.
@@ -1016,7 +1016,7 @@ New cells run three times before they are trusted. An entry in `expected-failure
   the X server for it. On P1a's candidate the picture is the same and there is no warning (0 of 58).
   **Windows and macOS, in the code:**
   - The pumps' wait hold (P3e, P5f) engages only when a capture backend reports a wait. Only the Linux DRM and
-    portal backends do; the trait's default is `None` (`capture/mod.rs:427`).
+    portal backends do; the trait's default is `None` (`capture/mod.rs:438`).
   - The reach verdict is `full` on Windows, so a session there is told nothing. On macOS the warning comes only
     while Accessibility is not granted. That is P1's own, deliberate: before it, such a session looked
     interactive and did nothing.

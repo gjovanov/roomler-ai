@@ -31,9 +31,9 @@ at 30 by a constant, and on a fast host the constant is not even the limit: the 
 
 | Path | Today | Anchor |
 |---|---|---|
-| VP9-444 over the DataChannel | 30, or 60 with `ROOMLERD_VP9_FPS=60` | `agents/roomlerd/src/peer.rs:9427` |
+| VP9-444 over the DataChannel | 30, or 60 with `ROOMLERD_VP9_FPS=60` | `agents/roomlerd/src/peer.rs:9435` |
 | H.264 over RTP (OpenH264) | 30: `TARGET_FPS_SW`, and the encoder's own `max_frame_rate(30)` | `peer.rs:98`, `encode/openh264_backend.rs:50` |
-| Hardware encoders | 60 | `peer.rs:105`, `ffmpeg_target_fps` (`peer.rs:9451`) |
+| Hardware encoders | 60 | `peer.rs:105`, `ffmpeg_target_fps` (`peer.rs:9459`) |
 
 ### The Asahi host at the cap, and past it
 
@@ -211,7 +211,7 @@ flowchart LR
   it: `tests/l4_latency.rs`'s replay cell read the periodic keyframe at +1 s as an obeyed replay (4 of 5).
 - **The ≤ 1280-px cap is not the limit it looks like.** The cap that shrinks software H.264 "so encode stays under
   the 33 ms 30-fps budget" fires on the host, and 230 ms later the viewer's default resolution (`original`,
-  `ui/src/composables/useRemoteControl.ts:5034`) overrides it: the field already encodes 2048×1080, and with its
+  `ui/src/composables/useRemoteControl.ts:5044`) overrides it: the field already encodes 2048×1080, and with its
   clock that costs 5.5 ms a frame. So P2c, which would have decided the cap from the measured encode, is dropped.
 - **No VP9 quality trade on this host.** With its clock, today's settings (`cpu-used` 6, four tile columns, the
   q-index-16 cap) send 56 fps. `ROOMLERD_VP9_CPU_USED` stays the lever for a host that measures short.
