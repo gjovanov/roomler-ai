@@ -4562,6 +4562,17 @@ pub struct TunnelAuditEvent {
     /// `"dial: connection refused"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// FR-90 P3-7-2a — the agent SESSION whose own flows this tunnel
+    /// carries, under a grant the vault signed. `origin_agent_id` is then
+    /// the device it runs on, and `user_id` the session's owner. `None`
+    /// for every tunnel that carries a device's or a person's flows, and in
+    /// every row from before P3-7-2a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<ObjectId>,
+    /// FR-90 P3-7-2a — the grant's id, as the vault recorded its allow
+    /// (`vault_audit`, target `grant:<id>`). Set with `session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
 }
 
 impl TunnelAuditEvent {
