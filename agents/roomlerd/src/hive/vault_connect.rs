@@ -1698,7 +1698,7 @@ mod endpoint {
     /// and SYSTEM is the only exception. Linux shares one only between
     /// sockets of one owner that both set `SO_REUSEPORT`, and macOS only
     /// between sockets that all set it, which this one does not.
-    mod loopback {
+    pub(super) mod loopback {
         use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
         use serde_json::json;
@@ -1744,53 +1744,103 @@ mod endpoint {
             }
         }
 
-        impl Bound {
-            /// Windows: the connection's row of the table names its process,
-            /// and the process's token the account.
-            #[cfg(windows)]
-            fn account(&self, client: SocketAddrV4) -> Result<(), String> {
-                let pid = crate::hive_win::tcp_client_pid(client, self.addr)
-                    .ok_or("a connection no process owns any more")?;
-                let sid = crate::hive_win::process_sid(pid)?;
-                if sid == self.peer {
-                    Ok(())
-                } else {
-                    Err(format!("{sid} (pid {pid})"))
-                }
-            }
+        /// FR-90 P3-7-3b — the one account a loopback connection is served
+        /// for: a uid on Unix, a SID on Windows.
+        #[cfg(unix)]
+        pub(crate) type Peer = u32;
+        #[cfg(windows)]
+        pub(crate) type Peer = String;
 
-            /// Linux (P3-5d-2): the kernel's row for the connection's client
-            /// end names the account that owns its socket.
-            #[cfg(target_os = "linux")]
-            fn account(&self, client: SocketAddrV4) -> Result<(), String> {
-                match super::super::proc_net::owner(client, self.addr) {
-                    Some(uid) if uid == self.peer => Ok(()),
-                    Some(uid) => Err(format!("uid {uid}")),
-                    None => Err("a connection no live socket owns".into()),
-                }
+        /// Windows: the connection's row of the table names its process, and
+        /// the process's token the account.
+        #[cfg(windows)]
+        pub(crate) fn connection_is(
+            peer: &Peer,
+            client: SocketAddrV4,
+            server: SocketAddrV4,
+        ) -> Result<(), String> {
+            let pid = crate::hive_win::tcp_client_pid(client, server)
+                .ok_or("a connection no process owns any more")?;
+            let sid = crate::hive_win::process_sid(pid)?;
+            if &sid == peer {
+                Ok(())
+            } else {
+                Err(format!("{sid} (pid {pid})"))
             }
+        }
 
-            /// macOS (P3-5d-3): the connection's client end is held, and held
-            /// only, by processes running as the session's account.
-            #[cfg(target_os = "macos")]
-            fn account(&self, client: SocketAddrV4) -> Result<(), String> {
-                if super::super::libproc::held_by(client, self.addr, self.peer) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "a client end not held by processes of uid {} alone",
-                        self.peer
-                    ))
-                }
+        /// Linux (P3-5d-2): the kernel's row for the connection's client end
+        /// names the account that owns its socket.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn connection_is(
+            peer: &Peer,
+            client: SocketAddrV4,
+            server: SocketAddrV4,
+        ) -> Result<(), String> {
+            match super::super::proc_net::owner(client, server) {
+                Some(uid) if uid == *peer => Ok(()),
+                Some(uid) => Err(format!("uid {uid}")),
+                None => Err("a connection no live socket owns".into()),
             }
+        }
 
-            /// Elsewhere: nothing says who connected, so nobody is served.
-            #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-            fn account(&self, _client: SocketAddrV4) -> Result<(), String> {
+        /// macOS (P3-5d-3): the connection's client end is held, and held
+        /// only, by processes running as the session's account.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn connection_is(
+            peer: &Peer,
+            client: SocketAddrV4,
+            server: SocketAddrV4,
+        ) -> Result<(), String> {
+            if super::super::libproc::held_by(client, server, *peer) {
+                Ok(())
+            } else {
                 Err(format!(
-                    "this system cannot say which account connected (uid {} is served)",
-                    self.peer
+                    "a client end not held by processes of uid {peer} alone"
                 ))
+            }
+        }
+
+        /// Elsewhere: nothing says who connected, so nobody is served.
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        pub(crate) fn connection_is(
+            peer: &Peer,
+            _client: SocketAddrV4,
+            _server: SocketAddrV4,
+        ) -> Result<(), String> {
+            Err(format!(
+                "this system cannot say which account connected (uid {peer} is served)"
+            ))
+        }
+
+        /// FR-90 P3-7-3b — the admit hook of an agent session's net listener
+        /// (`tunnel_core::flow_listener::Admit`): a connection from `peer`'s
+        /// processes alone, asked as an endpoint asks. Refused where this
+        /// system cannot say who connects to a loopback port.
+        // P3-7-3c's tools are its first caller; until they land, only the
+        // tests reach it.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn session_admit(
+            peer: Peer,
+        ) -> Result<tunnel_core::flow_listener::Admit, String> {
+            identifies()?;
+            Ok(std::sync::Arc::new(
+                move |tcp: &TcpStream, local: SocketAddr| {
+                    let SocketAddr::V4(client) = tcp.peer_addr().map_err(|e| e.to_string())? else {
+                        return Err("a client that is not IPv4 loopback".into());
+                    };
+                    let SocketAddr::V4(server) = local else {
+                        return Err("a listener that is not IPv4 loopback".into());
+                    };
+                    connection_is(&peer, client, server)
+                },
+            ))
+        }
+
+        impl Bound {
+            /// Whether `client` is a process running as the session's account.
+            fn account(&self, client: SocketAddrV4) -> Result<(), String> {
+                connection_is(&self.peer, client, self.addr)
             }
 
             /// The endpoint's own origin: where an HTTP endpoint points a
