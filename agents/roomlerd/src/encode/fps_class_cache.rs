@@ -71,7 +71,10 @@ pub(crate) fn load(path: &Path, key: &CacheKey, now_unix: u64) -> Vec<Entry> {
         .collect()
 }
 
-/// The cached verdict for one class, if there is one.
+/// The cached verdict for one class, if there is one. The pump hands every
+/// entry to `frame_rate::RateState`, which keeps the newest per class itself;
+/// this is the same rule, for the tests.
+#[cfg(test)]
 pub(crate) fn verdict_for(entries: &[Entry], class: &ClassKey) -> Option<Verdict> {
     entries
         .iter()

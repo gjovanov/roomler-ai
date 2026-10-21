@@ -247,6 +247,14 @@ impl ScreenCapture for SystemContextCapture {
         self.output_cap = target;
     }
 
+    /// FR-119 P2b — nothing to move: this backend has no pacer of its own and
+    /// delivers at the display's rate (the open ignores its target too).
+    fn set_target_fps(&mut self, _fps: u32) {}
+
+    fn backend(&self) -> &'static str {
+        "system-context"
+    }
+
     fn monitor_count(&self) -> u8 {
         // M3 A1 captures the primary monitor only — see plan §4.
         // Multi-monitor capture stays in the user-context worker

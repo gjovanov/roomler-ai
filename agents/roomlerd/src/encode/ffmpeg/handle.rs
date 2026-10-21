@@ -41,9 +41,9 @@ impl EncoderOps for FfmpegEncoder {
     fn rebuild_spec(&self, bps: u32) -> Option<RebuildSpec> {
         FfmpegEncoder::rebuild_spec(self, bps)
     }
-    fn rebuild_spec_at_dims(&self, width: u32, height: u32, bps: u32) -> Option<RebuildSpec> {
-        Some(FfmpegEncoder::rebuild_spec_at_dims(
-            self, width, height, bps,
+    fn rebuild_spec_at(&self, width: u32, height: u32, fps: u32, bps: u32) -> Option<RebuildSpec> {
+        Some(FfmpegEncoder::rebuild_spec_at(
+            self, width, height, fps, bps,
         ))
     }
     fn caps(&self) -> EncoderCaps {

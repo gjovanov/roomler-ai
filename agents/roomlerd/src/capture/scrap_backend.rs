@@ -422,7 +422,7 @@ impl ScrapCapture {
             width,
             height,
             monitor: 0,
-            target_frame_period: Duration::from_millis(1000 / target_fps.max(1) as u64),
+            target_frame_period: super::gate::legacy_period(target_fps),
             last_frame_at: None,
             desired,
             unchanged,
@@ -547,6 +547,20 @@ fn capture_one_blocking(
 impl ScreenCapture for ScrapCapture {
     fn frames_unchanged(&self) -> u64 {
         self.unchanged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// FR-119 P2b — the pace is this side's sleep, so it moves in place. The
+    /// legacy gate is kept above 60: this backend has no slot to look at first
+    /// (the worker asks the capturer when the pump asks), and its
+    /// whole-millisecond period runs a little fast at 120 and 144, so it does
+    /// not lock to a phase (`gate::legacy_period`). The macOS stream itself is
+    /// unthrottled, so a 120 Hz panel already delivers what this asks for.
+    fn set_target_fps(&mut self, fps: u32) {
+        self.target_frame_period = super::gate::legacy_period(fps);
+    }
+
+    fn backend(&self) -> &'static str {
+        "scrap"
     }
 
     /// Phase B — honour the pump's encode box by re-opening the capture
