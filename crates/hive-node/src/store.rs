@@ -2628,7 +2628,7 @@ mod tests {
     }
 
     /// What a daemon from before P2a runs on the store it opens: P0a's own
-    /// statements (`8e41174ed`, the only schema a released daemon wrote),
+    /// statements (`287b496b7`, the only schema a released daemon wrote),
     /// verbatim. ⚠️ Frozen on purpose: a rolled-back daemon runs ITS copy,
     /// not this build's, so never edit these to match the current code.
     mod p0a {

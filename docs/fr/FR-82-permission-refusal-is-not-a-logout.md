@@ -1,6 +1,6 @@
 # FR-82: A permission refusal is not a logout, and a managed role is not frozen at its birthday
 
-**Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** **shipped + field-verified 2026-09-09** (`786f016bf`, image `hosted-20260909-786f016`) — **all 10 criteria met; AC8 closed by the operator from the reporting seat on 2026-09-09** ·
+**Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** **shipped + field-verified 2026-09-09** (`865a261c2`, image `hosted-20260909-786f016`) — **all 10 criteria met; AC8 closed by the operator from the reporting seat on 2026-09-09** ·
 **Field report:** a GROX member opened `/tenant/69a1dbba…/devices`, got a 403 and
 was signed out of the product.
 
@@ -342,7 +342,7 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
 |---|---|---|
 | 2026-09-09 | **BEFORE**, measured on prod Mongo (`roomler2.roles`) while the *previous* image was still serving — so the pass below means something | 72 tenants · 360 managed rows · **12 drift strata**: `admin 0x7ffff7 ×63`, `owner 0xffffff ×63`, `moderator 0x07ef91 ×63`, plus 6 singleton/small strata. The defect reproduced exactly as surveyed |
 | 2026-09-09 | Pre-flight, with a **positive control** (an absent key and a broken `kubectl` look identical) | control `ROOMLER__APP__ENVIRONMENT` → `production`; `RUST_LOG` **absent** ⇒ the compiled `EnvFilter` default applies ⇒ `roomler_ai_api=debug` ⇒ the reconcile's INFO lines can actually reach the log; `ROOMLER__AUTH__RECONCILE_MANAGED_ROLES` **absent** ⇒ defaults on |
-| 2026-09-09 07:35 | Promoted `hosted-20260909-786f016` (from `786f016bf`) | both pods on it, `/health` 200 |
+| 2026-09-09 07:35 | Promoted `hosted-20260909-786f016` (from `865a261c2`) | both pods on it, `/health` 200 |
 | 2026-09-09 07:37 | **The arithmetic**, read live from the leader pod | 7 `managed role reconciled to its definition` lines; `admin rows=63 stored=0x7ffff7 gained=0x57000000` ⇒ `MANAGE_AGENTS, REMOTE_CONTROL, VIEW_REMOTE_AUDIT, VIEW_EXEC_AUDIT, VIEW_SSH_AUDIT`. The other pod: `lease held elsewhere` — the leader gate held |
 | 2026-09-09 | **AFTER**, re-measured from Mongo against the before-state | **12 strata → 5**, every managed role at all 72 orgs: `owner 0x7fffffff`, `admin 0x577ffff7`, `moderator 0x207ef91`, `member 0x3cf81`, `guest 0x801` |
 | 2026-09-09 | **AC6 in the field, not just in a unit test** | the granted mask `0x57000000` is bits 24,25,26,28,30 — **bits 27 (`EXEC_DEVICE`) and 29 (`SSH_DEVICE`) are CLEAR**. The one-shot grant across 63 orgs handed out the audit/agent bits and no root shell |
@@ -410,7 +410,7 @@ at one boot. A prediction that could not have failed would have proved nothing.
 
 ## AC11 in production — deployed 2026-09-10, and what it cannot show
 
-`hosted-20260910-dc54fc9` (master `dc54fc98a`, version `0.4.97`) promoted and
+`hosted-20260910-dc54fc9` (master `60e427218`, version `0.4.97`) promoted and
 rolled; both pods ready, `/health` 200 with all six modules, 17 fleet peers back
 on the overlay after the WS cycle, and the shipped bundle still carries the
 fixed 403 rule (`status===403 && …==="GET"` → **0 occurrences**,

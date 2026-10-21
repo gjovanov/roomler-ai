@@ -1,7 +1,7 @@
 # FR-118: GPU-resident frames — a captured frame stays on the GPU until the encoder takes it
 
 **Issue:** [#2669](https://github.com/gjovanov/roomler-ai/issues/2669) · **Status:** proposed 2026-10-21 —
-spec and claim · **Owner:** the agent's capture and encode path · **Anchors:** master `7a3dd06a6` ·
+spec and claim · **Owner:** the agent's capture and encode path · **Anchors:** master `c636c6e8c` ·
 **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 2 ("zero-copy") ·
 **Builds on:** [FR-70](FR-70-media-pipeline-leaves-the-runtime.md) (the encoder thread, M1),
 [FR-77](FR-77-encoder-chroma-matrix.md) (cells and the probe), [FR-107](FR-107-drm-capture-throughput.md)
@@ -23,7 +23,7 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 
 ## 2. Evidence
 
-### 2.1 Where the copies happen (master `7a3dd06a6`)
+### 2.1 Where the copies happen (master `c636c6e8c`)
 
 | Step | Where | What it costs |
 |---|---|---|

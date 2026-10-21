@@ -2,7 +2,7 @@
 
 **Issue:** [#2147](https://github.com/gjovanov/roomler-ai/issues/2147) · **Status:** **closed 2026-10-14**: all five criteria field-verified on the released 0.4.135 wizard (§8) · **Owner:**
 fleet (the anchor route, enrollment tokens), the wizard (`agents/roomler-setup`, `crates/roomler-setup-core`),
-the admin UI · **Anchors:** master `05b2bd2bd` · **Builds on:** FR-94 (the anchor; its P1 second half,
+the admin UI · **Anchors:** master `94a2032c6` · **Builds on:** FR-94 (the anchor; its P1 second half,
 "the wizard writing the anchor", was not built), FR-84 (the wizard)
 
 ## 1. Goal
@@ -15,7 +15,7 @@ An administrator installing Roomler on a Windows machine can anchor it for SYSTE
 FR-94's invariant still holds: the anchoring happens inside an elevated process, and the SYSTEM service's
 credential never passes through a process the signed-in user controls.
 
-## 2. Evidence (master `05b2bd2bd`)
+## 2. Evidence (master `94a2032c6`)
 
 **The wizard does not elevate itself.**
 - It runs at **Medium integrity**: `asInvoker`, no `requestedExecutionLevel` (`agents/roomler-setup/build.rs` L48–52). `crates/roomler-setup-core/src/msi_runner.rs` L139–156 measured it.

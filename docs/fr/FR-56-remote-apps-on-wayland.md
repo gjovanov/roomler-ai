@@ -181,7 +181,7 @@ one video surface, and changing that is a much larger UI program than this.
       (2026-09-25)**: FR-56 opened on 2026-09-01, before the
       docs-before-close rule (#1401, 2026-09-05), and a close after that date
       binds it. Marked rather than backdated, so the spec does not claim it
-      always complied. Ticked when the page has merged. **Merged 2026-09-25 as `bc99f9414` (#1667)** and
+      always complied. Ticked when the page has merged. **Merged 2026-09-25 as `990023c6d` (#1667)** and
       checked on master: `docs/remote-apps.md` (410 lines, 2 mermaid
       diagrams), indexed at `docs/README.md:92` with its map node.
 

@@ -384,7 +384,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   with the runner image ("already the newest version"). The composite costs ~21 s in a
   lane, against ~14 s for the raw step on a good day.
 - 2026-10-01: **Budget $10 (the operator); saves resume, and wave 16 in the field.**
-  Re-ran master CI at `37fa997ae` (run 36819352918, attempt 2, 7.8 min): all 11 salted
+  Re-ran master CI at `0c3a74ed0` (run 36819352918, attempt 2, 7.8 min): all 11 salted
   `ci.yml` jobs restored the pre-salt generation (`full match: false`, none cold) and
   SAVED their salted one, every key the one PR #1784's run had computed, the first
   writes since 09-28 20:24Z. installer-smoke's Windows job (run 36899658523) did the
@@ -424,7 +424,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   caches are invisible to master. It installed in 40 s, the mirror having recovered, and
   saved on master at 22:40:57Z.
 - 2026-10-01: **agent-v0.4.115, the field test of waves 18 and 19** (run 36937794461,
-  tagged 22:54:13Z on `dd50b13b6`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
+  tagged 22:54:13Z on `426150261`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
   (the pole), `.pkg` 10.4 (12.2 on 0.4.114, median 12.3 over the last 12 tags), Linux
   x86_64 9.9, aarch64 7.4, the companions 3.3 (macOS) and 6.1 (Windows).
   - Release: 28 assets, names identical to 0.4.114's apart from the version, each
@@ -554,7 +554,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - A dry run in WSL caught one bug before any of this: without `zstd`, `tar` left 0-byte
     archives, and the first draft uploaded them over the good cache. `ci-seed-save` now
     refuses a failed pack.
-- 2026-10-11: **wave 22 on master** (`7fe30a471`, #1954).
+- 2026-10-11: **wave 22 on master** (`b928d563b`, #1954).
   - The first master runs (CI 38096524857, integration-tests 38096524893, installer-smoke
     38096524865) restored each of the six from the `seed-cache` release. Each saw the key
     change, since removing the validation clause changed each job's definition, and
@@ -565,7 +565,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The six families' old Actions-cache entries were deleted by hand (8 entries,
     ~6.4 GiB), along with the orphaned plain-recorder family. One more
     `installer-smoke-windows` entry appeared at 00:00:31Z, written by the last run on the
-    old workflow (38095828862, `f47dfb5a1`, started before the merge), and was deleted.
+    old workflow (38095828862, `a91171f26`, started before the merge), and was deleted.
   - Settled pool: **7.48 GiB in 12 entries**, against the free 10 GiB.
 - 2026-10-19: **"the tests got slow": two causes, wave 23 (#2544).**
   - **CI lanes cold.** PR run 39288740822: lint 22.5 min, unit tests 19.2, profiles 10.1,
@@ -629,8 +629,8 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The partition was dry-run first with two fake libtest binaries (103 tests): union ==
     listing, no duplicates, the skipped test excluded, a module's tests spread 8/8/9.
 - 2026-10-20, evening: **the shards on master, and the queue** (wave 25).
-  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (35fa314ba
-    through e918d9e56), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
+  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (f0bf3a958
+    through d6235e5ee), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
     min: builds 1.9–3.8 min, suites 5.4–8.2. The sixth took 24.8 min: its shards queued
     3–7 min, and one shard's build ran 10.1 min. The build does not drop to ~2 min,
     because the cache holds third-party crates only and every shard rebuilds the workspace
