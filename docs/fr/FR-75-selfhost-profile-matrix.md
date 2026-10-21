@@ -256,7 +256,7 @@ Harness: `roomler-ai-deploy/profiletest/` (sibling of `vmtest/`), server golden
 | # | finding | evidence |
 |---|---|---|
 | 1 | **The four non-`full` profile images have never been published.** `ghcr.io/gjovanov/roomler-ai:latest-collab` does not resolve, and no `-remote`/`-mesh`/`-access` tag exists on any tag family. `publish-selfhost-image.yml` is dispatch-only with `profile` defaulting to `full`, and has only ever been dispatched that way | first cell, at the cheapest gate, before a browser booted |
-| 2 | **The one image that does exist predates the feature it is documented around.** `latest` = `v0.4.45` (2026-09-01); `/api/capabilities` + `/health .modules` landed 2026-09-04 (`d1f1be948`, FR-69 P8). `merge-base --is-ancestor` says false. The workspace is at 0.4.76 — 31 versions ahead | `/health` → `{"status":"ok","version":"0.4.45"}` with no `.modules`; `/api/capabilities` → **404** |
+| 2 | **The one image that does exist predates the feature it is documented around.** `latest` = `v0.4.45` (2026-09-01); `/api/capabilities` + `/health .modules` landed 2026-09-04 (`4f8296fa7`, FR-69 P8). `merge-base --is-ancestor` says false. The workspace is at 0.4.76 — 31 versions ahead | `/health` → `{"status":"ok","version":"0.4.45"}` with no `.modules`; `/api/capabilities` → **404** |
 | 3 | **Enrollment refuses plaintext off-loopback, and `docs/self-hosting.md` does not say so.** `normalize_server_url` upgrades `http://`→`https://` for any non-loopback host; loopback is exempt. So "Add your first machine" cannot work until the *later*, optional-looking "Putting it behind a real hostname" section has been done, and the error names nothing | `roomlerd enroll` → `POST https://…:8080/api/agent/enroll` → `SSL routines:ssl3_get_record:wrong version number` |
 
 Findings 1 and 2 are reported, not fixed: publishing puts a public package under the operator's
@@ -359,14 +359,14 @@ gates on `/api/capabilities`, and that has to cover what it *fetches*, not only 
 It is the same family as the P7b lesson in `docs/modular-monolith.md`, where every `remote` image
 404'd its own devices page and a `/health`-only smoke could not see it.
 
-Fixed in `b720001c6`. ⚠️ The fix lives in the **SPA bundle**, which is baked into the image, so
+Fixed in `8cd350ab2`. ⚠️ The fix lives in the **SPA bundle**, which is baked into the image, so
 `v0.4.76-remote` still carries the old one and the check stays in `expected-failures.txt` — with
 the fix named and the condition for deleting the entry — until the next self-host publish.
 
 **One more harness fault**, found in the same run: `mesh-profile.spec.ts` demanded a *Tunnels* tile
 and a *Network* nav group unconditionally, which fails on `remote` for doing exactly the right
 thing. Three profiles mount no chat and the spec is meaningful on all of them; only the
-network-owned surfaces are conditional. Fixed in `b63bbd178`.
+network-owned surfaces are conditional. Fixed in `c3613debd`.
 
 ### 2026-09-07 (second half) — clean sweep on `v0.4.81`, both open items closed
 
@@ -390,11 +390,11 @@ resolve to the same digest and the `full` cell no longer needs a `hosted-*` stan
 was bumped to `0.4.81` first, so every image reports the number on its own tag — the `v0.4.76`
 family reported `0.4.79`, which was harmless but read as a discrepancy.
 
-**Finding 4 closed — and the first fix was only HALF of it.** `b720001c6` gated `AgentsSection`'s
+**Finding 4 closed — and the first fix was only HALF of it.** `8cd350ab2` gated `AgentsSection`'s
 loads, which killed the `overlay-node` fetch and *two of the three* `tunnel-client` ones. The third
 came from the org dashboard, which guarded it on **`showFleet`** — and `fleet` is a different
 module, so a `remote` profile (fleet yes, network no) fired it anyway. A per-caller gate leaks the
-moment one caller reaches for the wrong predicate; `2f83a3cfc` (#1466) moves the guard **into the
+moment one caller reaches for the wrong predicate; `05280ce91` (#1466) moves the guard **into the
 two stores**, where there is no predicate for a caller to get wrong. `has()` is fail-open until the
 server answers, so both guards are inert before first paint and in unit tests (1209 pass unchanged).
 

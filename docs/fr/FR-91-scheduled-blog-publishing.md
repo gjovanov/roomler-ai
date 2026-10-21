@@ -1,7 +1,7 @@
 # FR-91: Scheduled blog publishing — a post goes live without rolling `roomler2`
 
 **Issue:** [#1880](https://github.com/gjovanov/roomler-ai/issues/1880) · **Status:** proposed 2026-10-09
-— spec and claim · **Owner:** web / public site + deploy · **Anchors:** master `758836df0` ·
+— spec and claim · **Owner:** web / public site + deploy · **Anchors:** master `251abb731` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the blog, its gates, IndexNow),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-88](FR-88-promotion-attribution-and-site-video.md)
 (attribution, `INSTALL_PAGES`), [FR-73](FR-73-image-build-on-github.md) (the image pipeline)
@@ -28,7 +28,7 @@ This FR gives the blog its own publishing lane:
 What gets published, when, and how it is written is not engineering. A private publisher drives the
 lane, and it is out of scope here, as FR-39 requires for campaign material.
 
-## 2. Evidence (master `758836df0`, 2026-10-09)
+## 2. Evidence (master `251abb731`, 2026-10-09)
 
 | What | Where | Consequence |
 |---|---|---|

@@ -3,7 +3,7 @@
 **Status:** shipped in [FR-115](fr/FR-115-pricing-reshape.md) (#2557): the ladder and per-seat
 billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b since
 2026-10-21), and the meeting cap (P5). The relay allowance (P4) is built for DERP and switched
-off; its TURN half is not built yet. Claims were checked against the code at `cd2085ef6`.
+off; its TURN half is not built yet. Claims were checked against the code at `8ab970586`.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
 This page is the engineering view: where the numbers live, the one place they are compared,
