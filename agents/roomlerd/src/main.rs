@@ -4046,6 +4046,9 @@ async fn run_cmd(
     // flows verbs) and the signaling loop (publish the live egress + demux).
     let tunnel_hub =
         roomlerd::tunnel::client_mgr::TunnelClientHub::new(env!("CARGO_PKG_VERSION").to_string());
+    // FR-90 P3-7-3c — the primary enrollment's hub is where an agent
+    // session's own egress opens its flows (`net_socks`, `net_forward`).
+    tunnel_hub.set_primary();
     // P3b-3: shared RTT cache — filled by the prober task (below), read by
     // `peers()`. Clone the pinger for the prober; the original moves into
     // `DaemonState` for the `ping` verb.

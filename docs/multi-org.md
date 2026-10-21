@@ -666,7 +666,7 @@ no blank row can render).
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2106-2101`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2114-2109`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:

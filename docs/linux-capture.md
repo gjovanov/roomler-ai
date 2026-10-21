@@ -1264,7 +1264,7 @@ deadline. Both fall through to the rest of the cascade with the reason in the
 log. Unattended access on Linux is FR-36's DRM arm (or §5's mutter arm where
 there is no scanout) — never this one. ⚠️ Where the product says so: the spec,
 this page, the `portal_capture` description in the config surface
-(`crates/agent-core/src/config_surface.rs:1036`, which every `roomler config`
+(`crates/agent-core/src/config_surface.rs:1044`, which every `roomler config`
 reader sees) and the helper's own log line. Since FR-93 P2c the web viewer says
 it too: `rc:video-info` carries `capture_arm` and `attended`, and the viewer
 names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b).
@@ -1272,7 +1272,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`main.rs:6015`): `capture-smoke: portal=<status>
+line an operator can act on (`main.rs:6018`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2024,8 +2024,8 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 ## 7. Configuration
 
 Every key below is `restart required`; env wins over the config file. The
-keys are `crates/agent-core/src/config_surface.rs:1179-1210`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2834`).
+keys are `crates/agent-core/src/config_surface.rs:1187-1218`, and they reach
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2843`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

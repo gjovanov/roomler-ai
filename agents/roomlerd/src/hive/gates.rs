@@ -50,6 +50,9 @@ pub struct HiveConfig {
     pub archive: bool,
     /// P2c — the most it keeps as a replica, in MiB (`hive_store_quota_mib`).
     pub store_quota_mib: Option<u32>,
+    /// FR-90 P3-7-3c — whether a session here is offered its own egress
+    /// (`hive_net`): `net_socks` and `net_forward`, where the vault is too.
+    pub net: bool,
 }
 
 impl HiveConfig {
@@ -77,6 +80,7 @@ impl HiveConfig {
             replica: cfg.hive_replica,
             archive: cfg.hive_archive && cfg.hive_replica,
             store_quota_mib: cfg.hive_store_quota_mib,
+            net: cfg.hive_net,
         }
     }
 
@@ -97,6 +101,7 @@ impl HiveConfig {
             replica: false,
             archive: false,
             store_quota_mib: None,
+            net: false,
         }
     }
 }
@@ -150,6 +155,18 @@ mod tests {
                 .collect(),
             ..HiveConfig::closed()
         }
+    }
+
+    /// FR-90 P3-7-3c — `hive_net` is the owner's word, read into the snapshot
+    /// as it is, and closed in a daemon that read no config.
+    #[test]
+    fn hive_net_is_the_owners_word() {
+        let mut agent = crate::config::test_fixture();
+        agent.hive_net = true;
+        assert!(HiveConfig::from_agent(&agent).net);
+        agent.hive_net = false;
+        assert!(!HiveConfig::from_agent(&agent).net);
+        assert!(!HiveConfig::closed().net);
     }
 
     /// `hive_adopt` is the owner's word, on Windows too since FR-97 P4c

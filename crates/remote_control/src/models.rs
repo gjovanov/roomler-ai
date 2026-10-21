@@ -9083,6 +9083,10 @@ mod tests {
             // its leases: the device's own word about itself, as
             // `ssh_activity_log` is.
             "vault_activity_log",
+            // FR-90 P3-7-3c — whether a session here may reach a network
+            // beyond this device: a server that could set it could open
+            // that path from every device it runs sessions on.
+            "hive_net",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

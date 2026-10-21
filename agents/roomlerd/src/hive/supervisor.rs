@@ -1446,6 +1446,19 @@ pub fn on_connected(tx: mpsc::Sender<ClientMsg>) {
 }
 
 impl Supervisor {
+    /// FR-90 P3-7-3c — the hub a session's own egress opens its flows on:
+    /// where the vault is offered and the device's owner turned `hive_net`
+    /// on, once the daemon built its primary hub. None otherwise, and then
+    /// `net_socks` and `net_forward` are not offered.
+    #[cfg(feature = "vault")]
+    fn net_hub(&self, vault: bool) -> Option<crate::tunnel::client_mgr::TunnelClientHub> {
+        if vault && self.cfg.net {
+            crate::tunnel::client_mgr::primary()
+        } else {
+            None
+        }
+    }
+
     fn new(
         cfg: HiveConfig,
         runtime: PathBuf,
@@ -3891,6 +3904,10 @@ impl Supervisor {
         // way a run stops being live here passes through this.
         #[cfg(feature = "vault")]
         crate::vault::drop_run(session, fence);
+        // FR-90 P3-7-3c — and so does every egress listener its tools opened,
+        // with every connection on it.
+        #[cfg(feature = "vault")]
+        super::net_tools::drop_run(session, fence);
     }
 
     /// P1d-2 — a session resumed after its daemon went down. A turn the
@@ -4207,12 +4224,20 @@ impl Supervisor {
         // P3-4b — the vault tools, where the primary connection takes leases:
         // offered by the toolbelt and allowed in the settings, together.
         let vault = toolbelt::daemon_vault();
-        let settings = write_settings(&self.runtime, &sid, vault.is_some()).map_err(|e| {
-            (
-                HiveRefusal::LaunchFailed,
-                format!("writing the session settings: {e}"),
-            )
-        })?;
+        // FR-90 P3-7-3c — and a session's own egress, where the owner offers it.
+        #[cfg(feature = "vault")]
+        let net = self.net_hub(vault.is_some());
+        #[cfg(feature = "vault")]
+        let net_tools = net.is_some();
+        #[cfg(not(feature = "vault"))]
+        let net_tools = false;
+        let settings =
+            write_settings(&self.runtime, &sid, vault.is_some(), net_tools).map_err(|e| {
+                (
+                    HiveRefusal::LaunchFailed,
+                    format!("writing the session settings: {e}"),
+                )
+            })?;
         // P1a — the toolbelt, whose `approve` is the session's permission
         // tool: every tool call that needs one waits for a driver. Its relay
         // is this binary, started by the harness AS THE SESSION'S ACCOUNT:
@@ -4250,6 +4275,8 @@ impl Supervisor {
                 session_dir: dir.clone(),
                 owner,
             }),
+            #[cfg(feature = "vault")]
+            net,
         };
         let toolbelt = toolbelt::open(&dir, owner, uid, run, approvals, self.approval_timing)
             .map_err(|e| {
@@ -4436,7 +4463,14 @@ impl Supervisor {
             .map_err(|e| failed("the session's runtime directory", e))?;
         // P3-4b — offered and allowed together, as on Unix.
         let vault = toolbelt::daemon_vault();
-        let settings = write_settings(&self.runtime, &sid, vault.is_some())
+        // FR-90 P3-7-3c — and a session's own egress, as on Unix.
+        #[cfg(feature = "vault")]
+        let net = self.net_hub(vault.is_some());
+        #[cfg(feature = "vault")]
+        let net_tools = net.is_some();
+        #[cfg(not(feature = "vault"))]
+        let net_tools = false;
+        let settings = write_settings(&self.runtime, &sid, vault.is_some(), net_tools)
             .map_err(|e| failed("writing the session settings", e))?;
         let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
         let run = toolbelt::Run {
@@ -4447,6 +4481,8 @@ impl Supervisor {
             // sandbox for one. The vault refuses `exec` first (AC13).
             #[cfg(feature = "vault")]
             exec: None,
+            #[cfg(feature = "vault")]
+            net,
         };
         let toolbelt = toolbelt::open(peer, run, approvals, self.approval_timing)
             .map_err(|e| failed("opening the session's toolbelt", e))?;
@@ -4605,7 +4641,12 @@ fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
 ///
 /// On Windows both directories are made first, each with its DACL
 /// ([`session_dir`]), and the file takes the session directory's.
-fn write_settings(runtime: &Path, sid: &str, vault_tools: bool) -> Result<PathBuf, String> {
+fn write_settings(
+    runtime: &Path,
+    sid: &str,
+    vault_tools: bool,
+    net_tools: bool,
+) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     #[cfg(unix)]
     for d in [runtime, dir.as_path()] {
@@ -4648,8 +4689,8 @@ fn write_settings(runtime: &Path, sid: &str, vault_tools: bool) -> Result<PathBu
         // (P3-4c-3) neither does asking a lease ahead, which hands nothing.
         allow_tools: vault_allow_tools(vault_tools),
         // P3-4c — and each of its uses asks one, whatever a repository's
-        // own settings allow.
-        ask_tools: vault_use_tools(vault_tools),
+        // own settings allow; so does each egress listener (P3-7-3c).
+        ask_tools: vault_use_tools(vault_tools, net_tools),
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
@@ -4672,13 +4713,20 @@ fn vault_allow_tools(vault_tools: bool) -> Vec<String> {
 
 /// FR-90 P3-4c — the tools a session's settings ask a person for on every
 /// call: the vault's uses, wherever the vault tools are offered.
-fn vault_use_tools(vault_tools: bool) -> Vec<String> {
+///
+/// FR-90 P3-7-3c — and a session's own egress, wherever it is offered: each
+/// call opens a listener the session reaches a network through.
+fn vault_use_tools(vault_tools: bool, net_tools: bool) -> Vec<String> {
     #[cfg(feature = "vault")]
     if vault_tools {
-        return toolbelt::VAULT_USE_TOOLS.map(String::from).to_vec();
+        let mut ask: Vec<String> = toolbelt::VAULT_USE_TOOLS.map(String::from).to_vec();
+        if net_tools {
+            ask.extend(toolbelt::NET_TOOLS.map(String::from));
+        }
+        return ask;
     }
     #[cfg(not(feature = "vault"))]
-    let _ = vault_tools;
+    let _ = (vault_tools, net_tools);
     Vec::new()
 }
 
@@ -6296,6 +6344,7 @@ done
             replica: false,
             archive: false,
             store_quota_mib: None,
+            net: false,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -7561,7 +7610,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "offered", true).unwrap();
+        write_settings(&runtime, "offered", true, false).unwrap();
         let offered = read("offered");
         #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
         let mut allowed: Vec<&str> = toolbelt::VAULT_TOOLS.to_vec();
@@ -7591,7 +7640,7 @@ done
                 "{offered}"
             );
         }
-        write_settings(&runtime, "not-offered", false).unwrap();
+        write_settings(&runtime, "not-offered", false, false).unwrap();
         let doc = read("not-offered");
         assert!(
             doc["permissions"].get("allow").is_none(),
@@ -7605,6 +7654,54 @@ done
             !doc["permissions"]["deny"].to_string().contains("secrets"),
             "no secrets directory to deny: {doc}"
         );
+    }
+
+    /// FR-90 P3-7-3c — a session's own egress is ASKED for on every call,
+    /// where it is offered, beside the vault's uses; never allowed outright,
+    /// and absent where it is not offered.
+    #[cfg(feature = "vault")]
+    #[test]
+    fn the_settings_ask_for_the_net_tools_where_they_are_offered() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let read = |sid: &str| -> serde_json::Value {
+            let path = runtime.join(sid).join("settings.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        write_settings(&runtime, "net", true, true).unwrap();
+        let doc = read("net");
+        let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
+        asked.extend(toolbelt::NET_TOOLS);
+        assert_eq!(doc["permissions"]["ask"], serde_json::json!(asked), "{doc}");
+        for tool in toolbelt::NET_TOOLS {
+            assert!(
+                !doc["permissions"]["allow"].to_string().contains(tool),
+                "{tool} is never allowed without a person: {doc}"
+            );
+        }
+        write_settings(&runtime, "no-net", true, false).unwrap();
+        let doc = read("no-net");
+        assert!(
+            !doc["permissions"]["ask"].to_string().contains("net_"),
+            "not offered, not named: {doc}"
+        );
+    }
+
+    /// FR-90 P3-7-3c — a session's own egress opens on the daemon's primary
+    /// hub, and only where the device's owner turned `hive_net` on and the
+    /// vault is offered.
+    #[cfg(feature = "vault")]
+    #[tokio::test]
+    async fn the_net_hub_is_the_owners_and_the_vaults_to_offer() {
+        crate::tunnel::client_mgr::TunnelClientHub::new("test".into()).set_primary();
+        let off = rig(true, 1);
+        assert!(off.sup.net_hub(true).is_none(), "hive_net off");
+        let on = rig_with(true, 1, |c| c.net = true, |s| s);
+        assert!(
+            on.sup.net_hub(true).is_some(),
+            "hive_net on, the vault offered"
+        );
+        assert!(on.sup.net_hub(false).is_none(), "the vault not offered");
     }
 
     /// P3-4c-2 — the daemon's start removes every secrets directory an
