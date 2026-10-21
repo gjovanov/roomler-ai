@@ -258,6 +258,11 @@ mod token_renewal_tests;
 mod touch_preset_tests;
 #[cfg(test)]
 mod transfer_activity_tests;
+/// FR-90 P3-7-2a — a session's egress, the network module's half: a grant
+/// bound at `rc:tunnel.open` only where it holds, its flows held to it and
+/// decided for the session, never its device.
+#[cfg(test)]
+mod tunnel_grant_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the
