@@ -1681,6 +1681,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
     },
     KeyMeta {
+        key: "fps_high",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-119 - offer a viewer that asks a frame rate above 60 (120 or 144): advertise fps-high, and grant a higher rate only on a direct path, on a rate class this host has proven or as a trial, and where the pipe covers it. Built-in default: off. Env: ROOMLERD_FPS_HIGH. Restart required.",
+    },
+    KeyMeta {
         key: "fps_deny",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2100,6 +2108,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "relay_probe" => cfg.relay_probe.map(fmt_bool),
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
+        "fps_high" => cfg.fps_high.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "fps_deny" => cfg.fps_deny.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
@@ -2715,6 +2724,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "relay_probe" => cfg.relay_probe = parse_tribool(value)?,
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
+        "fps_high" => cfg.fps_high = parse_tribool(value)?,
         "vaapi_device" => {
             cfg.vaapi_device = value
                 .map(str::trim)
@@ -4945,6 +4955,26 @@ mod tests {
         );
         apply(&mut cfg, "caps_cache", None).unwrap();
         assert_eq!(cfg.caps_cache, None);
+    }
+
+    /// FR-119 — `fps_high` is a tribool that reaches the daemon as
+    /// `ROOMLERD_FPS_HIGH`, and unset publishes nothing (off).
+    #[test]
+    fn fps_high_is_a_tribool_that_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "fps_high").unwrap().kind, "tribool");
+        let bridged = |cfg: &crate::config::AgentConfig| {
+            crate::config::env_bridge_bools(cfg)
+                .iter()
+                .find(|(s, _)| *s == "FPS_HIGH")
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(bridged(&cfg), Some(None), "unset: bridged as nothing");
+        apply(&mut cfg, "fps_high", Some("true")).unwrap();
+        assert_eq!(cfg.fps_high, Some(true));
+        assert_eq!(bridged(&cfg), Some(Some(true)));
+        apply(&mut cfg, "fps_high", None).unwrap();
+        assert_eq!(cfg.fps_high, None);
     }
 
     /// The chroma column keys ride the numeric bridge like the codec factors.
