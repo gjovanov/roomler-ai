@@ -28,11 +28,11 @@ use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::{enroll_agent, wait_agent_online};
 
-type AgentWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) type AgentWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// The caller's session key. A throwaway: its private half was deleted the
 /// moment it was generated, and nothing in these tests ever dials.
-const SESSION_KEY: &str =
+pub(crate) const SESSION_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHTipQcil2m8O1ZIOjcIA7lWXSa5hiqg4doutBYcFZ2F fr83-test";
 
 /// What a current `ssh-server` build advertises…
@@ -47,12 +47,12 @@ const HOLD: Duration = Duration::from_millis(1500);
 
 /// A device on the mesh with a raw control socket, SSH allowed by org and
 /// policy, and everything else left to the test.
-struct Device {
-    agent_id: String,
-    ws: AgentWs,
+pub(crate) struct Device {
+    pub(crate) agent_id: String,
+    pub(crate) ws: AgentWs,
 }
 
-async fn enable_org_ssh(app: &TestApp, seeded: &SeededTenant) {
+pub(crate) async fn enable_org_ssh(app: &TestApp, seeded: &SeededTenant) {
     let resp = app
         .auth_put(
             &format!("/api/tenant/{}/ssh-settings", seeded.tenant_id),
@@ -71,7 +71,7 @@ async fn enable_org_ssh(app: &TestApp, seeded: &SeededTenant) {
 
 /// Enrol, give the device an overlay address, open its policy, connect a raw
 /// socket advertising `rpc`, and wait until the server holds it.
-async fn device(
+pub(crate) async fn device(
     app: &TestApp,
     seeded: &SeededTenant,
     machine: &str,
@@ -197,7 +197,7 @@ async fn request_session(app: &TestApp, seeded: &SeededTenant, agent_id: &str) -
 }
 
 /// Read frames until the server pushes a grant; returns its id.
-async fn next_grant(ws: &mut AgentWs) -> String {
+pub(crate) async fn next_grant(ws: &mut AgentWs) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -215,7 +215,7 @@ async fn next_grant(ws: &mut AgentWs) -> String {
     }
 }
 
-async fn send_ack(ws: &mut AgentWs, grant_id: &str, refused: Option<&str>) {
+pub(crate) async fn send_ack(ws: &mut AgentWs, grant_id: &str, refused: Option<&str>) {
     let mut ack = json!({ "t": "rc:ssh.grant_ack", "grant_id": grant_id });
     if let Some(r) = refused {
         ack["refused"] = json!(r);

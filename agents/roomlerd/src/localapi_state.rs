@@ -1827,6 +1827,8 @@ impl LocalApiState for DaemonState {
                 target: node.to_string(),
                 public_key: public_key.to_string(),
                 session_secs,
+                // A person's request: no agent session's ticket (FR-90 P3-8).
+                ssh_ticket: None,
             })
             .await
             .is_err()
