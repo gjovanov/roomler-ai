@@ -15,6 +15,7 @@
 //! | [`ssh_agent`] | one SSH agent connection: the secret's key, signing a sign-in to one of the secret's hosts and nothing else (P3-5f-1) |
 //! | [`pg_mint`] | a Postgres user minted for one lease by a dynamic secret's issuer, and taken back (P3-6b-2a) |
 //! | [`mysql_mint`] | a MySQL user minted for one lease, ended by an event, and taken back (P3-6d-1a) |
+//! | [`k8s_mint`] | a Kubernetes service account's token minted for one lease, bound to a Secret its revocation deletes (P3-6f-1) |
 //! | [`minter`] | the minter a dynamic secret's provider names, which the lease client calls (P3-6d-1b) |
 //!
 //! P3-5b-1 builds these, P3-5c-1 the MongoDB engine, P3-5d-1 the HTTP one
@@ -25,6 +26,11 @@
 // P3-6d-1 — a dynamic secret's bundle, as every minter opens it.
 pub(crate) mod bundle;
 pub(crate) mod http;
+// P3-6f-1 — a Kubernetes service account's token minted per lease, bound to a
+// Secret its revocation deletes. Its caller is P3-6f-2's; until then only its
+// tests reach it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod k8s_mint;
 // P3-6d-1b — the minter by provider, the lease client's one door to them.
 pub(crate) mod minter;
 pub(crate) mod mongo;
@@ -91,4 +97,46 @@ pub(crate) fn upstream_of(raw: &str) -> Result<(String, u16), String> {
         }
     };
     Ok((host.to_string(), port))
+}
+
+/// P3-5d-2 — an origin, as an audience names an HTTP upstream:
+/// `https://<host>[:<port>]`, TLS always, with no path, query, user or
+/// fragment, and the port written only where it is not 443, so an origin
+/// has one spelling. A database's audience is `host:port`, a different
+/// string, so a secret named for one never opens the other. Answers the
+/// host, unbracketed, and the port.
+///
+/// P3-6f-1 moved it here from `hive::vault_connect`, as P3-6b-2b moved
+/// [`upstream_of`]: a Kubernetes issuer's minter reads its audience with it,
+/// wherever the `vault` feature is built.
+pub(crate) fn origin_of(raw: &str) -> Result<(String, u16), String> {
+    use roomler_ai_remote_control::vault::lease_limits::MAX_AUDIENCE_LEN;
+    let bad = || {
+        format!(
+            "upstream must be an origin, https://host or https://host:port, as the secret's \
+             audiences name it (such as https://github.com): got {raw:?}"
+        )
+    };
+    if raw.len() > MAX_AUDIENCE_LEN {
+        return Err(bad());
+    }
+    let authority = raw.strip_prefix("https://").ok_or_else(bad)?;
+    if authority.contains(['/', '?', '#', '@']) {
+        return Err(bad());
+    }
+    // A name with no colon, or a bracketed IPv6 address, names no port.
+    let ported = authority.contains(':') && !authority.ends_with(']');
+    let (host, port) = if ported {
+        upstream_of(authority)
+    } else {
+        upstream_of(&format!("{authority}:443"))
+    }
+    .map_err(|_| bad())?;
+    if ported && port == 443 {
+        let plain = authority.strip_suffix(":443").unwrap_or(authority);
+        return Err(format!(
+            "upstream names port 443, which an origin leaves out: write https://{plain}"
+        ));
+    }
+    Ok((host, port))
 }

@@ -53,6 +53,14 @@ impl Opened {
             .ok_or_else(|| format!("the issuer has no {name}"))
     }
 
+    /// P3-6f-1 — the one audience the bundle mints toward, as the lease was
+    /// decided for it: a Kubernetes issuer reads it as an origin. Its caller,
+    /// `k8s_mint`, is reached by its tests alone until P3-6f-2.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn audience(&self) -> &str {
+        &self.audience
+    }
+
     /// A field that may be absent: `None` when it is, or is empty.
     pub(crate) fn optional(&self, name: &str) -> Option<&String> {
         self.fields.0.get(name).filter(|v| !v.is_empty())
