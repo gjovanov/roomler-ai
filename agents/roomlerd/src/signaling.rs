@@ -6312,6 +6312,14 @@ async fn handle_server_msg(
                 debug!(%grant_id, "rc:vault.net.granted ignored — this build asks for none");
             }
         }
+        // FR-90 P3-8-1a — the vault's ticket for a session's command on
+        // another device, the answer to `rc:vault.ssh`. No build asks for one
+        // yet (P3-8-2b's is the first), so it is dropped, and never logged
+        // with the frame as the catch-all below would: `ticket` is a
+        // credential until its end.
+        ServerMsg::VaultSshGranted { ticket_id, .. } => {
+            debug!(%ticket_id, "rc:vault.ssh.granted ignored — this build asks for none");
+        }
         // FR-52 P3c — an outsider's login, relayed by the server. Answered in
         // a task, not inline: the live config read waits on the config lock,
         // which `rc password set` holds across an Argon2 derivation, and the

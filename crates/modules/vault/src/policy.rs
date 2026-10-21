@@ -56,6 +56,7 @@ pub const ACTIONS: &[&str] = &[
     ACTION_LIST,
     ACTION_NET_SOCKS,
     ACTION_NET_FORWARD,
+    ACTION_SSH_RUN,
 ];
 pub const ACTION_ASSUME: &str = "role:assume";
 pub const ACTION_USE: &str = "secret:use";
@@ -67,6 +68,10 @@ pub const ACTION_LIST: &str = "secret:list";
 pub const ACTION_NET_SOCKS: &str = "net:socks";
 /// P3-7 — a session opening a forward to one destination through a device.
 pub const ACTION_NET_FORWARD: &str = "net:forward";
+/// P3-8 — a session running one command on another device over Roomler SSH
+/// (`docs/fr/FR-90-hive-agent-sessions.md` §3e, "P3-8, `ssh_run`, as
+/// designed").
+pub const ACTION_SSH_RUN: &str = "ssh:run";
 
 /// The modes a session may ask a secret in (design §8.5). `raw` is not one:
 /// it is a person's `secret:read`, never a session's use.
@@ -499,6 +504,15 @@ pub enum Ask {
         port: u16,
         device: DeviceFacts,
     },
+    /// P3-8 — `ssh:run`: may `session`, on `device`, run one command on
+    /// `node` over Roomler SSH, as `account` (the account `node`'s SSH policy
+    /// maps, as an `SshAccountMode` word)?
+    SshRun {
+        session: SessionFacts,
+        node: NodeFacts,
+        account: String,
+        device: DeviceFacts,
+    },
 }
 
 fn uid(ty: &str, id: &str) -> Value {
@@ -603,6 +617,7 @@ impl Ask {
             Self::ListSecret { .. } => ACTION_LIST,
             Self::NetSocks { .. } => ACTION_NET_SOCKS,
             Self::NetForward { .. } => ACTION_NET_FORWARD,
+            Self::SshRun { .. } => ACTION_SSH_RUN,
         }
     }
 
@@ -705,6 +720,18 @@ impl Ask {
                 "port": i32::from(*port),
                 "device": device(d),
             },
+            Self::SshRun {
+                session,
+                node,
+                account,
+                device: d,
+            } => bson::doc! {
+                "action": ACTION_SSH_RUN,
+                "session": session_doc(session),
+                "node": node_doc(node),
+                "account": account,
+                "device": device(d),
+            },
         }
     }
 
@@ -797,6 +824,12 @@ impl Ask {
                 node: node(doc.get_document("node").ok()?)?,
                 host: doc.get_str("host").ok()?.to_string(),
                 port: u16::try_from(doc.get_i32("port").ok()?).ok()?,
+                device: device(doc.get_document("device").ok()?)?,
+            }),
+            ACTION_SSH_RUN => Some(Self::SshRun {
+                session: session(doc.get_document("session").ok()?)?,
+                node: node(doc.get_document("node").ok()?)?,
+                account: doc.get_str("account").ok()?.to_string(),
                 device: device(doc.get_document("device").ok()?)?,
             }),
             _ => None,
@@ -892,6 +925,22 @@ impl Ask {
                     node_uid,
                     entities,
                     json!({ "device": device.json(), "host": host, "port": port }),
+                )
+            }
+            Self::SshRun {
+                session,
+                node,
+                account,
+                device,
+            } => {
+                let (session_uid, mut entities) = session_entities(session);
+                let (node_uid, node_entity) = node.entity();
+                entities.push(node_entity);
+                (
+                    session_uid,
+                    node_uid,
+                    entities,
+                    json!({ "device": device.json(), "account": account }),
                 )
             }
         };
@@ -1848,6 +1897,108 @@ mod tests {
             ),
             r#"forbid (principal, action == Roomler::Action::"net:forward", resource) when { context.port == 22 };"#
                 .to_string(),
+        ] {
+            check_policy(&text, &names()).unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
+    }
+
+    fn ssh_run(role: Option<&str>, tags: &[&str], account: &str) -> Ask {
+        Ask::SshRun {
+            session: session(role),
+            node: node(tags),
+            account: account.into(),
+            device: device("linux", &[]),
+        }
+    }
+
+    const DEV_RUNS_ON_BUILD: &str = r#"permit (principal in Roomler::Role::"dev",
+        action == Roomler::Action::"ssh:run",
+        resource) when { resource.tags.contains("build") };"#;
+
+    /// P3-8 — a session's role is permitted a command on a node by the
+    /// node's tags, and nothing else follows: another node, another role, no
+    /// role, or egress through the same node; nor does egress imply a
+    /// command.
+    #[test]
+    fn a_role_may_run_a_command_on_the_nodes_a_policy_names() {
+        let set = set_with(&[DEV_RUNS_ON_BUILD]);
+        assert!(
+            decide(&set, &ssh_run(Some("dev"), &["Build"], "console_user")).allow,
+            "tags are lowercased"
+        );
+        for (ask, why) in [
+            (
+                ssh_run(Some("dev"), &["lab"], "console_user"),
+                "another node",
+            ),
+            (
+                ssh_run(Some("deployer"), &["build"], "console_user"),
+                "another role",
+            ),
+            (ssh_run(None, &["build"], "console_user"), "no role"),
+            (
+                net_socks(Some("dev"), &["build"]),
+                "a command is not a SOCKS listener",
+            ),
+        ] {
+            assert!(!decide(&set, &ask).allow, "{why}");
+        }
+        let socks = set_with(&[DEV_SOCKS_THROUGH_OFFICE]);
+        assert!(
+            !decide(&socks, &ssh_run(Some("dev"), &["office"], "console_user")).allow,
+            "egress through a node runs nothing on it"
+        );
+    }
+
+    /// P3-8 — the account the node maps is in the context, so a guardrail
+    /// can forbid a session the daemon's (SYSTEM or root) whatever permits
+    /// it: a `forbid` beats every `permit`.
+    #[test]
+    fn a_guardrail_may_forbid_a_session_the_daemons_account() {
+        let set = set_with(&[
+            DEV_RUNS_ON_BUILD,
+            r#"forbid (principal, action == Roomler::Action::"ssh:run", resource)
+                when { context.account == "daemon" };"#,
+        ]);
+        assert!(decide(&set, &ssh_run(Some("dev"), &["build"], "console_user")).allow);
+        assert!(decide(&set, &ssh_run(Some("dev"), &["build"], "named")).allow);
+        let as_daemon = decide(&set, &ssh_run(Some("dev"), &["build"], "daemon"));
+        assert!(!as_daemon.allow, "the daemon's account is forbidden");
+        assert_eq!(as_daemon.determining.len(), 1, "{as_daemon:?}");
+    }
+
+    /// P3-8 — an SSH request reads back from its record exactly, its account
+    /// included, and decides alike; a row without its account is unreadable.
+    #[test]
+    fn an_ssh_request_reads_back_from_its_record() {
+        let ask = ssh_run(Some("dev"), &["build"], "daemon");
+        let back = Ask::from_doc(&ask.to_doc()).expect("reads back");
+        assert_eq!(format!("{back:?}"), format!("{ask:?}"));
+        let set = set_with(&[DEV_RUNS_ON_BUILD]);
+        assert_eq!(decide(&set, &back), decide(&set, &ask));
+        let mut doc = ask.to_doc();
+        doc.remove("account");
+        assert!(Ask::from_doc(&doc).is_none());
+    }
+
+    /// P3-8 — `ssh:run` takes a Node, as `net:*` does: a policy naming a
+    /// Secret for it can never apply, and the guardrail on the daemon's
+    /// account is kept.
+    #[test]
+    fn an_ssh_policy_is_checked_as_a_net_one_is() {
+        let refused = check_policy(
+            r#"forbid (principal, action == Roomler::Action::"ssh:run", resource is Roomler::Secret);"#,
+            &names(),
+        )
+        .expect_err("a Secret where ssh:run takes a Node");
+        assert!(refused.contains("can never apply"), "{refused}");
+        for text in [
+            r#"forbid (principal, action == Roomler::Action::"ssh:run", resource) when { context.account == "daemon" };"#
+                .to_string(),
+            format!(
+                r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"ssh:run", resource == Roomler::Node::"{}");"#,
+                ObjectId::new().to_hex()
+            ),
         ] {
             check_policy(&text, &names()).unwrap_or_else(|e| panic!("{text}: {e}"));
         }

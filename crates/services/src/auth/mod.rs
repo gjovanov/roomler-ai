@@ -69,6 +69,12 @@ pub enum TokenType {
     /// accepts no other credential: it acts for a session, never for the
     /// device or a person.
     NetGrant,
+    /// FR-90 P3-8-1a — the vault's ticket for one agent session's command on
+    /// another device over Roomler SSH (`rc:vault.ssh`), which the network
+    /// module verifies at `rc:ssh.request` (P3-8-1b). Its own audience, so no
+    /// other gate accepts it and it accepts no other credential, a net grant
+    /// included: it acts for a session, never for the device or a person.
+    SshTicket,
 }
 
 /// Claims carried by a remote-control enrollment token (aud = enroll).
@@ -206,6 +212,55 @@ pub struct NetGrant<'a> {
     /// A forward's destination, its host canonical; `None` for SOCKS.
     pub dst: Option<(&'a str, u16)>,
     pub grant_id: ObjectId,
+    /// When it ends, in seconds since the epoch: at most
+    /// `lease_limits::MAX_TTL_SECS` from now.
+    pub exp: i64,
+}
+
+/// FR-90 P3-8-1a — claims carried by a session's SSH ticket (`ssh_ticket`).
+/// It names one session at one fence, running on one device, the one other
+/// device its command runs on, and the account that device's SSH policy
+/// mapped when the vault decided. It lives at most a lease's ceiling.
+///
+/// ⚠️ Never the device it runs on: a session already runs there, as its own
+/// account, and SSH would run it as whatever that device maps, the daemon's
+/// among them. No such ticket is signed, and none is believed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SshTicketClaims {
+    /// The session's id, hex.
+    pub sub: String,
+    pub tenant_id: String,
+    /// The session's fence when the vault decided.
+    pub fence: u64,
+    /// The person the session acts for, hex.
+    pub owner_user_id: String,
+    /// The device the session runs on, hex: the only one that may use it.
+    pub origin_agent_id: String,
+    /// The device the command runs on, hex: never the origin.
+    pub target_agent_id: String,
+    /// The account the target's SSH policy mapped when the vault decided, a
+    /// `roomler_ai_remote_control::models::SshAccountMode` word.
+    pub account: String,
+    /// The ticket's id, as the vault records its allow (`ticket:<jti>`).
+    pub jti: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub token_type: TokenType,
+}
+
+/// FR-90 P3-8-1a — what the vault tickets: every claim but the issuer, the
+/// audience and the start, which the auth service fills.
+#[derive(Debug, Clone, Copy)]
+pub struct SshTicket {
+    pub session_id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub fence: u64,
+    pub owner_user_id: ObjectId,
+    pub origin_agent_id: ObjectId,
+    pub target_agent_id: ObjectId,
+    pub account: roomler_ai_remote_control::models::SshAccountMode,
+    pub ticket_id: ObjectId,
     /// When it ends, in seconds since the epoch: at most
     /// `lease_limits::MAX_TTL_SECS` from now.
     pub exp: i64,
@@ -813,6 +868,82 @@ impl AuthService {
         net_grant_holds(&claims)?;
         Ok(claims)
     }
+
+    // ─── FR-90 P3-8-1a: a session's SSH ticket ────────────────────────
+
+    /// Sign the vault's ticket for a session's command on another device.
+    /// Refuses a ticket that does not hold together, before signing anything:
+    /// one naming the device it runs on as its target would let a session
+    /// run as whatever that device maps instead of as itself, and none ends
+    /// past the lease ceiling.
+    pub fn issue_ssh_ticket(&self, t: &SshTicket) -> Result<String, AuthError> {
+        let claims = SshTicketClaims {
+            sub: t.session_id.to_hex(),
+            tenant_id: t.tenant_id.to_hex(),
+            fence: t.fence,
+            owner_user_id: t.owner_user_id.to_hex(),
+            origin_agent_id: t.origin_agent_id.to_hex(),
+            target_agent_id: t.target_agent_id.to_hex(),
+            account: t.account.wire().to_string(),
+            jti: t.ticket_id.to_hex(),
+            iat: Utc::now().timestamp(),
+            exp: t.exp,
+            iss: self.jwt_settings.issuer.clone(),
+            token_type: TokenType::SshTicket,
+        };
+        ssh_ticket_holds(&claims)?;
+        encode(&self.header(), &claims, &self.signing.encoding)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+    }
+
+    /// Verify a session's SSH ticket. Refuses every other audience, a net
+    /// grant's included, and every other verifier refuses this one. Checked
+    /// as it was issued: its ids, its two devices, its account and its life.
+    ///
+    /// ⚠️ No leeway past `exp`, as for a net grant: a ticket's end is a
+    /// decision's.
+    pub fn verify_ssh_ticket(&self, token: &str) -> Result<SshTicketClaims, AuthError> {
+        let mut validation = self.validation();
+        validation.leeway = 0;
+        let claims = self.decode_any::<SshTicketClaims>(token, &validation)?;
+        if claims.token_type != TokenType::SshTicket {
+            return Err(AuthError::InvalidToken("Not an SSH ticket".to_string()));
+        }
+        ssh_ticket_holds(&claims)?;
+        Ok(claims)
+    }
+}
+
+/// FR-90 P3-8-1a — whether a ticket's claims hold together, at its signing
+/// and at every check: every id an id; a target that is not the device it
+/// runs on; an account this build names; and a life no longer than a lease's
+/// ceiling.
+fn ssh_ticket_holds(c: &SshTicketClaims) -> Result<(), AuthError> {
+    use roomler_ai_remote_control::{models::SshAccountMode, vault::lease_limits};
+    let bad = |why: &str| Err(AuthError::InvalidToken(format!("ssh ticket: {why}")));
+    let id = |hex: &str| ObjectId::parse_str(hex).ok();
+    let ids = [
+        &c.sub,
+        &c.tenant_id,
+        &c.owner_user_id,
+        &c.origin_agent_id,
+        &c.target_agent_id,
+        &c.jti,
+    ];
+    if ids.iter().any(|hex| id(hex).is_none()) {
+        return bad("an id that is not one");
+    }
+    // Compared as ids, so no two spellings of one device read as two.
+    if id(&c.origin_agent_id) == id(&c.target_agent_id) {
+        return bad("a target that is the device it runs on");
+    }
+    if SshAccountMode::from_wire(&c.account).is_none() {
+        return bad("an account this build cannot name");
+    }
+    if c.exp <= c.iat || c.exp - c.iat > i64::from(lease_limits::MAX_TTL_SECS) {
+        return bad("a life past the lease ceiling");
+    }
+    Ok(())
 }
 
 /// FR-90 P3-7-1b — whether a grant's claims hold together, at its signing
@@ -1742,6 +1873,195 @@ mod tests {
         );
         assert!(matches!(
             s.verify_net_grant(&t),
+            Err(AuthError::TokenExpired)
+        ));
+    }
+
+    // ─── FR-90 P3-8-1a: a session's SSH ticket ────────────────────────
+
+    use roomler_ai_remote_control::models::SshAccountMode;
+
+    fn a_ticket(account: SshAccountMode, exp: i64) -> SshTicket {
+        SshTicket {
+            session_id: ObjectId::new(),
+            tenant_id: ObjectId::new(),
+            fence: 7,
+            owner_user_id: ObjectId::new(),
+            origin_agent_id: ObjectId::new(),
+            target_agent_id: ObjectId::new(),
+            account,
+            ticket_id: ObjectId::new(),
+            exp,
+        }
+    }
+
+    /// A ticket names what was decided, and only its own verifier takes it:
+    /// no other gate accepts it, a net grant's included, and it accepts no
+    /// other credential.
+    #[test]
+    fn ssh_ticket_roundtrip_and_audiences() {
+        let s = svc();
+        let t = a_ticket(SshAccountMode::ConsoleUser, in_secs(120));
+        let token = s.issue_ssh_ticket(&t).unwrap();
+        let c = s.verify_ssh_ticket(&token).unwrap();
+        assert_eq!(
+            (c.sub.as_str(), c.tenant_id.as_str(), c.fence),
+            (
+                t.session_id.to_hex().as_str(),
+                t.tenant_id.to_hex().as_str(),
+                7
+            )
+        );
+        assert_eq!(c.owner_user_id, t.owner_user_id.to_hex());
+        assert_eq!(c.origin_agent_id, t.origin_agent_id.to_hex());
+        assert_eq!(c.target_agent_id, t.target_agent_id.to_hex());
+        assert_eq!(c.account, "console_user");
+        assert_eq!(c.jti, t.ticket_id.to_hex());
+        assert_eq!((c.exp, c.token_type.clone()), (t.exp, TokenType::SshTicket));
+
+        // No other gate accepts a ticket, a net grant's verifier among them.
+        assert!(s.verify_net_grant(&token).is_err());
+        assert!(s.verify_token(&token).is_err());
+        assert!(s.verify_access_token(&token).is_err());
+        assert!(s.verify_refresh_token(&token).is_err());
+        assert!(s.verify_enrollment_token(&token).is_err());
+        assert!(s.verify_enrollment_token_any(&token).is_err());
+        assert!(s.verify_agent_token(&token).is_err());
+        assert!(s.verify_agent_token_for_renewal(&token).is_err());
+        assert!(s.verify_agent_service_token(&token).is_err());
+        assert!(s.verify_tunnel_enrollment_token(&token).is_err());
+        assert!(s.verify_tunnel_client_token(&token).is_err());
+        assert!(s.verify_tunnel_client_token_for_renewal(&token).is_err());
+
+        // And a ticket is no other credential, a net grant least of all.
+        let (agent, tenant) = (ObjectId::new(), ObjectId::new());
+        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
+        let others = [
+            pair.access_token,
+            pair.refresh_token,
+            s.issue_enrollment_token(ObjectId::new(), tenant, 600)
+                .unwrap()
+                .0,
+            s.issue_ephemeral_enroll_key_token(ObjectId::new(), tenant, "j", in_secs(600))
+                .unwrap(),
+            s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap(),
+            s.issue_agent_service_token(agent, tenant, "anchor-1")
+                .unwrap(),
+            s.issue_tunnel_enrollment_token(ObjectId::new(), tenant, 600)
+                .unwrap()
+                .0,
+            s.issue_tunnel_client_token(ObjectId::new(), tenant, ObjectId::new(), 0, Some(60))
+                .unwrap(),
+            s.issue_net_grant(&a_grant(NetKind::Socks, None, in_secs(60)))
+                .unwrap(),
+        ];
+        for t in &others {
+            assert!(s.verify_ssh_ticket(t).is_err());
+        }
+    }
+
+    /// The issuer refuses a ticket that does not hold together, so no caller's
+    /// slip can sign one for the device the session runs on.
+    #[test]
+    fn an_ssh_ticket_that_does_not_hold_together_is_never_signed() {
+        let s = svc();
+        let mut own = a_ticket(SshAccountMode::Daemon, in_secs(60));
+        own.target_agent_id = own.origin_agent_id;
+        for t in [
+            own,
+            // Past the ceiling by more than a second's tick between the two
+            // clocks reads, so never at it by chance.
+            a_ticket(SshAccountMode::Daemon, in_secs(905)),
+            a_ticket(SshAccountMode::Daemon, in_secs(0)),
+            a_ticket(SshAccountMode::Daemon, in_secs(-10)),
+        ] {
+            assert!(s.issue_ssh_ticket(&t).is_err(), "{t:?}");
+        }
+        for account in SshAccountMode::ALL {
+            assert!(
+                s.issue_ssh_ticket(&a_ticket(account, in_secs(900))).is_ok(),
+                "the ceiling itself, as {account:?}"
+            );
+        }
+    }
+
+    /// A token signed with the server's own key but naming a ticket that does
+    /// not hold together is refused at the check too, whoever signed it.
+    #[test]
+    fn an_ssh_ticket_signed_wider_than_it_holds_is_refused() {
+        let s = svc();
+        let now = Utc::now().timestamp();
+        let good = SshTicketClaims {
+            sub: ObjectId::new().to_hex(),
+            tenant_id: ObjectId::new().to_hex(),
+            fence: 1,
+            owner_user_id: ObjectId::new().to_hex(),
+            origin_agent_id: ObjectId::new().to_hex(),
+            target_agent_id: ObjectId::new().to_hex(),
+            account: "console_user".into(),
+            jti: ObjectId::new().to_hex(),
+            iat: now,
+            exp: now + 60,
+            iss: "roomler-ai-test".into(),
+            token_type: TokenType::SshTicket,
+        };
+        let signed = |c: &SshTicketClaims| encode(&s.header(), c, &s.signing.encoding).unwrap();
+        assert!(s.verify_ssh_ticket(&signed(&good)).is_ok());
+        let mut wider = Vec::new();
+        let mut c = good.clone();
+        c.target_agent_id = c.origin_agent_id.clone();
+        wider.push(("the device it runs on", c));
+        let mut c = good.clone();
+        c.target_agent_id = c.origin_agent_id.to_uppercase();
+        wider.push(("the device it runs on, spelled another way", c));
+        let mut c = good.clone();
+        c.target_agent_id = "any-device".into();
+        wider.push(("a target that is no id", c));
+        let mut c = good.clone();
+        c.account = "root".into();
+        wider.push(("an account this build cannot name", c));
+        let mut c = good.clone();
+        c.account = "Daemon".into();
+        wider.push(("an account not in its one spelling", c));
+        let mut c = good.clone();
+        c.exp = now + 901;
+        wider.push(("a life past the ceiling", c));
+        // A ticket's every claim, under another audience: no ticket at all.
+        let mut c = good.clone();
+        c.token_type = TokenType::NetGrant;
+        wider.push(("a net grant's audience", c));
+        for (why, c) in &wider {
+            assert!(s.verify_ssh_ticket(&signed(c)).is_err(), "{why}");
+        }
+    }
+
+    /// A ticket ends at its end: none of the leeway every other verifier
+    /// gives, which would let a ticket decided for 900 s ask at 959.
+    #[test]
+    fn an_ssh_ticket_has_no_leeway_past_its_end() {
+        let s = svc();
+        let now = Utc::now().timestamp();
+        let lapsed = SshTicketClaims {
+            sub: ObjectId::new().to_hex(),
+            tenant_id: ObjectId::new().to_hex(),
+            fence: 1,
+            owner_user_id: ObjectId::new().to_hex(),
+            origin_agent_id: ObjectId::new().to_hex(),
+            target_agent_id: ObjectId::new().to_hex(),
+            account: "daemon".into(),
+            jti: ObjectId::new().to_hex(),
+            iat: now - 65,
+            exp: now - 5,
+            iss: "roomler-ai-test".into(),
+            token_type: TokenType::SshTicket,
+        };
+        let t = encode(&s.header(), &lapsed, &s.signing.encoding).unwrap();
+        assert!(
+            s.decode_any::<SshTicketClaims>(&t, &s.validation()).is_ok(),
+            "the default validation's minute of leeway would take it"
+        );
+        assert!(matches!(
+            s.verify_ssh_ticket(&t),
             Err(AuthError::TokenExpired)
         ));
     }
