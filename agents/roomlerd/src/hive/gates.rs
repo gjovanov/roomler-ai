@@ -53,6 +53,9 @@ pub struct HiveConfig {
     /// FR-90 P3-7-3c — whether a session here is offered its own egress
     /// (`hive_net`): `net_socks` and `net_forward`, where the vault is too.
     pub net: bool,
+    /// FR-90 P3-8-2b-2 — whether a session here is offered `ssh_run`
+    /// (`hive_ssh`): one command on another device, where the vault is too.
+    pub ssh: bool,
 }
 
 impl HiveConfig {
@@ -81,6 +84,7 @@ impl HiveConfig {
             archive: cfg.hive_archive && cfg.hive_replica,
             store_quota_mib: cfg.hive_store_quota_mib,
             net: cfg.hive_net,
+            ssh: cfg.hive_ssh,
         }
     }
 
@@ -102,6 +106,7 @@ impl HiveConfig {
             archive: false,
             store_quota_mib: None,
             net: false,
+            ssh: false,
         }
     }
 }
@@ -167,6 +172,20 @@ mod tests {
         agent.hive_net = false;
         assert!(!HiveConfig::from_agent(&agent).net);
         assert!(!HiveConfig::closed().net);
+    }
+
+    /// FR-90 P3-8-2b-2 — so is `hive_ssh`, and neither key opens the other.
+    #[test]
+    fn hive_ssh_is_the_owners_word() {
+        let mut agent = crate::config::test_fixture();
+        agent.hive_ssh = true;
+        let hive = HiveConfig::from_agent(&agent);
+        assert!(hive.ssh);
+        assert!(!hive.net, "hive_ssh is not egress");
+        agent.hive_ssh = false;
+        agent.hive_net = true;
+        assert!(!HiveConfig::from_agent(&agent).ssh, "nor egress SSH");
+        assert!(!HiveConfig::closed().ssh);
     }
 
     /// `hive_adopt` is the owner's word, on Windows too since FR-97 P4c

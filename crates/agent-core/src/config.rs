@@ -594,6 +594,15 @@ pub struct AgentConfig {
     /// a session here reaches a network beyond this device is the owner's call.
     #[serde(default)]
     pub hive_net: bool,
+    /// FR-90 P3-8-2b-2 — offer the agent sessions on this device `ssh_run`:
+    /// one command on another device of the organization over Roomler SSH,
+    /// as the account that device's SSH policy maps (which may be SYSTEM or
+    /// root there), its key minted by this daemon for the one call. Only
+    /// beside `vault_enabled`: the vault decides each call, and a person
+    /// approves it. Default OFF, and never pushable: whether a session here
+    /// reaches into another device is the owner's call.
+    #[serde(default)]
+    pub hive_ssh: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2769,6 +2778,7 @@ pub fn test_fixture() -> AgentConfig {
         vault_enabled: false,
         vault_activity_log: false,
         hive_net: false,
+        hive_ssh: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

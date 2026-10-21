@@ -522,6 +522,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-90 - offer the agent sessions on this device their own egress (net_socks, net_forward): a loopback listener per call, served to the session's account alone, its flows decided by the organization's vault and tunnel policies. Only with vault_enabled. Never settable by the server. Default: OFF.",
     },
     KeyMeta {
+        key: "hive_ssh",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - offer the agent sessions on this device ssh_run: one command on another device of the organization over Roomler SSH, as the account that device's SSH policy maps (it may be SYSTEM or root there), each call decided by the organization's vault and approved by a person. Only with vault_enabled. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
         tier: Tier::Essential,
@@ -1960,6 +1968,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "vault_enabled" => Some(fmt_bool(cfg.vault_enabled)),
         "vault_activity_log" => Some(fmt_bool(cfg.vault_activity_log)),
         "hive_net" => Some(fmt_bool(cfg.hive_net)),
+        "hive_ssh" => Some(fmt_bool(cfg.hive_ssh)),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2315,6 +2324,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "vault_enabled" => cfg.vault_enabled = parse_bool_or(value, false)?,
         "vault_activity_log" => cfg.vault_activity_log = parse_bool_or(value, false)?,
         "hive_net" => cfg.hive_net = parse_bool_or(value, false)?,
+        "hive_ssh" => cfg.hive_ssh = parse_bool_or(value, false)?,
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -4641,6 +4651,25 @@ mod tests {
         apply(&mut cfg, "hive_net", None).unwrap();
         assert!(!cfg.hive_net, "cleared is off");
         assert!(apply(&mut cfg, "hive_net", Some("on-ish")).is_err());
+    }
+
+    /// FR-90 P3-8-2b-2 — so is whether a session here may run a command on
+    /// another device: off until the owner says so, off again when cleared,
+    /// and read at start.
+    #[test]
+    fn hive_ssh_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.hive_ssh);
+        let e = entry_for(&cfg, "hive_ssh").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        assert!(e.restart_required, "the hive snapshot is read at start");
+        apply(&mut cfg, "hive_ssh", Some("true")).unwrap();
+        assert!(cfg.hive_ssh);
+        assert!(!cfg.hive_net, "and it is not hive_net");
+        apply(&mut cfg, "hive_ssh", None).unwrap();
+        assert!(!cfg.hive_ssh, "cleared is off");
+        assert!(apply(&mut cfg, "hive_ssh", Some("on-ish")).is_err());
     }
 
     /// FR-90 P3-4d-2 — whether the device reports what it does with its

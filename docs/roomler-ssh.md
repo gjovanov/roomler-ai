@@ -1261,7 +1261,7 @@ it presented (P3-8-2b).
 | the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
 | the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
 | the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
-| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. P3-8-2b-2: the tool `ssh_run`. The target holding `one_command` (P3-8-2a) and the device's client (P3-8-2b-1) are the next two sections |
+| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. The target holding `one_command` (P3-8-2a), the device's client (P3-8-2b-1) and the tool `ssh_run` (P3-8-2b-2) are the next three sections |
 
 ### A session's grant on the target: one command (FR-90 P3-8-2a)
 
@@ -1367,10 +1367,63 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:793`](../agents/roomlerd/src/vault.rs#L793)), answered at [`:946`](../agents/roomlerd/src/vault.rs#L946) from the primary's connection ([`signaling.rs:6334`](../agents/roomlerd/src/signaling.rs#L6334)) |
+| the ask | `Client::ssh` ([`vault.rs:801`](../agents/roomlerd/src/vault.rs#L801)), answered at [`:954`](../agents/roomlerd/src/vault.rs#L954) from the primary's connection ([`signaling.rs:6334`](../agents/roomlerd/src/signaling.rs#L6334)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:894`](../agents/roomlerd/src/overlay.rs#L894)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
 | the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:5970`](../agents/roomlerd/src/signaling.rs#L5970), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+
+### The tool: `ssh_run` (FR-90 P3-8-2b-2)
+
+A session asks for its one command with `ssh_run`, on its toolbelt. The tool is
+offered only where three things hold: the device's owner turned on `hive_ssh`,
+the vault is offered here (`vault_enabled`), and the build carries the `vault`
+and `ssh-server` features. Anywhere else `ssh_run` is an unknown tool.
+
+```mermaid
+flowchart LR
+    S["the session calls<br/>ssh_run {device, command, timeout_s}"] --> A{"a person approves<br/>(the settings ask)"}
+    A -- no --> X["denied: nothing is asked"]
+    A -- yes --> P{"one line, at most 8 KiB?<br/>timeout 1 to 300 s?"}
+    P -- no --> Y["refused in words:<br/>the vault is asked nothing"]
+    P -- yes --> V["rc:vault.ssh, its ticket for<br/>30 s + 30 s + the timeout"]
+    V -- refused --> Z["the vault's word"]
+    V -- a ticket --> C["the client, above:<br/>key, request, echo, host key, one exec"]
+    C --> R["os, account, ticket_id,<br/>exit_code, stdout, stderr, truncated"]
+```
+
+| Piece | What it does |
+|---|---|
+| the offer | `hive_ssh`: device-owned, default off, and never pushable (`DesiredConfig` cannot carry it). Only beside `vault_enabled` |
+| the call | `device`, a device's id; `command`, one line of at most 8 KiB for that device's shell (PowerShell on Windows, bash elsewhere); `timeout_s`, 1 to 300 seconds, 60 if not given. A call that breaks one of these is refused before the vault is asked |
+| the approval | the session's settings ASK for `mcp__roomler__ssh_run` on every call, as they do for the vault's uses, so a repository's own allow rule cannot skip the person |
+| the ticket | asked for the session at its fence, toward `device`, to last the server's answer (30 s), the target's prompt (30 s) and the command. The network module ends the SSH session with what is left of the ticket, so a shorter one would cut the command off |
+| the run | this daemon's own client (above), on the primary connection the vault answered on |
+| the answer | the target's `os`, the `account` it ran as, the ticket's id (the join key to `ssh_audit`), the exit code, and both streams with `truncated`. Never the ticket itself |
+
+⚠️ **The approval names the device and the command, not the account.** The
+person answers before the vault is asked: an approval may wait 25 minutes, and
+a ticket ends within 900 s. The account the target maps comes back in the
+answer. What an account may run is the organization's guardrail to decide
+beforehand: a Cedar `forbid` when `context.account == "daemon"` keeps a
+session off SYSTEM and root ([`vault.md`](vault.md) §7). Whether the vault
+seeds that guardrail is part of decision 22.
+
+⚠️ **Until decision 22, every call is refused at gate 3.** No `SshPolicy`
+admits a session yet, so the network module answers `session_not_allowed`
+(P3-8-1b-1), whatever ticket the vault gave. The tool, the ticket and the
+target's one command are all in place for that decision; until it lands,
+nothing reaches a target.
+
+⚠️ **The daemon never logs the command.** Its log line names the session, the
+target, the ticket and the account, for the reason a terminal's content is
+never recorded: what a session typed is its own.
+
+| Piece | Where |
+|---|---|
+| the owner's key | `hive_ssh` ([`config.rs:605`](../crates/agent-core/src/config.rs#L605)), never pushable ([`models.rs:9258`](../crates/remote_control/src/models.rs#L9258)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
+| the offer | `Supervisor::ssh_runner` ([`supervisor.rs:1478`](../agents/roomlerd/src/hive/supervisor.rs#L1478)), made at start ([`:783`](../agents/roomlerd/src/hive/supervisor.rs#L783)); `Run.ssh` ([`toolbelt.rs:367`](../agents/roomlerd/src/hive/toolbelt.rs#L367)); the settings' ask ([`supervisor.rs:4769`](../agents/roomlerd/src/hive/supervisor.rs#L4769), `SSH_TOOLS` at [`toolbelt.rs:453`](../agents/roomlerd/src/hive/toolbelt.rs#L453)) |
+| the tool | its definition ([`toolbelt.rs:1132`](../agents/roomlerd/src/hive/toolbelt.rs#L1132)); the call ([`ssh_tools.rs:153`](../agents/roomlerd/src/hive/ssh_tools.rs#L153)), its checks ([`:113`](../agents/roomlerd/src/hive/ssh_tools.rs#L113)), the ticket's life ([`:146`](../agents/roomlerd/src/hive/ssh_tools.rs#L146)), the daemon's runner ([`:63`](../agents/roomlerd/src/hive/ssh_tools.rs#L63)) |
+| the ask | `VaultTools::ssh` ([`toolbelt.rs:342`](../agents/roomlerd/src/hive/toolbelt.rs#L342)), on the primary's queue ([`vault.rs:580`](../agents/roomlerd/src/vault.rs#L580)) |
 
 ## 5. Roadmap
 

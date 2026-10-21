@@ -9251,6 +9251,11 @@ mod tests {
             // beyond this device: a server that could set it could open
             // that path from every device it runs sessions on.
             "hive_net",
+            // FR-90 P3-8-2b-2 — whether a session here may run a command on
+            // another device over SSH: a server that could set it could
+            // reach from every device it runs sessions on into every device
+            // whose SSH policy admits a session.
+            "hive_ssh",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

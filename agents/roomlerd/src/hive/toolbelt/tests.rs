@@ -66,6 +66,8 @@ fn run() -> Run {
         exec: None,
         #[cfg(feature = "vault")]
         net: None,
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        ssh: None,
     }
 }
 
@@ -499,6 +501,13 @@ struct FakeVault {
     nets: std::sync::Mutex<Vec<crate::vault::NetAsk>>,
     #[cfg(feature = "vault")]
     net_refusal: Option<String>,
+    /// FR-90 P3-8-2b-2 — each SSH ticket asked for, and the vault's word
+    /// when it refuses them; granted otherwise, for a `named` account on a
+    /// Linux target.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    sshs: std::sync::Mutex<Vec<crate::vault::SshAsk>>,
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    ssh_refusal: Option<String>,
 }
 
 impl FakeVault {
@@ -634,6 +643,22 @@ impl VaultTools for FakeVault {
                     port,
                 )
             }),
+            until: std::time::Instant::now() + Duration::from_secs(u64::from(ask.ttl_secs)),
+        })
+    }
+
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    async fn ssh(&self, ask: crate::vault::SshAsk) -> Result<crate::vault::SshTicket, String> {
+        let mut sshs = self.sshs.lock().unwrap();
+        sshs.push(ask.clone());
+        if let Some(why) = &self.ssh_refusal {
+            return Err(why.clone());
+        }
+        Ok(crate::vault::SshTicket {
+            ticket_id: format!("t{}", sshs.len()),
+            ticket: format!("ticket-of-{}", ask.session_id),
+            os: "linux".into(),
+            account: "named".into(),
             until: std::time::Instant::now() + Duration::from_secs(u64::from(ask.ttl_secs)),
         })
     }
@@ -795,6 +820,8 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
             exec: None,
             #[cfg(feature = "vault")]
             net: None,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh: None,
         },
         quick(),
     );
@@ -858,6 +885,8 @@ async fn a_vault_tool_answers_what_the_vault_says_for_the_sessions_run() {
             exec: None,
             #[cfg(feature = "vault")]
             net: None,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh: None,
         },
         quick(),
     );
@@ -930,6 +959,8 @@ async fn a_cancelled_vault_call_gets_no_answer() {
             exec: None,
             #[cfg(feature = "vault")]
             net: None,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh: None,
         },
         quick(),
     );
@@ -1011,6 +1042,8 @@ fn exec_belt_with(dir: &Path, vault: FakeVault) -> (Belt, Arc<FakeVault>, Object
             fence: 5,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: Some(super::super::vault_exec::ExecTarget {
                 account: None,
                 home: dir.to_path_buf(),
@@ -1054,6 +1087,8 @@ async fn vault_exec_is_offered_and_never_allowed_unasked() {
             fence: 1,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: None,
         },
         quick(),
@@ -1402,6 +1437,8 @@ async fn vault_request_asks_a_lease_ahead_and_answers_no_value() {
             fence: 1,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: None,
         },
         quick(),
@@ -2098,6 +2135,8 @@ async fn a_proxy_connection_from_another_account_is_refused() {
             fence: 5,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: Some(super::super::vault_exec::ExecTarget {
                 account: None,
                 home: dir.path().to_path_buf(),
@@ -2175,6 +2214,8 @@ async fn vault_connect_serves_a_loopback_endpoint() {
             fence: 5,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: None,
         },
         quick(),
@@ -2410,6 +2451,8 @@ async fn vault_connect_serves_mongodb_on_a_loopback_port() {
             fence: 5,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: None,
         },
         quick(),
@@ -2488,6 +2531,8 @@ fn http_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, Obj
             fence: 5,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: None,
         },
         quick(),
@@ -3264,6 +3309,8 @@ async fn an_http_connection_from_another_account_is_refused() {
             fence: 5,
             vault: Some(vault.clone()),
             net: None,
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
             exec: Some(super::super::vault_exec::ExecTarget {
                 account: None,
                 home: dir.path().to_path_buf(),
@@ -3348,6 +3395,8 @@ fn net_belt(
             vault: Some(vault.clone()),
             exec: None,
             net: Some(hub.clone()),
+            #[cfg(feature = "ssh-server")]
+            ssh: None,
         },
         quick(),
     );
@@ -3410,6 +3459,8 @@ async fn the_net_tools_are_offered_only_where_the_owner_offers_egress() {
                 vault: offered,
                 exec: None,
                 net,
+                #[cfg(feature = "ssh-server")]
+                ssh: None,
             },
             quick(),
         );
@@ -3696,6 +3747,256 @@ async fn a_net_connection_from_another_account_is_refused() {
     );
     assert_eq!(hub.flows_snapshot().len(), 1, "the listener lives on");
     assert_eq!(super::super::net_tools::drop_run(sid, 7), 1);
+}
+
+/// FR-90 P3-8-2b-2 — one run the stand-in was asked for: the target, the
+/// ticket's id and text, the command, the timeout.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+type AskedRun = (ObjectId, String, String, String, Duration);
+
+/// FR-90 P3-8-2b-2 — what a toolbelt's `ssh_run` runs on, if anything.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+type Runner = Option<Arc<dyn super::super::ssh_tools::SshRunner>>;
+
+/// FR-90 P3-8-2b-2 — a stand-in for the daemon's SSH client: what it was
+/// asked to run, and its word when it fails.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+#[derive(Default)]
+struct FakeSsh {
+    ran: std::sync::Mutex<Vec<AskedRun>>,
+    failure: Option<String>,
+}
+
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+#[async_trait::async_trait]
+impl super::super::ssh_tools::SshRunner for FakeSsh {
+    async fn run(
+        &self,
+        target: ObjectId,
+        ticket: &crate::vault::SshTicket,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<super::super::ssh_tools::Ran, String> {
+        self.ran.lock().unwrap().push((
+            target,
+            ticket.ticket_id.clone(),
+            ticket.ticket.clone(),
+            command.to_string(),
+            timeout,
+        ));
+        if let Some(why) = &self.failure {
+            return Err(why.clone());
+        }
+        Ok(super::super::ssh_tools::Ran {
+            exit_code: Some(3),
+            stdout: "out\n".into(),
+            stderr: "err\n".into(),
+            truncated: true,
+        })
+    }
+}
+
+/// FR-90 P3-8-2b-2 — a toolbelt whose device offers its sessions `ssh_run`.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+fn ssh_belt(vault: FakeVault, ssh: FakeSsh) -> (Belt, Arc<FakeVault>, Arc<FakeSsh>, ObjectId) {
+    let vault = Arc::new(vault);
+    let ssh = Arc::new(ssh);
+    let session = ObjectId::new();
+    let b = belt_running(
+        me(),
+        Run {
+            session,
+            fence: 4,
+            vault: Some(vault.clone()),
+            exec: None,
+            net: None,
+            ssh: Some(ssh.clone()),
+        },
+        quick(),
+    );
+    (b, vault, ssh, session)
+}
+
+/// FR-90 P3-8-2b-2 — `ssh_run` is offered where the device's owner offers it
+/// and the vault is offered, and nowhere else: elsewhere it is an unknown
+/// tool, and nothing is asked or run. Its settings name is the name offered.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+#[tokio::test]
+async fn ssh_run_is_offered_only_where_the_owner_offers_it() {
+    let names = |list: &Value| -> Vec<String> {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let vault = Arc::new(FakeVault::default());
+    let ssh = Arc::new(FakeSsh::default());
+    // The vault without SSH, and SSH without the vault.
+    let offers: [(Option<Arc<dyn VaultTools>>, Runner); 2] =
+        [(Some(vault.clone()), None), (None, Some(ssh.clone()))];
+    for (offered, runner) in offers {
+        let b = belt_running(
+            me(),
+            Run {
+                session: ObjectId::new(),
+                fence: 1,
+                vault: offered,
+                exec: None,
+                net: None,
+                ssh: runner,
+            },
+            quick(),
+        );
+        let mut c = Client::connect(&b).await;
+        c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+            .await;
+        let listed = names(&c.recv().await);
+        assert!(!listed.iter().any(|n| n == "ssh_run"), "{listed:?}");
+        let args = json!({"device": ObjectId::new().to_hex(), "command": "uptime"});
+        c.send(tool_call(2, "ssh_run", args)).await;
+        assert_eq!(c.recv().await["error"]["code"], -32602, "not offered here");
+    }
+    assert!(vault.sshs.lock().unwrap().is_empty(), "nothing asked");
+    assert!(ssh.ran.lock().unwrap().is_empty(), "nothing run");
+
+    let (b, vault, _, _) = ssh_belt(FakeVault::default(), FakeSsh::default());
+    let mut c = Client::connect(&b).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let list = c.recv().await;
+    let listed = names(&list);
+    assert_eq!(listed.last().map(String::as_str), Some("ssh_run"), "{list}");
+    let tool = list["result"]["tools"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        tool["inputSchema"]["required"],
+        json!(["device", "command"]),
+        "{tool}"
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["timeout_s"]["maximum"],
+        300
+    );
+    assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
+    assert_eq!(tool["annotations"]["destructiveHint"], true, "{tool}");
+    assert_eq!(
+        [format!("mcp__roomler__{}", listed.last().unwrap())],
+        SSH_TOOLS,
+        "what the settings ask a person about is what is offered"
+    );
+    assert!(
+        vault.sshs.lock().unwrap().is_empty(),
+        "listing the tools asks the vault nothing"
+    );
+}
+
+/// FR-90 P3-8-2b-2 — `ssh_run` asks the vault for a ticket for the session's
+/// run toward the device it names, lasting the server's answer, the target's
+/// prompt and the command; hands that ticket and the command, as written, to
+/// the daemon's client; and answers what ran, naming the ticket by its id
+/// alone. It opens no approval of its own: the harness asked one before
+/// calling it.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+#[tokio::test]
+async fn ssh_run_runs_the_one_command_under_the_vaults_ticket() {
+    let (mut b, vault, ssh, session) = ssh_belt(FakeVault::default(), FakeSsh::default());
+    let mut c = Client::connect(&b).await;
+    let target = ObjectId::new();
+    let command = "Get-Service roomler* | Format-Table -Auto";
+    let args = json!({"device": target.to_hex(), "command": command, "timeout_s": 90});
+    let answer = net_answer(&mut c, 2, "ssh_run", args).await.unwrap();
+    assert_eq!(
+        answer,
+        json!({
+            "device": target.to_hex(),
+            "os": "linux",
+            "account": "named",
+            "ticket_id": "t1",
+            "exit_code": 3,
+            "stdout": "out\n",
+            "stderr": "err\n",
+            "truncated": true,
+        })
+    );
+    assert!(
+        !answer.to_string().contains("ticket-of-"),
+        "the ticket never reaches the session: {answer}"
+    );
+    let lasts = crate::ssh_client::ASK_WAIT.as_secs() + crate::ssh_client::PROMPT_SECS + 90;
+    assert_eq!(
+        vault.sshs.lock().unwrap().clone(),
+        [crate::vault::SshAsk {
+            session_id: session,
+            fence: 4,
+            target,
+            ttl_secs: u32::try_from(lasts).unwrap(),
+        }]
+    );
+    assert_eq!(
+        ssh.ran.lock().unwrap().clone(),
+        [(
+            target,
+            "t1".to_string(),
+            format!("ticket-of-{session}"),
+            command.to_string(),
+            Duration::from_secs(90),
+        )]
+    );
+    assert!(b.events.try_recv().is_err(), "no approval of its own");
+}
+
+/// FR-90 P3-8-2b-2 — a call the tool refuses asks the vault nothing; the
+/// vault's refusal is its own word and runs nothing; and a run that fails
+/// says why, in the client's words.
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+#[tokio::test]
+async fn a_refused_ssh_run_runs_nothing() {
+    let target = ObjectId::new().to_hex();
+    let (b, vault, ssh, _) = ssh_belt(FakeVault::default(), FakeSsh::default());
+    let mut c = Client::connect(&b).await;
+    let two_lines = json!({"device": target, "command": "uptime\nreboot"});
+    let e = net_answer(&mut c, 2, "ssh_run", two_lines)
+        .await
+        .unwrap_err();
+    assert!(e.contains("not one this tool runs"), "{e}");
+    let too_long = json!({"device": target, "command": "uptime", "timeout_s": 301});
+    let e = net_answer(&mut c, 3, "ssh_run", too_long)
+        .await
+        .unwrap_err();
+    assert!(e.contains("1 to 300"), "{e}");
+    assert!(
+        vault.sshs.lock().unwrap().is_empty(),
+        "the vault was asked nothing"
+    );
+    assert!(ssh.ran.lock().unwrap().is_empty());
+
+    let refusing = FakeVault {
+        ssh_refusal: Some("the vault refused: denied".into()),
+        ..FakeVault::default()
+    };
+    let (b, vault, ssh, _) = ssh_belt(refusing, FakeSsh::default());
+    let mut c = Client::connect(&b).await;
+    let args = json!({"device": target, "command": "uptime"});
+    let e = net_answer(&mut c, 2, "ssh_run", args.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(e, "the vault refused: denied");
+    assert_eq!(vault.sshs.lock().unwrap().len(), 1);
+    assert!(
+        ssh.ran.lock().unwrap().is_empty(),
+        "a refused ticket runs nothing"
+    );
+
+    let failing = FakeSsh {
+        failure: Some("the server refused the session: session_not_allowed".into()),
+        ..FakeSsh::default()
+    };
+    let (b, _, ssh, _) = ssh_belt(FakeVault::default(), failing);
+    let mut c = Client::connect(&b).await;
+    let e = net_answer(&mut c, 2, "ssh_run", args).await.unwrap_err();
+    assert_eq!(e, "the server refused the session: session_not_allowed");
+    assert_eq!(ssh.ran.lock().unwrap().len(), 1);
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the

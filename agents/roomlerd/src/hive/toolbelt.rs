@@ -75,6 +75,15 @@
 //! ([`super::vault_connect`]): the session gets a connection string with no
 //! credential in it, for as long as the leases. Asked for in the settings with
 //! the other uses: it acts as the secret's user.
+//!
+//! # `ssh_run` (FR-90 P3-8-2b-2)
+//!
+//! Where the device's owner turned `hive_ssh` on, one command on another
+//! device of the organization over Roomler SSH ([`super::ssh_tools`]). The
+//! vault decides it (`ssh:run`) and answers with a ticket; this daemon's own
+//! SSH client then runs it as the account the target maps, with a key minted
+//! for the call, which the session never holds. Asked for in the settings on
+//! every call ([`SSH_TOOLS`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -326,6 +335,11 @@ pub(crate) trait VaultTools: Send + Sync {
     /// the vault's `net:socks` or `net:forward`, or why not.
     #[cfg(feature = "vault")]
     async fn net(&self, ask: crate::vault::NetAsk) -> Result<crate::vault::NetGrant, String>;
+    /// FR-90 P3-8-2b-2 — a ticket to run one command on `ask.target`,
+    /// granted by the vault's `ssh:run` for the account that device maps, or
+    /// why not. Only a build with the SSH client asks for one.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    async fn ssh(&self, ask: crate::vault::SshAsk) -> Result<crate::vault::SshTicket, String>;
 }
 
 /// FR-90 P3-4b — the run a toolbelt serves, and what it offers that run.
@@ -346,6 +360,11 @@ pub(crate) struct Run {
     /// offered; without it `net_socks` and `net_forward` are not offered.
     #[cfg(feature = "vault")]
     pub(crate) net: Option<crate::tunnel::client_mgr::TunnelClientHub>,
+    /// FR-90 P3-8-2b-2 — how `ssh_run` reaches another device, where the
+    /// device's owner turned `hive_ssh` on and the vault is offered; without
+    /// it `ssh_run` is not offered.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    pub(crate) ssh: Option<Arc<dyn super::ssh_tools::SshRunner>>,
 }
 
 /// What every connection of one session's toolbelt shares.
@@ -360,6 +379,9 @@ struct Ctx {
     /// FR-90 P3-7-3c — where `net_socks` and `net_forward` open their flows.
     #[cfg(feature = "vault")]
     net: Option<crate::tunnel::client_mgr::TunnelClientHub>,
+    /// FR-90 P3-8-2b-2 — how `ssh_run` runs its command.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    ssh: Option<Arc<dyn super::ssh_tools::SshRunner>>,
     /// The only account a connection is taken from: the session's.
     peer: PeerId,
     pending: Arc<Pending>,
@@ -423,6 +445,12 @@ pub(crate) const VAULT_AHEAD_TOOLS: [&str; 1] = ["mcp__roomler__vault_request"];
 /// session reaches a network through.
 #[cfg(feature = "vault")]
 pub(crate) const NET_TOOLS: [&str; 2] = ["mcp__roomler__net_socks", "mcp__roomler__net_forward"];
+
+/// FR-90 P3-8-2b-2 — `ssh_run`, as the session's settings name it: asked of
+/// a person on every call. Each runs a command on another device, as the
+/// account that device maps.
+#[cfg(feature = "vault")]
+pub(crate) const SSH_TOOLS: [&str; 1] = ["mcp__roomler__ssh_run"];
 
 /// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
 /// where the primary connection takes leases; otherwise none, and the vault
@@ -611,6 +639,11 @@ impl VaultTools for DaemonVault {
     async fn net(&self, ask: crate::vault::NetAsk) -> Result<crate::vault::NetGrant, String> {
         crate::vault::CLIENT.net(ask).await.map_err(vault_why)
     }
+
+    #[cfg(feature = "ssh-server")]
+    async fn ssh(&self, ask: crate::vault::SshAsk) -> Result<crate::vault::SshTicket, String> {
+        crate::vault::CLIENT.ssh(ask).await.map_err(vault_why)
+    }
 }
 
 /// One session's toolbelt: its socket, its open approvals, and the switch
@@ -695,6 +728,8 @@ pub(crate) fn open(
         exec: run.exec,
         #[cfg(feature = "vault")]
         net: run.net,
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        ssh: run.ssh,
         peer: uid,
         pending: Arc::clone(&pending),
         events,
@@ -771,6 +806,8 @@ pub(crate) fn open(
         exec: run.exec,
         #[cfg(feature = "vault")]
         net: run.net,
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        ssh: run.ssh,
         peer,
         pending: Arc::clone(&pending),
         events,
@@ -1089,6 +1126,40 @@ fn net_tools() -> Vec<Value> {
     ]
 }
 
+/// FR-90 P3-8-2b-2 — one command on another device of the organization over
+/// Roomler SSH. Offered where the device's owner turned `hive_ssh` on and the
+/// vault is offered ([`Run::ssh`]).
+#[cfg(all(feature = "vault", feature = "ssh-server"))]
+fn ssh_tools() -> Vec<Value> {
+    use super::ssh_tools::{DEFAULT_TIMEOUT_SECS, RUN};
+    use crate::ssh_client::{MAX_COMMAND, MAX_TIMEOUT_SECS};
+    vec![json!({
+        "name": RUN,
+        "description": format!(
+            "Runs one command on another Roomler device of the organization (device) over \
+             Roomler SSH, as the account that device's SSH policy maps, which may be SYSTEM or \
+             root there, and answers the device's os, the account it ran as, the exit code, \
+             stdout and stderr (each at most 64 KiB, truncated says whether either was cut). \
+             The organization's vault decides whether this session may, and the device's own \
+             gates still hold: a person there may be asked first. command is one line of at \
+             most {MAX_COMMAND} bytes for the device's own shell, PowerShell on Windows and bash \
+             elsewhere; there is no terminal and no input. timeout_s bounds the command (1 to \
+             {MAX_TIMEOUT_SECS} seconds, {DEFAULT_TIMEOUT_SECS} if not given). A person approves \
+             every call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device": {"type": "string", "description": "the id of the Roomler device of this organization to run on (24 hex characters), never this one"},
+                "command": {"type": "string", "description": "the command, one line, for that device's shell"},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS},
+            },
+            "required": ["device", "command"],
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
+    })]
+}
+
 /// One vault tool call, from asking to answering: what the vault says, as
 /// text, or why it said nothing, as an error the model reads.
 async fn vault_tool(
@@ -1164,6 +1235,20 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
             ctx.session,
             ctx.fence,
             peer,
+            args,
+        )
+        .await;
+    }
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    if name == super::ssh_tools::RUN {
+        let Some(runner) = &ctx.ssh else {
+            return Err("this device offers its sessions no SSH (hive_ssh)".into());
+        };
+        return super::ssh_tools::call(
+            vault.as_ref(),
+            runner.as_ref(),
+            ctx.session,
+            ctx.fence,
             args,
         )
         .await;
@@ -1293,6 +1378,11 @@ async fn on_message(
             if ctx.vault.is_some() && ctx.net.is_some() {
                 tools.extend(net_tools());
             }
+            // FR-90 P3-8-2b-2 — and one command on another device, likewise.
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            if ctx.vault.is_some() && ctx.ssh.is_some() {
+                tools.extend(ssh_tools());
+            }
             reply(&id, json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -1302,7 +1392,11 @@ async fn on_message(
                 && (name == super::net_tools::SOCKS || name == super::net_tools::FORWARD);
             #[cfg(not(feature = "vault"))]
             let net = false;
-            let vault = ctx.vault.is_some() && (is_vault_tool(name) || net);
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            let ssh = ctx.ssh.is_some() && name == super::ssh_tools::RUN;
+            #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
+            let ssh = false;
+            let vault = ctx.vault.is_some() && (is_vault_tool(name) || net || ssh);
             if name != "approve" && !vault {
                 error(&id, -32602, "unknown tool")
             } else {

@@ -300,6 +300,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         vault_enabled: false,
         vault_activity_log: false,
         hive_net: false,
+        hive_ssh: false,
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,
