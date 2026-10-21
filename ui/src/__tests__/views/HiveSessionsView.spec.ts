@@ -38,11 +38,21 @@ const hoisted = vi.hoisted(() => ({
   purge: vi.fn(),
   fetchPurge: vi.fn(),
   fetchAgent: vi.fn(),
+  fetchAgents: vi.fn(),
   push: vi.fn(),
   run: vi.fn(),
   close: vi.fn(),
   hive: {
-    sessions: [] as Array<{ id: string; owner_id?: string; title: string; room_id?: string; status: string }>,
+    sessions: [] as Array<{
+      id: string
+      owner_id?: string
+      title: string
+      room_id?: string
+      status: string
+      device_id?: string
+      device_name?: string
+      folder?: string
+    }>,
     loading: false,
     searchable: {} as Record<string, boolean>,
     copied: {} as Record<string, boolean>,
@@ -79,7 +89,18 @@ vi.mock('@/stores/devices', () => ({
   useDeviceStore: () => ({ items: [], loading: false, fetchDevices: vi.fn() }),
 }))
 vi.mock('@/stores/agents', () => ({
-  useAgentStore: () => ({ agents: hoisted.agents, fetchAgent: hoisted.fetchAgent }),
+  useAgentStore: () => ({
+    get agents() {
+      return hoisted.agents
+    },
+    fetchAgent: hoisted.fetchAgent,
+    fetchAgents: hoisted.fetchAgents,
+  }),
+}))
+// `useNodeLabel` (FR-116 AC4) reads tunnel clients too; the real store would
+// pull in the router plugin, which this file's vue-router mock does not carry.
+vi.mock('@/stores/tunnelClients', () => ({
+  useTunnelClientStore: () => ({ clients: [], fetchTunnelClients: vi.fn() }),
 }))
 vi.mock('vue-router', () => ({
   useRoute: () => ({ params: { tenantId: 't1' } }),
@@ -143,6 +164,7 @@ beforeEach(() => {
     },
   )
   hoisted.hive.sessions = [{ id: 's-mine', owner_id: 'u1', title: 'Fix the kubelet', room_id: 'r-mine', status: 'ended' }]
+  hoisted.agents = []
   hoisted.user = { id: 'u1' }
   hoisted.hive.searchable = { t1: true }
   hoisted.hive.copied = {}
@@ -335,6 +357,30 @@ describe('HiveSessionsView — delete for good (FR-90 P2j-3)', () => {
     expect(w.find('[data-testid="hive-purge-explain"]').exists(), 'the dialog, for the session asked').toBe(true)
     expect(w.find('[data-testid="hive-purge-explain"]').text()).toContain('"Fix the kubelet"')
     expect(hoisted.push, 'the row is not opened').not.toHaveBeenCalled()
+    w.unmount()
+  })
+})
+
+describe('HiveSessionsView — each session names its device as the Devices page does (FR-116 AC4)', () => {
+  it('shows the display name of a listed device, the kept machine name of one not listed, and the id last', async () => {
+    hoisted.agents = [{ id: 'd-listed', name: 'front-desk-pc', display_name: 'Reception PC' }]
+    hoisted.hive.sessions = [
+      { id: 's-a', owner_id: 'u1', title: 'A', status: 'ended', device_id: 'd-listed', device_name: 'front-desk-pc', folder: '/w/a' },
+      { id: 's-b', owner_id: 'u1', title: 'B', status: 'ended', device_id: 'd-gone', device_name: 'old-laptop', folder: '/w/b' },
+      { id: 's-c', owner_id: 'u1', title: 'C', status: 'ended', device_id: 'd-bare', folder: '/w/c' },
+    ]
+    const w = await render()
+    const sub = (id: string) => w.find(`[data-testid="hive-session-${id}"] .v-list-item-subtitle`).text()
+    expect(sub('s-a'), 'listed: its display name, never the kept machine name').toContain('Reception PC · /w/a')
+    expect(sub('s-a')).not.toContain('front-desk-pc')
+    expect(sub('s-b'), 'not listed: the machine name the session kept').toContain('old-laptop · /w/b')
+    expect(sub('s-c'), 'no name at all: the id').toContain('d-bare · /w/c')
+    w.unmount()
+  })
+
+  it('loads the devices it names rows by when nobody has yet', async () => {
+    const w = await render()
+    expect(hoisted.fetchAgents, 'the agents, for the labels').toHaveBeenCalledWith('t1')
     w.unmount()
   })
 })

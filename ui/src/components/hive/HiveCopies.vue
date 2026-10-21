@@ -249,6 +249,7 @@ import { useI18n } from 'vue-i18n'
 import { isLive, useHiveStore, type HiveReplicaMember, type HiveSession } from '@/stores/hive'
 import { useAgentStore } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
+import { deviceLabel } from '@/composables/useHideDeviceName'
 import {
   aheadOfTargets,
   behind,
@@ -326,8 +327,11 @@ function forkLabel(f: { device: { name: string; display_name?: string }; holds: 
 const movingText = computed(() => {
   const p = session.value?.promotion
   if (!p) return ''
+  // FR-116 AC4 — the device as the Devices page names it; the move's kept
+  // machine name (`to_name`) only for a device this org no longer lists.
+  const listed = agents.agents.find((x) => x.id === p.to)
   return t('hive.roomCopies.moving', {
-    device: p.to_name || nameOf(p.to),
+    device: listed ? deviceLabel(listed) : p.to_name || nameOf(p.to),
     step: t(`hive.roomCopies.step.${p.state}`, p.state),
   })
 })
