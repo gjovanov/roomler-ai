@@ -154,8 +154,8 @@ pub async fn or_machine_view(own: Response, req: tunnel_core::localapi::Request)
 }
 
 /// FR-97 P2g — ask the root half's person socket for `uid`. `None` when it is
-/// not there or does not answer within a few seconds: the caller keeps its
-/// own answer then.
+/// not there, is served by anyone but root, or does not answer within a few
+/// seconds: the caller keeps its own answer then.
 #[cfg(target_os = "macos")]
 pub async fn machine_answer(uid: u32, req: &tunnel_core::localapi::Request) -> Option<Response> {
     let path = localapi::person_socket_path(uid);
@@ -163,7 +163,8 @@ pub async fn machine_answer(uid: u32, req: &tunnel_core::localapi::Request) -> O
         return None;
     }
     let ask = async {
-        let mut client = localapi::connect_unix_at(path).await.ok()?;
+        // Only a socket ROOT serves is the machine's half.
+        let mut client = localapi::connect_unix_served_by_root(path).await.ok()?;
         client.request(req).await.ok()
     };
     tokio::time::timeout(Duration::from_secs(5), ask)

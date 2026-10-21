@@ -4255,6 +4255,25 @@ pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client
     Ok(Client::new(Box::new(stream)))
 }
 
+/// FR-97 P2g — [`connect_unix_at`], kept only when the process serving the
+/// socket is ROOT (its uid, from the kernel). A Mac's per-user half asks the
+/// root half's person socket for the machine's Devices and Mesh, and shows the
+/// answer to the person as the machine's own. Only root can make an entry in
+/// [`MACOS_PERSON_SOCKET_DIR`] in the first place, so this is the second lock:
+/// a socket served by anyone else is refused, not believed.
+#[cfg(unix)]
+pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::Result<Client> {
+    let stream = tokio::net::UnixStream::connect(&path).await?;
+    let server = stream.peer_cred()?.uid();
+    if server != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is served by uid {server}, not root", path.display()),
+        ));
+    }
+    Ok(Client::new(Box::new(stream)))
+}
+
 impl Client {
     fn new(stream: Box<dyn ClientStream>) -> Self {
         Self {
@@ -7185,6 +7204,32 @@ mod tests {
         assert!(person_peer_ok(&as_uid(Some(0)), 1000));
         assert!(!person_peer_ok(&as_uid(Some(1001)), 1000));
         assert!(!person_peer_ok(&as_uid(None), 1000));
+    }
+
+    /// FR-97 P2g — a Mac's per-user half believes the machine's view only from
+    /// a socket ROOT serves: served by anyone else, the same socket is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_view_is_taken_only_from_root() {
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-p2g-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("served.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let held = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        let r = connect_unix_served_by_root(path.clone()).await;
+        if me == 0 {
+            assert!(r.is_ok(), "a root server is believed: {:?}", r.err());
+        } else {
+            let e = r
+                .err()
+                .expect("a socket a non-root process serves must be refused");
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(e.to_string().contains(&format!("uid {me}")), "{e}");
+        }
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FR-27 P11 — the real socket: 0600 and the person's; serves and refuses

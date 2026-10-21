@@ -347,7 +347,11 @@ the directory is not the person's:
   borrow in any case;
 - nothing is accepted until that hand-over is done, and `getpeereid` is checked
   against that user or root on every connection, whatever the mode was in between;
-- the person is the console user (`/dev/console`'s owner), never the login window.
+- the person is the console user (`/dev/console`'s owner), never the login window;
+- the per-user half believes an answer only from a socket **root** serves
+  (`connect_unix_served_by_root`: the server's uid, from the kernel). The directory
+  already keeps everyone else out; this is the second lock, because the answer is shown
+  to the person as the machine's own.
 
 The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
 new verb cannot reach it by default. Widening it is a security change and needs

@@ -282,7 +282,8 @@ sequenceDiagram
 - **Only a `no_node` answer off root asks** (`person_socket::machine_view_wanted`), and only an
   `ok` answer replaces it (`machine_view_usable`). A root half that is missing, older, switched
   off (`ROOMLERD_PERSON_SOCKET=0`) or itself off the network leaves the per-user half's own
-  answer on screen, as before.
+  answer on screen, as before. So does a socket served by anyone but root
+  (`localapi::connect_unix_served_by_root`).
 - **"This device" is the root half's row.** The per-user half's own row has no node, so the
   machine's netmap does not carry it, and it is not in the list.
 - **Still the per-user half's: the Connection column and Overview's online count.** They come
