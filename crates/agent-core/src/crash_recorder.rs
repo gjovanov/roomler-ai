@@ -28,10 +28,12 @@
 //!   readable (ACL set on dir creation) so the same uploader scans
 //!   both dirs and merges results.
 //!
-//! On non-Windows the Supervisor context resolves to the same
-//! worker dir — the SCM supervisor only exists on Windows today;
-//! the symmetric path is reserved for a future systemd / launchd
-//! supervisor.
+//! On non-Windows the Supervisor context resolves to the writing
+//! process's own Worker dir. The one supervisor there is macOS's (FR-43,
+//! `macos_supervisor.rs`): the ROOT daemon records a GUI worker that died
+//! before its own panic hook could (FR-97 P6e-2), so the record lands in
+//! root's dir, and the root daemon's own uploader drains it on the
+//! daemon's enrollment.
 //!
 //! ## Reentrancy + panic safety
 //!
@@ -102,8 +104,8 @@ pub enum WriterContext {
     // host.
     /// LocalSystem SCM supervisor. Writes under
     /// `%PROGRAMDATA%\roomler\roomler-agent\crashes\` on Windows,
-    /// falls back to the Worker dir on non-Windows (no separate
-    /// supervisor process exists there today).
+    /// falls back to the Worker dir on non-Windows: on macOS that is
+    /// the root daemon's, recording its GUI worker (FR-97 P6e-2).
     Supervisor,
 }
 
@@ -276,8 +278,9 @@ fn supervisor_crashes_dir() -> std::io::Result<PathBuf> {
 
 #[cfg(not(target_os = "windows"))]
 fn supervisor_crashes_dir() -> std::io::Result<PathBuf> {
-    // No SCM supervisor on non-Windows today. Fall back to the
-    // worker dir so the API surface stays uniform.
+    // The writing process's own dir. On macOS the writer is the root
+    // daemon recording its GUI worker (FR-97 P6e-2), and its own uploader
+    // scans this dir (`pending_all`).
     crate::logging::log_dir()
         .map(|p| p.join("crashes"))
         .ok_or_else(|| {

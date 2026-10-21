@@ -157,6 +157,110 @@ pub fn next_backoff(current: Duration, ran: Duration) -> Duration {
     }
 }
 
+/// FR-97 P6e-2 — how a worker ended, read off its wait status.
+///
+/// The child the supervisor reaps is `sudo`, not the agent: `launchctl asuser`
+/// execs into it. `sudo` passes its command's end through as its own, a signal
+/// as the same signal and an exit code as the same code. Measured on macOS 15.7
+/// with sudo 1.9.13 (FR-97 §8): `kill -9`, `-SEGV`, `-BUS`, `-ABRT`, `-TERM`
+/// and `-HUP` on the worker came back as signals 9, 11, 10, 6, 15 and 1, and
+/// `exit 7` as code 7. So this is the worker's own end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerEnd {
+    /// It exited with this code.
+    Code(i32),
+    /// This signal ended it, in Darwin's numbering.
+    Signal(i32),
+}
+
+/// The worker's end from the status `try_wait` returned. `None` only for a
+/// status that carries neither, which a terminated child never has.
+#[cfg(unix)]
+pub fn worker_end(status: std::process::ExitStatus) -> Option<WorkerEnd> {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .signal()
+        .map(WorkerEnd::Signal)
+        .or_else(|| status.code().map(WorkerEnd::Code))
+}
+
+// Darwin's signal numbers, which a wait status on a Mac carries. Spelt out
+// rather than taken from `libc` because the pure half of this module also
+// builds and tests on Linux and Windows, where some are numbered differently
+// (SIGBUS is 7 on Linux) or are missing. The macOS build checks every one
+// against `libc` (`imp`).
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGQUIT: i32 = 3;
+const SIGILL: i32 = 4;
+const SIGTRAP: i32 = 5;
+const SIGABRT: i32 = 6;
+const SIGFPE: i32 = 8;
+const SIGKILL: i32 = 9;
+const SIGBUS: i32 = 10;
+const SIGSEGV: i32 = 11;
+const SIGSYS: i32 = 12;
+const SIGTERM: i32 = 15;
+
+const SIGNAL_NAMES: &[(i32, &str)] = &[
+    (SIGHUP, "SIGHUP"),
+    (SIGINT, "SIGINT"),
+    (SIGQUIT, "SIGQUIT"),
+    (SIGILL, "SIGILL"),
+    (SIGTRAP, "SIGTRAP"),
+    (SIGABRT, "SIGABRT"),
+    (SIGFPE, "SIGFPE"),
+    (SIGKILL, "SIGKILL"),
+    (SIGBUS, "SIGBUS"),
+    (SIGSEGV, "SIGSEGV"),
+    (SIGSYS, "SIGSYS"),
+    (SIGTERM, "SIGTERM"),
+];
+
+/// FR-97 P6e-2 — the crash record's summary for a worker's end, or `None`
+/// when the end is not a crash.
+///
+/// A crash is an end the worker's own hooks could not record: a signal that
+/// killed it before its panic hook ran (SIGKILL, SIGSEGV, SIGBUS…), or an exit
+/// the agent did not choose. Not a crash:
+/// - exit code 0;
+/// - the codes the agent exits with on purpose (`ALREADY_RUNNING`,
+///   `AGENT_DELETED`, `RESTART_REQUESTED`), and `STALL`, which the watchdog
+///   recorded itself before it forced the exit. The Windows supervisor skips
+///   the same list (`should_record_supervisor_crash`), plus a session-teardown
+///   code that macOS has no equivalent of;
+/// - SIGTERM, SIGHUP and SIGINT: a logout, a closed terminal or a person
+///   ending the process on purpose.
+///
+/// ⚠️ `RESTART_REQUESTED_EXIT_CODE` is 9, and so is SIGKILL. Exit code 9 is a
+/// restart someone asked for; signal 9 is a kill. Only the [`WorkerEnd`]
+/// variant tells them apart, which is why this takes no flat number.
+pub fn crash_summary(end: WorkerEnd, uid: u32, ran: Duration) -> Option<String> {
+    use crate::watchdog::{
+        AGENT_DELETED_EXIT_CODE, ALREADY_RUNNING_EXIT_CODE, RESTART_REQUESTED_EXIT_CODE,
+        STALL_EXIT_CODE,
+    };
+    let how = match end {
+        WorkerEnd::Code(
+            0
+            | STALL_EXIT_CODE
+            | AGENT_DELETED_EXIT_CODE
+            | ALREADY_RUNNING_EXIT_CODE
+            | RESTART_REQUESTED_EXIT_CODE,
+        ) => return None,
+        WorkerEnd::Code(code) => format!("exited with code {code}"),
+        WorkerEnd::Signal(SIGHUP | SIGINT | SIGTERM) => return None,
+        WorkerEnd::Signal(sig) => match SIGNAL_NAMES.iter().find(|(n, _)| *n == sig) {
+            Some((_, name)) => format!("was killed by {name} ({sig})"),
+            None => format!("was killed by signal {sig}"),
+        },
+    };
+    Some(format!(
+        "macOS supervisor: the GUI worker (uid {uid}) {how} after {} s",
+        ran.as_secs()
+    ))
+}
+
 #[cfg(target_os = "macos")]
 pub use imp::run;
 
@@ -167,6 +271,23 @@ mod imp {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::time::Instant;
+
+    // FR-97 P6e-2 — the Darwin numbers `crash_summary` reads, checked here, on
+    // the one OS whose wait statuses carry them.
+    const _: () = assert!(
+        SIGHUP == libc::SIGHUP
+            && SIGINT == libc::SIGINT
+            && SIGQUIT == libc::SIGQUIT
+            && SIGILL == libc::SIGILL
+            && SIGTRAP == libc::SIGTRAP
+            && SIGABRT == libc::SIGABRT
+            && SIGFPE == libc::SIGFPE
+            && SIGKILL == libc::SIGKILL
+            && SIGBUS == libc::SIGBUS
+            && SIGSEGV == libc::SIGSEGV
+            && SIGSYS == libc::SIGSYS
+            && SIGTERM == libc::SIGTERM
+    );
 
     /// The LaunchAgent label the postinstall bootstraps. If this is loaded,
     /// we stand down — see the module docs.
@@ -445,10 +566,13 @@ mod imp {
             // hence the map/filter dance rather than mutating inside an
             // `if let ... = worker.as_mut()` body. (Windows never compiles
             // this module, so only the macOS lane would have caught it.)
-            let exited = worker.as_mut().and_then(|(uid, child, started)| {
-                matches!(child.try_wait(), Ok(Some(_))).then(|| (*uid, started.elapsed()))
-            });
-            if let Some((uid, ran)) = exited {
+            let exited = worker
+                .as_mut()
+                .and_then(|(uid, child, started)| match child.try_wait() {
+                    Ok(Some(status)) => Some((*uid, started.elapsed(), status)),
+                    _ => None,
+                });
+            if let Some((uid, ran, status)) = exited {
                 backoff = next_backoff(backoff, ran);
                 fast_exits = if ran >= HEALTHY_RUN {
                     0
@@ -459,8 +583,22 @@ mod imp {
                     uid,
                     ran_secs = ran.as_secs(),
                     retry_in_secs = backoff.as_secs(),
+                    %status,
                     "macOS supervisor: GUI worker exited"
                 );
+                // FR-97 P6e-2 — a worker killed by a signal never reaches its
+                // own panic hook, so nothing else records it. The record goes
+                // to this daemon's own crashes dir, which its own uploader
+                // drains (`WriterContext::Supervisor`), so it reaches the
+                // server on the daemon's enrollment. Ends this supervisor
+                // causes never get here: `stop_worker` reaps its own child.
+                if let Some(summary) = worker_end(status).and_then(|e| crash_summary(e, uid, ran)) {
+                    crate::crash_recorder::record(
+                        crate::crash_recorder::Reason::SupervisorDetected,
+                        &summary,
+                        crate::crash_recorder::WriterContext::Supervisor,
+                    );
+                }
                 wait_until = Some(Instant::now() + backoff);
                 worker = None;
             }
@@ -842,6 +980,109 @@ mod tests {
                 ..wedged
             }),
             Action::Healthy
+        );
+    }
+
+    // FR-97 P6e-2 — which ends leave a crash record.
+    #[test]
+    fn a_kill_or_a_fault_leaves_a_record() {
+        let ran = Duration::from_secs(42);
+        for (sig, name) in [
+            (9, "SIGKILL"),
+            (11, "SIGSEGV"),
+            (10, "SIGBUS"),
+            (6, "SIGABRT"),
+            (4, "SIGILL"),
+        ] {
+            let s = crash_summary(WorkerEnd::Signal(sig), 501, ran).expect("a crash");
+            assert_eq!(
+                s,
+                format!(
+                    "macOS supervisor: the GUI worker (uid 501) was killed by {name} ({sig}) after 42 s"
+                )
+            );
+        }
+        assert_eq!(
+            crash_summary(WorkerEnd::Signal(24), 501, ran).as_deref(),
+            Some("macOS supervisor: the GUI worker (uid 501) was killed by signal 24 after 42 s")
+        );
+        assert_eq!(
+            crash_summary(WorkerEnd::Code(1), 501, ran).as_deref(),
+            Some("macOS supervisor: the GUI worker (uid 501) exited with code 1 after 42 s")
+        );
+        // A panic on the main thread exits 101. The worker's own hook recorded
+        // it on the WORKER's row; this record is the daemon's, so it stays.
+        assert!(crash_summary(WorkerEnd::Code(101), 501, ran).is_some());
+    }
+
+    #[test]
+    fn an_end_the_agent_chose_or_a_session_asked_for_is_not_a_crash() {
+        use crate::watchdog::{
+            AGENT_DELETED_EXIT_CODE, ALREADY_RUNNING_EXIT_CODE, RESTART_REQUESTED_EXIT_CODE,
+            STALL_EXIT_CODE,
+        };
+        let ran = Duration::from_secs(42);
+        for code in [
+            0,
+            STALL_EXIT_CODE,
+            AGENT_DELETED_EXIT_CODE,
+            ALREADY_RUNNING_EXIT_CODE,
+            RESTART_REQUESTED_EXIT_CODE,
+        ] {
+            assert_eq!(
+                crash_summary(WorkerEnd::Code(code), 501, ran),
+                None,
+                "code {code}"
+            );
+        }
+        // SIGHUP, SIGINT, SIGTERM.
+        for sig in [1, 2, 15] {
+            assert_eq!(
+                crash_summary(WorkerEnd::Signal(sig), 501, ran),
+                None,
+                "signal {sig}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_code_nine_is_a_restart_and_signal_nine_a_kill() {
+        // The collision this test exists for: renumber either and it is moot.
+        assert_eq!(crate::watchdog::RESTART_REQUESTED_EXIT_CODE, 9);
+        assert_eq!(SIGKILL, 9);
+        let ran = Duration::from_secs(42);
+        assert_eq!(crash_summary(WorkerEnd::Code(9), 501, ran), None);
+        assert!(crash_summary(WorkerEnd::Signal(9), 501, ran).is_some());
+    }
+
+    /// The raw statuses are the ones measured on a Mac (FR-97 §8): perl's `$?`
+    /// read 9 for `kill -9`, 11 for `-SEGV`, and 1792 for `exit 7`. The
+    /// encoding is the traditional one, the same on Linux, so this runs there.
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_status_reads_as_its_signal_or_its_code() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        assert_eq!(
+            worker_end(ExitStatus::from_raw(9)),
+            Some(WorkerEnd::Signal(9))
+        );
+        assert_eq!(
+            worker_end(ExitStatus::from_raw(11)),
+            Some(WorkerEnd::Signal(11))
+        );
+        assert_eq!(
+            worker_end(ExitStatus::from_raw(1792)),
+            Some(WorkerEnd::Code(7))
+        );
+        assert_eq!(
+            worker_end(ExitStatus::from_raw(0)),
+            Some(WorkerEnd::Code(0))
+        );
+        // A signal that dumped core sets 0x80; it is still that signal.
+        assert_eq!(
+            worker_end(ExitStatus::from_raw(11 | 0x80)),
+            Some(WorkerEnd::Signal(11))
         );
     }
 }
