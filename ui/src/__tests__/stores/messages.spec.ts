@@ -374,4 +374,54 @@ describe('useMessageStore', () => {
       expect(store.messages[0].id).toBe('m2')
     })
   })
+
+  // A bare PUT carried no JSON and the server's `Json<TogglePinRequest>` refused
+  // it with 415: no message could be pinned from the app (FR-116 AC6's field run).
+  describe('togglePin', () => {
+    it('pins an unpinned message: says { pinned: true }, then shows it pinned', async () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1', is_pinned: false })] as never
+      mockApi.put.mockResolvedValueOnce(undefined as never)
+
+      await store.togglePin('t1', 'r1', 'm1')
+
+      expect(mockApi.put).toHaveBeenCalledWith('/tenant/t1/room/r1/message/m1/pin', { pinned: true })
+      expect(store.messages[0].is_pinned).toBe(true)
+    })
+
+    it('unpins a pinned one, in the thread too', async () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1', is_pinned: true })] as never
+      store.threadMessages = [makeMessage({ id: 'm1', is_pinned: true })] as never
+      mockApi.put.mockResolvedValueOnce(undefined as never)
+
+      await store.togglePin('t1', 'r1', 'm1')
+
+      expect(mockApi.put).toHaveBeenCalledWith('/tenant/t1/room/r1/message/m1/pin', { pinned: false })
+      expect(store.messages[0].is_pinned).toBe(false)
+      expect(store.threadMessages[0].is_pinned).toBe(false)
+    })
+
+    it('leaves the message as it was when the server refuses', async () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1', is_pinned: false })] as never
+      mockApi.put.mockRejectedValueOnce(new Error('API error 403'))
+
+      await expect(store.togglePin('t1', 'r1', 'm1')).rejects.toThrow('403')
+      expect(store.messages[0].is_pinned).toBe(false)
+    })
+  })
+
+  describe('pinFromWs', () => {
+    it("applies another member's pin and unpin", () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1', is_pinned: false }), makeMessage({ id: 'm2', is_pinned: true })] as never
+
+      store.pinFromWs({ message_id: 'm1', pinned: true })
+      store.pinFromWs({ message_id: 'm2', pinned: false })
+
+      expect(store.messages[0].is_pinned).toBe(true)
+      expect(store.messages[1].is_pinned).toBe(false)
+    })
+  })
 })
