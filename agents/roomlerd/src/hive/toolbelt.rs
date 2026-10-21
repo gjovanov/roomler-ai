@@ -322,6 +322,10 @@ pub(crate) trait VaultTools: Send + Sync {
     /// has it report; nothing otherwise. Never waits.
     #[cfg(feature = "vault")]
     fn report(&self, r: crate::vault::Report);
+    /// FR-90 P3-7-3c — a session's own egress through `ask.exit`, granted by
+    /// the vault's `net:socks` or `net:forward`, or why not.
+    #[cfg(feature = "vault")]
+    async fn net(&self, ask: crate::vault::NetAsk) -> Result<crate::vault::NetGrant, String>;
 }
 
 /// FR-90 P3-4b — the run a toolbelt serves, and what it offers that run.
@@ -337,6 +341,11 @@ pub(crate) struct Run {
     /// command runs (Windows: no sandbox for a value there).
     #[cfg(feature = "vault")]
     pub(crate) exec: Option<super::vault_exec::ExecTarget>,
+    /// FR-90 P3-7-3c — the hub a session's own egress opens its flows on,
+    /// where the device's owner turned `hive_net` on and the vault is
+    /// offered; without it `net_socks` and `net_forward` are not offered.
+    #[cfg(feature = "vault")]
+    pub(crate) net: Option<crate::tunnel::client_mgr::TunnelClientHub>,
 }
 
 /// What every connection of one session's toolbelt shares.
@@ -348,6 +357,9 @@ struct Ctx {
     /// P3-4c-1 — where `vault_exec` runs a command.
     #[cfg(feature = "vault")]
     exec: Option<super::vault_exec::ExecTarget>,
+    /// FR-90 P3-7-3c — where `net_socks` and `net_forward` open their flows.
+    #[cfg(feature = "vault")]
+    net: Option<crate::tunnel::client_mgr::TunnelClientHub>,
     /// The only account a connection is taken from: the session's.
     peer: PeerId,
     pending: Arc<Pending>,
@@ -405,6 +417,12 @@ pub(crate) const VAULT_USE_TOOLS: [&str; 3] = [
 /// with the reads wherever it is offered.
 #[cfg(feature = "vault")]
 pub(crate) const VAULT_AHEAD_TOOLS: [&str; 1] = ["mcp__roomler__vault_request"];
+
+/// FR-90 P3-7-3c — a session's own egress, as its settings name it: asked of
+/// a person on every call, like the vault's uses. Each opens a listener this
+/// session reaches a network through.
+#[cfg(feature = "vault")]
+pub(crate) const NET_TOOLS: [&str; 2] = ["mcp__roomler__net_socks", "mcp__roomler__net_forward"];
 
 /// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
 /// where the primary connection takes leases; otherwise none, and the vault
@@ -589,6 +607,10 @@ impl VaultTools for DaemonVault {
     fn report(&self, r: crate::vault::Report) {
         crate::vault::CLIENT.report(r);
     }
+
+    async fn net(&self, ask: crate::vault::NetAsk) -> Result<crate::vault::NetGrant, String> {
+        crate::vault::CLIENT.net(ask).await.map_err(vault_why)
+    }
 }
 
 /// One session's toolbelt: its socket, its open approvals, and the switch
@@ -671,6 +693,8 @@ pub(crate) fn open(
         vault: run.vault,
         #[cfg(feature = "vault")]
         exec: run.exec,
+        #[cfg(feature = "vault")]
+        net: run.net,
         peer: uid,
         pending: Arc::clone(&pending),
         events,
@@ -745,6 +769,8 @@ pub(crate) fn open(
         vault: run.vault,
         #[cfg(feature = "vault")]
         exec: run.exec,
+        #[cfg(feature = "vault")]
+        net: run.net,
         peer,
         pending: Arc::clone(&pending),
         events,
@@ -1015,6 +1041,54 @@ fn vault_tools() -> Vec<Value> {
     tools
 }
 
+/// FR-90 P3-7-3c — a session's own egress: SOCKS through an exit, or a
+/// forward to one destination, each a loopback listener served to the
+/// session's account alone. Offered where the device's owner turned
+/// `hive_net` on and the vault is offered ([`Run::net`]).
+#[cfg(feature = "vault")]
+fn net_tools() -> Vec<Value> {
+    let exit = json!({"type": "string", "description": "the id of the Roomler device of this organization the flows leave from (24 hex characters)"});
+    let ttl = json!({"type": "integer", "minimum": 30, "maximum": 900});
+    vec![
+        json!({
+            "name": super::net_tools::SOCKS,
+            "description": "Opens a SOCKS5 proxy on this device whose connections leave from another \
+                            Roomler device of the organization (exit), as the organization's vault \
+                            and tunnel policies allow this session, and answers its proxy URL, \
+                            socks5h://user:password@127.0.0.1:port (curl -x, or ALL_PROXY), and how \
+                            long it serves. Only this session's account may connect, with the URL's \
+                            credential, and only CONNECT: no UDP. It closes at its end (ttl_s, 30 to \
+                            900 seconds), and every connection with it. A person approves every call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"exit": exit, "ttl_s": ttl},
+                "required": ["exit"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true},
+        }),
+        json!({
+            "name": super::net_tools::FORWARD,
+            "description": "Opens a port on this device's loopback that forwards to one destination \
+                            (host:port) from another Roomler device of the organization (exit), as \
+                            the organization's vault and tunnel policies allow this session, and \
+                            answers the address to connect to and how long it serves. Only this \
+                            session's account may connect. It closes at its end (ttl_s, 30 to 900 \
+                            seconds), and every connection with it. A person approves every call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "exit": exit,
+                    "host": {"type": "string", "description": "the destination's host, a name or an address, as the exit resolves it"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                    "ttl_s": ttl,
+                },
+                "required": ["exit", "host", "port"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true},
+        }),
+    ]
+}
+
 /// One vault tool call, from asking to answering: what the vault says, as
 /// text, or why it said nothing, as an error the model reads.
 async fn vault_tool(
@@ -1073,6 +1147,26 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
     #[cfg(feature = "vault")]
     if name == "vault_request" {
         return super::vault_request::call(vault.as_ref(), ctx.session, ctx.fence, args).await;
+    }
+    #[cfg(feature = "vault")]
+    if name == super::net_tools::SOCKS || name == super::net_tools::FORWARD {
+        let Some(hub) = &ctx.net else {
+            return Err("this device offers its sessions no egress (hive_net)".into());
+        };
+        #[cfg(unix)]
+        let peer = ctx.peer;
+        #[cfg(windows)]
+        let peer = ctx.peer.clone();
+        return super::net_tools::call(
+            name,
+            vault.as_ref(),
+            hub,
+            ctx.session,
+            ctx.fence,
+            peer,
+            args,
+        )
+        .await;
     }
     #[cfg(feature = "vault")]
     if name == "vault_connect" {
@@ -1194,11 +1288,21 @@ async fn on_message(
             if ctx.vault.is_some() {
                 tools.extend(vault_tools());
             }
+            // FR-90 P3-7-3c — a session's own egress, where the owner offers it.
+            #[cfg(feature = "vault")]
+            if ctx.vault.is_some() && ctx.net.is_some() {
+                tools.extend(net_tools());
+            }
             reply(&id, json!({ "tools": tools }))
         }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let vault = ctx.vault.is_some() && is_vault_tool(name);
+            #[cfg(feature = "vault")]
+            let net = ctx.net.is_some()
+                && (name == super::net_tools::SOCKS || name == super::net_tools::FORWARD);
+            #[cfg(not(feature = "vault"))]
+            let net = false;
+            let vault = ctx.vault.is_some() && (is_vault_tool(name) || net);
             if name != "approve" && !vault {
                 error(&id, -32602, "unknown tool")
             } else {

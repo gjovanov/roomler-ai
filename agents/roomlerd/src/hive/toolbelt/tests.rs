@@ -64,6 +64,8 @@ fn run() -> Run {
         vault: None,
         #[cfg(feature = "vault")]
         exec: None,
+        #[cfg(feature = "vault")]
+        net: None,
     }
 }
 
@@ -490,6 +492,13 @@ struct FakeVault {
     mints: std::sync::Mutex<Vec<String>>,
     #[cfg(feature = "vault")]
     credentials: std::sync::Mutex<HashMap<String, String>>,
+    /// FR-90 P3-7-3c — each egress asked for, and the vault's word when it
+    /// refuses them; granted as asked otherwise, a forward's host in the
+    /// vault's one spelling.
+    #[cfg(feature = "vault")]
+    nets: std::sync::Mutex<Vec<crate::vault::NetAsk>>,
+    #[cfg(feature = "vault")]
+    net_refusal: Option<String>,
 }
 
 impl FakeVault {
@@ -607,6 +616,26 @@ impl VaultTools for FakeVault {
     #[cfg(feature = "vault")]
     fn report(&self, r: crate::vault::Report) {
         self.reports.lock().unwrap().push(r);
+    }
+
+    #[cfg(feature = "vault")]
+    async fn net(&self, ask: crate::vault::NetAsk) -> Result<crate::vault::NetGrant, String> {
+        let mut nets = self.nets.lock().unwrap();
+        nets.push(ask.clone());
+        if let Some(why) = &self.net_refusal {
+            return Err(why.clone());
+        }
+        Ok(crate::vault::NetGrant {
+            grant_id: format!("g{}", nets.len()),
+            token: format!("grant-of-{}", ask.session_id),
+            dst: ask.dst.map(|(host, port)| {
+                (
+                    roomler_ai_remote_control::vault::canonical_net_host(&host).unwrap_or(host),
+                    port,
+                )
+            }),
+            until: std::time::Instant::now() + Duration::from_secs(u64::from(ask.ttl_secs)),
+        })
     }
 
     #[cfg(feature = "vault")]
@@ -764,6 +793,8 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
             vault: Some(vault.clone()),
             #[cfg(feature = "vault")]
             exec: None,
+            #[cfg(feature = "vault")]
+            net: None,
         },
         quick(),
     );
@@ -825,6 +856,8 @@ async fn a_vault_tool_answers_what_the_vault_says_for_the_sessions_run() {
             vault: Some(vault.clone()),
             #[cfg(feature = "vault")]
             exec: None,
+            #[cfg(feature = "vault")]
+            net: None,
         },
         quick(),
     );
@@ -895,6 +928,8 @@ async fn a_cancelled_vault_call_gets_no_answer() {
             vault: Some(vault.clone()),
             #[cfg(feature = "vault")]
             exec: None,
+            #[cfg(feature = "vault")]
+            net: None,
         },
         quick(),
     );
@@ -975,6 +1010,7 @@ fn exec_belt_with(dir: &Path, vault: FakeVault) -> (Belt, Arc<FakeVault>, Object
             session: sid,
             fence: 5,
             vault: Some(vault.clone()),
+            net: None,
             exec: Some(super::super::vault_exec::ExecTarget {
                 account: None,
                 home: dir.to_path_buf(),
@@ -1017,6 +1053,7 @@ async fn vault_exec_is_offered_and_never_allowed_unasked() {
             session: ObjectId::new(),
             fence: 1,
             vault: Some(vault.clone()),
+            net: None,
             exec: None,
         },
         quick(),
@@ -1364,6 +1401,7 @@ async fn vault_request_asks_a_lease_ahead_and_answers_no_value() {
             session: sid,
             fence: 1,
             vault: Some(vault.clone()),
+            net: None,
             exec: None,
         },
         quick(),
@@ -2059,6 +2097,7 @@ async fn a_proxy_connection_from_another_account_is_refused() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            net: None,
             exec: Some(super::super::vault_exec::ExecTarget {
                 account: None,
                 home: dir.path().to_path_buf(),
@@ -2135,6 +2174,7 @@ async fn vault_connect_serves_a_loopback_endpoint() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            net: None,
             exec: None,
         },
         quick(),
@@ -2369,6 +2409,7 @@ async fn vault_connect_serves_mongodb_on_a_loopback_port() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            net: None,
             exec: None,
         },
         quick(),
@@ -2446,6 +2487,7 @@ fn http_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, Obj
             session: sid,
             fence: 5,
             vault: Some(vault.clone()),
+            net: None,
             exec: None,
         },
         quick(),
@@ -3221,6 +3263,7 @@ async fn an_http_connection_from_another_account_is_refused() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            net: None,
             exec: Some(super::super::vault_exec::ExecTarget {
                 account: None,
                 home: dir.path().to_path_buf(),
@@ -3261,6 +3304,398 @@ async fn an_http_connection_from_another_account_is_refused() {
     assert!(ended.is_ok(), "the connection was closed");
     assert!(rest.is_empty(), "and answered nothing: {rest:?}");
     assert!(saw.try_recv().is_err(), "nothing reached the upstream");
+}
+
+/// P3-7-3c — the answer to a `net_socks` or `net_forward` call: its JSON,
+/// or its error text.
+#[cfg(feature = "vault")]
+async fn net_answer(c: &mut Client, id: u64, tool: &str, args: Value) -> Result<Value, String> {
+    c.send(tool_call(id, tool, args)).await;
+    let m = c.recv().await;
+    assert_eq!(m["id"], id, "{m}");
+    let text = m["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    if m["result"]["isError"] == true {
+        Err(text)
+    } else {
+        Ok(serde_json::from_str(&text).unwrap())
+    }
+}
+
+/// P3-7-3c — a toolbelt whose device offers its sessions egress: a hub of
+/// its own with no agent WS, so a flow holds what it admits and carries
+/// nothing.
+#[cfg(feature = "vault")]
+fn net_belt(
+    vault: FakeVault,
+    fence: u64,
+) -> (
+    Belt,
+    Arc<FakeVault>,
+    ObjectId,
+    crate::tunnel::client_mgr::TunnelClientHub,
+) {
+    let vault = Arc::new(vault);
+    let session = ObjectId::new();
+    let hub = crate::tunnel::client_mgr::TunnelClientHub::new("test".into());
+    let b = belt_running(
+        me(),
+        Run {
+            session,
+            fence,
+            vault: Some(vault.clone()),
+            exec: None,
+            net: Some(hub.clone()),
+        },
+        quick(),
+    );
+    (b, vault, session, hub)
+}
+
+/// P3-7-3c — whether a connection ended: closed by the other end, or
+/// refused, within `within`.
+#[cfg(feature = "vault")]
+async fn ended(s: &mut tokio::net::TcpStream, within: Duration) -> bool {
+    let mut buf = [0u8; 16];
+    matches!(
+        tokio::time::timeout(within, tokio::io::AsyncReadExt::read(s, &mut buf)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    )
+}
+
+/// P3-7-3c — whether `port` on loopback is dialled in vain, within `WAIT`:
+/// its listener is gone.
+#[cfg(feature = "vault")]
+async fn nothing_listens_on(port: u16) -> bool {
+    for _ in 0..40 {
+        match tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", port))).await
+        {
+            Ok(Err(_)) => return true,
+            Ok(Ok(s)) => drop(s),
+            Err(_) => return false,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// P3-7-3c — `net_socks` and `net_forward` are offered where the device's
+/// owner offers its sessions egress and the vault is offered, and nowhere
+/// else: elsewhere they are unknown tools, and the vault is asked nothing.
+/// Their settings names are the names offered, under the `roomler` server.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn the_net_tools_are_offered_only_where_the_owner_offers_egress() {
+    let names = |list: &Value| -> Vec<String> {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let vault = Arc::new(FakeVault::default());
+    let hub = crate::tunnel::client_mgr::TunnelClientHub::new("test".into());
+    // The vault without egress, and egress without the vault.
+    let offers: [(Option<Arc<dyn VaultTools>>, _); 2] =
+        [(Some(vault.clone()), None), (None, Some(hub.clone()))];
+    for (offered, net) in offers {
+        let b = belt_running(
+            me(),
+            Run {
+                session: ObjectId::new(),
+                fence: 1,
+                vault: offered,
+                exec: None,
+                net,
+            },
+            quick(),
+        );
+        let mut c = Client::connect(&b).await;
+        c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+            .await;
+        let listed = names(&c.recv().await);
+        assert!(!listed.iter().any(|n| n.starts_with("net_")), "{listed:?}");
+        for (id, tool) in [(2, "net_socks"), (3, "net_forward")] {
+            c.send(tool_call(
+                id,
+                tool,
+                json!({"exit": ObjectId::new().to_hex()}),
+            ))
+            .await;
+            assert_eq!(c.recv().await["error"]["code"], -32602, "not offered here");
+        }
+    }
+    assert!(vault.nets.lock().unwrap().is_empty(), "nothing asked");
+    assert!(hub.flows_snapshot().is_empty(), "nothing opened");
+
+    let (b, vault, _, _) = net_belt(FakeVault::default(), 1);
+    let mut c = Client::connect(&b).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let list = c.recv().await;
+    let listed = names(&list);
+    let net = &listed[listed.len() - 2..];
+    assert_eq!(net, ["net_socks", "net_forward"], "{list}");
+    let tools = list["result"]["tools"].as_array().unwrap();
+    for t in &tools[tools.len() - 2..] {
+        assert_eq!(t["annotations"]["readOnlyHint"], false, "{t}");
+        assert_eq!(t["annotations"]["openWorldHint"], true, "{t}");
+    }
+    assert_eq!(
+        tools[tools.len() - 1]["inputSchema"]["required"],
+        json!(["exit", "host", "port"]),
+        "{list}"
+    );
+    let named: Vec<String> = net.iter().map(|n| format!("mcp__roomler__{n}")).collect();
+    assert_eq!(
+        named, NET_TOOLS,
+        "what the settings ask a person about is what is offered"
+    );
+    assert!(
+        vault.nets.lock().unwrap().is_empty(),
+        "listing the tools asks the vault nothing"
+    );
+}
+
+/// P3-7-3c — `net_socks` asks the vault for the session's run, serves a
+/// SOCKS5 proxy on loopback whose URL carries the session's id and a
+/// capability made for that listener, and holds a connection from the
+/// session's account. The answer carries no grant token, and the tool opens
+/// no approval of its own: the harness asked one before calling it. When
+/// the run ends here, its listeners end, and every connection they held.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn net_socks_serves_a_proxy_for_the_sessions_run_until_it_ends() {
+    use super::super::net_tools::{DEFAULT_TTL_SECS, drop_run};
+    let (mut b, vault, sid, hub) = net_belt(FakeVault::default(), 3);
+    let exit = ObjectId::new();
+    let mut c = Client::connect(&b).await;
+    let answer = net_answer(
+        &mut c,
+        1,
+        "net_socks",
+        json!({"exit": exit.to_hex(), "ttl_s": 60}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *vault.nets.lock().unwrap(),
+        [crate::vault::NetAsk {
+            session_id: sid,
+            fence: 3,
+            exit,
+            dst: None,
+            ttl_secs: 60,
+        }]
+    );
+    assert_eq!(answer["host"], "127.0.0.1");
+    let port = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let proxy = answer["proxy"].as_str().unwrap();
+    let (user, rest) = proxy
+        .strip_prefix("socks5h://")
+        .and_then(|p| p.split_once(':'))
+        .unwrap();
+    let (capability, at) = rest.split_once('@').unwrap();
+    assert_eq!(user, sid.to_hex(), "the session's id: {proxy}");
+    assert_eq!(capability.len(), 64, "{proxy}");
+    assert!(capability.bytes().all(|b| b.is_ascii_hexdigit()), "{proxy}");
+    assert_eq!(at, format!("127.0.0.1:{port}"));
+    let expires = answer["expires_in_secs"].as_u64().unwrap();
+    assert!((58..=60).contains(&expires), "{answer}");
+    assert!(
+        !answer.to_string().contains("grant-of-"),
+        "the grant's token stays on the device: {answer}"
+    );
+    assert!(
+        b.events.try_recv().is_err(),
+        "the tool opens no approval of its own"
+    );
+    // The flow is the hub's, shown without its credential.
+    let shown = hub.flows_snapshot();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].local_addr, format!("127.0.0.1:{port}"));
+    assert!(
+        !format!("{shown:?}").contains(capability),
+        "the capability is not shown: {shown:?}"
+    );
+
+    // The session's account is admitted, and held: no carrier here.
+    let mut held = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert!(
+        !ended(&mut held, Duration::from_millis(300)).await,
+        "held open"
+    );
+
+    // Another listener, with a capability of its own and the default time.
+    let again = net_answer(&mut c, 2, "net_socks", json!({"exit": exit.to_hex()}))
+        .await
+        .unwrap();
+    assert_ne!(again["proxy"], answer["proxy"]);
+    assert_eq!(vault.nets.lock().unwrap()[1].ttl_secs, DEFAULT_TTL_SECS);
+
+    // The run ends here: both listeners end, and what they held.
+    assert_eq!(drop_run(sid, 3), 2);
+    assert!(ended(&mut held, WAIT).await, "the held connection ended");
+    assert!(nothing_listens_on(port).await, "the listener is gone");
+    assert!(hub.flows_snapshot().is_empty());
+    assert_eq!(drop_run(sid, 3), 0, "nothing left to end");
+}
+
+/// P3-7-3c — `net_forward` asks for the destination as the session names
+/// it, and serves the one the vault granted, in the vault's spelling; its
+/// answer is an address, with no credential.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn net_forward_serves_the_one_destination_the_vault_granted() {
+    let (b, vault, sid, hub) = net_belt(FakeVault::default(), 4);
+    let exit = ObjectId::new();
+    let mut c = Client::connect(&b).await;
+    let answer = net_answer(
+        &mut c,
+        1,
+        "net_forward",
+        json!({"exit": exit.to_hex(), "host": "DB.Internal.", "port": 5432}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        vault.nets.lock().unwrap()[0].dst,
+        Some(("DB.Internal.".to_string(), 5432))
+    );
+    assert_eq!(answer["destination"], "db.internal:5432");
+    let port = answer["port"].as_u64().unwrap();
+    assert_eq!(answer["address"], format!("127.0.0.1:{port}"));
+    assert!(answer.get("proxy").is_none(), "{answer}");
+    let shown = hub.flows_snapshot();
+    assert_eq!(shown[0].target.as_deref(), Some("db.internal:5432"));
+    assert_eq!(super::super::net_tools::drop_run(sid, 4), 1);
+}
+
+/// P3-7-3c — a refusal from the vault opens no listener and is the
+/// session's answer; a call the device refuses asks the vault nothing.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_refused_net_call_opens_no_listener() {
+    let (b, vault, sid, hub) = net_belt(
+        FakeVault {
+            net_refusal: Some("the vault refused: no_role".into()),
+            ..FakeVault::default()
+        },
+        5,
+    );
+    let exit = ObjectId::new().to_hex();
+    let mut c = Client::connect(&b).await;
+    assert_eq!(
+        net_answer(&mut c, 1, "net_socks", json!({"exit": exit})).await,
+        Err("the vault refused: no_role".into())
+    );
+    assert!(hub.flows_snapshot().is_empty(), "no listener");
+    for (id, tool, bad) in [
+        (2, "net_socks", json!({})),
+        (3, "net_socks", json!({"exit": "mars"})),
+        (4, "net_forward", json!({"exit": exit, "port": 5432})),
+        (
+            5,
+            "net_forward",
+            json!({"exit": exit, "host": "db", "port": 0}),
+        ),
+    ] {
+        assert!(net_answer(&mut c, id, tool, bad).await.is_err());
+    }
+    assert_eq!(vault.nets.lock().unwrap().len(), 1, "nothing more asked");
+    assert_eq!(super::super::net_tools::drop_run(sid, 5), 0);
+}
+
+/// P3-7-3c — a run holds a bounded number of listeners: one more is refused
+/// before the vault is asked, and a listener that ended (its grant's end,
+/// a refusal) gives its place back.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_run_holds_a_bounded_number_of_net_listeners() {
+    use super::super::net_tools::{MAX_FLOWS, drop_run};
+    let (b, vault, sid, hub) = net_belt(FakeVault::default(), 6);
+    let exit = ObjectId::new().to_hex();
+    let mut c = Client::connect(&b).await;
+    let mut first = None;
+    for id in 0..MAX_FLOWS as u64 {
+        let answer = net_answer(&mut c, id, "net_socks", json!({"exit": exit}))
+            .await
+            .unwrap();
+        first.get_or_insert(answer["port"].as_u64().unwrap());
+    }
+    let refused = net_answer(
+        &mut c,
+        100,
+        "net_forward",
+        json!({"exit": exit, "host": "db", "port": 22}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("egress listeners already"), "{refused}");
+    assert_eq!(vault.nets.lock().unwrap().len(), MAX_FLOWS, "nothing asked");
+    // The first one ends as the hub ends a flow at its grant's end.
+    let first = format!("127.0.0.1:{}", first.unwrap());
+    let flow = hub
+        .flows_snapshot()
+        .into_iter()
+        .find(|f| f.local_addr == first)
+        .unwrap();
+    assert!(hub.kill_flow(&flow.id));
+    net_answer(
+        &mut c,
+        101,
+        "net_forward",
+        json!({"exit": exit, "host": "db", "port": 22}),
+    )
+    .await
+    .expect("its place is given back");
+    assert_eq!(drop_run(sid, 6), MAX_FLOWS);
+}
+
+/// P3-7-3c — a connection from any account but the session's is closed at
+/// once, while the listener lives on: here the session's account is
+/// another's, so this test's own connection is the one refused.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_net_connection_from_another_account_is_refused() {
+    let vault = FakeVault::default();
+    let hub = crate::tunnel::client_mgr::TunnelClientHub::new("test".into());
+    #[cfg(unix)]
+    let other = me().wrapping_add(4242);
+    // SYSTEM, unless this test is SYSTEM: then LOCAL SERVICE.
+    #[cfg(windows)]
+    let other = match me().as_str() {
+        "S-1-5-18" => "S-1-5-19",
+        _ => "S-1-5-18",
+    }
+    .to_string();
+    let sid = ObjectId::new();
+    let answer = super::super::net_tools::call(
+        "net_socks",
+        &vault,
+        &hub,
+        sid,
+        7,
+        other,
+        &json!({"exit": ObjectId::new().to_hex()}),
+    )
+    .await
+    .unwrap();
+    let port = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut refused = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert!(
+        ended(&mut refused, WAIT).await,
+        "a connection from another account is closed"
+    );
+    assert_eq!(hub.flows_snapshot().len(), 1, "the listener lives on");
+    assert_eq!(super::super::net_tools::drop_run(sid, 7), 1);
 }
 
 /// More open approvals than Claude Code ever asks for, and a question the

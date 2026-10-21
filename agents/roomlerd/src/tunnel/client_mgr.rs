@@ -101,6 +101,15 @@ fn session_ran(elapsed: Duration) -> bool {
 // The hub — shared demux + flow registry
 // ---------------------------------------------------------------------------
 
+/// FR-90 P3-7-3c — the primary enrollment's hub ([`TunnelClientHub::set_primary`]).
+static PRIMARY: std::sync::OnceLock<TunnelClientHub> = std::sync::OnceLock::new();
+
+/// FR-90 P3-7-3c — the primary enrollment's hub, once the daemon built it:
+/// where an agent session's tools open its own egress.
+pub fn primary() -> Option<TunnelClientHub> {
+    PRIMARY.get().cloned()
+}
+
 /// Shared tunnel-client state: the reply demux + the supervised-flow registry +
 /// the live agent-WS egress handle. Cheap to clone (an `Arc` inside).
 #[derive(Clone)]
@@ -271,6 +280,14 @@ impl TunnelClientHub {
                 seq: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// FR-90 P3-7-3c — make this the primary enrollment's hub, where an agent
+    /// session's own egress opens its flows: sessions run on the primary
+    /// alone, as leases do. The daemon calls it once, as it builds the hub;
+    /// a later call is ignored.
+    pub fn set_primary(&self) {
+        let _ = PRIMARY.set(self.clone());
     }
 
     /// Publish the live agent-WS egress so flow supervisors can open sessions.
