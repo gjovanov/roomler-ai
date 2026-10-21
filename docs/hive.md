@@ -510,7 +510,7 @@ sequenceDiagram
 | Only a driver's grant answers; a reader's `answer` is refused on the device | | device [`view.rs:1033`](../agents/roomlerd/src/hive/view.rs#L1033) |
 | Unanswered for 25 minutes is a denial that says so. Progress goes to Claude Code every 60 s while a person decides, and the tool-call timeout in the MCP config is 30 minutes | what the model reads is our answer, never a transport error | [`toolbelt.rs:102`](../agents/roomlerd/src/hive/toolbelt.rs#L102) |
 | At most 4 approvals are open per session, and a fifth is refused at once | Claude Code asks one at a time (measured), so more is not Claude Code | [`toolbelt.rs:108`](../agents/roomlerd/src/hive/toolbelt.rs#L108) |
-| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1308`](../agents/roomlerd/src/hive/toolbelt.rs#L1308) |
+| The harness letting go (`notifications/cancelled`, a closed relay), a stop, or the session's end withdraws an open approval | | [`toolbelt.rs:1309`](../agents/roomlerd/src/hive/toolbelt.rs#L1309) |
 | A denial reaches the model as a failed tool result with our words verbatim, for example "Alice denied this: not now" | the model knows who said no, and why | |
 
 ---
@@ -1536,7 +1536,7 @@ The device advertises `hive-replica` while its owner's `hive_replica` is on and 
 opened, and `hive-archive` while `hive_archive` is on too
 ([`caps.rs:1833`](../agents/roomlerd/src/encode/caps.rs#L1833)). A secondary org's
 connection strips both words, in its hello and in every heartbeat that re-announces the
-caps ([`signaling.rs:6472`](../agents/roomlerd/src/signaling.rs#L6472)), so that org's
+caps ([`signaling.rs:6503`](../agents/roomlerd/src/signaling.rs#L6503)), so that org's
 placement never picks this device.
 
 ⚠️ **Only a device with copies to tell about sends a replica frame**
@@ -4160,7 +4160,7 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | A frame of its own, `rc:hive.search.grant`, never a field on the view grant. The device answers it as a view grant (`rc:hive.view.grant_ack`), and the peer rides the view's offer, ICE, renewal and close frames, keyed by the grant | a build before it must never read a search grant as a view of one session; the handshake is the one a view already proves | [`signaling.rs:4323`](../crates/remote_control/src/signaling.rs#L4323), [`view.rs:235`](../agents/roomlerd/src/hive/view.rs#L235) |
-| Sent only where the connection advertises `hive-search`: a build with `hive_archive` and `hive_replica` on. Matched by equality, and stripped from a secondary organization's connection with the other replica words | `hive` is its prefix and not the same promise: a build before it drops the grant, and the member would wait for an answer that never comes | [`models.rs:1024`](../crates/remote_control/src/models.rs#L1024), [`caps.rs:1870`](../agents/roomlerd/src/encode/caps.rs#L1870), [`signaling.rs:6482`](../agents/roomlerd/src/signaling.rs#L6482) |
+| Sent only where the connection advertises `hive-search`: a build with `hive_archive` and `hive_replica` on. Matched by equality, and stripped from a secondary organization's connection with the other replica words | `hive` is its prefix and not the same promise: a build before it drops the grant, and the member would wait for an answer that never comes | [`models.rs:1024`](../crates/remote_control/src/models.rs#L1024), [`caps.rs:1870`](../agents/roomlerd/src/encode/caps.rs#L1870), [`signaling.rs:6513`](../agents/roomlerd/src/signaling.rs#L6513) |
 | The device's own gates at every grant: the primary organization; an archive replica, by its owner's `hive_archive` and `hive_replica`, whatever the server asks; at most 500 sessions, the store's own bound on a filter, the two tied at compile time | a gate the server cannot open: a device that is no archive replica answers no search, whatever a server that may be compromised sends | [`view.rs:431`](../agents/roomlerd/src/hive/view.rs#L431), [`view.rs:85`](../agents/roomlerd/src/hive/view.rs#L85) |
 | What is searched: the sessions the grant names that the device holds a copy of, and nothing else. One named that it holds no copy of is left out; a copy it holds that the grant does not name is never searched, nor a session it ran itself. None left is `no_session` | the server names what the member may read; the device can narrow that, never widen it | [`view.rs:470`](../agents/roomlerd/src/hive/view.rs#L470) |
 | At most 8 searches a device, within its 32 viewers. A search is no session's viewer | a search is not a seat at one session's table, and a device's peers stay bounded | [`view.rs:495`](../agents/roomlerd/src/hive/view.rs#L495) |

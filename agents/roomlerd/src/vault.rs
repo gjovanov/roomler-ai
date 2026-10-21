@@ -108,7 +108,7 @@ mod client {
     use bson::oid::ObjectId;
     use roomler_ai_remote_control::signaling::ClientMsg;
     use roomler_ai_remote_control::vault::{
-        LeaseRefusal, VaultActivityKind, VaultSecretMeta, lease_limits,
+        LeaseRefusal, NetKind, VaultActivityKind, VaultSecretMeta, canonical_net_host, lease_limits,
     };
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, info, warn};
@@ -196,6 +196,9 @@ mod client {
         NoAnswer,
         /// The answer did not open with this daemon's key.
         Unopenable,
+        /// FR-90 P3-7-3a — the answer grants something other than what was
+        /// asked: refused here, never used.
+        NotAsked,
     }
 
     struct Held {
@@ -299,6 +302,95 @@ mod client {
         pub more: bool,
     }
 
+    /// FR-90 P3-7-3a — what a session asks for its own egress
+    /// (`rc:vault.net`): flows that exit through `exit`, to anywhere (SOCKS)
+    /// or to one destination (a forward).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NetAsk {
+        pub session_id: ObjectId,
+        /// The fence the session runs at here.
+        pub fence: u64,
+        /// The device the flows exit through.
+        pub exit: ObjectId,
+        /// A forward's destination, as the session names it; `None` for SOCKS.
+        pub dst: Option<(String, u16)>,
+        pub ttl_secs: u32,
+    }
+
+    /// FR-90 P3-7-3a — the vault's grant of a session's own egress: what a
+    /// tunnel presents at its open (`tunnel_core::driver::SessionGrantRef`).
+    ///
+    /// ⚠️ `token` is a credential until its end: `Debug` names the grant by
+    /// its id alone, and nothing logs the token.
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct NetGrant {
+        pub grant_id: String,
+        pub token: String,
+        /// A forward's destination exactly as granted: its host in
+        /// `canonical_net_host`'s spelling, which the device dials. `None`
+        /// for SOCKS.
+        pub dst: Option<(String, u16)>,
+        /// When it ends, on this daemon's clock: the vault's end, and never
+        /// later than the longest a grant lives (`lease_limits::MAX_TTL_SECS`)
+        /// from its answer.
+        pub until: Instant,
+    }
+
+    impl std::fmt::Debug for NetGrant {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NetGrant")
+                .field("grant_id", &self.grant_id)
+                .field("dst", &self.dst)
+                .field("until", &self.until)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl NetGrant {
+        /// What the tunnel presents at its open.
+        pub fn tunnel_ref(&self) -> tunnel_core::driver::SessionGrantRef {
+            tunnel_core::driver::SessionGrantRef {
+                token: self.token.clone(),
+                grant_id: self.grant_id.clone(),
+            }
+        }
+    }
+
+    /// FR-90 P3-7-3a — the grant an answer makes, if it grants what was
+    /// asked: a forward its one destination in the vault's spelling, SOCKS
+    /// none. An answer for anything else is refused here, never used.
+    fn net_granted(
+        ask: &NetAsk,
+        grant_id: &str,
+        token: &str,
+        expires_at_ms: i64,
+        host: &str,
+        port: u16,
+    ) -> Result<NetGrant, LeaseError> {
+        let dst = match &ask.dst {
+            Some((asked, asked_port)) => {
+                if canonical_net_host(asked).as_deref() != Some(host) || port != *asked_port {
+                    return Err(LeaseError::NotAsked);
+                }
+                Some((host.to_string(), port))
+            }
+            None if host.is_empty() && port == 0 => None,
+            None => return Err(LeaseError::NotAsked),
+        };
+        if grant_id.is_empty() || token.is_empty() {
+            return Err(LeaseError::NotAsked);
+        }
+        // As a lease's: the server's end on this clock, never past the ceiling.
+        let left =
+            (expires_at_ms - now_ms()).clamp(0, i64::from(lease_limits::MAX_TTL_SECS) * 1000);
+        Ok(NetGrant {
+            grant_id: grant_id.to_string(),
+            token: token.to_string(),
+            dst,
+            until: Instant::now() + Duration::from_millis(u64::try_from(left).unwrap_or(0)),
+        })
+    }
+
     /// What a request waits for, by kind.
     enum Waiting {
         Lease {
@@ -310,6 +402,11 @@ mod client {
         },
         Describe {
             reply: oneshot::Sender<Result<VaultSecretMeta, LeaseError>>,
+        },
+        /// FR-90 P3-7-3a.
+        Net {
+            ask: NetAsk,
+            reply: oneshot::Sender<Result<NetGrant, LeaseError>>,
         },
     }
 
@@ -324,6 +421,9 @@ mod client {
                     let _ = reply.send(Err(why));
                 }
                 Self::Describe { reply } => {
+                    let _ = reply.send(Err(why));
+                }
+                Self::Net { reply, .. } => {
                     let _ = reply.send(Err(why));
                 }
             }
@@ -583,6 +683,32 @@ mod client {
             self.wait(&req_id, answer, ANSWER_DEADLINE).await
         }
 
+        /// FR-90 P3-7-3a — ask the vault for a session's own egress
+        /// (`rc:vault.net`): SOCKS through `ask.exit`, or a forward to one
+        /// destination. The vault decides by its policies (`net:socks`,
+        /// `net:forward`) and answers with a grant the tunnel presents at its
+        /// open, which the network module holds every flow of it to.
+        pub async fn net(&self, ask: NetAsk) -> Result<NetGrant, LeaseError> {
+            let req_id = new_req_id();
+            let (kind, host, port) = match &ask.dst {
+                Some((host, port)) => (NetKind::Forward, host.clone(), *port),
+                None => (NetKind::Socks, String::new(), 0),
+            };
+            let frame = ClientMsg::VaultNet {
+                req_id: req_id.clone(),
+                session_id: ask.session_id,
+                fence: ask.fence,
+                exit: ask.exit,
+                kind: kind.wire().to_string(),
+                host,
+                port,
+                ttl_secs: ask.ttl_secs,
+            };
+            let (reply, answer) = oneshot::channel();
+            self.send(&req_id, frame, Waiting::Net { ask, reply })?;
+            self.wait(&req_id, answer, ANSWER_DEADLINE).await
+        }
+
         /// `rc:vault.leased`: open it, hold it, and answer the request.
         pub fn on_leased(
             &self,
@@ -687,6 +813,36 @@ mod client {
                 }
                 Some(other) => other.fail(LeaseError::NoAnswer),
                 None => debug!(req_id, "vault: a description nobody here waits for"),
+            }
+        }
+
+        /// FR-90 P3-7-3a — `rc:vault.net.granted`: answer the request with
+        /// its grant, if it grants what was asked. Never logs the token.
+        pub fn on_net_granted(
+            &self,
+            req_id: &str,
+            grant_id: &str,
+            token: &str,
+            expires_at_ms: i64,
+            host: &str,
+            port: u16,
+        ) {
+            match lock(&self.pending).remove(req_id) {
+                Some(Waiting::Net { ask, reply }) => {
+                    let granted = net_granted(&ask, grant_id, token, expires_at_ms, host, port);
+                    if granted.is_err() {
+                        warn!(
+                            req_id,
+                            grant_id,
+                            host,
+                            port,
+                            "vault: a grant for something other than was asked — refused"
+                        );
+                    }
+                    let _ = reply.send(granted);
+                }
+                Some(other) => other.fail(LeaseError::NoAnswer),
+                None => debug!(req_id, grant_id, "vault: a grant nobody here waits for"),
             }
         }
 
@@ -940,6 +1096,23 @@ mod client {
         CLIENT.on_described(req_id, secret);
     }
 
+    /// FR-90 P3-7-3a — the daemon's [`Client::net`].
+    pub async fn net(ask: NetAsk) -> Result<NetGrant, LeaseError> {
+        CLIENT.net(ask).await
+    }
+
+    /// FR-90 P3-7-3a — the daemon's [`Client::on_net_granted`].
+    pub fn on_net_granted(
+        req_id: &str,
+        grant_id: &str,
+        token: &str,
+        expires_at_ms: i64,
+        host: &str,
+        port: u16,
+    ) {
+        CLIENT.on_net_granted(req_id, grant_id, token, expires_at_ms, host, port);
+    }
+
     /// The daemon's [`Client::drop_run`]: hive's supervisor calls it when a
     /// run stops being live here.
     pub fn drop_run(session: ObjectId, fence: u64) {
@@ -1036,7 +1209,7 @@ mod tests {
     #[cfg(feature = "vault")]
     mod client {
         use std::sync::Arc;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         use base64::Engine;
         use bson::oid::ObjectId;
@@ -1044,7 +1217,9 @@ mod tests {
         use roomler_ai_remote_control::vault::{VaultActivityKind, VaultSecretMeta, lease_limits};
         use tokio::sync::mpsc;
 
-        use super::super::{Client, LeaseAsk, LeaseError, LeaseInfo, Listing, Report, hello_key};
+        use super::super::{
+            Client, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, Report, hello_key,
+        };
         use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, fake_mysql, made};
 
         fn in_ms(ms: i64) -> i64 {
@@ -1180,6 +1355,118 @@ mod tests {
                 ClientMsg::VaultLease { req_id, .. } => req_id,
                 other => panic!("{other:?}"),
             }
+        }
+
+        fn net_ask(dst: Option<(&str, u16)>) -> NetAsk {
+            NetAsk {
+                session_id: ObjectId::new(),
+                fence: 2,
+                exit: ObjectId::new(),
+                dst: dst.map(|(h, p)| (h.to_string(), p)),
+                ttl_secs: 300,
+            }
+        }
+
+        /// FR-90 P3-7-3a — ask for a session's egress and answer the
+        /// `rc:vault.net` it sends with `answer`; the asker's result.
+        async fn granted_as(
+            c: &Arc<Client>,
+            rx: &mut mpsc::Receiver<ClientMsg>,
+            ask: NetAsk,
+            answer: impl FnOnce(&Client, &str),
+        ) -> Result<NetGrant, LeaseError> {
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.net(ask).await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultNet { req_id, .. } => req_id,
+                other => panic!("{other:?}"),
+            };
+            answer(c.as_ref(), &req_id);
+            asker.await.unwrap()
+        }
+
+        /// FR-90 P3-7-3a — a session's egress goes out as `rc:vault.net`,
+        /// naming what it asks, and its grant comes back to its asker: a
+        /// forward's destination in the vault's one spelling, SOCKS with
+        /// none, and its end no later than the ceiling from now. `Debug`
+        /// never shows the token.
+        #[tokio::test]
+        async fn a_net_grant_comes_back_to_its_asker() {
+            let (c, mut rx) = connected();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.net(net_ask(Some(("DB.Internal.", 5432)))).await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultNet {
+                    req_id,
+                    fence,
+                    kind,
+                    host,
+                    port,
+                    ttl_secs,
+                    ..
+                } => {
+                    assert_eq!(
+                        (fence, kind.as_str(), host.as_str(), port, ttl_secs),
+                        (2, "forward", "DB.Internal.", 5432, 300)
+                    );
+                    req_id
+                }
+                other => panic!("{other:?}"),
+            };
+            // An end past the ceiling is held to it.
+            c.on_net_granted(
+                &req_id,
+                "g1",
+                "a.b.c",
+                in_ms(3_600_000),
+                "db.internal",
+                5432,
+            );
+            let g = asker.await.unwrap().expect("granted");
+            assert_eq!(g.grant_id, "g1");
+            assert_eq!(g.dst, Some(("db.internal".to_string(), 5432)));
+            assert!(
+                g.until
+                    <= Instant::now() + Duration::from_secs(u64::from(lease_limits::MAX_TTL_SECS))
+            );
+            assert_eq!(g.tunnel_ref().token, "a.b.c");
+            assert!(!format!("{g:?}").contains("a.b.c"), "{g:?}");
+
+            let socks = granted_as(&c, &mut rx, net_ask(None), |c, id| {
+                c.on_net_granted(id, "g2", "d.e.f", in_ms(60_000), "", 0)
+            })
+            .await
+            .expect("granted");
+            assert_eq!((socks.grant_id.as_str(), socks.dst), ("g2", None));
+        }
+
+        /// FR-90 P3-7-3a — a grant for anything but what was asked is refused
+        /// here, never used: another destination, another port, a destination
+        /// for SOCKS, no token. A refusal answers in the vault's own word.
+        #[tokio::test]
+        async fn a_net_grant_for_anything_else_is_refused() {
+            let (c, mut rx) = connected();
+            for (dst, token, host, port) in [
+                (Some(("db.internal", 5432)), "t", "other.internal", 5432),
+                (Some(("db.internal", 5432)), "t", "db.internal", 22),
+                (None, "t", "db.internal", 5432),
+                (None, "", "", 0),
+            ] {
+                let got = granted_as(&c, &mut rx, net_ask(dst), |c, id| {
+                    c.on_net_granted(id, "g1", token, in_ms(60_000), host, port)
+                })
+                .await;
+                assert_eq!(got, Err(LeaseError::NotAsked), "{dst:?} {host}:{port}");
+            }
+            let refused = granted_as(&c, &mut rx, net_ask(None), |c, id| {
+                c.on_refused(id, "no_exit", None)
+            })
+            .await;
+            assert_eq!(refused, Err(LeaseError::Refused("no_exit".into())));
         }
 
         /// P3-4e-2 — the next lease request on the connection, within a

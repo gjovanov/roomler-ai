@@ -6281,6 +6281,37 @@ async fn handle_server_msg(
             #[cfg(not(feature = "vault"))]
             let _ = (lease_ids, reason);
         }
+        // FR-90 P3-7-3a — the vault's grant of a session's own egress, the
+        // answer to this daemon's `rc:vault.net`: the primary's only, as a
+        // lease is. Never logged with the frame (nor by the catch-all below,
+        // which would): `grant` is a credential until its end.
+        ServerMsg::VaultNetGranted {
+            req_id,
+            grant_id,
+            grant,
+            expires_at_ms,
+            host,
+            port,
+        } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_net_granted(
+                    &req_id,
+                    &grant_id,
+                    &grant,
+                    expires_at_ms,
+                    &host,
+                    port,
+                );
+            } else {
+                debug!(%grant_id, "rc:vault.net.granted on a secondary org's connection — dropped");
+            }
+            #[cfg(not(feature = "vault"))]
+            {
+                let _ = (req_id, grant, expires_at_ms, host, port);
+                debug!(%grant_id, "rc:vault.net.granted ignored — this build asks for none");
+            }
+        }
         // FR-52 P3c — an outsider's login, relayed by the server. Answered in
         // a task, not inline: the live config read waits on the config lock,
         // which `rc password set` holds across an Argon2 derivation, and the
