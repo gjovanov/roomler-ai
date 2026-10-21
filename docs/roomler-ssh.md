@@ -1340,7 +1340,7 @@ sequenceDiagram
     D->>N: rc:ssh.request {target, public key, session_secs, ssh_ticket}
     N-->>D: rc:ssh.response {address, port, host_pubkey, ssh_ticket_id}
     D->>D: the echo is this ticket's, and a host key is named? (else nothing dials)
-    D->>T: dial the overlay address; pin the host key; one exec
+    D->>T: dial the overlay address, pin the host key, one exec
     T-->>D: exit status, stdout, stderr
 ```
 
