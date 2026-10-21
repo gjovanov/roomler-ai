@@ -39,7 +39,7 @@ use roomler_ai_remote_control::{
         ClientMsg, CloseReason, REJECT_REASON_NO_SESSION, REJECT_REASON_SESSION_MISMATCH,
         RejectKind, ServerMsg,
     },
-    vault::{NetKind, canonical_net_host},
+    vault::{NET_GRANT_REFUSED, NetKind, canonical_net_host},
 };
 use roomler_ai_services::auth::AuthService;
 use std::sync::Arc;
@@ -841,7 +841,7 @@ async fn handle_tunnel_open(
                     &orig.outbound_tx,
                     ServerMsg::Error {
                         session_id: None,
-                        code: "net_grant_refused".into(),
+                        code: NET_GRANT_REFUSED.into(),
                         message: why.into(),
                         open_nonce: open_nonce.clone(),
                     },

@@ -56,7 +56,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, info, warn};
 use tunnel_core::driver::{
-    Carrier, Establishment, SessionParams, Target, TransportPref, establish_tunnel_session,
+    Carrier, Establishment, GrantError, SessionGrantRef, SessionParams, Target, TransportPref,
+    establish_tunnel_session,
 };
 use tunnel_core::flow_listener::{FlowListener, HoldPolicy};
 use tunnel_core::forward::SessionThroughput;
@@ -184,6 +185,11 @@ pub(crate) struct FlowLive {
     /// #1685 — when the supervisor's current backoff sleep ends; `None`
     /// while an attempt is in flight. Read as `next_retry_secs`.
     retry_at: Mutex<Option<std::time::Instant>>,
+    /// FR-90 P3-7-3a — the agent session's grant this flow's tunnels are
+    /// opened under, every attempt and every re-upgrade candidate alike: the
+    /// tunnel carries the session's flows or none. `None` for the daemon's
+    /// own flows (declared routes, LocalAPI forwards).
+    net_grant: Option<SessionGrantRef>,
 }
 
 impl FlowLive {
@@ -385,6 +391,8 @@ impl TunnelClientHub {
             Target::Static { host, port },
             pref,
             start,
+            // The daemon's own forward: no session's grant.
+            None,
         );
         info!(flow = %id, %node, local, %remote, ?pref, start, "created daemon forward");
         Ok(id)
@@ -411,6 +419,8 @@ impl TunnelClientHub {
             pref,
             // SOCKS5 has no start-transport lever (the FR-86 P2 field test drives
             // a static forward); it always starts on the normal ladder.
+            None,
+            // The daemon's own listener: no session's grant.
             None,
         );
         info!(flow = %id, %node, local, ?pref, "created daemon socks5 listener");
@@ -529,9 +539,14 @@ impl TunnelClientHub {
         // FR-86 P2 — force the FIRST session's transport (a below-best carrier
         // for the field test); `None` = the normal ladder.
         start_transport: Option<&'static str>,
+        // FR-90 P3-7-3a — an agent session's grant: the flow is the session's.
+        net_grant: Option<SessionGrantRef>,
     ) -> String {
         let id = format!("fl-{}", self.inner.seq.fetch_add(1, Ordering::Relaxed));
-        let live = Arc::new(FlowLive::default());
+        let live = Arc::new(FlowLive {
+            net_grant,
+            ..FlowLive::default()
+        });
         let handle = tokio::spawn(run_flow_supervisor(
             self.clone(),
             id.clone(),
@@ -1635,7 +1650,14 @@ fn flow_retry_jitter(flow_id: &str, attempt: u64) -> Duration {
 /// ACL denies are NOT here: they arrive as `TcpForwardReject` per
 /// connection while the session stays up, and a policy edit heals them
 /// live. Anything unrecognised stays retryable (the pre-P6 behaviour).
+///
+/// FR-90 P3-7-3a — a session's grant the server refused or did not bind is
+/// permanent too, by its type: opening again would present the same grant to
+/// the same server. The session asks the vault for another.
 fn permanent_session_error(e: &anyhow::Error) -> Option<String> {
+    if e.downcast_ref::<GrantError>().is_some() {
+        return Some(format!("{e:#}"));
+    }
     let msg = format!("{e:#}");
     let lower = msg.to_ascii_lowercase();
     if lower.contains("revoked") || lower.contains("cross_tenant") {
@@ -1877,6 +1899,9 @@ async fn drive_attempt(
             // bind to be told about: the supervisor flips `Up` itself when it
             // installs the carrier (#1685's ONE event, one step later).
             on_listening: None,
+            // FR-90 P3-7-3a — a session's flow presents its grant at every
+            // open; the daemon's own flows present none.
+            net_grant: live.net_grant.clone(),
         },
         supported,
         request,
@@ -2867,5 +2892,22 @@ mod tests {
             entry_present_at_drop.load(Ordering::SeqCst),
             "the carrier is dropped BEFORE the entry is removed (and never under the demux lock)"
         );
+    }
+
+    /// FR-90 P3-7-3a — a session's grant the server refused or did not bind
+    /// ends the flow: opening again would present the same grant to the same
+    /// server. Known by its type through the context the supervisor wraps it
+    /// in, while an ordinary open failure stays retryable.
+    #[test]
+    fn a_refused_or_unbound_grant_ends_the_flow() {
+        for e in [
+            GrantError::NotBound,
+            GrantError::Refused("a grant for another exit".into()),
+        ] {
+            let wrapped = anyhow::Error::from(e.clone()).context("tunnel session (flow fl-1)");
+            assert!(permanent_session_error(&wrapped).is_some(), "{e}");
+        }
+        let ordinary = anyhow::anyhow!("server error during tunnel.open: agent_offline: gone");
+        assert!(permanent_session_error(&ordinary).is_none());
     }
 }

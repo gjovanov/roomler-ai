@@ -352,6 +352,8 @@ async fn run_session(
             // #1685: one forward per process and no liveness state to
             // publish — the daemon's route reconciler is the consumer.
             on_listening: None,
+            // FR-90 P3-7-3a: a person's own tunnel, never a session's grant.
+            net_grant: None,
         },
         supported_transports,
         request_transport,
