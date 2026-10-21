@@ -536,6 +536,12 @@ pub struct Supervisor {
     /// P2e-5 — this device's own enrollment, which tells a move back (the
     /// session comes back where its state is) from a move here.
     agent_id: Option<ObjectId>,
+    /// FR-90 P3-8-2b-2 — how a session's `ssh_run` reaches another device:
+    /// this daemon's own SSH client, made at [`init`] from the daemon's
+    /// config, which knows how its overlay dials. None in a supervisor
+    /// built without one, and then `ssh_run` is not offered.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    ssh_runner: Option<Arc<dyn super::ssh_tools::SshRunner>>,
     /// P1j — the terminal sessions this device mirrors ([`adopt`]), on disk.
     adopted: Mutex<adopt::AdoptedFile>,
     /// P1j — adopt offers waiting for the server's word, by offer id.
@@ -770,6 +776,12 @@ pub fn init(cfg: &AgentConfig) {
         hosted,
     );
     sup.agent_id = ObjectId::parse_str(&cfg.agent_id).ok();
+    // FR-90 P3-8-2b-2 — the daemon's own SSH client, dialing as its overlay
+    // does; offered to a session only under `hive_ssh` ([`Supervisor::ssh_runner`]).
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    {
+        sup.ssh_runner = Some(Arc::new(super::ssh_tools::DaemonSsh::new(cfg)));
+    }
     let sup = Arc::new(sup);
     let _ = SUPERVISOR.set(Arc::clone(&sup));
     // P2g-3d — the device's own clock, for the copies its store keeps.
@@ -1459,6 +1471,18 @@ impl Supervisor {
         }
     }
 
+    /// FR-90 P3-8-2b-2 — how a session runs one command on another device
+    /// (`ssh_run`): where the vault is offered and the device's owner turned
+    /// `hive_ssh` on. None otherwise, and then `ssh_run` is not offered.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    fn ssh_runner(&self, vault: bool) -> Option<Arc<dyn super::ssh_tools::SshRunner>> {
+        if vault && self.cfg.ssh {
+            self.ssh_runner.clone()
+        } else {
+            None
+        }
+    }
+
     fn new(
         cfg: HiveConfig,
         runtime: PathBuf,
@@ -1500,6 +1524,8 @@ impl Supervisor {
             #[cfg(all(test, unix))]
             test_workplaces: Mutex::new(HashMap::new()),
             agent_id: None,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh_runner: None,
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -4231,13 +4257,20 @@ impl Supervisor {
         let net_tools = net.is_some();
         #[cfg(not(feature = "vault"))]
         let net_tools = false;
-        let settings =
-            write_settings(&self.runtime, &sid, vault.is_some(), net_tools).map_err(|e| {
-                (
-                    HiveRefusal::LaunchFailed,
-                    format!("writing the session settings: {e}"),
-                )
-            })?;
+        // FR-90 P3-8-2b-2 — and `ssh_run`, where the owner offers it.
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        let ssh = self.ssh_runner(vault.is_some());
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        let ssh_tools = ssh.is_some();
+        #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
+        let ssh_tools = false;
+        let settings = write_settings(&self.runtime, &sid, vault.is_some(), net_tools, ssh_tools)
+            .map_err(|e| {
+            (
+                HiveRefusal::LaunchFailed,
+                format!("writing the session settings: {e}"),
+            )
+        })?;
         // P1a — the toolbelt, whose `approve` is the session's permission
         // tool: every tool call that needs one waits for a driver. Its relay
         // is this binary, started by the harness AS THE SESSION'S ACCOUNT:
@@ -4277,6 +4310,8 @@ impl Supervisor {
             }),
             #[cfg(feature = "vault")]
             net,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh,
         };
         let toolbelt = toolbelt::open(&dir, owner, uid, run, approvals, self.approval_timing)
             .map_err(|e| {
@@ -4470,7 +4505,15 @@ impl Supervisor {
         let net_tools = net.is_some();
         #[cfg(not(feature = "vault"))]
         let net_tools = false;
-        let settings = write_settings(&self.runtime, &sid, vault.is_some(), net_tools)
+        // FR-90 P3-8-2b-2 — `ssh_run` runs nothing here, so Windows offers it
+        // as every other OS does.
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        let ssh = self.ssh_runner(vault.is_some());
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        let ssh_tools = ssh.is_some();
+        #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
+        let ssh_tools = false;
+        let settings = write_settings(&self.runtime, &sid, vault.is_some(), net_tools, ssh_tools)
             .map_err(|e| failed("writing the session settings", e))?;
         let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
         let run = toolbelt::Run {
@@ -4483,6 +4526,8 @@ impl Supervisor {
             exec: None,
             #[cfg(feature = "vault")]
             net,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh,
         };
         let toolbelt = toolbelt::open(peer, run, approvals, self.approval_timing)
             .map_err(|e| failed("opening the session's toolbelt", e))?;
@@ -4646,6 +4691,7 @@ fn write_settings(
     sid: &str,
     vault_tools: bool,
     net_tools: bool,
+    ssh_tools: bool,
 ) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     #[cfg(unix)]
@@ -4689,8 +4735,9 @@ fn write_settings(
         // (P3-4c-3) neither does asking a lease ahead, which hands nothing.
         allow_tools: vault_allow_tools(vault_tools),
         // P3-4c — and each of its uses asks one, whatever a repository's
-        // own settings allow; so does each egress listener (P3-7-3c).
-        ask_tools: vault_use_tools(vault_tools, net_tools),
+        // own settings allow; so does each egress listener (P3-7-3c), and
+        // each command run on another device (P3-8-2b-2).
+        ask_tools: vault_use_tools(vault_tools, net_tools, ssh_tools),
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
@@ -4716,17 +4763,23 @@ fn vault_allow_tools(vault_tools: bool) -> Vec<String> {
 ///
 /// FR-90 P3-7-3c — and a session's own egress, wherever it is offered: each
 /// call opens a listener the session reaches a network through.
-fn vault_use_tools(vault_tools: bool, net_tools: bool) -> Vec<String> {
+///
+/// FR-90 P3-8-2b-2 — and `ssh_run`, wherever it is offered: each call runs a
+/// command on another device, as whatever account that device maps.
+fn vault_use_tools(vault_tools: bool, net_tools: bool, ssh_tools: bool) -> Vec<String> {
     #[cfg(feature = "vault")]
     if vault_tools {
         let mut ask: Vec<String> = toolbelt::VAULT_USE_TOOLS.map(String::from).to_vec();
         if net_tools {
             ask.extend(toolbelt::NET_TOOLS.map(String::from));
         }
+        if ssh_tools {
+            ask.extend(toolbelt::SSH_TOOLS.map(String::from));
+        }
         return ask;
     }
     #[cfg(not(feature = "vault"))]
-    let _ = (vault_tools, net_tools);
+    let _ = (vault_tools, net_tools, ssh_tools);
     Vec::new()
 }
 
@@ -6345,6 +6398,7 @@ done
             archive: false,
             store_quota_mib: None,
             net: false,
+            ssh: false,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -7610,7 +7664,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "offered", true, false).unwrap();
+        write_settings(&runtime, "offered", true, false, false).unwrap();
         let offered = read("offered");
         #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
         let mut allowed: Vec<&str> = toolbelt::VAULT_TOOLS.to_vec();
@@ -7640,7 +7694,7 @@ done
                 "{offered}"
             );
         }
-        write_settings(&runtime, "not-offered", false, false).unwrap();
+        write_settings(&runtime, "not-offered", false, false, false).unwrap();
         let doc = read("not-offered");
         assert!(
             doc["permissions"].get("allow").is_none(),
@@ -7668,7 +7722,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "net", true, true).unwrap();
+        write_settings(&runtime, "net", true, true, false).unwrap();
         let doc = read("net");
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::NET_TOOLS);
@@ -7679,12 +7733,48 @@ done
                 "{tool} is never allowed without a person: {doc}"
             );
         }
-        write_settings(&runtime, "no-net", true, false).unwrap();
+        write_settings(&runtime, "no-net", true, false, false).unwrap();
         let doc = read("no-net");
         assert!(
             !doc["permissions"]["ask"].to_string().contains("net_"),
             "not offered, not named: {doc}"
         );
+    }
+
+    /// FR-90 P3-8-2b-2 — so is `ssh_run`: asked for on every call where it is
+    /// offered, after the egress tools when both are, never allowed outright,
+    /// and absent where it is not offered or the vault is not.
+    #[cfg(feature = "vault")]
+    #[test]
+    fn the_settings_ask_for_ssh_run_where_it_is_offered() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let read = |sid: &str| -> serde_json::Value {
+            let path = runtime.join(sid).join("settings.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        write_settings(&runtime, "ssh", true, false, true).unwrap();
+        let doc = read("ssh");
+        let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
+        asked.extend(toolbelt::SSH_TOOLS);
+        assert_eq!(doc["permissions"]["ask"], serde_json::json!(asked), "{doc}");
+        assert!(
+            !doc["permissions"]["allow"].to_string().contains("ssh_run"),
+            "ssh_run is never allowed without a person: {doc}"
+        );
+        write_settings(&runtime, "both", true, true, true).unwrap();
+        let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
+        asked.extend(toolbelt::NET_TOOLS);
+        asked.extend(toolbelt::SSH_TOOLS);
+        assert_eq!(read("both")["permissions"]["ask"], serde_json::json!(asked));
+        for (sid, vault, ssh) in [("no-ssh", true, false), ("no-vault", false, true)] {
+            write_settings(&runtime, sid, vault, false, ssh).unwrap();
+            let doc = read(sid);
+            assert!(
+                !doc["permissions"].to_string().contains("ssh_run"),
+                "not offered, not named: {doc}"
+            );
+        }
     }
 
     /// FR-90 P3-7-3c — a session's own egress opens on the daemon's primary
@@ -7702,6 +7792,47 @@ done
             "hive_net on, the vault offered"
         );
         assert!(on.sup.net_hub(false).is_none(), "the vault not offered");
+    }
+
+    /// FR-90 P3-8-2b-2 — `ssh_run` reaches another device through the
+    /// daemon's own runner, only where the device's owner turned `hive_ssh`
+    /// on and the vault is offered; and a supervisor built without a runner
+    /// offers it nowhere.
+    #[cfg(all(feature = "vault", feature = "ssh-server"))]
+    #[tokio::test]
+    async fn the_ssh_runner_is_the_owners_and_the_vaults_to_offer() {
+        struct Never;
+        #[async_trait::async_trait]
+        impl super::super::ssh_tools::SshRunner for Never {
+            async fn run(
+                &self,
+                _: ObjectId,
+                _: &crate::vault::SshTicket,
+                _: &str,
+                _: Duration,
+            ) -> Result<super::super::ssh_tools::Ran, String> {
+                Err("never run".into())
+            }
+        }
+        let runner = |mut s: Supervisor| {
+            s.ssh_runner = Some(Arc::new(Never));
+            s
+        };
+        let off = rig_with(true, 1, |_| {}, runner);
+        assert!(off.sup.ssh_runner(true).is_none(), "hive_ssh off");
+        let on = rig_with(true, 1, |c| c.ssh = true, runner);
+        assert!(
+            on.sup.ssh_runner(true).is_some(),
+            "hive_ssh on, the vault offered"
+        );
+        assert!(on.sup.ssh_runner(false).is_none(), "the vault not offered");
+        let bare = rig_with(true, 1, |c| c.ssh = true, |s| s);
+        assert!(bare.sup.ssh_runner(true).is_none(), "no runner, no tool");
+        let net = rig_with(true, 1, |c| c.net = true, runner);
+        assert!(
+            net.sup.ssh_runner(true).is_none(),
+            "hive_net is not hive_ssh"
+        );
     }
 
     /// P3-4c-2 — the daemon's start removes every secrets directory an
