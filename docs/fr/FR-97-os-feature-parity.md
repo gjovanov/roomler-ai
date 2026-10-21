@@ -264,7 +264,7 @@ and the consent chain's fallbacks.
 |---|---|---|---|---|---|---|
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
-| O3 | Tunnel CLI `roomler self-update` | ✅ | 🟡 built (P6b) | 🟡 built (P6b) | Was: Windows only, with the manifest's SHA-256 the only check. *P6b:* the `.asc` against the pinned key on every OS (`agents/roomler-cli/src/update.rs:227`); a tarball, or the `.deb` where dpkg owns the binary, by host (`:262`); the version named inside the signed archive (`:386`, `:569`) | P6b |
+| O3 | Tunnel CLI `roomler self-update` | ✅ | 🟡 built (P6b) | 🟡 built (P6b) | Was: Windows only, with the manifest's SHA-256 the only check. *P6b:* the `.asc` against the pinned key on every OS (`agents/roomler-cli/src/update.rs:227`); a tarball, or the `.deb` where dpkg owns the binary, by host (`:267`); the version named inside the signed archive (`:391`, `:574`) | P6b |
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:902`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
@@ -921,15 +921,15 @@ model on Windows, so the three agree on what the mode means.
     still checked where it has one. Before P6b that was the only check, and a missing digest skipped it (CLAUDE.md's
     LOW issue).
   - *The version, from inside the signed bytes.* A signature does not say which release the bytes are. A tarball
-    must hold the binary under the one top-level dir that names the offered version and target (`:386`, `:397`),
-    and a `.deb`'s control `Version` must be the offered one (`:569`). The Windows zip names no version inside, so
+    must hold the binary under the one top-level dir that names the offered version and target (`:391`, `:402`),
+    and a `.deb`'s control `Version` must be the offered one (`:574`). The Windows zip names no version inside, so
     there the offer stands once the signature does.
-  - *Install, by host* (`:262`). Windows as before. macOS, and Linux where no package owns the binary: the
+  - *Install, by host* (`:267`). Windows as before. macOS, and Linux where no package owns the binary: the
     tarball's `roomler`, read in memory, so nothing is extracted and no directory is created or chowned. It is
-    written beside the binary with `O_EXCL`, then renamed over it (`:473`). Linux where dpkg owns the binary:
-    `dpkg -i` of the verified `.deb`, from a private directory (`:526`), so dpkg's record stays true. The owner may
+    written beside the binary with `O_EXCL`, then renamed over it (`:478`). Linux where dpkg owns the binary:
+    `dpkg -i` of the verified `.deb`, from a private directory (`:531`), so dpkg's record stays true. The owner may
     be the package under its pre-rename name (FR-21 P2b, rc.266 and older), which the new `.deb` replaces
-    (`:288`). Root where the directory or dpkg needs it, said before anything is downloaded; the command says `sudo`.
+    (`:293`). Root where the directory or dpkg needs it, said before anything is downloaded; the command says `sudo`.
   - *Not a daemon host's updater.* There `roomler` is a shim over `roomlerd cli`, which refuses `self-update` and
     names `roomlerd self-update` (`agents/roomler-cli/src/cli.rs:997`).
   - *Tested.* A new CI step runs the CLI's lib tests, which no lane had run (128 on Linux). The moved check

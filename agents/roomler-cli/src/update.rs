@@ -249,10 +249,15 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
     Ok(())
 }
 
-/// The running binary, symlinks resolved: a swap replaces the file, never a
-/// link that points at it.
+/// The running binary. On Linux and macOS, symlinks resolved: a swap replaces
+/// the file, never a link that points at it (macOS reports the path as
+/// invoked). Windows keeps `current_exe()` as it was before P6b: canonicalizing
+/// there yields a `\\?\` path and can fail on some volumes, for nothing gained.
 fn this_binary() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("resolve the running binary")?;
+    if cfg!(windows) {
+        return Ok(exe);
+    }
     std::fs::canonicalize(&exe).with_context(|| format!("resolve {}", exe.display()))
 }
 
