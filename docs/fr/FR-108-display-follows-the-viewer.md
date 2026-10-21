@@ -1,7 +1,8 @@
 # FR-108: Display follows the viewer — never on a screen someone is using
 
 **Issue:** [#2322](https://github.com/gjovanov/roomler-ai/issues/2322) · **Status:** in progress — P0
-measured, P1 built ([`docs/display-match.md`](../display-match.md)) · **Owner:** the Windows agent (`display_match.rs`, the user-context worker), the viewer (the
+measured; P1, P1b and P2 built and field-verified ([`docs/display-match.md`](../display-match.md)); P3 waits
+for the virtual display; P4 designed (3g) · **Owner:** the Windows agent (`display_match.rs`, the user-context worker), the viewer (the
 display-match toggle); later the Linux virtual desktop · **Anchors:** master `85d5cba30` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 2 (§5.3) · **Builds on:** rc.191's display
 match, [FR-92](FR-92-keep-busy.md) (a person told from the controller without hooks),
@@ -37,6 +38,18 @@ the screen.
 | The worker already knows whether the session is locked | `agents/roomlerd/src/lock_state.rs` L212 (`probe_lock_state`), L233 (`probe_lock_state_service`), L328 (`spawn_monitor`) | "Locked" is a fact the guard can read |
 | FR-92 tells a person from the controller without hooks | `agents/roomlerd/src/keep_busy/host_win.rs` L45 (`last_input_tick`, `GetLastInputInfo`), L129 (`remote_epoch`, bumped by the arbiter on every controller injection); `keep_busy/engine.rs` L10–25 ("Who is a real user") | "Someone is using it" can be measured the EDR-safe way |
 | Field, 2026-10-16: a vmtest Win11 guest with `vmtest` signed in at the console; a session from the production viewer | the guest's log, 13:08:21Z: `display-match: could not switch mode req_w=946 req_h=598 e=no supported mode fits within 946x598 (1 modes)` | The agent tries to switch an attended guest today. Only the Basic Render Driver's single mode stopped it |
+
+P4's evidence (master `cb69cad02`, 2026-10-21):
+
+| What | Where | Consequence |
+|---|---|---|
+| Every capture opens the primary display | `agents/roomlerd/src/capture/mod.rs` L2815 (WGC, `primary_with`), L2779 (SystemContext), L2972 (DRM), L3135 (scrap); `capture/wgc_backend.rs` L211 (`for_monitor` exists; its one caller is the primary, L205) | A second monitor cannot be seen from the viewer at all |
+| The viewer sends `mon: 0` with every pointer event | `ui/src/composables/useRemoteControl.ts` L6472, L10863, L10933, L10969 | The wire has the field (`agents/roomlerd/src/input/mod.rs` L332); nothing fills it |
+| `mon` reaches a monitor only on Windows, only behind `ROOMLERD_VIRTUAL_SCREEN` (unset is off), and through another list than the hello's | `input/enigo_backend.rs` L371 (`resolve_target_monitor`), L323; `input/mod.rs` L51; `win32_monitors.rs` L127 (`EnumDisplayMonitors` order) against `displays.rs` L38 (scrap's DXGI order, index 0 flagged primary) | Two lists that a comment says agree (`win32_monitors.rs` L114–117), from two APIs that promise no common order |
+| The pointer travels in desktop pixels | `capture/cursor.rs` L297 (`ptScreenPos`); `peer.rs` L10329 (`attach_cursor_handler`) | Measured from the primary's corner, so on another display it lands off the stream |
+| A shared pipeline is keyed by codec and chroma | `media_share.rs` L82 (`PipelineKey`) | Two viewers of two displays would be handed one stream |
+| Display match switches the primary | `display_match.rs` L657 (`ChangeDisplaySettingsExW(NULL, …)`) | A matched session on another display would resize the wrong one |
+| No live device reports a second display | production, 2026-10-21: 79 devices seen in 30 days (44 Windows, 32 Linux, 3 macOS). Every hello lists one display at its real size, or none | P4 is for a host this fleet does not have yet (open decision 5) |
 
 ## 3. Design
 
@@ -136,8 +149,55 @@ As plan §5.3 has it, with P2 corrected by its probe:
   - **The restore** returns to the start mode, as on Windows. The mode the viewer asked for is added for
     the session and removed after it.
 - **P3:** a mode no monitor offers comes from the virtual display (the IddCx FR, when it exists).
-- **P4:** several displays at once, with a pump and a `video-bytes` channel per display, and viewer windows
-  placed by `getScreenDetails`.
+- **P4:** several displays, 3g.
+
+### 3g. Several displays (P4)
+
+StarDesk switches displays with a hotkey and shows several at once (plan §1, P8). Roomler streams the
+primary display only, on every OS (§2, P4's evidence). P4 comes in two steps, and the first is most of the
+work.
+
+**One display table.** The hello, the capture, the input, the pointer and display match all read one list,
+`displays::table()`. Each entry has the OS's own name for the display (`\\.\DISPLAY2`, a RandR output, a
+display id) and its rectangle in desktop pixels. Windows builds the list from `EnumDisplayMonitors`, macOS
+from its active display list, X11 from RandR's monitors, and DRM from its connectors. The hello's
+`DisplayInfo` keeps its shape and gains the real names.
+
+⚠️ **The primary is index 0 in every list.** A deployed viewer sends `mon: 0` meaning "the stream", and
+today the stream is always the primary. A table in the OS's raw order would send those clicks to another
+monitor.
+
+**P4a, choose the display.**
+- **The hello** gains `display-select` (`AgentCaps.video`, matched by equality). The viewer shows a picker
+  only then, and only when the list has more than one display.
+- **The list and the answer** ride the control channel, not the agent row, which the viewer never reads:
+  `rc:display.state {displays, index}` at the session's start and after every change.
+- **The ask** is `rc:display {index, name}`. The agent reads the table again and finds the display by name,
+  so a monitor unplugged in between is refused as `gone`, never swapped for whatever took its index.
+- **The switch** reopens the capture on that display: WGC through `for_monitor`, scrap and DRM by rectangle
+  or connector. A different size re-initialises the encoder, as P2's mode switch does (§8 row 12).
+- **The input** carries the shown display's index as `mon`, and the injector maps it against that display's
+  rectangle. `mon: 0` keeps today's path byte for byte, so `ROOMLERD_VIRTUAL_SCREEN` matters for nothing
+  else.
+- **The pointer** is sent relative to the shown display's corner, and hidden while it is on another display.
+- **A shared pipeline** is keyed by the display as well as the codec.
+- **Display match** switches the shown display (`ChangeDisplaySettingsExW` with its device name) and
+  restores that one.
+- **Refused, with a word:** `unsupported` where the person picks the monitor (the portal's dialog), in the
+  SystemContext worker, and on the synthetic source.
+
+**P4b, several at once.**
+- **A pipeline per display:** a capture, an encoder and a data channel each. The first display keeps
+  `video-bytes`, and the others are `video-bytes:<index>`, so an older viewer's one channel is still the
+  primary. ⚠️ The agent parses that label exactly: `video-bytes` is a prefix of the new labels, and a
+  `starts_with` would route the second display into the first pump.
+- **A window per display** in the viewer, placed with `getScreenDetails()` where the browser offers it
+  (Chromium, after the `window-management` prompt), and side by side in one window elsewhere. Each window
+  sends its own display's index as `mon`, and the pointer carries the index of the display it is on.
+- **One pipe.** Today each pump runs its own FR-79 governor (`peer.rs` L4120, L6760), and two governors on
+  one path would each believe they own it. P4b moves the governor to the session and splits its capacity by
+  the pixels each pipeline streams. A second display doubles the bitrate, so P4b is granted only on a
+  direct path, like FR-119's rates above 60.
 
 ## 4. Phases
 
@@ -148,7 +208,8 @@ As plan §5.3 has it, with P2 corrected by its probe:
 | P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | `display_match = always` (no hand-back) | **built** (3e "as built"): `away_since_lock` in the tracker, the waiting request and `on_unlock` from the session's lock watcher, the 250 ms `on_tick` watcher with `hand_back`. Unit tests on Windows and Linux with two negative controls: an `away_since_lock` that never reads a lock as away failed the two lock tests, and a `hand_back` that keeps the mode under `never` failed the hand-back test. **Shipped in agent 0.4.140 and field-verified there:** AC2's locked half (§8 row 6), AC3 (§8 row 7) |
 | P2 | Linux virtual desktops: switch the virtual desktop's mode to the one asked (Xorg + dummy, open decision 4), reopen the capture after a switch, restore at the end | `display_match = never` | **probe done 2026-10-16** (§8 row 5): Xvfb cannot switch at all; Xorg + dummy switches to any size. **Built** (decision 4 settled 2026-10-17: Xorg + dummy where installed, Xvfb otherwise): the server pick and its kill switch `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb`, the config (an exact start mode, `ReducedBlanking`, no input devices, an empty config dir), the request as the mode exactly, `xrandr` switch and restore, the capture reopened on a mode generation. Tests: the config, the argv, the server pick, the kill switch, the modeline, the mode fitting, `xrandr --current` parsing |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
-| P4 | Several displays | — | — |
+| P4a | Choose the display (3g): one display table, `display-select`, `rc:display`, the capture reopened on the shown display, and the input, the pointer, shared pipelines and display match following it. First a probe: a vmtest guest with two heads, so there is a second display to test on | `display-select` left out of the hello: no picker, and `mon` stays 0 | **designed 2026-10-21** (3g) |
+| P4b | Several displays at once (3g): a pipeline and a channel per display, a window per display, one pipe | the same; direct paths only | **designed 2026-10-21** (3g) |
 | P5 | Docs: [`docs/display-match.md`](../display-match.md) (mermaid, the answers, the owner's key), linked from `docs/remote-control.md` §18.6.1 and indexed in `docs/README.md` | — | the page exists from P1 and grows with each phase |
 
 ## 5. Acceptance criteria
@@ -198,6 +259,18 @@ As plan §5.3 has it, with P2 corrected by its probe:
   section inside `docs/remote-control.md`, but other specs cite that page by line number, and a page of its
   own, like `privacy-mode.md`, moves none of them. The page exists from P1 and is ticked when the last
   phase is in it.)*
+- [ ] **AC9 (P4a, red first):** on a host with two displays, today's viewer shows only the primary. With P4a
+  the viewer lists both and shows the second, and a click on the second lands where it was clicked. Read on
+  the host: a window on the second display appears in the stream, and the pointer's position after the click
+  is the clicked point in desktop pixels.
+- [ ] **AC10 (one table):** the hello's order and the order `mon` resolves to are one list (a unit test that
+  both read `displays::table()`), with the primary at index 0. On a host whose second display sits left of
+  the primary (a negative desktop x), a click on it lands right.
+- [ ] **AC11 (P4b):** two displays at once in two windows, each at its own size. Input in each window lands
+  on its own display, and the two streams together stay inside the session's measured capacity (the
+  heartbeats).
+- [ ] **AC12 (old and new together, P4):** an older viewer with a P4 agent streams the primary, as today,
+  and its clicks land there. A P4 viewer with an older agent shows no picker.
 
 ## 6. Open decisions
 
@@ -216,11 +289,19 @@ As plan §5.3 has it, with P2 corrected by its probe:
    - keep Xvfb everywhere and answer `unsupported`: no package, and no crisp 1:1 text on a virtual desktop.
 
    Recommended: the first. **Decided by the operator, 2026-10-17: the first, as recommended** (P2).
+5. **P4's priority.** No live device reports a second display (§2, P4's evidence). Recommended: build P4a
+   when the first multi-display host enrolls, or sooner if StarDesk's parity row matters on its own. P4b
+   comes after P4a.
+6. **How P4b splits the pipe.** By the pixels each display streams (recommended), or most of it to the
+   window the controller used last.
 
 ## 7. Out of scope
 
-- macOS and Wayland hosts. rc.191 is Windows only, and Linux comes only for virtual desktops (P2).
+- Display match on macOS and Wayland hosts. rc.191 is Windows only, and Linux comes only for virtual
+  desktops (P2). P4's choice of display covers macOS and X11 (3g); Wayland's portal answers `unsupported`.
 - DPI and scaling changes.
+- Recording another display: the recorder opens its own capture of the primary (`capture/mod.rs` L2728),
+  and P4a does not change that.
 
 ## 8. Field-verification log
 
