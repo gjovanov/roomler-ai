@@ -23,10 +23,10 @@ latency side; this FR is the cadence side.
 | What | Where | Consequence |
 |---|---|---|
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | Every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9471`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:9888` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
-| pts are whole milliseconds | `TIME_BASE_DEN = 1000` `encode/ffmpeg/encoder.rs:86`; `pts = monotonic_us / 1000` `:1978` | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carry equal pts |
-| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1631`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2195`, `:2211`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9495`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:9912` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| pts are whole milliseconds | `TIME_BASE_DEN = 1000` `encode/ffmpeg/encoder.rs:86`; `pts = monotonic_us / 1000` `:2044` | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carry equal pts |
+| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1697`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2262`, `:2278`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps |
 | The direct ceiling law is linear in fps and clamped at 48 Mbps | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:193`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor | 1920×1080 at 144 fps computes 74.6 M and clamps to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit. Above 60 the picture gets softer per frame |
 | The default capture gate's period is whole milliseconds; the microsecond gate is opt-in | `capture/gate.rs` (the legacy rule caps `1000/144` at 166 fps and can phase-lock); the slot-first gate keeps µs (`:78`) behind `ROOMLERD_CAPTURE_GATE`, field A/B owed (FR-98 P1) | Above 60, the slot-first gate should be the one in use |
 | WGC and `CGDisplayStream` deliver at the panel's refresh | WGC is compositor-driven; scrap's quartz stream is unthrottled (`throttle: 0.0`, `crates/vendored/scrap/src/quartz/config.rs:69`) | A 60 Hz panel cannot produce 120 fps. A 120 Hz MacBook already can |
@@ -84,7 +84,7 @@ and as with encoder cells, the probe proves an open and only a session proves th
 ### 3.4 The encoder and the rate law
 
 - **pts in microseconds:** `TIME_BASE_DEN = 1_000_000`, `pts = monotonic_us`. The recorder keeps its own
-  counter clock (`recording_pts_ms`, `encoder.rs:715`), which already never repeats.
+  counter clock (`recording_pts_ms`, `encoder.rs:718`), which already never repeats.
 - **An fps change is a make-before-break swap.** `rebuild_spec_at_fps` next to `rebuild_spec_at_dims`; the plan
   names the fps (FR-70 M3a's `Plan.fps`), and a swap is adopted between frames like a dims swap. The live encoder
   keeps serving at the old rate until the replacement is ready.

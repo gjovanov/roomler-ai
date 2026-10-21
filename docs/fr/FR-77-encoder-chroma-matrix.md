@@ -26,7 +26,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:970,679`).
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
   (`agents/roomlerd/src/peer.rs:4534-4529`); the ONLY hardware 4:4:4 path is
-  `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:698-715`),
+  `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:701-718`),
   advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:502-505`).
 - The picker (`ui/src/views/remote/RemoteControl.vue:2606-2614`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
