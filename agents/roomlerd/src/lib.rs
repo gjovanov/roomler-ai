@@ -197,6 +197,10 @@ pub mod sleep_notice;
 /// [`overlay`]: without an overlay there is no address to serve on.
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod ssh;
+/// FR-90 P3-8-2b — this daemon's own SSH client, for an agent session's one
+/// command on another device. With the SSH server, whose `russh` it shares.
+#[cfg(feature = "ssh-server")]
+pub mod ssh_client;
 /// The ORIGINATING side of Roomler SSH. Ungated on purpose — [`ssh`] needs an
 /// overlay to serve on, but an answer to a request WE sent arrives on the
 /// plain control WS and must be deliverable in every build.

@@ -5965,10 +5965,9 @@ async fn handle_server_msg(
             host_pubkey,
             expires_at_ms,
             error,
-            // FR-90 P3-8-1b — the echo of an agent session's ticket. This
-            // build sends no ticket (P3-8-2b's daemon is the first), so every
-            // answer it gets is to a person's request, and carries none.
-            ssh_ticket_id: _,
+            // FR-90 P3-8-2b — the echo of an agent session's ticket: its
+            // daemon dials only on an answer that echoes the ticket it sent.
+            ssh_ticket_id,
         } => {
             // The key itself is never logged — only whether one arrived. It is
             // public, but a log line is the wrong place to start treating key
@@ -5978,6 +5977,7 @@ async fn handle_server_msg(
                 %request_id,
                 address = ?address, port = ?port, grant_id = ?grant_id,
                 verifiable = host_pubkey.is_some(), error = ?error,
+                ssh_ticket_id = ?ssh_ticket_id,
                 "rc:ssh.response"
             );
             crate::ssh_origin::deliver(
@@ -5989,6 +5989,7 @@ async fn handle_server_msg(
                     grant_id,
                     expires_at_ms,
                     error,
+                    ssh_ticket_id,
                 },
             );
         }
@@ -6325,13 +6326,37 @@ async fn handle_server_msg(
                 debug!(%grant_id, "rc:vault.net.granted ignored — this build asks for none");
             }
         }
-        // FR-90 P3-8-1a — the vault's ticket for a session's command on
-        // another device, the answer to `rc:vault.ssh`. No build asks for one
-        // yet (P3-8-2b's is the first), so it is dropped, and never logged
-        // with the frame as the catch-all below would: `ticket` is a
-        // credential until its end.
-        ServerMsg::VaultSshGranted { ticket_id, .. } => {
-            debug!(%ticket_id, "rc:vault.ssh.granted ignored — this build asks for none");
+        // FR-90 P3-8-2b — the vault's ticket for a session's command on
+        // another device, the answer to this daemon's `rc:vault.ssh`: the
+        // primary's only, as a lease is. Never logged with the frame (nor by
+        // the catch-all below, which would): `ticket` is a credential until
+        // its end.
+        ServerMsg::VaultSshGranted {
+            req_id,
+            ticket_id,
+            ticket,
+            expires_at_ms,
+            os,
+            account,
+        } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_ssh_granted(
+                    &req_id,
+                    &ticket_id,
+                    &ticket,
+                    expires_at_ms,
+                    &os,
+                    &account,
+                );
+            } else {
+                debug!(%ticket_id, "rc:vault.ssh.granted on a secondary org's connection — dropped");
+            }
+            #[cfg(not(feature = "vault"))]
+            {
+                let _ = (req_id, ticket, expires_at_ms, os, account);
+                debug!(%ticket_id, "rc:vault.ssh.granted ignored — this build asks for none");
+            }
         }
         // FR-52 P3c — an outsider's login, relayed by the server. Answered in
         // a task, not inline: the live config read waits on the config lock,

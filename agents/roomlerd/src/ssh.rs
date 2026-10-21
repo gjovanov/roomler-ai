@@ -4723,6 +4723,135 @@ mod tests {
         );
     }
 
+    // ── FR-90 P3-8-2b: this daemon's own client, against this server ──────
+
+    /// The server's host key, as a client pins it.
+    fn served_key(cfg: &crate::config::AgentConfig) -> russh::keys::ssh_key::PublicKey {
+        russh::keys::ssh_key::PublicKey::from_openssh(&super::host_public_key(cfg)).unwrap()
+    }
+
+    /// FR-90 P3-8-2b — the daemon's client runs ONE command under an agent
+    /// session's grant, its key minted for the call and the target's host key
+    /// pinned: the exit status and the output come back, nothing cut, and the
+    /// grant is spent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_daemons_client_runs_a_sessions_one_command() {
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let cfg = cfg_with(Vec::new());
+        let addr = serve_one(&cfg).await;
+        let key = crate::ssh_client::mint_key();
+        one_command_grant_for(&key.public_key().to_openssh().unwrap()).unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let ran = crate::ssh_client::exec_one(
+            stream,
+            served_key(&cfg),
+            key,
+            "echo one",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("ran");
+        assert_eq!(ran.exit_code, Some(0), "{ran:?}");
+        assert!(ran.stdout.contains("one"), "{ran:?}");
+        assert!(!ran.truncated);
+        assert_eq!(super::pending_grants(), 0, "the grant was redeemed");
+    }
+
+    /// FR-90 P3-8-2b — a device that answers with another host key is not
+    /// the target: the client refuses it before it authenticates, so the
+    /// grant is not spent and nothing runs. And a key no grant admits is
+    /// refused by the target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_daemons_client_pins_the_host_key_and_needs_its_grant() {
+        let _lock = grant_test().await;
+        let cfg = cfg_with(Vec::new());
+        let addr = serve_one(&cfg).await;
+        let key = crate::ssh_client::mint_key();
+        one_command_grant_for(&key.public_key().to_openssh().unwrap()).unwrap();
+        let other = crate::ssh_client::mint_key().public_key().clone();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let got = crate::ssh_client::exec_one(
+            stream,
+            other,
+            key,
+            "echo one",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(got.unwrap_err(), crate::ssh_client::RunError::WrongHostKey);
+        assert_eq!(
+            super::pending_grants(),
+            1,
+            "it never authenticated, so its grant is not spent"
+        );
+
+        let addr = serve_one(&cfg).await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let got = crate::ssh_client::exec_one(
+            stream,
+            served_key(&cfg),
+            crate::ssh_client::mint_key(),
+            "echo one",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(got.unwrap_err(), crate::ssh_client::RunError::NotAdmitted);
+    }
+
+    /// FR-90 P3-8-2b — one call, whole, through the OS's routes: the request
+    /// presents the ticket and the call's key, the "server" grants that key
+    /// on this device and answers with the echo, and the client dials, pins,
+    /// and runs the command.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_daemons_client_runs_a_whole_call() {
+        use roomler_ai_remote_control::ClientMsg;
+
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let cfg = cfg_with(Vec::new());
+        let addr = serve_one(&cfg).await;
+        let host = super::host_public_key(&cfg);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let server = tokio::spawn(async move {
+            let Some(ClientMsg::SshRequest {
+                request_id,
+                public_key,
+                ssh_ticket,
+                ..
+            }) = rx.recv().await
+            else {
+                panic!("no rc:ssh.request");
+            };
+            assert_eq!(ssh_ticket.as_deref(), Some("the-ticket"));
+            one_command_grant_for(&public_key).unwrap();
+            crate::ssh_origin::deliver(
+                &request_id,
+                crate::ssh_origin::SshGrantAnswer {
+                    address: Some(addr.ip().to_string()),
+                    port: Some(addr.port()),
+                    host_pubkey: Some(host),
+                    ssh_ticket_id: Some("k1".into()),
+                    ..Default::default()
+                },
+            );
+        });
+        let ran = crate::ssh_client::run(
+            &tx,
+            &crate::ssh_client::OsDialer,
+            bson::oid::ObjectId::new(),
+            "the-ticket",
+            "k1",
+            "echo whole",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("ran");
+        server.await.unwrap();
+        assert_eq!(ran.exit_code, Some(0), "{ran:?}");
+        assert!(ran.stdout.contains("whole"), "{ran:?}");
+    }
+
     // ── P8: activity reporting ───────────────────────────────────────────
 
     /// Reporting is the DEVICE's decision and it is off unless asked for.
