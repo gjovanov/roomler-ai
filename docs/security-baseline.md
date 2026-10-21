@@ -309,8 +309,8 @@ Windows it is a named pipe whose security descriptor admits `SYSTEM`,
 the recording verbs require the console user (FR-85) and an update hold requires
 root (FR-90).
 
-⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911).** A Linux
-system install's companion runs as the desktop user and could not reach the root
+⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911; FR-97 P2g).** A
+Linux system install's companion runs as the desktop user and could not reach the root
 socket. That left the person at the screen with no "being viewed" banner, no
 Disconnect, and on Wayland no consent prompt. The root daemon therefore also serves
 `/run/user/<uid>/roomler.sock`:
@@ -322,7 +322,36 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   `/etc/shadow`. The daemon therefore never runs a root path operation there;
 - `SO_PEERCRED` is checked against that user or root on every connection;
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
-  `ConsentDecide` and `RecordStatus`.
+  `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
+  `KeepBusyOn` (FR-92 P10, the start gated again on the peer); and, since FR-97 P2g,
+  `Devices` and `Mesh`.
+
+`Devices` and `Mesh` were the first widening for a read rather than a safety control,
+and they are bounded the same way the companion's page is everywhere else. They only
+read. The server shapes the answer by **this machine's** overlay ACL (`agent_self.rs`),
+so the person can search, sort and page the set but never widen it. The rows carry no
+machine ids, keys or owner ids. Windows already serves the same verbs to its
+interactive users.
+
+**A Mac's root half serves one too (FR-97 P2g).** Only root can hold a utun, so a
+two-half Mac (FR-43) is on the private network through its root half alone, and the
+per-user half that the companion talks to has no node. The root half therefore serves
+the console user a person socket at `/var/run/roomler-person/<uid>.sock`, and the
+per-user half asks it for `Devices` and `Mesh`. The bind is not the Linux one, because
+the directory is not the person's:
+- `/var/run/roomler-person` must be a real directory (not a link), owned by root, and
+  writable by nobody else (`root_only_dir`, checked on every bind). Nobody but root
+  can create, swap or link an entry there, so root may bind and then hand the socket
+  over (`lchown` to the person, then 0600). In a directory the person owns, that is
+  exactly the race the Linux bind avoids. macOS has no per-thread filesystem ids to
+  borrow in any case;
+- nothing is accepted until that hand-over is done, and `getpeereid` is checked
+  against that user or root on every connection, whatever the mode was in between;
+- the person is the console user (`/dev/console`'s owner), never the login window;
+- the per-user half believes an answer only from a socket **root** serves
+  (`connect_unix_served_by_root`: the server's uid, from the kernel). The directory
+  already keeps everyone else out; this is the second lock, because the answer is shown
+  to the person as the machine's own.
 
 The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
 new verb cannot reach it by default. Widening it is a security change and needs
