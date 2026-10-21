@@ -32,7 +32,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
   (fixed in #1468 by making the list the single source the type derives from).
-- The FFmpeg dispatch tables (`encoder.rs:95,107,133,148`) try
+- The FFmpeg dispatch tables (`encoder.rs:113,107,133,148`) try
   `h264/hevc/av1 × nvenc/qsv/amf/videotoolbox` + `vp9_qsv` (profile 0 only, `:655-659`).
   VAAPI was never wired (`agents/roomlerd/Cargo.toml:198-199` still promises it for
   "rc.74"); no `*_mf` name exists anywhere. macOS ships FFmpeg again since 2026-08-25
