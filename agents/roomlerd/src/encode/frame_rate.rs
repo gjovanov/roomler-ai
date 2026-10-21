@@ -276,25 +276,57 @@ impl TrialMeter {
         self.last_us = None;
     }
 
+    /// FR-119 P2b-3 — what the current window measured. Read when a verdict
+    /// is returned, it is what the verdict was decided on.
+    pub fn summary(&self) -> TrialSummary {
+        TrialSummary {
+            frames: self.intervals_us.len(),
+            active_ms: self.active_us / 1_000,
+            fps_x10: self.intervals_us.len() as u64 * 10_000_000 / self.active_us.max(1),
+            p99_interval_us: percentile(&self.intervals_us, 99),
+            p90_encode_us: percentile(&self.encode_us, 90),
+        }
+    }
+
     fn verdict(&self) -> Option<Verdict> {
-        let pct = |v: &[u64], q: usize| {
-            let mut s = v.to_vec();
-            s.sort_unstable();
-            s[(s.len() * q / 100).min(s.len() - 1)]
-        };
         // Achieved rate over the active time, against the target, in percent.
         let achieved_pct =
             self.intervals_us.len() as u64 * self.period_us * 100 / self.active_us.max(1);
         if achieved_pct >= TRIAL_MIN_RATE_PCT
-            && pct(&self.intervals_us, 99) < self.period_us * TRIAL_MAX_P99_PERIODS
+            && percentile(&self.intervals_us, 99) < self.period_us * TRIAL_MAX_P99_PERIODS
         {
             Some(Verdict::Proven)
-        } else if pct(&self.encode_us, 90) * 100 >= self.period_us * TRIAL_MAX_ENCODE_PCT {
+        } else if percentile(&self.encode_us, 90) * 100 >= self.period_us * TRIAL_MAX_ENCODE_PCT {
             Some(Verdict::Failed)
         } else {
             None
         }
     }
+}
+
+/// The `q`th percentile of `v` (nearest rank, rounded down); 0 for nothing.
+fn percentile(v: &[u64], q: usize) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s[(s.len() * q / 100).min(s.len() - 1)]
+}
+
+/// FR-119 P2b-3 — what a concluded trial measured, for its log line: a field
+/// run reads the numbers the verdict was decided on, not the verdict alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrialSummary {
+    /// The frames counted, and the motion they covered.
+    pub frames: usize,
+    pub active_ms: u64,
+    /// The achieved rate, in tenths of a frame per second.
+    pub fps_x10: u64,
+    /// The p99 interval between counted frames.
+    pub p99_interval_us: u64,
+    /// The encoder's p90 time per counted frame.
+    pub p90_encode_us: u64,
 }
 
 /// FR-119 P2b-2 — one session's frame rate: what the grant decided, what the
@@ -316,6 +348,8 @@ pub struct RateState {
     /// The last decision and what it was decided on.
     decided: Option<(GrantInputs, ClassKey, Grant)>,
     trial: Option<(ClassKey, TrialMeter)>,
+    /// P2b-3 — what the last trial to conclude measured.
+    concluded: Option<TrialSummary>,
 }
 
 impl RateState {
@@ -325,6 +359,7 @@ impl RateState {
             verdicts,
             decided: None,
             trial: None,
+            concluded: None,
         }
     }
 
@@ -392,9 +427,11 @@ impl RateState {
     /// When that concludes the trial, the verdict is this session's from now
     /// on (the decision is taken again at once, so a failed class stops being
     /// wanted), and the class and verdict are returned for the pump to persist.
+    /// What the trial measured stays readable ([`Self::concluded`]).
     pub fn frame(&mut self, at_us: u64, encode_us: u64) -> Option<(ClassKey, Verdict)> {
         let verdict = self.trial.as_mut()?.1.frame(at_us, encode_us)?;
-        let (class, _) = self.trial.take()?;
+        let (class, meter) = self.trial.take()?;
+        self.concluded = Some(meter.summary());
         self.verdicts.push((class.clone(), verdict));
         if let Some((inputs, decided_class, _)) = self.decided.clone() {
             self.decided = None;
@@ -433,6 +470,11 @@ impl RateState {
 
     pub fn trial_running(&self) -> bool {
         self.trial.is_some()
+    }
+
+    /// P2b-3 — what the last trial to conclude measured, for its log line.
+    pub fn concluded(&self) -> Option<TrialSummary> {
+        self.concluded
     }
 
     /// What the stream runs at and, once it runs below an ask the grant
@@ -982,6 +1024,33 @@ mod tests {
         assert_eq!(s.want(), 120);
         assert!(!s.trial_running());
         assert_eq!(s.video_info_fields(), r#","fps":120"#);
+    }
+
+    /// P2b-3 — a concluded trial says what it measured: the numbers its verdict
+    /// was decided on, which the pump logs beside it.
+    #[test]
+    fn a_concluded_trial_says_what_it_measured() {
+        let k = class("hevc_videotoolbox", 3840, 120);
+        let mut s = RateState::new(60, Vec::new());
+        assert_eq!(s.concluded(), None);
+        s.decide(ask(120), k.clone());
+        s.running_at(120);
+        let mut at = 0;
+        assert_eq!(
+            feed(&mut s, &mut at, 8_333, 6_000, 12),
+            Some((k, Verdict::Proven))
+        );
+        // 1201 counted gaps of 8333 µs are the first window past 10 s.
+        assert_eq!(
+            s.concluded(),
+            Some(TrialSummary {
+                frames: 1_201,
+                active_ms: 10_007,
+                fps_x10: 1_200,
+                p99_interval_us: 8_333,
+                p90_encode_us: 6_000,
+            })
+        );
     }
 
     /// A trial that falls short takes the stream back to the cap. The refusal

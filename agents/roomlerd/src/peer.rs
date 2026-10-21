@@ -9240,12 +9240,15 @@ async fn media_pump_ffmpeg_dc(
             && let Some(state) = fps_state.as_mut()
             && let Some((class, verdict)) = state.frame(frame.monotonic_us, frame_encode_us)
         {
+            // P2b-3 — with what it measured, so a field run reads the numbers
+            // the verdict was decided on.
             info!(
                 %session_id,
                 codec_label,
                 ?class,
                 ?verdict,
                 want = state.want(),
+                measured = ?state.concluded(),
                 "FR-119: the rate-class trial concluded"
             );
             if let Some((path, key)) = fps_cache.clone() {
