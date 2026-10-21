@@ -484,6 +484,12 @@ pub mod providers {
     }
 }
 
+/// FR-90 P3-7-2a — the `rc:error` code that refuses a `rc:tunnel.open` whose
+/// session grant does not hold; its message is the failing check's words.
+/// The device reads it as the end of that grant, never a reason to retry:
+/// the session asks the vault again. Wire-stable, do not reword.
+pub const NET_GRANT_REFUSED: &str = "net_grant_refused";
+
 #[cfg(test)]
 mod tests {
     use super::*;

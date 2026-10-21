@@ -441,6 +441,7 @@ fn vault_why(e: crate::vault::LeaseError) -> String {
         LeaseError::NotConnected => "this device is not connected to its server".into(),
         LeaseError::NoAnswer => "the vault did not answer".into(),
         LeaseError::Unopenable => "the vault's answer did not open".into(),
+        LeaseError::NotAsked => "the vault's answer granted something other than was asked".into(),
     }
 }
 
