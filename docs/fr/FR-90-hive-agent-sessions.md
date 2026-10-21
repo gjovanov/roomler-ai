@@ -2649,11 +2649,11 @@ sequenceDiagram
     participant D as their device (roomlerd)
     participant V as vault
     participant U as the upstream
-    P->>D: LocalAPI Connect {secret, engine, ttl}, on the daemon's own endpoint only
-    D->>V: rc:vault.connect {req_id, secret, engine, ttl_secs}
+    P->>D: LocalAPI Connect {handle, engine, upstream, ttl}, on the daemon's own endpoint only
+    D->>V: rc:vault.connect {req_id, secret, field, upstream, ttl_secs}, one per field the engine needs
     V->>V: the device's row (live, advertises vault, holds a key): its OWNER is the principal
-    V->>V: Cedar secret:connect for the owner in the organization's roles, recorded
-    V-->>D: rc:vault.connected {req_id, lease_id, sealed, expires_at_ms}
+    V->>V: Cedar secret:connect for the owner in the organization's roles, the upstream one the secret names
+    V-->>D: rc:vault.connected {req_id, lease_id, sealed, expires_at_ms}, each field sealed to the device
     D->>D: open the fields with the device's key, then serve the endpoint to the account that asked
     D-->>P: the endpoint (a socket, or 127.0.0.1:port) and when it ends
     P->>D: a client connects: only that account is served
@@ -2665,8 +2665,9 @@ sequenceDiagram
 | who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:2804`), put on the refusing side of `person_may`'s exhaustive match by hand (`:2772`) |
 | who it acts as | **the device's owner** (decision 23, decided). The vault reads the owner from the device's row, never from the frame, as `rc:ssh.request` does (`crates/modules/network/src/agent_arms.rs:161`, `:211`). A device whose row is gone or removed has no principal and gets nothing |
 | which organization | the device's primary enrollment's, where the lease client lives, as for every vault ask. A secondary organization's secrets are out of reach this way |
-| the ask | `rc:vault.connect {req_id, secret, engine, ttl_secs}`, a frame of its own. It never reuses `rc:vault.lease` with the session left out: every field of that frame is believed against a session record (`crates/modules/vault/src/lease.rs:90`, `identify` at `:771`), and a request with no session must not reach that path by an absent field |
-| the decision | Cedar's new `secret:connect`. Its principal is the owner as a `User` in the organization's roles (`crates/modules/vault/src/policy.rs:528`), its resource the secret, its context the device's facts from its row and the engine. `proxy` is the only mode |
+| the call | `roomler connect <handle> --engine <e> --upstream <u> [--ca <handle>] [--ttl <s>]`, the arguments a session's `vault_connect` takes (`docs/vault.md` §19): a structured secret by its path or this organization's RRN, an engine, and the upstream exactly as the secret's `audiences` names it |
+| the ask | `rc:vault.connect {req_id, secret, field, upstream, ttl_secs}`, one per field the engine needs, as `vault_connect` asks its leases (the secret's `user` and `password`, for `bearer` its `token`, for `ssh` its `key` and `host_keys`, and the CA's). It is a frame of its own and never reuses `rc:vault.lease` with the session left out: every field of that frame is believed against a session record (`crates/modules/vault/src/lease.rs:90`, `identify` at `:771`), and a request with no session must not reach that path by an absent field |
+| the decision | Cedar's new `secret:connect`. Its principal is the owner as a `User` in the organization's roles (`crates/modules/vault/src/policy.rs:528`), its resource the secret, its context the device's facts from its row and the upstream. `proxy` is the only mode, held to an upstream the secret names by a twin of `guardrail:proxy-only-named-audiences` that P3-9-1 seeds for `secret:connect` (`docs/vault.md` §7) |
 | the release | as a session's lease (`decide_and_release`, `lease.rs:847`): the fields opened under the KEK, sealed to the device's vault key, and recorded before the answer is sent, for at most 900 s (`:933`). The lease names the owner and the device, and no session |
 | the endpoint | the daemon's own `proxy` machinery (`agents/roomlerd/src/hive/vault_connect.rs:387`), served to the one account that asked (its LocalAPI peer) and checked as a session's account is (`:845`, `:1296`). On Unix it is a socket in a directory of that account's under the daemon's runtime; on Windows, a loopback port with each connection's SID checked |
 | the engines | those a session's `vault_connect` serves: Postgres, MongoDB, HTTP, a Kubernetes API server, an SSH agent |
@@ -2680,6 +2681,12 @@ sequenceDiagram
   (`permit (principal, action == Roomler::Action::"secret:use", resource …)`) admit its people
   too, without a line of it changing. `secret:connect` names people only, so no policy written
   before P3-9 admits a person.
+- ⚠️ **And so a session's guardrails do not bind it by themselves.** Each seeded guardrail names
+  `secret:use` (`docs/vault.md` §7). Three forbid modes `secret:connect` never asks (anything
+  but `proxy` on Windows, prod values materialized, `exec` outside `exec_allow`). The fourth,
+  `proxy-only-named-audiences`, is the one that holds a `proxy` use to the upstreams its secret
+  names, and a new action would escape it. So P3-9-1 seeds its twin for `secret:connect`, in
+  the same change as the action.
 - ⚠️ **Never on the person socket.** A system install's person socket serves whoever sits at the
   screen (`crates/localapi/src/lib.rs:2751`), who need not be the device's owner. Serving
   `roomler connect` there would lend the owner's vault to anyone at the seat. On a system install
@@ -2773,7 +2780,7 @@ sequenceDiagram
 | P3-8-2b-2 | the tool `ssh_run` on the toolbelt, behind a device-owned `hive_ssh`, asked of a person on every call | device `hive_ssh = false`; the `vault` feature in no release build | — |
 | P3-8-3 | `fleet_exec` as a tool, as decision 5 says | decision 5 | — |
 | P3-9-0 | `roomler connect`'s design (§3e "P3-9, `roomler connect`, as designed"), and decisions 23–25 | docs only | — |
-| P3-9-1 | the vault's half: `rc:vault.connect`, believed from the device's row with its owner the principal; Cedar's `secret:connect` (`User`); the release sealed to the device; `vault_audit` `source: person` | `vault.people` (default off) | — |
+| P3-9-1 | the vault's half: `rc:vault.connect`, one per field, believed from the device's row with its owner the principal; Cedar's `secret:connect` (`User`) with its twin of `guardrail:proxy-only-named-audiences`; the release sealed to the device; `vault_audit` `source: person` | `vault.people` (default off) | — |
 | P3-9-2 | the device's half: LocalAPI `Connect` on the daemon's own endpoint only; the daemon's ask and the endpoint for the account that asked; `roomler connect <handle>` (knowhow's `roomler_connect(entity)` waits for P4) | device `vault_enabled = false`; the `vault` feature in no release build | — |
 | P3k | the field run in the test org, and `docs/vault.md` | — | AC12, AC13, AC19's vault half |
 | P3b | `placeholder` egress, as designed | `vault.placeholder = false` | AC14 |
