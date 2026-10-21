@@ -45,10 +45,15 @@
 //! the rate governor's standing target. The controller is stateful and ticks
 //! inside the pass; making it the plan's is M4 (one controller), not M3. What
 //! M3a CAN check about the rate is the two places the loop decides a rate by
-//! itself — the rate it builds an encoder at (the inline open, and the
-//! make-before-break replacements it adopts) — against the first target the
-//! controller hands that encoder ([`Shadow::note_built`],
-//! [`Shadow::after_tick`]).
+//! itself. The inline open is judged against the first target the controller
+//! hands that encoder ([`Shadow::note_built`], [`Shadow::after_tick`]). A
+//! make-before-break replacement is judged against the plan it was SPAWNED
+//! under, because that is where the loop decided its rate (and, for a dims
+//! swap, its dims) — [`Shadow::note_rate_swap_adopted`],
+//! [`Shadow::note_dims_swap_adopted`]. One that arrives after the plan moved
+//! while it opened was still built at the plan of its moment: it is counted
+//! apart ([`Shadow::stale_swaps`]), never as a divergence. The field's first
+//! read found exactly that, and only that (2026-10-21).
 //!
 //! # Knobs are read once
 //!
@@ -299,6 +304,30 @@ pub(crate) struct FirstDivergence {
     pub inline: String,
 }
 
+/// The plan a make-before-break replacement was SPAWNED under. The loop
+/// decides a replacement's rate (and, for a dims swap, its dims) at the spawn,
+/// so that plan — not the one in force when the open finishes, which on a
+/// rebuild-bound backend can be seconds later — is the one it is judged
+/// against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SwapSpawn {
+    bitrate_bps: u32,
+    dims: (u32, u32),
+}
+
+/// A replacement adopted after the plan moved while it opened, for the pump
+/// to log once per session. Not a divergence: the loop built it at the plan's
+/// values of the moment it decided them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaleSwap {
+    pub kind: &'static str,
+    pub built_bps: u32,
+    pub spawned_bps: u32,
+    pub now_bps: u32,
+    pub spawned_dims: (u32, u32),
+    pub now_dims: (u32, u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Budget,
@@ -340,6 +369,10 @@ pub(crate) struct Shadow {
     /// built at (raw; laddered at the comparison) and its dims. A build the
     /// loop replaced before a tick is superseded, not judged.
     built: Option<(u32, (u32, u32))>,
+    /// Replacements adopted after the plan moved while they opened.
+    stale_swaps: u32,
+    /// Whether this session's first stale adoption has been reported.
+    stale_reported: bool,
 }
 
 impl Shadow {
@@ -509,6 +542,98 @@ impl Shadow {
             }
         }
         out
+    }
+
+    /// The plan a replacement spawned now will be judged against; `None`
+    /// before the first plan, and a replacement spawned then is not judged.
+    pub(crate) fn swap_spawn(&self) -> Option<SwapSpawn> {
+        self.plan.map(|p| SwapSpawn {
+            bitrate_bps: p.bitrate_bps,
+            dims: p.dims,
+        })
+    }
+
+    /// The loop adopted a RATE replacement built at `rate_bps`. Its rate is
+    /// the one thing the loop decided for it (`rebuild_spec` copies the live
+    /// encoder's dims, which M2's pin holds while a dims swap opens), so the
+    /// rate is all that is judged.
+    pub(crate) fn note_rate_swap_adopted(
+        &mut self,
+        rate_bps: u32,
+        spawned: Option<SwapSpawn>,
+    ) -> (Vec<FirstDivergence>, Option<StaleSwap>) {
+        self.judge_swap("rate", rate_bps, None, spawned)
+    }
+
+    /// The loop adopted a DIMS replacement built at `rate_bps` and `dims`;
+    /// it decided both at the spawn.
+    pub(crate) fn note_dims_swap_adopted(
+        &mut self,
+        rate_bps: u32,
+        dims: (u32, u32),
+        spawned: Option<SwapSpawn>,
+    ) -> (Vec<FirstDivergence>, Option<StaleSwap>) {
+        self.judge_swap("dims", rate_bps, Some(dims), spawned)
+    }
+
+    /// A replacement is judged against the plan AT ITS SPAWN, where the loop
+    /// decided it: built off that plan is a divergence. A plan that moved while
+    /// it opened is not the loop deciding anything — a QSV open runs 0.2–3.6 s
+    /// and a stall cascade halves the target every few seconds, so on the
+    /// field's first read (2026-10-21, a hevc_qsv session) a replacement built
+    /// at 12 M for the then-target arrived after the controller had reached
+    /// 2.7 M. That lag is counted apart, as `stale_swaps`, never as a
+    /// divergence, and the adoption is not judged again at the next tick.
+    fn judge_swap(
+        &mut self,
+        kind: &'static str,
+        rate_bps: u32,
+        dims: Option<(u32, u32)>,
+        spawned: Option<SwapSpawn>,
+    ) -> (Vec<FirstDivergence>, Option<StaleSwap>) {
+        let mut out = Vec::new();
+        let Some(spawned) = spawned else {
+            return (out, None);
+        };
+        let spawned_has_dims = spawned.dims.0 > 0 && spawned.dims.1 > 0;
+        self.diverge(
+            Field::Bitrate,
+            spawned.bitrate_bps,
+            ladder(rate_bps),
+            &mut out,
+        );
+        if let Some(dims) = dims
+            && spawned_has_dims
+        {
+            self.diverge(Field::Dims, spawned.dims, dims, &mut out);
+        }
+        let Some(now) = self.plan else {
+            return (out, None);
+        };
+        let dims_moved =
+            dims.is_some() && spawned_has_dims && now.has_dims() && now.dims != spawned.dims;
+        if now.bitrate_bps == spawned.bitrate_bps && !dims_moved {
+            return (out, None);
+        }
+        self.stale_swaps = self.stale_swaps.saturating_add(1);
+        if self.stale_reported {
+            return (out, None);
+        }
+        self.stale_reported = true;
+        let stale = StaleSwap {
+            kind,
+            built_bps: rate_bps,
+            spawned_bps: spawned.bitrate_bps,
+            now_bps: now.bitrate_bps,
+            spawned_dims: spawned.dims,
+            now_dims: now.dims,
+        };
+        (out, Some(stale))
+    }
+
+    /// Replacements adopted after the plan moved while they opened.
+    pub(crate) fn stale_swaps(&self) -> u32 {
+        self.stale_swaps
     }
 }
 
@@ -904,6 +1029,159 @@ mod tests {
         // A build is judged once.
         assert!(s.after_tick(3_000_000).is_empty());
         assert_eq!(s.counts().dims, 1);
+    }
+
+    /// The field's first read (2026-10-21, a hevc_qsv session in a stall
+    /// cascade): the live encoder at the 20 M rung, a rate swap spawned when
+    /// the controller said 10.7 M (the 12 M rung), the target at 5.4 M while
+    /// it opened, adopted, then 2.74 M (the 3 M rung) on the next tick.
+    fn field_cascade(s: &mut Shadow) -> Option<SwapSpawn> {
+        s.produce(
+            &PlanInputs {
+                target_bps: 19_670_400,
+                ..direct(43_000_000, 100)
+            },
+            &knobs(),
+        );
+        assert!(s.after_tick(10_708_885).is_empty());
+        let spawned = s.swap_spawn();
+        assert!(s.after_tick(5_396_362).is_empty());
+        spawned
+    }
+
+    #[test]
+    fn a_replacement_is_judged_at_its_spawn_not_after_the_plan_moved() {
+        let mut s = Shadow::default();
+        let spawned = field_cascade(&mut s);
+        assert_eq!(spawned.map(|p| p.bitrate_bps), Some(12_000_000));
+        let (first, stale) = s.note_rate_swap_adopted(12_000_000, spawned);
+        assert!(
+            first.is_empty(),
+            "built at the plan of its spawn: {first:?}"
+        );
+        assert_eq!(
+            stale,
+            Some(StaleSwap {
+                kind: "rate",
+                built_bps: 12_000_000,
+                spawned_bps: 12_000_000,
+                now_bps: 6_000_000,
+                spawned_dims: (1920, 1200),
+                now_dims: (1920, 1200),
+            })
+        );
+        // The controller's next tick does not judge the adoption again.
+        assert!(s.after_tick(2_744_302).is_empty());
+        assert_eq!(s.counts(), PlanDivergences::default());
+        assert_eq!(s.stale_swaps(), 1);
+    }
+
+    /// The same adoption judged the way M3a first shipped — at the
+    /// controller's next tick — is exactly the line the field logged.
+    #[test]
+    fn judged_at_the_next_tick_the_field_s_adoption_reads_as_a_divergence() {
+        let mut s = Shadow::default();
+        field_cascade(&mut s);
+        s.note_built(12_000_000, (1920, 1200));
+        let first = s.after_tick(2_744_302);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].field, "bitrate");
+        assert_eq!(first[0].plan, "3000000");
+        assert_eq!(first[0].inline, "12000000");
+    }
+
+    #[test]
+    fn a_replacement_built_off_the_plan_of_its_spawn_still_diverges() {
+        let mut s = Shadow::default();
+        s.produce(
+            &PlanInputs {
+                target_bps: 3_000_000,
+                ..constrained(None)
+            },
+            &knobs(),
+        );
+        let spawned = s.swap_spawn();
+        // A rate no plan had: the loop decided by itself.
+        let (first, stale) = s.note_rate_swap_adopted(6_000_000, spawned);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].field, "bitrate");
+        assert_eq!(first[0].plan, "3000000");
+        assert_eq!(first[0].inline, "6000000");
+        assert_eq!(stale, None, "the plan held: not stale");
+        assert_eq!(s.stale_swaps(), 0);
+    }
+
+    #[test]
+    fn a_dims_replacement_is_judged_on_rate_and_dims_at_its_spawn() {
+        let mut s = Shadow::default();
+        let plan = s.produce(
+            &PlanInputs {
+                target_bps: 3_000_000,
+                ..constrained(None)
+            },
+            &knobs(),
+        );
+        let spawned = s.swap_spawn();
+        // Built where the plan aimed when it spawned: clean, not stale.
+        assert_eq!(
+            s.note_dims_swap_adopted(3_000_000, plan.dims, spawned),
+            (vec![], None)
+        );
+        // Built at other dims than the plan of its spawn: a divergence.
+        let (first, _) = s.note_dims_swap_adopted(3_000_000, (1280, 800), spawned);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].field, "dims");
+        // The plan's geometry moved while it opened (a native change): stale.
+        s.produce(
+            &PlanInputs {
+                target_bps: 3_000_000,
+                dims: dims(2560, 1600),
+                ..constrained(None)
+            },
+            &knobs(),
+        );
+        let (first, stale) = s.note_dims_swap_adopted(3_000_000, plan.dims, spawned);
+        assert!(first.is_empty());
+        assert_eq!(stale.map(|x| x.kind), Some("dims"));
+        // A RATE replacement does not judge dims — they are the live
+        // encoder's, held by M2's pin — so moved geometry alone is not stale.
+        let rate_spawned = s.swap_spawn();
+        s.produce(
+            &PlanInputs {
+                target_bps: 3_000_000,
+                ..constrained(None)
+            },
+            &knobs(),
+        );
+        assert_eq!(
+            s.note_rate_swap_adopted(3_000_000, rate_spawned),
+            (vec![], None)
+        );
+        assert_eq!(s.counts().dims, 1);
+        assert_eq!(s.stale_swaps(), 1);
+    }
+
+    #[test]
+    fn a_replacement_spawned_before_any_plan_is_not_judged() {
+        let mut s = Shadow::default();
+        assert_eq!(s.swap_spawn(), None);
+        assert_eq!(s.note_rate_swap_adopted(12_000_000, None), (vec![], None));
+        assert_eq!(
+            s.note_dims_swap_adopted(12_000_000, (1280, 800), None),
+            (vec![], None)
+        );
+        assert_eq!(s.counts(), PlanDivergences::default());
+        assert_eq!(s.stale_swaps(), 0);
+    }
+
+    #[test]
+    fn a_stale_adoption_is_reported_once_and_counted_every_time() {
+        let mut s = Shadow::default();
+        let spawned = field_cascade(&mut s);
+        assert!(s.note_rate_swap_adopted(12_000_000, spawned).1.is_some());
+        assert!(s.note_rate_swap_adopted(12_000_000, spawned).1.is_none());
+        assert_eq!(s.stale_swaps(), 2);
+        assert_eq!(s.counts(), PlanDivergences::default());
     }
 
     /// The knobs the producer takes once are the numbers the per-frame readers
