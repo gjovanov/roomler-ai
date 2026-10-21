@@ -1830,3 +1830,271 @@ pub(crate) fn ssh_host() -> (ring::signature::Ed25519KeyPair, Vec<u8>, String) {
 pub(crate) fn ssh_host_line() -> String {
     ssh_host().2
 }
+
+/// P3-6f-1 — a Secret the fake API server holds.
+#[derive(Debug, Clone)]
+pub(crate) struct FakeSecret {
+    pub(crate) uid: String,
+    pub(crate) labels: serde_json::Value,
+    pub(crate) annotations: serde_json::Value,
+}
+
+/// P3-6f-1 — one request the fake API server saw.
+#[derive(Debug, Clone)]
+pub(crate) struct K8sSaw {
+    pub(crate) method: String,
+    /// The request's target, as it came: its path and its query.
+    pub(crate) target: String,
+    pub(crate) authorization: Option<String>,
+    /// Its body, as JSON; `Null` where it had none.
+    pub(crate) body: serde_json::Value,
+}
+
+/// P3-6f-1 — what the fake API server holds, and how it answers.
+#[derive(Default)]
+pub(crate) struct K8sState {
+    pub(crate) secrets: std::collections::BTreeMap<String, FakeSecret>,
+    pub(crate) saw: Vec<K8sSaw>,
+    /// Refuse the `TokenRequest` with this status and message.
+    pub(crate) refuse_token: Option<(u16, String)>,
+    /// Refuse to list Secrets, as for an issuer RBAC gives no `list`.
+    pub(crate) refuse_list: bool,
+    next: u64,
+}
+
+impl K8sState {
+    /// A Secret the fake holds, made by the test, as an earlier mint or
+    /// someone else would have left it.
+    pub(crate) fn put(
+        &mut self,
+        name: &str,
+        labels: serde_json::Value,
+        annotations: serde_json::Value,
+    ) -> String {
+        self.next += 1;
+        let uid = format!("uid-{}", self.next);
+        self.secrets.insert(
+            name.to_string(),
+            FakeSecret {
+                uid: uid.clone(),
+                labels,
+                annotations,
+            },
+        );
+        uid
+    }
+}
+
+/// P3-6f-1 — a fake Kubernetes API server on a random port of 127.0.0.1,
+/// over TLS with a certificate for `localhost` made for the test, and (with
+/// `mtls`) asking every client for a certificate its own client CA made.
+pub(crate) struct FakeK8s {
+    /// Its CA, PEM.
+    pub(crate) ca: String,
+    pub(crate) port: u16,
+    pub(crate) state: Arc<std::sync::Mutex<K8sState>>,
+    /// With `mtls`, a client certificate its client CA made, and its key.
+    pub(crate) client: Option<(String, String)>,
+}
+
+impl FakeK8s {
+    pub(crate) fn origin(&self) -> String {
+        format!("https://localhost:{}", self.port)
+    }
+
+    pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, K8sState> {
+        self.state.lock().unwrap()
+    }
+}
+
+/// P3-6f-1 — the fake answers what a Kubernetes issuer's minter asks of an
+/// API server, by path:
+///
+/// | Request | Answer |
+/// |---|---|
+/// | `POST …/namespaces/<ns>/secrets` | the Secret held, with a uid of its own; 409 where one has its name |
+/// | `POST …/serviceaccounts/<sa>/token` | a token, where its `boundObjectRef` names a Secret held, by name and uid; else 400 |
+/// | `DELETE …/secrets/<name>` | 404 where none is held; 409 where its uid is not the precondition's; else deleted |
+/// | `GET …/secrets?labelSelector=…` | the Secrets that carry the label (403 with `refuse_list`) |
+pub(crate) async fn fake_k8s(mtls: bool) -> FakeK8s {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use tokio_rustls::rustls::RootCertStore;
+    use tokio_rustls::rustls::server::WebPkiClientVerifier;
+
+    let state = Arc::new(std::sync::Mutex::new(K8sState::default()));
+    let (ca, acceptor, listener, port, client) = if mtls {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let issuer_key = KeyPair::generate().unwrap();
+        let mut issuer = CertificateParams::new(Vec::<String>::new()).unwrap();
+        issuer.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let issuer = issuer.self_signed(&issuer_key).unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let client = CertificateParams::new(vec!["vault-issuer".to_string()])
+            .unwrap()
+            .signed_by(&client_key, &issuer, &issuer_key)
+            .unwrap();
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(issuer.der().clone()).unwrap();
+        let verifier = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(client_roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .unwrap();
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![own.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(own.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (
+            own.cert.pem(),
+            TlsAcceptor::from(Arc::new(config)),
+            listener,
+            port,
+            Some((client.pem(), client_key.serialize_pem())),
+        )
+    } else {
+        let (pem, acceptor, listener, port) = tls_server().await;
+        (pem, acceptor, listener, port, None)
+    };
+    run_k8s(acceptor, listener, Arc::clone(&state));
+    FakeK8s {
+        ca,
+        port,
+        state,
+        client,
+    }
+}
+
+fn run_k8s(acceptor: TlsAcceptor, listener: TcpListener, state: Arc<std::sync::Mutex<K8sState>>) {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use serde_json::{Value, json};
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (acceptor, state) = (acceptor.clone(), Arc::clone(&state));
+            tokio::spawn(async move {
+                let Ok(s) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body = body
+                            .collect()
+                            .await
+                            .map(|b| b.to_bytes())
+                            .unwrap_or_default();
+                        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let target = parts.uri.to_string();
+                        let path = parts.uri.path().to_string();
+                        let mut st = state.lock().unwrap();
+                        st.saw.push(K8sSaw {
+                            method: parts.method.to_string(),
+                            target: target.clone(),
+                            authorization: parts
+                                .headers
+                                .get("authorization")
+                                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
+                            body: body.clone(),
+                        });
+                        let status_of = |code: u16, message: &str| {
+                            (code, json!({"kind": "Status", "message": message}))
+                        };
+                        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                        let (code, answer) = match (parts.method.as_str(), segments.as_slice()) {
+                            ("POST", ["api", "v1", "namespaces", _, "secrets"]) => {
+                                let name = body["metadata"]["name"].as_str().unwrap_or_default();
+                                if name.is_empty() || st.secrets.contains_key(name) {
+                                    status_of(409, "secrets already exists")
+                                } else {
+                                    let (labels, annotations) = (
+                                        body["metadata"]["labels"].clone(),
+                                        body["metadata"]["annotations"].clone(),
+                                    );
+                                    let uid = st.put(name, labels, annotations);
+                                    (201, json!({"metadata": {"name": name, "uid": uid}}))
+                                }
+                            }
+                            (
+                                "POST",
+                                ["api", "v1", "namespaces", _, "serviceaccounts", sa, "token"],
+                            ) => {
+                                let bound = &body["spec"]["boundObjectRef"];
+                                let held = bound["name"]
+                                    .as_str()
+                                    .and_then(|n| st.secrets.get(n))
+                                    .is_some_and(|s| bound["uid"].as_str() == Some(s.uid.as_str()));
+                                if let Some((code, message)) = st.refuse_token.clone() {
+                                    status_of(code, &message)
+                                } else if bound["kind"] != "Secret" || !held {
+                                    status_of(400, "the bound object is not held")
+                                } else {
+                                    let token =
+                                        ["minted", *sa, bound["name"].as_str().unwrap()].join(".");
+                                    (201, json!({"status": {"token": token}}))
+                                }
+                            }
+                            ("DELETE", ["api", "v1", "namespaces", _, "secrets", name]) => {
+                                let want = body["preconditions"]["uid"].as_str().map(String::from);
+                                match st.secrets.get(*name).map(|s| s.uid.clone()) {
+                                    None => status_of(404, "secrets not found"),
+                                    Some(uid) if Some(uid.as_str()) != want.as_deref() => {
+                                        status_of(409, "the precondition's uid is not the object's")
+                                    }
+                                    Some(_) => {
+                                        st.secrets.remove(*name);
+                                        (200, json!({"kind": "Status", "status": "Success"}))
+                                    }
+                                }
+                            }
+                            ("GET", ["api", "v1", "namespaces", _, "secrets"]) => {
+                                if st.refuse_list {
+                                    status_of(403, "secrets is forbidden: cannot list")
+                                } else {
+                                    let items: Vec<Value> = st
+                                        .secrets
+                                        .iter()
+                                        .filter(|(_, s)| s.labels.get("roomler.ai/lease").is_some())
+                                        .map(|(name, s)| {
+                                            json!({"metadata": {
+                                                "name": name,
+                                                "uid": s.uid,
+                                                "labels": s.labels,
+                                                "annotations": s.annotations,
+                                            }})
+                                        })
+                                        .collect();
+                                    (200, json!({"items": items}))
+                                }
+                            }
+                            _ => status_of(404, "the fake answers no such request"),
+                        };
+                        drop(st);
+                        let mut resp = Response::new(Full::new(Bytes::from(answer.to_string())));
+                        *resp.status_mut() = StatusCode::from_u16(code).unwrap();
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(s), service)
+                    .await;
+            });
+        }
+    });
+}

@@ -1012,7 +1012,7 @@ flowchart LR
 | Piece | Where |
 |---|---|
 | the hook | `Admit` ([`flow_listener.rs:122`](../crates/tunnel-core/src/flow_listener.rs#L122)), `FlowListener::bind_admitting` ([`:133`](../crates/tunnel-core/src/flow_listener.rs#L133)), asked before the hold ([`:304`](../crates/tunnel-core/src/flow_listener.rs#L304)) |
-| the account | `connection_is` ([`vault_connect.rs:1759`](../agents/roomlerd/src/hive/vault_connect.rs#L1759)), the session listener's hook `session_admit` ([`:1822`](../agents/roomlerd/src/hive/vault_connect.rs#L1822)) |
+| the account | `connection_is` ([`vault_connect.rs:1726`](../agents/roomlerd/src/hive/vault_connect.rs#L1726)), the session listener's hook `session_admit` ([`:1789`](../agents/roomlerd/src/hive/vault_connect.rs#L1789)) |
 | RFC 1929 | `Socks5Credential` ([`socks5.rs:95`](../crates/tunnel-core/src/socks5.rs#L95)), `accept_connect_authenticated` ([`:122`](../crates/tunnel-core/src/socks5.rs#L122)); `Target::SessionSocks5` ([`driver.rs:376`](../crates/tunnel-core/src/driver.rs#L376)), served in the carrier ([`:676`](../crates/tunnel-core/src/driver.rs#L676)) |
 | the flow | `create_session_flow` ([`client_mgr.rs:462`](../agents/roomlerd/src/tunnel/client_mgr.rs#L462)), ended at the grant's end ([`:495`](../agents/roomlerd/src/tunnel/client_mgr.rs#L495)) |
 | tests | `socks5::tests` (2), `flow_listener::tests` (1), `driver::tests::a_session_carrier_forwards_its_credentials_connections_alone`, `tunnel::client_mgr::tests::a_session_flow_serves_whom_it_admits_and_ends_with_its_grant`, `hive::vault_connect::tests::a_session_listener_admits_its_account_alone`: 6, and 11 negative controls |
