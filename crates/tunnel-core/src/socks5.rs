@@ -13,6 +13,11 @@
 //! Bound to 127.0.0.1 by the caller, so no on-wire auth is needed (the SOCKS
 //! hop never leaves the host); the target is still gated by the server-side
 //! tunnel policy + the agent allowlist, exactly like a static `--remote`.
+//!
+//! FR-90 P3-7-3b — an agent session's listener is the exception: a second
+//! session under the same account could share its loopback port, so it takes
+//! RFC 1929 with the listener's own capability, and CONNECT alone
+//! ([`accept_connect_authenticated`]).
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,7 +25,13 @@ use tokio::net::TcpStream;
 
 const VER: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
+/// FR-90 P3-7-3b — RFC 1929's method, offered by a session's listener alone.
+const METHOD_USER_PASS: u8 = 0x02;
 const METHOD_NONE: u8 = 0xFF;
+/// RFC 1929's sub-negotiation version, and its two statuses.
+const AUTH_VER: u8 = 0x01;
+const AUTH_OK: u8 = 0x00;
+const AUTH_FAILED: u8 = 0x01;
 const CMD_CONNECT: u8 = 0x01;
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
@@ -50,7 +61,13 @@ pub enum Socks5Request {
 /// type) before erroring; the caller sends the success reply once the
 /// agent has accepted the forward.
 pub async fn accept_request(tcp: &mut TcpStream) -> Result<Socks5Request> {
-    // ── method negotiation: VER, NMETHODS, METHODS ──
+    negotiate(tcp, METHOD_NO_AUTH).await?;
+    read_request(tcp).await
+}
+
+/// The method negotiation (VER, NMETHODS, METHODS), selecting `method` alone:
+/// a client that does not offer it is answered "no acceptable method".
+async fn negotiate(tcp: &mut TcpStream, method: u8) -> Result<()> {
     let ver = tcp.read_u8().await.context("read socks version")?;
     if ver != VER {
         bail!("unsupported SOCKS version {ver:#x} (only 5)");
@@ -60,15 +77,86 @@ pub async fn accept_request(tcp: &mut TcpStream) -> Result<Socks5Request> {
     tcp.read_exact(&mut methods)
         .await
         .context("read auth methods")?;
-    if !methods.contains(&METHOD_NO_AUTH) {
+    if !methods.contains(&method) {
         let _ = tcp.write_all(&[VER, METHOD_NONE]).await;
-        bail!("client offered no no-auth method");
+        bail!("client offered no {method:#04x} method");
     }
-    tcp.write_all(&[VER, METHOD_NO_AUTH])
+    tcp.write_all(&[VER, method])
         .await
-        .context("write method selection")?;
+        .context("write method selection")
+}
 
-    // ── request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT ──
+/// FR-90 P3-7-3b — the one credential an agent session's SOCKS5 listener
+/// takes (RFC 1929): the session's id for the username, the listener's
+/// capability for the password.
+///
+/// ⚠️ The password is the capability: `Debug` names the username alone.
+#[derive(Clone)]
+pub struct Socks5Credential {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Socks5Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5Credential")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The credential the tests' session listeners take, made at run time so the
+/// tree holds no username/password literal (GitGuardian scans every commit).
+#[cfg(test)]
+pub(crate) fn test_credential() -> Socks5Credential {
+    let username = ["session", "1"].join("-");
+    let password = ["the", "listeners", "capability"].join("-");
+    Socks5Credential { username, password }
+}
+
+/// FR-90 P3-7-3b — [`accept_connect`] for an agent session's listener: RFC
+/// 1929 alone, `cred` alone, compared in constant time, and CONNECT alone (the
+/// listener's account check reads TCP sockets). A client offering no
+/// username/password method, or another credential, is refused before any
+/// request is read. Every other listener keeps [`accept_request`]'s no-auth.
+pub async fn accept_connect_authenticated(
+    tcp: &mut TcpStream,
+    cred: &Socks5Credential,
+) -> Result<(String, u16)> {
+    use subtle::ConstantTimeEq;
+    negotiate(tcp, METHOD_USER_PASS).await?;
+    // ── RFC 1929: VER, ULEN, UNAME, PLEN, PASSWD ──
+    let ver = tcp.read_u8().await.context("read auth version")?;
+    if ver != AUTH_VER {
+        let _ = tcp.write_all(&[AUTH_VER, AUTH_FAILED]).await;
+        bail!("unsupported username/password version {ver:#x} (only 1)");
+    }
+    let ulen = tcp.read_u8().await.context("read username length")?;
+    let mut uname = vec![0u8; ulen as usize];
+    tcp.read_exact(&mut uname).await.context("read username")?;
+    let plen = tcp.read_u8().await.context("read password length")?;
+    let mut passwd = vec![0u8; plen as usize];
+    tcp.read_exact(&mut passwd).await.context("read password")?;
+    let user_ok = uname.as_slice().ct_eq(cred.username.as_bytes());
+    let pass_ok = passwd.as_slice().ct_eq(cred.password.as_bytes());
+    if !bool::from(user_ok & pass_ok) {
+        let _ = tcp.write_all(&[AUTH_VER, AUTH_FAILED]).await;
+        bail!("a username or password that is not this listener's");
+    }
+    tcp.write_all(&[AUTH_VER, AUTH_OK])
+        .await
+        .context("write auth status")?;
+    match read_request(tcp).await? {
+        Socks5Request::Connect { host, port } => Ok((host, port)),
+        Socks5Request::UdpAssociate => {
+            reply(tcp, REP_CMD_NOT_SUPPORTED).await;
+            bail!("UDP ASSOCIATE is not served on a session's listener");
+        }
+    }
+}
+
+/// One request after the negotiation: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT.
+async fn read_request(tcp: &mut TcpStream) -> Result<Socks5Request> {
     let ver = tcp.read_u8().await.context("read request version")?;
     if ver != VER {
         bail!("bad request version {ver:#x}");
@@ -419,6 +507,156 @@ mod tests {
         assert!(accept_connect(&mut srv).await.is_err());
         let sel = client.await.unwrap();
         assert_eq!(sel, [VER, METHOD_NONE]);
+    }
+
+    /// What a client saw of a session listener's handshake: the method the
+    /// server selected, the RFC 1929 status if it got that far, and the
+    /// request's reply code if it got that far.
+    type Seen = (u8, Option<u8>, Option<u8>);
+
+    /// FR-90 P3-7-3b — offer `methods`, authenticate as `user`/`pass` if the
+    /// server selects RFC 1929, then send `request`.
+    async fn user_pass_client(
+        addr: std::net::SocketAddr,
+        methods: Vec<u8>,
+        user: Vec<u8>,
+        pass: Vec<u8>,
+        request: Vec<u8>,
+    ) -> Seen {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let mut hello = vec![VER, methods.len() as u8];
+        hello.extend_from_slice(&methods);
+        c.write_all(&hello).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        if sel[1] != METHOD_USER_PASS {
+            return (sel[1], None, None);
+        }
+        let mut auth = vec![AUTH_VER, user.len() as u8];
+        auth.extend_from_slice(&user);
+        auth.push(pass.len() as u8);
+        auth.extend_from_slice(&pass);
+        c.write_all(&auth).await.unwrap();
+        let mut status = [0u8; 2];
+        c.read_exact(&mut status).await.unwrap();
+        if status[1] != AUTH_OK {
+            return (sel[1], Some(status[1]), None);
+        }
+        c.write_all(&request).await.unwrap();
+        let mut rep = [0u8; 10];
+        match c.read_exact(&mut rep).await {
+            Ok(_) => (sel[1], Some(status[1]), Some(rep[1])),
+            Err(_) => (sel[1], Some(status[1]), None),
+        }
+    }
+
+    fn connect_to(host: &str, port: u16) -> Vec<u8> {
+        let mut req = vec![VER, CMD_CONNECT, 0x00, ATYP_DOMAIN, host.len() as u8];
+        req.extend_from_slice(host.as_bytes());
+        req.extend_from_slice(&port.to_be_bytes());
+        req
+    }
+
+    /// One session-listener handshake: what the listener made of it, and
+    /// what the client saw.
+    async fn session_handshake(
+        methods: &[u8],
+        user: &str,
+        pass: &str,
+        request: Vec<u8>,
+    ) -> (Result<(String, u16)>, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(user_pass_client(
+            addr,
+            methods.to_vec(),
+            user.as_bytes().to_vec(),
+            pass.as_bytes().to_vec(),
+            request,
+        ));
+        let (mut srv, _) = listener.accept().await.unwrap();
+        let cred = test_credential();
+        let got = accept_connect_authenticated(&mut srv, &cred).await;
+        if got.is_ok() {
+            reply(&mut srv, REP_SUCCESS).await;
+        }
+        drop(srv);
+        (got, client.await.unwrap())
+    }
+
+    /// FR-90 P3-7-3b — a session's listener serves its own credential alone:
+    /// another password or another username is refused at RFC 1929, a client
+    /// that offers no username/password method at the negotiation, and either
+    /// way no request is read.
+    #[tokio::test]
+    async fn a_session_listener_takes_its_own_credential_alone() {
+        let cred = test_credential();
+        let (me, ours) = (cred.username.as_str(), cred.password.as_str());
+        let another_password = format!("{ours}x");
+        let another_user = format!("{me}x");
+        for (methods, user, pass, seen) in [
+            (
+                &[METHOD_USER_PASS][..],
+                me,
+                ours,
+                (METHOD_USER_PASS, Some(AUTH_OK), Some(REP_SUCCESS)),
+            ),
+            (
+                &[METHOD_NO_AUTH, METHOD_USER_PASS][..],
+                me,
+                ours,
+                (METHOD_USER_PASS, Some(AUTH_OK), Some(REP_SUCCESS)),
+            ),
+            (
+                &[METHOD_USER_PASS][..],
+                me,
+                another_password.as_str(),
+                (METHOD_USER_PASS, Some(AUTH_FAILED), None),
+            ),
+            (
+                &[METHOD_USER_PASS][..],
+                another_user.as_str(),
+                ours,
+                (METHOD_USER_PASS, Some(AUTH_FAILED), None),
+            ),
+            (
+                &[METHOD_USER_PASS][..],
+                me,
+                "",
+                (METHOD_USER_PASS, Some(AUTH_FAILED), None),
+            ),
+            (&[METHOD_NO_AUTH][..], "", "", (METHOD_NONE, None, None)),
+        ] {
+            let (got, saw) =
+                session_handshake(methods, user, pass, connect_to("db.internal", 5432)).await;
+            assert_eq!(saw, seen, "{methods:?} {user}");
+            if seen.1 == Some(AUTH_OK) {
+                assert_eq!(got.unwrap(), ("db.internal".to_string(), 5432));
+            } else {
+                assert!(got.is_err(), "{methods:?} {user}");
+            }
+        }
+    }
+
+    /// FR-90 P3-7-3b — a session's listener serves CONNECT alone: UDP
+    /// ASSOCIATE is refused even with its credential. And its credential
+    /// prints its username alone.
+    #[tokio::test]
+    async fn a_session_listener_serves_connect_alone() {
+        let cred = test_credential();
+        let udp = vec![VER, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+        let (got, saw) =
+            session_handshake(&[METHOD_USER_PASS], &cred.username, &cred.password, udp).await;
+        assert!(got.is_err());
+        assert_eq!(
+            saw,
+            (METHOD_USER_PASS, Some(AUTH_OK), Some(REP_CMD_NOT_SUPPORTED))
+        );
+        let shown = format!("{cred:?}");
+        assert!(
+            shown.contains(&cred.username) && !shown.contains(&cred.password),
+            "{shown}"
+        );
     }
 
     #[test]
