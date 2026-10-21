@@ -4,7 +4,8 @@
 //! by a dynamic secret's issuer, bound to a Secret made for the lease, so that
 //! deleting the Secret ends the token (`docs/fr/FR-90-hive-agent-sessions.md`
 //! §3e, "P3-6f, a Kubernetes `TokenRequest`, as designed"; `docs/vault.md`
-//! §20). Nothing calls it yet: its caller is P3-6f-2's.
+//! §20). Since P3-6f-2 the lease client reaches it through `super::minter`,
+//! by the bundle's provider, `kubernetes`.
 //!
 //! | Step | What happens |
 //! |---|---|

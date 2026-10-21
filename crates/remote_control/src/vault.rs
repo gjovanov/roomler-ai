@@ -474,8 +474,31 @@ pub mod providers {
         mints_on: MintsOn::Device,
     };
 
+    /// P3-6f-2 — a Kubernetes service account's token, minted for the lease
+    /// bound to a Secret made for it, which its revocation deletes. The
+    /// issuer signs in by `admin_token`, or by `admin_cert` and `admin_key`:
+    /// one of the two, which the device's minter holds it to, since
+    /// `required` names only what every issuer holds. Its credential is
+    /// named `admin_*` so it shares no name with the session's `token`; `ca`
+    /// and `namespace` are the same value on both sides.
+    pub const KUBERNETES: Provider = Provider {
+        name: "kubernetes",
+        issuer: &[
+            "namespace",
+            "service_account",
+            "admin_token",
+            "admin_cert",
+            "admin_key",
+            "ca",
+            "audiences",
+        ],
+        required: &["namespace", "service_account"],
+        minted: &["token", "server", "ca", "namespace"],
+        mints_on: MintsOn::Device,
+    };
+
     /// Every provider this build knows.
-    pub const ALL: &[Provider] = &[POSTGRES, MYSQL];
+    pub const ALL: &[Provider] = &[POSTGRES, MYSQL, KUBERNETES];
 
     /// The provider a secret names. `None` for a name this build cannot
     /// name, which nothing mints for.
@@ -705,7 +728,7 @@ mod tests {
     fn a_providers_names_are_locked() {
         use providers::*;
         let names: Vec<&str> = ALL.iter().map(|p| p.name).collect();
-        assert_eq!(names, ["postgres", "mysql"]);
+        assert_eq!(names, ["postgres", "mysql", "kubernetes"]);
         for p in [POSTGRES, MYSQL] {
             assert_eq!(
                 (p.issuer, p.required, p.minted),
@@ -719,9 +742,29 @@ mod tests {
             );
             assert_eq!(p.mints_on, MintsOn::Device, "{}", p.name);
         }
+        // P3-6f-2 — the credential is `admin_*`, never the session's `token`.
+        assert_eq!(
+            (KUBERNETES.issuer, KUBERNETES.required, KUBERNETES.minted),
+            (
+                &[
+                    "namespace",
+                    "service_account",
+                    "admin_token",
+                    "admin_cert",
+                    "admin_key",
+                    "ca",
+                    "audiences"
+                ][..],
+                &["namespace", "service_account"][..],
+                &["token", "server", "ca", "namespace"][..],
+            )
+        );
+        assert_eq!(KUBERNETES.mints_on, MintsOn::Device);
         assert_eq!(named("postgres"), Some(&POSTGRES));
         assert_eq!(named("mysql"), Some(&MYSQL));
+        assert_eq!(named("kubernetes"), Some(&KUBERNETES));
         assert_eq!(named("Postgres"), None, "one spelling");
+        assert_eq!(named("k8s"), None, "one spelling");
         assert_eq!(named("MySQL"), None, "one spelling");
         assert_eq!(
             named("mssql"),

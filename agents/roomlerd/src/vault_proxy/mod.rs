@@ -27,9 +27,7 @@
 pub(crate) mod bundle;
 pub(crate) mod http;
 // P3-6f-1 — a Kubernetes service account's token minted per lease, bound to a
-// Secret its revocation deletes. Its caller is P3-6f-2's; until then only its
-// tests reach it.
-#[cfg_attr(not(test), allow(dead_code))]
+// Secret its revocation deletes; since P3-6f-2 the minter's caller reaches it.
 pub(crate) mod k8s_mint;
 // P3-6d-1b — the minter by provider, the lease client's one door to them.
 pub(crate) mod minter;
