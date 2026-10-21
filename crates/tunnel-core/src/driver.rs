@@ -370,6 +370,10 @@ pub enum Target {
     /// This is the tunnel's userspace mode: no OS routing, so it works on strict
     /// full-tunnel corp VPNs that capture the L3 overlay's routes.
     Socks5,
+    /// FR-90 P3-7-3b — an agent session's SOCKS5 listener: RFC 1929 with this
+    /// credential alone, and CONNECT alone
+    /// ([`crate::socks5::accept_connect_authenticated`]).
+    SessionSocks5(crate::socks5::Socks5Credential),
 }
 
 /// #1685 — called by [`run_tunnel_session`] the moment the session's local
@@ -668,6 +672,17 @@ impl Carrier {
                                 return;
                             }
                         },
+                        // FR-90 P3-7-3b — a session's listener: its credential, CONNECT.
+                        Target::SessionSocks5(cred) => {
+                            match crate::socks5::accept_connect_authenticated(&mut tcp, cred).await
+                            {
+                                Ok((host, port)) => (host, port, true),
+                                Err(e) => {
+                                    warn!(%peer_addr, %e, "session socks5 handshake refused; dropping");
+                                    return;
+                                }
+                            }
+                        }
                     };
                     // Register the reply mailbox now that we're proceeding — before the
                     // request is sent, so the dispatcher can route the accept/reject.
@@ -731,6 +746,17 @@ impl Carrier {
                                 return;
                             }
                         },
+                        // FR-90 P3-7-3b — a session's listener: its credential, CONNECT.
+                        Target::SessionSocks5(cred) => {
+                            match crate::socks5::accept_connect_authenticated(&mut tcp, cred).await
+                            {
+                                Ok((host, port)) => (host, port, true),
+                                Err(e) => {
+                                    warn!(%peer_addr, %e, "session socks5 handshake refused; dropping");
+                                    return;
+                                }
+                            }
+                        }
                     };
                     let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
                     reply_registry.lock().await.insert(flow_id, reply_tx);
@@ -3486,6 +3512,82 @@ mod tests {
             _terminate: TerminateOnDrop::new(sink, session_id),
         };
         (carrier, TestControl { sink_rx, src_tx }, peer, answerer)
+    }
+
+    /// FR-90 P3-7-3b — a session's carrier takes its listener's credential and
+    /// forwards only then: a connection with another password is dropped at
+    /// RFC 1929 and asks the exit for nothing; one with the credential asks
+    /// for the destination it CONNECTs to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_carrier_forwards_its_credentials_connections_alone() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        /// RFC 1929 as a client: greet, authenticate as `user` with `pass`,
+        /// and CONNECT db.internal:5432 if it was taken.
+        async fn socks(
+            addr: std::net::SocketAddr,
+            user: Vec<u8>,
+            pass: Vec<u8>,
+        ) -> (TcpStream, u8) {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+            let mut sel = [0u8; 2];
+            c.read_exact(&mut sel).await.unwrap();
+            assert_eq!(sel, [0x05, 0x02], "RFC 1929 selected");
+            let mut auth = vec![0x01, user.len() as u8];
+            auth.extend_from_slice(&user);
+            auth.push(pass.len() as u8);
+            auth.extend_from_slice(&pass);
+            c.write_all(&auth).await.unwrap();
+            let mut status = [0u8; 2];
+            c.read_exact(&mut status).await.unwrap();
+            if status[1] == 0x00 {
+                let host = b"db.internal";
+                let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+                req.extend_from_slice(host);
+                req.extend_from_slice(&5432u16.to_be_bytes());
+                c.write_all(&req).await.unwrap();
+            }
+            (c, status[1])
+        }
+
+        let session_id = ObjectId::new();
+        let (mut carrier, mut ctl, _client_peer, _exit_peer) =
+            dc_carrier_for_test(session_id).await;
+        let cred = crate::socks5::test_credential();
+        carrier.target = Target::SessionSocks5(cred.clone());
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = local.local_addr().unwrap();
+        let user = cred.username.clone().into_bytes();
+
+        // Another password: refused, and nothing asked of the exit.
+        let another = format!("{}x", cred.password).into_bytes();
+        let refused = tokio::spawn(socks(addr, user.clone(), another));
+        let (tcp, peer_addr) = local.accept().await.unwrap();
+        carrier.carry(tcp, peer_addr);
+        let (_refused, status) = refused.await.unwrap();
+        assert_eq!(status, 0x01, "RFC 1929 failure");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while let Ok(msg) = ctl.sink_rx.try_recv() {
+            assert!(
+                !matches!(msg, ClientMsg::TcpForwardRequest { .. }),
+                "refused, yet forwarded: {msg:?}"
+            );
+        }
+
+        // Its credential: the exit is asked for the CONNECT's destination.
+        let admitted = tokio::spawn(socks(addr, user, cred.password.clone().into_bytes()));
+        let (tcp, peer_addr) = local.accept().await.unwrap();
+        carrier.carry(tcp, peer_addr);
+        let (_admitted, status) = admitted.await.unwrap();
+        assert_eq!(status, 0x00, "RFC 1929 success");
+        match next_client_msg(&mut ctl.sink_rx, "TcpForwardRequest").await {
+            ClientMsg::TcpForwardRequest {
+                dst_host, dst_port, ..
+            } => assert_eq!((dst_host.as_str(), dst_port), ("db.internal", 5432)),
+            other => panic!("expected TcpForwardRequest, got {other:?}"),
+        }
     }
 
     /// #2129 — dropping a WebRTC-DC carrier with a LIVE connection ends that

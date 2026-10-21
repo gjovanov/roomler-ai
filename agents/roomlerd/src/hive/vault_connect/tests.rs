@@ -392,6 +392,34 @@ async fn a_loopback_connection_is_held_by_the_account_that_made_it() {
     drop(client);
 }
 
+/// FR-90 P3-7-3b — a session's net listener admits a connection from its
+/// account's processes and refuses one from any other account, asked as an
+/// endpoint asks (`connection_is`).
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_session_listener_admits_its_account_alone() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    let client = tokio::net::TcpStream::connect(local).await.unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    #[cfg(unix)]
+    let (me, other) = {
+        // SAFETY: geteuid reads our own credentials.
+        let me = unsafe { libc::geteuid() };
+        (me, me.wrapping_add(4242))
+    };
+    #[cfg(windows)]
+    let (me, other) = (
+        crate::hive_win::process_sid(std::process::id()).unwrap(),
+        "S-1-5-21-1-2-3-4242".to_string(),
+    );
+    let ours = endpoint::loopback::session_admit(me).expect("this system says who connects");
+    assert_eq!(ours(&accepted, local), Ok(()));
+    let theirs = endpoint::loopback::session_admit(other).unwrap();
+    assert!(theirs(&accepted, local).is_err(), "another account's");
+    drop(client);
+}
+
 /// P3-5e-2 — a `kubernetes` call names an API server's origin, and `bearer`
 /// or `client-cert`; `client-cert` leases the secret's `cert` and `key`, for
 /// `http` too. A database's fields are refused in it, and so is `basic`,
