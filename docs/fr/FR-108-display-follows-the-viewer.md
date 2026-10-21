@@ -193,11 +193,15 @@ As plan §5.3 has it, with P2 corrected by its probe:
   The capture reopened and the encoder re-initialised at 946x598. The released 0.4.141 and the kill switch
   answer `unsupported` on Xvfb. It gets re-checked on the release that carries P2. **Re-checked on 0.4.143**
   (row 14), the release that carries it: the same answers on the released binary.
-- [ ] **AC8:** **Docs:** a `docs/display-match.md` page (mermaid, the answers, the owner's key), linked from
+- [x] **AC8:** **Docs:** a `docs/display-match.md` page (mermaid, the answers, the owner's key), linked from
   `docs/remote-control.md`, with a row in `docs/README.md`'s index. *(Reworded in P1: first written as a
   section inside `docs/remote-control.md`, but other specs cite that page by line number, and a page of its
   own, like `privacy-mode.md`, moves none of them. The page exists from P1 and is ticked when the last
-  phase is in it.)*
+  phase is in it.)* **Done.** `docs/display-match.md` carries the decision sequence diagram, the status
+  table through FR-97 P3e-2 (0.4.148), and the owner's `display_match` key; `remote-control.md` §18.6.1
+  links it under the "1:1 Match host display" button; `docs/README.md`'s index has its row. Grew with the
+  doc, not retrofitted: each phase landed its own update to this page in its own PR (P1's build, P2's Linux
+  virtual desktop, FR-97 P3e-2's X11 arm) — only the box itself was left unticked.
 
 ## 6. Open decisions
 
