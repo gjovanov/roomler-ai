@@ -81,6 +81,11 @@ row** and an **acceptance criterion** for it ("docs updated/created with diagram
 FR-69's [`../modular-monolith.md`](../modular-monolith.md) (owed after the fact), FR-73's
 pipeline section in [`../deployment.md`](../deployment.md).
 
+A `file:N-M` range reads start ≤ end: CI's `scripts/anchor-range-audit.sh` fails on a new
+inverted one. The 31 already on master when it landed (2026-10-21, all half-shifted) are
+pinned in `scripts/anchor-range-baseline.txt`. Fix one and delete its line; the baseline only
+shrinks.
+
 ## Registry
 
 <!-- RETIRED-NAME-ANCHOR(22): the FR-21 row names what FR-21 retired; an FR title
