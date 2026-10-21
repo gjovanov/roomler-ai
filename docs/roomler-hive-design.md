@@ -1162,6 +1162,12 @@ The server's decision and the device's report of use stay in separate collection
 credential in `proxy` mode, and the person gets `127.0.0.1:6543` with authentication
 already done — credential-injected access over the mesh, with no password on the laptop.
 
+For a vault handle it comes before knowhow: P3-9 (the FR-90 spec, §3e "P3-9, `roomler connect`,
+as designed"). The person acts as the device's owner, read from the device's row as
+`roomler ssh` does. A new Cedar action, `secret:connect`, decides it, so no policy written for
+sessions admits a person, and the endpoint is the session's `proxy` machinery, served to the
+one account that asked.
+
 ## 9. Knowhow — the org's map
 
 ### 9.1 Model
