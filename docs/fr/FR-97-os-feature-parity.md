@@ -81,6 +81,9 @@
   polled every second; merged (#2632). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
 - P3g needed no build of its own: FR-93 P6d and P6e ship the companion as an `.rpm` and for aarch64 (since
   0.4.138), and AC10 is field-verified in FR-93's lab. A tarball for a host with neither dpkg nor rpm waits on D17.
+- P7b, an aarch64 Linux tunnel CLI and setup wizard, built (#2641). `install.sh --role tunnel` picks the build by
+  arch; before it, an arm64 host got the x86_64 CLI, which it could not run. The wizard rides 0.4.149's lockstep
+  release, and the CLI the first tunnel release from then on.
 - P6f needs no build: Windows got its private staging directory with GHSA-r3xj-4wh9-xh2v (0.4.142), and on macOS
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - The rest of P2–P7 is open.
@@ -256,7 +259,7 @@ and the consent chain's fallbacks.
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-101` | P6b |
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
-| O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:886`) | P6d |
+| O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:902`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
@@ -265,7 +268,7 @@ and the consent chain's fallbacks.
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC | P7a |
-| A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`) | P7b |
+| A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:255`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:197`), from 0.4.149 | P7b |
 
 The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1978`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
@@ -747,10 +750,10 @@ test of the SIGKILL property itself.
   - Open: the layout is the system's (`localectl`, `/etc/default/keyboard`), not the session's own input source,
     which GNOME can set apart from it; P3f types for what the system names, as the table did.
 - **P3g, a companion where there is none** (with FR-93 D5/D6 and FR-95): an arm64 `.deb` and a tarball build;
-  `install.sh` already has the hook (`scripts/install.sh:777-785`).
+  `install.sh` already has the hook (`scripts/install.sh:793-801`).
   - *Done by FR-93 (checked 2026-10-20):* P6e builds the companion for aarch64 as a `.deb` and an `.rpm` on the
     arm64 runner (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138, and `install.sh` picks
-    either by the host's package manager (`scripts/install.sh:841-851`). AC10 is field-verified in FR-93's lab.
+    either by the host's package manager (`scripts/install.sh:857-867`). AC10 is field-verified in FR-93's lab.
   - *Not built, the tarball:* a host with neither dpkg nor rpm gets no companion (`install.sh` says so and skips
     it). FR-93 P6f's notification prompt still answers consent there; what such a host lacks is the banner under
     Wayland and the tray. Whether to build it is D17.
@@ -935,7 +938,7 @@ model on Windows, so the three agree on what the mode means.
     had refused on the belief that launchd would restart the agent; it now stops the same way.
 - **P6d, `install.sh --uninstall [--keep-config]` (built).** One command removes what any install path put on a Linux
   or macOS machine: this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the tunnel CLI. Every
-  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:886`).
+  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:902`).
   - **The order is the design.** Every service stops through its manager while its files are still on disk
     (`uninstall_stop_linux`, `uninstall_stop_macos`). The stop is a SIGTERM, the daemon's clean stop, so P0e's purge
     takes back the exit `/1`s and the DNS steer, and an ephemeral device unenrolls itself. A daemon no manager owns
@@ -990,6 +993,23 @@ model on Windows, so the three agree on what the mode means.
 - **P7a, Linux arm64 hardware encode.** A vendored aarch64 FFmpeg (VAAPI, V4L2 M2M, Vulkan) in the existing arm64 lane;
   recordings then write AAC.
 - **P7b, arm64 tunnel CLI and wizard.** Two more matrix rows.
+  - *As built (#2641):* more than the two rows, because nothing downstream knew aarch64. `install.sh --role
+    tunnel` handed every Linux host the x86_64 CLI: on aarch64, dpkg refused the package for its architecture, and
+    the tarball's binary could not run. The wizard's own platform said `unsupported`, so it refused there outright.
+  - The release jobs build both on the arm64 runner (`ubuntu-22.04-arm`, the glibc floor the agent's and the
+    companion's arm64 lanes use), under the frozen `<name>-<version>-aarch64-unknown-linux-gnu` asset names, and
+    smoke what they built where only an arm64 runner can: the CLI's package installed and its binary run, and the
+    wizard's binary checked for aarch64 and for any library the loader cannot find.
+  - The proxy gained `linux-aarch64` (tunnel and setup) and `linux-deb-aarch64` (tunnel). Every token names its own
+    target triple, so neither Linux arch can take the other's archive in either listing order, and a release from
+    before P7b answers 404 for aarch64 rather than the x86_64 build. The bare `linux` and `deb` stay x86_64.
+    `install.sh` picks by `uname -m` and says plainly when the server has no aarch64 CLI yet, and an aarch64 wizard
+    asks for `linux-aarch64`.
+  - Not in it: the enroll dialog's wizard link for Linux names no arch and still downloads the x86_64 wizard. The
+    one-line install, which picks the arch itself, stays the recommended path there.
+  - Found on the way: `release-setup.yml`'s failure alert named every build job but would not have named a new
+    one. A failed build SKIPS `publish-release` rather than failing it, so the wizard release would have been
+    withheld in silence; the alert now names the arm64 job.
 - Intel Macs and Windows ARM64 are decisions (D6), measured by P0d's architecture field.
 
 ### 3.13 Proving it
@@ -1047,7 +1067,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
-| **P7b** | arm64 tunnel CLI + wizard | — | an arm64 vmtest guest | S |
+| **P7b** | arm64 tunnel CLI + wizard (built #2641; rides 0.4.149 for the wizard, the next tunnel release for the CLI) | — (new artifacts; x86_64's names and tokens unchanged) | an arm64 vmtest guest | S |
 | **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction. *P8-1* merged (#2489): every §2.8 row but two, each re-checked against master first. *P8-2* (#2548), after 0.4.144 shipped FR-113: `platform-support.md` and the user page, written against 0.4.145; the stale code comments and W7c's last leftovers; the Linux system-install claims, but for the two public Wayland pages, which ride #2533 | — | — | M |
 
 Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `hive_adopt`,
@@ -1370,3 +1390,4 @@ one depends on it.
 | 2026-10-20 | — (`xrandr` on the guest, the agent out of the loop), then the P3e-3a candidate `160c1a3e…` (P3e-2 as merged) | the same cell on XFCE 4.18 on Xorg, nobody touching it since its session started; the production viewer (Playwright) sending the request a 1366×768 stage makes; the mode read through XFCE's session | 🟢 **P3e-2 on a second X11 desktop.** Measured first: XFCE keeps an outside `xrandr --mode 5120x2160` at +0.2 s, +1 s and +4 s, like mutter. The candidate answered `on: true, mode 1360x768` 23 ms after the request, with the restore guard on disk. The screen still read `Virtual-1 1360x768` 4 s and 9 s later, and the picture followed for the 25 s the session held. When the session closed, the daemon logged `the display's own mode is back … start=1280x800` and `restored on session close (owner)`, the screen read 1280x800 again, and the guard was gone |
 | 2026-10-20 | released 0.4.147, then the **0.4.148 candidate** (roomlerd `4f59674f…` from the candidate `.deb` `4cf805d6…`, release run 39498665680); the deployed viewer `index-DL-wSxxQ.js` (`hosted-20261020-5ffa1d8`, which carries #2623's viewer half) | a fresh vmtest Ubuntu 24.04 cell, a per-user install: GNOME 46 on Xorg, then XFCE 4.18 on Xorg; the production viewer (Playwright) | **The 0.4.148 release check.** 🔴 0.4.147: `caps.layout = null` and no chip; `clipboard-image-events: not-watched`, and no push after a GTK copy. 🟢 The candidate. **P3e-1:** on GNOME, `["report"]`, `rc:layout` 4 ms after the control DC opened, and the chip following GNOME's Super+Space both ways. On XFCE, `["report","set"]`; the viewer's own Settings picker, clicked, switched to `de-DE` in 555 ms and back in 535 ms, the X group following. **P3e-3a:** the word gone, and `clipboard:img-begin {96x64, 216 B}` 0.3 s after the copy, unasked. **P3e-2:** the deployed viewer offered the toggle to the Linux host by the device's word and sent on a click. 3 min after the X server started, the candidate answered `refused: attended`, presence's 5 min not yet passed. On XFCE past 5 min it switched (`on: true, 640x480`, 40 ms) and handed the screen back 0.2 s later with `refused: attended`. ⚠️ **The pointer clamp**, measured with the agent out of the loop: with the pointer at (1000, 700), `xrandr` to 640×480 clamped it to (639, 479) and reset the X idle clock from 1503 ms to 53 ms. With the pointer already inside, the clock was untouched. ⚠️ **The viewer's default-ON never left the page at connect** (#2638): 0 display-match messages before any click, on 0.4.147 and the candidate alike |
 | 2026-10-20 | the 0.4.148 candidate (above), then the clamp fix's candidate `8577d5e5…` (a release-profile build of the branch without `ffmpeg-encoder`) | the same cell on XFCE. The pointer was put at (1000, 700) by a client warp, outside the 640×480 a 946×598 stage gets, then nobody touched it for 5 min 20 s. The deployed viewer's own toggle, clicked | 🔴→🟢 **The pointer clamp, fixed.** The 0.4.148 candidate switched (`on: true, 640x480`) and handed the screen back 0.2 s later with `refused: attended`. The fix's candidate switched (`on: true, 640x480`, 49 ms), and the viewer said "the host runs at 640×480 for this session". The screen still read 640×480 3 s and 12 s later, and the session's end restored 1280×800. Read afterwards, the pointer sat at (639, 479), and the X server's last counted input was 22:40:50Z, the moment of the switch: the clamp happened, and it was not taken for a person |
+| 2026-10-20 | the served `install.sh` (0.4.148's server), then #2641's `install.sh` and its rehearsal artifacts (tunnel run 39508967436, setup run 39508972421, both green; each arm64 job smoke-ran what it built on the arm64 runner) | a throwaway vmtest ARM cell, `vmtest-a-scr-225109`: Ubuntu 24.04.4 arm64 under QEMU TCG, glibc 2.39. It was made tunnel-only by the served script's own `--uninstall`, since the daemon's package ships a `roomler` shim. No `--token`, so enrollment was skipped | 🔴→🟢 **P7b, the arm64 tunnel CLI and wizard.** The served `install.sh --role tunnel` failed (RC=1): dpkg answered *"package architecture (amd64) does not match system (arm64)"*. The fallback tarball then put an x86-64 binary (ELF `e_machine` 62) on PATH, *"Exec format error"*, *"no working `roomler` on PATH"*, and its own warning blamed unmet dependencies. #2641's `install.sh` against prod said *"serves no aarch64 build of the roomler CLI yet"* and installed nothing. Against a stand-in proxy serving the rehearsal's artifacts, it asked for `linux-aarch64/health`, then `linux-deb-aarch64`. dpkg set up `roomler-cli 0.4.148-1` (arm64) with its OpenSSL dependency met, and `roomler 0.4.148` ran (`e_machine` 183). The rehearsal's aarch64 wizard, after the runtime libraries a person installs (webkit2gtk-4.1, the tray library, librsvg), ran under Xvfb and was alive after 15 s, with its "Roomler Setup" window on the display |

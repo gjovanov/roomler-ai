@@ -622,7 +622,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:886` (the section) — `uninstall_linux` at `:1312`,
+`scripts/install.sh:902` (the section) — `uninstall_linux` at `:1328`,
 `uninstall_macos` at `:1377`.
 
 ```mermaid

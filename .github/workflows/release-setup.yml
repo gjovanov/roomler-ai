@@ -1,8 +1,9 @@
 name: Release roomler-setup
 
-# Builds the unified `roomler-setup` Tauri 2 wizard for the three
+# Builds the unified `roomler-setup` Tauri 2 wizard for the
 # desktop targets the operator might run on:
 #   - Linux x86_64 (gtk + webkit2gtk) — packaged as `.tar.gz`
+#   - Linux aarch64 (the same, built on the arm64 runner; FR-97 P7b) — `.tar.gz`
 #   - macOS universal (x86_64 + aarch64 lipo'd) — packaged as `.tar.gz`
 #   - Windows x86_64 (msvc + webview2 auto-bootstrap) — SIGNED EXE in a `.zip`
 #
@@ -53,7 +54,8 @@ name: Release roomler-setup
 #    target_commitish, so it cannot publish once master's workflow files have
 #    changed since. Release the next version instead.
 #
-# A release is ALL THREE platforms or none. The `skip_macos` escape that
+# A release is EVERY platform or none (since FR-97 P7b, Linux aarch64 too).
+# The `skip_macos` escape that
 # let Linux + Windows ship while the Apple enrolment was pending (FR-7)
 # is gone: Apple signing is live (repo-level secrets since 2026-09-08;
 # agent-v0.4.102's .pkg job signed and notarised with them), and a wizard
@@ -238,6 +240,78 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: setup-linux-x86_64
+          path: |
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 1b. Linux aarch64 (FR-97 P7b) — the same wizard, built on the arm64 runner
+  # ---------------------------------------------------------------------------
+  # On Linux the wizard installs the tunnel client, which it resolves by its
+  # own build's platform (`linux-aarch64` here, asset_resolver.rs). The asset
+  # name carries the aarch64 triple, which only `linux-aarch64` matches
+  # (setup_release.rs), so an x86_64 download can never be handed this one.
+  build-linux-arm64:
+    name: Build wizard (Linux aarch64)
+    needs: validate-version
+    # 22.04: the oldest supported base sets the glibc floor (Debian 12 /
+    # Raspberry Pi OS included); the companion's arm64 lane builds its
+    # Tauri app on the same image.
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: setup-linux-arm64
+          save-if: ${{ github.ref_type != 'tag' }}
+      - name: Install Tauri Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            patchelf
+      - name: Build wizard (release)
+        run: cargo build -p roomler-setup --release
+      - name: Strip binary
+        run: strip target/release/roomler-setup
+      - name: Smoke — the binary is aarch64 and links against this base
+        # A GUI cannot open here, but a missing shared library or a wrong
+        # architecture fails before it would; `ldd` names any library the
+        # loader cannot find.
+        shell: bash
+        run: |
+          set -euo pipefail
+          readelf -h target/release/roomler-setup | grep -q 'Machine:.*AArch64'
+          if ldd target/release/roomler-setup | grep 'not found'; then exit 1; fi
+      - name: Pack tarball
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          name="roomler-setup-${version}-aarch64-unknown-linux-gnu"
+          mkdir -p "/tmp/${name}"
+          cp target/release/roomler-setup "/tmp/${name}/"
+          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
+          mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload Linux aarch64 wizard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-linux-aarch64
           path: |
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
@@ -475,7 +549,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-release:
     name: Publish GitHub Release
-    needs: [validate-version, build-linux, build-macos, build-windows]
+    needs: [validate-version, build-linux, build-linux-arm64, build-macos, build-windows]
     # Plain `needs` semantics: every one of the three builds must have
     # SUCCEEDED, or nothing publishes. (The `always() || skipped` form that
     # let a skipped macOS build through went with the `skip_macos` input.)
@@ -555,6 +629,7 @@ jobs:
             **Download / run:**
             - Windows x86_64: `.zip` containing a signed `roomler-setup.exe` — extract + double-click.
             - Linux x86_64: `.tar.gz` — extract, run `./roomler-setup`.
+            - Linux aarch64: `.tar.gz` — extract, run `./roomler-setup`.
             - macOS universal (x86_64 + aarch64): `.tar.gz` — extract, then open `Roomler Setup.app`
               (or run `./roomler-setup`, a symlink into the bundle). The app is Developer-ID-signed,
               notarised and stapled, so Gatekeeper accepts it even offline — no `xattr` workaround.
@@ -628,10 +703,14 @@ jobs:
       (github.event_name == 'push' || github.event.inputs.publish_release == 'true') &&
       (needs.validate-version.result == 'failure' ||
        needs.build-linux.result == 'failure' ||
+       needs.build-linux-arm64.result == 'failure' ||
        needs.build-macos.result == 'failure' ||
        needs.build-windows.result == 'failure' ||
        needs.publish-release.result == 'failure')
-    needs: [validate-version, build-linux, build-macos, build-windows, publish-release]
+    # Every build job, by name: a failed build SKIPS publish-release rather
+    # than failing it, so a build left off this list withholds the release
+    # in silence.
+    needs: [validate-version, build-linux, build-linux-arm64, build-macos, build-windows, publish-release]
     runs-on: ubuntu-latest
     permissions:
       issues: write

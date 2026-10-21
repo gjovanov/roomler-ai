@@ -9,10 +9,11 @@
 # exemption. docs/fr/FR-21
 name: Release roomler-tunnel
 
-# Builds the `roomler-tunnel` CLI binary for the three desktop targets the
-# operator might run on — Linux x86_64, macOS (universal — x86_64 + aarch64),
-# and Windows x86_64. Outputs a plain archive (tar.gz / zip) per target, plus
-# a `.deb` for Debian / Ubuntu installs.
+# Builds the `roomler-tunnel` CLI binary for the desktop targets the
+# operator might run on — Linux x86_64, Linux aarch64 (FR-97 P7b), macOS
+# (universal — x86_64 + aarch64), and Windows x86_64. Outputs a plain archive
+# (tar.gz / zip) per target, plus a `.deb` per Linux arch for Debian / Ubuntu
+# installs.
 #
 # The Windows `roomler.exe` is Authenticode-signed via
 # ./.github/actions/sign-windows (the signing job carries `environment:
@@ -204,6 +205,90 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # 1b. Linux aarch64 — tarball + .deb (FR-97 P7b)
+  # ---------------------------------------------------------------------------
+  # The same two artifacts, built natively on the arm64 runner. The asset names
+  # follow the frozen `roomler-tunnel-<version>-<target>` contract with the
+  # aarch64 triple, which is what the installer proxy matches
+  # (tunnel_release.rs: `linux-aarch64`, `linux-deb-aarch64`). An x86_64 client
+  # can never be handed one: every x86_64 pattern names its own triple.
+  build-linux-arm64:
+    name: Build (Linux aarch64)
+    needs: validate-version
+    # 22.04, not latest: the oldest supported base sets the glibc floor, so the
+    # binary also loads on Debian 12 (Raspberry Pi OS) and Ubuntu 22.04 — the
+    # agent's and the companion's arm64 lanes build here for the same reason.
+    # The .deb names OpenSSL by both names (the CLI's Cargo.toml, #2472).
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: tunnel-linux-arm64
+          save-if: ${{ github.ref_type != 'tag' }}
+      - name: Install cargo-deb
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+      - name: Build roomler-tunnel (release)
+        run: cargo build -p roomler-cli --release
+      - name: Strip binary
+        run: strip target/release/roomler
+      - name: Pack tarball
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          name="roomler-tunnel-${version}-aarch64-unknown-linux-gnu"
+          mkdir -p "/tmp/${name}"
+          cp target/release/roomler "/tmp/${name}/"
+          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
+          mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Build .deb
+        working-directory: agents/roomler-cli
+        run: cargo deb --no-build --no-strip
+      - name: Rename .deb + checksum
+        id: deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          src=$(ls target/debian/roomler-cli_*_arm64.deb | head -n1)
+          dst="roomler-tunnel-${version}-aarch64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+      - name: Smoke — the package installs here and its binary is aarch64 and runs
+        # Only an arm64 runner can run what it built; a cross-built binary that
+        # never ran is the failure this lane exists to rule out.
+        shell: bash
+        run: |
+          set -euo pipefail
+          dpkg-deb --field "${{ steps.deb.outputs.artifact }}" Architecture | grep -qx arm64
+          sudo dpkg -i "${{ steps.deb.outputs.artifact }}"
+          readelf -h /usr/bin/roomler | grep -q 'Machine:.*AArch64'
+          roomler --version
+          sudo dpkg -r roomler-cli
+      - name: Upload Linux aarch64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: |
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+            ${{ steps.deb.outputs.artifact }}
+            ${{ steps.deb.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball
   # ---------------------------------------------------------------------------
   build-macos:
@@ -379,7 +464,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-release:
     name: Publish GitHub Release
-    needs: [validate-version, build-linux, build-macos, build-windows]
+    needs: [validate-version, build-linux, build-linux-arm64, build-macos, build-windows]
     if: needs.validate-version.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -434,6 +519,7 @@ jobs:
 
             **Install / download:**
             - Linux x86_64: `.tar.gz` or `.deb`
+            - Linux aarch64: `.tar.gz` or `.deb`
             - macOS universal (x86_64 + aarch64): `.tar.gz`
             - Windows x86_64: `.zip` containing `roomler.exe`
 

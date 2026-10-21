@@ -675,10 +675,26 @@ enroll_daemon() {
 # ─── tunnel role ────────────────────────────────────────────────────────────
 
 install_tunnel_linux() {
+    # FR-97 P7b — the build for this host's arch. The x86_64 names are the
+    # proxy's first ones (`linux-x86_64`, `linux-deb`), kept as they were.
+    # Before P7b every host got the x86_64 build: on aarch64, dpkg refused the
+    # package for its architecture and the tarball's binary could not run.
+    case "$(uname -m)" in
+        x86_64|amd64)   tunnel_tar=linux-x86_64;  tunnel_deb=linux-deb ;;
+        aarch64|arm64)  tunnel_tar=linux-aarch64; tunnel_deb=linux-deb-aarch64 ;;
+        *) echo "error: unsupported Linux architecture $(uname -m)" >&2; exit 1 ;;
+    esac
+    # aarch64 builds start with the first tunnel release that has them; before
+    # it the proxy answers 404, which on its own says nothing.
+    if [ "$tunnel_tar" = linux-aarch64 ] &&
+        ! curl -fs -o /dev/null "$SERVER/api/tunnel/installer/linux-aarch64/health?version=latest"; then
+        echo "error: $SERVER serves no aarch64 build of the roomler CLI yet (its latest tunnel release has none)" >&2
+        exit 1
+    fi
     if command -v dpkg >/dev/null 2>&1; then
         deb="$STAGE/roomler-cli.deb"
-        say "downloading the roomler CLI (.deb) via the proxy"
-        download "$SERVER/api/tunnel/installer/linux-deb?version=latest" "$deb"
+        say "downloading the roomler CLI (.deb, $tunnel_deb) via the proxy"
+        download "$SERVER/api/tunnel/installer/$tunnel_deb?version=latest" "$deb"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
             say "download-only: would run: sudo dpkg -i $deb (the tarball instead, if its dependencies cannot be met here)"
             return 0
@@ -691,13 +707,13 @@ install_tunnel_linux() {
         if ! tunnel_cli_runs; then
             warn "the .deb did not install here (its dependencies cannot be met on this distro) — installing the tarball instead"
             tarball="$STAGE/roomler-cli.tar.gz"
-            download "$SERVER/api/tunnel/installer/linux-x86_64?version=latest" "$tarball"
+            download "$SERVER/api/tunnel/installer/$tunnel_tar?version=latest" "$tarball"
             install_tunnel_tarball "$tarball"
         fi
     else
         tarball="$STAGE/roomler-cli.tar.gz"
-        say "downloading the roomler CLI (tarball) via the proxy"
-        download "$SERVER/api/tunnel/installer/linux-x86_64?version=latest" "$tarball"
+        say "downloading the roomler CLI (tarball, $tunnel_tar) via the proxy"
+        download "$SERVER/api/tunnel/installer/$tunnel_tar?version=latest" "$tarball"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
             say "download-only: would extract to /usr/local/bin"
             return 0

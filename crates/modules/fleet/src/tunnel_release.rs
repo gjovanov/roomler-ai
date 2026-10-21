@@ -187,12 +187,19 @@ fn content_type_for(filename: &str) -> &'static str {
 
 fn normalise_platform(s: &str) -> Result<&'static str, ApiError> {
     match s.to_ascii_lowercase().as_str() {
+        // The bare `linux` / `deb` stay x86_64: every installer and hint
+        // handed out before FR-97 P7b names them and means that arch.
         "linux-x86_64" | "linux" | "linux-tar" => Ok("linux-x86_64"),
         "linux-deb" | "deb" => Ok("linux-deb"),
+        // FR-97 P7b — aarch64. `linux-aarch64` is what an aarch64 CLI has
+        // always named itself (`roomler-cli`'s update.rs) and what an aarch64
+        // wizard asks for (asset_resolver.rs); install.sh asks for both.
+        "linux-aarch64" | "linux-arm64" => Ok("linux-aarch64"),
+        "linux-deb-aarch64" | "linux-deb-arm64" => Ok("linux-deb-aarch64"),
         "macos" | "macos-universal" | "darwin" => Ok("macos"),
         "windows-x86_64" | "windows" | "win" => Ok("windows-x86_64"),
         other => Err(ApiError::BadRequest(format!(
-            "unknown platform {other:?}; expected one of linux-x86_64 / linux-deb / macos / windows-x86_64"
+            "unknown platform {other:?}; expected one of linux-x86_64 / linux-deb / linux-aarch64 / linux-deb-aarch64 / macos / windows-x86_64"
         ))),
     }
 }
@@ -220,8 +227,13 @@ fn pick_release<'a>(releases: &'a [AgentRelease], version: &str) -> Option<&'a A
 /// conventions follow `release-tunnel.yml`:
 ///   - linux-x86_64 → `*-x86_64-unknown-linux-gnu.tar.gz`
 ///   - linux-deb    → `*-x86_64-unknown-linux-gnu.deb`
+///   - linux-aarch64 → `*-aarch64-unknown-linux-gnu.tar.gz` (FR-97 P7b)
+///   - linux-deb-aarch64 → `*-aarch64-unknown-linux-gnu.deb` (FR-97 P7b)
 ///   - macos        → `*-universal-apple-darwin.tar.gz`
 ///   - windows-x86_64 → `*-x86_64-pc-windows-msvc.zip`
+///
+/// Every arm names its own target triple, so a Linux arch never takes the
+/// other's archive, whatever order GitHub lists the assets in.
 pub fn pick_installer_asset<'a>(
     assets: &'a [AgentReleaseAsset],
     platform: &str,
@@ -237,6 +249,12 @@ pub fn pick_installer_asset<'a>(
                 name.contains("x86_64-unknown-linux-gnu") && name.ends_with(".tar.gz")
             }
             "linux-deb" => name.contains("x86_64-unknown-linux-gnu") && name.ends_with(".deb"),
+            "linux-aarch64" => {
+                name.contains("aarch64-unknown-linux-gnu") && name.ends_with(".tar.gz")
+            }
+            "linux-deb-aarch64" => {
+                name.contains("aarch64-unknown-linux-gnu") && name.ends_with(".deb")
+            }
             "macos" => name.contains("universal-apple-darwin") && name.ends_with(".tar.gz"),
             "windows-x86_64" => name.contains("x86_64-pc-windows-msvc") && name.ends_with(".zip"),
             _ => false,
@@ -272,8 +290,64 @@ mod tests {
         assert_eq!(normalise_platform("linux").unwrap(), "linux-x86_64");
         assert_eq!(normalise_platform("LINUX-X86_64").unwrap(), "linux-x86_64");
         assert_eq!(normalise_platform("deb").unwrap(), "linux-deb");
+        assert_eq!(
+            normalise_platform("linux-aarch64").unwrap(),
+            "linux-aarch64"
+        );
+        assert_eq!(normalise_platform("linux-arm64").unwrap(), "linux-aarch64");
+        assert_eq!(
+            normalise_platform("linux-deb-aarch64").unwrap(),
+            "linux-deb-aarch64"
+        );
+        assert_eq!(
+            normalise_platform("LINUX-DEB-ARM64").unwrap(),
+            "linux-deb-aarch64"
+        );
         assert_eq!(normalise_platform("Darwin").unwrap(), "macos");
         assert_eq!(normalise_platform("WIN").unwrap(), "windows-x86_64");
+    }
+
+    /// FR-97 P7b — a release that carries both Linux arches: each token takes
+    /// its own triple, in either listing order (GitHub's order is the upload
+    /// order, which nothing here controls), so an x86_64 installer or wizard
+    /// already in the field can never be handed an aarch64 archive.
+    #[test]
+    fn pick_installer_asset_keeps_the_linux_arches_apart() {
+        let names = [
+            "roomler-tunnel-0.4.148-aarch64-unknown-linux-gnu.tar.gz",
+            "roomler-tunnel-0.4.148-aarch64-unknown-linux-gnu.tar.gz.sha256",
+            "roomler-tunnel-0.4.148-aarch64-unknown-linux-gnu.deb",
+            "roomler-tunnel-0.4.148-x86_64-unknown-linux-gnu.tar.gz",
+            "roomler-tunnel-0.4.148-x86_64-unknown-linux-gnu.deb",
+        ];
+        let arm_first: Vec<_> = names.iter().map(|n| asset(n)).collect();
+        let x86_first: Vec<_> = names.iter().rev().map(|n| asset(n)).collect();
+        for assets in [&arm_first, &x86_first] {
+            let pick = |p| pick_installer_asset(assets, p).unwrap().name.as_str();
+            assert_eq!(
+                pick("linux-x86_64"),
+                "roomler-tunnel-0.4.148-x86_64-unknown-linux-gnu.tar.gz"
+            );
+            assert_eq!(
+                pick("linux-deb"),
+                "roomler-tunnel-0.4.148-x86_64-unknown-linux-gnu.deb"
+            );
+            assert_eq!(
+                pick("linux-aarch64"),
+                "roomler-tunnel-0.4.148-aarch64-unknown-linux-gnu.tar.gz"
+            );
+            assert_eq!(
+                pick("linux-deb-aarch64"),
+                "roomler-tunnel-0.4.148-aarch64-unknown-linux-gnu.deb"
+            );
+        }
+        // A release from before P7b: aarch64 is a clean 404, never x86_64.
+        let before = vec![
+            asset("roomler-tunnel-0.4.147-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("roomler-tunnel-0.4.147-x86_64-unknown-linux-gnu.deb"),
+        ];
+        assert!(pick_installer_asset(&before, "linux-aarch64").is_none());
+        assert!(pick_installer_asset(&before, "linux-deb-aarch64").is_none());
     }
 
     #[test]
