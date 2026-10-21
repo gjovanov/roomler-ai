@@ -32,7 +32,7 @@ with `uinput`) captured the X11 session through DRM: 84 of 84 viewer samples wit
 
 **Why.** A systemd unit carries none of the session's variables (`DISPLAY`, `XAUTHORITY`): `docs/linux-capture.md`
 §1. FR-95's plan engages only for a person's **Wayland** session on screen. `person_on_screen`
-(`agents/roomlerd/src/capture/mod.rs:917`) keeps a session only when `s.kind == "wayland"` (`:920`), so on an X11 seat
+(`agents/roomlerd/src/capture/mod.rs:928`) keeps a session only when `s.kind == "wayland"` (`:931`), so on an X11 seat
 the plan falls through to the X11 arm, which a root daemon cannot open. FR-95's AC5 asked for exactly that ("X11
 hosts are unchanged"), and this FR is what changing it means.
 
@@ -59,7 +59,7 @@ flowchart LR
   scanout would otherwise show whatever is on screen. **It sees a lock only through `LockedHint`**, so the X11 half
   switches on only for a desktop that sets it: GNOME Shell or KDE's `ksmserver` running as the person (D4).
 - **DRM's idle skip on X11 seats.** FR-93 P3d skips unchanged frames on Wayland seats only
-  (`capture/drm_backend.rs:1044`; the X11 cell logged "every frame is read (not a Wayland seat …)"). An idle X11
+  (`capture/drm_backend.rs:1061`; the X11 cell logged "every frame is read (not a Wayland seat …)"). An idle X11
   desktop through DRM would read every frame, so P1 extends the skip, or AC6 fails. **Why P3d was Wayland-only**
   (`drm_idle.rs`): a Wayland compositor flips buffers, so the buffer's identity tells a change; an X server draws
   into the buffer on screen in place, so only the sampled rows can, and 32 rows would leave a typed character up to

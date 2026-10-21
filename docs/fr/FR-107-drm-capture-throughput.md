@@ -65,10 +65,10 @@ flowchart LR
 ```
 
 **P1 — the DRM arm honours the pump's encode box.** `ScreenCapture::set_output_cap`
-(`agents/roomlerd/src/capture/mod.rs:395`) already exists for exactly this, and every pump calls it with its
+(`agents/roomlerd/src/capture/mod.rs:398`) already exists for exactly this, and every pump calls it with its
 effective box (`peer.rs:4283`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
-(`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1312`; `set_output_cap`, `drm_backend.rs:1525`).
+(`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1329`; `set_output_cap`, `drm_backend.rs:1542`).
 A 4K scanout encoded at 1920×1012 is read at 2048×1080. A 1440p scanout for the same box keeps its full read,
 because its half (1280×720) is smaller than what the encode keeps. The pump's "native" size is the frame's
 pre-downscale size (`Frame::native_dims`), so the box it computes does not shrink with the frame, and the
@@ -79,7 +79,7 @@ choice cannot feed back into itself.
 pattern FR-36 measured the mapping to tolerate. The frame is independent row by row, so nothing is
 coordinated but the join. The output is byte-identical to the single pass.
 
-**P2b — the frame period runs from the ask** (`next_frame`, `drm_backend.rs:1459`). The period is timed
+**P2b — the frame period runs from the ask** (`next_frame`, `drm_backend.rs:1476`). The period is timed
 from when a frame was asked of the worker, so it absorbs the grab instead of adding to it.
 
 **P3 — the GPU reads the scanout** (`agents/roomlerd/src/capture/drm_gpu.rs`). As built:

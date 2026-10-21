@@ -25,11 +25,11 @@ advertised), so it works with every deployed agent and needs no release.
 
 | What | Where |
 |---|---|
-| A finger is the mouse: pointer events with no `pointerType` branch; a touch down is `mouse_button` down at that point | [`useRemoteControl.ts:10812`](../../ui/src/composables/useRemoteControl.ts#L10812) `onPointerDown`, `:10674` `onPointerUp` |
-| The stage listens for `pointerdown`, `pointerup`, `pointermove` and `wheel`, and nothing else | [`useRemoteControl.ts:11224`](../../ui/src/composables/useRemoteControl.ts#L11224) |
+| A finger is the mouse: pointer events with no `pointerType` branch; a touch down is `mouse_button` down at that point | [`useRemoteControl.ts:10825`](../../ui/src/composables/useRemoteControl.ts#L10825) `onPointerDown`, `:10687` `onPointerUp` |
+| The stage listens for `pointerdown`, `pointerup`, `pointermove` and `wheel`, and nothing else | [`useRemoteControl.ts:11237`](../../ui/src/composables/useRemoteControl.ts#L11237) |
 | **No `pointercancel` handler** anywhere in the viewer, and **no `touch-action`** in the UI. A touch browser that turns a drag into a pan or a zoom fires `pointercancel` and never `pointerup`; P0 measures what the host is left with | `git grep -n -e pointercancel -e touch-action ui/src`: nothing; the stage's CSS, [`RemoteControl.vue:4808`](../../ui/src/views/remote/RemoteControl.vue#L4808) |
 | The soft keyboard is the only touch-specific control: an off-screen textarea whose input becomes key frames | [`MobileKeyboard.vue`](../../ui/src/components/remote/MobileKeyboard.vue) |
-| The viewer knows where the host's pointer is (`cursor:pos` on the cursor channel), which a trackpad mode needs for absolute moves | [`useRemoteControl.ts:9635`](../../ui/src/composables/useRemoteControl.ts#L9635) |
+| The viewer knows where the host's pointer is (`cursor:pos` on the cursor channel), which a trackpad mode needs for absolute moves | [`useRemoteControl.ts:9648`](../../ui/src/composables/useRemoteControl.ts#L9648) |
 | `InputMsg::Touch` is parsed and dropped by every injector | [`input/mod.rs:257`](../../agents/roomlerd/src/input/mod.rs#L257); [`enigo_backend.rs:267`](../../agents/roomlerd/src/input/enigo_backend.rs#L267), [`uinput_backend.rs:592`](../../agents/roomlerd/src/input/uinput_backend.rs#L592), [`portal/input.rs:210`](../../agents/roomlerd/src/capture/portal/input.rs#L210) |
 
 ## 3. Design
