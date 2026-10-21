@@ -1920,7 +1920,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:62`); the watcher (`sleep_notice.rs:161`, the rule
-`:149`) sends `peer.rs:5358`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5363`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram
@@ -1971,7 +1971,7 @@ Measured on the released 0.4.142 with S3 in the lab: 48 s that named no reason,
 the last 19 of them after the wake.
 
 Now the viewer keeps a `host_sleep` notice through the redial
-(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:951`). Its
+(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:960`). Its
 deadline is spent, so the stall watchdog is not held: a new session that stays
 silent is still re-created on the usual clock. The stage shows the notice in
 every redial phase, with that phase's own words beneath it
