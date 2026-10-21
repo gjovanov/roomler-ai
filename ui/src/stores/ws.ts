@@ -275,6 +275,10 @@ export const useWsStore = defineStore('ws', () => {
       case 'message:reaction':
         messageStore.handleReactionFromWs(msg.data as never)
         break
+      case 'message:pin':
+      case 'message:unpin':
+        messageStore.pinFromWs(msg.data as never)
+        break
       case 'task:update':
         taskStore.updateFromWs(msg.data as never)
         break
