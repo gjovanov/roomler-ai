@@ -43,7 +43,7 @@ Everything is **feature-flagged** (`--features moq-broadcast` + `ROOMLERD_MOQ=1`
 
 ### Phase 0 — hard-gate spike (the only thing worth doing first; cheap, reversible, throwaway)
 **Build (minimal):**
-- **Agent probe** (`roomlerd moq-probe`, behind the feature): reuse `capture::open_default` + `encode::open_for_codec` (`encode/mod.rs:343`); wrap each frame with the **existing** `frame_video_bytes` 13-byte header verbatim (`peer.rs:1703`); publish via the kixelated **`moq-lite`** + **`web-transport`** Rust crates (native QUIC) — map one keyframe-led GOP = one MoQ *group*, each frame = one *object*.
+- **Agent probe** (`roomlerd moq-probe`, behind the feature): reuse `capture::open_default` + `encode::open_for_codec` (`encode/mod.rs:349`); wrap each frame with the **existing** `frame_video_bytes` 13-byte header verbatim (`peer.rs:1703`); publish via the kixelated **`moq-lite`** + **`web-transport`** Rust crates (native QUIC) — map one keyframe-led GOP = one MoQ *group*, each frame = one *object*.
 - **Relay**: run kixelated **`moq-relay` as one container on an existing coturn host** (we already operate + monitor these). No new cloud account.
 - **Throwaway browser subscriber** (a static page / hidden route, *not* wired into `RemoteControl.vue`): open a `WebTransport` to the relay, subscribe, and `postMessage({type:'chunk', bytes})` to the **unmodified** `rc-vp9-444-worker.ts` / `rc-hevc-worker.ts` (the existing transport-agnostic handoff in `useRemoteControl.ts:~1850`). If frames paint, subscriber-reuse is proven.
 

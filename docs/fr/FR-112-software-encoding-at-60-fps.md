@@ -57,7 +57,7 @@ path, a spinning cube in a window, each arm a fresh session (`ROOMLERD_VP9_*` as
 - **The capture is not the limit.** In the 4:2:0 arms the capture ran at 38–44 fps while the encode stayed under
   30, and the display refreshes at 60 Hz.
 - **Nor the encoder's settings.** The 60 target *doubled* the bitrate ceiling (`initial_bitrate_for_fps`,
-  `encode/mod.rs:689`) and QP fell from 10 to 7, yet a frame still took ~37 ms, and no speed setting helped much.
+  `encode/mod.rs:695`) and QP fell from 10 to 7, yet a frame still took ~37 ms, and no speed setting helped much.
   What does help is the clock the encoder is given (below).
 
 ### What a frame costs, measured offline

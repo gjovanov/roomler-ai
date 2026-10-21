@@ -303,7 +303,7 @@ desktop spends almost nothing and only motion approaches the bound.
 `policy::rate_plan` (`encode/policy.rs:236`) finishes the chain: × the dial
 (`dial_rate_factor_pct` — 70 / 85 / 100, clamped to [30, 100]) × the
 encode-pressure factor (`governor.encode_factor()`, `governor.rs:1481`),
-floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:235`). On a direct
+floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:241`). On a direct
 transport `effective_ceiling` is the plan's value unchanged (`governor.rs:503`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
 divides it by the follower count; and the result is both the AIMD's ceiling
@@ -440,7 +440,7 @@ What it changes here:
 | Lever | Before FR-112 | Now |
 |---|---|---|
 | frame rate | a constant 30 | 60, paced by `SoftwarePace` (`encode/encode_pressure.rs:242`) in 5-fps steps, never below 30: down at once, up only with 2.5 fps of headroom (P2d) |
-| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:713`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
+| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:719`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
 | OpenH264's per-frame budget | configured for 30 whatever the rate | `set_frame_rate`: the rate the pump runs at, the keyframe period kept at 2 s |
 | the auto-fps-cap (a software encoder dropped to 30) | always | only where the tier is off: Windows and macOS by default |
 
