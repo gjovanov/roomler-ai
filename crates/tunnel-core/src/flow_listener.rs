@@ -114,10 +114,27 @@ struct Held {
     since: Instant,
 }
 
+/// FR-90 P3-7-3b — whom a listener serves: asked of every accepted connection,
+/// with the listener's own address, before the connection is carried or held.
+/// `Err` closes the connection, its reason logged. An agent session's listener
+/// serves the session's account alone; every other listener admits all, as it
+/// always did.
+pub type Admit = Arc<dyn Fn(&TcpStream, SocketAddr) -> Result<(), String> + Send + Sync>;
+
 impl<C: Carry> FlowListener<C> {
     /// Bind `127.0.0.1:local` and start accepting. Connections are held until
     /// the first [`install`](Self::install).
     pub async fn bind(local: u16, policy: HoldPolicy) -> Result<Self> {
+        Self::bind_admitting(local, policy, None).await
+    }
+
+    /// FR-90 P3-7-3b — [`bind`](Self::bind), each connection first asked of
+    /// `admit` ([`Admit`]); `local` 0 takes a port the system picks.
+    pub async fn bind_admitting(
+        local: u16,
+        policy: HoldPolicy,
+        admit: Option<Admit>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", local))
             .await
             .with_context(|| format!("binding 127.0.0.1:{local}"))?;
@@ -129,7 +146,12 @@ impl<C: Carry> FlowListener<C> {
                 held: VecDeque::new(),
             }),
         });
-        let acceptor = AbortOnDrop::new(tokio::spawn(accept_loop(listener, Arc::clone(&slot))));
+        let acceptor = AbortOnDrop::new(tokio::spawn(accept_loop(
+            listener,
+            Arc::clone(&slot),
+            admit,
+            local_addr,
+        )));
         Ok(Self {
             local_addr,
             slot,
@@ -266,12 +288,27 @@ impl<C: Carry> Slot<C> {
 /// The accept task. Runs until aborted (the [`FlowListener`] dropped); an
 /// accept error is logged and the loop goes on, the shape the sessions'
 /// own loops had.
-async fn accept_loop<C: Carry>(listener: TcpListener, slot: Arc<Slot<C>>) {
+async fn accept_loop<C: Carry>(
+    listener: TcpListener,
+    slot: Arc<Slot<C>>,
+    admit: Option<Admit>,
+    local_addr: SocketAddr,
+) {
     loop {
         let next_expiry = slot.next_expiry();
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((tcp, peer_addr)) => slot.offer(tcp, peer_addr),
+                Ok((tcp, peer_addr)) => {
+                    // FR-90 P3-7-3b — asked before the lock is taken: a
+                    // refused connection is never held, never carried.
+                    if let Some(admit) = &admit
+                        && let Err(why) = admit(&tcp, local_addr)
+                    {
+                        warn!(peer = %peer_addr, why, "connection refused: not whom this listener serves");
+                        continue; // `tcp` drops here: closed
+                    }
+                    slot.offer(tcp, peer_addr)
+                }
                 Err(e) => error!(%e, "accept failed"),
             },
             _ = sleep_until_or_never(next_expiry) => slot.expire(Instant::now()),
@@ -335,6 +372,57 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         (Arc::new(FakeCarrier { name, tx }), rx)
+    }
+
+    /// FR-90 P3-7-3b — a listener that admits by a hook closes a connection it
+    /// does not admit, never holding or carrying it, and carries one it does:
+    /// the hook decides before the queue. Port 0 takes a port the system picks.
+    #[tokio::test]
+    async fn a_connection_the_hook_does_not_admit_is_closed_never_held_or_carried() {
+        let allow = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&allow);
+        let admit: Admit = Arc::new(move |_tcp: &TcpStream, local: SocketAddr| {
+            assert_ne!(local.port(), 0, "the hook is told the bound address");
+            if gate.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("not the session's account".into())
+            }
+        });
+        let listener = FlowListener::bind_admitting(0, HoldPolicy::default(), Some(admit))
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        assert_ne!(addr.port(), 0);
+
+        // Refused while no carrier is current: closed, not held.
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+            .await
+            .expect("a refused connection is closed at once")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "EOF");
+        assert_eq!(listener.held(), 0, "never held");
+
+        // Refused with a carrier current: closed, not carried.
+        let (carrier, mut carried) = fake("a");
+        listener.install(carrier);
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+            .await
+            .expect("a refused connection is closed at once")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "EOF");
+        assert!(carried.try_recv().is_err(), "never carried");
+
+        // Admitted: carried.
+        allow.store(true, Ordering::SeqCst);
+        let _admitted = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), carried.recv())
+            .await
+            .expect("an admitted connection is carried")
+            .expect("the carrier's channel is open");
     }
 
     async fn free_port() -> u16 {

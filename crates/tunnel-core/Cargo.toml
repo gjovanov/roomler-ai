@@ -111,7 +111,9 @@ blake2 = { version = "0.10", optional = true }
 # WireGuard mac1, which its own doc calls "a ROUTER's pre-filter, not an
 # authenticator"), so its comparison must be constant-time. Already in the
 # lock transitively; this makes it a real dependency rather than an accident.
-subtle = { version = "2.6", optional = true, default-features = false }
+# Unconditional since FR-90 P3-7-3b: a session's SOCKS5 listener compares its
+# RFC 1929 password, the listener's capability, in constant time too.
+subtle = { version = "2.6", default-features = false }
 # Unconditional since FR-97 P6b: `pgp_verify` de-armors the release `.asc`
 # sidecars for the agent's updater AND the CLI's `self-update`, and the CLI
 # builds this crate without `overlay`.
@@ -199,7 +201,7 @@ libc = "0.2"
 
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
-overlay = ["dep:boringtun", "dep:if-addrs", "dep:blake2", "dep:subtle"]
+overlay = ["dep:boringtun", "dep:if-addrs", "dep:blake2"]
 # Phase 3: the OS TUN device (`overlay::tun::SystemTun`) on top of the WG
 # core. `overlay` alone gives the WG device + the bridge logic + the
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
