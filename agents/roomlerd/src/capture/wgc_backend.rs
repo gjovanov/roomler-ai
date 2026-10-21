@@ -145,6 +145,9 @@ pub struct WgcCapture {
     /// (`ROOMLERD_CAPTURE_GATE=slot_first`); `None` keeps the legacy gate
     /// above, whose code path is unchanged.
     slot_first: Option<super::gate::SlotFirst>,
+    /// FR-119 P2b — the gate the open chose, which a rate moved back to 60 or
+    /// below returns to (`set_target_fps`).
+    gate_mode: super::gate::GateMode,
     // DownscalePolicy is accepted in the constructor so the call site
     // signature matches the scrap backend, but WGC runs at native
     // resolution today — the MF HW encoder handles 4K natively so
@@ -270,10 +273,11 @@ impl WgcCapture {
             width: size.Width.max(0) as u32,
             height: size.Height.max(0) as u32,
             monitor: monitor_index,
-            target_frame_period: Duration::from_millis(1000 / target_fps.max(1) as u64),
+            target_frame_period: super::gate::legacy_period(target_fps),
             last_frame_at: None,
             slot_first: (gate_mode == super::gate::GateMode::SlotFirst)
                 .then(|| super::gate::SlotFirst::new(target_fps)),
+            gate_mode,
             _downscale: downscale,
             _worker: worker,
             _shutdown: shutdown,
@@ -387,6 +391,21 @@ impl ScreenCapture for WgcCapture {
             .readback_us_total
             .load(std::sync::atomic::Ordering::Relaxed);
         Some((frames, us))
+    }
+
+    /// FR-119 P2b — both gates move in place. Above 60 the slot-first gate
+    /// runs whatever the open chose (`GateMode::at_fps`), with a fresh bucket
+    /// at the new period; at 60 or below the open's own gate comes back.
+    fn set_target_fps(&mut self, fps: u32) {
+        let gate = super::gate::GateMode::at_fps(self.gate_mode, fps);
+        self.target_frame_period = super::gate::legacy_period(fps);
+        self.slot_first =
+            (gate == super::gate::GateMode::SlotFirst).then(|| super::gate::SlotFirst::new(fps));
+        tracing::info!(gate = gate.as_str(), fps, "wgc capture gate moved");
+    }
+
+    fn backend(&self) -> &'static str {
+        "wgc"
     }
 
     fn monitor_count(&self) -> u8 {

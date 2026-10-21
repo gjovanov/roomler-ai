@@ -34,7 +34,7 @@ host cannot show the prompt at all. The operator had to unlock first, which is
 what set up defect 2. (The M3 lock-screen work put the video *capture* on the
 secure desktop; this newer window is not there.)
 
-### 2. A DXGI duplication bound during the lock→unlock transition returns empty frames forever — `system_context/capture_pump.rs:562`
+### 2. A DXGI duplication bound during the lock→unlock transition returns empty frames forever — `system_context/capture_pump.rs:570`
 
 The black session's own log (session `6a930b60`) is unambiguous:
 

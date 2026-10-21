@@ -394,6 +394,23 @@ pub trait ScreenCapture: Send {
     /// dim-change encoder rebuild).
     fn set_output_cap(&mut self, _target: Option<(u32, u32)>) {}
 
+    /// FR-119 P2b — move the rate this backend paces to, without a reopen.
+    /// Applies from the next frame. The pump calls it once a swap to the new
+    /// rate has been adopted (going up) or before it (going down), so the
+    /// encoder is never fed faster than it was built for.
+    ///
+    /// The default does nothing. A backend that cannot move its pace in place
+    /// keeps the rate it opened at (the portal's helper paces in its own
+    /// process), and a trial at a higher rate then fails on the frames it
+    /// actually delivers: the honest verdict, and the one cached.
+    fn set_target_fps(&mut self, _fps: u32) {}
+
+    /// FR-119 P2b — this backend in a rate class (`frame_rate::ClassKey`): a
+    /// rate proven on one backend is no evidence for another.
+    fn backend(&self) -> &'static str {
+        "unknown"
+    }
+
     /// FR-29 — cumulative frames the backend declined to produce because it
     /// PROVED the screen was unchanged.
     ///
@@ -2334,6 +2351,9 @@ impl ScreenCapture for NoopCapture {
     }
     fn unavailable(&self) -> Option<&CaptureUnavailable> {
         self.reason.as_ref()
+    }
+    fn backend(&self) -> &'static str {
+        "none"
     }
 }
 
