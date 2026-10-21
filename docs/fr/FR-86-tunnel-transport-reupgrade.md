@@ -25,17 +25,17 @@ The operator's decision (2026-09-28, on #1768): *"they should switch to the bett
 
 The ladder runs **only when a session opens**, and nothing ever re-opens a healthy session, so a route keeps the
 transport it happened to land on. The flow supervisor even remembers that QUIC-over-TURN failed
-(`quic_over_turn_failing`, `agents/roomlerd/src/tunnel/client_mgr.rs:747`) — but only uses it to choose the
+(`quic_over_turn_failing`, `agents/roomlerd/src/tunnel/client_mgr.rs:762`) — but only uses it to choose the
 NEXT session's first rung, and a healthy fallen-back session never ends on its own.
 
 ## The mechanism, in the code (master `0806a1ed0`)
 
 | What | Where | Why it blocks a re-upgrade |
 |---|---|---|
-| Each session binds the route's loopback port itself | `crates/tunnel-core/src/driver.rs:369` `bind_local_listener`, called at `:682` (`run_webrtc_session`, `:550`) and `:1379` (`run_quic_session`, `:1190`) | A second session cannot open beside the first — both would bind `127.0.0.1:<port>` |
+| Each session binds the route's loopback port itself | `crates/tunnel-core/src/driver.rs:370` `bind_local_listener`, called at `:687` (`run_webrtc_session`, `:555`) and `:1409` (`run_quic_session`, `:1220`) | A second session cannot open beside the first — both would bind `127.0.0.1:<port>` |
 | Each session owns its accept loop and spawns one task per connection, holding `Arc`s to ITS pool / connection | `driver.rs` `run_webrtc_session` accept loop after `:682`; `run_quic_session` after `:1374` | Connections are welded to the session that accepted them |
-| Ending a session sends `rc:tunnel.terminate` (the #1754 guard) | `driver.rs:112` `TerminateOnDrop`, armed in `run_tunnel_session` (`:393`) | Ending a session to switch transport cuts every connection it carries — at the exit, the peer is closed |
-| The ladder runs once per session open | `client_mgr.rs:933` `run_session_with_fallback`, `:1058` `drive_one`, driven by `:718` `run_flow_supervisor` | A fallback is permanent for the life of the session |
+| Ending a session sends `rc:tunnel.terminate` (the #1754 guard) | `driver.rs:113` `TerminateOnDrop`, armed in `run_tunnel_session` (`:394`) | Ending a session to switch transport cuts every connection it carries — at the exit, the peer is closed |
+| The ladder runs once per session open | `client_mgr.rs:948` `run_session_with_fallback`, `:1073` `drive_one`, driven by `:733` `run_flow_supervisor` | A fallback is permanent for the life of the session |
 | During a reconnect the port is unbound | the listener lives and dies with the session | A client connecting during a reconnect gets `connection refused` |
 
 ## Key design
@@ -62,7 +62,7 @@ the exit side are untouched. Its visible effect is that a route no longer refuse
 ### P2 — make-before-break re-upgrade
 
 The flow supervisor gains a **re-upgrade probe**. The order is `quic-v1` > `quic-derp-v1` > `webrtc-dc-v1`
-(`quic-derp-v1` only where `TUNNEL_DERP_FALLBACK` is on, `client_mgr.rs:865`), restricted to what the route's
+(`quic-derp-v1` only where `TUNNEL_DERP_FALLBACK` is on, `client_mgr.rs:880`), restricted to what the route's
 `--transport` preference allows (`auto` only; a pinned transport never re-upgrades).
 
 ```mermaid
