@@ -264,7 +264,7 @@ and the consent chain's fallbacks.
 |---|---|---|---|---|---|---|
 | O1 | A per-user install updates itself | ✅ | ❌ | ✅ | #2046 | FR-96 |
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
-| O3 | Tunnel CLI `roomler self-update` | ✅ | 🟡 built (P6b) | 🟡 built (P6b) | Was: Windows only, with the manifest's SHA-256 the only check. *P6b:* the `.asc` against the pinned key on every OS (`agents/roomler-cli/src/update.rs:223`); a tarball, or the `.deb` where dpkg owns the binary, by host (`:258`); the version named inside the signed archive (`:363`, `:533`) | P6b |
+| O3 | Tunnel CLI `roomler self-update` | ✅ | 🟡 built (P6b) | 🟡 built (P6b) | Was: Windows only, with the manifest's SHA-256 the only check. *P6b:* the `.asc` against the pinned key on every OS (`agents/roomler-cli/src/update.rs:227`); a tarball, or the `.deb` where dpkg owns the binary, by host (`:262`); the version named inside the signed archive (`:386`, `:569`) | P6b |
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:902`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
@@ -915,23 +915,24 @@ model on Windows, so the three agree on what the mode means.
     `roomlerd artifact-version <file> <tag>` runs the updater's check on a file, for that proof and its re-runs.
 - **P6b, `roomler self-update` on Linux and macOS, and the pinned check on every OS (built, #P6BPR).**
   - *The signature, every OS.* The artifact's detached `.asc` must verify against the release key pinned in the
-    binary (`agents/roomler-cli/src/update.rs:223`). It is the agent updater's own check, `pgp_verify`, moved to
+    binary (`agents/roomler-cli/src/update.rs:227`). It is the agent updater's own check, `pgp_verify`, moved to
     `crates/tunnel-core` so both binaries carry it; the agent re-exports it. `code_signature.rs` stays in the agent:
     no OS needs WinTrust here, so the `windows-sys` 0.59 / 0.61 split never comes up. The manifest's SHA-256 is
     still checked where it has one. Before P6b that was the only check, and a missing digest skipped it (CLAUDE.md's
     LOW issue).
   - *The version, from inside the signed bytes.* A signature does not say which release the bytes are. A tarball
-    must hold `roomler-tunnel-<offered>-<triple>/roomler` (`:363`, `:373`), and a `.deb`'s control `Version` must
-    be the offered one (`:533`). The Windows zip names no version inside, so there the offer stands once the
-    signature does.
-  - *Install, by host* (`:258`). Windows as before. macOS, and Linux where no package owns the binary: the
+    must hold the binary under the one top-level dir that names the offered version and target (`:386`, `:397`),
+    and a `.deb`'s control `Version` must be the offered one (`:569`). The Windows zip names no version inside, so
+    there the offer stands once the signature does.
+  - *Install, by host* (`:262`). Windows as before. macOS, and Linux where no package owns the binary: the
     tarball's `roomler`, read in memory, so nothing is extracted and no directory is created or chowned. It is
-    written beside the binary with `O_EXCL`, then renamed over it (`:449`). Linux where dpkg owns the binary:
-    `dpkg -i` of the verified `.deb`, from a private directory (`:485`), so dpkg's record stays true. Root where the
-    directory or dpkg needs it; the command says `sudo`.
+    written beside the binary with `O_EXCL`, then renamed over it (`:473`). Linux where dpkg owns the binary:
+    `dpkg -i` of the verified `.deb`, from a private directory (`:526`), so dpkg's record stays true. The owner may
+    be the package under its pre-rename name (FR-21 P2b, rc.266 and older), which the new `.deb` replaces
+    (`:288`). Root where the directory or dpkg needs it, said before anything is downloaded; the command says `sudo`.
   - *Not a daemon host's updater.* There `roomler` is a shim over `roomlerd cli`, which refuses `self-update` and
     names `roomlerd self-update` (`agents/roomler-cli/src/cli.rs:997`).
-  - *Tested.* A new CI step runs the CLI's lib tests, which no lane had run (127 on Linux). The moved check
+  - *Tested.* A new CI step runs the CLI's lib tests, which no lane had run (128 on Linux). The moved check
     verified the real 0.4.148 agent `.deb`'s `.asc` and refused it with one byte flipped.
   - *Found while scoping it (2026-10-18).* There was nothing to update from. Every tunnel install and `self-update`
     had 404'd since ~09-07, because the server's release cache lost the tunnel family to depth (#2468, fixed by
@@ -1058,7 +1059,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1277-1293`).
+  test (`ci.yml:1285-1301`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;
@@ -1242,7 +1243,9 @@ one depends on it.
   Linux on P6c's branch and again on the 0.4.144 candidate, §8 (red on 0.4.143). On a Mac its stop's mechanism is measured on the released pkg, and
   the verb itself runs on the release check. A SIGKILLed Mac worker leaving a crash record is field-verified on
   P6e-2's candidate, §8: nothing on 0.4.148, and one `supervisor_detected` record on the server for the candidate.
-  It is checked again on the release. The rest is P6b.)*
+  It is checked again on the release. The `roomler self-update` clause is built (P6b, #P6BPR): its refusals are
+  field-verified against a stand-in for the release endpoints (§8), and the install itself waits for the first
+  tunnel release that carries it.)*
 - [ ] **AC14 (P7):** an arm64 Linux host advertises a hardware cell and records AAC; the arm64 CLI and wizard
   install.
 - [ ] **AC15 (the rule):** P0d's server count of advertised capability words by OS, taken before P0 and after the
@@ -1438,3 +1441,4 @@ one depends on it.
 | 2026-10-21 | — (no roomler: the supervisor's own spawn line with `/bin/sleep` as the worker) | a throwaway tart Mac (a vmtest-golden clone), macOS 15.7.7 arm64, sudo 1.9.13p2, `admin` (uid 501) at the console. As root, perl forked a child into its own process group that exec'd `launchctl asuser 501 /usr/bin/sudo -u '#501' /bin/sleep 300`, as `spawn_worker` does, then signalled the sleep and decoded the child's wait status. Destroyed after | **P6e-2's premise, measured.** The group was `sudo` (the forked pid itself) and the sleep, as uid 501: `launchctl asuser` execs into `sudo`, so the child the supervisor reaps is `sudo`. `sudo` passed the worker's end through as its own: `kill -KILL`, `-SEGV`, `-BUS`, `-ABRT`, `-TERM` and `-HUP` came back as signals 9, 11, 10, 6, 15 and 1 (raw statuses 9, 11, 10, 6, 15, 1; no core bit). `exit 7` came back as code 7 (raw 1792) and `exit 0` as code 0. Nothing was left in the group after any of them |
 | 2026-10-21 | released 0.4.148 (roomlerd `c1fb9da9…`, from its `.pkg`) | a throwaway tart Mac (a vmtest-golden clone, macOS 15.7.7), `admin` (uid 501) at the console. Both halves enrolled standard in the vmtest org with `auto_update` off; `macos_supervise_gui_worker = true` in the root config and the LaunchAgent booted out, so the root daemon's supervisor spawned the worker. Both rows were deleted and the VM destroyed afterwards | 🔴 **P6e-2 red.** The worker ran 45 s and was `kill -9`'d. The supervisor logged *GUI worker exited* (`ran_secs=45`) and respawned it. The root daemon's crashes dir stayed empty, also after a restart's startup drain, and the daemon row's crash list on the server read **0**. A `kill -TERM` left nothing either |
 | 2026-10-21 | P6e-2's candidate: the `.pkg` from release-workflow rehearsal 39556889800 on #2655 (`ee0e08dd…`; roomlerd `3fec03af…`) | the same set-up on a fresh clone | 🟢 **P6e-2 green.** The negative control ran first, because the recorder writes one sidecar per 30 s, so a wrong record right after the kill would have been suppressed. `kill -TERM`: the worker shut down cleanly and exited 0 (*status=exit status: 0*), and no sidecar appeared. Then `kill -9` after 20 s: the supervisor logged *status=signal: 9 (SIGKILL)*, and one sidecar appeared. A restart's startup drain uploaded it (*uploaded + deleted*). The daemon row's crash list on the server read **1**: `supervisor_detected`, *macOS supervisor: the GUI worker (uid 501) was killed by SIGKILL (9) after 20 s*, pid 791 (the root daemon, which wrote it), version 0.4.148 |
+| 2026-10-21 | the released tunnel CLI `0.3.0-rc.266` (its tarball, then its `.deb`), then #P6BPR's CLI (roomler `9416dcbf…`, a release build of the branch) | a throwaway Debian 13 container on mars (glibc 2.41). A stand-in for the release endpoints offered tunnel 0.4.149 (the manifest, the proxy download, the `.asc`) and logged each request. The signed artifacts were the agent's 0.4.148 tarball and `.deb`, each checked against its published SHA-256 | 🔴 **The released CLI cannot self-update on Linux:** *"self-update installs on Windows x86_64 only for now"*. 🟢 **P6b refused all five, with the binary's hash unchanged each time.** An unsigned tarball: *".asc is missing from the release; refusing to install an unsigned artifact"*. A real signature over other bytes: *"does not verify against the pinned release key"*. The agent's genuinely signed 0.4.148 tarball offered as tunnel 0.4.149: *"Signature verified against the pinned release key"*, then refused, because it holds no 0.4.149 dir. With `/usr/bin/roomler` owned by rc.266's package (its pre-rename name), as a non-root user: *"dpkg owns this binary … needs root"*, before any download. As root, the agent's signed 0.4.148 `.deb` offered as 0.4.149: verified, then *"the .deb says it is version "0.4.148-1", not 0.4.149"*, and dpkg's record was unchanged. Every download was pinned to `?version=0.4.149`. The install itself needs a signed tunnel release |
