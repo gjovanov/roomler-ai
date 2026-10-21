@@ -1681,6 +1681,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
     },
     KeyMeta {
+        key: "fps_deny",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-119 - frame rates above 60 this device must not grant: comma-separated name:fps entries (e.g. hevc_qsv:120), `*` for every encoder (e.g. *:144). Empty or `none` = deny nothing. Env: ROOMLERD_FPS_DENY. Pushable through remote config. Restart required.",
+    },
+    KeyMeta {
         key: "vaapi_device",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2093,6 +2101,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
+        "fps_deny" => cfg.fps_deny.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
         "vulkan_device" => cfg.vulkan_device.clone(),
@@ -2743,6 +2752,15 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 }
             }
         }
+        "fps_deny" => {
+            cfg.fps_deny = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    validate_fps_denylist(v)?;
+                    Some(v.to_string())
+                }
+            }
+        }
         "forward_acl" => {
             cfg.forward_acl = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => Default::default(),
@@ -2896,6 +2914,45 @@ pub fn validate_denylist(v: &str) -> Result<(), String> {
             return Err(format!(
                 "encoder_cells_deny entry {entry:?}: chroma must be yuv420 or yuv444"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// FR-119 P2b — `fps_deny` entries are `name:fps`: a plain FFmpeg encoder
+/// name or `*`, and a rate above 60. Validated for the reason
+/// `validate_denylist` is: an entry that matches nothing is inert, and the
+/// operator would read it as in force. A rate at or below 60 is never granted
+/// above anything, so denying it would deny nothing. The single word `none`
+/// denies nothing on purpose: it is how a remote push says so, where a blank
+/// box hands the key back to the device.
+pub fn validate_fps_denylist(v: &str) -> Result<(), String> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+    for entry in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((name, fps)) = entry.split_once(':') else {
+            return Err(format!(
+                "fps_deny entry {entry:?} must be name:fps (e.g. hevc_qsv:120, or *:144 for every encoder)"
+            ));
+        };
+        if name != "*"
+            && (name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+        {
+            return Err(format!(
+                "fps_deny entry {entry:?}: the encoder must be a plain FFmpeg name (lowercase, digits, underscores) or *"
+            ));
+        }
+        match fps.parse::<u32>() {
+            Ok(f) if f > 60 => {}
+            _ => {
+                return Err(format!(
+                    "fps_deny entry {entry:?}: the rate must be a whole number above 60 (only those are ever granted)"
+                ));
+            }
         }
     }
     Ok(())
@@ -4837,6 +4894,38 @@ mod tests {
         ] {
             assert!(
                 apply(&mut cfg, "encoder_cells_deny", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-119 P2b — `fps_deny` sets, echoes, clears, and refuses an entry that
+    /// could only ever deny nothing.
+    #[test]
+    fn fps_deny_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "fps_deny"), None);
+        apply(&mut cfg, "fps_deny", Some(" hevc_qsv:120, *:144 ")).unwrap();
+        assert_eq!(cfg.fps_deny.as_deref(), Some("hevc_qsv:120, *:144"));
+        assert_eq!(
+            entry_for(&cfg, "fps_deny").unwrap().value.as_deref(),
+            Some("hevc_qsv:120, *:144")
+        );
+        apply(&mut cfg, "fps_deny", Some("none")).unwrap();
+        assert_eq!(cfg.fps_deny.as_deref(), Some("none"));
+        apply(&mut cfg, "fps_deny", Some("")).unwrap();
+        assert_eq!(cfg.fps_deny, None, "blank clears: deny nothing");
+        for bad in [
+            "hevc_qsv",
+            "hevc_qsv:60",
+            "hevc_qsv:fast",
+            "HEVC_QSV:120",
+            ":120",
+            "a b:120",
+            "**:120",
+        ] {
+            assert!(
+                apply(&mut cfg, "fps_deny", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

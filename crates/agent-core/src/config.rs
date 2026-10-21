@@ -1533,6 +1533,13 @@ pub struct AgentConfig {
     /// `remote_config_enabled` is needed.
     #[serde(default)]
     pub encoder_cells_deny: Option<String>,
+    /// FR-119 P2b — frame rates this device must not grant above its usual
+    /// rate, comma-separated `name:fps` (`hevc_qsv:120`, `*:144` for every
+    /// encoder). Unset = deny nothing. Env `ROOMLERD_FPS_DENY`, read once per
+    /// session. Pushable through remote config for the same reason as
+    /// `encoder_cells_deny`: it only ever REMOVES rates.
+    #[serde(default)]
+    pub fps_deny: Option<String>,
     /// FR-77 P4 — pin the VAAPI render node (`ROOMLERD_VAAPI_DEVICE`,
     /// e.g. `/dev/dri/renderD129`). Unset = the first node libva opens, in
     /// order `/dev/dri/renderD128`…`renderD135`. Read once per process at
@@ -2883,6 +2890,7 @@ pub fn test_fixture() -> AgentConfig {
         text_mod_neutralize: None,
         caps_cache: None,
         encoder_cells_deny: None,
+        fps_deny: None,
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,
@@ -3218,6 +3226,10 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // child through `config_fallbacks_for_child` like every other knob.
     if let Some(v) = &cfg.encoder_cells_deny {
         fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
+    }
+    // FR-119 P2b — the frame-rate denylist, read by the pump once per session.
+    if let Some(v) = &cfg.fps_deny {
+        fallbacks.insert("FPS_DENY".to_string(), v.clone());
     }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
@@ -3560,8 +3572,10 @@ mod tests {
         cfg.uinput = Some(false);
         cfg.overlay_pathmon = Some("shadow".into());
         cfg.encoder_cells_deny = Some("h264/nvenc".into());
+        cfg.fps_deny = Some("hevc_qsv:120".into());
         let m = env_fallbacks(&cfg);
         let get = |k: &str| m.get(k).map(String::as_str);
+        assert_eq!(get("FPS_DENY"), Some("hevc_qsv:120"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),

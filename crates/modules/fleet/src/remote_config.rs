@@ -35,6 +35,8 @@ pub struct DesiredConfigBody {
     pub ssh_port: Option<u16>,
     #[serde(default)]
     pub encoder_cells_deny: Option<String>,
+    #[serde(default)]
+    pub fps_deny: Option<String>,
 }
 
 /// ⚠️ `desired` is the SAME projection the listing returns
@@ -170,6 +172,7 @@ pub async fn set_desired_config(
         ssh_account_mode: body.ssh_account_mode,
         ssh_port: body.ssh_port,
         encoder_cells_deny: body.encoder_cells_deny,
+        fps_deny: body.fps_deny,
         revision: agent.desired_config.revision + 1,
         updated_by: Some(auth.user_id),
         updated_at: Some(DateTime::now()),
@@ -492,6 +495,24 @@ mod tests {
         };
         decide(DEFAULT_ADMIN, &DesiredConfig::default(), &deny)
             .expect("MANAGE_AGENTS alone may set the denylist");
+        assert!(!deny.touches_exec() && !deny.touches_ssh());
+        assert!(!deny.is_empty(), "a denylist-only request is a request");
+        assert_eq!(
+            decide(0, &DesiredConfig::default(), &deny),
+            Err(ConfigDenyReason::NotDeviceAdmin)
+        );
+    }
+
+    /// FR-119 P2b — the frame-rate denylist is a kill switch the same way:
+    /// it only ever REMOVES rates, so `MANAGE_AGENTS` alone may push it.
+    #[test]
+    fn the_frame_rate_denylist_needs_only_manage_agents() {
+        let deny = DesiredConfig {
+            fps_deny: Some("hevc_qsv:120,*:144".into()),
+            ..Default::default()
+        };
+        decide(DEFAULT_ADMIN, &DesiredConfig::default(), &deny)
+            .expect("MANAGE_AGENTS alone may set the frame-rate denylist");
         assert!(!deny.touches_exec() && !deny.touches_ssh());
         assert!(!deny.is_empty(), "a denylist-only request is a request");
         assert_eq!(

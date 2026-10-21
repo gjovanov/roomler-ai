@@ -565,6 +565,9 @@ export interface DesiredConfig {
   ssh_port?: number
   /** FR-77 P3 — the cell denylist (`name:chroma` list or `none`); MANAGE_AGENTS only. */
   encoder_cells_deny?: string
+  /** FR-119 P2b — the frame-rate denylist (`name:fps` list, `*` for every
+   *  encoder, or `none`); MANAGE_AGENTS only. */
+  fps_deny?: string
   updated_by?: string
   updated_at?: string
 }

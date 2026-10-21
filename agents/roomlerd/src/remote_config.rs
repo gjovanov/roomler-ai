@@ -317,6 +317,19 @@ impl RemoteConfigServices {
                     applied.needs_restart.push("encoder_cells_deny");
                 }
             }
+            // FR-119 P2b — the frame-rate denylist, the same shape: a blank
+            // push clears it (deny nothing). It reaches the pump through the
+            // config fallbacks, registered once per process, hence
+            // `needs_restart`.
+            if let Some(want) = desired.fps_deny.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.fps_deny != next {
+                    cfg.fps_deny = next;
+                    applied.needs_restart.push("fps_deny");
+                }
+            }
 
             if applied.is_noop() {
                 return Ok(applied);
@@ -506,6 +519,35 @@ mod tests {
             exec,
             opted_in,
         )
+    }
+
+    /// FR-119 P2b — a pushed frame-rate denylist is written and reported as
+    /// needing a restart; the same push again changes nothing; a blank push
+    /// clears it.
+    #[tokio::test]
+    async fn a_pushed_frame_rate_denylist_is_written_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr119-fps-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            fps_deny: Some(v.to_string()),
+            ..Default::default()
+        };
+        let applied = svc.apply(&push(" hevc_qsv:120 ")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["fps_deny"]);
+        let back = crate::config::load(&path).unwrap();
+        assert_eq!(back.fps_deny.as_deref(), Some("hevc_qsv:120"));
+        assert!(svc.apply(&push("hevc_qsv:120")).await.unwrap().is_noop());
+        svc.apply(&push("")).await.unwrap();
+        assert_eq!(crate::config::load(&path).unwrap().fps_deny, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FR-40 — a rotation writes ONE enrollment's key + epoch through the

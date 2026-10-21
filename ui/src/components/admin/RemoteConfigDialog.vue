@@ -162,6 +162,23 @@
           <code>none</code> = deny nothing. It only ever removes cells, so no
           extra permission bit; takes effect at the next daemon restart.
         </div>
+        <v-text-field
+          v-model="fpsDenyText"
+          label="Frame rates to deny (fps_deny)"
+          placeholder="hevc_qsv:120, *:144"
+          density="compact"
+          variant="outlined"
+          hide-details
+          persistent-placeholder
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Comma-separated <code>name:fps</code> rates above 60 the device must
+          not grant, <code>*</code> for every encoder. Blank = not managed (the
+          device keeps its own, which denies nothing unless set there);
+          <code>none</code> = deny nothing. It only ever removes rates, so no
+          extra permission bit; takes effect at the next daemon restart.
+        </div>
 
         <!-- The combination checks. Each of these produces a device that is
              "on" and reaches nobody — the exact silent-nothing this feature
@@ -451,6 +468,15 @@ const encoderDenyText = computed({
     draft.value.encoder_cells_deny = t === '' ? undefined : t
   },
 })
+/** FR-119 P2b — the frame-rate denylist, the same shape: a blank box is "not
+ *  managed", and `none` says "deny nothing". */
+const fpsDenyText = computed({
+  get: () => draft.value.fps_deny ?? '',
+  set: (v: string) => {
+    const t = v.trim()
+    draft.value.fps_deny = t === '' ? undefined : t
+  },
+})
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
   { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
@@ -472,6 +498,7 @@ watch(
       ssh_account_mode: d?.ssh_account_mode,
       ssh_port: d?.ssh_port,
       encoder_cells_deny: d?.encoder_cells_deny,
+      fps_deny: d?.fps_deny,
     }
     original.value = JSON.stringify(draft.value)
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
