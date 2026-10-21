@@ -203,6 +203,7 @@ actions inside the viewport.
 | **P4** — P4a #2574 (chat) · P4b #2580 (calls) | chat and conference | revert | a two-browser call with one at phone width | L |
 | **P5** — #2577 · P5b #2588 (the files drawer; a stack on #2577) | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
 | **P6** — P6a #2584 (UI) · P6b #2586 (D4, the server); hive's rows are FR-90's and stay open | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
+| **P6c** — #2652 | hive's session rows and dialogs name the device as the Devices page does (a UI join on `device_id`; the kept `device_name` only for a device the org no longer lists). The agent's message author, `Claude · <device_name>` (`crates/modules/hive/src/model.rs:640`), is stamped by the server and stays FR-90's | revert: UI only | the hive pages on production after a promote | S |
 | **P7** — #2575 (sign-in) · P7b #2587 (the landing bar) | public pages, sign-in | revert | iOS Safari sign-in (the operator) | S |
 | **P8** — docs: this PR, a stack on #2582; the smoke: open (§6) | docs + the phone-width smoke | — | CI | S |
 
@@ -219,7 +220,8 @@ Found by the audit and fixed outside the phases (every width): a deep link to an
   the P8 smoke's). *(§8. The idle viewer's secondary break-glass button still reaches 361 px; #2601 shortens it.)*
 - [ ] **AC4**: a device is named by its display name everywhere a person reads a device name: the Devices page and
   its dialogs, the audit pages, the overlay pages, the Tunnel ACL, analytics, usage, hive. *(§8: every surface
-  but hive verified on production 2026-10-20; hive's rows are FR-90's.)*
+  but hive verified on production 2026-10-20. Hive's rows and dialogs: P6c. Still open: the agent's message
+  author in a session room, `Claude · <device_name>`, which the server stamps (FR-90's).)*
 - [x] **AC5**: complex dialogs are full screen on `xs` with their actions reachable. *(§8, 2026-10-20.)*
 - [ ] **AC6**: chat and calls on a phone: Send is always visible; message actions work by tap, and nothing invisible
   takes a tap; the transcript closes; a call leaves visible controls once you leave its page.
