@@ -115,7 +115,7 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:6038-6180`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:6039-6181`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
@@ -316,7 +316,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | the conditional report write | `crates/services/src/dao/agent.rs:999-1029` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-676`, `:1452-1460` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6038-6180`, `:2940-2982`, `:2984-3005`, `:1102-1126` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6039-6181`, `:2940-2982`, `:2984-3005`, `:1102-1126` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1566`, `:1567-1569`; `config_surface.rs:1096-1069` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:948-902` |

@@ -1261,7 +1261,7 @@ it presented (P3-8-2b).
 | the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
 | the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
 | the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
-| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. P3-8-2b: the device's client and tool. The target holding `one_command` (P3-8-2a) is the next section |
+| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. P3-8-2b-2: the tool `ssh_run`. The target holding `one_command` (P3-8-2a) and the device's client (P3-8-2b-1) are the next two sections |
 
 ### A session's grant on the target: one command (FR-90 P3-8-2a)
 
@@ -1320,6 +1320,57 @@ session's grant backs it.
 | the device's word | `ssh-one-command` in the hello ([`caps.rs:1932`](../agents/roomlerd/src/encode/caps.rs#L1932)) |
 | the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
 | the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2653`](../crates/remote_control/src/models.rs#L2653)) |
+
+### The session's own device: the client (FR-90 P3-8-2b)
+
+The SSH client is the session's own daemon, never the session. The session
+never holds a key, and no key reaches its transcript: this daemon mints one for
+each call, presents its public half once, and drops it when the call ends.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as the session's daemon
+    participant V as vault
+    participant N as network module
+    participant T as target
+    D->>V: rc:vault.ssh {session, fence, target, ttl}
+    V-->>D: rc:vault.ssh.granted {ticket_id, ticket, os, account}
+    D->>D: mint an ed25519 key for this call
+    D->>N: rc:ssh.request {target, public key, session_secs, ssh_ticket}
+    N-->>D: rc:ssh.response {address, port, host_pubkey, ssh_ticket_id}
+    D->>D: the echo is this ticket's, and a host key is named? (else nothing dials)
+    D->>T: dial the overlay address; pin the host key; one exec
+    T-->>D: exit status, stdout, stderr
+```
+
+| Step | What the client does |
+|---|---|
+| the ticket | asks the vault (`rc:vault.ssh`), the primary's connection only, as a lease is. An answer that is not whole is refused; `Debug` never shows the ticket |
+| the key | ed25519, minted for the call; its private half lives in this process's memory alone |
+| the request | `rc:ssh.request` with the ticket and the key's public half. `session_secs` is the command's time plus the target's 30 s prompt; the network module clamps it to what is left of the ticket |
+| the answer | refused unless it echoes the ticket it presented and names a host key that parses. A refusal is the server's words |
+| the dial | the target's overlay address: through the userspace stack on a netstack node, through the OS's routes on a node with a TUN |
+| the session | the target's host key pinned to the answer's; one `exec`; the exit status and both streams, each to 64 KiB (`truncated` when cut), all within the call's time |
+
+⚠️ **The echo is the client's guard.** A server before P3-8-1b ignores
+`ssh_ticket`, an unknown field, and would answer the request as the device
+owner's. Such an answer echoes nothing, and the client dials nothing on it.
+
+⚠️ **Another host key is refused before the key is offered.** The client
+checks the target's key during the handshake, before it authenticates, so a
+device that answers in the target's place learns no key and spends no grant.
+
+⚠️ **One command is the target's rule, not this client's.** The client asks
+for one `exec` because that is all it needs; the target refuses anything more
+(P3-8-2a), whatever a daemon holding the key might ask.
+
+| Piece | Where |
+|---|---|
+| the ask | `Client::ssh` ([`vault.rs:793`](../agents/roomlerd/src/vault.rs#L793)), answered at [`:946`](../agents/roomlerd/src/vault.rs#L946) from the primary's connection ([`signaling.rs:6334`](../agents/roomlerd/src/signaling.rs#L6334)) |
+| the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
+| the dial | the netstack's ([`overlay.rs:894`](../agents/roomlerd/src/overlay.rs#L894)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:5970`](../agents/roomlerd/src/signaling.rs#L5970), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ## 5. Roadmap
 
