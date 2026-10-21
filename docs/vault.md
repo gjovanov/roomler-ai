@@ -1958,5 +1958,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS; a Kubernetes `TokenRequest`; the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); `ssh_run` and `fleet_exec` as tools, `roomler connect` |
+| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`; the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); `ssh_run` and `fleet_exec` as tools, `roomler connect` |
 | P3k | the field run in the test organization |
