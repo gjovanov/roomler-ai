@@ -832,6 +832,8 @@ pub struct DrmCapture {
     height: u32,
     target_frame_period: Duration,
     last_frame_at: Option<Instant>,
+    /// FR-119 P2b-3 — the scanned-out mode's refresh rate, read at the open.
+    refresh_hz: Option<u16>,
     /// FR-93 P3d — frames the worker skipped because nothing changed.
     unchanged: Arc<AtomicU64>,
     /// FR-93 P3e — the last grab found the display off.
@@ -898,7 +900,7 @@ impl DrmCapture {
         // stay on one thread for their whole life, and ack readiness back
         // synchronously so an init failure surfaces to the cascade here rather
         // than as a silently dead capturer.
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32, String)>>();
+        let (ready_tx, ready_rx) = std_mpsc::channel::<WorkerReady>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<FrameRequest>();
         let unchanged = Arc::new(AtomicU64::new(0));
         let worker_unchanged = Arc::clone(&unchanged);
@@ -922,13 +924,16 @@ impl DrmCapture {
             })
             .map_err(|e| anyhow!("spawn drm-capture worker: {e}"))?;
 
-        let (width, height, path) = ready_rx
+        let (width, height, path, refresh_hz) = ready_rx
             .recv()
             .map_err(|_| anyhow!("drm-capture worker exited before reporting readiness"))??;
 
         info!(
             node = path.as_str(),
-            width, height, "capture: backend=drm (scanout plane, below the compositor)"
+            width,
+            height,
+            ?refresh_hz,
+            "capture: backend=drm (scanout plane, below the compositor)"
         );
 
         Ok(Self {
@@ -941,14 +946,20 @@ impl DrmCapture {
             dark: false,
             guard: None,
             output_cap,
+            refresh_hz,
         })
     }
 }
 
+/// What the capture thread reports once, when it is ready or has failed: the
+/// scanout's width and height, the device node it opened, and (FR-119 P2b-3)
+/// the scanned-out mode's refresh rate.
+type WorkerReady = Result<(u32, u32, String, Option<u16>)>;
+
 /// The capture thread: owns the device, the cached mapping, and every unsafe
 /// region in this module.
 fn worker(
-    ready_tx: std_mpsc::Sender<Result<(u32, u32, String)>>,
+    ready_tx: std_mpsc::Sender<WorkerReady>,
     cmd_rx: std_mpsc::Receiver<FrameRequest>,
     downscale: DownscalePolicy,
     idle_skip: drm_idle::IdleSkip,
@@ -1000,7 +1011,7 @@ fn worker(
 
     // Resolve the geometry once so the caller gets a real size, and so an
     // unusable modifier is refused at open rather than per frame.
-    let Some((fb, _crtc)) = primary_plane(&card, &planes) else {
+    let Some((fb, crtc_handle)) = primary_plane(&card, &planes) else {
         let _ = ready_tx.send(Err(anyhow!(
             "no plane is bound to a CRTC with a live framebuffer — is anything being scanned out? \
              (a blanked screen stops scanout, which is why screen blanking must be disabled)"
@@ -1033,7 +1044,13 @@ fn worker(
     }
     let (w, h) = info.size();
     drop(open_handles);
-    if ready_tx.send(Ok((w, h, path))).is_err() {
+    // FR-119 P2b-3 — the scanned-out mode's refresh rate.
+    let refresh_hz = card
+        .get_crtc(crtc_handle)
+        .ok()
+        .and_then(|c| c.mode())
+        .and_then(|m| super::refresh::hz(f64::from(m.vrefresh())));
+    if ready_tx.send(Ok((w, h, path, refresh_hz))).is_err() {
         return;
     }
 
@@ -1538,6 +1555,10 @@ impl ScreenCapture for DrmCapture {
 
     fn backend(&self) -> &'static str {
         "drm"
+    }
+
+    fn refresh_hz(&self) -> Option<u16> {
+        self.refresh_hz
     }
 
     /// FR-93 P3d — the frames skipped because nothing changed, which the

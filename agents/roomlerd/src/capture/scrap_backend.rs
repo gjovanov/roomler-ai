@@ -79,6 +79,8 @@ pub struct ScrapCapture {
         allow(dead_code)
     )]
     origin: (i32, i32),
+    /// FR-119 P2b-3 — the captured display's refresh rate, read at the open.
+    refresh_hz: Option<u16>,
 }
 
 /// FR-85 P1d — where a display sits in screen coordinates. DXGI's first
@@ -417,6 +419,18 @@ impl ScrapCapture {
             .recv()
             .context("capture thread never responded")??;
 
+        // FR-119 P2b-3 — the captured display's refresh rate, read once: the
+        // primary output on Windows (DXGI) and X11, the main display on macOS.
+        #[cfg(target_os = "windows")]
+        let refresh_hz = super::refresh::of_primary();
+        #[cfg(target_os = "macos")]
+        let refresh_hz = super::refresh::of_main_display();
+        #[cfg(target_os = "linux")]
+        let refresh_hz = super::refresh::of_x11_primary();
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        let refresh_hz = None;
+        tracing::info!(?refresh_hz, "scrap capture: the display's refresh rate");
+
         Ok(Self {
             cmd_tx,
             width,
@@ -427,6 +441,7 @@ impl ScrapCapture {
             desired,
             unchanged,
             origin,
+            refresh_hz,
         })
     }
 
@@ -561,6 +576,10 @@ impl ScreenCapture for ScrapCapture {
 
     fn backend(&self) -> &'static str {
         "scrap"
+    }
+
+    fn refresh_hz(&self) -> Option<u16> {
+        self.refresh_hz
     }
 
     /// Phase B — honour the pump's encode box by re-opening the capture

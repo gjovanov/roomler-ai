@@ -73,6 +73,9 @@ export interface FrameRateAnswer {
   asked: number | null
   /** Why not, in the agent's word (`unproven`, `constrained`, …). */
   reason: string | null
+  /** FR-119 P2b — the rate runs as a trial: the host has not shown it can
+   *  sustain it yet, and goes back to its usual rate if it cannot. */
+  trial: boolean
 }
 
 /** Read the frame-rate half of a parsed `rc:video-info`; `null` when it has
@@ -81,6 +84,7 @@ export function frameRateAnswerOf(info: {
   fps?: number
   fps_asked?: number
   fps_reason?: string
+  fps_trial?: boolean
 } | null | undefined): FrameRateAnswer | null {
   if (!info || typeof info.fps !== 'number' || !Number.isFinite(info.fps)) return null
   const asked = typeof info.fps_asked === 'number' && Number.isFinite(info.fps_asked) ? info.fps_asked : null
@@ -88,7 +92,20 @@ export function frameRateAnswerOf(info: {
   // Both or neither: an ask without its reason, or a reason without the ask,
   // explains nothing, so neither is shown.
   const refused = asked !== null && reason !== null
-  return { fps: info.fps, asked: refused ? asked : null, reason: refused ? reason : null }
+  return {
+    fps: info.fps,
+    asked: refused ? asked : null,
+    reason: refused ? reason : null,
+    trial: info.fps_trial === true,
+  }
+}
+
+/** FR-119 P2b-3 — the host screen's refresh rate from `rc:video-info`, when the
+ *  agent could read it; `null` otherwise (an older agent, or a screen that
+ *  does not say). */
+export function hostRefreshHzOf(info: { refresh_hz?: number } | null | undefined): number | null {
+  const hz = info?.refresh_hz
+  return typeof hz === 'number' && Number.isFinite(hz) && hz > 0 ? hz : null
 }
 
 /** Why the agent did not grant the ask, in words. A word this viewer does not
@@ -99,6 +116,12 @@ export function describeFrameRateReason(word: string): string {
       return "this host hasn't shown it can sustain that rate yet"
     case 'constrained':
       return 'the connection is relayed, and a relay stays at its current rate'
+    case 'refresh':
+      return "the host's screen refreshes slower than that"
+    case 'denied':
+      return "this device's owner has turned that rate off for its encoder"
+    case 'pipe':
+      return "the connection hasn't shown it can carry what that rate needs"
     default:
       return word
   }
@@ -110,6 +133,9 @@ export function frameRateSummary(answer: FrameRateAnswer | null): string | null 
   if (!answer) return null
   if (answer.asked !== null && answer.reason !== null) {
     return `${answer.fps} fps (${answer.asked} fps not granted: ${describeFrameRateReason(answer.reason)})`
+  }
+  if (answer.trial) {
+    return `${answer.fps} fps, on trial until this host has shown it can keep up`
   }
   return `${answer.fps} fps`
 }

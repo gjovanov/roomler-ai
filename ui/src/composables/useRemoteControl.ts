@@ -116,6 +116,7 @@ import {
   fpsWireMessage,
   frameRateAnswerOf,
   frameRateOptions,
+  hostRefreshHzOf,
   toFrameRate,
   type FrameRate,
 } from './frameRate'
@@ -1134,6 +1135,10 @@ export interface RcVideoInfo {
    *  (`'unproven'`, `'constrained'`). Present together, only when refused. */
   fps_asked?: number
   fps_reason?: string
+  /** FR-119 P2b — the stream runs at a rate granted as a trial. */
+  fps_trial?: boolean
+  /** FR-119 P2b-3 — the host screen's refresh rate, when the agent read it. */
+  refresh_hz?: number
 }
 
 /** FR-93 P2 (FR-45 AC8 option b) — the capture pill: which Linux arm serves
@@ -1534,6 +1539,11 @@ export function parseControlInbound(data: unknown): RcControlInbound {
               fps: obj.fps,
               ...(typeof obj.fps_asked === 'number' && typeof obj.fps_reason === 'string'
                 ? { fps_asked: obj.fps_asked, fps_reason: obj.fps_reason }
+                : {}),
+              // FR-119 P2b — a trial, and the host screen's refresh rate.
+              ...(obj.fps_trial === true ? { fps_trial: true } : {}),
+              ...(typeof obj.refresh_hz === 'number' && Number.isFinite(obj.refresh_hz)
+                ? { refresh_hz: obj.refresh_hz }
                 : {}),
             }
           : {}),
@@ -5121,9 +5131,12 @@ export function useRemoteControl(
   /** FR-119 P1 — the frame rate this viewer asks for (`rc:fps`), remembered per
    *  browser. Sent only to an agent advertising `fps-high`. */
   const frameRate = ref<FrameRate>(readStoredFrameRate())
-  /** FR-119 P1 — the picker's options for the connected agent. The host's
-   *  screen refresh is not reported yet, so it decides nothing here. */
-  const frameRateChoices = computed(() => frameRateOptions(agent?.value?.capabilities?.video, null))
+  /** FR-119 P1 — the picker's options for the connected agent. P2b-3: a rate
+   *  above the host screen's refresh rate is disabled, once the agent says
+   *  what that is. */
+  const frameRateChoices = computed(() =>
+    frameRateOptions(agent?.value?.capabilities?.video, hostRefreshHzOf(videoInfo.value)),
+  )
   /** Per-agent codec override bookkeeping Ã¢ÂÂ set in connect(), cleared in
    *  disconnect() so an idle post-session global pick can't silently write
    *  the last agent's override. */

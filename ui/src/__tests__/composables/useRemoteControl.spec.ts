@@ -3509,13 +3509,15 @@ describe('rc:video-info frame rate (FR-119 P1)', () => {
       expect(refused.info.fps).toBe(60)
       expect(refused.info.fps_asked).toBe(120)
       expect(refused.info.fps_reason).toBe('unproven')
-      expect(frameRateAnswerOf(refused.info)).toEqual({ fps: 60, asked: 120, reason: 'unproven' })
+      // FR-119 P2b-3 — `trial` joins the answer: false unless the agent says
+      // a trial runs.
+      expect(frameRateAnswerOf(refused.info)).toEqual({ fps: 60, asked: 120, reason: 'unproven', trial: false })
     }
     const granted = parseControlInbound(`${head},"fps":60}`)
     if (granted?.kind === 'video_info') {
       expect(granted.info.fps).toBe(60)
       expect('fps_asked' in granted.info).toBe(false)
-      expect(frameRateAnswerOf(granted.info)).toEqual({ fps: 60, asked: null, reason: null })
+      expect(frameRateAnswerOf(granted.info)).toEqual({ fps: 60, asked: null, reason: null, trial: false })
     }
   })
 
