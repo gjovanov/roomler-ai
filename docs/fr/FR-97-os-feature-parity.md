@@ -41,7 +41,7 @@
 - P6e-1, a daemon that never dies on a log sink (#1538: no panicking prints, no unbounded launchd stdout), merged
   (#2478), red → green on a Linux container and under a real launchd (§8).
 - P6e-2, the FR-43 supervisor recording a Mac GUI worker that a signal killed, or that exited with a code the agent
-  did not choose, built (#P6E2PR). Measured first on a tart Mac (§8): `launchctl asuser` execs into `sudo`, which
+  did not choose, built (#2655). Measured first on a tart Mac (§8): `launchctl asuser` execs into `sudo`, which
   passes the worker's end through as its own.
 - P6d, `install.sh --uninstall`, merged (#2485), field-verified on the branch (§8): six containers, a vmtest Ubuntu
   guest per install type and a tart Mac with both halves, against the served script's red.
@@ -980,7 +980,7 @@ model on Windows, so the three agree on what the mode means.
     - *The plists.* `com.roomler.agent` and `com.roomler.daemon` send stdout to `/dev/null`. It carried only
       tracing's console copy of the rotating log, unrotated: 13.9 MB and 42 MB on one Mac. stderr keeps its
       file, so an agent that cannot start still says why there, and the vmtest lane reads it.
-  - **P6e-2, the supervisor's crash record (built, #P6E2PR).** A worker that a signal ends never reaches its own
+  - **P6e-2, the supervisor's crash record (built, #2655).** A worker that a signal ends never reaches its own
     panic hook, so nothing recorded a `kill -9`, a fault inside a framework, or a kill by the system.
     - *Measured first, on a tart Mac (§8).* The child the supervisor reaps is `sudo`: `launchctl asuser` execs into
       it. `sudo` passes the worker's end through as its own, so the supervisor's wait status is the worker's.
@@ -1081,7 +1081,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --as-service` (alias `--system`) on Linux + macOS (merged, #2488) | — (a new verb) | a vmtest Ubuntu guest, red on 0.4.143; the 0.4.144 candidate; the macOS stop's mechanism on a tart Mac | S |
 | **P6d** | `install.sh --uninstall [--keep-config]` (built) | — (a new flag; the install path is unchanged) | six throwaway containers on four distros, a vmtest Ubuntu guest per install type, a tart Mac with both halves; red on the served script | S |
-| **P6e** | macOS supervisor crash capture (P6e-2: built, #P6E2PR); #1538 (P6e-1, never die on a log sink: built) | P6e-1: — (a liveness fix). P6e-2: the FR-43 supervisor's own `macos_supervise_gui_worker` (default off) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143. P6e-2: a tart Mac with both halves, its worker SIGKILLed, red on 0.4.148 | S |
+| **P6e** | macOS supervisor crash capture (P6e-2: built, #2655); #1538 (P6e-1, never die on a log sink: built) | P6e-1: — (a liveness fix). P6e-2: the FR-43 supervisor's own `macos_supervise_gui_worker` (default off) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143. P6e-2: a tart Mac with both halves, its worker SIGKILLed, red on 0.4.148 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard (built #2641; rides 0.4.149 for the wizard, the next tunnel release for the CLI) | — (new artifacts; x86_64's names and tokens unchanged) | an arm64 vmtest guest | S |
