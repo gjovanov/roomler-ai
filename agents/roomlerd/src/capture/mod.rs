@@ -63,6 +63,9 @@ pub mod synthetic_backend;
 /// slot-first (look, and pace only a source that outruns the target).
 pub mod gate;
 
+/// FR-119 P2b-3 — the captured display's refresh rate, per OS.
+pub mod refresh;
+
 /// FR-16 L4 — the frame marker (a 12-bit number and a CRC-4 as luma blocks)
 /// the synthetic source and `roomlerd probe-target` paint and the viewer reads.
 pub mod bench_marker;
@@ -409,6 +412,14 @@ pub trait ScreenCapture: Send {
     /// rate proven on one backend is no evidence for another.
     fn backend(&self) -> &'static str {
         "unknown"
+    }
+
+    /// FR-119 P2b-3 — the captured display's refresh rate in Hz, read once at
+    /// the open (`capture::refresh`). A screen cannot produce frames faster
+    /// than it refreshes, so the grant refuses a rate above it. `None` from
+    /// every backend that cannot read it, which decides nothing.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
     }
 
     /// FR-29 — cumulative frames the backend declined to produce because it

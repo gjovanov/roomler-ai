@@ -528,6 +528,14 @@ pub fn video_info_fields(a: &Answer) -> String {
     }
 }
 
+/// FR-119 P2b-3 — the captured display's refresh rate for `rc:video-info`
+/// (`refresh_hz`), with a leading comma; nothing when it is unknown. The
+/// viewer's picker greys the rates above it.
+pub fn refresh_field(hz: Option<u16>) -> String {
+    hz.map(|hz| format!(r#","refresh_hz":{hz}"#))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,5 +1109,13 @@ mod tests {
             r#","fps":30,"fps_asked":144,"fps_reason":"constrained""#
         );
         assert_eq!(CAP, "fps-high");
+    }
+
+    /// FR-119 P2b-3 — the screen's refresh rate rides beside the answer, and
+    /// an unknown one says nothing.
+    #[test]
+    fn the_refresh_rate_field_is_what_the_viewer_reads() {
+        assert_eq!(refresh_field(Some(120)), r#","refresh_hz":120"#);
+        assert_eq!(refresh_field(None), "");
     }
 }

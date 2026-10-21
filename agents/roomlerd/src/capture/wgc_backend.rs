@@ -148,6 +148,8 @@ pub struct WgcCapture {
     /// FR-119 P2b — the gate the open chose, which a rate moved back to 60 or
     /// below returns to (`set_target_fps`).
     gate_mode: super::gate::GateMode,
+    /// FR-119 P2b-3 — the captured monitor's refresh rate, read at the open.
+    refresh_hz: Option<u16>,
     // DownscalePolicy is accepted in the constructor so the call site
     // signature matches the scrap backend, but WGC runs at native
     // resolution today — the MF HW encoder handles 4K natively so
@@ -267,7 +269,14 @@ impl WgcCapture {
 
         // FR-98 C1 — read once per open (FR-70: never per frame).
         let gate_mode = super::gate::GateMode::from_env();
-        tracing::info!(gate = gate_mode.as_str(), target_fps, "wgc capture gate");
+        // FR-119 P2b-3 — so is the monitor's refresh rate.
+        let refresh_hz = super::refresh::of_monitor(hmon.0 as usize);
+        tracing::info!(
+            gate = gate_mode.as_str(),
+            target_fps,
+            ?refresh_hz,
+            "wgc capture gate"
+        );
         Ok(Self {
             shared,
             width: size.Width.max(0) as u32,
@@ -278,6 +287,7 @@ impl WgcCapture {
             slot_first: (gate_mode == super::gate::GateMode::SlotFirst)
                 .then(|| super::gate::SlotFirst::new(target_fps)),
             gate_mode,
+            refresh_hz,
             _downscale: downscale,
             _worker: worker,
             _shutdown: shutdown,
@@ -406,6 +416,10 @@ impl ScreenCapture for WgcCapture {
 
     fn backend(&self) -> &'static str {
         "wgc"
+    }
+
+    fn refresh_hz(&self) -> Option<u16> {
+        self.refresh_hz
     }
 
     fn monitor_count(&self) -> u8 {
