@@ -33,7 +33,7 @@ it (`encode::stall`, counted per pass), and whether the carrier moved.
 
 ```mermaid
 flowchart TB
-    W["viewer window closes<br/>governor.rs:1010 — constrained transports only"] --> A{"a pump pass overran<br/>its stall budget?"}
+    W["viewer window closes<br/>governor.rs:1022 — constrained transports only"] --> A{"a pump pass overran<br/>its stall budget?"}
     A -- yes --> RA["Reason::AgentStalled"]
     A -- no --> T{"classifier says<br/>transit-stalled?"}
     T -- yes --> RT["Reason::TransitStalled"]
@@ -53,7 +53,7 @@ transit-stalled, stall-shadow, carrier-changed]` (`Rejections`,
 `evidence.rs:154`; printed at `peer.rs:7965`) — one field where T1b, T2 and
 T2b each had their own counter. A direct transport never reaches the gate: it
 has no classifier verdict, and the measured-ceiling clamp does that job there
-(`governor.rs:1054`).
+(`governor.rs:1066`).
 
 ⚠️ The classifier (`encode::pipe_state`, FR-71 T1a) stopped being a shadow the
 day the gate was built on it: `transit_classify` and `transit_hold` were
@@ -62,19 +62,19 @@ is an inert key.
 
 ### What each consumer does with the verdict
 
-All of it is in one function, `RateGovernor`'s window fold (`governor.rs:1010`
+All of it is in one function, `RateGovernor`'s window fold (`governor.rs:1022`
 onward). `valid` is the gate's `None`; `stall_is_ours` is V5's exception, below.
 
 | consumer | on a valid window | on a rejected window | site |
 |---|---|---|---|
-| goodput fold (`GoodputEstimator::observe_window`) | folds the window's blocked sends | samples **dropped**, not quarantined; the next valid window is measured on its own merits | `governor.rs:1102` |
-| FR-35 hard ×0.5 (a send blocked ≥ `HARD_STALL` = 1 s, `ceiling_learn.rs:64`) | `apply_hard_md` | nothing — only the window boundary knows whether the block was the pipe (12:15: 2.9 s and 7.4 s blocked sends inside stalled passes, on a path that carried 6.6 M twenty seconds later) | `governor.rs:1119` |
-| FR-63 opener ramp | doubles on a clean window, ends on congestion | neither — unless `stall_is_ours`, which ENDS it | `governor.rs:1129` |
-| FR-15 age loop | fires on a streak over the learned floor; always learns the floor | learns, does not fire, and the streak resets — unless `stall_is_ours`, which keeps both | `governor.rs:1169` |
-| FR-59 P3 arrival-rate clamp | armed / released by the viewer's report | **neither armed nor released** — whatever it held, it still holds (14:52: the report *for* the stall set 834,800 on a path that had just carried 7.45 M) | `governor.rs:1199` |
-| the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1291` |
-| FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1307`, `:1316` |
-| FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:990`, `:1110`, `:1224` |
+| goodput fold (`GoodputEstimator::observe_window`) | folds the window's blocked sends | samples **dropped**, not quarantined; the next valid window is measured on its own merits | `governor.rs:1114` |
+| FR-35 hard ×0.5 (a send blocked ≥ `HARD_STALL` = 1 s, `ceiling_learn.rs:64`) | `apply_hard_md` | nothing — only the window boundary knows whether the block was the pipe (12:15: 2.9 s and 7.4 s blocked sends inside stalled passes, on a path that carried 6.6 M twenty seconds later) | `governor.rs:1131` |
+| FR-63 opener ramp | doubles on a clean window, ends on congestion | neither — unless `stall_is_ours`, which ENDS it | `governor.rs:1141` |
+| FR-15 age loop | fires on a streak over the learned floor; always learns the floor | learns, does not fire, and the streak resets — unless `stall_is_ours`, which keeps both | `governor.rs:1181` |
+| FR-59 P3 arrival-rate clamp | armed / released by the viewer's report | **neither armed nor released** — whatever it held, it still holds (14:52: the report *for* the stall set 834,800 on a path that had just carried 7.45 M) | `governor.rs:1211` |
+| the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1303` |
+| FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1319`, `:1328` |
+| FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1002`, `:1122`, `:1236` |
 | pair-memory write-back (V2 + V4) | the session's belief, else the opener's measurement | nothing measured ⇒ nothing written | `peer.rs:1594` |
 
 ### V5 — a rejected window is not a measurement, but a stall is still push-back
@@ -97,9 +97,9 @@ downstream of the agent, it is the only push-back there is.
 | half | rule | anchor |
 |---|---|---|
 | which rejection also speaks about the rate | `Reason::is_congestion()` is true **only** for `TransitStalled`. `AgentStalled` would re-create the 12:15 defect, `StallShadow` double-counts one stall, `CarrierChanged` cuts for a path the session has left | `evidence.rs:100` |
-| whose fault the stall is | `stall_is_ours` = congestion **and** `desired > pipe_bps × 1.2`. Above the measured pipe the stall is the rate's doing; at or below it, the transport's (FR-71's finding 4: an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485 bytes queued, where a cut costs quality for an event the sender did not cause); **with nothing measured there is no claim to contradict, so no cut** | `governor.rs:1089` |
-| what it reaches | only the rate-limited ×0.85, the ramp's end, the age streak and the prior's push-back. **Never `apply_hard_md`** — it has no spacing and would halve once per stalled window. Everything that sets a *number* still reads `valid` | `governor.rs:1129`, `:1169`, `:1291`, `:1316` |
-| which estimate | `pipe_bps` (`governor.rs:553`: blocked-send goodput → the viewer's arrival rate while its queue grows, 15 s TTL → the decaying prior), **never** `blocked_send_bps` (`:536`). `0.4.96` shipped on the wrong accessor: the agent's sends block only when the queue is LOCAL, and CORPLAP-3 read `goodput_bps=None` with `goodput_samples=(0, 5)` for a whole relay session — V5 inert on that host. Fixed in **V5a, `agent-v0.4.97`** | `governor.rs:1078`–`1098` |
+| whose fault the stall is | `stall_is_ours` = congestion **and** `desired > pipe_bps × 1.2`. Above the measured pipe the stall is the rate's doing; at or below it, the transport's (FR-71's finding 4: an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485 bytes queued, where a cut costs quality for an event the sender did not cause); **with nothing measured there is no claim to contradict, so no cut** | `governor.rs:1101` |
+| what it reaches | only the rate-limited ×0.85, the ramp's end, the age streak and the prior's push-back. **Never `apply_hard_md`** — it has no spacing and would halve once per stalled window. Everything that sets a *number* still reads `valid` | `governor.rs:1141`, `:1181`, `:1303`, `:1328` |
+| which estimate | `pipe_bps` (`governor.rs:565`: blocked-send goodput → the viewer's arrival rate while its queue grows, 15 s TTL → the decaying prior), **never** `blocked_send_bps` (`:548`). `0.4.96` shipped on the wrong accessor: the agent's sends block only when the queue is LOCAL, and CORPLAP-3 read `goodput_bps=None` with `goodput_samples=(0, 5)` for a whole relay session — V5 inert on that host. Fixed in **V5a, `agent-v0.4.97`** | `governor.rs:1090`–`1098` |
 
 ⚠️ The control that must stay green is
 `finding_4_keeps_the_rate_with_the_validity_gate`. Its field twin is every
@@ -176,8 +176,8 @@ evidence the old `min(goodput, link_rx)` averaged together:
 
 | evidence | meaning | source | accessor |
 |---|---|---|---|
-| a **delivery** | *"the path carried at least X"* — a lower bound, available every window on every carrier | the viewer's arrival rate (`governor.rs:990`) | `floor_bps` — a MAX for the session, lowered only by contrary evidence, never by time |
-| a **push-back** | *"the path refused above X"* — a limit | an accepted goodput fold (`governor.rs:1110`), or the arrival rate while the viewer's queue grows (`:1224`) | `capacity_bps` (`pipe.rs:216`), 60 s TTL |
+| a **delivery** | *"the path carried at least X"* — a lower bound, available every window on every carrier | the viewer's arrival rate (`governor.rs:1002`) | `floor_bps` — a MAX for the session, lowered only by contrary evidence, never by time |
+| a **push-back** | *"the path refused above X"* — a limit | an accepted goodput fold (`governor.rs:1122`), or the arrival rate while the viewer's queue grows (`:1236`) | `capacity_bps` (`pipe.rs:216`), 60 s TTL |
 | the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:242`) |
 
 ⚠️ **It is a shadow.** The heartbeat prints `pipe_belief=(anchor, floor,
@@ -300,9 +300,9 @@ show the products: 34.56 M for AV1 at 1920×1200 @ 60, 43.2 M for HEVC and
 target**: the encoders run constant quality under `maxrate`, so a settled
 desktop spends almost nothing and only motion approaches the bound.
 
-`policy::rate_plan` (`encode/policy.rs:220`) finishes the chain: × the dial
+`policy::rate_plan` (`encode/policy.rs:236`) finishes the chain: × the dial
 (`dial_rate_factor_pct` — 70 / 85 / 100, clamped to [30, 100]) × the
-encode-pressure factor (`governor.encode_factor()`, `governor.rs:1469`),
+encode-pressure factor (`governor.encode_factor()`, `governor.rs:1481`),
 floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:231`). On a direct
 transport `effective_ceiling` is the plan's value unchanged (`governor.rs:503`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
@@ -342,7 +342,7 @@ flowchart TB
     subgraph ceiling["the ceiling — a bound, never an operating point"]
         G["w × h × fps × 0.25 bpp/s<br/>(0.07 on a constrained path)"] --> C["clamp [3, 48] M × codec/chroma factor<br/>rate_profile.rs:193"]
         C --> D["× dial 70 / 85 / 100 %"]
-        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:220"]
+        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:236"]
         E --> S["÷ followers (shared split)"]
         S --> CEIL["ceiling_bps<br/>= the AIMD's ceiling = the gate's reference"]
     end
