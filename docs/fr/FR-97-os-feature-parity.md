@@ -244,7 +244,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices and the mesh since P2g | 🟡 Devices and the mesh from the root half since P2g; the Connection column and Overview's count still the user half's (P2h) | Person socket (`crates/localapi/src/lib.rs:2759`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:138`) | #1911; FR-43 P3; P2g, P2h |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices and the mesh since P2g | 🟡 Devices and the mesh from the root half since P2g; the Connection column and Overview's network fields (count, overlay address, MagicDNS, exit) still the user half's (P2h) | Person socket (`crates/localapi/src/lib.rs:2759`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:138`) | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
@@ -647,11 +647,17 @@ test of the SIGKILL property itself.
     (`agents/roomlerd/src/person_socket.rs:113`). It shows the root half's answer only when that is `ok` (`:121`),
     and keeps its own on any other answer, a timeout (5 s) or no socket (`:138`).
   Kill switch: `ROOMLERD_PERSON_SOCKET=0` on the root half, which gives the pre-P2g page.
-- **P2h, the rest of that page on a two-half Mac.** Its Connection column and Overview's online count come from the
-  local `Peers` poll, a synchronous read of the half's own overlay (`LocalApiState::peers`), so after P2g a Mac
-  shows `—` there and the dot falls back to the server's presence. Serving them from the root half means an async
-  `peers` or a mirrored copy, plus a person-scoped `Peers` without the probe and carrier detail. That is a design
-  change to the trait, so it is a phase of its own.
+- **P2h, the rest of the network view on a two-half Mac.** The companion's other network fields come from the
+  per-user half's own synchronous reads (`LocalApiState::peers` and `status`), so after P2g a Mac still shows:
+  - `—` in the Devices page's Connection column, with the dot falling back to the server's presence;
+  - `—` for Overview's online count;
+  - "(no overlay IP)" on Overview, with no MagicDNS line and no exit status, while the machine holds an overlay
+    address.
+
+  The shape it should take is one async hook at the dispatch of `Peers` and `Status`, defaulting to today's sync
+  reads, so the tests' fakes are untouched. The daemon overrides it with P2g's rule: the root half's answer, when
+  the per-user half has no node. Two more pieces: `person_may` admits a `Peers` without the probe, carrier and relay
+  endpoints, and the root half's `Status` lends only its network fields. It is a phase of its own.
 - **Open, found by AC3's macOS session (§8): Local Network privacy.** macOS 15 asked "Allow 'roomlerd' to find devices
   on local networks?" over the per-user agent, in Apple's generic words: the bundle has no
   `NSLocalNetworkUsageDescription`. On an unattended Mac nobody answers it. A LaunchDaemon run as root is exempt, so
@@ -1111,7 +1117,7 @@ model on Windows, so the three agree on what the mode means.
 | **P2e** | macOS clipboard images + RTF | `ROOMLERD_CLIPBOARD_NATIVE=0` | a field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P2g** | The companion's Devices page and mesh on a two-half Mac come from the root half, over a person socket it serves the console user; a Linux system install's person socket serves the same two verbs (D2) | `ROOMLERD_PERSON_SOCKET=0` | a tart Mac with both halves, red on 0.4.149; the operator's MacBook | S |
-| **P2h** | The Connection column and Overview's count on a two-half Mac, from the root half (not built) | — | a tart Mac with both halves | S–M |
+| **P2h** | The rest of the network view on a two-half Mac from the root half: the Connection column, Overview's count, its overlay address, MagicDNS line and exit status (not built) | — | a tart Mac with both halves | S–M |
 | **P3a** | Linux cursor shape: X11 from XFixes (merged #2555); PipeWire's cursor metadata for the portal and mutter arms stays open | `ROOMLERD_X11_CURSOR=0` | a vmtest Ubuntu cell on Xorg, a per-user install, red on 0.4.145 | S → M |
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |

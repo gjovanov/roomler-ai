@@ -286,10 +286,14 @@ sequenceDiagram
   (`localapi::connect_unix_served_by_root`).
 - **"This device" is the root half's row.** The per-user half's own row has no node, so the
   machine's netmap does not carry it, and it is not in the list.
-- **Still the per-user half's: the Connection column and Overview's online count.** They come
-  from the local `Peers` poll, a synchronous read of the half's own overlay, which that half
-  does not run, so a Mac shows `—` there and the dot falls back to the server's presence
-  (FR-97 P2h).
+- **Still the per-user half's: the Connection column and the Overview page's network
+  fields.** They come from the half's own synchronous `Peers` and `Status`, and that half runs
+  no overlay. So on a Mac:
+  - the Connection column shows `—`, and the dot falls back to the server's presence;
+  - Overview shows no online count and "(no overlay IP)", with no MagicDNS or exit line,
+    though the machine holds an address.
+
+  Serving them from the root half too is FR-97 P2h.
 - The root half's person socket, its directory and the uid check: §12 and the
   [security baseline](security-baseline.md) §4.
 
