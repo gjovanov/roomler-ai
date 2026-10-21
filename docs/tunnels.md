@@ -909,6 +909,11 @@ sequenceDiagram
   is the operator's decision 20 (FR-90 §6), built in P3-7-2b. Until then a
   session's flow passes its grant and every policy refuses it, so no policy
   written before P3-7 opens anything to a session.
+- ⚠️ **The grant's end refuses new flows; it does not cut open ones.** A flow
+  admitted before the end runs until either side closes it. Ending it with
+  the grant is the device's job: its listener goes at the grant's end and its
+  flows with it, both halves (#2129, P3-7-3). The grant's life is at most
+  900 s.
 - ⚠️ **An older server ignores the grant** (an unknown field) and opens the
   tunnel as the device's own. `net_grant_id` on `rc:tunnel.opened` is the
   device's proof that its grant was bound: a device that presented one carries
