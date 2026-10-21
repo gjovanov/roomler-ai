@@ -166,6 +166,29 @@ pub fn chroma_rate_factor_pct(codec_label: &str, chroma444: bool) -> usize {
     }
 }
 
+/// FR-119 P2a — the rate law's exponent above 60 fps. Bits per second grow as
+/// `(fps / 60)^α`, not linearly: frames closer together differ less.
+///
+/// Measured offline (2026-10-21; NVENC on scrolling text at a fixed px/s, at
+/// constant quality, 60 / 120 / 144 fps): α ran from ~0 to 0.8 by codec and
+/// content, with HEVC on whole-pixel text motion at the top (0.77–0.80). 0.8 is
+/// that upper envelope, so a ceiling above 60 never starves the motion it
+/// exists for. P3's field cells refine it (FR-119 open decision 2). FR-112's
+/// RTP bitrate base uses 0.5 (`bitrate_base_for_fps`); this law serves text
+/// scrolls, the top of the range.
+pub(crate) const HIGH_FPS_ALPHA: f64 = 0.8;
+
+/// FR-119 P2a — the frame rate a ceiling is computed at: `fps` itself up to 60
+/// (today's linear law, so every ceiling at or below 60 is byte-identical), and
+/// above it the 60 fps rate scaled by `(fps / 60)^α`.
+pub(crate) fn rate_law_fps(fps: u32) -> f64 {
+    if fps <= 60 {
+        fps as f64
+    } else {
+        60.0 * (fps as f64 / 60.0).powf(HIGH_FPS_ALPHA)
+    }
+}
+
 /// P3 — codec-factor-aware ceiling. `factor_pct` scales the bpp-derived rate
 /// AND the [3, 12] Mbps band proportionally (H.264 needs ~1.5× the bits of
 /// HEVC/AV1 for the same screen-content text sharpness — field 2026-07-26:
@@ -190,6 +213,9 @@ pub fn chroma_rate_factor_pct(codec_label: &str, chroma444: bool) -> usize {
 /// 0.07 / [3, 12] band (it is min'd with `relay_max_bps` anyway); relay paths
 /// are unchanged byte for byte. `FFMPEG_MAXRATE_KBPS` stays the operator's
 /// override in both directions.
+///
+/// FR-119 P2a — above 60 fps the rate follows [`rate_law_fps`], and the band's
+/// top grows with it; at or below 60 every value is byte-identical.
 pub(crate) fn ffmpeg_maxrate_bps_scaled(
     width: u32,
     height: u32,
@@ -212,7 +238,15 @@ pub(crate) fn ffmpeg_maxrate_bps_scaled(
     } else {
         (DIRECT_BPP_PER_SECOND, 48_000_000_usize)
     };
-    let raw = (width as f64 * height as f64 * fps as f64 * bpp) as usize;
+    // FR-119 P2a — above 60 fps the band's top grows with the rate law, so a
+    // 120 fps stream does not hit the 60 fps class's top and run softer per
+    // frame than 60 would.
+    let band_top = if fps > 60 {
+        (band_top as f64 * rate_law_fps(fps) / 60.0) as usize
+    } else {
+        band_top
+    };
+    let raw = (width as f64 * height as f64 * rate_law_fps(fps) * bpp) as usize;
     let raw = raw.saturating_mul(factor_pct) / 100;
     let clamped = raw.clamp(
         3_000_000_usize.saturating_mul(factor_pct) / 100,
@@ -1638,6 +1672,82 @@ mod tests {
             ffmpeg_maxrate_bps_scaled(1920, 1200, 30, true, 125),
             6_048_000.min(relay)
         );
+    }
+
+    /// FR-119 P2a — at or below 60 fps the law is today's, byte for byte: the
+    /// old formula, inlined here, against the new one across geometries,
+    /// rates, transports and codec factors.
+    #[test]
+    fn the_rate_law_is_byte_identical_at_and_below_60() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let relay = crate::encode::relay_max_bps() as usize;
+        let old = |w: u32, h: u32, fps: u32, constrained: bool, factor: usize| -> usize {
+            let (bpp, top) = if constrained {
+                (0.07, 12_000_000_usize)
+            } else {
+                (0.25, 48_000_000_usize)
+            };
+            let raw = (w as f64 * h as f64 * fps as f64 * bpp) as usize;
+            let raw = raw.saturating_mul(factor) / 100;
+            let clamped = raw.clamp(
+                3_000_000_usize.saturating_mul(factor) / 100,
+                top.saturating_mul(factor) / 100,
+            );
+            if constrained {
+                clamped.min(relay)
+            } else {
+                clamped
+            }
+        };
+        for (w, h) in [
+            (640, 400),
+            (1280, 800),
+            (1920, 1080),
+            (1920, 1200),
+            (2560, 1600),
+            (2880, 1800),
+            (3840, 2160),
+        ] {
+            for fps in [1, 15, 24, 30, 45, 59, 60] {
+                for constrained in [false, true] {
+                    for factor in [100, 125, 150] {
+                        assert_eq!(
+                            ffmpeg_maxrate_bps_scaled(w, h, fps, constrained, factor),
+                            old(w, h, fps, constrained, factor),
+                            "{w}x{h}@{fps} constrained={constrained} factor={factor}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// FR-119 P2a — above 60 the rate and the band's top follow (fps/60)^0.8.
+    #[test]
+    fn above_60_the_rate_law_follows_alpha() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(rate_law_fps(60), 60.0);
+        let r120 = rate_law_fps(120) / 60.0; // 2^0.8
+        assert!((r120 - 1.7411).abs() < 1e-3, "{r120}");
+        let r144 = rate_law_fps(144) / 60.0; // 2.4^0.8
+        assert!((r144 - 2.0145).abs() < 1e-3, "{r144}");
+        // 1920×1080 at 144: 31.1 M × 2.0145 = 62.7 M, under the class's top
+        // (48 M × 2.0145 = 96.7 M). Today's law clamped it to 48 M.
+        let hd144 = ffmpeg_maxrate_bps_scaled(1920, 1080, 144, false, 100);
+        assert!((62_000_000..63_500_000).contains(&hd144), "{hd144}");
+        // 4K at 144 reaches the class's top, ~96.7 M, where today's gave 48 M.
+        let uhd144 = ffmpeg_maxrate_bps_scaled(3840, 2160, 144, false, 100);
+        assert!((96_000_000..97_500_000).contains(&uhd144), "{uhd144}");
+        // Per frame, 120 fps gets less than 60 (frames closer together need
+        // less), 2^0.8 / 2 = 0.87 of it, not the 0.5 a fixed band gives.
+        let per_frame =
+            |fps: u32| ffmpeg_maxrate_bps_scaled(1920, 1080, fps, false, 100) as f64 / fps as f64;
+        let ratio = per_frame(120) / per_frame(60);
+        assert!((0.86..0.88).contains(&ratio), "{ratio}");
     }
 
     fn gate() -> SettleKeyframeGate {

@@ -726,11 +726,11 @@ path** (FR-70's rule) and the producer takes the arithmetic through explicit
 forms that the per-frame readers are now defined as:
 `rate_profile::{constrained_queue_budget_bytes_at,
 direct_queue_budget_bytes_at, direct_queue_hard_budget_bytes_at, hrd_pct_for}`
-(`rate_profile.rs:371,540,564,578`), `encode::priority_relay_cap_for` over
+(`rate_profile.rs:405,540,564,578`), `encode::priority_relay_cap_for` over
 `PriorityCaps` (`encode/mod.rs:1018,1036`), and
 `Pipeline::merged_priority_cap_by` (`media_share.rs:340`). Each reader is its
 explicit form applied, and a test locks each pair
-(`the_budget_readers_equal_their_explicit_window_forms` `rate_profile.rs:1181`,
+(`the_budget_readers_equal_their_explicit_window_forms` `rate_profile.rs:1215`,
 `priority_relay_cap_for_is_priority_relay_cap_over_explicit_caps`
 `encode/mod.rs:1962`, `the_knobs_resolve_to_what_the_per_frame_readers_read`).
 
@@ -1102,7 +1102,7 @@ sequenceDiagram
   ceiling, and the old ceiling sits under the new one. Only a move down, whose
   applied rate exceeds the new ceiling, opens lower: at the rung the controller's
   first tick would apply anyway. `rebuild_spec_at_dims` coarsens the rate the
-  same way `set_bitrate` does (`encoder.rs:2273`, `:2403`), so that tick finds
+  same way `set_bitrate` does (`encoder.rs:2293`, `:2423`), so that tick finds
   the encoder already on its rung and does nothing.
 - **No kill switch, on purpose.** The change moves one transient to the rate the
   next tick applies anyway; it removes an open and adds no state. Its alarm is

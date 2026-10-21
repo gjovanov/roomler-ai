@@ -60,7 +60,7 @@ therefore **increased**.
    **The loop makes the latency worse.**
 
 4. **The queue budget is denominated in the nominal ceiling.**
-   `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:326`, called once at
+   `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:360`, called once at
    `peer.rs:4780`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
    budget is **3.4 seconds** of standing queue. The gate never fired.
 

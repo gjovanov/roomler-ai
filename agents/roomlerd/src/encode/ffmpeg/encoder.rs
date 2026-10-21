@@ -80,10 +80,28 @@ static VP9_QSV_IDR_VERDICT: OnceLock<(bool, bool)> = OnceLock::new();
 /// at 60, so `set_frame_rate` + the maxrate math were computed for 30 fps).
 const DEFAULT_ENCODER_FPS: i32 = 30;
 
-/// Time-base denominator. We use 1000 (millisecond resolution) so that
-/// `monotonic_us` from `Frame` can be converted to pts via integer
-/// division without precision loss at typical capture rates.
-const TIME_BASE_DEN: i32 = 1000;
+/// Time-base denominator: microseconds, the unit of `Frame::monotonic_us`, so
+/// a frame's pts IS its capture time ([`live_pts`]).
+///
+/// FR-119 P2a — it was 1000 (milliseconds), and a frame's pts was its capture
+/// time divided by 1000. At 144 fps a period is 6.9 ms, and two frames
+/// delivered within the same millisecond (a burst after a stall, the
+/// latest-wins slot handing over back to back) got EQUAL pts, which an encoder
+/// may reject or misorder. Every FFmpeg backend either rescales pts from the
+/// codec time base itself (QSV to 90 kHz, AMF and VideoToolbox to their own
+/// clocks) or carries it through untouched (NVENC, VAAPI). None assumes
+/// milliseconds, so the unit is ours to choose.
+const TIME_BASE_DEN: i32 = 1_000_000;
+
+/// FR-119 P2a — a live frame's pts: its capture time, in the time base.
+fn live_pts(monotonic_us: u64) -> i64 {
+    monotonic_us as i64
+}
+
+/// FR-119 P2a — encoder ticks (the time base) to microseconds.
+fn ticks_to_us(ticks: i64) -> u64 {
+    (ticks.max(0) as u64) * 1_000_000 / TIME_BASE_DEN as u64
+}
 
 /// Codec dispatch order for HEVC. First successful `find_by_name +
 /// open_as` wins. Matches RustDesk's order (NVIDIA → Intel → AMD), with
@@ -713,10 +731,12 @@ pub(crate) fn recording_maxrate_bps(name: &str, width: u32, height: u32, fps: u3
     (px_per_s * bpp_milli / 1000).clamp(lo, hi) as usize
 }
 
-/// FR-85 P1b — the millisecond PTS of frame `n` at `fps`. Strictly
-/// increasing for any fps ≤ 1000, which is what a counter-timed encoder needs.
-fn recording_pts_ms(n: u64, fps: i32) -> i64 {
-    (n * 1000 / u64::from(fps.max(1) as u32)) as i64
+/// FR-85 P1b — the PTS of frame `n` at `fps`, in the time base. Strictly
+/// increasing for any fps up to the time base's resolution (a million),
+/// which is what a counter-timed encoder needs. FR-119 P2a moved it from
+/// milliseconds to the microsecond time base with the live pts.
+fn recording_pts(n: u64, fps: i32) -> i64 {
+    (n * TIME_BASE_DEN as u64 / u64::from(fps.max(1) as u32)) as i64
 }
 
 /// FR-62 A1 — how `set_bitrate` applies a rate move on a given backend.
@@ -1691,8 +1711,8 @@ impl FfmpegEncoder {
                 maxrate_bps
             };
             enc.set_bit_rate(target_bps);
-            // Time base: 1/1000 (ms resolution). Pts is set per-frame from
-            // monotonic_us / 1000.
+            // Time base: 1/1_000_000 (µs). Pts is set per frame from
+            // `monotonic_us` itself (`live_pts`), FR-119 P2a.
             enc.set_time_base((1, TIME_BASE_DEN));
             enc.set_frame_rate(Some((fps, 1)));
             // rc.219 — vp9_qsv defaults to the short natural-key GOP
@@ -2039,9 +2059,9 @@ impl FfmpegEncoder {
         // must not repeat a timestamp. Every live encoder keeps the capture
         // clock, exactly as before.
         let pts = if self.counter_pts {
-            recording_pts_ms(self.frame_count, self.fps)
+            recording_pts(self.frame_count, self.fps)
         } else {
-            (monotonic_us / 1000) as i64
+            live_pts(monotonic_us)
         };
         av.set_pts(Some(pts));
 
@@ -2113,7 +2133,7 @@ impl FfmpegEncoder {
                         self.idr_count += 1;
                     }
                     // duration is in time_base units (1/1000 == ms); convert to us.
-                    let duration_us = (packet.duration().max(0) as u64) * 1000;
+                    let duration_us = ticks_to_us(packet.duration());
                     // P8 Phase 5 — NVENC/QSV report the frame's average
                     // QP via quality-stats side data; absent = None.
                     let qp = packet
@@ -2714,16 +2734,49 @@ mod tests {
 
     #[test]
     fn a_recording_encoder_never_repeats_a_timestamp() {
-        for fps in [1, 15, 24, 25, 30, 50, 60] {
-            let pts: Vec<i64> = (0..10_000u64).map(|n| recording_pts_ms(n, fps)).collect();
+        for fps in [1, 15, 24, 25, 30, 50, 60, 120, 144, 240] {
+            let pts: Vec<i64> = (0..10_000u64).map(|n| recording_pts(n, fps)).collect();
             assert!(pts.windows(2).all(|w| w[1] > w[0]), "{fps} fps");
+            // One second of frames is one second of time base.
             assert_eq!(
-                recording_pts_ms(u64::from(fps as u32), fps),
-                1000,
+                recording_pts(u64::from(fps as u32), fps),
+                i64::from(TIME_BASE_DEN),
                 "{fps} fps"
             );
         }
-        assert_eq!(recording_pts_ms(7, 0), 7000, "fps 0 is treated as 1");
+        assert_eq!(
+            recording_pts(7, 0),
+            7 * i64::from(TIME_BASE_DEN),
+            "fps 0 is treated as 1"
+        );
+    }
+
+    // ── FR-119 P2a — microsecond pts ────────────────────────────────────
+
+    /// Two live frames delivered within the same millisecond (a burst after a
+    /// stall, or the latest-wins slot handing over back to back) get distinct
+    /// pts. Under the millisecond time base both became `monotonic_us / 1000`,
+    /// the same number, and at 144 fps (a 6.9 ms period) such pairs are
+    /// ordinary.
+    #[test]
+    fn two_frames_in_one_millisecond_get_distinct_pts() {
+        let first = 10_000_200u64;
+        let second = first + 500; // 0.5 ms later
+        assert_ne!(live_pts(first), live_pts(second));
+        assert!(live_pts(second) > live_pts(first));
+        // At 144 fps, every frame of a steady second strictly increases.
+        let period_us = 1_000_000 / 144;
+        let pts: Vec<i64> = (0..144u64).map(|n| live_pts(n * period_us)).collect();
+        assert!(pts.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    /// The pts IS the capture time, so a duration in ticks is microseconds.
+    #[test]
+    fn ticks_are_microseconds() {
+        assert_eq!(ticks_to_us(6_944), 6_944);
+        assert_eq!(ticks_to_us(16_667), 16_667);
+        assert_eq!(ticks_to_us(-5), 0, "a negative duration is none");
+        assert_eq!(TIME_BASE_DEN, 1_000_000);
     }
 
     #[test]

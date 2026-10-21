@@ -290,7 +290,7 @@ paths untouched byte for byte, and **no new switch** — the operator's override
 ### P1 (0.4.77) — the ceiling is a content-generous bound
 
 `rate_profile::ffmpeg_maxrate_bps_scaled`
-(`agents/roomlerd/src/encode/rate_profile.rs:193`) uses **0.25 bpp/s on a
+(`agents/roomlerd/src/encode/rate_profile.rs:219`) uses **0.25 bpp/s on a
 direct path** (0.07 on a constrained one, min'd with the relay clamp as
 before), clamped to **[3, 48] Mbps × the codec/chroma factor**
 (`codec_rate_factor_pct`, `:129` — AV1 100, HEVC and VP9 125, H.264 150;
@@ -330,17 +330,17 @@ meant to bound.
 
 | piece | rule | anchor |
 |---|---|---|
-| soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:525` (`direct_queue_budget_bytes`) |
-| hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:544` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
+| soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:559` (`direct_queue_budget_bytes`) |
+| hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:578` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
 | measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6308`–`6261`; set and cleared by the send task at `:5653`, `:5721` |
-| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:563` (`direct_gate_trips`), called at `peer.rs:6348` |
+| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6348` |
 | on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6363`, `:6306` |
 | relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6277`–`6190` |
 
 ```mermaid
 flowchart TB
     subgraph ceiling["the ceiling — a bound, never an operating point"]
-        G["w × h × fps × 0.25 bpp/s<br/>(0.07 on a constrained path)"] --> C["clamp [3, 48] M × codec/chroma factor<br/>rate_profile.rs:193"]
+        G["w × h × fps × 0.25 bpp/s<br/>(0.07 on a constrained path)"] --> C["clamp [3, 48] M × codec/chroma factor<br/>rate_profile.rs:219"]
         C --> D["× dial 70 / 85 / 100 %"]
         D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:236"]
         E --> S["÷ followers (shared split)"]

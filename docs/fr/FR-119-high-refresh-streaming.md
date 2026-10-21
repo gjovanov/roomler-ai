@@ -25,9 +25,9 @@ latency side; this FR is the cadence side.
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
 | The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9523`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
 | The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:9940` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
-| pts are whole milliseconds | `TIME_BASE_DEN = 1000` `encode/ffmpeg/encoder.rs:86`; `pts = monotonic_us / 1000` `:2044` | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carry equal pts |
-| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1697`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2262`, `:2278`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps |
-| The direct ceiling law is linear in fps and clamped at 48 Mbps | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:193`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor | 1920×1080 at 144 fps computes 74.6 M and clamps to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit. Above 60 the picture gets softer per frame |
+| pts were whole milliseconds (**fixed in P2a**, §4.2) | master `7a3dd06a6` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
+| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1717`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2282`, `:2298`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps |
+| The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
 | The default capture gate's period is whole milliseconds; the microsecond gate is opt-in | `capture/gate.rs` (the legacy rule caps `1000/144` at 166 fps and can phase-lock); the slot-first gate keeps µs (`:78`) behind `ROOMLERD_CAPTURE_GATE`, field A/B owed (FR-98 P1) | Above 60, the slot-first gate should be the one in use |
 | WGC and `CGDisplayStream` deliver at the panel's refresh | WGC is compositor-driven; scrap's quartz stream is unthrottled (`throttle: 0.0`, `crates/vendored/scrap/src/quartz/config.rs:69`) | A 60 Hz panel cannot produce 120 fps. A 120 Hz MacBook already can |
 | The viewer's struggle rule counts frames | `DEFAULT_MAX_DECODE_QUEUE = 4` (`ui/src/workers/rc-hop-stats.ts:253`), `DEFAULT_STRUGGLE_QUEUE = 2` (`:256`) | At 144 fps, two frames of queue is 14 ms, where at 60 it is 33 ms: the rule tightens by itself |
@@ -91,7 +91,8 @@ and as with encoder cells, the probe proves an open and only a session proves th
 ### 3.4 The encoder and the rate law
 
 - **pts in microseconds:** `TIME_BASE_DEN = 1_000_000`, `pts = monotonic_us`. The recorder keeps its own
-  counter clock (`recording_pts_ms`, `encoder.rs:718`), which already never repeats.
+  counter clock (`recording_pts`, `encoder.rs:738`), which already never repeats; P2a moved it to the
+  microsecond base with the live pts.
 - **An fps change is a make-before-break swap.** `rebuild_spec_at_fps` next to `rebuild_spec_at_dims`; the plan
   names the fps (FR-70 M3a's `Plan.fps`), and a swap is adopted between frames like a dims swap. The live encoder
   keeps serving at the old rate until the replacement is ready.
@@ -132,9 +133,9 @@ sequenceDiagram
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); (a), (b), (d) owed |
+| P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH` (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is not reported yet |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | — |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b owed**: the grant, the rate class and its trial, `fps_deny`, the fps swap, the slot-first gate above 60 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | — |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -183,6 +184,46 @@ That is ~2.7× D2's ~100 Mbit/s on that CPU. A weaker host and a real round trip
 
   A–C were run together: 5 failed / 2 passed.
 
+### 4.2 P2a — microsecond pts and the rate law above 60, as built (2026-10-21)
+
+These are the encoder-side half of P2, the half that changes nothing at or below 60. P2b builds the grant (the
+rate class and its trial, `fps_deny`, the fps swap, the slot-first gate above 60). Until then, only an
+operator's `ROOMLERD_FFMPEG_FPS` reaches anything here.
+
+| Piece | What changed | Where |
+|---|---|---|
+| The time base | `TIME_BASE_DEN` 1000 → 1 000 000; a live frame's pts is its capture time (`live_pts`) | `agents/roomlerd/src/encode/ffmpeg/encoder.rs` |
+| The recorder's counter pts | `recording_pts_ms` → `recording_pts`, in the same base | the same |
+| Packet durations | `ticks_to_us`, where `* 1000` assumed milliseconds. No consumer reads `duration_us` from this encoder today; it is kept right anyway | the same |
+| The rate law | `rate_law_fps`: fps itself up to 60, `60 × (fps / 60)^0.8` above; the band's top grows the same way (`HIGH_FPS_ALPHA`) | `agents/roomlerd/src/encode/rate_profile.rs` |
+
+- **Why the pts change is safe on every backend.** Each FFmpeg backend either rescales pts from the codec time
+  base itself (QSV to 90 kHz, AMF and VideoToolbox to their own clocks) or carries it through untouched
+  (NVENC, VAAPI). None assumes milliseconds. The recorder's MP4 writer keeps its own 90 kHz clock and never
+  reads the encoder's pts. Still, a probe proves an open and only a session proves a cell, so P3's field cells
+  include one session per backend at 60 before anything above 60 is granted.
+- **α = 0.8** is the upper envelope of P0(d)'s offline read (§8): α ran from ~0 to 0.8 by codec and content.
+  That puts 1080p144 at 62.7 M where today's law clamped it to 48 M, and 4K144 at the class top, 96.7 M, where
+  today's law gave 48 M. Per frame, 120 fps gets 0.87 of what 60 does, not the 0.5 a fixed band gives. Open
+  decision 2 refines it on P3's field cells.
+- **Tests:**
+  - two frames 0.5 ms apart get distinct pts;
+  - a steady second at 144 fps strictly increases;
+  - ticks are microseconds;
+  - the recorder's pts strictly increase up to 240 fps;
+  - the law is byte-identical to the old formula at and below 60 (7 geometries × 7 rates × both transports × 3
+    codec factors);
+  - above 60 the rate and the top follow α.
+- **Negative controls, each failing exactly its target:**
+
+  | Control | Failed |
+  |---|---|
+  | live pts back to milliseconds, master's rule | the pts test, with `left: 10000, right: 10000`: the collision itself |
+  | the law linear above 60 | the α test |
+  | α applied below 60 | the byte-identity test, `left: 3050564, right: 3000000` |
+
+This is AC1's pts half: red on master's rule, green here.
+
 ## 5. Acceptance criteria
 
 - [ ] **AC1 — P0 measured.** The pts test is red on master and green after P2. L0's 120 and 144 cells hold their
@@ -226,6 +267,7 @@ That is ~2.7× D2's ~100 Mbit/s on that CPU. A weaker host and a real round trip
 |---|---|---|---|
 | 2026-10-21 | fleet, agents 0.4.135–0.4.148 | every FFmpeg DC session for 7 days (FR-118 §2.2) | **The red record for the encode stage.** Only `hevc_videotoolbox` (6.3 ms at 3024×1964) fits a 120 fps period on today's CPU path; QSV and NVENC need 9.9–16.4 ms per 1080p–1600p frame. No session ran above 60, because nothing lets one |
 | 2026-10-21 | dev build, release profile, neo16 (a Ryzen 9 7945HX laptop, Windows 11) | P0(c): the data channel alone, in process over loopback UDP (`agents/roomlerd/tests/dc_throughput.rs`): 16 KiB messages awaited back to back, as the production send task sends them; 5 s × 3 rounds per mode | **The transport is not D1's limiter.** Ordered: 375.9 / 278.8 / 275.7 Mbit/s. Unordered: 281.0 / 287.1 / 271.6. Every byte was delivered. That is ~2.7× D2's ~100 Mbit/s on this CPU. Still owed before open decision 3 closes: a weaker host's CPU and a real round trip, because this is an upper bound for a LAN path |
+| 2026-10-21 | ffmpeg (a winget build) with NVENC on neo16 (RTX 5090), offline | P0(d): α. The same content at 60, 120 and 144 fps: code-like text scrolling at a fixed **px/s** (each frame's y is `40 − t·speed`). HEVC at `cq 28`, AV1 at `cq 34`, `-b:v 0`; preset p4, tune ll, no B-frames, no periodic keyframes. 10 s per clip, bits counted after the first IDR | **α ≈ 0 to 0.8 by codec and content.** HEVC on text moving a whole number of pixels per frame (720 px/s: 12 / 6 / 5 px): 471 / 805 / 950 kbit/s, so α = 0.77 (120 vs 60) and 0.80 (144 vs 60). HEVC at 200 px/s: 0.73. HEVC at 800 px/s: −0.12. HEVC static: 0.23. AV1: 0.02–0.32. **Wrong turn:** every 144 fps clip with fractional per-frame motion came out 31–34 Mbit/s, about 20× its neighbours. `drawtext` renders each frame at a different sub-pixel glyph phase (18 at 200 px/s), which defeats motion compensation. Whole-pixel steps behave. That is a caveat for real smooth-scrolled text too, for P3. P2a uses 0.8, the upper envelope. Posted on #2670 |
 
 ## 9. Related
 
