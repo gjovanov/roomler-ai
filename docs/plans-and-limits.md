@@ -2,8 +2,8 @@
 
 **Status:** shipped in [FR-115](fr/FR-115-pricing-reshape.md) (#2557): the ladder and per-seat
 billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b since
-2026-10-21), and the meeting cap (P5). The relay allowance (P4) is built for DERP and switched
-off; its TURN half is not built yet. Claims were checked against the code at `8ab970586`.
+2026-10-21), and the meeting cap (P5). The relay allowance on DERP (P4a) has been on since
+2026-10-21; its TURN half is not built yet. Claims were checked against the code at `8ab970586`.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
 This page is the engineering view: where the numbers live, the one place they are compared,
@@ -154,6 +154,7 @@ Each fence now has an integration test on a server without `saas`.
 |---|---|
 | `ROOMLER__RC__ORG_SESSION_CAP=false` | the concurrent-session cap |
 | `ROOMLER__RC__SESSION_SLOTS=false` | P3b's cluster-wide count: back to P3's count on the device's hub, and external (FR-52) sessions uncapped. On in production; it takes effect on a rollout restart, since the ConfigMap carries no content hash |
+| `ROOMLER__RELAY_ALLOWANCE__ENABLED=false` | the relay allowance on DERP (P4a): no over-allowance set is published, and the API pods and every PoP drop the one they hold within a period. On in production since 2026-10-21; like the line above, it takes effect on a rollout restart |
 | `ROOMLER__MEETINGS__FREE_CAP=false` | the meeting-length cap |
 | `ROOMLER__STRIPE__SEAT_SYNC=false` | the quantity reconcile (the quantity is then set at checkout only) |
 | an org's `settings.plan_enforcement = off` | every **staged** limit for that org (never an established one) |
@@ -163,6 +164,6 @@ Each fence now has an integration test on a server without `saas`.
 
 - **The relay allowance on TURN (P4c):** TURN bytes past the plan's allowance are throttled,
   never refused (a host behind symmetric NAT has no other path). Needs per-org TURN
-  attribution first. The DERP half (P4a) is built, on the API pods and the regional PoPs, and
-  stays switched off (`relay_allowance.enabled`) until the fleet measurement it waits on.
+  attribution first. The DERP half (P4a) has been on since 2026-10-21, on the API pods and
+  the regional PoPs.
 - **Exit nodes on Free (P4d):** after the throttle exists.
