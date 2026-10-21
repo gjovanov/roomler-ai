@@ -170,7 +170,7 @@ prevent, and the guard re-asserts it on every tick.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
-- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2214-2077`) and independent of NAT setup
+- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2340-2349`) and independent of NAT setup
   (`runtime.rs:2149-2172`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
@@ -237,7 +237,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2735-2646`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2758-2808`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
@@ -280,9 +280,11 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 2. Linux and macOS advertise clipboard image events they never send (R8); a root Linux daemon advertises a clipboard
    it cannot reach (R10).
 3. The Ctrl+Alt+Del button shows for every host. It sends three ordinary key events
-   (`ui/src/composables/useRemoteControl.ts:11864-11461`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
+   (`ui/src/composables/ctrlAltDel.ts:24-31`) ✔, and nothing in the agent calls `SendSAS` (grep: none) ✔.
    Windows does not treat a synthesised Ctrl+Alt+Del as the secure attention sequence, so the button does nothing at
    a lock screen that requires it; on Linux and macOS the chord means something else, or nothing.
+   *P4a:* a Windows agent that can send the real sequence advertises `input: sas`, and the button sends it one `sas`
+   frame instead (`ctrlAltDel.ts:23`, §3.9).
 4. The enroll dialog offers the setup wizard for agents on Linux and macOS, where it installs only the tunnel client
    (D5).
 5. An admin can approve a Mac or a Windows Home device as an exit or subnet router (S2).
