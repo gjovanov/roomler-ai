@@ -821,6 +821,14 @@ pub enum ClientMsg {
         /// [`crate::models::ssh_limits::MAX_SESSION_SECS`]; 0 ⇒ the ceiling.
         #[serde(default)]
         session_secs: u64,
+        /// FR-90 P3-8-1b — an agent session's own decision: the vault's
+        /// ticket (`rc:vault.ssh.granted`), under which the SESSION is the
+        /// principal, never the device's owner. A request whose ticket does
+        /// not hold is refused, never served as the owner's. Absent from
+        /// every request a person makes (`roomler ssh`), so that frame is
+        /// byte for byte what it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_ticket: Option<String>,
     },
 
     /// FR-85 P3 — the device reports one thing that happened to a REMOTE
@@ -3512,6 +3520,13 @@ pub enum ServerMsg {
         /// is byte-for-byte what older agents parse.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         via_service: bool,
+        /// FR-90 P3-8-1b — an agent session's grant: the device serves the
+        /// key ONE `exec` and refuses anything else on it (P3-8-2a). Sent only
+        /// to a device advertising `ssh-one-command`, which can read it; absent
+        /// (false) on every other grant, so the frame is byte for byte what
+        /// older agents parse.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        one_command: bool,
     },
 
     /// Answer to a device-originated [`ClientMsg::SshRequest`] — the
@@ -3545,6 +3560,14 @@ pub enum ServerMsg {
         /// a refusal is always answered rather than dropped.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// FR-90 P3-8-1b — the echo of the agent session's ticket
+        /// (`SshRequest::ssh_ticket`), by its id, once the server held the
+        /// request to it. A server before P3-8-1b ignores the ticket and
+        /// would answer the request as the device owner's, so the session's
+        /// daemon never dials on an answer that does not echo the ticket it
+        /// presented (P3-8-2b). Absent from every other answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_ticket_id: Option<String>,
     },
 
     /// Answer to a device-originated [`ClientMsg::RpcExecRequest`] — the
@@ -7463,6 +7486,7 @@ mod tests {
             host_pubkey: Some(KEY.into()),
             expires_at_ms: Some(123),
             error: None,
+            ssh_ticket_id: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""host_pubkey""#), "must reach the wire");
@@ -7484,6 +7508,7 @@ mod tests {
             host_pubkey: None,
             expires_at_ms: None,
             error: Some("nope".into()),
+            ssh_ticket_id: None,
         };
         let s = serde_json::to_string(&refused).unwrap();
         assert!(!s.contains("host_pubkey"), "absent, not null");
@@ -7491,6 +7516,72 @@ mod tests {
             ServerMsg::SshResponse { host_pubkey, .. } => assert!(host_pubkey.is_none()),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// FR-90 P3-8-1b — an agent session's three fields cross only when set:
+    /// a person's `roomler ssh` request, every grant to a device, and every
+    /// answer stay byte for byte what older builds parse, and each field reads
+    /// back as sent.
+    #[test]
+    fn ssh_session_fields_cross_only_when_set() {
+        let request = |ssh_ticket: Option<&str>| ClientMsg::SshRequest {
+            request_id: "q1".into(),
+            target: "devbox".into(),
+            public_key: "a-public-key".into(),
+            session_secs: 60,
+            ssh_ticket: ssh_ticket.map(String::from),
+        };
+        let v = serde_json::to_value(request(None)).unwrap();
+        assert!(v.get("ssh_ticket").is_none(), "a person's request: {v}");
+        let v = serde_json::to_value(request(Some("the-ticket"))).unwrap();
+        assert_eq!(v["ssh_ticket"], "the-ticket");
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(v).unwrap(),
+            ClientMsg::SshRequest { ssh_ticket: Some(ref t), .. } if t == "the-ticket"
+        ));
+
+        let grant = |one_command: bool| ServerMsg::SshGrant {
+            grant_id: "g1".into(),
+            public_key: "a-public-key".into(),
+            caller: "someone".into(),
+            account_mode: "console_user".into(),
+            account: None,
+            expires_at_ms: 1,
+            session_secs: 60,
+            consent_mode: None,
+            via_service: false,
+            one_command,
+        };
+        let v = serde_json::to_value(grant(false)).unwrap();
+        assert!(v.get("one_command").is_none(), "a person's grant: {v}");
+        let v = serde_json::to_value(grant(true)).unwrap();
+        assert_eq!(v["one_command"], true);
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::SshGrant {
+                one_command: true,
+                ..
+            }
+        ));
+
+        let answer = |ssh_ticket_id: Option<&str>| ServerMsg::SshResponse {
+            request_id: "q1".into(),
+            address: None,
+            port: None,
+            grant_id: None,
+            host_pubkey: None,
+            expires_at_ms: None,
+            error: Some("refused".into()),
+            ssh_ticket_id: ssh_ticket_id.map(String::from),
+        };
+        let v = serde_json::to_value(answer(None)).unwrap();
+        assert!(v.get("ssh_ticket_id").is_none(), "{v}");
+        let v = serde_json::to_value(answer(Some("k1"))).unwrap();
+        assert_eq!(v["ssh_ticket_id"], "k1");
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::SshResponse { ssh_ticket_id: Some(ref k), .. } if k == "k1"
+        ));
     }
 
     #[test]

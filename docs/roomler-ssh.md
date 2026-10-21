@@ -386,7 +386,7 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1047`](../crates/modules/network/src/routes/agent_ssh.rs#L1047)).
+  [`agent_ssh.rs:1219`](../crates/modules/network/src/routes/agent_ssh.rs#L1219)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
@@ -1189,6 +1189,79 @@ SYSTEM, the signed-in user on an attended install).
 ⚠️ `VIEW_SSH_AUDIT` is a new bit, so **existing** admin roles do not carry it
 until their mask is rewritten — the same friction `SSH_DEVICE` has. Owner is
 unaffected (it passes via the `ADMINISTRATOR` bypass).
+
+### An agent session's request (FR-90 P3-8-1b)
+
+A Hive agent session runs one command on another device of its organization
+(`ssh_run`, the FR-90 spec's §3e "P3-8, `ssh_run`, as designed"). It asks
+from its own device, on the device-originated leg, which today runs under
+the origin device's **owner**. A session that used it as it is would borrow
+its owner's SSH rights. So the session's request carries a decision of its
+own: the vault's **ticket** (`ssh_ticket`, [`vault.md`](vault.md) §22), and
+the network module holds the request to it. It is a ticket, not a grant,
+because `rc:ssh.grant` is already the target's grant, and the request
+carries both.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as the session's device
+    participant S as server (network module)
+    participant T as target device
+    D->>S: rc:ssh.request { …, ssh_ticket }
+    S->>S: bind the ticket: this org, this device, this target (else ticket_refused)
+    S->>S: its account still the target's? the target says ssh-one-command?
+    S->>S: gate 1 · gate 2 is the vault's · gate 3: no policy admits a session yet
+    S-->>D: rc:ssh.response { error, ssh_ticket_id }
+    Note over T: nothing reaches the target until a policy admits sessions
+```
+
+| Check, in order | Refused as | The answer echoes the ticket |
+|---|---|---|
+| the ticket binds: this server's, unexpired, for THIS organization, from THIS connection's device, toward the request's target as resolved (by id) | `ticket_refused` | no: nothing it claims was verified |
+| the public key | `bad_public_key` | yes |
+| the account the ticket was decided for is still the one the target's policy maps | `ticket_refused` | yes |
+| the target advertises `ssh-one-command` (it can hold a grant to one command) | `target_too_old` | yes |
+| gate 1, the org's switch | `org_disabled` | yes |
+| gate 2 | (the vault decided `ssh:run` in its place: the owner's `SSH_DEVICE` is not read) | — |
+| gate 3: the device's `mode`, then which policies admit a session | `device_disabled`, then `session_not_allowed` until decision 22 | yes |
+
+What a session's request is held to once a policy admits it (decision 22,
+P3-8-1b-2), already in place:
+
+- **The rate limit counts the session**, not its owner: one session cannot
+  spend its owner's budget, nor the owner the session's.
+- **`session_secs` ends with the ticket at the latest**: the target closes the
+  session there, whatever the session asked for. What is left of a ticket is
+  never 0, which `clamp_session_secs` would read as the ceiling.
+- **The grant says `one_command`**, and so does FR-105's pending row and the
+  SYSTEM service's claim: the target serves the key one `exec` (P3-8-2a).
+
+⚠️ **Never served as the owner's request.** A ticket that does not hold
+refuses the request. It does not fall back to the owner's path, which the
+device-originated leg would otherwise take: a session's daemon that sent a
+forged or stale ticket gets a refusal, not its owner's rights.
+
+⚠️ **The audit names the session.** `ssh_audit` rows of a session's request
+are `source: session`. Once the ticket holds, they carry `session_id` and
+`ssh_ticket_id` (`ticket:<id>` in `vault_audit`), and `user_id` is the
+person the session acts for, who need not own the device it runs on. The
+`caller` names the session too. A refused ticket's row is `session` with no
+session id, since nothing it claimed was verified.
+
+⚠️ **The echo is the client's guard.** A server before P3-8-1b ignores
+`ssh_ticket`, an unknown field, and would answer the request as the owner's.
+So `rc:ssh.response` echoes `ssh_ticket_id` whenever the ticket held, and
+the session's daemon never dials on an answer that does not echo the ticket
+it presented (P3-8-2b).
+
+| Piece | Where |
+|---|---|
+| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831)), `one_command` on `rc:ssh.grant` ([`:3529`](../crates/remote_control/src/signaling.rs#L3529)), `ssh_ticket_id` on `rc:ssh.response` ([`:3570`](../crates/remote_control/src/signaling.rs#L3570)); `RpcCap::SshOneCommand` ([`models.rs:1129`](../crates/remote_control/src/models.rs#L1129)) and the three refusals ([`models.rs:4766`](../crates/remote_control/src/models.rs#L4766)) |
+| the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
+| the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:942`](../crates/modules/network/src/routes/agent_ssh.rs#L942)) |
+| the audit | the `session` source and the session's ids ([`agent_ssh.rs:846`](../crates/modules/network/src/routes/agent_ssh.rs#L846)) |
+| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. P3-8-2a: the target holding `one_command`. P3-8-2b: the device's client and tool |
 
 ## 5. Roadmap
 

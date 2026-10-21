@@ -241,6 +241,11 @@ mod session_feedback_tests;
 mod ssh_grant_ack_tests;
 #[cfg(test)]
 mod ssh_service_tests;
+/// FR-90 P3-8-1b — an agent session's SSH request is the session's own: held
+/// to the vault's ticket, refused at gate 3 until decision 22, never served
+/// as the device owner's, every outcome audited as the session's.
+#[cfg(test)]
+mod ssh_session_ticket_tests;
 #[cfg(test)]
 mod stats_tests;
 #[cfg(test)]
