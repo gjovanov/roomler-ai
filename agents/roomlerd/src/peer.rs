@@ -9222,15 +9222,18 @@ async fn media_pump_ffmpeg_dc(
                 continue;
             }
         };
-        encode_us += encode_start.elapsed().as_micros() as u64;
+        let frame_encode_us = encode_start.elapsed().as_micros() as u64;
+        encode_us += frame_encode_us;
         frames_encoded += 1;
         // FR-119 P2b-2 — a trial judges every real frame that left the
-        // encoder, at its capture time (a keepalive re-encode is no frame).
-        // The state has taken a verdict into account by the time it returns
-        // one; persisting it runs off the runtime, next to the probe cache.
+        // encoder, at its capture time and with its encode time: only an
+        // encoder that cannot keep up fails it (a keepalive re-encode is no
+        // frame). The state has taken a verdict into account by the time it
+        // returns one; persisting it runs off the runtime, next to the probe
+        // cache.
         if is_real_frame
             && let Some(state) = fps_state.as_mut()
-            && let Some((class, verdict)) = state.frame(frame.monotonic_us)
+            && let Some((class, verdict)) = state.frame(frame.monotonic_us, frame_encode_us)
         {
             info!(
                 %session_id,

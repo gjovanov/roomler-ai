@@ -195,6 +195,9 @@ pub const TRIAL_MAX_P99_PERIODS: u64 = 2;
 /// Two frames further apart than this many periods are not one stretch of
 /// motion: the content paused.
 pub const TRIAL_STRETCH_GAP_PERIODS: u64 = 3;
+/// A trial fails only when the encoder's p90 time per frame reached this share
+/// of a period: then the host itself cannot keep up, whatever the content did.
+pub const TRIAL_MAX_ENCODE_PCT: u64 = 90;
 
 /// FR-119 P2b — the trial: does this host sustain `fps` while the content
 /// moves?
@@ -205,15 +208,25 @@ pub const TRIAL_STRETCH_GAP_PERIODS: u64 = 3;
 /// judges only **active stretches**: runs of frames at most
 /// [`TRIAL_STRETCH_GAP_PERIODS`] periods apart. A pause, typing, or a 30 fps
 /// video (33 ms apart, more than three 120 fps periods) is not evidence either
-/// way. An encoder that cannot keep up (11 ms frames against an 8.3 ms period)
-/// or a 60 Hz screen (16.7 ms) stays inside a stretch and falls short of
-/// [`TRIAL_MIN_RATE_PCT`].
+/// way.
+///
+/// ⚠️ **Proven** needs the frames themselves: [`TRIAL_MIN_RATE_PCT`] of the
+/// rate over [`TRIAL_ACTIVE`] of motion. **Failed** needs the host to be the
+/// limit: the encoder's p90 time per frame at [`TRIAL_MAX_ENCODE_PCT`] of a
+/// period (11 ms frames against 8.3 ms). Content that changes slower than the
+/// rate (a 60 fps video; a browser page held at 60 on a 120 Hz panel) falls
+/// short of the first while the encoder keeps up, and that is no verdict at
+/// all: the window starts over, and a later burst of fast content may still
+/// prove the class. Counting it as a failure would cache a capable host as
+/// unable for a week.
 #[derive(Debug, Clone)]
 pub struct TrialMeter {
     period_us: u64,
     last_us: Option<u64>,
     active_us: u64,
     intervals_us: Vec<u64>,
+    /// The encoder's time for each counted frame.
+    encode_us: Vec<u64>,
 }
 
 impl TrialMeter {
@@ -223,21 +236,34 @@ impl TrialMeter {
             last_us: None,
             active_us: 0,
             intervals_us: Vec::new(),
+            encode_us: Vec::new(),
         }
     }
 
-    /// One frame left the encoder, captured at `at_us`. Returns the verdict
-    /// once [`TRIAL_ACTIVE`] of moving content has been seen, and `None` until
-    /// then.
-    pub fn frame(&mut self, at_us: u64) -> Option<Verdict> {
+    /// One frame left the encoder, captured at `at_us`, after `encode_us` in
+    /// it. Returns the verdict once [`TRIAL_ACTIVE`] of moving content has
+    /// been seen and it concludes one, and `None` until then.
+    pub fn frame(&mut self, at_us: u64, encode_us: u64) -> Option<Verdict> {
         let previous = self.last_us.replace(at_us);
         let gap = at_us.saturating_sub(previous?);
         if gap == 0 || gap > self.period_us * TRIAL_STRETCH_GAP_PERIODS {
             return None; // the first frame, a duplicate, or a pause
         }
         self.intervals_us.push(gap);
+        self.encode_us.push(encode_us);
         self.active_us += gap;
-        (self.active_us >= TRIAL_ACTIVE.as_micros() as u64).then(|| self.verdict())
+        if self.active_us < TRIAL_ACTIVE.as_micros() as u64 {
+            return None;
+        }
+        let verdict = self.verdict();
+        if verdict.is_none() {
+            // The content was slower than the rate and the encoder kept up:
+            // judge a fresh window.
+            self.active_us = 0;
+            self.intervals_us.clear();
+            self.encode_us.clear();
+        }
+        verdict
     }
 
     /// The pump dropped a frame for the viewer or the link (the viewer-rate
@@ -250,17 +276,23 @@ impl TrialMeter {
         self.last_us = None;
     }
 
-    fn verdict(&self) -> Verdict {
-        let mut sorted = self.intervals_us.clone();
-        sorted.sort_unstable();
-        let p99 = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
+    fn verdict(&self) -> Option<Verdict> {
+        let pct = |v: &[u64], q: usize| {
+            let mut s = v.to_vec();
+            s.sort_unstable();
+            s[(s.len() * q / 100).min(s.len() - 1)]
+        };
         // Achieved rate over the active time, against the target, in percent.
         let achieved_pct =
             self.intervals_us.len() as u64 * self.period_us * 100 / self.active_us.max(1);
-        if achieved_pct >= TRIAL_MIN_RATE_PCT && p99 < self.period_us * TRIAL_MAX_P99_PERIODS {
-            Verdict::Proven
+        if achieved_pct >= TRIAL_MIN_RATE_PCT
+            && pct(&self.intervals_us, 99) < self.period_us * TRIAL_MAX_P99_PERIODS
+        {
+            Some(Verdict::Proven)
+        } else if pct(&self.encode_us, 90) * 100 >= self.period_us * TRIAL_MAX_ENCODE_PCT {
+            Some(Verdict::Failed)
         } else {
-            Verdict::Failed
+            None
         }
     }
 }
@@ -356,12 +388,12 @@ impl RateState {
         }
     }
 
-    /// A frame left the encoder, captured at `at_us`. When that concludes the
-    /// trial, the verdict is this session's from now on (the decision is taken
-    /// again at once, so a failed class stops being wanted), and the class
-    /// and verdict are returned for the pump to persist.
-    pub fn frame(&mut self, at_us: u64) -> Option<(ClassKey, Verdict)> {
-        let verdict = self.trial.as_mut()?.1.frame(at_us)?;
+    /// A frame left the encoder, captured at `at_us`, after `encode_us` in it.
+    /// When that concludes the trial, the verdict is this session's from now
+    /// on (the decision is taken again at once, so a failed class stops being
+    /// wanted), and the class and verdict are returned for the pump to persist.
+    pub fn frame(&mut self, at_us: u64, encode_us: u64) -> Option<(ClassKey, Verdict)> {
+        let verdict = self.trial.as_mut()?.1.frame(at_us, encode_us)?;
         let (class, _) = self.trial.take()?;
         self.verdicts.push((class.clone(), verdict));
         if let Some((inputs, decided_class, _)) = self.decided.clone() {
@@ -644,16 +676,21 @@ mod tests {
         }
     }
 
-    /// Feed a meter frames at the given intervals (µs) until it concludes.
-    fn run_trial(fps: u32, intervals_us: impl IntoIterator<Item = u64>) -> Option<Verdict> {
+    /// Feed a meter frames at the given intervals (µs), each after `encode_us`
+    /// in the encoder, until it concludes.
+    fn run_trial(
+        fps: u32,
+        intervals_us: impl IntoIterator<Item = u64>,
+        encode_us: u64,
+    ) -> Option<Verdict> {
         let mut meter = TrialMeter::new(fps);
         let mut at = 1_000_000u64;
-        if let Some(v) = meter.frame(at) {
+        if let Some(v) = meter.frame(at, encode_us) {
             return Some(v);
         }
         for gap in intervals_us {
             at += gap;
-            if let Some(v) = meter.frame(at) {
+            if let Some(v) = meter.frame(at, encode_us) {
                 return Some(v);
             }
         }
@@ -663,29 +700,52 @@ mod tests {
     #[test]
     fn a_steady_rate_proves_the_class() {
         assert_eq!(
-            run_trial(120, std::iter::repeat_n(8_333, 2_000)),
+            run_trial(120, std::iter::repeat_n(8_333, 2_000), 6_000),
             Some(Verdict::Proven)
         );
     }
 
-    /// An encoder that needs 11 ms a frame at 120 fps: inside a stretch, and
-    /// 76 % of the rate.
+    /// An encoder that needs 11 ms a frame at 120 fps: frames 11 ms apart,
+    /// 76 % of the rate, and the encoder is the reason.
     #[test]
     fn an_encoder_that_cannot_keep_up_fails() {
         assert_eq!(
-            run_trial(120, std::iter::repeat_n(11_000, 2_000)),
+            run_trial(120, std::iter::repeat_n(11_000, 2_000), 11_000),
             Some(Verdict::Failed)
         );
     }
 
-    /// A 60 Hz screen asked for 120: frames 16.7 ms apart are still one stretch
-    /// (under three 8.3 ms periods), at half the rate.
+    /// Content at 60 fps (a 60 fps video, a browser page held at 60 on a 120 Hz
+    /// panel) under a 120 fps trial, with an encoder that needs 6 ms: frames
+    /// 16.7 ms apart, half the rate, and nothing about the host. No verdict,
+    /// however long it runs: each window starts over.
     #[test]
-    fn a_screen_slower_than_the_rate_fails() {
+    fn content_slower_than_the_rate_concludes_nothing_while_the_encoder_keeps_up() {
         assert_eq!(
-            run_trial(120, std::iter::repeat_n(16_667, 2_000)),
+            run_trial(120, std::iter::repeat_n(16_667, 2_000), 6_000),
+            None
+        );
+    }
+
+    /// The same 60 fps content with an encoder that needs 9 ms, more than a
+    /// 120 fps period: the host could not have kept up with fast content
+    /// either.
+    #[test]
+    fn a_slow_encoder_fails_even_on_slow_content() {
+        assert_eq!(
+            run_trial(120, std::iter::repeat_n(16_667, 2_000), 9_000),
             Some(Verdict::Failed)
         );
+    }
+
+    /// Slow content first (a window with no verdict), then fast: the fast
+    /// burst proves the class.
+    #[test]
+    fn fast_content_after_slow_still_proves_the_class() {
+        let intervals: Vec<u64> = std::iter::repeat_n(16_667u64, 600)
+            .chain(std::iter::repeat_n(8_333u64, 2_000))
+            .collect();
+        assert_eq!(run_trial(120, intervals, 6_000), Some(Verdict::Proven));
     }
 
     /// Long pauses between bursts of motion count nothing; the bursts alone
@@ -696,14 +756,17 @@ mod tests {
         let intervals: Vec<u64> = std::iter::repeat_n(burst_then_pause, 20)
             .flatten()
             .collect();
-        assert_eq!(run_trial(120, intervals), Some(Verdict::Proven));
+        assert_eq!(run_trial(120, intervals, 6_000), Some(Verdict::Proven));
     }
 
     /// A 30 fps video (33 ms apart) at a 120 fps target is no evidence either
     /// way: the trial never concludes on it.
     #[test]
     fn content_slower_than_three_periods_never_concludes() {
-        assert_eq!(run_trial(120, std::iter::repeat_n(33_333, 10_000)), None);
+        assert_eq!(
+            run_trial(120, std::iter::repeat_n(33_333, 10_000), 6_000),
+            None
+        );
     }
 
     /// An occasional late frame (one in 200, one period late) stays under the
@@ -713,12 +776,12 @@ mod tests {
         let intervals: Vec<u64> = (0..2_000u64)
             .map(|n| if n % 200 == 199 { 16_000 } else { 8_333 })
             .collect();
-        assert_eq!(run_trial(120, intervals), Some(Verdict::Proven));
+        assert_eq!(run_trial(120, intervals, 6_000), Some(Verdict::Proven));
     }
 
     /// One frame in fifty captured and then dropped for the viewer. Counted,
-    /// the two-period gap across each drop is the p99 and fails a host that
-    /// kept up; as a pause, the trial judges what the host did.
+    /// the two-period gap across each drop is the p99, and a host that kept up
+    /// never proves it; as a pause, the trial judges what the host did.
     #[test]
     fn a_frame_dropped_for_the_viewer_breaks_the_stretch() {
         let judge = |pause_on_drop: bool| {
@@ -733,7 +796,7 @@ mod tests {
                     }
                     continue;
                 }
-                if let Some(v) = meter.frame(at) {
+                if let Some(v) = meter.frame(at, 6_000) {
                     return Some(v);
                 }
             }
@@ -742,8 +805,8 @@ mod tests {
         assert_eq!(judge(true), Some(Verdict::Proven));
         assert_eq!(
             judge(false),
-            Some(Verdict::Failed),
-            "the control: counted, the drops fail it"
+            None,
+            "the control: counted, the drops keep a host that kept up from proving it"
         );
     }
 
@@ -859,16 +922,18 @@ mod tests {
         }
     }
 
-    /// Frames `gap_us` apart for `secs` of motion; the verdict, if one came.
+    /// Frames `gap_us` apart, each after `encode_us` in the encoder, for `secs`
+    /// of motion; the verdict, if one came.
     fn feed(
         s: &mut RateState,
         at_us: &mut u64,
         gap_us: u64,
+        encode_us: u64,
         secs: u64,
     ) -> Option<(ClassKey, Verdict)> {
         for _ in 0..secs * 1_000_000 / gap_us {
             *at_us += gap_us;
-            if let Some(v) = s.frame(*at_us) {
+            if let Some(v) = s.frame(*at_us, encode_us) {
                 return Some(v);
             }
         }
@@ -902,7 +967,10 @@ mod tests {
         s.decide(ask(120), k.clone());
         s.running_at(120);
         let mut at = 0;
-        assert_eq!(feed(&mut s, &mut at, 8_333, 12), Some((k, Verdict::Proven)));
+        assert_eq!(
+            feed(&mut s, &mut at, 8_333, 6_000, 12),
+            Some((k, Verdict::Proven))
+        );
         assert_eq!(s.want(), 120);
         assert!(!s.trial_running());
         assert_eq!(s.video_info_fields(), r#","fps":120"#);
@@ -919,7 +987,7 @@ mod tests {
         s.running_at(120);
         let mut at = 0;
         assert_eq!(
-            feed(&mut s, &mut at, 11_000, 12),
+            feed(&mut s, &mut at, 11_000, 11_000, 12),
             Some((k, Verdict::Failed))
         );
         assert_eq!(s.want(), 60);
@@ -939,7 +1007,7 @@ mod tests {
         s.decide(ask(120), class("hevc_qsv", 1920, 120));
         s.running_at(120);
         let mut at = 0;
-        assert!(feed(&mut s, &mut at, 11_000, 12).is_some());
+        assert!(feed(&mut s, &mut at, 11_000, 11_000, 12).is_some());
         s.running_at(60);
         s.decide(ask(120), class("hevc_qsv", 1920, 120));
         assert_eq!(s.want(), 60);
@@ -972,12 +1040,16 @@ mod tests {
         s.decide(ask(120), class("hevc_videotoolbox", 1920, 120));
         s.running_at(120);
         let mut at = 0;
-        assert_eq!(feed(&mut s, &mut at, 8_333, 5), None);
+        assert_eq!(feed(&mut s, &mut at, 8_333, 6_000, 5), None);
         let wide = class("hevc_videotoolbox", 3840, 120);
         s.decide(ask(120), wide.clone());
-        assert_eq!(feed(&mut s, &mut at, 8_333, 7), None, "seven seconds anew");
         assert_eq!(
-            feed(&mut s, &mut at, 8_333, 5),
+            feed(&mut s, &mut at, 8_333, 6_000, 7),
+            None,
+            "seven seconds anew"
+        );
+        assert_eq!(
+            feed(&mut s, &mut at, 8_333, 6_000, 5),
             Some((wide, Verdict::Proven))
         );
     }
