@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-labelledby="tv-title tv-desc">
+  <title id="tv-title">Unattended remote desktop from a browser tab</title>
+  <desc id="tv-desc">Your laptop shows the office PC's live desktop in a browser tab, with nothing installed. The picture travels to the browser end to end encrypted, and the mouse and keys travel back. The office PC runs the Roomler daemon as a service, so it can be reached with nobody there on a Friday night. roomler.ai checks who is allowed and introduces the two ends, and never sees a pixel. No one-time password from a colleague is needed.</desc>
+  <style>
+    .ctrl { fill: none; stroke: rgba(0,121,107,.5); stroke-width: 1.25; stroke-linecap: round; stroke-dasharray: 2 6; animation: tv-march8 2.6s linear infinite; }
+    .rd { fill: none; stroke: #ef5350; stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 10 7; animation: tv-march17 1.1s linear infinite; }
+    @keyframes tv-march8 { to { stroke-dashoffset: -8; } }
+    @keyframes tv-march17 { to { stroke-dashoffset: 17; } }
+    .keys { offset-path: path('M232 236 C 330 236, 410 252, 492 252'); animation: tv-along 2.6s linear infinite; }
+    .keys.k2 { animation-delay: 1.3s; }
+    @keyframes tv-along { 0% { offset-distance: 0%; opacity: 0; } 12% { opacity: 1; } 88% { opacity: 1; } 100% { offset-distance: 100%; opacity: 0; } }
+    .live { animation: tv-live 2s ease-in-out infinite; }
+    @keyframes tv-live { 0%, 100% { opacity: .9; } 50% { opacity: .4; } }
+    .ring, .ripple { transform-box: fill-box; transform-origin: center; }
+    .ring { animation: tv-ring 2.2s ease-out infinite; }
+    .ripple { animation: tv-ripple 3.6s ease-out infinite; }
+    .ripple.r2 { animation-delay: 1.8s; }
+    @keyframes tv-ring { 0% { transform: scale(1); opacity: .55; } 100% { transform: scale(2.4); opacity: 0; } }
+    @keyframes tv-ripple { 0% { transform: scale(.85); opacity: .5; } 100% { transform: scale(1.45); opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; }
+      .keys, .ring, .ripple { display: none; }
+    }
+  </style>
+
+  <!-- The control plane: it checks who is allowed and introduces the two ends; it never sees a pixel. -->
+  <g>
+    <circle class="ripple" cx="380" cy="56" r="46" fill="none" stroke="rgba(0,150,136,.35)" />
+    <circle class="ripple r2" cx="380" cy="56" r="46" fill="none" stroke="rgba(0,150,136,.35)" />
+    <path transform="translate(98,-6)" d="M240 92 h84 a20 20 0 0 0 7 -39 a30 30 0 0 0 -53 -18 a26 26 0 0 0 -45 18 a20 20 0 0 0 7 39 z" fill="#ffffff" stroke="rgba(0,150,136,.45)" stroke-width="1.5" />
+    <text x="380" y="57" text-anchor="middle" font-size="13" font-weight="700" fill="#00796B">roomler.ai</text>
+    <text x="380" y="72" text-anchor="middle" font-size="10" fill="rgba(26,26,46,.55)">control plane</text>
+    <text x="380" y="117" text-anchor="middle" font-size="11.5" fill="#607d8b">checks who is allowed · never sees a pixel</text>
+    <path class="ctrl" d="M330 66 Q 205 90 150 168" />
+    <path class="ctrl" d="M431 66 Q 560 80 610 150" />
+  </g>
+
+  <!-- Your laptop at home: the office PC's desktop, live in a browser tab. -->
+  <g>
+    <rect x="22" y="172" width="210" height="132" rx="9" fill="#1a1a2e" stroke="rgba(0,150,136,.5)" />
+    <rect x="30" y="180" width="194" height="116" rx="4" fill="#f5f7fa" />
+    <rect x="30" y="180" width="194" height="15" rx="4" fill="#eceff1" />
+    <circle cx="39" cy="187.5" r="2.4" fill="#ef5350" />
+    <circle cx="47" cy="187.5" r="2.4" fill="#ffb300" />
+    <circle cx="55" cy="187.5" r="2.4" fill="#4caf50" />
+    <rect x="64" y="184" width="96" height="7" rx="3.5" fill="#ffffff" stroke="#cfd8dc" stroke-width=".8" />
+    <rect x="34" y="199" width="186" height="93" rx="2" fill="#b2dfdb" />
+    <rect x="42" y="206" width="84" height="54" rx="2.5" fill="#ffffff" />
+    <rect x="42" y="206" width="84" height="8" rx="2.5" fill="#4DB6AC" />
+    <rect x="48" y="219" width="62" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="48" y="227" width="52" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="48" y="235" width="68" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="48" y="243" width="40" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="134" y="216" width="78" height="60" rx="2.5" fill="#ffffff" />
+    <rect x="134" y="216" width="78" height="8" rx="2.5" fill="#009688" />
+    <rect x="140" y="230" width="50" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="140" y="238" width="60" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="140" y="246" width="44" height="4" rx="2" fill="#cfd8dc" />
+    <rect x="34" y="284" width="186" height="8" fill="#37474f" />
+    <rect class="live" x="33" y="198" width="188" height="95" rx="2.5" fill="none" stroke="#ef5350" stroke-width="1.5" />
+    <path d="M12 304 h230 l11 13 h-252 z" fill="#cfd8dc" />
+    <circle cx="227" cy="168" r="4" fill="#4caf50" />
+    <circle class="ring" cx="227" cy="168" r="4" fill="none" stroke="rgba(76,175,80,.5)" />
+    <text x="127" y="340" text-anchor="middle" font-size="14" font-weight="600" fill="#1a1a2e">your laptop, at home</text>
+    <text x="127" y="357" text-anchor="middle" font-size="12" fill="#607d8b">a browser tab · nothing installed</text>
+  </g>
+
+  <!-- The session: the screen comes to the browser, the mouse and keys go back. -->
+  <g>
+    <path d="M232 244 C 330 244, 410 260, 492 260" fill="none" stroke="#009688" stroke-width="14" stroke-linecap="round" opacity=".12" />
+    <path class="rd" d="M232 244 C 330 244, 410 260, 492 260" />
+    <circle class="keys" r="4" fill="#00796B" />
+    <circle class="keys k2" r="4" fill="#00796B" />
+    <rect x="276" y="200" width="140" height="22" rx="11" fill="#ffffff" stroke="rgba(239,83,80,.4)" />
+    <text x="346" y="215" text-anchor="middle" font-size="10.5" fill="#ef5350">the screen, live · 60 fps</text>
+    <rect x="290" y="276" width="128" height="22" rx="11" fill="#ffffff" stroke="rgba(0,150,136,.4)" />
+    <path d="M301 287 v-2.5 a3.5 3.5 0 0 1 7 0 v2.5" fill="none" stroke="#00796B" stroke-width="1.4" />
+    <rect x="299.5" y="287" width="10" height="7" rx="1.2" fill="#00796B" />
+    <text x="364" y="291" text-anchor="middle" font-size="10.5" fill="#00796B">end-to-end encrypted</text>
+    <text x="354" y="318" text-anchor="middle" font-size="11" fill="#607d8b">mouse and keys go back the other way</text>
+  </g>
+
+  <!-- The office PC: nobody there, reachable anyway. -->
+  <g>
+    <rect x="496" y="150" width="246" height="232" rx="14" fill="#ffffff" stroke="rgba(0,150,136,.5)" stroke-width="1.5" />
+    <text x="512" y="177" font-size="15" font-weight="700" fill="#1a1a2e">the office PC</text>
+    <path d="M719 166 a8 8 0 1 0 6 13 a6.5 6.5 0 1 1 -6 -13 z" fill="#ffb300" />
+    <text x="512" y="193" font-size="11" fill="#607d8b">Friday night · nobody there</text>
+
+    <rect x="512" y="204" width="118" height="76" rx="5" fill="#1a1a2e" />
+    <rect x="518" y="210" width="106" height="64" rx="2.5" fill="#b2dfdb" />
+    <rect x="523" y="215" width="48" height="31" rx="2" fill="#ffffff" />
+    <rect x="523" y="215" width="48" height="6" rx="2" fill="#4DB6AC" />
+    <rect x="577" y="222" width="42" height="34" rx="2" fill="#ffffff" />
+    <rect x="577" y="222" width="42" height="6" rx="2" fill="#009688" />
+    <rect x="562" y="280" width="18" height="10" fill="#cfd8dc" />
+    <rect x="548" y="290" width="46" height="5" rx="2.5" fill="#cfd8dc" />
+    <rect x="642" y="204" width="34" height="91" rx="4" fill="#1a1a2e" />
+    <rect x="648" y="214" width="22" height="3" rx="1.5" fill="#4DB6AC" opacity=".8" />
+    <rect x="648" y="221" width="22" height="3" rx="1.5" fill="#4DB6AC" opacity=".5" />
+    <circle cx="659" cy="276" r="4" fill="#4caf50" />
+    <circle class="ring" cx="659" cy="276" r="4" fill="none" stroke="rgba(76,175,80,.5)" />
+
+    <rect x="512" y="306" width="214" height="62" rx="8" fill="#00796B" />
+    <text x="526" y="327" font-size="13.5" font-weight="700" fill="#ffffff">roomlerd, a service</text>
+    <text x="526" y="343" font-size="11" fill="#e0f2f1">unattended access, even at</text>
+    <text x="526" y="358" font-size="11" fill="#e0f2f1">the lock screen</text>
+  </g>
+
+  <!-- What the story needed and did not have: a colleague to send a one-time password. -->
+  <g>
+    <rect x="36" y="378" width="236" height="26" rx="13" fill="#ffffff" stroke="rgba(239,83,80,.45)" />
+    <text x="56" y="395" font-size="11.5" fill="#90a4ae">a one-time password from a colleague</text>
+    <path d="M52 386 L264 396" stroke="#ef5350" stroke-width="1.6" stroke-linecap="round" />
+    <path d="M286 382 l14 14 M300 382 l-14 14" stroke="#ef5350" stroke-width="2.6" stroke-linecap="round" />
+    <text x="310" y="395" font-size="11.5" fill="#ef5350">nothing to wait for</text>
+  </g>
+</svg>
