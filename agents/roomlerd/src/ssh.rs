@@ -810,6 +810,10 @@ mod sshd {
         /// row in `ssh_audit`. `None` for a key-list session, which no grant
         /// backs and which therefore has nothing to correlate to.
         pub grant_id: Option<String>,
+        /// FR-90 P3-8-2a — an agent session's: one `exec` on one channel, and
+        /// nothing else ([`super::Grant::one_command`]). Every request handler
+        /// that could do more reads it.
+        pub one_command: bool,
     }
 
     impl ResolvedSessionPolicy {
@@ -836,6 +840,7 @@ mod sshd {
                 account,
                 consent_mode,
                 session_secs,
+                one_command,
                 deadline,
             } = grant;
             // Two fields were spent BEFORE resolution, and that is their
@@ -883,6 +888,7 @@ mod sshd {
                         )),
                 ),
                 caller: format!("ssh:{caller}@{peer}"),
+                one_command,
             }
         }
 
@@ -911,6 +917,9 @@ mod sshd {
                 // a decision row to join against — the `(key-list)` suffix on
                 // `caller` is what identifies it.
                 grant_id: None,
+                // The device owner's own break-glass key: no agent session's
+                // grant backs it, so nothing limits it to one command.
+                one_command: false,
             }
         }
 
@@ -1015,6 +1024,18 @@ mod sshd {
         /// Who asks the person before anything runs: this process, or
         /// (FR-105) the worker that carried this connection.
         asker: Asker,
+        /// FR-90 P3-8-2a — what a session granted one command has used of it.
+        /// Read only when its policy says `one_command`.
+        used: OneCommandUse,
+    }
+
+    /// FR-90 P3-8-2a — a one-command session's one channel and one `exec`.
+    /// An attempt counts as used whether or not it runs, so a refused or
+    /// failed `exec` cannot be followed by another.
+    #[derive(Default)]
+    struct OneCommandUse {
+        channel: bool,
+        exec: bool,
     }
 
     impl Handler {
@@ -1037,7 +1058,14 @@ mod sshd {
                 exec_aborts: std::collections::HashMap::new(),
                 _awake: awake,
                 asker,
+                used: OneCommandUse::default(),
             }
+        }
+
+        /// FR-90 P3-8-2a — was this session granted one command? `false`
+        /// before authentication, when russh delivers no request anyway.
+        fn one_command(&self) -> bool {
+            self.policy.as_ref().is_some_and(|p| p.one_command)
         }
 
         /// Start the one-per-session watchdog that ends the connection when
@@ -1649,6 +1677,21 @@ mod sshd {
             reply: russh::server::ChannelOpenHandle,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // FR-90 P3-8-2a — a session granted one command gets ONE channel:
+            // a second could carry a second command.
+            if self.one_command() {
+                if self.used.channel {
+                    warn!(
+                        peer = %self.peer,
+                        "ssh: refused a second channel: this session was granted one command"
+                    );
+                    reply
+                        .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                        .await;
+                    return Ok(());
+                }
+                self.used.channel = true;
+            }
             reply.accept().await;
             self.arm_session_deadline(session);
             Ok(())
@@ -1699,6 +1742,25 @@ mod sshd {
                 return Ok(());
             };
             let caller = policy.caller.clone();
+
+            // FR-90 P3-8-2a — nor for a session granted one command, whatever
+            // this device's allowlist would let another session reach.
+            if policy.one_command {
+                warn!(
+                    peer = %self.peer, %caller, %host, port,
+                    "ssh: forward refused: this session was granted one command"
+                );
+                self.report(
+                    SshActivityKind::Forward,
+                    Some(format!("{host}:{port}")),
+                    None,
+                    false,
+                );
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
+            }
 
             // FR-105 — no forward at all on the SYSTEM service's server.
             let verdict = match self.ctx.forward_refusal {
@@ -1776,6 +1838,20 @@ mod sshd {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // FR-90 P3-8-2a — one command, asked once: the attempt is spent
+            // here, before anything can refuse or fail it.
+            if self.one_command() {
+                if self.used.exec {
+                    return refuse(
+                        session,
+                        channel,
+                        self.peer,
+                        "exec",
+                        "this session was granted one command, and has asked for it.",
+                    );
+                }
+                self.used.exec = true;
+            }
             // The SSH exec payload is bytes, not necessarily UTF-8. Refuse
             // rather than lossily convert: a command with replacement
             // characters in it is not the command the caller asked for.
@@ -1870,6 +1946,16 @@ mod sshd {
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // FR-90 P3-8-2a — never a shell for a session granted one command.
+            if self.one_command() {
+                return refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    "shell",
+                    "this session was granted one command, not a shell.",
+                );
+            }
             if self.pty_req.is_some() {
                 // The shell's CONTENTS are never recorded; this row exists so
                 // a reader can see that an interactive session happened.
@@ -1899,6 +1985,16 @@ mod sshd {
             _modes: &[(russh::Pty, u32)],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // FR-90 P3-8-2a — nor a terminal: refused before it is recorded,
+            // so nothing a later request asks can find one.
+            if self.one_command() {
+                warn!(
+                    peer = %self.peer, %term,
+                    "ssh: refused a terminal: this session was granted one command"
+                );
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
             // Recorded, not acted on: the terminal is allocated when the
             // shell starts, because that is when the identity it runs as
             // is known and when consent has been settled. Allocating here
@@ -1992,6 +2088,16 @@ mod sshd {
             name: &str,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // FR-90 P3-8-2a — nor a subsystem, `sftp` included.
+            if self.one_command() {
+                return refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    name,
+                    "this session was granted one command, not a subsystem.",
+                );
+            }
             if name == "sftp" {
                 // File operations happen inside `sftp-server`; this records
                 // only that a transfer channel was opened.
@@ -2720,6 +2826,12 @@ pub struct Grant {
     pub consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     /// Server-clamped session lifetime once redeemed.
     pub session_secs: u64,
+    /// FR-90 P3-8-2a — an agent session's grant: the session it opens is
+    /// served ONE `exec` on ONE channel, and refused a shell, a terminal, a
+    /// subsystem, a forward and any second channel. This device enforces it,
+    /// not the client: the daemon that holds the key could ask for anything a
+    /// key may ask for.
+    pub one_command: bool,
     /// LOCAL deadline after which this grant is dead.
     ///
     /// Deliberately an `Instant` derived from arrival rather than the server's
@@ -2804,6 +2916,7 @@ pub fn record_grant(
     consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     expires_at_ms: u64,
     session_secs: u64,
+    one_command: bool,
 ) -> Result<(), GrantRejected> {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2835,6 +2948,7 @@ pub fn record_grant(
         account,
         consent_mode,
         session_secs: ssh_limits::clamp_session_secs(session_secs),
+        one_command,
         deadline: Instant::now() + window,
     };
 
@@ -2850,6 +2964,7 @@ pub fn record_grant(
     tracing::info!(
         grant_id = %grant.grant_id, caller = %grant.caller,
         account_mode = %grant.account_mode, ttl_secs = window.as_secs(),
+        one_command = grant.one_command,
         "ssh: grant recorded"
     );
     grants.push(grant);
@@ -3626,6 +3741,26 @@ mod tests {
             consent,
             now_ms() + ttl_ms,
             0,
+            false,
+        )
+        .map(|()| grant_id)
+        .map_err(|e| e.to_string())
+    }
+
+    /// FR-90 P3-8-2a — an agent session's grant, held to one command, that
+    /// needs no operator approval (`Auto`, as [`grant_for`] says why).
+    fn one_command_grant_for(line: &str) -> Result<String, String> {
+        let grant_id = format!("g-one-{}", rand::random::<u32>());
+        super::record_grant(
+            grant_id.clone(),
+            line.to_string(),
+            "agent session 0 of someone (via a device)".into(),
+            "daemon".into(),
+            None,
+            Some(roomler_ai_remote_control::models::ConsentMode::Auto),
+            now_ms() + 30_000,
+            0,
+            true,
         )
         .map(|()| grant_id)
         .map_err(|e| e.to_string())
@@ -3709,6 +3844,7 @@ mod tests {
             None,
             0,
             0,
+            false,
         )
         .unwrap_err();
         assert!(matches!(expired, super::GrantRejected::ExpiredOnArrival));
@@ -3727,6 +3863,7 @@ mod tests {
             None,
             now_ms() + 30_000,
             0,
+            false,
         )
         .unwrap_err();
         assert_eq!(garbage.refusal(), SshGrantRefusal::Invalid);
@@ -3807,6 +3944,7 @@ mod tests {
             account: None,
             consent_mode: consent,
             session_secs,
+            one_command: false,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
         }
     }
@@ -3895,6 +4033,32 @@ mod tests {
         assert!(key_list.consent_sentinel.is_none());
         assert!(key_list.caller.contains("(key-list)"));
         assert_eq!(key_list.run_as.unwrap(), crate::exec::RunAs::ConsoleUser);
+    }
+
+    /// FR-90 P3-8-2a — a grant's `one_command` reaches the session's policy,
+    /// which every request handler reads; an ordinary grant's does not, and a
+    /// key-list session, the owner's break-glass path, never has it.
+    #[test]
+    fn resolve_carries_one_command_and_a_key_list_session_never_has_it() {
+        let mut grant = test_grant(None, 60);
+        grant.one_command = true;
+        let session = super::sshd::ResolvedSessionPolicy::from_grant(grant, test_peer(), false);
+        assert!(session.one_command);
+        let person = super::sshd::ResolvedSessionPolicy::from_grant(
+            test_grant(None, 60),
+            test_peer(),
+            false,
+        );
+        assert!(!person.one_command);
+
+        let ctx = super::sshd::Ctx::build(
+            &cfg_with_mode(vec![client_key(26).1], Some("daemon")),
+            test_services(),
+        )
+        .expect("a usable host key");
+        let key_list =
+            super::sshd::ResolvedSessionPolicy::from_key_list(&ctx, "roomler", test_peer());
+        assert!(!key_list.one_command);
     }
 
     // ── M5: the device-side privilege ceiling ─────────────────────────────
@@ -4099,6 +4263,7 @@ mod tests {
             Some(ConsentMode::Auto),
             now_ms() + 30_000,
             1, // a one-second session budget
+            false,
         )
         .unwrap();
 
@@ -4398,6 +4563,164 @@ mod tests {
         // conversion lives in the handler, so this locks the reasoning
         // rather than the call.
         assert!(u16::try_from(65_536u32 + 22).is_err());
+    }
+
+    // ── FR-90 P3-8-2a: an agent session's grant holds ONE command ─────────
+
+    /// What a channel said until the server closed it.
+    struct Heard {
+        successes: usize,
+        failures: usize,
+        out: String,
+        err: String,
+        exit: Option<u32>,
+    }
+
+    async fn hear(channel: &mut russh::Channel<russh::client::Msg>) -> Heard {
+        let (mut successes, mut failures, mut exit) = (0, 0, None);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Success => successes += 1,
+                russh::ChannelMsg::Failure => failures += 1,
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => err.extend_from_slice(data),
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+        Heard {
+            successes,
+            failures,
+            out: String::from_utf8_lossy(&out).into_owned(),
+            err: String::from_utf8_lossy(&err).into_owned(),
+            exit,
+        }
+    }
+
+    /// Read a channel until it has said `n` failures, or 10 s pass: the
+    /// answers to refused requests, which leave it open. Any acceptance is a
+    /// failure of the test.
+    async fn refusals_heard(
+        channel: &mut russh::Channel<russh::client::Msg>,
+        n: usize,
+    ) -> (usize, String) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut failures, mut err) = (0, Vec::new());
+        while failures < n {
+            match tokio::time::timeout_at(deadline, channel.wait()).await {
+                Ok(Some(russh::ChannelMsg::Failure)) => failures += 1,
+                Ok(Some(russh::ChannelMsg::Success)) => panic!("a request was accepted"),
+                Ok(Some(russh::ChannelMsg::ExtendedData { ref data, ext: 1 })) => {
+                    err.extend_from_slice(data)
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        (failures, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    /// FR-90 P3-8-2a — an agent session's grant runs its ONE command and no
+    /// more: a terminal is refused before it is recorded (the command runs
+    /// without one), a second `exec` on the same channel is refused while
+    /// the first runs, and a second channel is refused outright. The
+    /// device-owned key list is empty, so the grant alone let it in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_granted_one_command_runs_it_once_and_nothing_more() {
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(60);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        one_command_grant_for(&line).unwrap();
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.exec(true, "sleep 1; echo once").await.unwrap();
+        channel.exec(true, "echo twice").await.unwrap();
+        let heard = hear(&mut channel).await;
+        assert!(
+            heard.out.contains("once"),
+            "the command ran: {:?}",
+            heard.out
+        );
+        assert!(!heard.out.contains("twice"), "and only it: {:?}", heard.out);
+        assert_eq!(heard.exit, Some(0));
+        assert_eq!(heard.successes, 1, "only the first exec is accepted");
+        assert_eq!(
+            heard.failures, 2,
+            "the terminal and the second exec are refused"
+        );
+        assert!(
+            heard.err.contains("has asked for it"),
+            "the second exec's refusal says why: {:?}",
+            heard.err
+        );
+
+        assert!(
+            session.channel_open_session().await.is_err(),
+            "a second channel must be refused"
+        );
+    }
+
+    /// FR-90 P3-8-2a — nor a forward, even to a destination this device
+    /// forwards to for any other session (the positive control first); nor a
+    /// shell or a subsystem, `sftp` included, on its one channel. Each
+    /// refusal of a request on the channel says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_granted_one_command_gets_no_forward_shell_or_subsystem() {
+        let _lock = grant_test().await;
+        let dest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = dest.local_addr().unwrap().port();
+        let mut cfg = cfg_with(Vec::new());
+        cfg.forward_acl = acl_allowing("127.0.0.1", port, port);
+
+        // An ordinary grant on this device forwards there…
+        let (key, line) = client_key(61);
+        let addr = serve_one(&cfg).await;
+        grant_for(&line, 30_000).unwrap();
+        let session = connect(addr, key).await;
+        let forward = session
+            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
+            .await;
+        assert!(
+            forward.is_ok(),
+            "the positive control: this device forwards there"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), dest.accept())
+            .await
+            .expect("the forward reached its destination")
+            .unwrap();
+
+        // …and does not for a session granted one command.
+        let (key, line) = client_key(62);
+        let addr = serve_one(&cfg).await;
+        one_command_grant_for(&line).unwrap();
+        let session = connect(addr, key).await;
+        let forward = session
+            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
+            .await;
+        assert!(
+            forward.is_err(),
+            "a forward for a session granted one command"
+        );
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.request_shell(true).await.unwrap();
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        let (failures, why) = refusals_heard(&mut channel, 2).await;
+        assert_eq!(
+            failures, 2,
+            "the shell and the subsystem are refused: {why:?}"
+        );
+        assert!(
+            why.contains("not a shell") && why.contains("not a subsystem"),
+            "each refusal says why: {why:?}"
+        );
     }
 
     // ── P8: activity reporting ───────────────────────────────────────────

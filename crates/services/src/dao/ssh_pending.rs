@@ -41,24 +41,33 @@ impl SshPendingDao {
     /// withdrawn, past `claim_by`, or pending for a DIFFERENT device. The
     /// caller cannot tell those apart, and should not: a forged id learns
     /// nothing.
+    ///
+    /// FR-90 P3-8-2a — nor an agent session's grant (`one_command`) to a
+    /// claimer that does not hold one command (`holds_one_command`). A row
+    /// written before the field has none, and `$ne` matches it.
     pub async fn claim(
         &self,
         grant_id: &str,
         agent_id: ObjectId,
         tenant_id: ObjectId,
+        holds_one_command: bool,
     ) -> DaoResult<Option<SshPending>> {
         let now = DateTime::now();
+        let mut filter = doc! {
+            "grant_id": grant_id,
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+            "state": SshPending::PENDING,
+            "claim_by": { "$gt": now },
+        };
+        if !holds_one_command {
+            filter.insert("one_command", doc! { "$ne": true });
+        }
         let row = self
             .base
             .collection()
             .find_one_and_update(
-                doc! {
-                    "grant_id": grant_id,
-                    "agent_id": agent_id,
-                    "tenant_id": tenant_id,
-                    "state": SshPending::PENDING,
-                    "claim_by": { "$gt": now },
-                },
+                filter,
                 doc! { "$set": { "state": SshPending::CLAIMED, "claimed_at": now } },
             )
             .return_document(ReturnDocument::After)

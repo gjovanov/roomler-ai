@@ -2644,6 +2644,13 @@ pub struct SshServiceEndpoint {
     /// requires it to name the device's CURRENT anchor.
     pub anchor_id: String,
     pub published_at: DateTime,
+    /// FR-90 P3-8-2a — the service said it holds an agent session's grant to
+    /// one command. Only then is such a grant routed to it: the worker's
+    /// `ssh-one-command` speaks for the worker's own server, never for a
+    /// service that may be older. Absent (false) in every record published
+    /// before it.
+    #[serde(default)]
+    pub one_command: bool,
 }
 
 /// Device config an operator has requested, for the agent to reconcile

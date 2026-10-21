@@ -524,7 +524,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the device's switch | `vault_enabled` ([`config.rs:579`](../crates/agent-core/src/config.rs#L579)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9191) |
+| the device's switch | `vault_enabled` ([`config.rs:579`](../crates/agent-core/src/config.rs#L579)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9198) |
 | the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1574`](../agents/roomlerd/src/signaling.rs#L1574) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:593`](../crates/remote_control/src/signaling.rs#L593)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
 | what the fleet stores | [`socket.rs:103`](../crates/modules/fleet/src/socket.rs#L103), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L491), `Agent::vault_key` ([`models.rs:2108`](../crates/remote_control/src/models.rs#L2108)); no route answers it |
@@ -1023,7 +1023,7 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9258`](../crates/remote_control/src/models.rs#L9258) |
+| the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9265`](../crates/remote_control/src/models.rs#L9265) |
 | the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:517`](../agents/roomlerd/src/vault.rs#L517), [`vault_exec.rs:470`](../agents/roomlerd/src/hive/vault_exec.rs#L470), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
 | the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1553`](../crates/remote_control/src/signaling.rs#L1553), [`vault.rs:317`](../crates/remote_control/src/vault.rs#L317) |
 | the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:410`](../crates/modules/vault/src/lease.rs#L410) |
@@ -2039,7 +2039,7 @@ bash elsewhere.
 >   a grant is (§21).
 > - **It is never logged by a daemon.** No build asks for one before
 >   P3-8-2b, so `rc:vault.ssh.granted` has an arm of its own that drops it by
->   its id ([`signaling.rs:6330`](../agents/roomlerd/src/signaling.rs#L6330)),
+>   its id ([`signaling.rs:6333`](../agents/roomlerd/src/signaling.rs#L6333)),
 >   where the catch-all below would print the frame and the ticket with it.
 
 | Piece | Where |
@@ -2049,7 +2049,7 @@ bash elsewhere.
 | the handler | [`ssh.rs`](../crates/modules/vault/src/ssh.rs) `ticket` ([`ssh.rs:87`](../crates/modules/vault/src/ssh.rs#L87): the checks above), answered in order on the lease queue (§10) |
 | the ticket | [`auth/mod.rs`](../crates/services/src/auth/mod.rs): `TokenType::SshTicket`, `issue_ssh_ticket`, `verify_ssh_ticket`, `ssh_ticket_holds` |
 | the network module's half | P3-8-1b-1 ([roomler-ssh.md](roomler-ssh.md#an-agent-sessions-request-fr-90-p3-8-1b)): the ticket bound at `rc:ssh.request` to this organization, the device that asked and the target, its account still the target's; the session the principal, refused at gate 3 until decision 22; `ssh_audit` naming the session; the echo |
-| what comes next | P3-8-1b-2, gate 3 for a session as decision 22 says; P3-8-2a, the target serving a session one command and nothing else; P3-8-2b, the device's tool |
+| what comes next | P3-8-1b-2, gate 3 for a session as decision 22 says; P3-8-2b, the device's tool. P3-8-2a is in place: the target serves a session's grant one command and nothing else, on the worker and on the SYSTEM service ([roomler-ssh.md](roomler-ssh.md#a-sessions-grant-on-the-target-one-command-fr-90-p3-8-2a)) |
 
 ## 23. Audit
 
@@ -2133,5 +2133,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else (P3-8-2a), and the device's tool (P3-8-2b) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; `roomler connect` |
+| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), and the device's tool (P3-8-2b) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; `roomler connect` |
 | P3k | the field run in the test organization |
