@@ -2421,6 +2421,18 @@ pub trait LocalApiState: Send + Sync {
     fn status(&self) -> NodeStatus;
     fn peers(&self) -> Vec<PeerInfo>;
     fn flows(&self) -> Vec<FlowInfo>;
+    /// FR-97 P2h — what a `Status` request answers. Default: [`Self::status`].
+    /// A daemon whose network view is another process's (a two-half Mac's
+    /// per-user half, which has no overlay node) overrides it to ask that
+    /// process; the sync read stays what everything else uses.
+    async fn status_view(&self) -> NodeStatus {
+        self.status()
+    }
+    /// FR-97 P2h — what a `Peers` request answers. Default: [`Self::peers`];
+    /// overridden as [`Self::status_view`] is.
+    async fn peers_view(&self) -> Vec<PeerInfo> {
+        self.peers()
+    }
     /// Remote-control sessions awaiting an operator consent decision (P2b).
     /// Default: none — so existing impls / mocks and the read-only contract are
     /// undisturbed; the agent daemon overrides this.
@@ -2755,7 +2767,8 @@ pub enum Scope {
 /// safety surface the companion draws for the person: the status that says
 /// the service is up, the sessions behind the "Being viewed by …" banner, its
 /// Disconnect, the consent prompt and its answer, and whether a recording is
-/// running (the tray turns red). FR-97 P2g adds the companion's Devices page.
+/// running (the tray turns red). FR-97 P2g adds the companion's Devices page,
+/// and P2h the live links its Connection column and Overview read.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -2780,9 +2793,13 @@ pub fn person_may(req: &Request) -> bool {
         // per-user half asks for it here, because only the root half is on
         // the network; before this it listed itself alone.
         | Request::Devices { .. }
-        | Request::Mesh { .. } => true,
-        Request::Peers
-        | Request::Flows
+        | Request::Mesh { .. }
+        // FR-97 P2h — the live state of this machine's links to those devices
+        // (online, direct or relayed, round trip), which the Devices page's
+        // Connection column and Overview's count read. Read-only, and served
+        // without the endpoints and probe detail (`person_view`).
+        | Request::Peers => true,
+        Request::Flows
         | Request::Ping { .. }
         | Request::CreateForward { .. }
         | Request::CreateSocks5 { .. }
@@ -2815,13 +2832,37 @@ pub fn person_may(req: &Request) -> bool {
     }
 }
 
+/// FR-97 P2h — an answer as the person socket serves it. `Peers` keeps what
+/// the companion draws (the link: online, direct or relayed and over what,
+/// round trip, last seen) and loses what only an administrator debugging a
+/// path needs: the endpoints of either end and of the relay (`relay_local`,
+/// `relay_dst`, `relay_server`), the carrier's forensic snapshot (`debug`), the
+/// path decision (`why`) and the prober's measurements (`probes`). Those name
+/// other devices' public and LAN addresses. Everything else passes as it is.
+pub fn person_view(resp: Response) -> Response {
+    match resp {
+        Response::Peers(mut peers) => {
+            for p in &mut peers {
+                p.relay_local = None;
+                p.relay_dst = None;
+                p.relay_server = None;
+                p.debug = None;
+                p.why = None;
+                p.probes.clear();
+            }
+            Response::Peers(peers)
+        }
+        other => other,
+    }
+}
+
 /// FR-27 P11 — the answer to anything else on the person-at-the-device socket.
 fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
                   viewing this screen, ends it, answers consent prompts, and lists the devices \
-                  this machine's private network reaches. Everything else goes to the daemon's \
-                  own socket — run `sudo roomler …`"
+                  this machine's private network reaches and its links to them. Everything else \
+                  goes to the daemon's own socket — run `sudo roomler …`"
             .into(),
     }
 }
@@ -2950,6 +2991,10 @@ where
                 }
                 // The async verbs — await them here; everything else is a pure sync
                 // dispatch through `handle`.
+                // FR-97 P2h — the network view, which a daemon may take from
+                // another process (a two-half Mac's root half).
+                Ok(Request::Status) => Response::Status(Box::new(state.status_view().await)),
+                Ok(Request::Peers) => Response::Peers(state.peers_view().await),
                 Ok(Request::Ping {
                     target,
                     timeout_ms,
@@ -3177,6 +3222,13 @@ where
                 Err(e) => Response::Error {
                     message: format!("bad request: {e}"),
                 },
+            };
+            // FR-97 P2h — what the person socket serves leaves out what only
+            // an administrator needs (see `person_view`).
+            let resp = if scope == Scope::Person {
+                person_view(resp)
+            } else {
+                resp
             };
             let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
             held |= matches!(resp, Response::HiveUpdateHeld { .. });
@@ -7070,13 +7122,14 @@ mod tests {
             // FR-97 P2g — the machine's device list and mesh, read-only.
             r#"{"t":"devices","d":{"org":"primary"}}"#,
             r#"{"t":"mesh","d":{"org":"primary"}}"#,
+            // FR-97 P2h — and its live links, without the endpoints.
+            r#"{"t":"peers"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
             assert!(person_may(&req), "the person must be able to: {j}");
         }
         let refused = [
-            Request::Peers,
             Request::Flows,
             Request::RouteList,
             Request::ConfigGet,
@@ -7151,7 +7204,7 @@ mod tests {
             matches!(&r, Response::Error { message } if message.contains("sudo roomler")),
             "the refusal says where to go instead: {r:?}"
         );
-        let r = ask_scoped(Scope::Person, r#"{"t":"peers"}"#).await;
+        let r = ask_scoped(Scope::Person, r#"{"t":"flows"}"#).await;
         assert!(is_person_refusal(&r), "{r:?}");
         // The banner's Disconnect and the consent answer reach the state.
         for j in [
@@ -7169,11 +7222,81 @@ mod tests {
             let r = ask_scoped(Scope::Person, j).await;
             assert!(!is_person_refusal(&r), "{j} must pass through: {r:?}");
         }
-        // The daemon's own socket is unchanged.
-        assert!(matches!(
-            ask_scoped(Scope::Full, r#"{"t":"peers"}"#).await,
-            Response::Peers(_)
-        ));
+        // FR-97 P2h — the peers pass too, without the relay endpoints the
+        // Mock's first peer carries; the daemon's own socket keeps them.
+        match ask_scoped(Scope::Person, r#"{"t":"peers"}"#).await {
+            Response::Peers(p) => {
+                assert_eq!(p.len(), 2, "every peer, as the daemon knows them");
+                assert_eq!(p[0].rtt_ms, Some(52), "the link itself is served");
+                assert_eq!(p[0].relay_local, None);
+                assert_eq!(p[0].relay_dst, None);
+            }
+            other => panic!("expected Peers on the person socket, got {other:?}"),
+        }
+        match ask_scoped(Scope::Full, r#"{"t":"peers"}"#).await {
+            Response::Peers(p) => {
+                assert_eq!(p[0].relay_local.as_deref(), Some("94.130.141.74:10850"));
+                assert_eq!(p[0].relay_dst.as_deref(), Some("5.9.157.226:12728"));
+            }
+            other => panic!("expected Peers on the full socket, got {other:?}"),
+        }
+    }
+
+    /// FR-97 P2h — the person's view of the peers keeps the link and drops
+    /// every endpoint and diagnostic; any other answer passes untouched.
+    #[test]
+    fn person_view_keeps_the_link_and_drops_the_endpoints() {
+        let mut p = Mock.peers().remove(0);
+        p.relay_kind = Some("derp".into());
+        p.relay_transport = Some("tcp".into());
+        p.relay_server = Some("derp.example:443".into());
+        p.why = Some(PeerWhy {
+            tiers: Vec::new(),
+            relayed_instead_s: Some(30),
+            relayed_instead_strikes: 1,
+            forced_derp_s: None,
+            probing: Some("198.51.100.7:41641".into()),
+        });
+        p.probes = vec![PathProbe {
+            dst: "198.51.100.7:41641".into(),
+            loss: Some(0.0),
+            rtt_ms: Some(12.0),
+            rtt_p95_ms: None,
+            rtt_max_ms: None,
+        }];
+        p.debug = Some(PeerCarrierDebug {
+            tier: "direct".into(),
+            initiated: true,
+            hs_done: true,
+            local: Some("192.0.2.10:41641".into()),
+            dst: Some("198.51.100.7:41641".into()),
+            tx: 1,
+            rx: 1,
+            last_rx_age_s: 0,
+            relay_kind: None,
+            rx_denied: 0,
+            rx_denied_noroute: 0,
+        });
+        let Response::Peers(out) = person_view(Response::Peers(vec![p.clone()])) else {
+            panic!("a Peers answer stays a Peers answer");
+        };
+        let q = &out[0];
+        assert_eq!(
+            (
+                q.relay_local.as_deref(),
+                q.relay_dst.as_deref(),
+                q.relay_server.as_deref()
+            ),
+            (None, None, None)
+        );
+        assert!(q.debug.is_none() && q.why.is_none() && q.probes.is_empty());
+        assert_eq!(q.node_id, p.node_id);
+        assert_eq!(q.online, p.online);
+        assert_eq!(q.rtt_ms, p.rtt_ms);
+        assert_eq!(q.relay_kind.as_deref(), Some("derp"));
+        assert_eq!(q.relay_transport.as_deref(), Some("tcp"));
+        let status = Response::Status(Box::new(Mock.status()));
+        assert_eq!(person_view(status.clone()), status);
     }
 
     /// FR-97 P2g — the Mac person socket's directory must be a real

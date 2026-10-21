@@ -33,6 +33,14 @@
 //! the root half, over this socket, for the machine's own view
 //! ([`machine_view_wanted`], [`machine_answer`]), and shows that instead.
 //!
+//! **And the live view (FR-97 P2h).** The same half's `Status` said "(no
+//! overlay IP)" and its `Peers` were empty, so the Devices page's Connection
+//! column and the Overview's network lines were blank on a Mac. With no overlay
+//! address of its own ([`network_view_wanted`]), it now answers those from the
+//! root half too: the root half's peers as the person socket serves them,
+//! without endpoints, and its own status with the root half's network fields
+//! ([`with_machine_network`]).
+//!
 //! Kill switch: `ROOMLERD_PERSON_SOCKET=0` (or `false` / `off` / `no`) — the
 //! pre-P11 behaviour, and on a Mac the pre-P2g one, since with no socket the
 //! per-user half keeps its own answer.
@@ -44,9 +52,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tokio::sync::watch;
-use tunnel_core::localapi::Response;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tunnel_core::localapi::{self, LocalApiState};
+use tunnel_core::localapi::{NodeStatus, Response};
 
 /// How often the seat is looked at. A consent prompt stays up for 30 s or
 /// more, so following a user switch within a few seconds is plenty. A look is
@@ -141,7 +149,7 @@ pub async fn or_machine_view(own: Response, req: tunnel_core::localapi::Request)
         // SAFETY: geteuid never fails.
         let euid = unsafe { libc::geteuid() };
         if machine_view_wanted(&own, euid)
-            && let Some(machine) = machine_answer(euid, &req).await
+            && let Some(machine) = machine_answer(euid, &req, SERVER_ANSWER).await
             && machine_view_usable(&machine)
         {
             tracing::debug!("devices: the per-user half shows the machine's view (FR-97 P2g)");
@@ -153,11 +161,26 @@ pub async fn or_machine_view(own: Response, req: tunnel_core::localapi::Request)
     own
 }
 
-/// FR-97 P2g — ask the root half's person socket for `uid`. `None` when it is
-/// not there, is served by anyone but root, or does not answer within a few
-/// seconds: the caller keeps its own answer then.
+/// How long the root half has to answer a question it asks its server first
+/// (Devices, Mesh: one HTTP round trip, cached).
 #[cfg(target_os = "macos")]
-pub async fn machine_answer(uid: u32, req: &tunnel_core::localapi::Request) -> Option<Response> {
+const SERVER_ANSWER: Duration = Duration::from_secs(5);
+
+/// …and one it answers from memory (Status, Peers), which the companion asks
+/// every 2 s: a root half that is slow here is stuck, and the person's own
+/// answer is the better one to show meanwhile.
+#[cfg(target_os = "macos")]
+const LIVE_ANSWER: Duration = Duration::from_millis(1500);
+
+/// FR-97 P2g — ask the root half's person socket for `uid`. `None` when it is
+/// not there, is served by anyone but root, or does not answer within `within`:
+/// the caller keeps its own answer then.
+#[cfg(target_os = "macos")]
+pub async fn machine_answer(
+    uid: u32,
+    req: &tunnel_core::localapi::Request,
+    within: Duration,
+) -> Option<Response> {
     let path = localapi::person_socket_path(uid);
     if !path.exists() {
         return None;
@@ -167,10 +190,63 @@ pub async fn machine_answer(uid: u32, req: &tunnel_core::localapi::Request) -> O
         let mut client = localapi::connect_unix_served_by_root(path).await.ok()?;
         client.request(req).await.ok()
     };
-    tokio::time::timeout(Duration::from_secs(5), ask)
-        .await
-        .ok()
-        .flatten()
+    tokio::time::timeout(within, ask).await.ok().flatten()
+}
+
+/// FR-97 P2h — should a Mac's per-user half take the machine's live network
+/// view (its `Status` network fields and its `Peers`) from the root half? When
+/// it is not root and holds no overlay address of its own: it runs no node
+/// then, so its own answer can only say "not on the private network".
+pub fn network_view_wanted(own_overlay_ip: Option<&str>, euid: u32) -> bool {
+    euid != 0 && own_overlay_ip.is_none()
+}
+
+/// FR-97 P2h — `own`, with the root half's NETWORK fields: its overlay
+/// addresses, its exit status and its MagicDNS. Everything else stays the
+/// per-user half's: its name, version, mode, and its own link to the server.
+/// A machine view that holds no overlay address lends nothing.
+pub fn with_machine_network(mut own: NodeStatus, machine: &NodeStatus) -> NodeStatus {
+    if machine.overlay_ip.is_some() {
+        own.overlay_ip = machine.overlay_ip.clone();
+        own.overlay_ip6 = machine.overlay_ip6.clone();
+        own.exit_node = machine.exit_node.clone();
+        own.dns = machine.dns.clone();
+    }
+    own
+}
+
+/// FR-97 P2h — the status a Mac's per-user half answers: its own, with the
+/// root half's network fields where [`network_view_wanted`] says so.
+#[cfg(target_os = "macos")]
+pub async fn or_machine_status(own: NodeStatus) -> NodeStatus {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    if network_view_wanted(own.overlay_ip.as_deref(), euid)
+        && let Some(Response::Status(machine)) =
+            machine_answer(euid, &tunnel_core::localapi::Request::Status, LIVE_ANSWER).await
+    {
+        return with_machine_network(own, &machine);
+    }
+    own
+}
+
+/// FR-97 P2h — the peers a Mac's per-user half answers: the root half's where
+/// [`network_view_wanted`] says so (its own list is empty then). They arrive
+/// as the person socket serves them, without endpoints (`localapi::person_view`).
+#[cfg(target_os = "macos")]
+pub async fn or_machine_peers(
+    own: Vec<tunnel_core::localapi::PeerInfo>,
+    own_overlay_ip: Option<&str>,
+) -> Vec<tunnel_core::localapi::PeerInfo> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    if network_view_wanted(own_overlay_ip, euid)
+        && let Some(Response::Peers(machine)) =
+            machine_answer(euid, &tunnel_core::localapi::Request::Peers, LIVE_ANSWER).await
+    {
+        return machine;
+    }
+    own
 }
 
 /// Who is at the seat now: on Linux the active graphical session's user, on
@@ -390,5 +466,54 @@ mod tests {
         assert!(!machine_view_usable(&Response::Error {
             message: "x".into()
         }));
+    }
+
+    fn status(j: &str) -> NodeStatus {
+        serde_json::from_str(j).unwrap()
+    }
+
+    /// FR-97 P2h — the per-user half takes the root half's network view only
+    /// when it holds no overlay address of its own, and never as root.
+    #[test]
+    fn only_a_node_less_half_off_root_takes_the_machine_network() {
+        assert!(network_view_wanted(None, 501));
+        assert!(!network_view_wanted(Some("100.64.0.9"), 501));
+        assert!(!network_view_wanted(None, 0));
+    }
+
+    /// FR-97 P2h — and borrows only the network fields, and only from a
+    /// machine view that is on the network.
+    #[test]
+    fn only_the_network_fields_are_borrowed() {
+        let own = status(
+            r#"{"node_id":"u","name":"mac-u","version":"0.4.150","mode":"user","connected":false}"#,
+        );
+        let machine = status(
+            r#"{"node_id":"d","name":"mac-d","version":"0.4.149","mode":"service","connected":true,
+                "overlay_ip":"100.64.0.9","overlay_ip6":"fd7a:115c:a1e0::9",
+                "dns":{"magic_domain":"vmtest.roomler.ai","resolver_bound":true,
+                       "os_steer_active":true,"upstream":"192.0.2.53:53","answer_aaaa":true}}"#,
+        );
+        let merged = with_machine_network(own.clone(), &machine);
+        assert_eq!(merged.overlay_ip.as_deref(), Some("100.64.0.9"));
+        assert_eq!(merged.overlay_ip6.as_deref(), Some("fd7a:115c:a1e0::9"));
+        assert!(merged.dns.is_some());
+        assert_eq!(merged.dns, machine.dns);
+        // Its own identity and its own link to the server stay its own.
+        assert_eq!(
+            (
+                merged.node_id.as_str(),
+                merged.name.as_str(),
+                merged.version.as_str()
+            ),
+            ("u", "mac-u", "0.4.150")
+        );
+        assert_eq!(merged.mode, own.mode);
+        assert!(!merged.connected);
+        // A machine view off the network lends nothing.
+        let off = status(
+            r#"{"node_id":"d","name":"mac-d","version":"0.4.149","mode":"service","connected":true}"#,
+        );
+        assert_eq!(with_machine_network(own.clone(), &off), own);
     }
 }

@@ -1912,6 +1912,36 @@ impl LocalApiState for DaemonState {
         crate::person_socket::or_machine_view(own, req).await
     }
 
+    /// FR-97 P2h — on a Mac's per-user half, which runs no overlay node, the
+    /// network fields of the status (overlay addresses, exit, MagicDNS) are the
+    /// root half's ([`crate::person_socket::or_machine_status`]). Everywhere
+    /// else, and on a half with a node of its own, the status is its own.
+    async fn status_view(&self) -> NodeStatus {
+        #[cfg(target_os = "macos")]
+        {
+            crate::person_socket::or_machine_status(self.status()).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.status()
+        }
+    }
+
+    /// FR-97 P2h — and so are its peers, the live links the companion's
+    /// Connection column and Overview count read.
+    async fn peers_view(&self) -> Vec<PeerInfo> {
+        #[cfg(target_os = "macos")]
+        {
+            // Cloned out first: no borrow of the overlay state across the await.
+            let own_ip = self.overlay.borrow().self_ip.clone();
+            crate::person_socket::or_machine_peers(self.peers(), own_ip.as_deref()).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.peers()
+        }
+    }
+
     /// S1b — archive the STALE config copy on a split-config host (the
     /// desktop's "Two configurations found" banner finally gets a button).
     /// The daemon is the only safe actor: it knows which copy it LOADED and
