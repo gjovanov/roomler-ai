@@ -323,8 +323,8 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 - `SO_PEERCRED` is checked against that user or root on every connection;
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
-  `KeepBusyOn` (FR-92 P10, the start gated again on the peer); and, since FR-97 P2g,
-  `Devices` and `Mesh`.
+  `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
+  `Devices` and `Mesh`; and since P2h, `Peers`, served through `person_view`.
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -332,6 +332,14 @@ read. The server shapes the answer by **this machine's** overlay ACL (`agent_sel
 so the person can search, sort and page the set but never widen it. The rows carry no
 machine ids, keys or owner ids. Windows already serves the same verbs to its
 interactive users.
+
+`Peers` (P2h) is the live state of the links to those same devices: online, direct or
+relayed and over what, round trip, last seen. The person socket serves it through
+`localapi::person_view`, which drops everything only an administrator debugging a path
+needs. That is the endpoints of either end and of a relay (`relay_local`, `relay_dst`,
+`relay_server`), the carrier snapshot (`debug`), the path decision (`why`) and the
+prober's measurements (`probes`). Those name other devices' public and LAN addresses,
+which the overlay addresses already on the Devices page do not.
 
 **A Mac's root half serves one too (FR-97 P2g).** Only root can hold a utun, so a
 two-half Mac (FR-43) is on the private network through its root half alone, and the
