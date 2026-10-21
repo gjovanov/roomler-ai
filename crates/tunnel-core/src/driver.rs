@@ -988,6 +988,9 @@ pub async fn establish_tunnel_session(
         // R4 — our DERP identity, so the server can hand it to the agent
         // when the derp flavor is negotiated. Harmless on other flavors.
         derp_pubkey: params.derp.as_ref().map(|d| d.self_pubkey_hex.clone()),
+        // FR-90 P3-7-2a — a person's or a device's own tunnel: no session
+        // grant. A session's tunnel is opened by its device (P3-7-3).
+        net_grant: None,
     })
     .await
     .context("send TunnelOpen")?;
@@ -1011,6 +1014,8 @@ pub async fn establish_tunnel_session(
                     // nonce to route this frame here; the single-session
                     // driver doesn't need it.
                     open_nonce: _,
+                    // FR-90 P3-7-2a — never set: this driver sends no grant.
+                    net_grant_id: _,
                 } => {
                     info!(
                         %session_id, %transport, dc_pool_size, sctp_rwnd_bytes,

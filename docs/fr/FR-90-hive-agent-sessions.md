@@ -59,7 +59,7 @@ it.
   ask for credentials (`agents/roomlerd/src/exec.rs:509-514`); a root daemon's LocalAPI socket is
   `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:3013-2958`); tunnel SOCKS5
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
-  attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-51`); `SplitTun` intercepts one
+  attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-63`); `SplitTun` intercepts one
   port and SSH is its only caller (`crates/tunnel-core/src/overlay/split_tun.rs:92-126`); fleet exec
   always runs as SYSTEM/root (`agents/roomlerd/src/signaling.rs:4813`).
 - **Chat needs four changes.** `AuthorType::Bot` exists and nothing writes it — the DAO hard-codes
@@ -90,7 +90,7 @@ each a module behind the FR-69 contract (`crates/core/src/module.rs:23`); new `E
 (`crates/core/src/hooks.rs:37`), because it holds sessions. The node side is a `roomlerd` feature,
 and its user-level half is `roomlerd hive-host`, re-exec'd as the mapped user like `portal-helper`
 (`agents/roomlerd/src/main.rs:222`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
-`rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:1989`); new
+`rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:2002`); new
 `RpcCap` verbs `hive`, `hive-view` (P0d-2), `hive-replica`, `vault`, `knowhow-scan`, equality-matched
 (`crates/remote_control/src/models.rs:765,757`).
 
@@ -207,7 +207,7 @@ fingerprint the dialer pins, over a plain socket, a TURN relay or the establishe
 (`crates/tunnel-core/src/transport/quic.rs:369`–`:479`), and the dialer presents a token the server
 minted (`:586`, `:605`). The serving half is the exit agent's
 (`agents/roomlerd/src/tunnel/quic_peer.rs:187` direct, `:229` TURN, `:272` DERP), the dialing half
-the tunnel client's (`crates/tunnel-core/src/driver.rs:1566` `establish_quic`). The signalling is
+the tunnel client's (`crates/tunnel-core/src/driver.rs:1571` `establish_quic`). The signalling is
 Hive's own, `rc:hive.replica.*`, so `hive` still calls neither `network` nor `remote`
 (`crates/core/src/graph.rs:25`). TURN credentials come from the stateless helper the viewer uses
 (`crates/modules/hive/src/view.rs:299`), and the DERP leg rides each device's own `/derp`
@@ -1001,7 +1001,7 @@ Demoted to a newer fence, its next call, made while the run has not let go yet, 
 | the hosted record and the resume (`hosted.rs`; `resume_once`, `supervisor.rs:3290`) | unchanged for what a device RUNS. Membership is the store's, not `hosted.json`'s; a promotion's target writes its entry at the new fence like any launch; a replicated session's resume waits for the server's word |
 | the viewer peer (`agents/roomlerd/src/hive/view.rs`) | a member serves a session it holds on `hive_replica` alone, as an adopted session is served on `hive_adopt` (`:270`), read only. The server picks the member, where today it always names the location (`crates/modules/hive/src/view.rs:249`): the primary while it is online, else the freshest, an archive replica first (design §5.2). P2i adds `search` |
 | the server module (`crates/modules/hive/`) | `agent_sessions` gains `replicaset`, `path_maps`, `parent_session` and `retain_until`; `hive_policies` and `hive_purges` come with their indexes in the module's own `indexes()` (`crates/modules/hive/src/lib.rs:261`, FR-69 rule 3); routes `…/session/{sid}/{replicas,promote,teleport,fork}`, `DELETE …/session/{sid}` and `…/hive/policy`; reconcile-on-connect re-sends joins, purges and the lease word; the composition baseline is re-recorded (rule 2) |
-| the hive wire (`crates/remote_control/src/hive.rs`, `signaling.rs`) | `rc:hive.replica.*` (`join`, `join_ack`, `want`, `grant`, `ready`, `dial`, `close`, `tip`, `manifest`), `rc:hive.prepare` and `prepare_ack`, `rc:hive.drain` and `drained`, `rc:hive.move` (P2e-3), `rc:hive.demote`, `rc:hive.lease` (P2e-2), `rc:hive.purge` and `purge_ack`: metadata only, field sets locked, each `Owner::Hive` in `namespace()` (`signaling.rs:2642`), refusals decoded leniently (an unknown word still refuses: the prepare's are the start's `HiveRefusal`, the drain's its own `HiveDrainRefusal`), bounds in a `replica_limits` beside `view_limits` (`hive.rs:91`), and the drain's turn cut in `promote_limits`. `RpcCap::HiveReplica` (`hive-replica`), `HiveArchive` (`hive-archive`), `HiveLease` (`hive-lease`, P2e-2), `HivePromote` (`hive-promote`, P2e-3) and `HivePurge` (`hive-purge`), equality-matched: `hive` is a prefix of all five. The test asserting that `hive-replica` is no verb (`models.rs:8115`) changes with them |
+| the hive wire (`crates/remote_control/src/hive.rs`, `signaling.rs`) | `rc:hive.replica.*` (`join`, `join_ack`, `want`, `grant`, `ready`, `dial`, `close`, `tip`, `manifest`), `rc:hive.prepare` and `prepare_ack`, `rc:hive.drain` and `drained`, `rc:hive.move` (P2e-3), `rc:hive.demote`, `rc:hive.lease` (P2e-2), `rc:hive.purge` and `purge_ack`: metadata only, field sets locked, each `Owner::Hive` in `namespace()` (`signaling.rs:2655`), refusals decoded leniently (an unknown word still refuses: the prepare's are the start's `HiveRefusal`, the drain's its own `HiveDrainRefusal`), bounds in a `replica_limits` beside `view_limits` (`hive.rs:91`), and the drain's turn cut in `promote_limits`. `RpcCap::HiveReplica` (`hive-replica`), `HiveArchive` (`hive-archive`), `HiveLease` (`hive-lease`, P2e-2), `HivePromote` (`hive-promote`, P2e-3) and `HivePurge` (`hive-purge`), equality-matched: `hive` is a prefix of all five. The test asserting that `hive-replica` is no verb (`models.rs:8126`) changes with them |
 | the module DAG | no new edge. `hive → fleet` reads devices' tags and owners, `hive → chat` posts the room's notes, TURN credentials come from the stateless helper, and DERP is the devices' own. Core gains one hook, `agent_updated` (a device's tags or owner changed): a hook is the only way fleet's change reaches hive (FR-69 rule 1) |
 | §3g's gates | the device's `hive_replica`, `hive_archive` and `hive_store_quota_mib`: default off, never pushable. The server's: the policy is an `ADMINISTRATOR`'s; promote, teleport and fork need `HIVE_RUN` and are the owner's |
 
@@ -2289,13 +2289,13 @@ device's report of use: a separate claim, as `ssh_audit` and `ssh_activity` are.
 - **Authenticated per-session SOCKS5** (RFC 1929, the password the session's capability). Today's
   SOCKS server is "CONNECT only, no authentication" (`crates/tunnel-core/src/socks5.rs:3`).
 - **`Principal::Session {sid, owner}`**, beside `TunnelClient` and `Agent`
-  (`crates/tunnel-core/src/policy.rs:37`), so `tunnel_audit` names the session and not just its
+  (`crates/tunnel-core/src/policy.rs:43`), so `tunnel_audit` names the session and not just its
   owner.
 
 **P3-7, a session's own egress, as designed.** A session reaches a private subnet behind a device,
 or the internet from a chosen place, through Roomler's own tunnels (design §7.2). Today a flow a
 daemon opens is `Principal::Agent`, its subject the device's owner
-(`crates/modules/network/src/agent_socket.rs:208`, `crates/modules/network/src/tunnel.rs:1052`),
+(`crates/modules/network/src/agent_socket.rs:208`, `crates/modules/network/src/tunnel.rs:1263`),
 and the SOCKS5 front takes no authentication (`crates/tunnel-core/src/socks5.rs:63`). A session
 that used either would appear in `tunnel_audit` as its owner. It would reach whatever its owner
 may, through a listener any local process can share.
@@ -2321,7 +2321,7 @@ sequenceDiagram
 |---|---|
 | who decides | the vault. It believes a session only from the device its record places it on, at its fence (`crates/modules/vault/src/lease.rs:35`). The network module cannot, because `hive ↔ network` is forbidden both ways (`crates/core/src/graph.rs:103`). Two new Cedar actions, `net:socks` and `net:forward`. Their principal is the `Session`, their resource a new `Node` entity (an enrolled device: its tags, OS and owner), and their context the device the session runs on and, for a forward, the destination. Every decision is recorded in `vault_audit` |
 | the grant | the vault's answer: a token signed by core's auth service (`crates/core/src/state.rs:53`) under an audience of its own, `net_grant`, which no other gate accepts. It names the tenant, the session and its fence, the session's owner, the origin device, the exit, the destination (one `host:port` for a forward, none for SOCKS) and its end, at most the lease ceiling (900 s). The network module verifies it and calls no module, so the graph is unchanged |
-| the principal | `Principal::Session {sid, owner}`: what `tunnel_policies` are evaluated for, and what `tunnel_audit` records, a `session_id` beside `origin_agent_id` (`crates/remote_control/src/models.rs:4525`). Which subjects match it is decision 20 |
+| the principal | `Principal::Session {sid, owner}`: what `tunnel_policies` are evaluated for, and what `tunnel_audit` records, a `session_id` beside `origin_agent_id` (`crates/remote_control/src/models.rs:4525`). Which subjects match it is decision 20. As built (P3-7-2a), it names the session and the device whose WS carries its flows; the owner is the flow's subject `user_id`, as for any flow |
 | the listener | one per tool call, on loopback, on a port the system picks. It serves a connection only when the process holding it runs as the session's account, as `vault_connect`'s endpoint does on Linux, macOS and Windows (`agents/roomlerd/src/hive/vault_connect.rs:22`). `net_socks` adds RFC 1929: the username the session's id, the password a capability made for the listener (32 random bytes), so a second session under the same account cannot share it. The SOCKS5 front offers RFC 1929 on session listeners alone. The loopback listeners it already serves keep offering no authentication |
 | the answer | `net_socks`: `socks5h://<session>:<capability>@127.0.0.1:<port>` and its end; `net_forward`: `127.0.0.1:<port>` and its end. The capability lands in the transcript. It is the session's own: refused off the device and to any other account, and gone with its listener |
 | its life | until the grant's end, or the session's run ending on this device: its end, or a move, which the device's own fence ends. A grant is no lease, so no `rc:vault.revoke` names it. A flow the listener opened ends with it, both halves (#2129) |
@@ -2336,8 +2336,9 @@ sequenceDiagram
   sockets.
 - ⚠️ **An exit dials as its daemon** (found writing P3-7-1b). A session's flow to an exit's
   loopback reaches it as SYSTEM or root, and an exit that is the session's own device makes its
-  own loopback the daemon's. P3-7-2 decides, at the flow, whether a session may reach an exit's
-  loopback; Cedar's context does not name the session's device by id.
+  own loopback the daemon's. P3-7-2b decides, at the flow, whether a session may reach an exit's
+  loopback; Cedar's context does not name the session's device by id. Until then a session's
+  flow reaches nothing, loopback or not (P3-7-2a).
 - Not in P3-7: the egress proxy (design §7.2's third change), which the sandbox sends every
   command through, and `roomler connect` (P3-9).
 
@@ -2399,8 +2400,9 @@ sequenceDiagram
 | P3-7-0 | P3-7's design (§3e "P3-7, a session's own egress, as designed"), and decision 20 | docs only | — |
 | P3-7-1a | the vault's half, in Cedar: `net:socks` and `net:forward`, the `Node` entity, a node named in a policy only where it is a live device of the organization, `simulate` deciding both | `vault.tenants`; nothing asks before P3-7-1b | — |
 | P3-7-1b | the vault's half, on the wire: `rc:vault.net`, believed only from the device the session's record places it on, at its fence; decided by `net:*`; answered with its grant (`net_grant`, signed by core's auth service) | `vault.tenants`; no device asks before P3-7-3 | — |
-| P3-7-2 | the network module's half: the grant verified at `rc:tunnel.open`, `Principal::Session`, the subjects decision 20 names, `tunnel_audit.session_id` | `vault.tenants` | — |
-| P3-7-3 | the device's half: RFC 1929 in the SOCKS5 front, the per-session listeners and their account check, `hive_net`, the tools `net_socks` and `net_forward` | device `hive_net = false`; the `vault` feature in no release build | — |
+| P3-7-2a | the network module's half, before decision 20: the grant verified at `rc:tunnel.open` and bound only from the device and toward the exit it names, else the open refused; `rc:tunnel.opened` echoing it; `Principal::Session`, which no subject matches yet; each flow held to the grant; `tunnel_audit.session_id` and `grant_id` | `vault.tenants`; no device presents a grant before P3-7-3 | — |
+| P3-7-2b | the subjects decision 20 names, and whether a session's flow may reach an exit's loopback | `vault.tenants` | — |
+| P3-7-3 | the device's half: RFC 1929 in the SOCKS5 front, the per-session listeners and their account check, `hive_net`, the tools `net_socks` and `net_forward`; no session flow over a tunnel whose `rc:tunnel.opened` does not echo its grant | device `hive_net = false`; the `vault` feature in no release build | — |
 | P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
 | P3-9 | `roomler connect <handle>` for people (knowhow's `roomler_connect(entity)` waits for P4) | — | — |
 | P3k | the field run in the test org, and `docs/vault.md` | — | AC12, AC13, AC19's vault half |
@@ -2751,7 +2753,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-7-0 | P3-7's design (§3e "P3-7, a session's own egress, as designed") and decision 20, docs only: the vault decides a session's egress (Cedar's `net:socks` and `net:forward` over a new `Node` entity), as it alone can believe a session (`hive ↔ network` is forbidden); its answer a grant signed by core's auth service under its own audience, which the network module verifies without calling a module; `Principal::Session` in `tunnel_policies` and `tunnel_audit`; one loopback listener per tool call, served only to the session's account, with RFC 1929 for SOCKS; the device-owned `hive_net`; which subjects match a session is decision 20 | docs only | **merged** #2626 `15fdd7b78` |
 | P3-7-1a | the vault's Cedar for a session's own egress (`docs/vault.md` §7), with nothing asking yet (P3-7-1b's `rc:vault.net` is the first): the `Node` entity, a device a session's flow exits through, named by its id, its `os`, `tags` and `owner` read from its row; `net:socks` (a SOCKS5 listener whose flows exit through the node) and `net:forward` (one destination, `context.host` and `context.port`), the `Session` the principal and the `Node` the resource, a permit for one opening nothing for the other; `Ask::NetSocks` and `Ask::NetForward` recorded and read back for replay, a recorded port past `u16` making the row unreadable, never a guess; a node named in a policy only where it is a live device of the organization, so a policy learns nothing of another's devices; `simulate` deciding both, the node by `resource.node_id`. Found on the way: Cedar's strict validation keeps an impossible policy, as a warning, so a `forbid` that can never hold forbids nothing; refusing it is P3-2c. 5 new tests (4 of the module, 1 integration) and 3 negative controls | `vault.tenants`; nothing asks before P3-7-1b | **merged** #2636 `1f5d1907f` |
 | P3-7-1b | `rc:vault.net` and its grant (`docs/vault.md` §21), with nothing asking yet (P3-7-3's daemon is the first): a session's request for SOCKS through an exit, or for a forward to one destination, believed as a lease is (the session's record, at its fence, on the asking device), on the lease queue and under its per-minute ceiling; the exit a live device of the organization, else `no_exit`; decided by Cedar's `net:socks` or `net:forward`, the node's and the device's facts from their rows; answered `rc:vault.net.granted`, a token signed by core's auth service under its own audience, `net_grant` (`TokenType::NetGrant`), naming the session at its fence, its owner, the origin device, the exit, a forward's destination, and an end clamped to 30 s to 900 s, its allow recorded first (`grant:<id>`); a forward's host decided and granted in one spelling (`canonical_net_host`: lowercase, no root dot, an address canonical and an IPv4-mapped IPv6 address as its IPv4, a numeric last label refused); the grant refused by every other verifier, and every other credential by its own, checked as it was signed (kind, destination, ids, a life of at most 900 s) with no leeway past its end; `simulate` taking a forward's host in the same spelling. 10 new tests (3 of the wire, 4 of the grant's signing and checking, 1 of the vault's bounds, 2 integration) and 15 negative controls | `vault.tenants`; no device asks before P3-7-3 | **merged** #2639 `7b4531114` |
-| P3-2c | a policy that can never apply refused when it is written (`docs/vault.md` §7), found in P3-7-1a: Cedar's strict validation reports one only as a warning, a scope no action applies to (`InvalidActionApplication`, a `Node` named where `secret:use` takes a `Secret`, which Cedar reports as `ImpossiblePolicy` too) or a condition that is always false (`ImpossiblePolicy`), and `check_policy` refused only errors, so a `forbid` like that was kept and forbade nothing; now a write refuses it in Cedar's own words, as does `simulate` of a change, which checks its `with` policies as writes; a policy stored before is not checked again, and decides nothing, as before. 2 new tests (1 of the module, 1 integration) and 3 negative controls | `vault.tenants` | **in review** |
+| P3-2c | a policy that can never apply refused when it is written (`docs/vault.md` §7), found in P3-7-1a: Cedar's strict validation reports one only as a warning, a scope no action applies to (`InvalidActionApplication`, a `Node` named where `secret:use` takes a `Secret`, which Cedar reports as `ImpossiblePolicy` too) or a condition that is always false (`ImpossiblePolicy`), and `check_policy` refused only errors, so a `forbid` like that was kept and forbade nothing; now a write refuses it in Cedar's own words, as does `simulate` of a change, which checks its `with` policies as writes; a policy stored before is not checked again, and decides nothing, as before. 2 new tests (1 of the module, 1 integration) and 3 negative controls | `vault.tenants` | **merged** #2643 `247e01786` |
+| P3-7-2a | a session's grant at its tunnel (`docs/tunnels.md` "An agent session's grant"), the network module's half, with nothing presenting one yet (P3-7-3's daemon is the first) and decision 20 left open: `rc:tunnel.open` carries a `net_grant`, verified with `verify_net_grant` and bound to the tunnel only on an agent's own WS, in the grant's organization, from the device it names and toward the exit it names; otherwise the open is refused (`net_grant_refused`, in the failing check's words) and never opened as the device's; `rc:tunnel.opened` echoes `net_grant_id`, the device's proof that its grant was bound, as an older server ignores the field; each flow held to the grant before any policy is read (TCP only, before its end, a forward toward its one destination in `canonical_net_host`'s spelling), then decided for `Principal::Session {session_id, agent_id}`, which no subject matches until decision 20, so a session reaches nothing yet; every `tunnel_audit` row of the tunnel naming `session_id` and `grant_id`, its `user_id` the session's owner. 8 new tests (3 of the network module, 1 of the policy, 1 of the wire, 3 integration) and 11 negative controls | `vault.tenants`; no device presents a grant before P3-7-3 | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3294,7 +3297,8 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         the issuer next mints, which may be never.
 
 20. **Which tunnel policies a session's flows match** (P3-7), for the operator to confirm (P3-7-0,
-    §3e "P3-7, a session's own egress, as designed"). Nothing in P3-7-1 depends on the answer.
+    §3e "P3-7, a session's own egress, as designed"). Nothing in P3-7-1 depends on the answer,
+    nor does P3-7-2a, which matches no subject to a session until it is decided: P3-7-2b builds it.
     - *Recommended: only policies that name sessions.*
       - A new subject, `Sessions`, matches every session in the organization, and
         `SessionRole {role}` a session in that role. `AllUsers`, `UserId`, `RoleId`, `AgentId` and
@@ -3305,7 +3309,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         writes those policies again.
     - *Or: a session matches what its owner does.*
       - `UserId {owner}` and `AllUsers` match a session, as they match its owner's devices today
-        (`crates/modules/network/src/tunnel.rs:1052`); Cedar's `net:*` alone narrows it.
+        (`crates/modules/network/src/tunnel.rs:1263`); Cedar's `net:*` alone narrows it.
       - What it costs: an organization with an `AllUsers` policy opens it to every session the
         moment it permits `net:*`.
 

@@ -514,7 +514,7 @@ Where it fires:
 | End | Trigger | Where |
 |---|---|---|
 | exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:347`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
-| client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:486`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1266` |
+| client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:486`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1271` |
 
 ⚠️ **The exclusion is `close`, not the loop exit.** The cancel is tied to
 `AgentTunnelPeer::close`, so a peer that is **kept** — never closed, e.g. one
@@ -656,7 +656,7 @@ established beside the first, promoted, the first drained.
 | `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:445`](../crates/tunnel-core/src/driver.rs) · `carry` `:606` · `dead` `:770` |
 | `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:150` · `offer` `:197` |
 | `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:67`](../crates/tunnel-core/src/flow_listener.rs) |
-| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1198`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1360` `run_flow_cycle` |
+| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1202`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1364` `run_flow_cycle` |
 | the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:893`](../crates/tunnel-core/src/driver.rs) |
 
 ```mermaid
@@ -698,7 +698,7 @@ open's 15 s and the ready's 30 s are caps a healthy exit cuts to 1–5 s) and is
 client timeout worth waiting out. Both are constants in P1, not config.
 
 ⚠️ **Nothing about #1754 moved.** The terminate guard is created at the same point
-([`driver.rs:1053`](../crates/tunnel-core/src/driver.rs), the moment the session id is
+([`driver.rs:1058`](../crates/tunnel-core/src/driver.rs), the moment the session id is
 known) and *moves into the carrier*, so an early `?`, a `QuicSetupFailed` soft-fall, the
 carrier's drop and the `kill_flow` abort all still tell the exit, and `kill_flow`'s
 synchronous fast path is unchanged. A killed flow drops its listener — the accept task is
@@ -756,7 +756,7 @@ sequenceDiagram
 ```
 
 The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_mgr.rs) ·
-[`client_mgr.rs:774`], mapped to deadlines by [`ProbeTimer`] `:811`), reset on a netwatch
+[`client_mgr.rs:778`], mapped to deadlines by [`ProbeTimer`] `:815`), reset on a netwatch
 **Major** and after a **promotion**, at most **one candidate per flow** in flight:
 
 | Failed probes | Next probe after |
@@ -769,10 +769,10 @@ The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_m
 
 | Piece | What it is | Where |
 |---|---|---|
-| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:854`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:874` |
-| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1070`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1107` · `CandidateGuard` `:1034` |
-| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1360`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
-| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:997`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:968` · `spawn_drain` `:1025` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
+| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:858`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:878` |
+| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1074`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1111` · `CandidateGuard` `:1038` |
+| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1364`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
+| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1001`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:972` · `spawn_drain` `:1029` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
 
 ⚠️ **A draining connection is NEVER cut, and there is no maximum drain time.** An RDP
 session that lives for hours keeps its old carrier for hours. The old carrier is dropped
@@ -848,11 +848,83 @@ Locked by lib tests, each shown red with a one-line negative control:
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
-   as *subject* (user / tunnel client) × *target* (agent) × *destination*
-   (`host:port`, protocol). Managed in the admin UI; every decision lands in
-   `tunnel_audit` (90 d).
+   as *subject* (user / tunnel client / agent / an agent session, below) ×
+   *target* (agent) × *destination* (`host:port`, protocol). Managed in the
+   admin UI; every decision lands in `tunnel_audit` (90 d).
 2. **Agent-local `forward_acl`** (config.toml): the exit machine's own last word —
    it survives a compromised server. Empty-but-enabled means "trust the server".
+
+### An agent session's grant (FR-90 P3-7-2a)
+
+A Hive agent session ([hive.md](hive.md)) reaches a private subnet, or the
+internet from a chosen place, through these same tunnels, but never as its
+device. It asks the vault, which decides by policy and answers with a
+**grant** ([vault.md](vault.md) §21): a token signed under its own `net_grant`
+audience. The grant names the session, its owner, the device it runs on (the
+origin), the exit, a forward's one destination, and an end at most 900 s away.
+The device presents it on `rc:tunnel.open`, over its own agent WS. The server
+binds it to that tunnel, and every flow the tunnel carries is then the
+**session's**, never the device's. No device presents one before P3-7-3.
+
+```mermaid
+sequenceDiagram
+    participant D as roomlerd (the session's device)
+    participant S as network module
+    participant E as exit
+    D->>S: rc:tunnel.open {agent_id: exit, open_nonce, net_grant}
+    S->>S: verify_net_grant: signature, audience, kind, destination, life
+    S->>S: an agent's own WS? its organization? origin = this device? exit = agent_id?
+    alt the grant holds
+        S-->>D: rc:tunnel.opened {session_id, open_nonce, net_grant_id}
+        D->>S: rc:tunnel.tcp.request {session_id, flow_id, dst}
+        S->>S: the grant first: TCP, before its end, a forward's one destination
+        S->>S: then tunnel_policies, for Principal::Session
+        S-->>D: rc:tunnel.tcp.reject {kind: acl_denied}, until a policy names sessions
+        S-->>E: rc:tunnel.tcp.forward, once one does (decision 20, P3-7-2b)
+    else it does not
+        S-->>D: rc:error {code: net_grant_refused, message, open_nonce}
+    end
+```
+
+| At the open, in order | Refused `net_grant_refused`, with the message |
+|---|---|
+| it came on an agent's own WS, not a tunnel client's | `a session's grant rides only its own device's connection` |
+| it verifies as a grant: this server's signature, the `net_grant` audience, a kind this build names, a forward's host canonical, every id it names an id, a life of at most 900 s, and before its end, with no leeway | `not a grant this server signed, or it has ended` |
+| its organization is this connection's | `a grant for another organization` |
+| its origin is this connection's device | `a grant for another device` |
+| its exit is the open's `agent_id` | `a grant for another exit` |
+
+| At each flow, before any policy is read | Rejected `acl_denied`, with the reason |
+|---|---|
+| TCP: a session's listener serves CONNECT only | `a session's grant carries TCP only` |
+| before the grant's end | `the session's grant has ended` |
+| a forward: toward the grant's one destination, its host compared in `canonical_net_host`'s one spelling | `outside the session's grant` |
+
+- ⚠️ **A grant that does not hold refuses the open.** It never falls back to
+  the device's own principal, which would hand the session whatever its device
+  may reach.
+- ⚠️ **A session matches no subject yet.** `subject_matches` answers `false`
+  for `Principal::Session` before it reads a subject: `AllUsers`, the owner's
+  `UserId` and the device's `AgentId` included. Which subjects match a session
+  is the operator's decision 20 (FR-90 §6), built in P3-7-2b. Until then a
+  session's flow passes its grant and every policy refuses it, so no policy
+  written before P3-7 opens anything to a session.
+- ⚠️ **An older server ignores the grant** (an unknown field) and opens the
+  tunnel as the device's own. `net_grant_id` on `rc:tunnel.opened` is the
+  device's proof that its grant was bound: a device that presented one carries
+  no session flow over a tunnel opened without it (P3-7-3).
+- **The audit names the session.** Every `tunnel_audit` row of such a tunnel
+  carries `session_id` and `grant_id`; its `user_id` is the session's owner,
+  and `origin_agent_id` stays the device.
+
+| Piece | Where |
+|---|---|
+| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:1863`](../crates/remote_control/src/signaling.rs#L1863)), `net_grant_id` on `rc:tunnel.opened` ([`:3580`](../crates/remote_control/src/signaling.rs#L3580)) |
+| the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
+| each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
+| the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
+| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:4571`](../crates/remote_control/src/models.rs#L4571)) |
+| tests | `tunnel::tests` in the network module (3), `policy::tests::a_session_matches_no_subject_yet`, `signaling::tests::tunnel_open_carries_a_grant_and_opened_echoes_its_id`, and end to end [`tunnel_grant_tests.rs`](../crates/tests/src/tunnel_grant_tests.rs) (3) |
 
 ## LocalAPI
 
