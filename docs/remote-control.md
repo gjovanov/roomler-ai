@@ -2993,6 +2993,38 @@ wakes every 30s, force-exits if the async watchdog hasn't bumped
 its `AtomicU64` heartbeat in 60s — catches a fully-deadlocked
 tokio runtime.
 
+**Where a stall froze** (#2551). A tick says a pump is alive, not
+where it is. The signaling loop awaits inside its `select!` arms,
+so a stall is one arm whose await never returned, and the INFO log
+is silent while it waits.
+- Every arm therefore enters a named stage first
+  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:375`):
+  `shutdown`, `keepalive`, `netchange`, `heartbeat`, `outbound`,
+  `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
+  `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
+  `ws.close` / `ws.error` / `ws.other`
+  (`agents/roomlerd/src/signaling.rs:1881` onwards).
+- The connection's setup awaits too, with the pump already counting.
+  It reads `setup`, and `setup.overlay` while the overlay runtime
+  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1496`).
+  Only the loop waiting for its next event reads `select`.
+- A `ws.text` arm is refined to the message it is handling, read
+  from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
+  `agents/roomlerd/src/signaling.rs:6385`). The dispatch awaits per
+  message, so that is where a stall inside it shows.
+- The `StageGuard` (`watchdog.rs:389`) puts the pump back to
+  `select` when the arm's scope ends, however it ends. An arm that
+  leaves early cannot leave its name behind for a later stall to be
+  blamed on.
+- The stall report then reads `signaling=93s@ws.text:rc:ssh.response`
+  (`stall_summary`, `watchdog.rs:405`). The `name=Ns` prefix is
+  unchanged, so a parser of the old line still finds the pump.
+- ⚠️ Read it from the crash record, not only the log. The summary
+  also goes into the crash sidecar that the next worker uploads
+  (`agent_crashes.summary` on the server). The forced exit loses its
+  own log line about 1 stall in 6, measured on a Windows dev box on
+  2026-10-19.
+
 **Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
 (`auth_backoff_for`): 30s → 60s → 5min → 1h capped. Server-side

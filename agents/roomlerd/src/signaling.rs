@@ -1490,6 +1490,10 @@ async fn connect_once(
     // backoff-reconnect cycle isn't counted against the 90 s stall
     // threshold. See the type-level comment on `SignalingPumpGuard`.
     let _pump_guard = SignalingPumpGuard::activate(ctx.pump);
+    // #2551 — the setup below awaits too (the hello, the overlay start) while
+    // the pump already counts: name it, so a stall here is not blamed on the
+    // select loop. Dropped where the loop starts; its arms name their own.
+    let setup_stage = watchdog::enter(ctx.pump, "setup");
     // Unification P1 — mark the daemon connected for the LocalAPI; the guard
     // clears it on every return path (like `_pump_guard`). Sentinel clearing
     // is primary-only (see `ConnectedGuard::mark`).
@@ -1687,6 +1691,10 @@ async fn connect_once(
     // and capture the channel its `rc:overlay.*` events flow into. The
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
+    // #2551 — a re-attach to a persistent runtime awaits that runtime's
+    // event channel, unbounded.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    watchdog::stage(ctx.pump, "setup.overlay");
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     let mut overlay_evt_tx = crate::overlay::maybe_start(
         cfg,
@@ -1704,6 +1712,8 @@ async fn connect_once(
         },
     )
     .await;
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    watchdog::stage(ctx.pump, "setup");
     // B1 — install THIS connection's RTT-sample sink: a hook wrapping a
     // WEAK handle to the runtime's event channel. `None` when overlay is
     // off; a stale hook is harmless (weak upgrade fails once the runtime
@@ -1862,9 +1872,13 @@ async fn connect_once(
     let mut net_rx: Option<NetDeltaRx> = None;
     let mut netchange_probe: Option<(std::time::Instant, u8)> = None;
 
+    // #2551 — setup is done: from here each arm names its own stage.
+    drop(setup_stage);
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
+                // #2551 — every arm names its stage, so a stall says where.
+                let _stage = watchdog::enter(ctx.pump, "shutdown");
                 if *shutdown.borrow() {
                     info!("shutdown signalled; closing ws");
                     close_all_peers(&mut peers, &indicator).await;
@@ -1877,6 +1891,7 @@ async fn connect_once(
                 }
             }
             _ = keepalive.tick() => {
+                let _stage = watchdog::enter(ctx.pump, "keepalive");
                 // W4(a) — TUN-death self-heal. The overlay runtime EXITS when
                 // its TUN dies (a contract the runtime tests pin), and before
                 // this the only respawner was the NEXT control-WS reconnect
@@ -2057,6 +2072,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             summary = next_major_netchange(&mut net_rx) => {
+                let _stage = watchdog::enter(ctx.pump, "netchange");
                 // New network = new throttle regime — the slowness treadmill
                 // re-earns its hold verdict from scratch.
                 *slowness_cycles = 0;
@@ -2084,6 +2100,7 @@ async fn connect_once(
                 }
             }
             _ = heartbeat.tick() => {
+                let _stage = watchdog::enter(ctx.pump, "heartbeat");
                 // Wave 3 — tunnel volume the server cannot see for itself
                 // (the payload rides the P2P data channel). Cumulative for
                 // each forward's life, so the server treats it like the
@@ -2243,6 +2260,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some(mut outbound_msg) = outbound_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "outbound");
                 // FR-52 P4 — the choke point for answers this process did not
                 // build itself: a GUI worker's (FR-43), relayed up by the
                 // delegation host. An external session's answer is sealed
@@ -2285,6 +2303,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some(sid) = carrier_ready_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "carrier_ready");
                 // FR-102 P9d — the carrier observation for a LIVE session just
                 // landed (`session_carrier::observe` set the OnceLock and
                 // signalled). Send ONE `rc:session.stats` for it NOW, by the
@@ -2309,6 +2328,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some((session_hex, allow)) = consent_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "consent");
                 // FR-27 — an Approve/Deny from the NATIVE panel. Routed
                 // through the broker, not applied here, so it passes the same
                 // live-prompt gate as a LocalAPI or CLI decision: an answer
@@ -2326,6 +2346,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some((sid, end)) = device_end(kill_rx, idle_rx) => {
+                let _stage = watchdog::enter(ctx.pump, "device_end");
                 // FR-101 P4b-2 — a hand-back from an idle watcher races the
                 // session's own end; one this connection no longer holds has
                 // nothing left to end (a disconnect closed every peer).
@@ -2444,6 +2465,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some(reap) = tunnel_reap_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "tunnel_reap");
                 // #1754 — a tunnel peer reports its client gone (a pool DC
                 // closed, the peer connection Failed, the QUIC connection
                 // ended). Until now only `rc:tunnel.terminate` and the WS
@@ -2492,6 +2514,7 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             Some(outcome) = quic_setup_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "quic_setup");
                 // #1761 — a TURN-relayed QUIC setup finished on its task.
                 // `settle` decides against this connection's in-flight
                 // entries: the attempt still held and not cancelled is
@@ -2547,6 +2570,7 @@ async fn connect_once(
             // this feature. Divergence is a compile error, so the duplication
             // cannot rot silently.
             Some(inbound) = next_delegated(&mut delegated_in) => {
+                let _stage = watchdog::enter(ctx.pump, "delegated");
                 watchdog::tick(ctx.pump);
                 let delegated_msg = match inbound {
                     // The parameters the daemon resolved, arriving ahead of the
@@ -2648,10 +2672,17 @@ async fn connect_once(
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
+                    let _stage = watchdog::enter(ctx.pump, "ws.text");
                     last_rx = std::time::Instant::now();
                     watchdog::tick(ctx.pump);
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
+                            // #2551 — which message this arm is handling: the
+                            // dispatch below awaits per message.
+                            watchdog::stage(
+                                ctx.pump,
+                                format!("ws.text:{}", server_msg_tag(&text).unwrap_or("?")),
+                            );
                             // Phase 3b: route `rc:overlay.*` to the node
                             // runtime; everything else falls through to the
                             // normal dispatch below.
@@ -2748,6 +2779,7 @@ async fn connect_once(
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
+                    let _stage = watchdog::enter(ctx.pump, "ws.ping");
                     last_rx = std::time::Instant::now();
                     if let Err(e) = send_frame(&mut ws, Message::Pong(data)).await {
                         warn!(%e, "pong reply failed — will reconnect");
@@ -2759,6 +2791,7 @@ async fn connect_once(
                     watchdog::tick(ctx.pump);
                 }
                 Some(Ok(Message::Close(_))) | None => {
+                    let _stage = watchdog::enter(ctx.pump, "ws.close");
                     info!("ws closed by peer");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
@@ -2766,12 +2799,14 @@ async fn connect_once(
                     return Ok(());
                 }
                 Some(Err(e)) => {
+                    let _stage = watchdog::enter(ctx.pump, "ws.error");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
                 Some(Ok(Message::Pong(payload))) => {
+                    let _stage = watchdog::enter(ctx.pump, "ws.pong");
                     last_rx = std::time::Instant::now();
                     outstanding_ping = None;
                     // Zombie-slow WS detector (see [`WS_PONG_RTT_DEGRADED`]):
@@ -2819,6 +2854,7 @@ async fn connect_once(
                 // Binary / raw frames — any inbound frame proves the link
                 // is alive.
                 Some(Ok(_)) => {
+                    let _stage = watchdog::enter(ctx.pump, "ws.other");
                     last_rx = std::time::Instant::now();
                 }
             }
@@ -6343,6 +6379,18 @@ async fn close_all_peers(
     );
 }
 
+/// #2551 — the `t` tag of a server message, read from its raw JSON without
+/// building the message a second time: the stage a `ws.text` arm is refined
+/// to, so a stall in the dispatch names the message it was handling.
+fn server_msg_tag(text: &str) -> Option<&str> {
+    #[derive(serde::Deserialize)]
+    struct Tag<'a> {
+        #[serde(borrow)]
+        t: &'a str,
+    }
+    serde_json::from_str::<Tag<'_>>(text).ok().map(|tag| tag.t)
+}
+
 /// T2.10d: tear down every tunnel peer on WS disconnect. Cheap
 /// no-op when the map is empty (normal for agents that never serve
 /// a tunnel).
@@ -6913,6 +6961,30 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2551 — a `ws.text` stage is refined to the message's wire tag, read
+    /// straight from the JSON. Anything without a plain `t` gives `None`, and
+    /// the arm then names `?` rather than failing.
+    #[test]
+    fn a_server_message_tag_is_read_from_its_json() {
+        assert_eq!(
+            server_msg_tag(r#"{"t":"rc:ssh.response","request_id":"x","port":2222}"#),
+            Some("rc:ssh.response")
+        );
+        assert_eq!(
+            server_msg_tag(r#"{"port":2222,"t":"rc:goodbye"}"#),
+            Some("rc:goodbye")
+        );
+        assert_eq!(server_msg_tag(r#"{"request_id":"x"}"#), None);
+        assert_eq!(server_msg_tag("not json"), None);
+        // Every real tag parses: one the dispatch handles, serialised here.
+        let msg = ServerMsg::Goodbye {
+            reason: AgentCloseReason::AgentDeleted,
+            message: "x".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(server_msg_tag(&json), Some("rc:goodbye"));
+    }
 
     /// #2221 — a dropped session that lived restarts the reconnect ladder. A
     /// quick drop, or a failure inside an outage, keeps climbing it.
