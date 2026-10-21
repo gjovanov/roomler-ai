@@ -111,7 +111,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 
 | Feature | Windows | Linux | macOS |
 |---|---|---|---|
-| The desktop app | ✅ | 🟡 x86_64 `.deb` and `.rpm` | ✅ |
+| The desktop app | ✅ | 🟡 a `.deb` and an `.rpm`, for x86_64 and arm64; nothing for a computer with neither package manager, such as Arch | ✅ |
 | The computer stays awake during a session | ✅ | ✅ | ✅ except a closed laptop with no external display |
 | A received file lands in your own Downloads | ✅ | ✅ | ✅ |
 | The setup wizard installs the agent | ✅ | ❌ use the one-line install | ❌ use the one-line install |
@@ -127,7 +127,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 | The tunnel client (`roomler self-update`) updates itself | ✅ | ❌ | ❌ |
 | Processors the agent runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |
 | Hardware video encoding on Linux ARM | — | ❌ | — |
-| The tunnel client and the wizard on Linux ARM | — | ❌ | — |
+| The tunnel client and the wizard on Linux ARM | — | ✅ from 0.4.149: the wizard with the agent release, the tunnel client with the first tunnel release from then on | — |
 
 ## Where the operating system rules it out
 

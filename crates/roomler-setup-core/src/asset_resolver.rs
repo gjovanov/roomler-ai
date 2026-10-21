@@ -276,6 +276,13 @@ pub fn current_platform() -> &'static str {
         // double-clicked wizard EXE consumes.
         "linux-x86_64"
     }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        // FR-97 P7b — the aarch64 wizard installs the aarch64 CLI. Before
+        // it this said "unsupported", and the wizard refused on an arm64
+        // host with UnsupportedPlatform.
+        "linux-aarch64"
+    }
     #[cfg(target_os = "macos")]
     {
         "macos"
@@ -283,12 +290,13 @@ pub fn current_platform() -> &'static str {
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
         target_os = "macos"
     )))]
     {
-        // Aarch64-Linux, FreeBSD, etc. — wizard EXE doesn't ship for
-        // these platforms in v1, but the const has to exist so the
-        // crate compiles. Backend will 404 for an unknown platform.
+        // FreeBSD, Windows on ARM, etc. — the wizard doesn't ship for
+        // these, but the const has to exist so the crate compiles.
+        // Backend will 404 for an unknown platform.
         "unsupported"
     }
 }
@@ -405,10 +413,15 @@ mod tests {
         assert!(
             matches!(
                 plat,
-                "windows-x86_64" | "linux-x86_64" | "macos" | "unsupported"
+                "windows-x86_64" | "linux-x86_64" | "linux-aarch64" | "macos" | "unsupported"
             ),
             "unexpected platform {plat:?}"
         );
+        // FR-97 P7b — an aarch64 Linux build names its own arch, never the
+        // x86_64 token (which would install a CLI it cannot run).
+        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            assert_eq!(plat, "linux-aarch64");
+        }
     }
 
     #[test]
