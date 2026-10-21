@@ -482,7 +482,7 @@ command reports "daemon not running", you are probably asking the wrong half.
 
 Video encodes in hardware through VideoToolbox, H.264 and HEVC: the FFmpeg
 cascades carry `h264_videotoolbox` and `hevc_videotoolbox`
-(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:97`, `:161`), and the macOS
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:115`, `:179`), and the macOS
 release builds `ffmpeg-encoder`; a MacBook's probe advertises both cells
 ([encoders.md](encoders.md)). Software H.264 (openh264) and VP9-4:4:4 (libvpx)
 are offered too. There is no AV1 encode: Apple ships AV1 decode only. Remote

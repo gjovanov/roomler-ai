@@ -90,7 +90,7 @@ what it costs in installer size and ships with integration and e2e tests.
   it is wall-clock. A lock screen or `ACCESS_LOST` re-acquires and inserts a black gap; it never aborts. A fast user
   switch terminates the worker, so the recording ends `session_changed` — a recording never follows a user switch.
 - **Recording encoder profile.** A new `RateMode { ConstantQuality { q }, Vbr { … } }` and an explicit GOP are threaded
-  through `build_encoder` (`encode/ffmpeg/encoder.rs:1487`) and `encoder_options` (`:240`); today both force
+  through `build_encoder` (`encode/ffmpeg/encoder.rs:1507`) and `encoder_options` (`:258`); today both force
   maxrate/bufsize and a 64 800-frame GOP (`:51`).
 
   | Backend | Recording options |

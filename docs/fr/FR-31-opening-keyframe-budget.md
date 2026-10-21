@@ -49,7 +49,7 @@ Two things this is NOT, both refuted by data rather than assumed:
    `if (ctx->quality)` block, which runs *later* in `nvenc_setup_rate_control` — does
    `averageBitRate = bit_rate = 0; vbvBufferSize = rc_buffer_size = 0; maxBitRate = rc_max_rate`.
    So the agent's HRD sizing in `encoder_options`
-   (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:228-260`, the rc.234 "2× the ceiling" design
+   (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:246-278`, the rc.234 "2× the ceiling" design
    and the rc.442/443 constrained-window notes) **never reaches the driver on NVENC**. The
    driver runs its own default for the `ll` tuning, which behaves as a single-frame reservoir:
    the opening IDR may spend ~`maxrate/fps` (85 kbit at 2.55 Mbps / 30 fps — the observed
@@ -60,7 +60,7 @@ Two things this is NOT, both refuted by data rather than assumed:
    driver. That is what the A/B has to establish.
 
 The runtime side already works: the agent's `set_bitrate`
-(`encoder.rs:1649-1686`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
+(`encoder.rs:1669-1706`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
 ffmpeg's reconfigure path (`nvenc.c:2985-3001`) applies both via `NvEncReconfigureEncoder`
 before the next frame — the `if (avctx->rc_buffer_size > 0 && vbvBufferSize != rc_buffer_size)`
 branch is unconditional on `cq`. Consequence worth writing down: **from the first AIMD step
@@ -75,7 +75,7 @@ faster, so the same starvation is over in ~0.3 s.
 
 **P1 — make the intended reservoir reach the driver before frame 0 (NVENC).** Right after
 `build_encoder` returns an opened NVENC context (the constructor funnel at
-`encoder.rs:993-1039`, the `Ok(encoder)` arm), write `rc_buffer_size = open_vbv_bits` on the
+`encoder.rs:1013-1059`, the `Ok(encoder)` arm), write `rc_buffer_size = open_vbv_bits` on the
 context, exactly as `set_bitrate` does; ffmpeg's reconfigure applies it on the first
 `send_frame`, before the opening IDR is encoded. `open_vbv_bits = buf × pct / 100`, where `buf`
 is the same HRD window `encoder_options` already computes (`maxrate × hrd_pct / 100`; AV1 is
