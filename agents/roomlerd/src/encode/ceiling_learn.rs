@@ -125,9 +125,17 @@ impl CeilingLearner {
     }
 
     /// The ceiling the AIMD should run under, given the plan's nominal one.
-    /// Never below the plan; never above `hi`.
+    /// Never below the plan; never above `hi`. Records the nominal: the
+    /// learner's own judgements run against the frame actually encoded.
     pub fn effective_ceiling(&mut self, plan_ceiling_bps: u32) -> u32 {
         self.nominal_bps = plan_ceiling_bps;
+        self.ceiling_for(plan_ceiling_bps)
+    }
+
+    /// FR-70 M3a.2 — [`Self::effective_ceiling`] without recording the
+    /// nominal: the ceiling for some OTHER dims than the frame being encoded
+    /// (a dims replacement's), which must not move the learner's reference.
+    pub fn ceiling_for(&self, plan_ceiling_bps: u32) -> u32 {
         if self.hi_bps == 0 {
             return plan_ceiling_bps;
         }
@@ -287,6 +295,28 @@ mod tests {
             }
         }
         out
+    }
+
+    /// FR-70 M3a.2 — asking the ceiling for a dims replacement's dims returns
+    /// what the per-frame call would, and leaves the learner's nominal on the
+    /// frame actually encoded.
+    #[test]
+    fn ceiling_for_answers_like_effective_ceiling_without_recording_the_nominal() {
+        for (hi, seed) in [
+            (0, None),
+            (HI, None),
+            (HI, Some(6_000_000)),
+            (HI, Some(100_000_000)),
+        ] {
+            let mut l = CeilingLearner::new(hi, seed);
+            l.effective_ceiling(NOMINAL);
+            let asked = l.ceiling_for(1_200_000);
+            assert_eq!(l.nominal_bps, NOMINAL, "asking must not move the nominal");
+            let mut twin = CeilingLearner::new(hi, seed);
+            twin.effective_ceiling(NOMINAL);
+            assert_eq!(l.current_ceiling(), twin.current_ceiling());
+            assert_eq!(asked, twin.effective_ceiling(1_200_000));
+        }
     }
 
     #[test]

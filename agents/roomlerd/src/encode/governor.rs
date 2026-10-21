@@ -512,6 +512,18 @@ impl RateGovernor {
         }
     }
 
+    /// FR-70 M3a.2 — what [`Self::effective_ceiling`] would return, without
+    /// recording anything: the per-frame call keeps the learner's nominal in
+    /// step with the frame actually encoded, so the ceiling for a dims
+    /// replacement's dims is asked here.
+    pub fn ceiling_for(&self, plan_ceiling_bps: u32, constrained: bool) -> u32 {
+        if constrained {
+            self.learner.ceiling_for(plan_ceiling_bps)
+        } else {
+            plan_ceiling_bps
+        }
+    }
+
     /// FR-35 — the learned ceiling (0 = nothing learned or seeded), for the
     /// heartbeat.
     pub fn learned_ceiling_bps(&self) -> u32 {
