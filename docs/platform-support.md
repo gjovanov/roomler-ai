@@ -154,7 +154,7 @@ and never outliving the daemon (FR-97 P0e).
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
 | The desktop companion | ✅ | 🟡 a `.deb` and an `.rpm` for x86_64 and, since 0.4.138, arm64 (FR-93 P6d, P6e); none for a host with neither dpkg nor rpm, such as Arch (FR-97 D17) | ✅ in the `.pkg` | `.github/workflows/release-agent.yml:733-744`, `:822-827`, `:914` |
-| Its pages on a system install | ✅ | 🟡 the safety pages | ❓ never run | `docs/desktop-companion.md` |
+| Its pages on a system install | ✅ | 🟡 the safety pages; Devices and the mesh since 0.4.150 (FR-97 P2g) | 🟡 a two-half Mac: Devices and the mesh from the root half since 0.4.150 (FR-97 P2g); the Connection column and Overview's network fields (count, overlay address, MagicDNS, exit) still the per-user half's (P2h) | `docs/desktop-companion.md` §6, §12 |
 | The host stays awake during a session | ✅ `PowerCreateRequest` | ✅ a logind block inhibitor | ✅ `IOPMAssertion`; a closed lid with no external display sleeps anyway (§8) | `agents/roomlerd/src/power.rs:643-656` |
 | A received file lands as the signed-in person | ✅ | ✅ the person at seat0's Downloads | ✅ | `agents/roomlerd/src/files.rs:209-227` |
 | Hive: adopt a terminal session | ✅ a named pipe | ✅ | ✅ | `agents/roomlerd/src/hive/supervisor/adopt.rs:562` |

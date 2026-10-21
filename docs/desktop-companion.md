@@ -256,6 +256,47 @@ sequenceDiagram
 - **From a terminal:** `roomler devices [--org L] [-q TEXT] [--sort KEY] [--desc]
   [--page N] [--per-page N] [--json]`.
 
+### A two-half Mac asks its root half (FR-97 P2g)
+
+A Mac with both halves (FR-43) is **two devices**, and only the root half is on the private
+network: only root can hold a utun. The companion talks to the per-user half, whose own answer
+is `no_node`, so the page listed the Mac and nothing else. The per-user half now asks the root
+half for the machine's view, over a person socket the root half serves the console user:
+
+```mermaid
+sequenceDiagram
+    participant G as Devices page
+    participant U as per-user half (the console user)
+    participant S as /api/agent/self/*
+    participant R as root half (/var/run/roomler-person/<uid>.sock)
+    G->>U: Devices / Mesh
+    U->>S: with ITS token
+    S-->>U: itself only · overlay = no_node
+    U->>R: the same request (5 s)
+    R->>S: with the root half's token
+    S-->>R: the netmap's devices · overlay = ok
+    R-->>U: DevicesPage
+    U-->>G: the root half's answer, when it is `ok`; its own otherwise
+```
+
+- **Only a `no_node` answer off root asks** (`person_socket::machine_view_wanted`), and only an
+  `ok` answer replaces it (`machine_view_usable`). A root half that is missing, older, switched
+  off (`ROOMLERD_PERSON_SOCKET=0`) or itself off the network leaves the per-user half's own
+  answer on screen, as before. So does a socket served by anyone but root
+  (`localapi::connect_unix_served_by_root`).
+- **"This device" is the root half's row.** The per-user half's own row has no node, so the
+  machine's netmap does not carry it, and it is not in the list.
+- **Still the per-user half's: the Connection column and the Overview page's network
+  fields.** They come from the half's own synchronous `Peers` and `Status`, and that half runs
+  no overlay. So on a Mac:
+  - the Connection column shows `—`, and the dot falls back to the server's presence;
+  - Overview shows no online count and "(no overlay IP)", with no MagicDNS or exit line,
+    though the machine holds an address.
+
+  Serving them from the root half too is FR-97 P2h.
+- The root half's person socket, its directory and the uid check: §12 and the
+  [security baseline](security-baseline.md) §4.
+
 ## 7. Apply now — restarting the service from the companion
 
 Most settings are read once at startup, so saving one is not the same as applying it. The
@@ -549,11 +590,17 @@ at the person's own `/run/user/<uid>/roomler.sock`, which is the path the compan
 tries first:
 - it is theirs, mode 0600, and only they or root may connect (`SO_PEERCRED`);
 - it follows the active graphical session's user;
-- it serves only the safety surface: status, the sessions viewing the screen, their
-  Disconnect, consent, and the recording state.
+- it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
+  consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
+  and the mesh, read-only (§6).
 
 Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
 views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
+
+A Mac's root half serves its console user one as well (FR-97 P2g), at
+`/var/run/roomler-person/<uid>.sock` in a directory only root writes: there the per-user half
+is the person's own daemon already, and what it asks the root half for is the machine's
+private-network view (§6).
 
 ⚠️ **A session the compositor says nothing about starts the companion** (FR-93 P6g). On
 Wayland the desktop's own screen-sharing indicator (GNOME's pill, KDE's tray icon) shows for

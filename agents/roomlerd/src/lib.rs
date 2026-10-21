@@ -129,8 +129,9 @@ pub mod peer;
 /// FR-100 P1a — this enrollment's device key: made here, kept in its own file
 /// beside the config, only its public half on the hello.
 pub mod peer_auth;
-/// FR-27 P11 — the person-at-the-device socket of a Linux system install.
-#[cfg(target_os = "linux")]
+/// FR-27 P11 — the person-at-the-device socket of a Linux system install; FR-97
+/// P2g — and of a Mac's root half, which its per-user half asks for the
+/// machine's Devices and Mesh. The pure decisions build everywhere, for tests.
 pub mod person_socket;
 /// The pinned-key `.asc` check, which lives in `tunnel-core` since FR-97 P6b
 /// so the CLI's `self-update` shares it. Re-exported, so `crate::pgp_verify`

@@ -1870,27 +1870,46 @@ impl LocalApiState for DaemonState {
     /// FR-84 D5b — the devices this device may see, asked of the org's
     /// server with the org's agent token (`self_view.rs`). Read-only; the
     /// token never crosses the pipe.
+    ///
+    /// FR-97 P2g — on a Mac's per-user half, which has no overlay node, the
+    /// server's answer is this device alone (`no_node`); the machine's view is
+    /// the root half's, asked over its person socket
+    /// ([`crate::person_socket::or_machine_view`]).
     async fn devices(&self, org: &str, query: &tunnel_core::localapi::DevicesQuery) -> Response {
-        match &self.self_view {
+        let own = match &self.self_view {
             Some(view) => view.devices(org, query).await,
             None => Response::Upstream {
                 code: "unsupported".into(),
                 message: "this daemon was started without a server identity to ask".into(),
                 status: None,
             },
-        }
+        };
+        let req = tunnel_core::localapi::Request::Devices {
+            org: org.to_string(),
+            page: query.page,
+            per_page: query.per_page,
+            q: query.q.clone(),
+            sort: query.sort.clone(),
+            dir: query.dir.clone(),
+        };
+        crate::person_socket::or_machine_view(own, req).await
     }
 
-    /// FR-84 D5b — the mesh graph for the same set.
+    /// FR-84 D5b — the mesh graph for the same set (and, FR-97 P2g, the
+    /// machine's on a Mac's per-user half, as [`Self::devices`]).
     async fn mesh(&self, org: &str) -> Response {
-        match &self.self_view {
+        let own = match &self.self_view {
             Some(view) => view.mesh(org).await,
             None => Response::Upstream {
                 code: "unsupported".into(),
                 message: "this daemon was started without a server identity to ask".into(),
                 status: None,
             },
-        }
+        };
+        let req = tunnel_core::localapi::Request::Mesh {
+            org: org.to_string(),
+        };
+        crate::person_socket::or_machine_view(own, req).await
     }
 
     /// S1b — archive the STALE config copy on a split-config host (the
