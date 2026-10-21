@@ -146,7 +146,7 @@ sequenceDiagram
     SCM->>Host: start
     Host->>SCM: Running
     Host->>FW: netsh delete + add "Roomler UDP-In (roomlerd)" (≤ 10 s per call)
-    Host->>FW: read the rule store; Remove-NetFirewallRule for inbound Block rules whose program == roomlerd.exe (≤ 30 s, only if any)
+    Host->>FW: read the rule store, Remove-NetFirewallRule for inbound Block rules whose program == roomlerd.exe (≤ 30 s, only if any)
     Host->>Worker: CreateProcessAsUserW
     Worker->>FW: bind 0.0.0.0:<udp> — a rule exists for this path
     Note over FW,Worker: no prompt, so no Block rules

@@ -149,15 +149,15 @@ sequenceDiagram
     participant S as underlay UDP socket
 
     C->>A: timeout(UDP_ALLOC_TIMEOUT, …)
-    A->>S: bind (Arc #1)
-    A->>T: listen() spawns — takes Arc #2
+    A->>S: bind (Arc #35;1)
+    A->>T: listen() spawns — takes Arc #35;2
     Note over A: guard armed HERE, before listen()
     C--xA: timeout fires → the future is DROPPED
-    alt before #1556
-        Note over T,S: task still holds Arc #2 → socket bound forever
-    else after #1556
+    alt before #35;1556
+        Note over T,S: task still holds Arc #35;2 → socket bound forever
+    else after #35;1556
         A->>T: ClientCloseGuard::drop spawns close()
-        T-->>S: close_notify cancelled → task exits → Arc #2 dropped → socket freed
+        T-->>S: close_notify cancelled → task exits → Arc #35;2 dropped → socket freed
     end
 ```
 
@@ -240,9 +240,9 @@ sequenceDiagram
         Q->>M: QM query <uuid>.local
     end
     Note over A: session ends: pc.close() → agent.close()
-    alt before #1740
+    alt before #35;1740
         Note over Q: never answered, never told: asks forever,<br/>and the closed agent keeps every socket bound
-    else after #1740
+    else after #35;1740
         A-->>Q: close() raises `closed` (a watch) → the task returns
         Note over A: agent, candidates, sockets freed
     end
@@ -352,7 +352,7 @@ sequenceDiagram
 
     Note over D: session id known → TerminateOnDrop armed
     K->>D: end the session (return / abort)
-    Note over D: guard Drop spawns the send (Drop can't await);<br/>the spawned task is independent of an aborted one
+    Note over D: guard Drop spawns the send (Drop can't await),<br/>the spawned task is independent of an aborted one
     D->>S: rc:tunnel.terminate { session_id }
     S->>A: rc:tunnel.terminate (relayed)
     Note over A: reaps AgentTunnelPeer — sockets + DC pool freed
@@ -411,7 +411,7 @@ sequenceDiagram
         Note over A: ICE Disconnected at 5 s — NOT reported, a live client crosses this
         A->>L: TunnelReap { pc_failed } at ~30 s — terminal, frees nothing by itself
     end
-    L->>L: remove from BOTH maps; neither held it → nothing (a peer's own close reports too)
+    L->>L: remove from BOTH maps, neither held it → nothing (a peer's own close reports too)
     L->>A: close_within_budget(peer.close(), "tunnel_remote_gone") — the sockets go here
     L->>S: rc:tunnel.terminate { io_error } (relayed to a client still registered)
 ```
@@ -749,10 +749,10 @@ sequenceDiagram
     S->>X: open a candidate session requesting quic-v1 (background task)
     X-->>S: quic-v1 ready — candidate fully established
     S->>L: install(B) — new connections → B (atomic swap)
-    S->>S: log "flow re-upgraded webrtc-dc-v1 → quic-v1"; FlowLive.transport = quic-v1
-    Note over A: DRAINING — no new connections; established ones keep flowing
+    S->>S: log "flow re-upgraded webrtc-dc-v1 → quic-v1", FlowLive.transport = quic-v1
+    Note over A: DRAINING — no new connections, established ones keep flowing
     A-->>S: active() reached 0 (or A died)
-    S->>X: drop A → rc:tunnel.terminate (the #1754 guard) — the exit frees its peer
+    S->>X: drop A → rc:tunnel.terminate (the #35;1754 guard) — the exit frees its peer
 ```
 
 The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_mgr.rs) ·

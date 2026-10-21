@@ -1804,6 +1804,22 @@ jobs:
       - name: Audit anchor ranges
         run: bash scripts/anchor-range-audit.sh
 
+  mermaid-sequences:
+    name: Every mermaid sequence diagram parses
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Mermaid's sequence lexer ends a message's text at a `;` (a statement
+    # separator) or a `#` (a comment). With a `;` GitHub draws "Unable to
+    # render rich display: Parse error" where the diagram should be; with a
+    # `#` the message is silently cut short. There were 69 such lines on
+    # master when this landed (2026-10-21), across 24 docs, and no build,
+    # test or link check noticed. Mermaid's entity codes (`#59;`, `#35;`,
+    # `#lt;`) are decoded before the lexer runs, so they spell either one.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit mermaid sequence diagrams
+        run: bash scripts/mermaid-sequence-audit.sh
+
   machine-names:
     name: No real machine names
     runs-on: ubuntu-latest

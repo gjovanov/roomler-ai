@@ -33,7 +33,7 @@ sequenceDiagram
     A->>S: POST …/agent/{id}/overlay-key/rotate
     S->>S: gates: MANAGE_AGENTS · 1 order/min/device · the device advertises key-rotate
     S->>S: agents.key_rotation = {request_id, public_key_before} · key_rotation_audit row
-    S-->>D: rc:agent.key_rotate {request_id}  (only to a live socket; else queued)
+    S-->>D: rc:agent.key_rotate {request_id}  (only to a live socket, else queued)
     D->>D: kill switch? own 60 s ceiling? → mint WgKeypair → config::save (lock, fsync, .prev)
     D-->>S: rc:agent.key_rotated {request_id, rotated, old_pub, new_pub, key_epoch}
     D->>D: close every session on this org · reconnect under the new key

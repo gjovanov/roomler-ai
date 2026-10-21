@@ -1038,7 +1038,7 @@ sequenceDiagram
     S->>D: rc:session.request (RECORD kept: may_record and the cap)
     D->>D: consent (the local floor) → RecordMeta { controller, prompt window }
     D->>W: SessionParams { …, record: DelegatedRecord } (then the offer)
-    W->>W: its peer; the record channel gets the context
+    W->>W: its peer, the record channel gets the context
     V->>W: rc:record.start (P2P, the record channel)
     W->>R: spawn as itself: the person, in their GUI session, holding the grant
     W->>D: RecordingActivity (admitted: a session handed over with RECORD)

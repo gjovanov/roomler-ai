@@ -318,7 +318,7 @@ sequenceDiagram
         P->>P: TrialMeter
     end
     alt 10 s of motion at 120
-        P->>P: Proven, cached; no trial next time
+        P->>P: Proven, cached, no trial next time
     else short of the rate
         P->>C: set_target_fps(60)
         P-)E: open the replacement at 60

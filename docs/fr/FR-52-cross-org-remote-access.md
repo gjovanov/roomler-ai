@@ -282,7 +282,7 @@ sequenceDiagram
   participant B as Outsider's browser
   participant S as Server (Hub)
   participant D as Device (roomlerd)
-  Note over B,D: P3 — login VERIFIED. B and D each derive AppKey; S keeps a bookkeeping entry, not a credential.
+  Note over B,D: P3 — login VERIFIED. B and D each derive AppKey, S keeps a bookkeeping entry, not a credential.
   B->>S: rc:extauth.session {connect_code, attempt_id, permissions}
   S->>S: resolve the code · spend the verified login (principal + device) · gates 1–2 · external-session cap · clamp to the org ceiling
   S->>D: rc:request {…, external: {attempt_id}}

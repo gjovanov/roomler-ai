@@ -508,7 +508,7 @@ sequenceDiagram
     T->>K: netstat -rnW (the table: a lookup answers with a scoped clone)
     alt every v4 pin holds through the uplink
         G->>T: add_cidr_route(0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1)
-        G->>G: steer DNS (P1c); set_v6_exit only when the v6 exemptions hold
+        G->>G: steer DNS (P1c), set_v6_exit only when the v6 exemptions hold
     else a pin fails, or the table shows it elsewhere
         G->>G: WITHHOLD — egress stays on the uplink, the reason goes to roomler status
     end

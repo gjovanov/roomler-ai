@@ -253,7 +253,7 @@ sequenceDiagram
     Note over B: capabilities store: has(m) = bundle carries m (VITE_MODULES) AND server mounts m<br/>FAIL-OPEN until the answer arrives
     B->>B: router.beforeEach awaits caps.ready()
     alt route.meta.module is mounted
-        B->>B: navigate; AppLayout / TenantDashboard show the pillar's nav + tiles
+        B->>B: navigate, AppLayout / TenantDashboard show the pillar's nav + tiles
     else refused
         B->>B: land on the org dashboard
     end
@@ -368,7 +368,7 @@ sequenceDiagram
     participant F as fleet (record owner)
     O->>C: agent_removed(agent)
     C->>H: FleetLifecycle — end its agent sessions (an end note in each room), rc:hive.stop while the socket is still there
-    C->>V: FleetLifecycle — take back its vault leases, rc:vault.revoke while the socket is still there (P3-3c; a failure is logged, never a refusal)
+    C->>V: FleetLifecycle — take back its vault leases, rc:vault.revoke while the socket is still there (P3-3c, a failure is logged, never a refusal)
     C->>R: FleetLifecycle — end RC sessions
     C->>N: FleetLifecycle — release the overlay lease (tombstone, pool the host, netmap_delta removes)
     C->>F: FleetLifecycle — delete the row, kick the socket
