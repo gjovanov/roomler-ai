@@ -22,9 +22,9 @@ latency side; this FR is the cadence side.
 
 | What | Where | Consequence |
 |---|---|---|
-| The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | Every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9495`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:9912` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9523`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:9940` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts are whole milliseconds | `TIME_BASE_DEN = 1000` `encode/ffmpeg/encoder.rs:86`; `pts = monotonic_us / 1000` `:2044` | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carry equal pts |
 | The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1697`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2262`, `:2278`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps |
 | The direct ceiling law is linear in fps and clamped at 48 Mbps | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:193`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor | 1920×1080 at 144 fps computes 74.6 M and clamps to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit. Above 60 the picture gets softer per frame |
@@ -43,16 +43,23 @@ latency side; this FR is the cadence side.
 
 ### 3.1 The viewer asks; the host says what it can do
 
-- **Hello.** `AgentCaps` gains the verb `fps-high`, matched by **equality** like every capability verb, and
-  ignored by servers and viewers that do not know it. `DisplayInfo` gains `refresh_hz: Option<u16>` (serde
-  default; old peers skip it).
+- **Hello.** `AgentCaps.video`, where `chunk-framing` and `bench` already live, gains `fps-high`. It is matched by
+  **equality** like every capability verb, and ignored by servers and viewers that do not know it.
+- **The host's refresh rate** rides `rc:video-info` (`refresh_hz`, the captured monitor's) once a per-OS reader
+  exists. It does not go into `DisplayInfo`: that struct lives in the agent row the server stores and the viewer
+  never reads, so a field there would change the server and still reach no picker. Not built in P1.
 - **Ask.** `rc:fps {fps: 60 | 120 | 144}` on the control channel, handled next to `rc:resolution`. The viewer
   sends it only to an agent that advertised `fps-high`; an agent that receives an unknown value drops it, as it
   does for `rc:resolution`. Shared pipelines merge their viewers' asks by `min`, the way they floor-merge
   resolution (`media_share.rs:318`). A viewer on a 60 Hz screen therefore never receives a heavier stream than it
   asked for.
-- **Picker.** Settings → Frame rate: 60 (default), 120, 144. An option above the host display's `refresh_hz`,
-  or any option for an agent without `fps-high`, is shown disabled, with the reason.
+- **Answer.** In `rc:video-info`, the message that already describes the stream: `fps` (what the stream runs
+  at), and when an ask was not granted, `fps_asked` + `fps_reason`. Not a separate message: the pump knows its
+  cap and its transport, so its answer is always correct, and a new ask or a new target re-sends video-info
+  through the path every other refresh already takes.
+- **Picker.** Settings → Frame rate: 60 (default), 120, 144. It is shown only for an agent that advertises
+  `fps-high`. A picker every viewer sees before any agent can honour it is noise. Once the host's refresh rate is
+  reported, an option above it is shown disabled, with the reason.
 
 ### 3.2 When the agent grants it
 
@@ -64,9 +71,9 @@ Above 60 fps only when **all** of these hold, re-checked whenever any of them mo
 2. The host has **proven the rate class** (§3.3) for this capture backend, display refresh, encoder and geometry.
 3. The pipe belief ([FR-79](FR-79-one-validity-gate.md)) covers the higher ceiling (§3.4).
 
-The agent answers every ask with what it granted and why: `rc:fps.state {asked, granted, reason}`, with reasons
-such as `constrained`, `unproven`, `refresh`, `pipe`, `denied`. A viewer that asked for 120 and sees 60 is told
-why, as FR-108 tells the display-match refusal.
+The agent answers every ask in `rc:video-info` with what the stream runs at and, when it did not grant the ask,
+why: `fps_reason` is `constrained` or `unproven` in P1, and P2 adds `refresh`, `pipe` and `denied`. A viewer
+that asked for 120 and sees 60 is told why, as FR-108 tells the display-match refusal.
 
 ### 3.3 The rate class: proven by a session, never assumed
 
@@ -91,7 +98,9 @@ and as with encoder cells, the probe proves an open and only a session proves th
 - **The ceiling law:** `ceiling(fps) = ceiling(60) × (fps / 60)^α`, with a higher band top for the 120–144 class.
   At 60 the law is byte-identical to today's. α is **measured**, not chosen: a constant-quality run on the same
   screen content at 60 and at 120 shows how many bits the encoder actually spends per second. Inter frames 8 ms
-  apart differ less than frames 17 ms apart, so α is expected well below 1.
+  apart differ less than frames 17 ms apart, so α is expected well below 1. There is a precedent in the code:
+  FR-112 already scales the RTP pump's bitrate base by `√(fps / 30)`, i.e. α = 0.5 (`bitrate_base_for_fps`,
+  `agents/roomlerd/src/encode/mod.rs`).
 - **The capture gate:** above 60, the slot-first gate (FR-98 C1) is used regardless of `ROOMLERD_CAPTURE_GATE`,
   because the legacy gate's whole-millisecond period phase-locks at these rates.
 - **The cursor channel:** its poll interval follows the frame period above 60 (FR-98's `poll_interval` knob,
@@ -108,14 +117,14 @@ sequenceDiagram
     autonumber
     participant V as viewer (120 Hz screen)
     participant A as agent
-    A->>V: rc:agent.hello: caps fps-high, displays[refresh_hz=120]
+    A->>V: rc:agent.hello: caps.video has fps-high
     V->>A: rc:fps {fps: 120}
     alt constrained, unproven trial failed, refresh < 120, or denied
-        A->>V: rc:fps.state {asked:120, granted: today's cap, reason}
+        A->>V: rc:video-info {…, fps: today's cap, fps_asked: 120, fps_reason}
     else direct, class proven (or trial), pipe covers the ceiling
         A->>A: plan.fps = 120 → make-before-break encoder swap
-        A->>V: rc:fps.state {asked:120, granted:120}
-        Note over A: a failed 60 s trial ends at 60 with reason "unproven"
+        A->>V: rc:video-info {…, fps: 120}
+        Note over A: a failed 60 s trial ends at 60 with fps_reason "unproven"
     end
 ```
 
@@ -123,12 +132,56 @@ sequenceDiagram
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in L0, which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps | none: tests and measurements | — |
-| P1 | **The wire.** `fps-high`, `refresh_hz`, `rc:fps`, `rc:fps.state`, the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `reason:"unproven"` (or `"constrained"`) | `fps_high` (default OFF): no `fps-high` in the hello, so no viewer asks | — |
+| P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); (a), (b), (d) owed |
+| P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH` (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is not reported yet |
 | P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | — |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | — |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
+
+### 4.1 P0(c) and P1 — as built (2026-10-21)
+
+**P0(c), the data-channel ceiling.** `agents/roomlerd/tests/dc_throughput.rs` runs two peers in one process
+over real loopback UDP (host candidates, mDNS off), sending 16 KiB messages back to back the way the
+production send task does. It is `#[ignore]`d: CI runners are too noisy for a throughput assertion, so the
+numbers live in §8. The first run (neo16, release build) delivered every byte:
+
+| Mode | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| ordered | 375.9 Mbit/s | 278.8 Mbit/s | 275.7 Mbit/s |
+| unordered | 281.0 Mbit/s | 287.1 Mbit/s | 271.6 Mbit/s |
+
+That is ~2.7× D2's ~100 Mbit/s on that CPU. A weaker host and a real round trip are owed before open decision
+3 closes.
+
+**P1, the wire.** It grants nothing above today's cap; P2 builds the grant.
+
+| Piece | Where |
+|---|---|
+| `fps-high` in `AgentCaps.video`, only with `ROOMLERD_FPS_HIGH=1` (a test locks the default off) | `encode::frame_rate::CAP`, `video_features` in `agents/roomlerd/src/encode/caps.rs` |
+| `rc:fps {fps}`: 60, 120 or 144; anything else is dropped. The ask is stored on the session's `ViewerFeedback`, which already reaches the control handler and every pump | the `rc:fps` arm next to `rc:resolution` in `agents/roomlerd/src/peer.rs`; `agents/roomlerd/src/encode/frame_rate.rs` |
+| The answer, in `rc:video-info`: `fps` (what the stream runs at) and, when it refused an ask, `fps_asked` + `fps_reason` (`unproven`, or `constrained` on a relay) | `video_info_payload` and the FFmpeg pump in `agents/roomlerd/src/peer.rs` |
+| The viewer's half: the options, the wire message, the answer read back, the words | `ui/src/composables/frameRate.ts` |
+| The pick (per browser), re-sent when the control channel opens, to an agent with `fps-high` only; a Frame rate picker shown only for such an agent | `ui/src/composables/useRemoteControl.ts`, `ui/src/views/remote/RemoteControl.vue` |
+
+- **With the switch off, the frame-rate fields are never written**, so every `rc:video-info` payload is
+  byte-identical to before; the wire-shape tests pass unchanged. A new ask or a new target re-sends video-info
+  through the path every other refresh already takes.
+- **P1 answers only the session's own viewer.** A shared pipeline's followers merge their asks by `min` in P2,
+  where the grant is built.
+- **Tests:**
+  - agent: four in `encode::frame_rate`, the video-info fields, and `fps-high` off by default;
+  - viewer: seven in `frameRate.spec.ts`, plus two video-info parse tests fed the agent's exact bytes.
+- **Negative controls, each failing exactly its targets:**
+
+  | Control | Failed |
+  |---|---|
+  | A: accept any fps | the ask test |
+  | B: grant every ask | the three tests that involve a refusal |
+  | C: advertise `fps-high` always | the default test |
+  | D (viewer): offer above 60 without `fps-high` | the options test (1 failed / 6 passed) |
+
+  A–C were run together: 5 failed / 2 passed.
 
 ## 5. Acceptance criteria
 
@@ -172,6 +225,7 @@ sequenceDiagram
 | Date | Build | Cell | Result |
 |---|---|---|---|
 | 2026-10-21 | fleet, agents 0.4.135–0.4.148 | every FFmpeg DC session for 7 days (FR-118 §2.2) | **The red record for the encode stage.** Only `hevc_videotoolbox` (6.3 ms at 3024×1964) fits a 120 fps period on today's CPU path; QSV and NVENC need 9.9–16.4 ms per 1080p–1600p frame. No session ran above 60, because nothing lets one |
+| 2026-10-21 | dev build, release profile, neo16 (a Ryzen 9 7945HX laptop, Windows 11) | P0(c): the data channel alone, in process over loopback UDP (`agents/roomlerd/tests/dc_throughput.rs`): 16 KiB messages awaited back to back, as the production send task sends them; 5 s × 3 rounds per mode | **The transport is not D1's limiter.** Ordered: 375.9 / 278.8 / 275.7 Mbit/s. Unordered: 281.0 / 287.1 / 271.6. Every byte was delivered. That is ~2.7× D2's ~100 Mbit/s on this CPU. Still owed before open decision 3 closes: a weaker host's CPU and a real round trip, because this is an upper bound for a LAN path |
 
 ## 9. Related
 

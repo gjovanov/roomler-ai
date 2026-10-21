@@ -107,7 +107,7 @@ flowchart LR
 | Match the remote display to the viewer | ✅ | ✅ a person's own X11 display with one active output, a per-user install (FR-97 P3e-2, from 0.4.148), and the daemon's own virtual desktop on Xorg's dummy driver · ❌ Wayland, a system install, several active outputs | ❌ | `agents/roomlerd/src/display_match.rs:739-744`, `:262`; `docs/display-match.md` |
 | Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:790-808`; FR-93 P7 |
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ❌ the same | image watching rides Windows' clipboard sequence number, and on X11 the change gate (`agents/roomlerd/src/clipboard.rs:632`, `:1055`); `docs/remote-control.md`, the watcher on X11 |
-| Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:1650-1654` |
+| Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:1654-1658` |
 | An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:526`); `docs/wayland.md` |
 | The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:625`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
