@@ -177,7 +177,7 @@ prevent, and the guard re-asserts it on every tick.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
-- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2348-2357`) and independent of NAT setup
+- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2362-2371`) and independent of NAT setup
   (`runtime.rs:2149-2172`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
@@ -227,10 +227,10 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ❌ | `display_match.rs:574`. *P3e-2:* `agents/roomlerd/src/display_match.rs:262` `x11_offered`; the viewer's toggle followed the OS until P3e-2 | P2d, P3e |
 | R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ❌ | Forced off (`clipboard.rs:818-822` before P3e-3a) ✔ while advertised (`caps.rs:1630-1638`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:632` `x11_gate` | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:959` | P2e, P3e |
-| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10098-10101`) | FR-93 P7 |
+| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10106-10109`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 picture only | No SCK audio; cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:321-322`) | P2a, P2f |
-| R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:222`) | D2 |
+| R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:224`) | D2 |
 | R14 | "Being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | CGDisplayStream ignores `NSWindowSharingNone` (`desktop-companion.md:514-517`) | D2 |
 | R15 | Greeter, nobody signed in | ✅ SystemContext | 🟡 DRM, opt-in | ⛔ | macOS loginwindow: §7 | FR-93 / FR-95 |
 | R16 | Ctrl+Alt+Del | ❌ | ⛔ | ⛔ | §2.7 item 3 | P0c, P4a |
@@ -325,7 +325,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9807`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9820`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.

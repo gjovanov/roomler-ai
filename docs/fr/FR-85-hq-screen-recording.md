@@ -31,13 +31,13 @@ what it costs in installer size and ships with integration and e2e tests.
   `--disable-everything` plus hardware encoders only: static in `roomlerd.exe`, shared `libavcodec.so` in the .deb,
   dylibs in `roomlerd.app`. No decoders, demuxers, muxers, filters or swscale. **Linux arm64 has no FFmpeg at all**
   (openh264 + libvpx).
-- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2241`)
+- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2252`)
   and a synthetic source with a decodable 64-bit counter strip (`capture/synthetic_backend.rs:41`); `EncoderThread`
   (`encode/thread.rs:125`); the cells, denylist and probe cache; the child-process probe pattern (`encode/caps.rs`); the
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
   consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1103`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
-  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:11011`); `.roomler-partial` staging (`files.rs`).
+  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:11019`); `.roomler-partial` staging (`files.rs`).
 
 ## Decisions taken with the operator (2026-09-25)
 
@@ -198,7 +198,7 @@ Each refusal carries a named reason on the wire and in the UI.
    RECORD never reaches one.
 3. **Device gate.** `record_remote_enabled` and `record_remote_audio`, both default **OFF**, device-owned and
    **structurally absent from `DesiredConfig`** — a `record_` twin of `no_relay_key_is_server_pushable_via_desired_config`
-   (`crates/remote_control/src/models.rs:5083`). Capabilities are read once at hello, so ON takes effect at the next
+   (`crates/remote_control/src/models.rs:5093`). Capabilities are read once at hello, so ON takes effect at the next
    connect; **OFF is immediate** — new starts are refused and a running remote recording stops.
 4. **A `record` DataChannel**, attached only when the grant holds RECORD — the same attach-time gate as `files` and
    `input`. The control channel carries no permission context, so it cannot host this. Messages:

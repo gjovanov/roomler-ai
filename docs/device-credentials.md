@@ -67,7 +67,7 @@ sequenceDiagram
   - never before the first connect, so a device that cannot reach its server asks it nothing;
   - a random 0–60 s delay spreads a fleet that reconnected at once;
   - after a failure that may pass, it waits a full hour, and reconnects meanwhile do not trigger another try.
-- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:395`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
+- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:408`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
   - A file holding a *different* token was re-enrolled meanwhile, and that token wins.
   - A file naming another device for the enrollment is refused, with nothing written.
   - A save that fails still puts the renewed token in use: the file's token stays valid, so nothing is lost.

@@ -135,7 +135,7 @@ never consulted, and never leak that they exist.
 | # | Gate | Owner | Mechanism |
 |---|---|---|---|
 | 1 | Org kill-switch | org admin | `TenantSettings.external_rc_enabled`, default `false` — the twin of `remote_exec_enabled` / `remote_ssh_enabled` (`crates/db/src/models/tenant.rs:233`) and deliberately separate from both. Off ⇒ a connect code does not resolve. |
-| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:3531`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
+| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:3541`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
 | 3 | Device opt-in | device owner, locally | `external_access_enabled` in the agent's own config, default off, **absent from `DesiredConfig`**. Alongside: `external_consent_mode`, `external_max_permissions`. The refusal that survives a compromised server. |
 | 4 | The password proof | device verifies, outsider proves | §4. The substitute for tenant membership, and the only gate the outsider can satisfy by their own action. |
 | 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`crates/remote_control/src/models.rs:1381`), defaulting to `Prompt`. |
@@ -376,7 +376,7 @@ does not advertise it cannot be gate-2 approved, which is what keeps §3's
 ### F1 — the hub keys controllers by `ObjectId`, so an anonymous principal forks everything
 
 `Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1235`),
-`RemoteSession.controller_user_id: ObjectId` (`models.rs:5348`), the `remote_audit`
+`RemoteSession.controller_user_id: ObjectId` (`models.rs:5358`), the `remote_audit`
 rows and the TURN credential all key on a real user id. A synthetic principal would
 fork the session record, the audit, the credential and the rate limiter — and leave
 *"someone controlled your machine"* in the log.
