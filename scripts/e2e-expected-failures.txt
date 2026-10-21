@@ -38,7 +38,7 @@ clicking Google OAuth button redirects to Google
 #  conference-list:76 — stale post-S4 selector, re-scoped to the dashboard
 #  card (#248); mention:66 — v-if→v-show stable tippy anchor in MentionList
 #  (#250, v20260729-135328). Kept here as a marker in case either regresses.)
-# 2026-10-21 — channels.spec.ts:90, #2647. FR-116 P2 (d18018088) gave the app
+# 2026-10-21 — channels.spec.ts:90, #2647. FR-116 P2 (ae5e725c8) gave the app
 # bar's Search icon button its missing accessible name, so the spec's
 # `getByLabel('Search', { exact: true })` matched that button AND the explore
 # page's field: a strict-mode violation. The UI is right; the spec now asks for

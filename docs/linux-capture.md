@@ -1409,7 +1409,7 @@ on, no restore token), against prod's viewer, which has carried P2d-2's half sin
 `hosted-20261012-f07ba2c`. One viewer connects, nobody answers for 75 s, then the
 lab answers the dialog over QMP (2026-10-13):
 
-| | 0.4.131, the release (P2d-1 only) | P2d-2 (master `b5871e47f`) |
+| | 0.4.131, the release (P2d-1 only) | P2d-2 (master `b9b9277ab`) |
 |---|---|---|
 | sessions while nobody answered | 5: the watchdog re-created it 4 times (`media stalled 10 s … re-creating session`), with "Reconnecting" in between | **1** |
 | the notice | never: 0 of 51 samples | from +3 s, in every sample until the answer |

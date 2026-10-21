@@ -7,7 +7,7 @@ version: roomlerd, roomler, roomler-desktop across all os"*). **P1, P2 and P4 re
 2026-10-20 22:24Z); the candidate proved the decision and the safe failure; the release moved every companion in the
 field, the Asahi box's from 0.4.139 by its own timer, and the fleet census went from one skew to none. P3 stays a
 proposal · **Owner:** the updater (agent) · **Anchors:** master
-`0c1bb97f2`, the pre-fix tree §2–§3 describe · **Builds on:** [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
+`ca853c840`, the pre-fix tree §2–§3 describe · **Builds on:** [FR-27](FR-27-consent-surfaces-and-desktop-companion.md)
 (the companion, `companion_version` on the wire), [FR-84](FR-84-companion-and-installer-polish.md) (the companion's
 launch), [FR-96](FR-96-per-user-linux-installs-update-themselves.md) (the root update helper),
 [FR-67](FR-67-update-outcome-observability.md) (update outcomes)
@@ -97,7 +97,7 @@ flowchart TD
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
 | **P0** | spec, claim, the census in §2 | — | ✅ 2026-10-20 | S |
-| **P1** | Linux: the companion package tracks the daemon (root daemon + update helper; the per-user wake), the `.rpm` version binding | `ROOMLERD_COMPANION_SYNC=0` | ✅ merged #2631 (`e01e03517`), released **0.4.148**; the candidate: the plan and the safe failure on an unpublished tag; ✅ **the release**: a system install's update, the Asahi box's `.rpm` by its own timer, a per-user helper, the 4 h retry, the kill switch (§8) | M |
+| **P1** | Linux: the companion package tracks the daemon (root daemon + update helper; the per-user wake), the `.rpm` version binding | `ROOMLERD_COMPANION_SYNC=0` | ✅ merged #2631 (`a1a47b54d`), released **0.4.148**; the candidate: the plan and the safe failure on an unpublished tag; ✅ **the release**: a system install's update, the Asahi box's `.rpm` by its own timer, a per-user helper, the 4 h retry, the kill switch (§8) | M |
 | **P2** | Windows: `refresh_if_stale` on the 4 h tick in the process that owns it | `ROOMLERD_COMPANION_SYNC=0` | ✅ merged #2631, released **0.4.148**; ✅ the retry on the release: 4 h after a 404 at the service's start, the same SCM host refreshed and respawned the companion (§8) | S |
 | **P3** | the sync outcome on the heartbeat, and the grid's skew says why (D4) | — | | M |
 | **P4** | docs: `docs/linux-self-update.md`, `docs/desktop-companion.md` §13, the `docs/README.md` index rows | — | ✅ in #2631; the anchors it moved elsewhere followed in its own PR | S |
@@ -146,7 +146,7 @@ flowchart TD
 |---|---|---|---|---|
 | 2026-10-20 18:18Z | `asahi-m2pro` (Fedora Asahi Remix 42, aarch64) | the released 0.4.147 | the red | 🔴 `roomlerd 0.4.147`, `roomler 0.4.147`, `roomler-desktop` 0.4.139 (`rpm -q` → `roomler-desktop-0.4.139-1.aarch64`) |
 | 2026-10-20 21:28Z | a vmtest Ubuntu system install (`r148a`), two orgs, needrestart on its default config | the 0.4.148 candidate (run 39498665680, `.deb` `4cf805d6`), companion 0.4.147 | the plan + the safe failure | ✅ at the first check after the restart: `WARN companion: could not move the desktop companion package to this daemon's version; it keeps its version, and the next update check retries reason=fetching release agent-v0.4.148: GitHub returned 404 Not Found` (the tag was not published yet). `ii roomler-desktop 0.4.147-1` unchanged, its process untouched, the daemon healthy; the row read 0.4.148 / 0.4.147 |
-| 2026-10-20 22:24Z | — | **0.4.148 published** (`501b59063`, the `.deb` bit-identical to the candidate) | — | — |
+| 2026-10-20 22:24Z | — | **0.4.148 published** (`c6586424c`, the `.deb` bit-identical to the candidate) | — | — |
 | 2026-10-20 22:42Z | a vmtest Ubuntu system install (`r148b`), both packages put back to 0.4.147, a companion running, needrestart on its default config | the released 0.4.148 | **AC1** | ✅ `auto_update` on → the 0.4.147 daemon updated itself (`package installed bin="apt-get"`) → 22:42:59Z the 0.4.148 daemon → 22:43:02Z `companion: the desktop companion package now matches this daemon from=0.4.147 to=0.4.148 restarted=1`; the companion a new process; the daemon's pid unchanged (needrestart suspended); the `.asc` and the version binding logged for the companion's `.deb` (AC6) |
 | 2026-10-20 23:00Z | the Asahi box (Fedora Asahi Remix 42, aarch64; a tarball daemon, an `.rpm` companion) | the released 0.4.148, by its own 4 h timer | **AC2** | ✅ `tarball installed` → 23:00:11Z the 0.4.148 daemon → 23:00:13Z `companion: package installed tool="dnf"` → `… from=0.4.139 to=0.4.148 restarted=1`; `roomler-desktop-0.4.148-1.aarch64`; the `.rpm` reader logged `artifact_version=0.4.148` (AC6) |
 | 2026-10-20 23:06Z | a vmtest Ubuntu per-user install (`r148c`), its root helper enabled, the companion put back to 0.4.147 | the released 0.4.148 | **AC3** | ✅ the person touched the wake file → 3 s later the helper (root): `companion: package installed tool="apt-get"` → `… from=0.4.147 to=0.4.148 restarted=1` → `update-helper: up to date` |

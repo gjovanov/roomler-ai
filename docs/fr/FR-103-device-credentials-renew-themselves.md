@@ -2,7 +2,7 @@
 
 **Issue:** [#2134](https://github.com/gjovanov/roomler-ai/issues/2134) · **Status:** **closed 2026-10-15**: all
 seven criteria verified (§5); released in 0.4.135; the fleet's first natural renewals fall due from 2026-11-27 (§8) · **Owner:** fleet (the agent token, removal), network (the tunnel-client token), the agent
-(the renew loop) · **Anchors:** master `05b2bd2bd` · **Builds on:** FR-94 (its service credential already
+(the renew loop) · **Anchors:** master `94a2032c6` · **Builds on:** FR-94 (its service credential already
 renews itself), FR-40 (key rotation, the in-memory adoption pattern), FR-51 (removal), #2133
 
 ## 1. Goal
@@ -11,7 +11,7 @@ A device that keeps running keeps its credentials. Agent and tunnel-client token
 before they expire. A device that slept through its anniversary recovers by itself after it updates.
 Removing a device ends every token it was ever given, so a revived row never accepts an old one.
 
-## 2. Evidence (master `05b2bd2bd`)
+## 2. Evidence (master `94a2032c6`)
 
 **Issuance.**
 - `issue_agent_token` (`crates/services/src/auth/mod.rs` L462–480) uses a TTL of `unwrap_or(365 * 24 * 60 * 60)`. `issue_tunnel_client_token` (L573–593) does the same.
