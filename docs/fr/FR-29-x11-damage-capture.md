@@ -40,9 +40,9 @@ DXGI Desktop Duplication, which returns `WouldBlock` when the desktop is
 unchanged. Two consequences in
 [`capture/scrap_backend.rs`](../../agents/roomlerd/src/capture/scrap_backend.rs):
 
-- `scrap_backend.rs:375` — the `WouldBlock` arm is the "no new frame" path.
+- `scrap_backend.rs:377` — the `WouldBlock` arm is the "no new frame" path.
   **On Linux it is unreachable**: XShm always yields a full buffer.
-- `scrap_backend.rs:366` — every delivered frame is stamped
+- `scrap_backend.rs:368` — every delivered frame is stamped
   `damage: Damage::Unknown`, so the encoder must treat all pixels as dirty and
   `peer.rs:2481`'s `set_roi_hints` receives an empty rect list.
 
@@ -51,7 +51,7 @@ The pump already has the fast path this needs. `peer.rs:2157` logs
 counts `frames_empty`. **That path exists, is named, and is simply
 unreachable on Linux.** P1 is about making it reachable, not about inventing it.
 
-`Damage` (`capture/mod.rs:76`) likewise already distinguishes the two empty
+`Damage` (`capture/mod.rs:79`) likewise already distinguishes the two empty
 states — `Unknown` ("no information, assume all dirty") vs `Tracked(vec![])`
 ("provably nothing changed"). Only the producer is missing.
 

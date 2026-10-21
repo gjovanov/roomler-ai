@@ -57,7 +57,7 @@ sequenceDiagram
 [`display_match.rs:923`](../agents/roomlerd/src/display_match.rs#L923) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:948`](../agents/roomlerd/src/display_match.rs#L948) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:10300`](../agents/roomlerd/src/peer.rs#L10300)).
+control-channel arm sends the answer ([`peer.rs:10308`](../agents/roomlerd/src/peer.rs#L10308)).
 
 ### The answers
 
@@ -98,12 +98,12 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3086`](../crates/localapi/src/lib.rs#L3086)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:8980`](../crates/remote_control/src/models.rs#L8980)). A server that could set it could
+  push it ([`models.rs:8995`](../crates/remote_control/src/models.rs#L8995)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:853`](../agents/roomlerd/src/display_match.rs#L853)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2535`](../crates/agent-core/src/config.rs#L2535) `DisplayMatchPolicy`).
+  ([`config.rs:2549`](../crates/agent-core/src/config.rs#L2549) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
@@ -222,7 +222,7 @@ sequenceDiagram
   refuses to delete the mode in use ([`display_match.rs:232`](../agents/roomlerd/src/display_match.rs#L232)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
-  ([`scrap_backend.rs:243`](../agents/roomlerd/src/capture/scrap_backend.rs#L243)). The encoder already
+  ([`scrap_backend.rs:245`](../agents/roomlerd/src/capture/scrap_backend.rs#L245)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb
   ([`virtual_desktop.rs:747`](../agents/roomlerd/src/virtual_desktop.rs#L747) `spawn_x_server`).

@@ -39,7 +39,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`release-agent.yml:2211-2234`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
-  (`ui/src/composables/useRemoteControl.ts:2801-2831`).
+  (`ui/src/composables/useRemoteControl.ts:2811-2841`).
 
 ### The size question, measured
 
@@ -116,7 +116,7 @@ Two structural facts shape the design: Chromium keeps **one** `HEVCPROFILE_REXT`
 every RExt chroma form, so `isConfigSupported` cannot tell 4:4:4 from 4:2:2 (the
 mismatch surfaces at the first SPS); and no browser API says whether hardware or software
 decoded. Only a real-bytes trial proves a cell, and the page-scoped transport ban
-(`useRemoteControl.ts:3986`) already is that trial.
+(`useRemoteControl.ts:3996`) already is that trial.
 
 **The honest 4:4:4 cells** are therefore: HEVC 4:4:4 (hardware both ends on modern
 NVIDIA and Intel; not on Linux Chrome), VP9 4:4:4 (software or Intel hardware encode,
@@ -161,7 +161,7 @@ flowchart LR
    format, i18n keys, each impossible entry greyed with the reason as its subtitle.
    Auto chroma follows Priority (sharper ⇒ 4:4:4 when a cell exists; latency and
    balanced ⇒ 4:2:0). Auto codec under 4:4:4 ranks HEVC → VP9 → H.264 → libvpx; under
-   4:2:0 it keeps today's rank (`useRemoteControl.ts:2309-2375`). Explicit chroma
+   4:2:0 it keeps today's rank (`useRemoteControl.ts:2319-2385`). Explicit chroma
    overrides Priority; Priority only ever fills an Auto. The backend is never in the
    picker: it is a host fact, shown in the pill (FR-26 format).
 6. **Decode gating.** Pessimistic on the agent (probed cells only), optimistic on the

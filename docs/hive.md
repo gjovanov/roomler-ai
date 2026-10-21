@@ -226,7 +226,7 @@ word from a newer device is still a refusal (`other`), never "accepted"
 Every one is the device owner's, read once when the daemon starts (a change needs a
 restart), and none can be pushed:
 `the_device_owned_refusals_are_not_pushable`
-([`models.rs:9019`](../crates/remote_control/src/models.rs#L9019)) asserts that no
+([`models.rs:9034`](../crates/remote_control/src/models.rs#L9034)) asserts that no
 Hive key appears in a serialised `DesiredConfig`. The user-facing reference is
 [`configuration.md`](../ui/docs/content/reference/configuration.md).
 
@@ -1278,7 +1278,7 @@ moved, the config files are not placed, and the materialize says so.
 
 Before any frame of the replicaset exists, the device's own refusals do (§3g). Three
 keys, each the device owner's, default off, never pushable, and in the lock test's list
-([`models.rs:9019`](../crates/remote_control/src/models.rs#L9019)):
+([`models.rs:9034`](../crates/remote_control/src/models.rs#L9034)):
 
 | Key | What it is | Where |
 |---|---|---|
@@ -1346,7 +1346,7 @@ sequenceDiagram
 | `replicaset.max` | `min` to 8 | |
 | `replicaset.archive` | whether every archive replica the rules allow joins | |
 | `replicaset.prefer` | `owner_devices`, once; any other word is refused | the one order decision 2 names. Refused rather than stored, so a word the server cannot place by fails at the write, not silently at every placement |
-| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:1071`](../crates/modules/fleet/src/agent.rs#L1071)) | normalized as device tags are, so a tag compares equal to the one a device carries |
+| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:1074`](../crates/modules/fleet/src/agent.rs#L1074)) | normalized as device tags are, so a tag compares equal to the one a device carries |
 | `retention_days` | 0 to 3650; 0 keeps sessions for ever | P2g applies it |
 | `archive_devices` | at most 16, each a live device of this organization and not ephemeral, each kept once ([`policy.rs:315`](../crates/modules/hive/src/policy.rs#L315)) | the administrator's half of an archive replica. The device's own `hive_archive` is the other half, read where placement runs, so either may come first |
 
@@ -1571,7 +1571,7 @@ decides again for every live placed session of the organization
 
 | What changed | Who tells hive | Where |
 |---|---|---|
-| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1182`](../crates/modules/fleet/src/agent.rs#L1182), [`hooks.rs:154`](../crates/core/src/hooks.rs#L154), [`hooks.rs:118`](../crates/modules/hive/src/hooks.rs#L118) |
+| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1185`](../crates/modules/fleet/src/agent.rs#L1185), [`hooks.rs:154`](../crates/core/src/hooks.rs#L154), [`hooks.rs:118`](../crates/modules/hive/src/hooks.rs#L118) |
 | the policy, or its archive replicas | the policy write, after it is stored | [`policy.rs:354`](../crates/modules/hive/src/policy.rs#L354) |
 | a member removed from the fleet | the removal cascade, hive first, while the row is still there: the device is named as gone | [`hooks.rs:107`](../crates/modules/hive/src/hooks.rs#L107) |
 
@@ -4400,7 +4400,7 @@ sequenceDiagram
 
 ⚠️ **A restricted tag is compared exactly.** The server trims the tags, drops an empty one and
 keeps each once, as it does a device's tags, but it keeps their case
-([`agent.rs:1141`](../crates/modules/fleet/src/agent.rs#L1141)): `Prod` restricts nothing about a
+([`agent.rs:1144`](../crates/modules/fleet/src/agent.rs#L1144)): `Prod` restricts nothing about a
 session on a device tagged `prod`. The form offers the tags the organization's devices carry
 first for that reason ([`HiveCopiesView.vue:519`](../ui/src/views/hive/HiveCopiesView.vue#L519)).
 

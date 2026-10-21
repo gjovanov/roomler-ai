@@ -27,10 +27,10 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 
 | Step | Where | What it costs |
 |---|---|---|
-| WGC reads every arrived frame back, **inside `FrameArrived`**, before the latest-wins slot | `capture/wgc_backend.rs:596` → `copy_to_cpu` `:757` (`CopyResource` `:790`, then a synchronous `Map` and a row copy into a `Vec`) | A GPU → CPU copy plus a CPU stall per frame, including frames the slot then drops |
-| WGC's D3D11 device is on the **default adapter** | `create_d3d11_device` `wgc_backend.rs:715`, `None` at `:726` ("defer until that's a real field issue") | Which GPU holds the frames is not decided by anyone |
+| WGC reads every arrived frame back, **inside `FrameArrived`**, before the latest-wins slot | `capture/wgc_backend.rs:610` → `copy_to_cpu` `:771` (`CopyResource` `:804`, then a synchronous `Map` and a row copy into a `Vec`) | A GPU → CPU copy plus a CPU stall per frame, including frames the slot then drops |
+| WGC's D3D11 device is on the **default adapter** | `create_d3d11_device` `wgc_backend.rs:729`, `None` at `:740` ("defer until that's a real field issue") | Which GPU holds the frames is not decided by anyone |
 | The SystemContext DXGI arm reads back too, and its device is bound to the adapter that **owns the output** | `system_context/dxgi_direct.rs:366` (`find_primary_output` `:1071`); `read_acquired` `:861`; its Phase B GPU scale still ends in a readback (`vp_blt_and_read` `:702`) | Desktop Duplication cannot cross adapters (`E_INVALIDARG`), so on that arm the capture adapter is fixed |
-| `Frame` owns a `Vec<u8>` | `capture/mod.rs:82`, `data` at `:87`; `PixelFormat` is `Bgra`, `Nv12` or `I420` (`:278`) | The contract has no way to say "this frame is on the GPU" |
+| `Frame` owns a `Vec<u8>` | `capture/mod.rs:85`, `data` at `:90`; `PixelFormat` is `Bgra`, `Nv12` or `I420` (`:281`) | The contract has no way to say "this frame is on the GPU" |
 | The pump converts BGRA → NV12 (or I444) **on the CPU**, BT.601 limited range | `FfmpegEncoder::convert_bgra` `encode/ffmpeg/encoder.rs:1814` (dcv, banded threads above 2 MP); the matrix is `encode/color.rs:16` | Per-pixel CPU work on every frame |
 | …then copies the planes into an `AVFrame`, uploads it for the VAAPI / D3D12 / Vulkan encoders, and submits | `encode_sync` `encoder.rs:2386`; `HwKind` `encode/ffmpeg/hwframes.rs:50` (those three kinds only) | The VAAPI, D3D12 and Vulkan cells make the full GPU → CPU → GPU round trip in our code; NVENC, QSV and AMF do the upload inside `send_frame` |
 | The portal arm copies twice | `capture/portal/pipewire.rs:806` (out of the PipeWire buffer), then the helper's stdout into the daemon (`capture/portal/wire.rs`, which argues for exactly this as a first version); a DmaBuf buffer is reported, never read | Two CPU copies, by design until a measurement says otherwise |
@@ -39,7 +39,7 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 ### 2.2 What the fleet measures today (7 days to 2026-10-21, read-only)
 
 From `agent_logs`: 142 538 FFmpeg DC pump heartbeats from 11 hosts, read-only, from mars. The "encode"
-column is the pump's `avg_encode_ms` (`peer.rs:9491`): the time inside `encode_sync`, so **conversion,
+column is the pump's `avg_encode_ms` (`peer.rs:9499`): the time inside `encode_sync`, so **conversion,
 copies, upload, submission and the packet drain together** (§3). The fps columns are the delivered rate
 between consecutive heartbeats (spaced 2.0 s). The median sits at 16–17 fps on almost every host because an
 idle desktop produces few frames, which is not a limit. So the table shows the top of the distribution, p99

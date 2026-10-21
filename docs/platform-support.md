@@ -108,7 +108,7 @@ flowchart LR
 | Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:790-808`; FR-93 P7 |
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ❌ the same | image watching rides Windows' clipboard sequence number, and on X11 the change gate (`agents/roomlerd/src/clipboard.rs:632`, `:1055`); `docs/remote-control.md`, the watcher on X11 |
 | Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:1654-1658` |
-| An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:526`); `docs/wayland.md` |
+| An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:541`); `docs/wayland.md` |
 | The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:625`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
 | Lock the computer when the last session ends | ✅ | ✅ `loginctl lock-session` | ❌ no mechanism yet: an end that should lock logs that it could not | `docs/privacy-mode.md`, lock on end |

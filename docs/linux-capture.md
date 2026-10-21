@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2241`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2252`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -494,7 +494,7 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
 | `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:285`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
-`capture_arm` is `capture::planned_arm` (`capture/mod.rs:996`), a pure function
+`capture_arm` is `capture::planned_arm` (`capture/mod.rs:1007`), a pure function
 that walks `open_with`'s own order (`:1505`). The two sit together in one file
 because they must not drift:
 
@@ -699,7 +699,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:1111`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:1128`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -718,7 +718,7 @@ decoded as `XR24`, `AB24` is the right picture with a blue sky turned orange,
 so every order has a test pinned to hand-computed bytes.
 
 ⚠️ **A reason must fit FR-80's cap whole.** `CaptureUnavailable` keeps 200
-characters of a detail (`capture/mod.rs:2048`), the cascade's prefix included,
+characters of a detail (`capture/mod.rs:2059`), the cascade's prefix included,
 and cuts the rest. The first draft of this reason was longer, and on the lab the
 viewer showed it ending *"…run roomler config clear"*: the fix, at the end, was
 the part cut off. Each new reason's test now builds the detail as the viewer
@@ -978,9 +978,9 @@ flowchart LR
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3698`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1312`; `set_output_cap`, `drm_backend.rs:1525` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3698`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1329`; `set_output_cap`, `drm_backend.rs:1542` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
 | **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:712`; `band_threads`, `drm_backend.rs:740` | `ROOMLERD_DRM_THREADS=1` |
-| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1459` | — (a timing fix) |
+| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1476` | — (a timing fix) |
 | **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:151` | `ROOMLERD_DRM_GPU=0` |
 
 Shipped in **0.4.140**. Measured on that box (GNOME, 4096×2160 `XR30`), one
@@ -1346,10 +1346,10 @@ sequenceDiagram
 
 | | what | where |
 |---|---|---|
-| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:2083`, the eight pump call sites in `peer.rs` |
+| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:2094`, the eight pump call sites in `peer.rs` |
 | one request per host | `portal::pending::open_with`, which the configured and the automatic (P2d-3) arms share: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:59`, `Broker::open` `:150` |
 | the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:229` |
-| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1629`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:2083`, `Request::land` `pending.rs:220` |
+| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1629`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:2094`, `Request::land` `pending.rs:220` |
 | mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:60` |
 
 **Measured** on the FR-93 lab's KDE guest: Plasma 6.7 on Fedora 44, 4 cores, a per-user install with
@@ -1971,7 +1971,7 @@ Measured on the released 0.4.142 with S3 in the lab: 48 s that named no reason,
 the last 19 of them after the wake.
 
 Now the viewer keeps a `host_sleep` notice through the redial
-(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:960`). Its
+(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:961`). Its
 deadline is spent, so the stall watchdog is not held: a new session that stays
 silent is still re-created on the usual clock. The stage shows the notice in
 every redial phase, with that phase's own words beneath it
@@ -2025,7 +2025,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1187-1218`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2843`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2857`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

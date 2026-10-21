@@ -201,7 +201,7 @@ must count against the controller's org. That is **P3b** (#2637), live since 202
 outsider's session (FR-52's extauth path) opens
 uncapped. A refusal is `org_session_limit`
 (`crates/remote_control/src/error.rs:41`), which the viewer does not retry
-(`ui/src/composables/useRemoteControl.ts:731`). It names the person and the device holding
+(`ui/src/composables/useRemoteControl.ts:732`). It names the person and the device holding
 the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
 session ending or Business. Kill switch `rc.org_session_cap = false`.
 

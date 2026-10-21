@@ -23,8 +23,8 @@ latency side; this FR is the cadence side.
 | What | Where | Consequence |
 |---|---|---|
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9829`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10247` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9837`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10255` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts were whole milliseconds (**fixed in P2a**, §4.2) | master `c636c6e8c` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
 | The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1717`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2289`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2312`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
 | The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
@@ -45,9 +45,9 @@ latency side; this FR is the cadence side.
 
 - **Hello.** `AgentCaps.video`, where `chunk-framing` and `bench` already live, gains `fps-high`. It is matched by
   **equality** like every capability verb, and ignored by servers and viewers that do not know it.
-- **The host's refresh rate** rides `rc:video-info` (`refresh_hz`, the captured monitor's) once a per-OS reader
-  exists. It does not go into `DisplayInfo`: that struct lives in the agent row the server stores and the viewer
-  never reads, so a field there would change the server and still reach no picker. Not built in P1.
+- **The host's refresh rate** rides `rc:video-info` (`refresh_hz`, the captured monitor's), read per OS since
+  P2b-3 (§4.5). It does not go into `DisplayInfo`: that struct lives in the agent row the server stores and the
+  viewer never reads, so a field there would change the server and still reach no picker.
 - **Ask.** `rc:fps {fps: 60 | 120 | 144}` on the control channel, handled next to `rc:resolution`. The viewer
   sends it only to an agent that advertised `fps-high`; an agent that receives an unknown value drops it, as it
   does for `rc:resolution`. Shared pipelines merge their viewers' asks by `min`, the way they floor-merge
@@ -147,8 +147,8 @@ sequenceDiagram
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
-| P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH` (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is not reported yet |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 owed**: the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words |
+| P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. P2 is built; its field proof is P3 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | — |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -354,10 +354,10 @@ sequenceDiagram
   frame at 90 % of a period or more (`TRIAL_MAX_ENCODE_PCT`); anything else is no verdict, and the window starts
   over. The pump passes each frame's own encode time.
 - **The slot-first gate above 60 is WGC's alone** (§3.4).
-- **Not yet, for P2b-3:** the screen's refresh rate (every class has `refresh_hz` 0, so `refresh` is never the
-  reason yet); `fps_deny` as a config key and through remote config; and the viewer's words for `trial`,
-  `refresh`, `denied` and `pipe`. Today the viewer shows the raw word for those, as it does for any word it does
-  not know.
+- **Not yet, for P2b-3** (built there, §4.5): the screen's refresh rate (every class has `refresh_hz` 0, so
+  `refresh` is never the reason yet); `fps_deny` as a config key and through remote config; and the viewer's
+  words for `trial`, `refresh`, `denied` and `pipe`. Until then the viewer shows the raw word for those, as it
+  does for any word it does not know.
 - **Tests:**
   - `RateState`: a trial starts only when the stream runs at the granted rate; a proven trial runs on without
     one; a failed one goes back to the cap and says `unproven`, once the stream runs below the ask; a class
@@ -386,6 +386,71 @@ sequenceDiagram
 
   The trial rule's own controls: Failed on the rate alone (3 tests failed), the encode threshold at two periods
   (4), no fresh window after one with no verdict (1). The first masks the second, so each was also run alone.
+
+### 4.5 P2b-3 — the screen's refresh rate, `fps_deny` in config, and the viewer's words, as built (2026-10-21)
+
+A screen cannot produce frames faster than it refreshes. P2b-3 makes the agent say what the captured screen
+refreshes at, lets an admin push the frame-rate denylist, and has the viewer say what P2b-2's answers mean.
+
+| OS, backend | The reading | Where |
+|---|---|---|
+| Windows, WGC | the captured monitor: `GetMonitorInfoW` → `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` → `dmDisplayFrequency` | `capture/refresh.rs` `of_monitor` |
+| Windows, scrap (DXGI) | the primary display, the same call | `of_primary` |
+| macOS, scrap (quartz) | `CGDisplayModeGetRefreshRate` of the main display's current mode | `of_main_display` |
+| Linux, scrap (X11) | the primary RandR output's mode: the dot clock over `htotal × vtotal`, halved when interlaced, doubled when double-scanned | `of_x11_primary`, `of_mode_timings` |
+| Linux, DRM | the CRTC mode's `vrefresh` | `drm_backend.rs`, at the open |
+
+- **Read once, at the open,** like the gate (`ScreenCapture::refresh_hz`). A capture opened again reads it again.
+  A reading of 0 or 1 is no rate: Windows reports those for the hardware's default, and macOS reports 0 for some
+  built-in panels. Neither decides anything, and a trial then finds out. The portal, the system context and the
+  synthetic source do not read it.
+- **Where it goes:** the grant refuses a rate above it (`refresh`), the rate class is keyed on it, and
+  `rc:video-info` carries it as `refresh_hz`, beside the frame-rate answer and only with `fps-high` on. The
+  viewer's picker disables the rates above it, with the reason.
+- **The viewer's words:** a trial reads "on trial until this host has shown it can keep up". `refresh`, `denied`
+  and `pipe` get sentences, and an unknown word is still shown as it came.
+- **`fps_high` in config.** The switch is no longer environment-only: `roomler config set fps_high true`
+  (Video encoding, Advanced) bridges to `ROOMLERD_FPS_HIGH`. It is read at start with the hello's capabilities,
+  so a change needs a restart, and it stays device-local: it is not pushable, because it widens what a session
+  may do. Default off.
+- **`fps_deny` in config.** The denylist is now a config key on `encoder_cells_deny`'s terms.
+  `roomler config set fps_deny` validates it: a plain FFmpeg name or `*`, and a rate above 60, because an entry
+  that could only deny nothing would read as in force. It rides `desired_config` with `MANAGE_AGENTS` alone,
+  since it only ever removes rates. The device writes it, reports `needs_restart` (the fallbacks are registered
+  once per process), and a blank push clears it. `none` denies nothing, where a blank box in the dialog hands the
+  key back to the device. [`docs/remote-config.md`](../remote-config.md) has the key.
+- **A trial's conclusion says what it measured.** The line `FR-119: the rate-class trial concluded` carries the
+  counted frames, the motion they covered, the achieved rate, the p99 interval and the encoder's p90 time
+  (`measured=`), so a field run reads the numbers the verdict was decided on, not the verdict alone.
+- **Tests:**
+  - what a reading is (0, 1, negative and absurd values are none; 59.94 Hz is 60);
+  - RandR timings of real modes, including interlaced and double-scanned ones;
+  - the `refresh_hz` field;
+  - a concluded trial's numbers (1201 frames over 10.007 s at 8333 µs gaps: 120.0 fps, p99 8333 µs, encoder p90
+    6000 µs);
+  - `fps_deny`: the config surface (set, echo, `none`, clear, refusals), the fallback bridge, the route's
+    permission (`MANAGE_AGENTS` alone, refused without it), and the agent's apply (written, `needs_restart`,
+    idempotent, a blank clears it);
+  - `fps_high`: a tribool that reaches the daemon as `ROOMLERD_FPS_HIGH`, unset bridging nothing; the check that
+    every bridged switch is a config key of the right kind now covers it;
+  - in the viewer: a trial read only when the agent says so, the trial's words and a refusal outranking them,
+    the three new reasons, the host refresh rate, a 60 Hz host disabling 120 and 144, and the store passing the
+    denylist through.
+
+  The lanes: CI's FFmpeg clippy is clean, and 1820 of the agent's 1822 library tests pass in WSL. The two that
+  fail need a display `:99` and a dialer timeout. The touched server crates pass 216 + 376 + 255 tests with
+  clippy clean at CI's scope. Windows clippy with `wgc-capture`, `scrap-capture` and
+  `system-context` is clean. In the viewer, `vue-tsc` is clean, the frame-rate spec passes 12 of 12 and the
+  agents store 62 of 62.
+- **Negative controls,** each set run together; in every set exactly the tests that guard them failed:
+  - in the agent: 1 Hz read as a rate, interlace ignored, the field misnamed (3 failed, 28 passed);
+  - in the viewer: the trial never read, the `refresh` sentence missing, a 0 Hz host read as a rate, the trial's
+    words skipped (4 failed, 8 passed);
+  - in the config path: the push ignored by the agent, a 60 accepted, a denylist-only request read as empty, the
+    fallback not bridged (4 failed);
+  - for `fps_high`: the bridge entry misnamed (2 failed, 253 passed: its own test and the bridge's parity check);
+  - for the trial's numbers, each alone: the summary not kept, and the rate counted in the wrong unit (its test failed
+    both times).
 
 ## 5. Acceptance criteria
 
