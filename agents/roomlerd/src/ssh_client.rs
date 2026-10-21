@@ -133,9 +133,8 @@ pub fn check_command(command: &str) -> Result<(), RunError> {
 }
 
 /// The call's key: ed25519, seeded from the OS CSPRNG, as `roomler ssh`
-/// mints one (`agents/roomler-cli/src/sshcmd.rs`). Its private half never
-/// leaves this process. Its comment tells it from `roomler ssh`'s
-/// (`roomler-session`) wherever the target shows a key.
+/// mints one (`agents/roomler-cli/src/sshcmd.rs`), under a comment of its own.
+/// Its private half never leaves this process.
 pub fn mint_key() -> PrivateKey {
     let seed: [u8; 32] = rand::random();
     let mut key = PrivateKey::from(Ed25519Keypair::from_seed(&seed));
