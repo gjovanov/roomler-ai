@@ -285,6 +285,23 @@ describe('useWsStore', () => {
       expect(spy).toHaveBeenCalledWith(data)
     })
 
+    it('should route message:pin and message:unpin to messageStore.pinFromWs', () => {
+      const store = useWsStore()
+      store.connect()
+      mockWsInstance.simulateOpen()
+
+      const messageStore = useMessageStore()
+      const spy = vi.spyOn(messageStore, 'pinFromWs')
+
+      const pin = { message_id: 'm1', room_id: 'r1', pinned: true }
+      const unpin = { message_id: 'm1', room_id: 'r1', pinned: false }
+      mockWsInstance.simulateMessage({ type: 'message:pin', data: pin })
+      mockWsInstance.simulateMessage({ type: 'message:unpin', data: unpin })
+
+      expect(spy).toHaveBeenNthCalledWith(1, pin)
+      expect(spy).toHaveBeenNthCalledWith(2, unpin)
+    })
+
     it('should increment unread for message:create in a non-current room', () => {
       const store = useWsStore()
       store.connect()

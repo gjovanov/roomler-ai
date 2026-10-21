@@ -238,8 +238,32 @@ export const useMessageStore = defineStore('messages', () => {
     updateList(threadMessages.value)
   }
 
+  /**
+   * Pin a message, or unpin a pinned one. The server sets the state it is
+   * told (`{ pinned }`, `toggle_pin` in crates/modules/chat/src/message.rs);
+   * a bare PUT carries no JSON, so axum refused every one with 415, and no
+   * message could be pinned from the app until 2026-10-21 (FR-116 AC6's
+   * field run found it).
+   */
   async function togglePin(tenantId: string, roomId: string, messageId: string) {
-    await api.put(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/pin`)
+    const current = messages.value.find((m) => m.id === messageId) ?? threadMessages.value.find((m) => m.id === messageId)
+    const pinned = !(current?.is_pinned ?? false)
+    await api.put(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/pin`, { pinned })
+    applyPin(messageId, pinned)
+  }
+
+  /** The server's `message:pin` / `message:unpin`, which every member of the
+   *  room receives: until these were applied, a pin showed nowhere but in a
+   *  reload. */
+  function pinFromWs(data: { message_id: string; pinned: boolean }) {
+    applyPin(data.message_id, data.pinned)
+  }
+
+  function applyPin(messageId: string, pinned: boolean) {
+    for (const list of [messages.value, threadMessages.value]) {
+      const m = list.find((x) => x.id === messageId)
+      if (m) m.is_pinned = pinned
+    }
   }
 
   async function fetchThread(tenantId: string, roomId: string, messageId: string) {
@@ -301,6 +325,7 @@ export const useMessageStore = defineStore('messages', () => {
     hasUserReacted,
     handleReactionFromWs,
     togglePin,
+    pinFromWs,
     fetchThread,
     addMessageFromWs,
     updateMessageFromWs,
