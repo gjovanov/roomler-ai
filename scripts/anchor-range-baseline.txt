@@ -1,0 +1,39 @@
+# anchor-range-baseline.txt — the inverted `file:N-M` anchors already on master when
+# scripts/anchor-range-audit.sh arrived (2026-10-21), one per occurrence, as
+# `doc<TAB>anchor`. Each is a half-shifted range: an older shift moved the start of
+# the range and not its end. They are pinned so the audit can fail on NEW ones.
+#
+# This file only shrinks. Fix a range (both ends, start ≤ end, pointing at what the
+# doc means) and delete its line here in the same commit; the audit fails while a
+# pinned range is gone, and it never accepts a new line. Regenerate nothing.
+docs/fr/FR-102-growth-observability.md	crates/db/src/models/tenant.rs:243-232
+docs/fr/FR-102-growth-observability.md	crates/remote_control/src/models.rs:4709-4024
+docs/fr/FR-106-devices-say-when-not-updating.md	crates/remote_control/src/models.rs:1827-1797
+docs/fr/FR-106-devices-say-when-not-updating.md	ui/src/components/admin/AgentsSection.vue:396-388
+docs/fr/FR-106-devices-say-when-not-updating.md	ui/src/components/admin/AgentsSection.vue:759-747
+docs/fr/FR-40-overlay-key-rotation.md	crates/agent-core/src/config_surface.rs:2289-2148
+docs/fr/FR-40-overlay-key-rotation.md	models.rs:2385-2348
+docs/fr/FR-40-overlay-key-rotation.md	ui/src/components/admin/AgentsSection.vue:1918-1906
+docs/fr/FR-40-overlay-key-rotation.md	ui/src/stores/agents.ts:749-704
+docs/fr/FR-43-macos-single-enrollment.md	crates/localapi/src/lib.rs:1966-1875
+docs/fr/FR-49-second-org-has-no-mesh.md	agents/roomlerd/src/main.rs:1791-1731
+docs/fr/FR-66-config-probe-false-re-enrollment-error.md	crates/agent-core/src/config.rs:2620-2417
+docs/fr/FR-77-encoder-chroma-matrix.md	agents/roomlerd/src/peer.rs:4534-4529
+docs/fr/FR-77-encoder-chroma-matrix.md	ui/src/composables/useRemoteControl.ts:1908-1893
+docs/fr/FR-85-hq-screen-recording.md	crates/modules/fleet/src/hub.rs:1117-881
+docs/fr/FR-90-hive-agent-sessions.md	crates/db/src/models/tenant.rs:302-220
+docs/fr/FR-90-hive-agent-sessions.md	crates/localapi/src/lib.rs:3013-2958
+docs/linux-capture.md	main.rs:3498-3486
+docs/multi-org.md	crates/agent-core/src/config.rs:2114-2109
+docs/overlay-key-rotation.md	agents/roomlerd/src/encode/caps.rs:1812-1800
+docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
+docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
+docs/overlay-key-rotation.md	config_surface.rs:1096-1069
+docs/overlay-key-rotation.md	config_surface.rs:1096-1069
+docs/overlay-key-rotation.md	crates/agent-core/src/config.rs:980-868
+docs/overlay-key-rotation.md	crates/agent-core/src/config.rs:980-868
+docs/overlay-key-rotation.md	signaling.rs:4201-4168
+docs/overlay-key-rotation.md	signaling.rs:4326-4291
+docs/overlay-key-rotation.md	ui/src/stores/agents.ts:948-902
+docs/roomler-hive-design.md	crates/localapi/src/lib.rs:3145-2958
+docs/roomler-hive-design.md	crates/remote_control/src/models.rs:2590-2412
