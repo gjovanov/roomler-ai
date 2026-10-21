@@ -23,7 +23,9 @@ set -u
 cd "$(dirname "$0")/../../.." || exit 1
 GUARD=".claude/skills/sanitize-hostnames/check_shapes.py"
 CANARY="canary-selftest.md"
-trap 'rm -f "$CANARY"' EXIT
+GLUED="canary-glued.rs"
+PATHS=()   # canary FILE NAMES, filled in below once the fragments exist
+trap 'rm -f "$CANARY" "$GLUED" "${PATHS[@]}"' EXIT
 
 D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABC4EFGHIJK"
 P5="P""C51234";        P4="P""C5123";         C="CL""K00099887"
@@ -85,12 +87,31 @@ IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
 
 { printf '%s\n' "${CAUGHT[@]}"; printf 'must not trip: %s\n' "${IGNORED[*]}"; } > "$CANARY"
 
+# ⚠️⚠️ GLUED and PATH canaries (2026-10-21). Every canary above stands alone
+# between spaces, so all of them passed while the guard was blind to two whole
+# classes, both measured that day in this repo's own history:
+#   * a tag GLUED to an identifier by `_` (a Rust test named `fn <tag>_...`):
+#     `\b` treats `_` as part of the word, so no shape could see it;
+#   * a tag in a FILE NAME (an e2e spec named after a corp laptop): only
+#     content was ever scanned.
+# Each is asserted by its exact `<file>:<line-or-name>  <token>` report line,
+# because the bare token is already in the output from the standalone plants
+# and a grep for it alone would pass on the very bug these lock. The .png is
+# deliberate: a binary's CONTENT is skipped, and its name must still be read.
+printf 'fn %s_layout() {}\nconst T: &str = "fixture_%s";\n' "$p5" "$C" > "$GLUED"
+PATHS=("canary-path-$p4.md" "canary-path-$D.png")
+echo ordinary-prose > "${PATHS[0]}"; : > "${PATHS[1]}"
+WANT=("  $GLUED:1  $p5" "  $GLUED:2  $C" "  ${PATHS[0]}:name  $p4" "  ${PATHS[1]}:name  $D")
+
 out=$(python3 "$GUARD" --root . 2>&1); rc=$?
-rm -f "$CANARY"
+rm -f "$CANARY" "$GLUED" "${PATHS[@]}"
 
 fail=0
 for n in "${CAUGHT[@]}"; do
   grep -qF -- "$n" <<<"$out" || { echo "MISSED: $n"; fail=1; }
+done
+for n in "${WANT[@]}"; do
+  grep -qxF -- "$n" <<<"$out" || { echo "MISSED:${n}"; fail=1; }
 done
 for n in "${IGNORED[@]}"; do
   grep -qE "  ${n}\$" <<<"$out" && { echo "FALSE POSITIVE: $n"; fail=1; }
@@ -207,6 +228,71 @@ if [ -x "$HOOK" ] && command -v python3 >/dev/null 2>&1; then
   r=$(hook_says 0)
   [ "${r%%|*}" = "0" ]              || { echo "hook: a clean guard must allow the commit (got ${r%%|*})"; fail=1; }
 fi
+
+# --- the SWEEP's rules (sanitize.py): glued tags, identifiers, paths ----------
+#
+# The guard above only DETECTS. The sweep REWRITES, and in a history rewrite it
+# rewrites every commit at once, so its boundary is the more dangerous of the
+# two to get wrong in either direction: too narrow and a name survives the
+# rewrite (it did, twice), too wide and a digit-free short key rewrites
+# ordinary code identifiers across the entire history. A synthetic map --
+# assembled at runtime, like every canary in this file -- pins both edges,
+# the identifier-safe replacement, the ORDER of the generated filter-repo
+# rules, and the filename callback that renames a path.
+st=$(mktemp -d)
+printf '%s = CORP-ALIAS-1\n%s = word-alias\n' "$P5" "Quokka""farm" > "$st/map.txt"
+python3 - "$st" <<'PY' || fail=1
+import re, sys
+from pathlib import Path
+sys.path.insert(0, ".claude/skills/sanitize-hostnames")
+import sanitize as s
+
+t = Path(sys.argv[1])
+pairs, _ = s.load_map(t / "map.txt")
+tag = next(k for k, _ in pairs if any(c.isdigit() for c in k))
+word = next(k for k, _ in pairs if not any(c.isdigit() for c in k))
+rx, bad = s.build_regex(pairs), []
+
+def flag(msg):  # print AS FOUND: a later step that raises must not swallow an earlier verdict
+    print("SWEEP: " + msg, flush=True)
+    bad.append(msg)
+
+def check(src, want, label):
+    got, _ = s.apply_text(src, pairs, rx)
+    if got != want:
+        flag("%s: %r -> %r, want %r" % (label, src, got, want))
+
+check("fn %s_layout() {}" % tag, "fn CORP_ALIAS_1_layout() {}", "tag glued before _")
+check("x = fixture_%s;" % tag, "x = fixture_CORP_ALIAS_1;", "tag glued after _")
+check("see %s." % tag, "see CORP-ALIAS-1.", "tag standing alone")
+check("%s9" % tag, "%s9" % tag, "tag inside a longer run")
+check("let %s_cfg = 1;" % word, "let %s_cfg = 1;" % word, "digit-free key glued to _")
+check("ask %s now" % word, "ask word-alias now", "digit-free key standing alone")
+
+# filter-repo applies the regex lines in file order, one re.sub per line, on BYTES.
+s.gen_filter_repo(pairs, t / "replace.txt")
+data = ("fn %s_layout(); fixture_%s; see %s." % (tag, tag, tag)).encode()
+for line in (t / "replace.txt").read_text(encoding="utf-8").splitlines():
+    pat, _, repl = line[len("regex:"):].rpartition("==>")
+    data = re.sub(pat.encode(), lambda m, r=repl.encode(): r, data)
+want = b"fn CORP_ALIAS_1_layout(); fixture_CORP_ALIAS_1; see CORP-ALIAS-1."
+if data != want:
+    flag("filter-repo rules, applied in order: %r, want %r" % (data, want))
+
+s.gen_filename_callback(pairs, t / "cb.py")
+body = (t / "cb.py").read_text(encoding="utf-8")
+ns = {}
+exec("def cb(filename):\n" + "".join("    " + l + "\n" for l in body.splitlines()), ns)
+for src, want in ((b"e2e/upload-%s.spec.ts" % tag.encode(), b"e2e/upload-CORP-ALIAS-1.spec.ts"),
+                  (b"shots/%s_full.png" % tag.encode(), b"shots/CORP-ALIAS-1_full.png"),
+                  (b"src/%s_cfg.rs" % word.encode(), b"src/%s_cfg.rs" % word.encode())):
+    got = ns["cb"](src)
+    if got != want:
+        flag("filename callback: %r -> %r, want %r" % (src, got, want))
+
+sys.exit(1 if bad else 0)
+PY
+rm -rf "$st"
 
 if [ "$fail" -eq 0 ]; then echo "sanitize-hostnames selftest: ok"; else
   echo "sanitize-hostnames selftest: FAILED"; fi
