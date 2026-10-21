@@ -586,6 +586,14 @@ pub struct AgentConfig {
     /// key. Never pushable.
     #[serde(default)]
     pub vault_activity_log: bool,
+    /// FR-90 P3-7-3c — offer the agent sessions on this device their own
+    /// egress: `net_socks` and `net_forward`, a loopback listener per call,
+    /// served to the session's account alone, its flows leaving from another
+    /// device of the organization as its vault and tunnel policies decide.
+    /// Only beside `vault_enabled`. Default OFF, and never pushable: whether
+    /// a session here reaches a network beyond this device is the owner's call.
+    #[serde(default)]
+    pub hive_net: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2746,6 +2754,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_store_quota_mib: None,
         vault_enabled: false,
         vault_activity_log: false,
+        hive_net: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

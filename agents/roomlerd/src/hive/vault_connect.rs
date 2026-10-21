@@ -462,6 +462,8 @@ pub(crate) fn sweep(runtime_root: &std::path::Path) -> usize {
 
 #[cfg(all(unix, test))]
 pub(crate) use endpoint::MAX_ENDPOINTS;
+/// FR-90 P3-7-3c — the admit hook a session's net listener takes.
+pub(crate) use endpoint::loopback::session_admit;
 
 /// P3-5d-2 — Linux: who owns a TCP connection's client end, read from the
 /// kernel's own tables of sockets.
@@ -1817,9 +1819,6 @@ mod endpoint {
         /// (`tunnel_core::flow_listener::Admit`): a connection from `peer`'s
         /// processes alone, asked as an endpoint asks. Refused where this
         /// system cannot say who connects to a loopback port.
-        // P3-7-3c's tools are its first caller; until they land, only the
-        // tests reach it.
-        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn session_admit(
             peer: Peer,
         ) -> Result<tunnel_core::flow_listener::Admit, String> {
