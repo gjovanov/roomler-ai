@@ -78,6 +78,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { isBecomingManaged, mayBecomeManaged, useHiveStore, type HiveSession } from '@/stores/hive'
 import { useAuthStore } from '@/stores/auth'
+import { useNodeLabel } from '@/composables/useNodeLabel'
 
 const props = defineProps<{ tenantId: string; sessionId: string }>()
 const hive = useHiveStore()
@@ -92,7 +93,10 @@ const done = ref(false)
 const outcome = ref<{ kind: 'success' | 'info' | 'warning' | 'error'; text: string } | null>(null)
 
 const session = computed<HiveSession | null>(() => hive.sessions.find((s) => s.id === props.sessionId) ?? null)
-const deviceName = computed(() => session.value?.device_name ?? '')
+// FR-116 AC4 — the device by the name the Devices page shows; the session's
+// kept machine name only for a device this org no longer lists.
+const { agentLabel } = useNodeLabel()
+const deviceName = computed(() => agentLabel(session.value?.device_id, session.value?.device_name ?? ''))
 /** Only its owner makes it managed; the server answers anyone else 404. */
 const isOwner = computed(() => !!session.value && !!auth.user && session.value.owner_id === auth.user.id)
 /** The route is the replicaset's: where the server copies nothing, it is not there. */
@@ -119,7 +123,7 @@ async function manageNow(): Promise<void> {
   try {
     const res = await hive.manage(props.tenantId, s.id, typed !== s.folder ? typed : undefined)
     if (res.outcome === 'accepted') {
-      outcome.value = { kind: 'success', text: t('hive.manage.accepted', { device: s.device_name }) }
+      outcome.value = { kind: 'success', text: t('hive.manage.accepted', { device: agentLabel(s.device_id, s.device_name) }) }
     } else if (res.outcome === 'pending') {
       outcome.value = { kind: 'info', text: t('hive.manage.pending') }
     } else {
