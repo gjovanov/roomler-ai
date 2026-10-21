@@ -5224,6 +5224,12 @@ async fn handle_server_msg(
             session_secs,
             consent_mode,
             via_service,
+            // FR-90 P3-8-1b — an agent session's grant, held to one command.
+            // This build does not advertise `ssh-one-command`, and the server
+            // sends a session's grant only to a device that does, so no grant
+            // this build receives carries it; holding one to one command is
+            // P3-8-2a's.
+            one_command: _,
         } => {
             #[cfg(feature = "ssh-server")]
             if via_service {
@@ -5956,6 +5962,10 @@ async fn handle_server_msg(
             host_pubkey,
             expires_at_ms,
             error,
+            // FR-90 P3-8-1b — the echo of an agent session's ticket. This
+            // build sends no ticket (P3-8-2b's daemon is the first), so every
+            // answer it gets is to a person's request, and carries none.
+            ssh_ticket_id: _,
         } => {
             // The key itself is never logged — only whether one arrived. It is
             // public, but a log line is the wrong place to start treating key

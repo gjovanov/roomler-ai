@@ -7,11 +7,9 @@
 # doc means) and delete its line here in the same commit; the audit fails while a
 # pinned range is gone, and it never accepts a new line. Regenerate nothing.
 docs/fr/FR-102-growth-observability.md	crates/db/src/models/tenant.rs:243-232
-docs/fr/FR-106-devices-say-when-not-updating.md	crates/remote_control/src/models.rs:1827-1797
 docs/fr/FR-106-devices-say-when-not-updating.md	ui/src/components/admin/AgentsSection.vue:396-388
 docs/fr/FR-106-devices-say-when-not-updating.md	ui/src/components/admin/AgentsSection.vue:759-747
 docs/fr/FR-40-overlay-key-rotation.md	crates/agent-core/src/config_surface.rs:2289-2148
-docs/fr/FR-40-overlay-key-rotation.md	models.rs:2385-2348
 docs/fr/FR-40-overlay-key-rotation.md	ui/src/components/admin/AgentsSection.vue:1918-1906
 docs/fr/FR-40-overlay-key-rotation.md	ui/src/stores/agents.ts:749-704
 docs/fr/FR-43-macos-single-enrollment.md	crates/localapi/src/lib.rs:1966-1875

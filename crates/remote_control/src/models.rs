@@ -1117,6 +1117,16 @@ pub enum RpcCap {
     /// worker runs an SSH server", which on an attended install is the
     /// signed-in user. Equality-matched, locked by test.
     SshSystem,
+    /// FR-90 P3-8 — the device's SSH server holds a grant marked
+    /// `one_command` to one `exec` and refuses anything else on it: a shell,
+    /// a PTY, a forward, a subsystem. The server sends an agent session's
+    /// grant only to a device saying so (P3-8-1b); the device's half is
+    /// P3-8-2a.
+    ///
+    /// ⚠️ `ssh` is its prefix and NOT the same promise: an `ssh` device that
+    /// cannot read the field would serve a session's key a shell.
+    /// Equality-matched, locked by test.
+    SshOneCommand,
     /// FR-99 — the device serves privacy mode: it understands the `PRIVACY`
     /// permission, can cover the local screen with a curtain the capture
     /// does not see, and its owner allowed it (`privacy_mode_allowed`,
@@ -1268,6 +1278,7 @@ impl RpcCap {
             Self::HiveSearch => "hive-search",
             Self::ExecSystem => "exec-system",
             Self::SshSystem => "ssh-system",
+            Self::SshOneCommand => "ssh-one-command",
             Self::PrivacyMode => "privacy-mode",
             Self::PrivacyAvailable => "privacy-available",
             Self::SessionPolicy => "session-policy",
@@ -1282,7 +1293,7 @@ impl RpcCap {
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 37] = [
+    pub const ALL: [RpcCap; 38] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1310,6 +1321,7 @@ impl RpcCap {
         Self::HiveSearch,
         Self::ExecSystem,
         Self::SshSystem,
+        Self::SshOneCommand,
         Self::PrivacyMode,
         Self::PrivacyAvailable,
         Self::SessionPolicy,
@@ -4747,6 +4759,17 @@ pub enum SshDenyReason {
     /// or another device's. Not told apart, so a forged ring learns nothing.
     /// Audited with no user: the device's service asked, not a person.
     ClaimRefused,
+    /// FR-90 P3-8-1b — an agent session's request carried a ticket that does
+    /// not hold: not one this server signed, ended, for another organization,
+    /// device or target, or naming an account the target's policy no longer
+    /// maps. Never served as the owner's request instead.
+    TicketRefused,
+    /// FR-90 P3-8-1b — gate 3 for an agent session: no SSH policy names
+    /// sessions yet (decision 22), so none admits one.
+    SessionNotAllowed,
+    /// FR-90 P3-8-1b — the target does not advertise `ssh-one-command`, so it
+    /// could not hold an agent session's grant to one command.
+    TargetTooOld,
 }
 
 impl SshDenyReason {
@@ -4794,6 +4817,15 @@ impl SshDenyReason {
             Self::ClaimRefused => {
                 "the device's SYSTEM service claimed a grant that was not pending for \
                  it (unknown, already claimed, withdrawn, expired or another device's)"
+            }
+            Self::TicketRefused => {
+                "the agent session's SSH ticket does not hold for this request (ended, \
+                 for another device or target, or the target's account changed)"
+            }
+            Self::SessionNotAllowed => "no SSH policy on this device admits agent sessions",
+            Self::TargetTooOld => {
+                "this device's agent cannot hold an agent session to one command (needs a \
+                 build that advertises ssh-one-command)"
             }
         }
     }
@@ -5006,8 +5038,18 @@ pub struct SshAuditEvent {
     /// device-side log line that redeemed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
-    /// `cli` (device LocalAPI leg) | `api` (authenticated HTTP caller).
+    /// `cli` (device LocalAPI leg) | `api` (authenticated HTTP caller) |
+    /// (FR-90 P3-8-1b) `session` (an agent session's request, with its ticket).
     pub source: String,
+    /// FR-90 P3-8-1b — the agent session that asked, once its ticket held:
+    /// the acting principal then, with `user_id` the person it acts for.
+    /// Absent on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<ObjectId>,
+    /// FR-90 P3-8-1b — the vault's ticket the session presented, by its id
+    /// (`ticket:<id>` in `vault_audit`). Absent on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_ticket_id: Option<String>,
     /// Display name of the principal, as it was pushed to the device.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caller: String,
@@ -5057,6 +5099,11 @@ pub struct SshPending {
     pub session_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_mode: Option<ConsentMode>,
+    /// FR-90 P3-8-1b — an agent session's grant: the SYSTEM service holds it
+    /// to one `exec`, as `rc:ssh.grant`'s `one_command` says. False on every
+    /// other row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_command: bool,
     /// [`SshPending::PENDING`] → [`SshPending::CLAIMED`], or
     /// [`SshPending::CANCELLED`] when the caller stopped waiting first.
     pub state: String,
@@ -7652,7 +7699,7 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 22] = [
+        const KNOWN: [(RpcCap, RpcCap); 23] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
@@ -7713,6 +7760,9 @@ mod tests {
             // FR-105 — "runs an SSH server" is not "serves SSH from the
             // SYSTEM service". Locked by `ssh_does_not_imply_ssh_system`.
             (RpcCap::Ssh, RpcCap::SshSystem),
+            // FR-90 P3-8 — nor "holds a session's grant to one command".
+            // Locked by `ssh_does_not_imply_ssh_one_command`.
+            (RpcCap::Ssh, RpcCap::SshOneCommand),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -8037,6 +8087,58 @@ mod tests {
         assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshSystem));
         assert_eq!(RpcCap::SshSystem.wire(), "ssh-system");
         assert_eq!(RpcCap::from_wire("ssh-system"), Some(RpcCap::SshSystem));
+    }
+
+    /// FR-90 P3-8 — every SSH-capable agent advertises `ssh`, and one that
+    /// cannot read `one_command` would serve an agent session's key a shell.
+    /// A prefix matcher would send a session's grant to exactly that device.
+    #[test]
+    fn ssh_does_not_imply_ssh_one_command() {
+        let ssh_only = AgentCaps {
+            rpc: vec![
+                "ssh".into(),
+                "ssh-consent".into(),
+                "ssh-grant-ack".into(),
+                "ssh-system".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(ssh_only.has_rpc(RpcCap::Ssh));
+        assert!(
+            !ssh_only.has_rpc(RpcCap::SshOneCommand),
+            "an agent before P3-8-2a must NOT read as holding a grant to one command"
+        );
+        let both = AgentCaps {
+            rpc: vec!["ssh".into(), "ssh-one-command".into()],
+            ..Default::default()
+        };
+        assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshOneCommand));
+        assert_eq!(RpcCap::SshOneCommand.wire(), "ssh-one-command");
+        assert_eq!(
+            RpcCap::from_wire("ssh-one-command"),
+            Some(RpcCap::SshOneCommand)
+        );
+    }
+
+    /// FR-90 P3-8-1b — an agent session's three refusals, spelled out so a
+    /// rename is a deliberate edit: a session's daemon shows them in words.
+    #[test]
+    fn ssh_session_refusals_are_locked() {
+        for (reason, word) in [
+            (SshDenyReason::TicketRefused, "ticket_refused"),
+            (SshDenyReason::SessionNotAllowed, "session_not_allowed"),
+            (SshDenyReason::TargetTooOld, "target_too_old"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(word)
+            );
+            assert_eq!(
+                serde_json::from_value::<SshDenyReason>(serde_json::json!(word)).unwrap(),
+                reason
+            );
+            assert!(!reason.message().is_empty(), "{word}");
+        }
     }
 
     /// FR-83 — every agent before the ack advertises `ssh` (and most

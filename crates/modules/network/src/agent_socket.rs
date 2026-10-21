@@ -115,6 +115,7 @@ impl AgentMsgHandler for NetworkAgentSocket {
                 target,
                 public_key,
                 session_secs,
+                ssh_ticket,
             } => {
                 let state = state.clone();
                 let (tenant_id, agent_id, reply_tx) = (ctx.tenant_id, ctx.agent_id, ctx.tx.clone());
@@ -127,6 +128,7 @@ impl AgentMsgHandler for NetworkAgentSocket {
                         target,
                         public_key,
                         session_secs,
+                        ssh_ticket,
                         reply_tx,
                     )
                     .await;
