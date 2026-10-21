@@ -65,7 +65,7 @@ flowchart LR
 ```
 
 **P1 — the DRM arm honours the pump's encode box.** `ScreenCapture::set_output_cap`
-(`agents/roomlerd/src/capture/mod.rs:382`) already exists for exactly this, and every pump calls it with its
+(`agents/roomlerd/src/capture/mod.rs:395`) already exists for exactly this, and every pump calls it with its
 effective box (`peer.rs:4272`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
 (`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1312`; `set_output_cap`, `drm_backend.rs:1525`).

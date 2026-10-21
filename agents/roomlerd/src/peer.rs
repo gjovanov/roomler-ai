@@ -6572,6 +6572,11 @@ async fn media_pump_ffmpeg_dc(
     // key frame is required", the encoder isn't flagging IDRs.
     let mut first_keyframe_logged = false;
     let mut heartbeat_frames_base: u64 = 0;
+    // FR-118 P0 — the encoder's stage totals and the capture backend's
+    // readback totals at the last heartbeat, so each heartbeat reports its own
+    // window.
+    let mut stage_base = crate::encode::ffmpeg::encoder::StageTimes::default();
+    let mut readback_base: (u64, u64) = (0, 0);
     let mut last_heartbeat = std::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -9231,6 +9236,23 @@ async fn media_pump_ffmpeg_dc(
             // one grep; read `idr_count` against `keyframe_requests` to isolate
             // rate-caused IDRs.
             let rate_stats = enc.rate_stats().await;
+            // FR-118 P0 — `avg_encode_ms` split into its four steps, and the
+            // capture thread's own readback, per frame over this window (0.0
+            // when the window had none, like `avg_encode_ms`). The readback runs
+            // off the pump's clock on WGC, so `avg_capture_ms` never contained it.
+            let [avg_convert_ms, avg_upload_ms, avg_submit_ms, avg_drain_ms] = rate_stats
+                .stage
+                .window_ms_since(&stage_base)
+                .unwrap_or([0.0; 4]);
+            stage_base = rate_stats.stage;
+            let avg_readback_ms = match capturer.readback_totals() {
+                Some(now) => {
+                    let ms = capture::readback_window_ms(now, readback_base);
+                    readback_base = now;
+                    ms
+                }
+                None => 0.0,
+            };
             info!(
                 %session_id,
                 codec_label,
@@ -9244,6 +9266,8 @@ async fn media_pump_ffmpeg_dc(
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
                 frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
+                avg_convert_ms, avg_upload_ms, avg_submit_ms, avg_drain_ms,
+                avg_readback_ms,
                 send_wait_avg_ms, send_wait_max_ms,
                 learned_ceiling_bps = governor.learned_ceiling_bps(),
                 send_stalls,
