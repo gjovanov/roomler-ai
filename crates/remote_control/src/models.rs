@@ -2689,6 +2689,13 @@ pub struct DesiredConfig {
     /// process), which the device reports as `needs_restart`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_cells_deny: Option<String>,
+    /// FR-119 P2b — the frame-rate denylist (`fps_deny`): comma-separated
+    /// `name:fps` entries, `*` for every encoder. Pushable for the same reason
+    /// as `encoder_cells_deny`: it only ever REMOVES rates a device would
+    /// otherwise grant, so `MANAGE_AGENTS` is enough. The daemon reads it once
+    /// per process, which the device reports as `needs_restart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_deny: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -2711,6 +2718,7 @@ impl DesiredConfig {
             && self.ssh_account_mode.is_none()
             && self.ssh_port.is_none()
             && self.encoder_cells_deny.is_none()
+            && self.fps_deny.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -2754,6 +2762,8 @@ impl DesiredConfig {
             // FR-77 P3 — neither exec nor SSH: the cell denylist only removes
             // encoder cells and needs MANAGE_AGENTS alone (see `remote_config::decide`).
             encoder_cells_deny: _,
+            // FR-119 P2b — the same for the frame-rate denylist: it only removes.
+            fps_deny: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -7161,6 +7171,7 @@ mod tests {
             ssh_account_mode: Some("console_user".into()),
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
+            fps_deny: Some("*:144".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7205,6 +7216,7 @@ mod tests {
             ssh_account_mode: Some("console_user".into()),
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
+            fps_deny: Some("*:144".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7233,6 +7245,7 @@ mod tests {
             ssh_account_mode: Some("console_user".into()),
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
+            fps_deny: Some("*:144".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7281,6 +7294,7 @@ mod tests {
             ssh_account_mode: Some("console_user".into()),
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
+            fps_deny: Some("*:144".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7322,6 +7336,7 @@ mod tests {
             ssh_account_mode: Some("console_user".into()),
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
+            fps_deny: Some("*:144".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -9026,6 +9041,7 @@ mod tests {
             ssh_account_mode: Some("daemon".into()),
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
+            fps_deny: Some("*:144".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),

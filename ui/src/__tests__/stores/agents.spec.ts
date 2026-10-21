@@ -900,6 +900,19 @@ describe('useAgentStore', () => {
     expect('ssh_enabled' in (body as object)).toBe(false)
   })
 
+  it('FR-119 — updateDesiredConfig carries the frame-rate denylist as given', async () => {
+    mockApi.put.mockResolvedValueOnce({
+      revision: 2,
+      desired: { revision: 2, fps_deny: 'hevc_qsv:120' },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { fps_deny: 'hevc_qsv:120' })
+
+    const [, body] = mockApi.put.mock.calls.at(-1)!
+    expect(body).toEqual({ fps_deny: 'hevc_qsv:120' })
+  })
+
   it('a saved request is optimistically PENDING, never applied', async () => {
     // The device has not spoken yet. Writing anything but `pending` would put
     // an answer on screen that no device has given — the exact lie the
