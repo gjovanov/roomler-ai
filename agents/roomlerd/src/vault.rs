@@ -270,10 +270,11 @@ mod client {
     }
 
     /// P3-6b-2b — take a minted credential back, in the background: the
-    /// revocation dials the database, and nothing that lets a lease go waits
-    /// on it. Without a runtime to spawn on (never so in the daemon), the
-    /// credential is left to the end its database keeps (Postgres's `VALID
-    /// UNTIL`, MySQL's event) and its issuer's next sweep.
+    /// revocation dials the database (from P3-6f-2, or the API server), and
+    /// nothing that lets a lease go waits on it. Without a runtime to spawn
+    /// on (never so in the daemon), the credential is left to the end its
+    /// provider keeps (Postgres's `VALID UNTIL`, MySQL's event, a token's own
+    /// expiry) and its issuer's next sweep.
     fn revoke_later(lease_id: &str, role: (minter::Issuer, minter::Minted)) {
         let lease = lease_id.to_string();
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
@@ -282,12 +283,12 @@ mod client {
         };
         rt.spawn(async move {
             let (issuer, minted) = role;
-            match minter::revoke(&issuer, &minted.user).await {
+            match minter::revoke(&issuer, &minted).await {
                 Ok(()) => {
-                    info!(%lease, role = %minted.user, "vault: a minted credential taken back")
+                    info!(%lease, role = %minted.label(), "vault: a minted credential taken back")
                 }
                 Err(why) => warn!(
-                    %lease, role = %minted.user, %why,
+                    %lease, role = %minted.label(), %why,
                     "vault: a minted credential was not taken back: it lives to its end"
                 ),
             }
@@ -1011,9 +1012,11 @@ mod client {
         }
 
         /// P3-6b-2b — one field of the credential minted for `lease_id`, by
-        /// the name a session gives it (`user`, `password`, `host`, `port`,
-        /// `database`): `None` before its mint, once the lease is let go, or
-        /// for any other name.
+        /// the name a session gives it (its provider's minted fields: a
+        /// database user's `user`, `password`, `host`, `port`, `database`;
+        /// from P3-6f-2 a token's `token`, `server`, `ca`, `namespace`):
+        /// `None` before its mint, once the lease is let go, or for any other
+        /// name.
         pub fn minted(&self, lease_id: &str, field: &str) -> Option<Zeroizing<Vec<u8>>> {
             self.prune();
             let held = lock(&self.held);
@@ -1220,7 +1223,7 @@ mod tests {
         use super::super::{
             Client, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, Report, hello_key,
         };
-        use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, fake_mysql, made};
+        use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, fake_k8s, fake_mysql, made};
 
         fn in_ms(ms: i64) -> i64 {
             let now = std::time::SystemTime::now()
@@ -1694,6 +1697,83 @@ mod tests {
             .await;
             eventually("its event dropped", || {
                 !f.events.lock().unwrap().contains(&event)
+            })
+            .await;
+        }
+
+        /// P3-6f-2 — a Kubernetes issuer's lease is served as a database
+        /// user's is, by the minter its provider names: one token for the
+        /// lease, bound to one Secret made for it, for Kubernetes' shortest
+        /// where the lease is shorter; the Secret deleted when the lease is
+        /// let go, and the token with it.
+        #[tokio::test]
+        async fn a_kubernetes_bundle_mints_a_token_bound_to_its_lease_and_takes_it_back() {
+            let k = fake_k8s(false).await;
+            let (c, mut rx) = connected();
+            let lease_id = ObjectId::new().to_hex();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.request(ask(ObjectId::new(), 3)).await })
+            };
+            let req_id = req_id_of(rx.recv().await.unwrap());
+            let bundle = serde_json::to_vec(&serde_json::json!({
+                "audience": k.origin(),
+                "fields": {
+                    "namespace": "hive-tokens",
+                    "service_account": "session-runner",
+                    "admin_token": made(),
+                    "ca": k.ca,
+                },
+            }))
+            .unwrap();
+            c.on_leased(
+                &req_id,
+                &lease_id,
+                0,
+                &sealed_for_us(&bundle),
+                in_ms(60_000),
+                Some("kubernetes"),
+            );
+            let info = asker.await.unwrap().unwrap();
+            assert_eq!(info.provider.as_deref(), Some("kubernetes"));
+            assert_eq!(c.with_value(&lease_id, |_| ()), None, "nothing lent");
+            let (a, b) = tokio::join!(c.mint(&lease_id), c.mint(&lease_id));
+            assert_eq!((a, b), (Ok(()), Ok(())));
+            let secret = format!("roomler-{lease_id}");
+            {
+                let st = k.state();
+                assert_eq!(
+                    st.secrets.keys().collect::<Vec<_>>(),
+                    [&secret],
+                    "one Secret per lease"
+                );
+                let asks: Vec<_> = st
+                    .saw
+                    .iter()
+                    .filter(|s| s.target.ends_with("/token"))
+                    .collect();
+                assert_eq!(asks.len(), 1, "one token per lease");
+                assert_eq!(
+                    asks[0].body["spec"]["expirationSeconds"], 600,
+                    "a minute's lease asks for Kubernetes' shortest"
+                );
+            }
+            let field = |name: &str| c.minted(&lease_id, name).map(|v| v.to_vec());
+            assert_eq!(
+                field("token"),
+                Some(format!("minted.session-runner.{secret}").into_bytes())
+            );
+            assert_eq!(field("server"), Some(k.origin().into_bytes()));
+            assert_eq!(field("ca"), Some(k.ca.clone().into_bytes()));
+            assert_eq!(field("namespace"), Some(b"hive-tokens".to_vec()));
+            assert_eq!(
+                field("admin_token"),
+                None,
+                "an issuer's field is no credential's"
+            );
+            assert_eq!(c.release(std::slice::from_ref(&lease_id)), 1);
+            eventually("the Secret deleted, and its token with it", || {
+                !k.state().secrets.contains_key(&secret)
             })
             .await;
         }

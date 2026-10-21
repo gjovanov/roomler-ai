@@ -49,6 +49,41 @@ fn each_provider_this_build_mints_for_reaches_its_own_minter() {
         Issuer::from_bundle(providers::MYSQL.name, &b),
         Ok(Issuer::Mysql(_))
     ));
+    // P3-6f-2 — a Kubernetes issuer's bundle names an origin, and its
+    // minter reads it; a database's bundle is no issuer of it.
+    let k8s = serde_json::to_vec(&json!({
+        "audience": "https://kubernetes.internal:6443",
+        "fields": {
+            "namespace": "hive-tokens",
+            "service_account": "session-runner",
+            "admin_token": made(),
+        },
+    }))
+    .unwrap();
+    assert!(matches!(
+        Issuer::from_bundle(providers::KUBERNETES.name, &k8s),
+        Ok(Issuer::Kubernetes(_))
+    ));
+    assert!(Issuer::from_bundle(providers::KUBERNETES.name, &b).is_err());
+    assert!(Issuer::from_bundle(providers::POSTGRES.name, &k8s).is_err());
+}
+
+/// P3-6f-2 — the TTL a token is asked for is what is left of its lease, in
+/// whole seconds, at least one and never past the longest lease, whatever
+/// the two clocks say.
+#[test]
+fn a_tokens_ttl_is_what_is_left_of_its_lease() {
+    let now = 1_767_225_600_000;
+    assert_eq!(ttl_secs(now + 60_000, now), 60);
+    assert_eq!(ttl_secs(now + 60_999, now), 60, "rounded down");
+    assert_eq!(ttl_secs(now + 500, now), 1, "at least a second");
+    assert_eq!(ttl_secs(now - 60_000, now), 1, "an end already past");
+    assert_eq!(
+        ttl_secs(now + 86_400_000, now),
+        MAX_TTL_SECS,
+        "never past the longest lease"
+    );
+    assert_eq!(ttl_secs(i64::MAX, i64::MIN), MAX_TTL_SECS);
 }
 
 /// A provider this build mints nothing for, however it is spelled, is

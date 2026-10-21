@@ -971,10 +971,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| asking | `vault::net` ([`vault.rs:691`](../agents/roomlerd/src/vault.rs#L691)) and its answer `on_net_granted` ([`:821`](../agents/roomlerd/src/vault.rs#L821)), held to what was asked by `net_granted` ([`:362`](../agents/roomlerd/src/vault.rs#L362)); the answer's own arm in the daemon's signalling ([`signaling.rs:6288`](../agents/roomlerd/src/signaling.rs#L6288)) |
+| asking | `vault::net` ([`vault.rs:692`](../agents/roomlerd/src/vault.rs#L692)) and its answer `on_net_granted` ([`:822`](../agents/roomlerd/src/vault.rs#L822)), held to what was asked by `net_granted` ([`:363`](../agents/roomlerd/src/vault.rs#L363)); the answer's own arm in the daemon's signalling ([`signaling.rs:6288`](../agents/roomlerd/src/signaling.rs#L6288)) |
 | presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
 | the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1737`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1737)) |
-| the code | `NET_GRANT_REFUSED` ([`vault.rs:491`](../crates/remote_control/src/vault.rs#L491)), shared by the server and the device |
+| the code | `NET_GRANT_REFUSED` ([`vault.rs:514`](../crates/remote_control/src/vault.rs#L514)), shared by the server and the device |
 | tests | `driver::tests` (4), `tunnel::client_mgr::tests::a_refused_or_unbound_grant_ends_the_flow`, `vault::tests::client` (2): 7, and 13 negative controls |
 
 #### The device's listeners (P3-7-3b)

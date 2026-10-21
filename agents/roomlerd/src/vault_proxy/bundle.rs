@@ -54,9 +54,7 @@ impl Opened {
     }
 
     /// P3-6f-1 — the one audience the bundle mints toward, as the lease was
-    /// decided for it: a Kubernetes issuer reads it as an origin. Its caller,
-    /// `k8s_mint`, is reached by its tests alone until P3-6f-2.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// decided for it: a Kubernetes issuer reads it as an origin.
     pub(crate) fn audience(&self) -> &str {
         &self.audience
     }
