@@ -140,7 +140,7 @@ frame to an agent too old to understand it must be a no-op.
 
 The structure is favourable. `DerpMux` already outlives its socket: *"the outbound
 receiver lives for the mux's whole life (across reconnects), so a reconnect never severs
-the `DerpConn`→WS path"* (`transport/derp.rs:325-330`). Carriers hang off the mux, not
+the `DerpConn`→WS path"* (`transport/derp.rs:356-361`). Carriers hang off the mux, not
 off the socket, so a socket swap need not be visible to them at all.
 
 What makes today's reconnect visible is `mark_down()` — the agent's WS loop

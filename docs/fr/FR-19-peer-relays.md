@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:3007` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:5160` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -172,7 +172,7 @@ first draft's claim that demux is *"unambiguous without a magic number"*; it is 
 What actually keeps WireGuard disjoint on the existing plane is a **four**-byte test —
 `is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2413`) requires `pkt[1..4] == 0`, and
 Geneve's bytes 2–3 carry a nonzero Protocol Type. One byte is not enough, and
-`payload_is_wg_or_disco` (`crates/tunnel-core/src/transport/derp.rs:257`) classifies on the
+`payload_is_wg_or_disco` (`crates/remote_control/src/derp_frame.rs:39`) classifies on the
 first byte alone.
 
 So the rules are:
@@ -198,7 +198,7 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:2929`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:2938`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
 adding a variant later is forward-compatible"* (`:1976-1978`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
@@ -371,7 +371,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
 | …delegating to the pure decision | `overlay.rs:1944` `relay_verdict_core` |
 | Measured caps supersede presence | `overlay.rs:1893-1902` (in `verdict_from_nodes`, `:1872`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:2931` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:2940` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1016` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:4806` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:5160` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -615,7 +615,7 @@ So the design is:
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
   (`wg.rs:155`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:410`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
-  DerpConn` (`transport/derp.rs:268`), `DerpMux::conn_for` (`derp.rs:420`) vending one per
+  DerpConn` (`transport/derp.rs:296`), `DerpMux::conn_for` (`derp.rs:458`) vending one per
   peer off a shared connection — and there are already **three** production impls
   (`DerpConn`, `TurnRelayConn` `transport/relay.rs:348`, `UdpRelayConn` `:491`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
@@ -688,7 +688,7 @@ evidence that justifies it.
 
 ⚠️ **The precedent:** FR-18's field log records `dropped_stale` *"could NOT be evaluated —
 the counter was added without a reader"*. Still true: `stale_drops()`
-(`transport/derp.rs:407`) has zero consumers in the tree.
+(`transport/derp.rs:445`) has zero consumers in the tree.
 
 | surface | addition |
 |---|---|
@@ -713,16 +713,16 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:152` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:268` (`impl RelayConn for DerpConn`) and `derp.rs:420` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:296` (`impl RelayConn for DerpConn`) and `derp.rs:458` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1016` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:693` `handle_overlay_relay_request` (cross-tenant `:705-717`, ACL `:719-743`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:1982` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:2951` `NetmapPeer`; `:2929` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:2960` `NetmapPeer`; `:2938` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:271` `sweep_carrier_health` |
-| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2413`; fix `payload_is_wg_or_disco` `transport/derp.rs:222` |
+| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2413`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |

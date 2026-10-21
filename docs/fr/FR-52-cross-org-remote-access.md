@@ -38,7 +38,7 @@ Four properties, stated as the acceptance bar rather than as a description:
 ## 1. The gap, measured in the code
 
 Every remote-desktop session passes through **one** function:
-`resolve_session_authz` — `crates/modules/remote/src/controller.rs:532`. After the
+`resolve_session_authz` — `crates/modules/remote/src/controller.rs:579`. After the
 self-control shortcut, the whole of the cross-org story is three lines:
 
 ```rust
@@ -141,7 +141,7 @@ never consulted, and never leak that they exist.
 | 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`crates/remote_control/src/models.rs:1381`), defaulting to `Prompt`. |
 
 Gate 5 needs one wire addition: the prompt must say the controller is **outside the
-organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2972`)
+organization**. `ServerMsg::Request` (`crates/remote_control/src/signaling.rs:2981`)
 carries `tenant_name` for the multi-org case, which answers *which* org is asking —
 not whether the asker is in one at all. A `controller_scope: external` field is
 additive and serde-defaulted, so older agents keep today's prompt text; a device
@@ -375,8 +375,8 @@ does not advertise it cannot be gate-2 approved, which is what keeps §3's
 
 ### F1 — the hub keys controllers by `ObjectId`, so an anonymous principal forks everything
 
-`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1190`),
-`RemoteSession.controller_user_id: ObjectId` (`models.rs:5332`), the `remote_audit`
+`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1235`),
+`RemoteSession.controller_user_id: ObjectId` (`models.rs:5337`), the `remote_audit`
 rows and the TURN credential all key on a real user id. A synthetic principal would
 fork the session record, the audit, the credential and the rate limiter — and leave
 *"someone controlled your machine"* in the log.
@@ -401,8 +401,8 @@ P5, do not assume.**
 
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
-`is_overlay_relay_ip` (`crates/modules/fleet/src/hub.rs:63`) accepts any
-`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2054` hands it to the agent as a
+`is_overlay_relay_ip` (`crates/modules/fleet/src/hub.rs:65`) accepts any
+`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2113` hands it to the agent as a
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.
