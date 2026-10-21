@@ -1786,6 +1786,22 @@ jobs:
       - name: Audit the FR registry
         run: bash scripts/fr-registry-audit.sh
 
+  anchor-ranges:
+    name: No inverted anchor ranges in the docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The docs point into the code by line (`file.rs:N-M`, `#LN-LM`), and every
+    # merge that moves code re-shifts those numbers. A shift that moves only
+    # the START of a range leaves `file.rs:2088-2087`, which no build, test or
+    # link check notices: the file exists and both numbers are in range. There
+    # were 31 on master when this landed (2026-10-21), all half-shifted. They
+    # are pinned in scripts/anchor-range-baseline.txt. The audit fails on any
+    # NEW one, and on a pinned one that is gone, so the baseline only shrinks.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit anchor ranges
+        run: bash scripts/anchor-range-audit.sh
+
   machine-names:
     name: No real machine names
     runs-on: ubuntu-latest
