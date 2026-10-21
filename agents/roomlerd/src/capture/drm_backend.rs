@@ -1530,6 +1530,16 @@ impl ScreenCapture for DrmCapture {
         Some(super::CaptureArm::Drm)
     }
 
+    /// FR-119 P2b — the pace is this side's sleep, in microseconds as at the
+    /// open, so it moves in place.
+    fn set_target_fps(&mut self, fps: u32) {
+        self.target_frame_period = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
+    }
+
+    fn backend(&self) -> &'static str {
+        "drm"
+    }
+
     /// FR-93 P3d — the frames skipped because nothing changed, which the
     /// pump's idle log carries beside its own count of empty polls.
     /// FR-93 P3e — a display switched off waits for its wake.

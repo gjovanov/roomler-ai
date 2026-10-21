@@ -115,9 +115,9 @@ pub mod viewer_rate;
 pub mod frame_rate;
 
 // FR-119 P2b — what trials concluded about this host's rate classes, next to
-// the probe cache and under its key. Built in P2b-1; P2b-2 wires it into the
-// pump and removes this allow. Until then nothing outside its tests calls it.
-#[allow(dead_code)]
+// the probe cache and under its key. Its one caller is the FFmpeg pump, so a
+// build without that pump has none.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub mod fps_class_cache;
 
 // Encode-pressure controller — auto-reduces the maxrate ceiling when the

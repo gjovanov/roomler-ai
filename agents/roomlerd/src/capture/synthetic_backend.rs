@@ -470,6 +470,12 @@ impl ScreenCapture for SyntheticCapture {
     fn monitor_count(&self) -> u8 {
         1
     }
+
+    /// FR-119 P2b. The pace stays the open's (`set_target_fps` is the
+    /// default): a test that wants another rate opens the source at it.
+    fn backend(&self) -> &'static str {
+        "synthetic"
+    }
 }
 
 /// Construct the synthetic capture honouring the same `target_fps` +

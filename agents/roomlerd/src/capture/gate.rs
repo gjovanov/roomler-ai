@@ -55,6 +55,31 @@ impl GateMode {
             Self::SlotFirst => "slot_first",
         }
     }
+
+    /// FR-119 P2b — the gate a granted rate runs: above
+    /// [`SLOT_FIRST_ABOVE_FPS`] the slot-first gate, whatever the open chose
+    /// (spec §3.4); at or below it, the open's own gate. The legacy rule
+    /// sleeps out the rest of a period before it looks at the slot, so a frame
+    /// that landed during the encode waits, and at 120 fps that wait comes out
+    /// of an 8.3 ms budget.
+    pub fn at_fps(opened: Self, fps: u32) -> Self {
+        if fps > SLOT_FIRST_ABOVE_FPS {
+            Self::SlotFirst
+        } else {
+            opened
+        }
+    }
+}
+
+/// FR-119 P2b — above this rate a granted session runs the slot-first gate.
+pub const SLOT_FIRST_ABOVE_FPS: u32 = 60;
+
+/// The legacy gate's period: whole milliseconds, as every backend has always
+/// computed it. At 120 and 144 fps it is 8 and 6 ms, a little shorter than the
+/// frames' own 8.3 and 6.9, so, as at 30 and 60, the cadence drifts out of the
+/// wait instead of locking to a phase (the module comment).
+pub fn legacy_period(fps: u32) -> Duration {
+    Duration::from_millis(1000 / u64::from(fps.max(1)))
 }
 
 /// The slot-first bucket. Pure over the instants it is given, so the tests
@@ -133,6 +158,31 @@ mod tests {
             Some("on"),
         ] {
             assert_eq!(GateMode::parse(raw), GateMode::Legacy, "{raw:?}");
+        }
+    }
+
+    /// FR-119 P2b — above 60 a granted rate runs the slot-first gate whatever
+    /// the open chose; at 60 and below the open's choice stands.
+    #[test]
+    fn above_sixty_the_slot_first_gate_runs_whatever_the_open_chose() {
+        for opened in [GateMode::Legacy, GateMode::SlotFirst] {
+            assert_eq!(GateMode::at_fps(opened, 120), GateMode::SlotFirst);
+            assert_eq!(GateMode::at_fps(opened, 144), GateMode::SlotFirst);
+            assert_eq!(GateMode::at_fps(opened, 60), opened);
+            assert_eq!(GateMode::at_fps(opened, 30), opened);
+        }
+    }
+
+    /// The legacy period is whole milliseconds, a little under the frame
+    /// period at 120 and 144, never over it.
+    #[test]
+    fn the_legacy_period_runs_a_little_fast_at_high_rates() {
+        assert_eq!(legacy_period(60), Duration::from_millis(16));
+        assert_eq!(legacy_period(120), Duration::from_millis(8));
+        assert_eq!(legacy_period(144), Duration::from_millis(6));
+        assert_eq!(legacy_period(0), Duration::from_secs(1));
+        for fps in [120u32, 144] {
+            assert!(legacy_period(fps) < SlotFirst::new(fps).period());
         }
     }
 

@@ -5362,9 +5362,11 @@ fn video_info_payload(
     // viewers and non-Linux agents are byte-identical.
     arm: Option<crate::capture::CaptureArm>,
     // FR-119 P1 — the frame rate the stream runs at, and the viewer's ask with
-    // the reason it was not granted (`encode::frame_rate`). `None` whenever
-    // `fps-high` is off, so every payload is byte-identical to before.
-    fps: Option<crate::encode::frame_rate::Answer>,
+    // the reason it was not granted, already in their wire form with a
+    // leading comma (`frame_rate::RateState::video_info_fields`; P2b-2 adds
+    // `fps_trial`). `None` whenever `fps-high` is off, so every payload is
+    // byte-identical to before.
+    fps: Option<String>,
 ) -> String {
     let reason = transport_reason
         .map(|r| format!(r#","transport_reason":"{r}""#))
@@ -5385,9 +5387,7 @@ fn video_info_payload(
         .filter(|_| cap_reason.is_some())
         .map(|d| format!(r#","cap_detail":"{d}""#))
         .unwrap_or_default();
-    let fps = fps
-        .map(|a| crate::encode::frame_rate::video_info_fields(&a))
-        .unwrap_or_default();
+    let fps = fps.unwrap_or_default();
     format!(
         r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}{cap}{detail}{arm}{fps}}}"#,
         if constrained { "relay" } else { "direct" },
@@ -6204,11 +6204,12 @@ async fn media_pump_ffmpeg_dc(
         session_id,
     );
     let mut last_viewers: usize = 0;
-    // FR-119 P1 — the viewer's frame-rate ask and the target it was answered
-    // against, so `rc:video-info` is re-sent when either moves. `fps-high` is
-    // read once per pump (FR-70: no knob is read in the frame path).
+    // FR-119 P1 — `fps-high`, read once per pump (FR-70: no knob is read in the
+    // frame path). P2b-2 — the answer `rc:video-info` last carried, and
+    // whether a trial ran, so a new one (a new ask, a new rate, a trial
+    // starting or ending) re-sends it.
     let fps_high = crate::encode::fps_high_enabled();
-    let mut fps_answered: (Option<u32>, u32) = (None, 0);
+    let mut fps_told: Option<(crate::encode::frame_rate::Answer, bool)> = None;
     // rc.87 — emit `rc:video-info` so the browser stats badge shows the
     // TRUTH (real encoder + HW + chroma + transport). Badge-truth rc:
     // RETRIED until delivered (see the loop-top block) — the old
@@ -6361,6 +6362,66 @@ async fn media_pump_ffmpeg_dc(
              opening with fewer pixels and fewer frames"
         );
     }
+    // FR-119 P2b-2 — the frame-rate grant. `base_fps` is what the session
+    // runs at without one (the transport's rate, or the slow-link profile's)
+    // and moves only with the transport; `encoder_fps` is the rate the live
+    // encoder was built for. With `fps-high` on, the rate-class cache is read
+    // once, here, off the runtime, under the probe cache's key: no key (macOS,
+    // or the cache switched off) reads as an empty cache, every class
+    // unproven. `fps_deny` is read here too (FR-70: no knob in the frame path).
+    let mut base_fps = target_fps;
+    let mut encoder_fps = target_fps;
+    let fps_deny = if fps_high {
+        crate::encode::frame_rate::fps_deny_from_env()
+    } else {
+        Vec::new()
+    };
+    let fps_cache = if fps_high {
+        tokio::task::spawn_blocking(|| {
+            let path = crate::encode::fps_class_cache::path()?;
+            let key = crate::encode::caps_cache::current_key()?;
+            let entries = crate::encode::fps_class_cache::load(
+                &path,
+                &key,
+                crate::encode::caps_cache::now_unix(),
+            );
+            Some((path, key, entries))
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let mut fps_state = fps_high.then(|| {
+        let verdicts = fps_cache
+            .as_ref()
+            .map(|(_, _, entries)| {
+                entries
+                    .iter()
+                    .map(|e| (e.class.clone(), e.verdict))
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::encode::frame_rate::RateState::new(target_fps, verdicts)
+    });
+    let fps_cache = fps_cache.map(|(path, key, _)| (path, key));
+    // What the last decision was taken on (the ask, the base rate, the
+    // transport, the capture backend, the encoder, its dims), and when:
+    // decided again when any of it moves, and once a second for the pipe's
+    // belief.
+    type FpsDecidedOn = (
+        Option<u32>,
+        u32,
+        bool,
+        &'static str,
+        &'static str,
+        (u32, u32),
+    );
+    const FPS_DECIDE_EVERY: Duration = Duration::from_secs(1);
+    const FPS_SWAP_RETRY: Duration = Duration::from_secs(10);
+    let mut fps_decided_on: Option<FpsDecidedOn> = None;
+    let mut fps_decided_at = std::time::Instant::now();
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
@@ -6415,14 +6476,20 @@ async fn media_pump_ffmpeg_dc(
     /// The open in flight, the dims it will produce, when it started, the
     /// plan target it was opened for (`built_target` at the swap), and the
     /// FR-70 M3a plan it was spawned under (the shadow's staleness reference).
+    /// FR-119 P2b-2 — and the frame rate it opens at.
     type PendingDimsOpen = (
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
         (u32, u32),
         std::time::Instant,
         TargetResolution,
         Option<crate::encode::plan::SwapSpawn>,
+        u32,
     );
     let mut pending_dims_open: Option<PendingDimsOpen> = None;
+    // FR-119 P2b-2 — after a replacement at another frame rate failed to
+    // open, no frame-rate move is opened again before this instant: a rate
+    // the backend refuses must not cost an open on every frame.
+    let mut fps_retry_at: Option<std::time::Instant> = None;
     let mut dims_swaps: u32 = 0;
     /// Frames the pump may skip after a capture-cap change before it treats
     /// a dims mismatch as real: the backend applies a cap "from the next
@@ -7123,11 +7190,15 @@ async fn media_pump_ffmpeg_dc(
         // target follow the plan again. A refused or failed open drops the
         // pending state and the next frame takes the inline path, exactly
         // as before M2.
-        if let Some((handle, _, _, _, _)) = pending_dims_open.as_ref()
+        if let Some((handle, _, _, _, _, _)) = pending_dims_open.as_ref()
             && handle.is_finished()
         {
-            let (handle, dims, started, target, spawned) =
+            let (handle, dims, started, target, spawned, opened_fps) =
                 pending_dims_open.take().expect("checked above");
+            // FR-119 P2b-2 — whether this open was a frame-rate move, read
+            // before an adoption moves `encoder_fps`.
+            let fps_move = opened_fps != encoder_fps;
+            let mut open_failed = false;
             let open_ms = started.elapsed().as_millis() as u64;
             match handle.await {
                 Ok(Ok(rebuilt)) => {
@@ -7136,10 +7207,29 @@ async fn media_pump_ffmpeg_dc(
                     // tick, as it does an inline open — unless the plan moved
                     // while it opened, which makes it a stale adoption.
                     let built_rate = rebuilt.maxrate_bps() as u32;
+                    let built_fps = rebuilt.fps();
                     if let Some(enc) = encoder.as_mut() {
                         let from = encoder_dims.unwrap_or((0, 0));
+                        let from_fps = encoder_fps;
                         if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                             encoder_dims = Some(dims);
+                            // FR-119 P2b-2 — the rate it was opened at. Going
+                            // up, the capture's pace follows only now, so the
+                            // encoder is never fed faster than it was built
+                            // for, and never above what the grant still wants
+                            // (it may have moved while this opened).
+                            encoder_fps = built_fps;
+                            if built_fps != from_fps {
+                                fps_retry_at = None;
+                            }
+                            if let Some(state) = fps_state.as_mut() {
+                                let pace = built_fps.min(state.want());
+                                if pace != target_fps {
+                                    capturer.set_target_fps(pace);
+                                    target_fps = pace;
+                                }
+                                state.running_at(target_fps);
+                            }
                             log_plan_stale_swap(
                                 &session_id,
                                 codec_label,
@@ -7160,6 +7250,8 @@ async fn media_pump_ffmpeg_dc(
                                 from_h = from.1,
                                 to_w = dims.0,
                                 to_h = dims.1,
+                                from_fps,
+                                to_fps = built_fps,
                                 open_ms,
                                 dims_swaps,
                                 "FR-70 M2: dims swap adopted — the picture never froze"
@@ -7171,9 +7263,28 @@ async fn media_pump_ffmpeg_dc(
                 }
                 Ok(Err(e)) => {
                     warn!(%session_id, codec_label, %e, open_ms, "FR-70 M2: background open failed — inline re-open next frame");
+                    open_failed = true;
                 }
                 Err(e) => {
                     warn!(%session_id, codec_label, %e, "FR-70 M2: background open task panicked — inline re-open next frame");
+                    open_failed = true;
+                }
+            }
+            // FR-119 P2b-2 — a replacement at another frame rate that did not
+            // open: no frame-rate move is opened again for a while (a rate the
+            // backend refuses must not cost an open on every frame), and a
+            // rate above the cap is not granted again this session.
+            if open_failed && fps_move {
+                fps_retry_at = Some(std::time::Instant::now() + FPS_SWAP_RETRY);
+                if let Some(state) = fps_state.as_mut()
+                    && state.open_failed()
+                {
+                    warn!(
+                        %session_id,
+                        codec_label,
+                        opened_fps,
+                        "FR-119: the replacement at the granted rate did not open — back to the session's rate for this session"
+                    );
                 }
             }
         }
@@ -7198,8 +7309,11 @@ async fn media_pump_ffmpeg_dc(
                         // (the dims swap below needs it), so the rate swap
                         // guards its own staleness here: a replacement opened
                         // for dims the session has since left is discarded.
+                        // FR-119 P2b-2 — and one opened at a frame rate the
+                        // session has since left (an fps swap was adopted).
                         let rebuilt_dims = rebuilt.dims();
-                        let stale_dims = encoder_dims.is_some_and(|d| d != rebuilt_dims);
+                        let stale_dims = encoder_dims.is_some_and(|d| d != rebuilt_dims)
+                            || rebuilt.fps() != encoder_fps;
                         if let Some(enc) = encoder.as_mut() {
                             if !stale_dims && timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                                 // Stale pre-swap frames yield to the fresh
@@ -7303,6 +7417,9 @@ async fn media_pump_ffmpeg_dc(
                         && let Some(nc) = flip_tracker.observe(relay, std::time::Instant::now())
                     {
                         let new_fps = ffmpeg_target_fps(nc);
+                        // FR-119 P2b-2 — the rate without a grant follows the
+                        // transport; a grant is decided again against it.
+                        base_fps = new_fps;
                         if new_fps != target_fps {
                             info!(
                                 %session_id,
@@ -7327,6 +7444,9 @@ async fn media_pump_ffmpeg_dc(
                             .await;
                             encoder = None;
                             encoder_dims = None;
+                            if let Some(state) = fps_state.as_mut() {
+                                state.running_at(target_fps);
+                            }
                         }
                     }
                 }
@@ -7340,12 +7460,13 @@ async fn media_pump_ffmpeg_dc(
             last_viewers = viewers;
             video_info_sent = false;
         }
-        // FR-119 P1 — a new frame-rate ask, or a new target, re-sends
-        // `rc:video-info`, which carries the answer.
-        if fps_high {
-            let now = (viewer_report.fps_ask(), target_fps);
-            if now != fps_answered {
-                fps_answered = now;
+        // FR-119 P1 — a new answer re-sends `rc:video-info`, which carries it.
+        // P2b-2: the state moves it on a new ask, a new rate, or a trial
+        // starting or ending.
+        if let Some(state) = fps_state.as_ref() {
+            let told = Some((state.answer(), state.trial_running()));
+            if told != fps_told {
+                fps_told = told;
                 video_info_sent = false;
             }
         }
@@ -7412,12 +7533,9 @@ async fn media_pump_ffmpeg_dc(
                     cap_reason,
                     cap_detail.as_deref(),
                     capturer.arm(),
-                    // FR-119 P1 — what the stream runs at, and the viewer's
-                    // ask if it asked for more (nothing above the cap is
-                    // granted in P1).
-                    fps_high.then(|| {
-                        crate::encode::frame_rate::answer(fps_answered.0, target_fps, constrained)
-                    }),
+                    // FR-119 P1 — what the stream runs at, the viewer's ask
+                    // if it was refused, and (P2b-2) whether a trial runs.
+                    fps_state.as_ref().map(|s| s.video_info_fields()),
                 );
                 // FR-65 — the control-DC lock and send both await; the lock is
                 // shared with every other control-plane writer, and a congested
@@ -7659,6 +7777,11 @@ async fn media_pump_ffmpeg_dc(
                 );
             }
             frames_skipped_backpressure += 1;
+            // FR-119 P2b-2 — a frame not taken for the link is no evidence
+            // about this host's rate.
+            if let Some(state) = fps_state.as_mut() {
+                state.pause();
+            }
             // Phase B — a FULL send channel is the real DC backpressure signal.
             // Drive the multiplicative decrease HERE, before the `continue`, so
             // it runs DURING sustained congestion (the VP9 pump's rc.171
@@ -7990,6 +8113,11 @@ async fn media_pump_ffmpeg_dc(
                     media_waiting_hook(session_id, control_dc.clone()),
                 )
                 .await;
+                // FR-119 P2b-2 — an open applies its own gate; a granted rate
+                // above the session's base runs the granted one.
+                if fps_state.is_some() && target_fps > base_fps {
+                    capturer.set_target_fps(target_fps);
+                }
                 continue;
             }
         };
@@ -8058,6 +8186,95 @@ async fn media_pump_ffmpeg_dc(
                 plan_target,
             )),
         );
+        // FR-119 P2b-2 — the frame rate: decided again when the ask, the base
+        // rate, the transport or the class (capture backend, encoder,
+        // geometry) moves, and once a second for the pipe's belief. The
+        // capture runs at the lower of what the grant wants and what the live
+        // encoder was built for: a move down slows it at once, a move up waits
+        // for the replacement below, so the encoder is never fed faster than
+        // it was built for.
+        if let Some(state) = fps_state.as_mut()
+            && let (Some(enc), Some(enc_dims)) = (encoder.as_ref(), encoder_dims)
+        {
+            let asked = pipeline.merged_fps_ask(viewer_report.fps_ask());
+            let on = (
+                asked,
+                base_fps,
+                constrained,
+                capturer.backend(),
+                enc.name(),
+                enc_dims,
+            );
+            if fps_decided_on != Some(on) || fps_decided_at.elapsed() >= FPS_DECIDE_EVERY {
+                fps_decided_on = Some(on);
+                fps_decided_at = std::time::Instant::now();
+                let above = asked.filter(|&a| a > base_fps);
+                // The ceiling the asked rate would get here, by the chain the
+                // replacement opens at, against what the pipe pushed back.
+                let pipe_covers = above.is_none_or(|a| {
+                    let at = crate::encode::policy::rate_plan(
+                        enc_dims.0,
+                        enc_dims.1,
+                        cap_native_w,
+                        cap_native_h,
+                        a,
+                        constrained,
+                        codec.label(),
+                        cell_444,
+                        governor.encode_factor(),
+                        matches!(
+                            dims_plan.reason,
+                            crate::encode::policy::RungReason::UserPick
+                        ),
+                        crate::encode::dial_rate_factor_pct(
+                            priority.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                    );
+                    crate::encode::frame_rate::pipe_covers(
+                        governor.belief_bps(std::time::Instant::now()).2,
+                        at.ceiling_bps,
+                    )
+                });
+                let class = crate::encode::frame_rate::ClassKey {
+                    backend: capturer.backend().to_string(),
+                    // P2b-3 reads the screen's refresh; unknown decides nothing.
+                    refresh_hz: 0,
+                    encoder: enc.name().to_string(),
+                    long_edge: crate::encode::frame_rate::long_edge_bucket(enc_dims.0, enc_dims.1),
+                    fps: asked.unwrap_or(base_fps),
+                };
+                let inputs = crate::encode::frame_rate::GrantInputs {
+                    asked,
+                    cap: base_fps,
+                    constrained,
+                    refresh_hz: None,
+                    denied: above.is_some_and(|a| {
+                        crate::encode::frame_rate::fps_denied(&fps_deny, enc.name(), a)
+                    }),
+                    verdict: None,
+                    pipe_covers,
+                };
+                if state.decide(inputs, class) {
+                    info!(
+                        %session_id,
+                        codec_label,
+                        ?asked,
+                        base_fps,
+                        want = state.want(),
+                        refused = ?state.answer().refused,
+                        backend = capturer.backend(),
+                        encoder = enc.name(),
+                        "FR-119: frame rate decided"
+                    );
+                }
+            }
+            let pace = state.want().min(encoder_fps);
+            if pace != target_fps {
+                capturer.set_target_fps(pace);
+                target_fps = pace;
+                state.running_at(pace);
+            }
+        }
         // FR-70 M2 — the make-before-break is decided from the PLAN, never
         // from a frame: a live encoder built for `built_target` that the
         // plan has moved away from gets its replacement opened in the
@@ -8072,13 +8289,29 @@ async fn media_pump_ffmpeg_dc(
         // inline re-opens on top of a swap that had just been adopted. A
         // backend that cannot rebuild off the frame path leaves the pin
         // unset and takes the inline open below, exactly as before M2.
+        //
+        // FR-119 P2b-2 — a frame-rate move rides the same make-before-break,
+        // at the live dims and the same pinned target, and a dims move opened
+        // meanwhile carries the wanted rate too. With `fps-high` off the
+        // wanted rate is the live encoder's, so nothing here changes.
+        let want_fps = fps_state.as_ref().map_or(encoder_fps, |s| s.want());
         if let Some(built) = built_target
             && pending_dims_open.is_none()
             && let Some(enc_dims) = encoder_dims
-            && plan_target != built
         {
             let plan_dims = crate::encode::resample::target_dims(frame.native_dims(), plan_target);
-            if plan_dims != enc_dims
+            let dims_move = plan_target != built && plan_dims != enc_dims;
+            let fps_move = want_fps != encoder_fps
+                && fps_retry_at.is_none_or(|t| std::time::Instant::now() >= t);
+            let (to_dims, to_target) = if dims_move {
+                (plan_dims, plan_target)
+            } else {
+                (enc_dims, built)
+            };
+            // A dims move carries the wanted rate only when a frame-rate move
+            // is due as well; otherwise the live encoder's, as before.
+            let to_fps = if fps_move { want_fps } else { encoder_fps };
+            if (dims_move || fps_move)
                 && let Some(enc) = encoder.as_mut()
             {
                 // FR-70 M3a.2 — open the replacement at the ceiling of the
@@ -8091,13 +8324,14 @@ async fn media_pump_ffmpeg_dc(
                 // rebuild-bound backend). The same chain the per-frame
                 // ceiling runs below, for the target dims; the learner is
                 // ASKED (`ceiling_for`), never told, so its nominal stays the
-                // frame actually encoded.
+                // frame actually encoded. FR-119 P2b-2: and at the rate it is
+                // opened for, by the rate law above 60.
                 let target_rate = crate::encode::policy::rate_plan(
-                    plan_dims.0,
-                    plan_dims.1,
+                    to_dims.0,
+                    to_dims.1,
                     cap_native_w,
                     cap_native_h,
-                    target_fps,
+                    to_fps,
                     constrained,
                     codec.label(),
                     cell_444,
@@ -8113,7 +8347,7 @@ async fn media_pump_ffmpeg_dc(
                 let target_ceiling = crate::encode::shared_split_ceiling_bps(
                     governor.ceiling_for(target_rate.ceiling_bps, constrained),
                     (1 + pipeline.follower_count()) as u32,
-                    crate::encode::area_min_bitrate_bps(plan_dims.0, plan_dims.1, constrained),
+                    crate::encode::area_min_bitrate_bps(to_dims.0, to_dims.1, constrained),
                     constrained,
                     crate::encode::shared_rate_split_enabled(),
                 );
@@ -8122,27 +8356,37 @@ async fn media_pump_ffmpeg_dc(
                     governor.applied_bps(),
                     governor.open_seed_bps(),
                 );
-                if let Some(spec) = enc
-                    .rebuild_spec_at_dims(plan_dims.0, plan_dims.1, bps)
-                    .await
-                {
-                    info!(
-                        %session_id,
-                        codec_label,
-                        from_w = enc_dims.0,
-                        from_h = enc_dims.1,
-                        to_w = plan_dims.0,
-                        to_h = plan_dims.1,
-                        "FR-70 M2: dims change — opening the replacement in the background, serving at the old dims meanwhile"
-                    );
+                if let Some(spec) = enc.rebuild_spec_at(to_dims.0, to_dims.1, to_fps, bps).await {
+                    if dims_move {
+                        info!(
+                            %session_id,
+                            codec_label,
+                            from_w = enc_dims.0,
+                            from_h = enc_dims.1,
+                            to_w = to_dims.0,
+                            to_h = to_dims.1,
+                            from_fps = encoder_fps,
+                            to_fps,
+                            "FR-70 M2: dims change — opening the replacement in the background, serving at the old dims meanwhile"
+                        );
+                    } else {
+                        info!(
+                            %session_id,
+                            codec_label,
+                            from_fps = encoder_fps,
+                            to_fps,
+                            "FR-119: frame-rate change — opening the replacement in the background, serving at the old rate meanwhile"
+                        );
+                    }
                     pending_dims_open = Some((
                         tokio::task::spawn_blocking(move || {
                             crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
                         }),
-                        plan_dims,
+                        to_dims,
                         std::time::Instant::now(),
-                        plan_target,
+                        to_target,
                         plan_shadow.swap_spawn(),
+                        to_fps,
                     ));
                 }
             }
@@ -8290,6 +8534,10 @@ async fn media_pump_ffmpeg_dc(
         // changed under a live session.
         if need_rebuild && encoder_dims.is_some() && stale_skips_left > 0 {
             stale_skips_left -= 1;
+            // FR-119 P2b-2 — the pump's own drop, not the host's.
+            if let Some(state) = fps_state.as_mut() {
+                state.pause();
+            }
             continue;
         }
         if need_rebuild {
@@ -8420,6 +8668,11 @@ async fn media_pump_ffmpeg_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
+                    // FR-119 P2b-2 — opened at the capture's pace.
+                    encoder_fps = target_fps;
+                    if let Some(state) = fps_state.as_mut() {
+                        state.running_at(target_fps);
+                    }
                     // FR-70 M3a — the loop decided this rate and these dims by
                     // itself; the shadow judges both against the controller's
                     // next target and the plan after its tick below.
@@ -8659,11 +8912,20 @@ async fn media_pump_ffmpeg_dc(
         // carrier: those bytes are already gone and cannot be recalled.
         // Bounded sub-second, and NO forced keyframe on resume — a pause
         // loses no frames, so the delta chain survives it intact.
+        //
+        // FR-119 P2b-2 — a frame dropped for the link or the viewer ends the
+        // trial's stretch (`TrialMeter::pause`).
         if governor.draining(std::time::Instant::now()) {
+            if let Some(state) = fps_state.as_mut() {
+                state.pause();
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
         if governor.should_skip_delta_frame(force_keyframe_this_iter) {
+            if let Some(state) = fps_state.as_mut() {
+                state.pause();
+            }
             continue;
         }
 
@@ -8962,6 +9224,36 @@ async fn media_pump_ffmpeg_dc(
         };
         encode_us += encode_start.elapsed().as_micros() as u64;
         frames_encoded += 1;
+        // FR-119 P2b-2 — a trial judges every real frame that left the
+        // encoder, at its capture time (a keepalive re-encode is no frame).
+        // The state has taken a verdict into account by the time it returns
+        // one; persisting it runs off the runtime, next to the probe cache.
+        if is_real_frame
+            && let Some(state) = fps_state.as_mut()
+            && let Some((class, verdict)) = state.frame(frame.monotonic_us)
+        {
+            info!(
+                %session_id,
+                codec_label,
+                ?class,
+                ?verdict,
+                want = state.want(),
+                "FR-119: the rate-class trial concluded"
+            );
+            if let Some((path, key)) = fps_cache.clone() {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::encode::fps_class_cache::record(
+                        &path,
+                        &key,
+                        class,
+                        verdict,
+                        crate::encode::caps_cache::now_unix(),
+                    ) {
+                        warn!(%e, "FR-119: the rate-class verdict was not saved; the next session tries the class again");
+                    }
+                });
+            }
+        }
         // rc.446 — the deferred-bitrate motion clock, ONE site: any real
         // frame whose encoded cost exceeds trivial-delta size marks motion.
         // rc.445 armed it only on SIGNIFICANCE-floor frames (42 KB scaled),
@@ -13763,15 +14055,16 @@ mod tests {
             )
         };
         let head = r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1"#;
-        let answer = crate::encode::frame_rate::answer;
+        let fields = |asked| {
+            crate::encode::frame_rate::video_info_fields(&crate::encode::frame_rate::answer(
+                asked, 60, false,
+            ))
+        };
         assert_eq!(
-            payload(Some(answer(Some(120), 60, false))),
+            payload(Some(fields(Some(120)))),
             format!(r#"{head},"fps":60,"fps_asked":120,"fps_reason":"unproven"}}"#)
         );
-        assert_eq!(
-            payload(Some(answer(None, 60, false))),
-            format!(r#"{head},"fps":60}}"#)
-        );
+        assert_eq!(payload(Some(fields(None))), format!(r#"{head},"fps":60}}"#));
         assert_eq!(payload(None), format!("{head}}}"));
     }
 
