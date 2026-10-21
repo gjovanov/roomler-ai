@@ -1410,10 +1410,29 @@ export const APPS_UNAVAILABLE_NO_REASON =
   'Remote apps are not available on this host. This agent did not say why (agents ' +
   'older than FR-56 AC10 carry no reason) — run `roomlerd apps-probe` on the host.'
 
+/** What the person at the viewer can do at the host's lock screen, from
+ *  `rc:host_locked`'s `input`. `passes` (FR-97 P3b, Linux): it takes input
+ *  like any other screen. `unknown` (FR-97 P2d-1, a Mac): not measured, so the
+ *  chip claims neither way. Anything else, or no `input` at all (Windows,
+ *  older agents), is Windows' meaning: input is suppressed. */
+export type HostLockedInput = 'passes' | 'unknown' | 'suppressed'
+
+/** The "Host locked" chip's title for each {@link HostLockedInput}. */
+export function hostLockedChipTitle(input: HostLockedInput): string {
+  switch (input) {
+    case 'passes':
+      return 'The remote host is on its lock screen. Your input reaches it, so you can type the password to unlock.'
+    case 'unknown':
+      return 'The remote host is on its lock screen.'
+    case 'suppressed':
+      return 'The remote host is on the lock screen — input is suppressed.'
+  }
+}
+
 export type RcControlInbound =
-  /** `inputPasses` (FR-97 P3b): the lock screen takes input, so the chip must
-   *  not say input is suppressed. A Linux hint; Windows never sends it. */
-  | { kind: 'host_locked'; locked: boolean; inputPasses: boolean }
+  /** `input` (FR-97 P3b, P2d-1): what the lock screen does with input — see
+   *  {@link HostLockedInput}. Windows never sends it. */
+  | { kind: 'host_locked'; locked: boolean; input: HostLockedInput }
   /** FR-92 — the device's keep-busy state (to every viewer, on change). */
   | { kind: 'keep_busy'; state: KeepBusyState }
   /** FR-108 — the device's answer to this viewer's display-match request. */
@@ -1456,7 +1475,9 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   if (parsed === null || typeof parsed !== 'object') return null
   const obj = parsed as Record<string, unknown>
   if (obj.t === 'rc:host_locked' && typeof obj.locked === 'boolean') {
-    return { kind: 'host_locked', locked: obj.locked, inputPasses: obj.input === 'passes' }
+    const input: HostLockedInput =
+      obj.input === 'passes' || obj.input === 'unknown' ? obj.input : 'suppressed'
+    return { kind: 'host_locked', locked: obj.locked, input }
   }
   if (
     obj.t === 'rc:clock.echo'
@@ -4880,10 +4901,11 @@ export function useRemoteControl(
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
-  /** FR-97 P3b — the host says its lock screen TAKES input (a Linux lock
-   *  screen is captured and typed into like any other screen), so the chip
-   *  must not say input is suppressed. False from Windows and older agents. */
-  const hostLockedInputPasses = ref(false)
+  /** FR-97 P3b — what the host says its lock screen does with input: a Linux
+   *  lock screen TAKES it (captured and typed into like any other screen), so
+   *  the chip must not say input is suppressed; a Mac's is `unknown` (P2d-1).
+   *  `suppressed` from Windows and older agents. */
+  const hostLockedInput = ref<HostLockedInput>('suppressed')
   /** FR-92 — the device's keep-busy state; `null` until an agent that has
    *  the feature says something (older agents never do). */
   const keepBusy = ref<KeepBusyState | null>(null)
@@ -8805,7 +8827,7 @@ export function useRemoteControl(
     mediaIntrinsicW.value = 0
     mediaIntrinsicH.value = 0
     hostLocked.value = false
-    hostLockedInputPasses.value = false
+    hostLockedInput.value = 'suppressed'
     keepBusy.value = null
     displayMatchState.value = null
     currentDesktop.value = 'Default'
@@ -9936,7 +9958,7 @@ export function useRemoteControl(
       const parsed = parseControlInbound(ev.data)
       if (parsed?.kind === 'host_locked') {
         hostLocked.value = parsed.locked
-        hostLockedInputPasses.value = parsed.inputPasses
+        hostLockedInput.value = parsed.input
       } else if (parsed?.kind === 'keep_busy') {
         keepBusy.value = parsed.state
       } else if (parsed?.kind === 'display_match') {
@@ -13009,8 +13031,8 @@ export function useRemoteControl(
      * padlock overlay frame.
      */
     hostLocked,
-    /** FR-97 P3b — the lock screen takes input (Linux): the chip says so. */
-    hostLockedInputPasses,
+    /** FR-97 P3b — what the lock screen does with input: the chip says it. */
+    hostLockedInput,
     keepBusy,
     setKeepBusy,
     /** FR-108 — the device's answer to the latest display-match request. */

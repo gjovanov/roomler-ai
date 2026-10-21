@@ -96,9 +96,7 @@
         variant="flat"
         prepend-icon="mdi-lock"
         class="mr-2 rc-tb-status"
-        :title="rc.hostLockedInputPasses.value
-          ? 'The remote host is on its lock screen. Your input reaches it, so you can type the password to unlock.'
-          : 'The remote host is on the lock screen — input is suppressed.'"
+        :title="hostLockedChipTitle(rc.hostLockedInput.value)"
       >
         Host locked
       </v-chip>
@@ -2327,6 +2325,7 @@ import {
   captureArmLabel,
   mediaWaitingCopy,
   idleSecondsLeft,
+  hostLockedChipTitle,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,

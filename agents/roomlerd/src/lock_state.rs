@@ -300,7 +300,22 @@ mod nowin {
     }
     /// No WTS session-lock concept off Windows — let the caller fall
     /// back to [`probe_lock_state`] (which is `Unlocked` here).
+    ///
+    /// FR-97 P2d-1 — except a Mac's GUI session, which can say: a consent
+    /// panel is out of sight behind a locked screen, as Windows' is on the
+    /// secure desktop, so the controller is told to unlock first. Still `None`
+    /// outside a GUI session (the root half) and with `ROOMLERD_LOCK_HINT=0`.
     pub fn probe_lock_state_service() -> Option<LockState> {
+        #[cfg(target_os = "macos")]
+        if super::lock_hint_enabled() {
+            return super::mac_locked_hint().map(|locked| {
+                if locked {
+                    LockState::Locked
+                } else {
+                    LockState::Unlocked
+                }
+            });
+        }
         None
     }
 }
@@ -310,11 +325,12 @@ pub use nowin::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_se
 #[cfg(target_os = "windows")]
 pub use win::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_service};
 
-/// FR-97 P3b — how often a Linux session asks logind whether the screen is
-/// locked. A lock is a person stepping away, so a couple of seconds late is
-/// fine, and each ask is one `loginctl` run.
-#[cfg(target_os = "linux")]
-pub const LINUX_HINT_POLL: Duration = Duration::from_secs(2);
+/// FR-97 P3b — how often a session asks whether its screen is locked: on
+/// Linux logind, one `loginctl` run; on a Mac (P2d-1) the session dictionary,
+/// one call. A lock is a person stepping away, so a couple of seconds late is
+/// fine.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub const HINT_POLL: Duration = Duration::from_secs(2);
 
 /// FR-97 P3b — Linux: logind's `LockedHint` for seat0's active session, the
 /// screen a session sees. GNOME, KDE and light-locker set it; a locker that
@@ -333,12 +349,54 @@ pub fn linux_locked_hint() -> bool {
         .is_some_and(|id| crate::lock_on_end::linux_session_hint(&id, "LockedHint"))
 }
 
-/// FR-97 P3b's kill switch for [`linux_locked_hint`]: on unless
-/// `ROOMLERD_LOCK_HINT=0`.
-#[cfg(target_os = "linux")]
-pub fn linux_lock_hint_enabled() -> bool {
+/// FR-97 P2d-1 — a Mac: this session's screen is locked, or another user has
+/// the console (`CGSSessionScreenIsLocked`, `kCGSSessionOnConsoleKey`, read as
+/// keep busy reads them). `None` outside a GUI session: the root half has no
+/// screen to ask about. Advisory, as on Linux; it never gates input.
+#[cfg(target_os = "macos")]
+pub fn mac_locked_hint() -> Option<bool> {
+    #[cfg(feature = "enigo-input")]
+    {
+        crate::keep_busy::mac_screen_locked()
+    }
+    #[cfg(not(feature = "enigo-input"))]
+    {
+        None
+    }
+}
+
+/// FR-97 P3b's kill switch for the lock hints (and P2d-1's on a Mac): on
+/// unless `ROOMLERD_LOCK_HINT=0`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn lock_hint_enabled() -> bool {
     tunnel_core::env::node_env("LOCK_HINT").is_none_or(|v| v.trim() != "0")
 }
+
+/// The session's lock hint on this OS: logind's on Linux, the session
+/// dictionary's on a Mac (unlocked when there is no session to ask).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn locked_hint() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_locked_hint()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac_locked_hint().unwrap_or(false)
+    }
+}
+
+/// What the person at the viewer can do at this OS's lock screen, as the
+/// `input` of `rc:host_locked`: a Linux lock screen takes input like any other
+/// (`passes`); on a Mac it is not measured yet whether the lock screen's
+/// password field takes injected keys, so the hint does not claim either way
+/// (`unknown`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub const LOCK_SCREEN_INPUT: &str = if cfg!(target_os = "linux") {
+    "passes"
+} else {
+    "unknown"
+};
 
 /// Spawn a tokio task that polls `probe_lock_state` every
 /// `POLL_INTERVAL` and emits transitions on the returned
@@ -538,5 +596,20 @@ mod tests {
         assert_eq!(LockState::Locked, LockState::Locked);
         assert_eq!(LockState::Unlocked, LockState::Unlocked);
         assert_ne!(LockState::Locked, LockState::Unlocked);
+    }
+
+    /// FR-97 P2d-1 — what each OS's lock hint tells the viewer about input:
+    /// a Linux lock screen takes it (P3b's chip, unchanged); a Mac's is not
+    /// measured, so it claims neither way.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lock_screen_input_per_os() {
+        let want = if cfg!(target_os = "linux") {
+            "passes"
+        } else {
+            "unknown"
+        };
+        assert_eq!(LOCK_SCREEN_INPUT, want);
+        assert_eq!(HINT_POLL, Duration::from_secs(2));
     }
 }

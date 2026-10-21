@@ -288,7 +288,7 @@ fn sample() -> bool {
 }
 
 /// FR-97 P3e-2 — Linux: logind's `LockedHint`, as the session's P3b emitter
-/// last read it (every `lock_state::LINUX_HINT_POLL` while a session is
+/// last read it (every `lock_state::HINT_POLL` while a session is
 /// connected). Each ask is a `loginctl` run, so the sampler never asks itself.
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
 static LINUX_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

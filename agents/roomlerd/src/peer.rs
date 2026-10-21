@@ -1431,39 +1431,50 @@ impl AgentPeer {
         // retried until the control DC carries it (FR-80's helper): a host
         // already locked when the session starts is the case that most needs
         // saying, and the DC is rarely open yet then.
-        #[cfg(target_os = "linux")]
-        if lock_state::linux_lock_hint_enabled() {
+        // FR-97 P2d-1 — a Mac too, from the session dictionary, with
+        // `input: "unknown"`: whether its lock screen takes injected keys is
+        // not measured, so the chip claims neither way.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if lock_state::lock_hint_enabled() {
             let stash = control_dc.clone();
             let until = session_end.clone();
+            #[cfg(target_os = "linux")]
             let sid = session_id;
             tokio::spawn(async move {
                 let run = async move {
                     let mut said = false;
+                    #[cfg(target_os = "linux")]
                     let mut seen = false;
                     loop {
-                        let locked = tokio::task::spawn_blocking(lock_state::linux_locked_hint)
+                        let locked = tokio::task::spawn_blocking(lock_state::locked_hint)
                             .await
                             .unwrap_or(false);
-                        // FR-97 P3e-2 — display match's presence takes the
-                        // lock from here: each read is a `loginctl` run.
-                        crate::presence::note_linux_lock_hint(locked);
-                        // FR-97 P3e-2 — a display-match request answered
-                        // `locked` on a person's own X11 display is decided
-                        // again at the unlock, as on Windows (FR-108 P1b).
-                        if seen
-                            && !locked
-                            && let Ok(Some(answer)) = tokio::task::spawn_blocking(move || {
-                                crate::display_match::on_unlock(sid)
-                            })
-                            .await
+                        #[cfg(target_os = "linux")]
                         {
-                            emit_display_match(&stash, answer).await;
+                            // FR-97 P3e-2 — display match's presence takes the
+                            // lock from here: each read is a `loginctl` run.
+                            crate::presence::note_linux_lock_hint(locked);
+                            // FR-97 P3e-2 — a display-match request answered
+                            // `locked` on a person's own X11 display is decided
+                            // again at the unlock, as on Windows (FR-108 P1b).
+                            if seen
+                                && !locked
+                                && let Ok(Some(answer)) = tokio::task::spawn_blocking(move || {
+                                    crate::display_match::on_unlock(sid)
+                                })
+                                .await
+                            {
+                                emit_display_match(&stash, answer).await;
+                            }
+                            seen = locked;
                         }
-                        seen = locked;
                         if locked != said
                             && send_control_notice(
                                 &stash,
-                                &host_locked_advisory_payload(locked),
+                                &host_locked_advisory_payload(
+                                    locked,
+                                    lock_state::LOCK_SCREEN_INPUT,
+                                ),
                                 Duration::from_millis(500),
                                 Duration::from_secs(30),
                                 Duration::from_secs(2),
@@ -1472,7 +1483,7 @@ impl AgentPeer {
                         {
                             said = locked;
                         }
-                        tokio::time::sleep(lock_state::LINUX_HINT_POLL).await;
+                        tokio::time::sleep(lock_state::HINT_POLL).await;
                     }
                 };
                 tokio::select! {
@@ -9682,13 +9693,14 @@ async fn emit_host_locked(
 /// FR-97 P3b — the Linux hint's `rc:host_locked`: the same message plus
 /// `input: "passes"`, so the viewer says the lock screen takes input rather
 /// than "input is suppressed", which is Windows' case. An older viewer ignores
-/// the field and shows its chip as before.
+/// the field and shows its chip as before. FR-97 P2d-1 — a Mac's says
+/// `input: "unknown"` (`lock_state::LOCK_SCREEN_INPUT`).
 ///
-/// Always compiled (only Linux sends it) so the wire shape is locked by a test
-/// on every OS.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn host_locked_advisory_payload(locked: bool) -> String {
-    format!(r#"{{"t":"rc:host_locked","locked":{locked},"input":"passes"}}"#)
+/// Always compiled (only Linux and a Mac send it) so the wire shape is locked
+/// by a test on every OS.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn host_locked_advisory_payload(locked: bool, input: &str) -> String {
+    format!(r#"{{"t":"rc:host_locked","locked":{locked},"input":"{input}"}}"#)
 }
 
 /// FR-108 P1b — tell this session's viewer what display match did on its own
@@ -13460,14 +13472,18 @@ mod codec_cap_tests {
 
     /// FR-97 P3b — the Linux lock hint is `rc:host_locked` plus
     /// `input: "passes"`: the viewer's chip says the lock screen takes input.
+    /// FR-97 P2d-1 — a Mac's is `input: "unknown"`.
     #[test]
     fn host_locked_advisory_payload_wire_shape() {
-        for locked in [true, false] {
-            let v: serde_json::Value =
-                serde_json::from_str(&super::host_locked_advisory_payload(locked)).expect("JSON");
-            assert_eq!(v["t"], "rc:host_locked");
-            assert_eq!(v["locked"], locked);
-            assert_eq!(v["input"], "passes");
+        for input in ["passes", "unknown"] {
+            for locked in [true, false] {
+                let v: serde_json::Value =
+                    serde_json::from_str(&super::host_locked_advisory_payload(locked, input))
+                        .expect("JSON");
+                assert_eq!(v["t"], "rc:host_locked");
+                assert_eq!(v["locked"], locked);
+                assert_eq!(v["input"], input);
+            }
         }
     }
 

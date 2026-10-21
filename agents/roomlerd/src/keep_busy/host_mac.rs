@@ -179,6 +179,19 @@ pub fn console_from(locked: Option<bool>, on_console: Option<bool>) -> Console {
     }
 }
 
+/// FR-97 P2d-1 — this session's screen, for `lock_state`'s hints: `None`
+/// outside a GUI session (the root LaunchDaemon has none to ask about), else
+/// whether nobody can use it right now. Another user on the console (fast user
+/// switching) counts as locked, as it does for keep busy: this session's
+/// screen, and a consent panel drawn on it, are out of sight either way.
+pub(crate) fn screen_locked() -> Option<bool> {
+    match console() {
+        Console::NoSession => None,
+        Console::Locked | Console::NotOnConsole => Some(true),
+        Console::Present => Some(false),
+    }
+}
+
 fn console() -> Console {
     // SAFETY: no preconditions; NULL outside a GUI session. A Copy result,
     // so ours to release.
