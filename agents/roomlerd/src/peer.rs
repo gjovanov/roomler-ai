@@ -6209,7 +6209,7 @@ async fn media_pump_ffmpeg_dc(
     // whether a trial ran, so a new one (a new ask, a new rate, a trial
     // starting or ending) re-sends it.
     let fps_high = crate::encode::fps_high_enabled();
-    let mut fps_told: Option<(crate::encode::frame_rate::Answer, bool)> = None;
+    let mut fps_told: Option<(crate::encode::frame_rate::Answer, bool, Option<u16>)> = None;
     // rc.87 — emit `rc:video-info` so the browser stats badge shows the
     // TRUTH (real encoder + HW + chroma + transport). Badge-truth rc:
     // RETRIED until delivered (see the loop-top block) — the old
@@ -6407,14 +6407,15 @@ async fn media_pump_ffmpeg_dc(
     });
     let fps_cache = fps_cache.map(|(path, key, _)| (path, key));
     // What the last decision was taken on (the ask, the base rate, the
-    // transport, the capture backend, the encoder, its dims), and when:
-    // decided again when any of it moves, and once a second for the pipe's
-    // belief.
+    // transport, the capture backend and its screen's refresh rate, the
+    // encoder, its dims), and when: decided again when any of it moves, and
+    // once a second for the pipe's belief.
     type FpsDecidedOn = (
         Option<u32>,
         u32,
         bool,
         &'static str,
+        Option<u16>,
         &'static str,
         (u32, u32),
     );
@@ -7464,7 +7465,7 @@ async fn media_pump_ffmpeg_dc(
         // P2b-2: the state moves it on a new ask, a new rate, or a trial
         // starting or ending.
         if let Some(state) = fps_state.as_ref() {
-            let told = Some((state.answer(), state.trial_running()));
+            let told = Some((state.answer(), state.trial_running(), capturer.refresh_hz()));
             if told != fps_told {
                 fps_told = told;
                 video_info_sent = false;
@@ -7535,7 +7536,10 @@ async fn media_pump_ffmpeg_dc(
                     capturer.arm(),
                     // FR-119 P1 — what the stream runs at, the viewer's ask
                     // if it was refused, and (P2b-2) whether a trial runs.
-                    fps_state.as_ref().map(|s| s.video_info_fields()),
+                    fps_state.as_ref().map(|s| {
+                        s.video_info_fields()
+                            + &crate::encode::frame_rate::refresh_field(capturer.refresh_hz())
+                    }),
                 );
                 // FR-65 — the control-DC lock and send both await; the lock is
                 // shared with every other control-plane writer, and a congested
@@ -8202,6 +8206,7 @@ async fn media_pump_ffmpeg_dc(
                 base_fps,
                 constrained,
                 capturer.backend(),
+                capturer.refresh_hz(),
                 enc.name(),
                 enc_dims,
             );
@@ -8237,8 +8242,8 @@ async fn media_pump_ffmpeg_dc(
                 });
                 let class = crate::encode::frame_rate::ClassKey {
                     backend: capturer.backend().to_string(),
-                    // P2b-3 reads the screen's refresh; unknown decides nothing.
-                    refresh_hz: 0,
+                    // P2b-3 — unknown is 0, and decides nothing.
+                    refresh_hz: capturer.refresh_hz().unwrap_or(0),
                     encoder: enc.name().to_string(),
                     long_edge: crate::encode::frame_rate::long_edge_bucket(enc_dims.0, enc_dims.1),
                     fps: asked.unwrap_or(base_fps),
@@ -8247,7 +8252,7 @@ async fn media_pump_ffmpeg_dc(
                     asked,
                     cap: base_fps,
                     constrained,
-                    refresh_hz: None,
+                    refresh_hz: capturer.refresh_hz(),
                     denied: above.is_some_and(|a| {
                         crate::encode::frame_rate::fps_denied(&fps_deny, enc.name(), a)
                     }),
