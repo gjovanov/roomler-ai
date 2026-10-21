@@ -25,8 +25,8 @@ use std::sync::LazyLock;
 
 use bson::oid::ObjectId;
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, EntityUid, Policy, PolicyId, PolicySet, Request,
-    Schema, ValidationMode, ValidationWarning, Validator,
+    ActionConstraint, Authorizer, Context, Decision, Effect, Entities, EntityUid, Policy, PolicyId,
+    PolicySet, Request, Schema, ValidationMode, ValidationWarning, Validator,
 };
 use serde_json::{Value, json};
 
@@ -57,6 +57,7 @@ pub const ACTIONS: &[&str] = &[
     ACTION_NET_SOCKS,
     ACTION_NET_FORWARD,
     ACTION_SSH_RUN,
+    ACTION_CONNECT,
 ];
 pub const ACTION_ASSUME: &str = "role:assume";
 pub const ACTION_USE: &str = "secret:use";
@@ -72,6 +73,20 @@ pub const ACTION_NET_FORWARD: &str = "net:forward";
 /// (`docs/fr/FR-90-hive-agent-sessions.md` §3e, "P3-8, `ssh_run`, as
 /// designed").
 pub const ACTION_SSH_RUN: &str = "ssh:run";
+/// P3-9-1 — a PERSON using a secret through an endpoint their device serves
+/// them (`roomler connect`; `docs/fr/FR-90-hive-agent-sessions.md` §3e, "P3-9,
+/// `roomler connect`, as designed"). Its principal is a `User`, the device's
+/// owner: `secret:use` is a session's alone, so no policy written for
+/// sessions admits a person.
+pub const ACTION_CONNECT: &str = "secret:connect";
+
+/// P3-9-1 — the actions only a permit that NAMES them in its scope admits
+/// ([`decide`]). A policy whose scope names no action
+/// (`permit (principal in Roomler::Group::"admin", action, resource)`)
+/// admits every action Cedar knows, so one written before a person's action
+/// existed would admit a person the day it did, without a line of it
+/// changing. A `forbid` binds whatever its scope, as it always did.
+pub const NAMED_ONLY: &[&str] = &[ACTION_CONNECT];
 
 /// The modes a session may ask a secret in (design §8.5). `raw` is not one:
 /// it is a person's `secret:read`, never a session's use.
@@ -160,6 +175,37 @@ when { resource.kind == "dynamic" && context.mode != "short-lived" };"#,
               secret is leased in it",
         text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
 when { context.mode == "short-lived" && resource.kind != "dynamic" };"#,
+    },
+    // P3-9-1 — each guardrail above names `secret:use`, so none binds a
+    // person's own action by itself. A person's endpoint is always a proxy:
+    // the twin of `proxy-only-named-audiences` holds it to the upstreams its
+    // secret names, exactly.
+    Guardrail {
+        id: "guardrail:connect-only-named-audiences",
+        why: "a person's endpoint (`roomler connect`) signs in only to an upstream its secret \
+              names in `audiences`, exactly: an endpoint pointed anywhere else is refused",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:connect", resource)
+when { !(resource.audiences.contains(context.audience)) };"#,
+    },
+    // P3-9-1 — the twin of `dynamic-only-short-lived`: a dynamic secret's
+    // fields are its issuer's, and a person's short-lived credential is not
+    // in P3-9, so no person's endpoint signs in with one.
+    Guardrail {
+        id: "guardrail:connect-never-dynamic",
+        why: "a dynamic secret's fields are its issuer's, the account that mints: no person's \
+              endpoint signs in with one",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:connect", resource)
+when { resource.kind == "dynamic" };"#,
+    },
+    // P3-9-1 — decision 24: no person reaches a production secret through
+    // an endpoint, as the design's §8.6 asks a second approver for a
+    // person's read of one, and P3-9 has no approver for a person.
+    Guardrail {
+        id: "guardrail:connect-never-prod",
+        why: "no person reaches a production secret through `roomler connect` (decision 24): a \
+              secret tagged `prod`, or under the folder `prod/`",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:connect", resource)
+when { resource.tags.contains("prod") || resource.path == "prod" || resource.path like "prod/*" };"#,
     },
 ];
 
@@ -513,6 +559,23 @@ pub enum Ask {
         account: String,
         device: DeviceFacts,
     },
+    /// P3-9-1 — `secret:connect`: may `user` (in `groups`), the owner of
+    /// `device` as its row names them, use `secret` through an endpoint the
+    /// device serves them, toward `audience`, for `ttl_s`?
+    ///
+    /// `approver` is never given in a real decision (decision 24): a person's
+    /// request has nobody to say yes. It is how the vault asks whether a yes
+    /// WOULD lift a deny, to refuse `approval_unavailable` rather than
+    /// `denied`.
+    ConnectSecret {
+        user: ObjectId,
+        groups: Vec<String>,
+        secret: SecretFacts,
+        audience: String,
+        ttl_s: i64,
+        device: DeviceFacts,
+        approver: Option<Approver>,
+    },
 }
 
 fn uid(ty: &str, id: &str) -> Value {
@@ -552,6 +615,15 @@ fn strings(a: &bson::Array) -> Option<Vec<String>> {
 /// over.
 fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, Value, Vec<Value>) {
     let (session_uid, mut entities) = session_entities(session);
+    let (secret_uid, secret) = secret_entities(secret);
+    entities.extend(secret);
+    (session_uid, secret_uid, entities)
+}
+
+/// The secret, in its folders: its uid, and the entities, itself and every
+/// folder above it.
+fn secret_entities(secret: &SecretFacts) -> (Value, Vec<Value>) {
+    let mut entities = Vec::new();
     let chain = folders(&secret.path);
     let secret_uid = uid("Secret", &format!("{}{}", secret.prefix, secret.path));
     entities.push(json!({
@@ -578,7 +650,7 @@ fn session_and_secret(session: &SessionFacts, secret: &SecretFacts) -> (Value, V
             "parents": parents,
         }));
     }
-    (session_uid, secret_uid, entities)
+    (secret_uid, entities)
 }
 
 /// The session, in the role it assumed: its uid, and the entities, itself and
@@ -618,6 +690,7 @@ impl Ask {
             Self::NetSocks { .. } => ACTION_NET_SOCKS,
             Self::NetForward { .. } => ACTION_NET_FORWARD,
             Self::SshRun { .. } => ACTION_SSH_RUN,
+            Self::ConnectSecret { .. } => ACTION_CONNECT,
         }
     }
 
@@ -732,6 +805,30 @@ impl Ask {
                 "account": account,
                 "device": device(d),
             },
+            Self::ConnectSecret {
+                user,
+                groups,
+                secret,
+                audience,
+                ttl_s,
+                device: d,
+                approver,
+            } => {
+                let mut doc = bson::doc! {
+                    "action": ACTION_CONNECT,
+                    "user": *user,
+                    "groups": groups,
+                    "secret": secret_doc(secret),
+                    "audience": audience,
+                    "ttl_s": *ttl_s,
+                    "device": device(d),
+                };
+                if let Some(a) = approver {
+                    doc.insert("approver", a.id);
+                    doc.insert("approver_groups", a.groups.clone());
+                }
+                doc
+            }
         }
     }
 
@@ -831,6 +928,15 @@ impl Ask {
                 node: node(doc.get_document("node").ok()?)?,
                 account: doc.get_str("account").ok()?.to_string(),
                 device: device(doc.get_document("device").ok()?)?,
+            }),
+            ACTION_CONNECT => Some(Self::ConnectSecret {
+                user: doc.get_object_id("user").ok()?,
+                groups: strings(doc.get_array("groups").ok()?)?,
+                secret: secret(doc.get_document("secret").ok()?)?,
+                audience: doc.get_str("audience").ok()?.to_string(),
+                ttl_s: doc.get_i64("ttl_s").ok()?,
+                device: device(doc.get_document("device").ok()?)?,
+                approver,
             }),
             _ => None,
         }
@@ -943,6 +1049,32 @@ impl Ask {
                     json!({ "device": device.json(), "account": account }),
                 )
             }
+            Self::ConnectSecret {
+                user,
+                groups,
+                secret,
+                audience,
+                ttl_s,
+                device,
+                approver,
+            } => {
+                let (secret_uid, mut entities) = secret_entities(secret);
+                entities.extend(user_in_groups(*user, groups));
+                let mut context = json!({
+                    "audience": audience,
+                    "ttl_s": ttl_s,
+                    "device": device.json(),
+                });
+                if let Some(a) = approver {
+                    context["approval"] = json!({ "approver": user_ref(a.id) });
+                    // In the groups they hold, as for `secret:use`. A group
+                    // both name, or the person as their own approver, is the
+                    // same entity twice, which Cedar takes when the copies
+                    // are identical.
+                    entities.extend(user_in_groups(a.id, &a.groups));
+                }
+                (uid("User", &user.to_hex()), secret_uid, entities, context)
+            }
         };
         let principal = parse_uid(&principal)?;
         let resource = parse_uid(&resource)?;
@@ -981,10 +1113,24 @@ impl Verdict {
 
 /// Decide `ask` against `set`. Anything that keeps a request from being
 /// decided is a DENY, with why.
+///
+/// ⚠️ P3-9-1 — an action in [`NAMED_ONLY`] is decided over the set without
+/// the permits whose scope names no action: only a permit written for it
+/// admits it.
 pub fn decide(set: &PolicySet, ask: &Ask) -> Verdict {
     let (request, entities) = match ask.build() {
         Ok(built) => built,
         Err(why) => return Verdict::deny(why),
+    };
+    let narrowed;
+    let set = if NAMED_ONLY.contains(&ask.action()) {
+        narrowed = match named_only(set, ask.action()) {
+            Ok(s) => s,
+            Err(why) => return Verdict::deny(why),
+        };
+        &narrowed
+    } else {
+        set
     };
     let response = Authorizer::new().is_authorized(&request, set, &entities);
     let mut determining: Vec<String> = response
@@ -1002,6 +1148,26 @@ pub fn decide(set: &PolicySet, ask: &Ask) -> Verdict {
             .map(|e| e.to_string())
             .collect(),
     }
+}
+
+/// P3-9-1 — `set` without the permits whose scope does not name `action`:
+/// every `forbid`, and every permit that names it (`action ==` it, or
+/// `action in [...]` with it).
+fn named_only(set: &PolicySet, action: &str) -> Result<PolicySet, String> {
+    let action = parse_uid(&uid("Action", action))?;
+    let mut out = PolicySet::new();
+    for p in set.policies() {
+        let names = match p.action_constraint() {
+            ActionConstraint::Any => false,
+            ActionConstraint::Eq(a) => a == action,
+            ActionConstraint::In(actions) => actions.contains(&action),
+        };
+        if names || p.effect() == Effect::Forbid {
+            out.add(p.clone())
+                .map_err(|e| format!("policy {}: {e}", p.id()))?;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1999,6 +2165,235 @@ mod tests {
                 r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"ssh:run", resource == Roomler::Node::"{}");"#,
                 ObjectId::new().to_hex()
             ),
+        ] {
+            check_policy(&text, &names()).unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
+    }
+
+    /// P3-9-1 — a person, `user` in `groups`, the owner of a Linux device,
+    /// connecting to `path` toward `audience`; the secret names
+    /// `db.internal:5432` as its one upstream.
+    fn connect(groups: &[&str], path: &str, tags: &[&str], audience: &str) -> Ask {
+        let user = ObjectId::new();
+        Ask::ConnectSecret {
+            user,
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            secret: SecretFacts {
+                prefix: ORG.into(),
+                path: path.into(),
+                kind: "structured".into(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                exec_allow: Vec::new(),
+                audiences: vec!["db.internal:5432".into()],
+            },
+            audience: audience.into(),
+            ttl_s: 600,
+            device: DeviceFacts::new("linux", &[], user).unwrap(),
+            approver: None,
+        }
+    }
+
+    const MEMBERS_CONNECT_TO_DB: &str = r#"permit (principal in Roomler::Group::"member",
+        action == Roomler::Action::"secret:connect",
+        resource in Roomler::SecretFolder::"rrn:grox:secret:db");"#;
+
+    /// P3-9-1 — only a permit that names `secret:connect` admits a person: one
+    /// written for sessions does not, and neither does one whose scope names
+    /// no action, however wide. A `forbid` that names no action still binds.
+    #[test]
+    fn a_person_is_admitted_only_by_a_permit_that_names_their_action() {
+        let asked = connect(&["member"], "db/orders", &[], "db.internal:5432");
+        let ok = decide(&set_with(&[MEMBERS_CONNECT_TO_DB]), &asked);
+        assert!(ok.allow && ok.errors.is_empty(), "{ok:?}");
+        assert_eq!(ok.determining, ["policy:0"]);
+        for wide in [
+            r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#,
+            r#"permit (principal, action, resource);"#,
+            r#"permit (principal in Roomler::Group::"member", action, resource);"#,
+        ] {
+            let v = decide(&set_with(&[wide]), &asked);
+            assert!(!v.allow, "{wide}: {v:?}");
+            assert!(
+                v.determining.is_empty() && v.errors.is_empty(),
+                "{wide}: {v:?}"
+            );
+        }
+        // Named in a list, it counts.
+        let listed = r#"permit (principal in Roomler::Group::"member",
+            action in [Roomler::Action::"secret:use", Roomler::Action::"secret:connect"],
+            resource);"#;
+        assert!(decide(&set_with(&[listed]), &asked).allow);
+        // A forbid whose scope names no action binds a person too.
+        let v = decide(
+            &set_with(&[
+                MEMBERS_CONNECT_TO_DB,
+                r#"forbid (principal, action, resource) when { resource.path == "db/orders" };"#,
+            ]),
+            &asked,
+        );
+        assert!(!v.allow);
+        assert_eq!(v.determining, ["policy:1"]);
+        // And the narrowing is the person's alone: a session is admitted by
+        // an action-less permit as it always was.
+        let session_ask = use_secret(Some("dev"), "db/orders", &[], "env", "linux");
+        assert!(
+            decide(
+                &set_with(&[r#"permit (principal, action, resource);"#]),
+                &session_ask
+            )
+            .allow
+        );
+    }
+
+    /// P3-9-1 — a person's endpoint signs in only to an upstream its secret
+    /// names, exactly, never with a dynamic secret's field, and never to a
+    /// production secret (decision 24): whatever a policy permits, and
+    /// whatever someone's yes would say.
+    #[test]
+    fn a_persons_endpoint_is_held_by_its_own_guardrails() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:connect", resource);"#;
+        let set = set_with(&[any]);
+        assert!(decide(&set, &connect(&[], "db/orders", &[], "db.internal:5432")).allow);
+        let with_yes = |mut ask: Ask| {
+            if let Ask::ConnectSecret { approver, .. } = &mut ask {
+                *approver = Some(Approver {
+                    id: ObjectId::new(),
+                    groups: vec!["admin".into()],
+                });
+            }
+            ask
+        };
+        let dynamic = || {
+            let mut ask = connect(&[], "db/dyn", &[], "db.internal:5432");
+            if let Ask::ConnectSecret { secret, .. } = &mut ask {
+                secret.kind = "dynamic".into();
+            }
+            ask
+        };
+        for (ask, guardrail) in [
+            (
+                connect(&[], "db/orders", &[], "evil.example:5432"),
+                "guardrail:connect-only-named-audiences",
+            ),
+            (
+                connect(&[], "db/orders", &[], "DB.internal:5432"),
+                "guardrail:connect-only-named-audiences",
+            ),
+            (
+                connect(&[], "db/orders", &[], ""),
+                "guardrail:connect-only-named-audiences",
+            ),
+            (dynamic(), "guardrail:connect-never-dynamic"),
+            (
+                connect(&[], "prod", &[], "db.internal:5432"),
+                "guardrail:connect-never-prod",
+            ),
+            (
+                connect(&[], "prod/db", &[], "db.internal:5432"),
+                "guardrail:connect-never-prod",
+            ),
+            (
+                connect(&[], "svc/db", &["prod"], "db.internal:5432"),
+                "guardrail:connect-never-prod",
+            ),
+        ] {
+            for ask in [ask.clone(), with_yes(ask)] {
+                let v = decide(&set, &ask);
+                assert!(!v.allow, "{ask:?}: {v:?}");
+                assert_eq!(v.determining, [guardrail], "{ask:?}");
+            }
+        }
+        // A sibling whose name merely starts the same is no prod path.
+        assert!(
+            decide(
+                &set,
+                &connect(&[], "production/db", &[], "db.internal:5432")
+            )
+            .allow
+        );
+    }
+
+    /// P3-9-1 — a person's request in a policy's terms: `principal` is the
+    /// person, in their groups; `context.device.owner` is the same person,
+    /// and `context.approval` exists only when a yes was given. A person and
+    /// an approver who share a group, or one person as both, decide without
+    /// an error: each shared entity is the same both times.
+    #[test]
+    fn a_persons_request_reads_as_a_policy_names_it() {
+        let set = set_with(&[
+            r#"permit (principal, action == Roomler::Action::"secret:connect", resource)
+            when { principal == context.device.owner && context has approval
+                   && context.approval.approver in Roomler::Group::"admin"
+                   && context.approval.approver != principal };"#,
+        ]);
+        let mut ask = connect(&["member", "admin"], "db/orders", &[], "db.internal:5432");
+        let v = decide(&set, &ask);
+        assert!(!v.allow && v.errors.is_empty(), "no yes was given: {v:?}");
+        if let Ask::ConnectSecret { approver, .. } = &mut ask {
+            *approver = Some(Approver {
+                id: ObjectId::new(),
+                groups: vec!["admin".into(), "member".into()],
+            });
+        }
+        let v = decide(&set, &ask);
+        assert!(v.allow && v.errors.is_empty(), "{v:?}");
+        // Their own yes is no yes.
+        if let Ask::ConnectSecret {
+            approver: Some(a),
+            user,
+            ..
+        } = &mut ask
+        {
+            a.id = *user;
+        }
+        let v = decide(&set, &ask);
+        assert!(!v.allow && v.errors.is_empty(), "{v:?}");
+    }
+
+    /// P3-9-1 — a person's request reads back from its record exactly, its
+    /// groups and an approver included, and decides alike; a row without its
+    /// person is unreadable.
+    #[test]
+    fn a_persons_request_reads_back_from_its_record() {
+        let mut ask = connect(&["member", "ops"], "db/orders", &["pg"], "db.internal:5432");
+        for approver in [
+            None,
+            Some(Approver {
+                id: ObjectId::new(),
+                groups: vec!["admin".into()],
+            }),
+        ] {
+            if let Ask::ConnectSecret { approver: a, .. } = &mut ask {
+                *a = approver;
+            }
+            let back = Ask::from_doc(&ask.to_doc()).expect("reads back");
+            assert_eq!(format!("{back:?}"), format!("{ask:?}"));
+            let set = set_with(&[MEMBERS_CONNECT_TO_DB]);
+            assert_eq!(decide(&set, &back), decide(&set, &ask));
+        }
+        let mut doc = ask.to_doc();
+        doc.remove("user");
+        assert!(Ask::from_doc(&doc).is_none());
+    }
+
+    /// P3-9-1 — `secret:connect` takes a person: a policy that names a role
+    /// for it, which only a session assumes, can never apply and is refused;
+    /// one that names a group, a member, or the device's owner is kept.
+    #[test]
+    fn a_connect_policy_names_people_never_sessions() {
+        let refused = check_policy(
+            r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"secret:connect", resource);"#,
+            &names(),
+        )
+        .expect_err("a role where secret:connect takes a person");
+        assert!(refused.contains("can never apply"), "{refused}");
+        for text in [
+            MEMBERS_CONNECT_TO_DB.to_string(),
+            format!(
+                r#"permit (principal == Roomler::User::"{}", action == Roomler::Action::"secret:connect", resource);"#,
+                ObjectId::new().to_hex()
+            ),
+            r#"permit (principal, action == Roomler::Action::"secret:connect", resource) when { principal == context.device.owner && context.ttl_s <= 300 };"#.to_string(),
         ] {
             check_policy(&text, &names()).unwrap_or_else(|e| panic!("{text}: {e}"));
         }

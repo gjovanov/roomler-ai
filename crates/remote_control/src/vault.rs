@@ -68,6 +68,11 @@ pub mod lease_limits {
     /// answer is `busy` and nothing is recorded: the ceiling is what keeps a
     /// flood from becoming a flood of audit rows.
     pub const RATE_PER_MINUTE: u32 = 120;
+    /// P3-9-1 — the requests (`rc:vault.connect`) one device may make for
+    /// its owner per minute. An endpoint asks a few fields, and asks them
+    /// again each time it renews; past the ceiling the answer is `busy`
+    /// and nothing is recorded, as for a session.
+    pub const CONNECT_PER_MINUTE: u32 = 30;
     /// P3-3c — the leases one `rc:vault.revoke` names at most; more go in
     /// further frames.
     pub const MAX_REVOKE_IDS: usize = 64;
@@ -186,6 +191,11 @@ pub enum LeaseRefusal {
     NoExit,
     /// P3-8-1a — no live device of this organization by the SSH target's id.
     NoTarget,
+    /// P3-9-1 — a person's request (`rc:vault.connect`) that the vault's
+    /// policies would allow only with someone's yes: a person's request has
+    /// no session room to post a card into (decision 24), so it is refused
+    /// rather than left waiting for a yes nobody can give.
+    ApprovalUnavailable,
 }
 
 impl LeaseRefusal {
@@ -210,10 +220,11 @@ impl LeaseRefusal {
             Self::AwaitingApproval => "awaiting_approval",
             Self::NoExit => "no_exit",
             Self::NoTarget => "no_target",
+            Self::ApprovalUnavailable => "approval_unavailable",
         }
     }
 
-    pub const ALL: [LeaseRefusal; 17] = [
+    pub const ALL: [LeaseRefusal; 18] = [
         Self::NotServed,
         Self::Unsupported,
         Self::BadRequest,
@@ -231,6 +242,7 @@ impl LeaseRefusal {
         Self::AwaitingApproval,
         Self::NoExit,
         Self::NoTarget,
+        Self::ApprovalUnavailable,
     ];
 
     /// Parse a refusal word. `None` for a word this build cannot name, which
@@ -271,8 +283,15 @@ pub enum RevokeReason {
     KeyChanged,
     /// The device was removed.
     DeviceRemoved,
-    /// The vault no longer serves the organization (`vault.tenants`).
+    /// The vault no longer serves the organization (`vault.tenants`), or
+    /// (P3-9-1) no longer lends to its people (`vault.people`).
     NotServed,
+    /// P3-9-1 — a person's lease, and the device's row names another owner
+    /// than the one it was decided for.
+    OwnerChanged,
+    /// P3-9-1 — a person's lease, and its owner is no longer a member of the
+    /// organization.
+    OwnerNotMember,
 }
 
 impl RevokeReason {
@@ -288,10 +307,12 @@ impl RevokeReason {
             Self::KeyChanged => "key_changed",
             Self::DeviceRemoved => "device_removed",
             Self::NotServed => "not_served",
+            Self::OwnerChanged => "owner_changed",
+            Self::OwnerNotMember => "owner_not_member",
         }
     }
 
-    pub const ALL: [RevokeReason; 8] = [
+    pub const ALL: [RevokeReason; 10] = [
         Self::SessionEnded,
         Self::SessionMoved,
         Self::ValueChanged,
@@ -300,6 +321,8 @@ impl RevokeReason {
         Self::KeyChanged,
         Self::DeviceRemoved,
         Self::NotServed,
+        Self::OwnerChanged,
+        Self::OwnerNotMember,
     ];
 
     /// Parse a revocation word. `None` for a word this build cannot name,
@@ -551,6 +574,7 @@ mod tests {
                 "awaiting_approval",
                 "no_exit",
                 "no_target",
+                "approval_unavailable",
             ]
         );
         for r in LeaseRefusal::ALL {
@@ -724,6 +748,8 @@ mod tests {
                 "key_changed",
                 "device_removed",
                 "not_served",
+                "owner_changed",
+                "owner_not_member",
             ]
         );
         for r in RevokeReason::ALL {
