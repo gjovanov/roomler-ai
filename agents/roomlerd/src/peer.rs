@@ -6390,7 +6390,7 @@ async fn media_pump_ffmpeg_dc(
     let mut built_target: Option<TargetResolution> = None;
     /// The open in flight, the dims it will produce, when it started, the
     /// plan target it was opened for (`built_target` at the swap), and the
-    /// FR-70 M3a plan it was spawned under (what the shadow judges it by).
+    /// FR-70 M3a plan it was spawned under (the shadow's staleness reference).
     type PendingDimsOpen = (
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
         (u32, u32),
@@ -6816,7 +6816,7 @@ async fn media_pump_ffmpeg_dc(
     // Adoption stays quiet-gated below, so the IDR timing is unchanged.
     let bg_rebuild_constrained = crate::encode::bg_rebuild_constrained_enabled();
     // The rate replacement in flight, and the plan it was spawned under (FR-70
-    // M3a judges it against that plan at adoption, not the one in force then).
+    // M3a: adopted after that plan moved, it is a stale adoption, counted apart).
     let mut pending_swap: Option<(
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
         Option<crate::encode::plan::SwapSpawn>,
@@ -7102,18 +7102,20 @@ async fn media_pump_ffmpeg_dc(
             let open_ms = started.elapsed().as_millis() as u64;
             match handle.await {
                 Ok(Ok(rebuilt)) => {
-                    // FR-70 M3a — the rate the replacement was opened at; the
-                    // shadow judges it, and its dims, against the plan it was
-                    // spawned under.
+                    // FR-70 M3a — the rate the replacement was opened at. The
+                    // shadow judges it and its dims at the controller's next
+                    // tick, as it does an inline open — unless the plan moved
+                    // while it opened, which makes it a stale adoption.
                     let built_rate = rebuilt.maxrate_bps() as u32;
                     if let Some(enc) = encoder.as_mut() {
                         let from = encoder_dims.unwrap_or((0, 0));
                         if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                             encoder_dims = Some(dims);
-                            let (first, stale) =
-                                plan_shadow.note_dims_swap_adopted(built_rate, dims, spawned);
-                            log_plan_divergences(&session_id, codec_label, first);
-                            log_plan_stale_swap(&session_id, codec_label, stale);
+                            log_plan_stale_swap(
+                                &session_id,
+                                codec_label,
+                                plan_shadow.note_dims_swap_adopted(built_rate, dims, spawned),
+                            );
                             // The adopted encoder was built for the target
                             // the open was spawned with; the pin follows it
                             // from here, and the capture cap below it.
@@ -7174,16 +7176,18 @@ async fn media_pump_ffmpeg_dc(
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                // FR-70 M3a — judged against the plan it was
-                                // SPAWNED under, where the loop decided its
-                                // rate. A plan that moved while it opened (a
-                                // QSV open can outlast two AIMD halvings) is a
-                                // stale adoption, counted apart — not a
-                                // divergence, and not judged again at the tick.
-                                let (first, stale) =
-                                    plan_shadow.note_rate_swap_adopted(maxrate as u32, spawned);
-                                log_plan_divergences(&session_id, codec_label, first);
-                                log_plan_stale_swap(&session_id, codec_label, stale);
+                                // FR-70 M3a — judged at the controller's next
+                                // tick, as an inline open is: re-rated there
+                                // although the plan held is a divergence. A
+                                // plan that moved while it opened (a QSV open
+                                // can outlast two AIMD halvings) makes it a
+                                // stale adoption instead — counted apart, not
+                                // judged.
+                                log_plan_stale_swap(
+                                    &session_id,
+                                    codec_label,
+                                    plan_shadow.note_rate_swap_adopted(maxrate as u32, spawned),
+                                );
                                 video_info_sent = false;
                                 info!(
                                     %session_id, codec_label, maxrate_bps = maxrate,
@@ -8819,11 +8823,12 @@ async fn media_pump_ffmpeg_dc(
         }
         // FR-70 M3a — the controller has ticked: its target becomes the plan's
         // `bitrate_bps` (an epoch move, not a divergence), and an encoder the
-        // inline open above built since the last tick is judged against it:
-        // was it built at the plan's rate and the plan's dims? A `bitrate`
-        // divergence here is an encoder the controller re-rates on its very
-        // next tick. A replacement adopted at the loop top is NOT judged here:
-        // it was judged at adoption against the plan it was spawned under.
+        // loop built since the last tick — the inline open above, or a
+        // replacement adopted at the loop top while the plan held — is judged
+        // against it: was it built at the plan's rate and the plan's dims? A
+        // `bitrate` divergence here is an encoder the controller re-rates on
+        // its very next tick. A replacement adopted after the plan moved while
+        // it opened is a stale adoption, counted apart and not judged.
         log_plan_divergences(
             &session_id,
             codec_label,
