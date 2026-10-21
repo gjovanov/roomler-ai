@@ -23,12 +23,12 @@ latency side; this FR is the cadence side.
 | What | Where | Consequence |
 |---|---|---|
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9534`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:9952` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9829`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10247` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts were whole milliseconds (**fixed in P2a**, §4.2) | master `c636c6e8c` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
-| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1717`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2282`, `:2298`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps |
+| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1717`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2289`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2312`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
 | The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
-| The default capture gate's period is whole milliseconds; the microsecond gate is opt-in | `capture/gate.rs` (the legacy rule caps `1000/144` at 166 fps and can phase-lock); the slot-first gate keeps µs (`:78`) behind `ROOMLERD_CAPTURE_GATE`, field A/B owed (FR-98 P1) | Above 60, the slot-first gate should be the one in use |
+| The default capture gate's period is whole milliseconds; the microsecond gate is opt-in | `capture/gate.rs` (the legacy rule caps `1000/144` at 166 fps and can phase-lock); the slot-first gate keeps µs (`:103`) behind `ROOMLERD_CAPTURE_GATE`, field A/B owed (FR-98 P1) | Above 60, the slot-first gate should be the one in use |
 | WGC and `CGDisplayStream` deliver at the panel's refresh | WGC is compositor-driven; scrap's quartz stream is unthrottled (`throttle: 0.0`, `crates/vendored/scrap/src/quartz/config.rs:69`) | A 60 Hz panel cannot produce 120 fps. A 120 Hz MacBook already can |
 | The viewer's struggle rule counts frames | `DEFAULT_MAX_DECODE_QUEUE = 4` (`ui/src/workers/rc-hop-stats.ts:253`), `DEFAULT_STRUGGLE_QUEUE = 2` (`:256`) | At 144 fps, two frames of queue is 14 ms, where at 60 it is 33 ms: the rule tightens by itself |
 | **The encode stage alone exceeds a 120 fps period on every measured cell but one** | [FR-118](FR-118-gpu-resident-frames.md) §2.2, a 7-day fleet read: 10.6 ms (`hevc_qsv`, 1080p), 11.9 ms (`av1_qsv`, 1200p), 9.9 ms (`av1_nvenc`, 1200p), 16.4 ms (`av1_nvenc`, 1600p); **6.3 ms (`hevc_videotoolbox`, 3024×1964)** | 120 fps needs ≤ 8.3 ms per frame. On today's CPU path, only the Mac's VideoToolbox cell fits |
@@ -85,10 +85,12 @@ and as with encoder cells, the probe proves an open and only a session proves th
   wall time would fail every capable host that sat still. So the trial keeps only active stretches, frames at
   most three periods apart, and a frame the pump drops for the viewer or the link ends a stretch. Once it has
   seen 10 s of motion, a class that ran at ≥ 0.9 × the target with p99 inter-frame time under two periods is
-  proven and written to the agent's cache (the caps cache's keying: build, hardware fingerprint, knobs).
-  (The first draft said 60 s at ≥ 0.9 × the target; P2b-1 measured that rule against event-driven capture and
-  replaced it, §4.3.)
-- A class that fails that test is not granted again until the build, the hardware or the knobs change.
+  proven and written to the agent's cache (the caps cache's keying: build, hardware fingerprint, knobs). It
+  **fails** only when the host is the limit: the encoder's p90 time per frame at 90 % of a period or more. A
+  window whose content changed slower than the rate (a 60 fps video, a browser page held at 60 on a 120 Hz panel)
+  while the encoder kept up concludes nothing and starts over (P2b-2, §4.4). (The first draft said 60 s at
+  ≥ 0.9 × the target; P2b-1 measured that rule against event-driven capture and replaced it, §4.3.)
+- A class that fails is not granted again until the build, the hardware or the knobs change.
 - `fps_deny` (`name:fps`, the `encoder_cells_deny` shape) removes classes. It is honoured at **every** entry
   point (the grant and the trial), pushable through remote config with `MANAGE_AGENTS`, and only ever removes.
 - The first grant on an unproven host is a **trial**, never a promise. The viewer's picker says "trial", and
@@ -99,17 +101,22 @@ and as with encoder cells, the probe proves an open and only a session proves th
 - **pts in microseconds:** `TIME_BASE_DEN = 1_000_000`, `pts = monotonic_us`. The recorder keeps its own
   counter clock (`recording_pts`, `encoder.rs:738`), which already never repeats; P2a moved it to the
   microsecond base with the live pts.
-- **An fps change is a make-before-break swap.** `rebuild_spec_at_fps` next to `rebuild_spec_at_dims`; the plan
-  names the fps (FR-70 M3a's `Plan.fps`), and a swap is adopted between frames like a dims swap. The live encoder
-  keeps serving at the old rate until the replacement is ready.
+- **An fps change is a make-before-break swap.** `rebuild_spec_at` takes the dims and the rate (it was
+  `rebuild_spec_at_dims`), and an fps move rides FR-70 M2's dims swap: the same pending slot, the same adoption
+  between frames. The live encoder keeps serving at the old rate until the replacement is ready. The plan's `fps`
+  (FR-70 M3a) follows the pump's target, so the shadow sees the move too (§4.4).
 - **The ceiling law:** `ceiling(fps) = ceiling(60) × (fps / 60)^α`, with a higher band top for the 120–144 class.
   At 60 the law is byte-identical to today's. α is **measured**, not chosen: a constant-quality run on the same
   screen content at 60 and at 120 shows how many bits the encoder actually spends per second. Inter frames 8 ms
   apart differ less than frames 17 ms apart, so α is expected well below 1. There is a precedent in the code:
   FR-112 already scales the RTP pump's bitrate base by `√(fps / 30)`, i.e. α = 0.5 (`bitrate_base_for_fps`,
   `agents/roomlerd/src/encode/mod.rs`).
-- **The capture gate:** above 60, the slot-first gate (FR-98 C1) is used regardless of `ROOMLERD_CAPTURE_GATE`,
-  because the legacy gate's whole-millisecond period phase-locks at these rates.
+- **The capture gate:** above 60, WGC runs the slot-first gate (FR-98 C1) regardless of `ROOMLERD_CAPTURE_GATE`.
+  Its legacy rule sleeps out the rest of a period before it looks at the slot, so a frame that landed during the
+  encode waits, and at 120 fps that wait comes out of an 8.3 ms budget. scrap keeps its legacy gate, because it
+  has no slot to look at first, and DRM's period is in microseconds already. (The first draft gave a phase-lock as
+  the reason. At 120 and 144 the whole-millisecond period is 8 and 6 ms, a little faster than the frames, so as at
+  30 and 60 it drifts out of the wait instead.)
 - **The cursor channel:** its poll interval follows the frame period above 60 (FR-98's `poll_interval` knob,
   `capture/cursor.rs:44`).
 
@@ -141,7 +148,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH` (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is not reported yet |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache, pure and not yet called. **P2b-2 owed**: the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, and the wiring |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 owed**: the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | — |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -275,6 +282,110 @@ pump: the fps swap, a capture pace that moves without a reopen, and the trial ru
 
   Exactly the seven tests that guard them failed: 17 passed, 7 failed. The first control fails two tests, because
   "a pause is not evidence" and "content slower than three periods is not evidence" are one rule.
+
+### 4.4 P2b-2 — the rate moves in place, and the grant runs, as built (2026-10-21)
+
+The wiring half of P2b. With `fps-high` on, an ask above the session's rate is decided by P2b-1's `grant()`.
+A granted rate is reached without a freeze: the encoder is replaced in the background, and the capture's pace
+moves in place. An unproven class runs as a trial, and its verdict is cached.
+
+| Piece | What it does | Where |
+|---|---|---|
+| `ScreenCapture::set_target_fps` | moves the capture's pace without a reopen. WGC, scrap and DRM move their sleep, and WGC runs the slot-first gate above 60. The portal keeps its helper's pace (the default), so a trial there fails on what it delivers | `agents/roomlerd/src/capture/mod.rs` and the backends |
+| `ScreenCapture::backend` | the backend's name in a rate class | the same |
+| `GateMode::at_fps`, `gate::legacy_period` | the gate a granted rate runs, and the legacy period every backend computed inline | `agents/roomlerd/src/capture/gate.rs` |
+| `FfmpegEncoder::rebuild_spec_at` | a replacement at new dims, at a new rate, or both; `adopt_rebuilt` takes the rate too | `agents/roomlerd/src/encode/ffmpeg/encoder.rs`, `agents/roomlerd/src/encode/thread.rs` |
+| `RateState` | one session's decision: the grant, the running rate, what the session knows of each class, the trial | `agents/roomlerd/src/encode/frame_rate.rs` |
+| `Pipeline::merged_fps_ask` | a shared stream's ask: the smallest, and a viewer that asked nothing holds today's rate | `agents/roomlerd/src/media_share.rs` |
+| the pump | decides, swaps, paces, feeds the trial, persists the verdict | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs` |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as viewer
+    participant P as pump
+    participant E as encoder
+    participant C as capture
+    V->>P: rc:fps {fps: 120}
+    P->>P: RateState.decide: granted, as a trial
+    P-)E: open the replacement at 120 (background)
+    Note over P,C: the stream keeps running at 60
+    E--)P: replacement ready
+    P->>E: adopt between frames (an IDR)
+    P->>C: set_target_fps(120)
+    P->>V: rc:video-info {fps: 120, fps_trial: true}
+    loop every real frame
+        P->>P: TrialMeter
+    end
+    alt 10 s of motion at 120
+        P->>P: Proven, cached; no trial next time
+    else short of the rate
+        P->>C: set_target_fps(60)
+        P-)E: open the replacement at 60
+        P->>V: rc:video-info {fps: 60, fps_asked: 120, fps_reason: "unproven"}
+    end
+```
+
+- **The encoder is never fed faster than it was built for.** The capture runs at the lower of what the grant
+  wants and what the live encoder was built for. Going up, the replacement opens at the higher rate while the
+  stream keeps running at the old one, and the capture's pace follows at the adoption. Going down, the capture
+  slows at once and the replacement follows. An encoder's rate control counts time in frames at its rate, so
+  frames that come faster spend its ceiling faster by the same factor.
+- **One make-before-break.** An fps move rides FR-70 M2's dims swap: the same pending slot, the same pinned
+  target, the same adoption between frames. A dims move opened meanwhile carries the wanted rate too. A rate swap
+  opened at a frame rate the session has since left is discarded as stale, like one opened for dims it has left.
+- **A replacement that will not open.** One at another rate that fails to open is not opened again for 10 s,
+  and a rate above the cap is not granted again that session. That is not cached: an open can fail for a reason
+  that is not the rate (two encoder sessions at once, on a card at its session limit).
+- **With `fps-high` off,** the wanted rate is the live encoder's own, so every path is unchanged, with one
+  exception, a fix: a rate swap opened before a transport flip and finished after it carried the old frame rate
+  and was adopted; now it is discarded as stale.
+- **When it decides.** On a change of the ask, the base rate, the transport, the capture backend, the encoder or
+  its dims, and once a second for the pipe's belief. The ceiling at the asked rate comes from the same chain the
+  replacement opens at. Nothing new is read per frame: the deny list and the cache are read once per pump, the
+  cache off the runtime.
+- **The trial** is fed every real frame that left the encoder, at its capture time. The viewer-rate divisor, the
+  byte gate, the drain and the pump's own stale-frame skip pause it. A verdict holds for the rest of the session at
+  once, and is written next to the probe cache off the runtime. `rc:video-info` carries `fps_trial: true` while
+  a trial runs, and names a refusal only once the stream runs below the ask.
+- **The trial's Failed rule changed here.** P2b-1 failed a class on the frames' rate alone. Content slower than
+  the rate (a 60 fps video; Safari holds web pages at 60 on a ProMotion panel by default) would have failed a
+  capable host and cached that for a week. Now Proven is as before; Failed needs the encoder's p90 time per
+  frame at 90 % of a period or more (`TRIAL_MAX_ENCODE_PCT`); anything else is no verdict, and the window starts
+  over. The pump passes each frame's own encode time.
+- **The slot-first gate above 60 is WGC's alone** (§3.4).
+- **Not yet, for P2b-3:** the screen's refresh rate (every class has `refresh_hz` 0, so `refresh` is never the
+  reason yet); `fps_deny` as a config key and through remote config; and the viewer's words for `trial`,
+  `refresh`, `denied` and `pipe`. Today the viewer shows the raw word for those, as it does for any word it does
+  not know.
+- **Tests:**
+  - `RateState`: a trial starts only when the stream runs at the granted rate; a proven trial runs on without
+    one; a failed one goes back to the cap and says `unproven`, once the stream runs below the ask; a class
+    the session failed is not tried again, another class is; the cache decides from the first ask; a new class
+    starts the trial over; a replacement that fails to open fails the class for the session only; an ask the
+    cap covers wants the cap;
+  - the gate above 60, and the legacy period at 120 and 144;
+  - the shared stream's ask, floor-merged, a viewer that asked nothing holding today's rate;
+  - the trial: slow content with a fast encoder concludes nothing however long it runs, a slow encoder fails on
+    slow content too, and fast content after a slow window still proves the class;
+  - `rc:video-info`'s frame-rate fields, byte for byte.
+
+  The lane: CI's FFmpeg clippy clean, and 1815 of the agent's 1817 library tests pass in WSL; the two that
+  fail need a display `:99` and a dialer timeout this box does not have, as on master. Windows clippy with
+  `wgc-capture`, `scrap-capture` and `system-context` is clean.
+- **Negative controls,** six, run together:
+  - the refusal named while the swap down still opens;
+  - a trial's verdict not remembered;
+  - a new class not starting the trial over;
+  - the slot-first gate not taken above 60;
+  - a viewer that asked nothing not holding the shared stream;
+  - a failed open not failing the class.
+
+  Exactly the seven tests that guard them failed: 46 passed, 7 failed. The second control fails three tests,
+  which guard one property. It masks the first control, so that one was also run alone: one test failed, its own.
+
+  The trial rule's own controls: Failed on the rate alone (3 tests failed), the encode threshold at two periods
+  (4), no fresh window after one with no verdict (1). The first masks the second, so each was also run alone.
 
 ## 5. Acceptance criteria
 
