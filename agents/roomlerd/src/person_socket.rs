@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-27 P11 — the person-at-the-device socket of a Linux SYSTEM install.
+//! FR-27 P11 — the person-at-the-device socket of a Linux SYSTEM install;
+//! FR-97 P2g — and of a Mac's ROOT half.
 //!
 //! A root daemon's LocalAPI (`/var/run/roomler`, 0700 / 0600) is root-only,
 //! and rightly: it is the trust boundary for every administrative verb. But
@@ -10,31 +11,48 @@
 //! Disconnect and — on GNOME/KDE Wayland, which have no native overlay — no
 //! consent prompt at all (#1911, measured 2026-10-09).
 //!
-//! This module keeps ONE [`localapi::serve_person_socket`] listening in the
-//! runtime dir of whoever is at the seat, and moves it when that changes:
-//! - "at the seat" is the ACTIVE graphical session's user, by the same
-//!   `loginctl` walk the companion launch uses — never a display manager's
-//!   greeter, and never a user switched away in the background (they must not
-//!   answer consent for a view of someone else's desktop);
+//! This module keeps ONE [`localapi::serve_person_socket`] listening for
+//! whoever is at the seat, and moves it when that changes:
+//! - on Linux, "at the seat" is the ACTIVE graphical session's user, by the
+//!   same `loginctl` walk the companion launch uses — never a display
+//!   manager's greeter, and never a user switched away in the background
+//!   (they must not answer consent for a view of someone else's desktop);
+//! - on a Mac, it is the console user, `/dev/console`'s owner, as the FR-43
+//!   supervisor reads it;
 //! - root at the seat needs nothing: root reaches the daemon's own socket;
 //! - a per-user daemon (not root) does nothing: its own socket already IS its
 //!   person's.
 //!
 //! What the socket serves is decided in `localapi` ([`localapi::person_may`]).
 //!
+//! **A Mac (FR-97 P2g).** A two-half Mac's companion talks to its per-user
+//! half, whose enrollment has no overlay node: only root can hold a utun, so
+//! the machine is on the private network through its root half alone. The
+//! server lists a device with no node by itself (`no_node`), so the companion's
+//! Devices page showed the Mac and nothing else. The per-user half now asks
+//! the root half, over this socket, for the machine's own view
+//! ([`machine_view_wanted`], [`machine_answer`]), and shows that instead.
+//!
 //! Kill switch: `ROOMLERD_PERSON_SOCKET=0` (or `false` / `off` / `no`) — the
-//! pre-P11 behaviour.
+//! pre-P11 behaviour, and on a Mac the pre-P2g one, since with no socket the
+//! per-user half keeps its own answer.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tokio::sync::watch;
+use tunnel_core::localapi::Response;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tunnel_core::localapi::{self, LocalApiState};
 
 /// How often the seat is looked at. A consent prompt stays up for 30 s or
 /// more, so following a user switch within a few seconds is plenty. A look is
 /// a couple of `loginctl` calls, and none at all where nobody but root is
-/// logged in ([`any_user_runtime_dir`]).
+/// logged in ([`any_user_runtime_dir`]); on a Mac it is one `stat`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const POLL: Duration = Duration::from_secs(5);
 
 /// Is any NON-root user logged in? logind gives every logged-in user a
@@ -55,6 +73,7 @@ pub fn any_user_runtime_dir(root: &std::path::Path) -> bool {
 /// After a listener could not be served (no runtime dir yet, or a per-user
 /// daemon owns the path), the same person is retried this long after, rather
 /// than on every tick.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// The kill switch. Anything but an explicit off leaves it on.
@@ -87,12 +106,108 @@ pub fn step(serving: Option<u32>, at_seat: Option<u32>) -> Step {
     }
 }
 
+/// FR-97 P2g — should a Mac's per-user half ask the machine's root half for
+/// this answer? Only when its own answer is a Devices or Mesh view the server
+/// cut down to itself because it has no overlay node (`no_node`), and only
+/// when it is NOT root: a root daemon is the machine's own view already.
+pub fn machine_view_wanted(own: &Response, euid: u32) -> bool {
+    euid != 0 && overlay_reason(own) == Some("no_node")
+}
+
+/// FR-97 P2g — is the root half's answer worth showing instead? Only a view
+/// the server shaped for a node it has (`ok`). Anything else — the root half
+/// is off the network too, its server has no network module, an error —
+/// tells the person nothing better than the per-user half's own answer did.
+pub fn machine_view_usable(machine: &Response) -> bool {
+    overlay_reason(machine) == Some("ok")
+}
+
+/// The envelope's `overlay` reason of a Devices or Mesh answer.
+fn overlay_reason(r: &Response) -> Option<&str> {
+    match r {
+        Response::Devices(p) => Some(p.overlay.as_str()),
+        Response::Mesh(m) => Some(m.overlay.as_str()),
+        _ => None,
+    }
+}
+
+/// FR-97 P2g — on a Mac, `own` replaced by the root half's answer to `req`
+/// where [`machine_view_wanted`] and [`machine_view_usable`] say so; `own`
+/// itself in every other case, on every other OS, and whenever the root half
+/// does not answer (an older one, `ROOMLERD_PERSON_SOCKET=0`, no root half).
+pub async fn or_machine_view(own: Response, req: tunnel_core::localapi::Request) -> Response {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: geteuid never fails.
+        let euid = unsafe { libc::geteuid() };
+        if machine_view_wanted(&own, euid)
+            && let Some(machine) = machine_answer(euid, &req).await
+            && machine_view_usable(&machine)
+        {
+            tracing::debug!("devices: the per-user half shows the machine's view (FR-97 P2g)");
+            return machine;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = req;
+    own
+}
+
+/// FR-97 P2g — ask the root half's person socket for `uid`. `None` when it is
+/// not there or does not answer within a few seconds: the caller keeps its
+/// own answer then.
+#[cfg(target_os = "macos")]
+pub async fn machine_answer(uid: u32, req: &tunnel_core::localapi::Request) -> Option<Response> {
+    let path = localapi::person_socket_path(uid);
+    if !path.exists() {
+        return None;
+    }
+    let ask = async {
+        let mut client = localapi::connect_unix_at(path).await.ok()?;
+        client.request(req).await.ok()
+    };
+    tokio::time::timeout(Duration::from_secs(5), ask)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Who is at the seat now: on Linux the active graphical session's user, on
+/// a Mac the console user. `None` for nobody, and for root.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn person_at_the_seat() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        // This runs on EVERY Linux root daemon, servers and cluster nodes
+        // included. Where no non-root user is logged in at all there is
+        // nobody to serve, and no `loginctl` to spawn.
+        if !any_user_runtime_dir(std::path::Path::new("/run/user")) {
+            return None;
+        }
+        crate::companion::graphical_session_matching(None, true)
+            .ok()
+            .map(|s| s.uid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // `/dev/console`'s owner, as the FR-43 supervisor reads it: uid 0 is
+        // the login window, which is nobody to serve.
+        std::fs::metadata("/dev/console")
+            .ok()
+            .map(|m| m.uid())
+            .filter(|&u| u != 0)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Listener {
     uid: u32,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Listener {
     fn start(uid: u32, state: Arc<dyn LocalApiState>) -> Self {
         let path = localapi::person_socket_path(uid);
@@ -115,6 +230,7 @@ impl Listener {
 }
 
 /// Run until `shutdown`. Inert unless this is a root daemon with the switch on.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bool>) {
     if !enabled_by_env(std::env::var("ROOMLERD_PERSON_SOCKET").ok().as_deref()) {
         tracing::info!("person socket: off (ROOMLERD_PERSON_SOCKET) — FR-27 P11");
@@ -132,20 +248,10 @@ pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bo
         if let Some(l) = current.take_if(|l| l.task.is_finished()) {
             failed = Some((l.uid, Instant::now()));
         }
-        let at_seat = tokio::task::spawn_blocking(|| {
-            // This runs on EVERY Linux root daemon, servers and cluster nodes
-            // included. Where no non-root user is logged in at all there is
-            // nobody to serve, and no `loginctl` to spawn.
-            if !any_user_runtime_dir(std::path::Path::new("/run/user")) {
-                return None;
-            }
-            crate::companion::graphical_session_matching(None, true)
-                .ok()
-                .map(|s| s.uid)
-        })
-        .await
-        .ok()
-        .flatten();
+        let at_seat = tokio::task::spawn_blocking(person_at_the_seat)
+            .await
+            .ok()
+            .flatten();
         match step(current.as_ref().map(|l| l.uid), at_seat) {
             Step::Keep => {}
             Step::Stop => {
@@ -193,6 +299,7 @@ pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tunnel_core::localapi::{DevicesPage, MeshView};
 
     #[test]
     fn the_switch_is_on_unless_turned_off() {
@@ -233,5 +340,54 @@ mod tests {
         // Root at the seat reaches the daemon's own socket.
         assert_eq!(step(None, Some(0)), Step::Keep);
         assert_eq!(step(Some(1000), Some(0)), Step::Stop);
+    }
+
+    fn devices(overlay: &str) -> Response {
+        Response::Devices(Box::new(DevicesPage {
+            overlay: overlay.into(),
+            ..Default::default()
+        }))
+    }
+
+    fn mesh(overlay: &str) -> Response {
+        Response::Mesh(Box::new(MeshView {
+            overlay: overlay.into(),
+            ..Default::default()
+        }))
+    }
+
+    /// FR-97 P2g — the per-user half asks the root half only for a view the
+    /// server cut to itself for want of a node, and never as root.
+    #[test]
+    fn only_a_no_node_view_off_root_asks_the_machine() {
+        assert!(machine_view_wanted(&devices("no_node"), 501));
+        assert!(machine_view_wanted(&mesh("no_node"), 501));
+        // A root daemon IS the machine's view.
+        assert!(!machine_view_wanted(&devices("no_node"), 0));
+        // A node, an org with no network, a server without the module: the
+        // per-user half's own answer already says the true thing.
+        for other in ["ok", "no_network", "unavailable", ""] {
+            assert!(!machine_view_wanted(&devices(other), 501), "{other:?}");
+        }
+        assert!(!machine_view_wanted(
+            &Response::Error {
+                message: "x".into()
+            },
+            501
+        ));
+    }
+
+    /// FR-97 P2g — and shows the root half's answer only when it is a real
+    /// network view.
+    #[test]
+    fn only_a_shaped_machine_view_replaces_the_own_one() {
+        assert!(machine_view_usable(&devices("ok")));
+        assert!(machine_view_usable(&mesh("ok")));
+        for other in ["no_node", "no_network", "unavailable", ""] {
+            assert!(!machine_view_usable(&devices(other)), "{other:?}");
+        }
+        assert!(!machine_view_usable(&Response::Error {
+            message: "x".into()
+        }));
     }
 }

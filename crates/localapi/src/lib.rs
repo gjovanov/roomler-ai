@@ -2740,9 +2740,10 @@ pub enum Scope {
     /// The daemon's own endpoints. Their ACL is the boundary, so every verb is
     /// served (the per-verb console checks above still apply).
     Full,
-    /// The person-at-the-device socket of a Linux system install
-    /// ([`serve_person_socket`]): only what that person needs to see who is
-    /// viewing their screen, end it, and answer a consent prompt.
+    /// The person-at-the-device socket of a Linux system install, and of a
+    /// Mac's root half ([`serve_person_socket`]): only what that person needs
+    /// to see who is viewing their screen, end it, answer a consent prompt, and
+    /// see the devices the machine's private network lets it see.
     Person,
 }
 
@@ -2754,7 +2755,7 @@ pub enum Scope {
 /// safety surface the companion draws for the person: the status that says
 /// the service is up, the sessions behind the "Being viewed by …" banner, its
 /// Disconnect, the consent prompt and its answer, and whether a recording is
-/// running (the tray turns red).
+/// running (the tray turns red). FR-97 P2g adds the companion's Devices page.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -2770,7 +2771,16 @@ pub fn person_may(req: &Request) -> bool {
         // again, on the peer, in the dispatcher).
         | Request::KeepBusyStatus
         | Request::KeepBusyOff
-        | Request::KeepBusyOn { .. } => true,
+        | Request::KeepBusyOn { .. }
+        // FR-97 P2g — the companion's Devices page and mesh graph: the devices
+        // THIS machine's private network lets it see. Read-only. The server
+        // shapes the list by the machine's own overlay ACL, and the person
+        // can search, sort and page it but not widen it. Windows serves the
+        // same to its interactive users (the pipe's `IU` ace). A Mac's
+        // per-user half asks for it here, because only the root half is on
+        // the network; before this it listed itself alone.
+        | Request::Devices { .. }
+        | Request::Mesh { .. } => true,
         Request::Peers
         | Request::Flows
         | Request::Ping { .. }
@@ -2799,8 +2809,6 @@ pub fn person_may(req: &Request) -> bool {
         | Request::RecordStop
         | Request::RecordingsList
         | Request::RecordingDelete { .. }
-        | Request::Devices { .. }
-        | Request::Mesh { .. }
         | Request::RestartDaemon { .. }
         | Request::EncoderCaps
         | Request::HiveUpdateHold => false,
@@ -2811,8 +2819,9 @@ pub fn person_may(req: &Request) -> bool {
 fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
-                  viewing this screen, ends it, and answers consent prompts. Everything else \
-                  goes to the daemon's own socket — run `sudo roomler …`"
+                  viewing this screen, ends it, answers consent prompts, and lists the devices \
+                  this machine's private network reaches. Everything else goes to the daemon's \
+                  own socket — run `sudo roomler …`"
             .into(),
     }
 }
@@ -3767,6 +3776,21 @@ pub fn person_socket_path(uid: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/run/user/{uid}")).join(LOCALAPI_SOCKET_NAME)
 }
 
+/// FR-97 P2g — where a Mac's ROOT half serves the console user's person socket.
+/// Not in a directory of theirs, as on Linux: on a Mac the per-user half
+/// already serves that person a socket of its own (in their temp dir), which
+/// is what their companion and CLI talk to. This one is what the per-user half
+/// asks for the machine's private-network view (Devices and Mesh), which only
+/// the root half has, since only root can hold a utun.
+#[cfg(target_os = "macos")]
+pub const MACOS_PERSON_SOCKET_DIR: &str = "/var/run/roomler-person";
+
+/// FR-97 P2g — see [`MACOS_PERSON_SOCKET_DIR`].
+#[cfg(target_os = "macos")]
+pub fn person_socket_path(uid: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(MACOS_PERSON_SOCKET_DIR).join(format!("{uid}.sock"))
+}
+
 /// FR-27 P11 — the caller check on the person socket, per connection, from
 /// the kernel (`SO_PEERCRED`): the person it belongs to, or root. Unknown is
 /// neither.
@@ -3796,39 +3820,24 @@ pub fn person_peer_ok(peer: &ClientPeer, owner_uid: u32) -> bool {
 /// same person would own it), removes a stale file only if it IS a socket,
 /// and on the way out unlinks only the entry it bound (`lstat`, never
 /// following a link).
-#[cfg(target_os = "linux")]
+///
+/// FR-97 P2g — a Mac's root half serves one too, at [`person_socket_path`]
+/// in a directory only root can write ([`bind_person_socket`]), with the same
+/// per-connection uid check and the same [`Scope::Person`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn serve_person_socket(
     path: std::path::PathBuf,
     owner_uid: u32,
     state: Arc<dyn LocalApiState>,
     mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
     use std::os::unix::fs::MetadataExt;
     use tokio::net::UnixListener;
 
     if *stop.borrow() {
         return Ok(());
     }
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "person socket path has no parent"))?;
-    let dir_meta = std::fs::metadata(dir)?;
-    if !dir_meta.is_dir() || dir_meta.uid() != owner_uid {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "{} is not a directory owned by uid {owner_uid}",
-                dir.display()
-            ),
-        ));
-    }
-    let owner_gid = dir_meta.gid();
-    let bind_path = path.clone();
-    let (std_listener, bound_ino) =
-        tokio::task::spawn_blocking(move || bind_as_person(&bind_path, owner_uid, owner_gid))
-            .await
-            .map_err(|e| Error::other(format!("person socket: the bind task failed: {e}")))??;
+    let (std_listener, bound_ino) = bind_person_socket(path.clone(), owner_uid).await?;
     std_listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(std_listener)?;
     tracing::info!(
@@ -3883,6 +3892,117 @@ pub async fn serve_person_socket(
     }
     tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
     served
+}
+
+/// FR-27 P11 — the Linux bind: in the person's own runtime dir, which logind
+/// made and they own (this never creates it, and refuses a dir owned by anyone
+/// else), and AS them ([`bind_as_person`]).
+#[cfg(target_os = "linux")]
+async fn bind_person_socket(
+    path: std::path::PathBuf,
+    owner_uid: u32,
+) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "person socket path has no parent"))?;
+    let dir_meta = std::fs::metadata(dir)?;
+    if !dir_meta.is_dir() || dir_meta.uid() != owner_uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory owned by uid {owner_uid}",
+                dir.display()
+            ),
+        ));
+    }
+    let owner_gid = dir_meta.gid();
+    tokio::task::spawn_blocking(move || bind_as_person(&path, owner_uid, owner_gid))
+        .await
+        .map_err(|e| Error::other(format!("person socket: the bind task failed: {e}")))?
+}
+
+/// FR-97 P2g — the Mac bind: in [`MACOS_PERSON_SOCKET_DIR`], a directory
+/// ROOT owns and only root can write, so no one else can make, swap or link an
+/// entry in it. That is what lets root bind and then hand the socket over,
+/// which on Linux, in the person's own dir, is the race [`bind_as_person`]
+/// exists to avoid (macOS has no per-thread filesystem ids to borrow).
+#[cfg(target_os = "macos")]
+async fn bind_person_socket(
+    path: std::path::PathBuf,
+    owner_uid: u32,
+) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+    tokio::task::spawn_blocking(move || bind_root_owned(&path, owner_uid))
+        .await
+        .map_err(|e| std::io::Error::other(format!("person socket: the bind task failed: {e}")))?
+}
+
+/// FR-97 P2g — the directory check of [`bind_root_owned`], on plain facts so
+/// it is tested on every platform: a real directory (not a link to one),
+/// root's, and writable by nobody else.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn root_only_dir(is_dir: bool, is_symlink: bool, uid: u32, mode: u32) -> bool {
+    is_dir && !is_symlink && uid == 0 && mode & 0o022 == 0
+}
+
+/// FR-97 P2g — see [`bind_person_socket`]. Makes the directory 0755 if it is
+/// missing (under `/var/run` only root can), refuses one that is not
+/// [`root_only_dir`], clears a stale socket (never anything else), binds, and
+/// only then gives the socket to the person, 0600. Nothing is accepted before
+/// that, and every connection is checked against the person or root
+/// ([`person_peer_ok`]) whatever the mode was in between. The `chmod` follows
+/// links, which is safe only because nobody but root can change an entry in
+/// this directory. Returns the listener and its inode.
+#[cfg(target_os = "macos")]
+fn bind_root_owned(
+    path: &std::path::Path,
+    uid: u32,
+) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "person socket path has no parent"))?;
+    if let Err(e) = std::fs::symlink_metadata(dir) {
+        if e.kind() != ErrorKind::NotFound {
+            return Err(e);
+        }
+        std::fs::DirBuilder::new().mode(0o755).create(dir)?;
+        // The mode above is under the umask; the person must be able to
+        // search the directory to reach their socket in it.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let m = std::fs::symlink_metadata(dir)?;
+    if !root_only_dir(m.is_dir(), m.file_type().is_symlink(), m.uid(), m.mode()) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory only root owns and writes",
+                dir.display()
+            ),
+        ));
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!("{} is already served by another process", path.display()),
+        ));
+    }
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_socket() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        std::fs::remove_file(path)?;
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    std::os::unix::fs::lchown(path, Some(uid), None)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let ino = std::fs::symlink_metadata(path)?.ino();
+    Ok((listener, ino))
 }
 
 /// FR-27 P11 — make the person socket AS the person: check the path, clear a
@@ -6928,6 +7048,9 @@ mod tests {
             r#"{"t":"keep_busy_off"}"#,
             // P10 — and theirs to start (the peer is gated again on top).
             r#"{"t":"keep_busy_on","d":{}}"#,
+            // FR-97 P2g — the machine's device list and mesh, read-only.
+            r#"{"t":"devices","d":{"org":"primary"}}"#,
+            r#"{"t":"mesh","d":{"org":"primary"}}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -7019,11 +7142,35 @@ mod tests {
             let r = ask_scoped(Scope::Person, j).await;
             assert!(!is_person_refusal(&r), "{j} must pass through: {r:?}");
         }
+        // FR-97 P2g — so do the Devices page and the mesh, read-only.
+        for j in [
+            r#"{"t":"devices","d":{"org":"primary"}}"#,
+            r#"{"t":"mesh","d":{"org":"primary"}}"#,
+        ] {
+            let r = ask_scoped(Scope::Person, j).await;
+            assert!(!is_person_refusal(&r), "{j} must pass through: {r:?}");
+        }
         // The daemon's own socket is unchanged.
         assert!(matches!(
             ask_scoped(Scope::Full, r#"{"t":"peers"}"#).await,
             Response::Peers(_)
         ));
+    }
+
+    /// FR-97 P2g — the Mac person socket's directory must be a real
+    /// directory, root's, and writable by nobody else, or root's bind-then-
+    /// chown there could be raced.
+    #[test]
+    fn a_mac_person_socket_dir_is_root_only() {
+        assert!(root_only_dir(true, false, 0, 0o40755));
+        assert!(root_only_dir(true, false, 0, 0o40700));
+        // Group- or world-writable: someone else could make or swap entries.
+        assert!(!root_only_dir(true, false, 0, 0o40775));
+        assert!(!root_only_dir(true, false, 0, 0o41777));
+        // Not root's, a link to a directory, or not a directory at all.
+        assert!(!root_only_dir(true, false, 501, 0o40755));
+        assert!(!root_only_dir(false, true, 0, 0o120755));
+        assert!(!root_only_dir(false, false, 0, 0o100644));
     }
 
     #[cfg(unix)]

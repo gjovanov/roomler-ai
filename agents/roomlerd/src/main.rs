@@ -4428,9 +4428,11 @@ async fn run_cmd(
 
     // FR-27 P11 — on a Linux system install, the person at the seat gets a
     // socket of their own for the safety surface (who is viewing, Disconnect,
-    // consent): the daemon's own socket is root-only. Inert for a per-user
-    // daemon and with ROOMLERD_PERSON_SOCKET=0; exits on the shutdown watch.
-    #[cfg(target_os = "linux")]
+    // consent): the daemon's own socket is root-only. FR-97 P2g — a Mac's root
+    // half serves the console user one too, which the per-user half asks for
+    // the machine's Devices and Mesh. Inert for a per-user daemon and with
+    // ROOMLERD_PERSON_SOCKET=0; exits on the shutdown watch.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _person_socket_task = tokio::spawn(roomlerd::person_socket::run(
         localapi_state.clone(),
         shutdown_rx.clone(),

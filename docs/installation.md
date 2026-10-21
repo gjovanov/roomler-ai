@@ -338,6 +338,8 @@ Disconnect and its consent prompt. As that user:
   (`service (SYSTEM)` on Windows). `status --json` carries the same fact as
   `"privileged"`. An older daemon reports no account: a new CLI then prints a
   bare `service`, an older one `service (SYSTEM)` for every install;
+- `roomler devices` answers too (FR-97 P2g): the devices this machine's private
+  network reaches, as the companion's Devices page shows them;
 - anything administrative (`peers`, routes, `config`, …) is refused with a pointer
   to `sudo roomler …`.
 

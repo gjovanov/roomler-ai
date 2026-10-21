@@ -244,7 +244,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages only | ❓ | Person socket (`crates/localapi/src/lib.rs:2758-2808`); a two-half Mac may answer Routes and Devices from the user half | #1911; FR-43 P3 |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices and the mesh since P2g | 🟡 Devices and the mesh from the root half since P2g; the Connection column and Overview's count still the user half's (P2h) | Person socket (`crates/localapi/src/lib.rs:2759`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:138`) | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
@@ -319,7 +319,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
 | code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:80-81`, `caps.rs:1925`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:78-81`, `agents/roomlerd/src/encode/caps.rs:1956`, `crates/tunnel-core/src/overlay/tun.rs:3926-3927`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4712` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3779`, `:3875`, `:4282`, `agents/roomlerd/src/main.rs:4714` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:580-585`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -632,6 +632,26 @@ test of the SIGKILL property itself.
   `public.rtf` beside the HTML lane.
 - **P2f, a microphone for recordings.** cpal on macOS, `NSMicrophoneUsageDescription` in the bundle (a missing key
   ends the process at first access), and the audio-input entitlement.
+- **P2g, the companion's Devices page on a two-half Mac (D2).** Reported by the operator on 2026-10-21: the Mac's
+  Devices page listed the Mac and nothing else. Only root can hold a utun, so the machine is on the private network
+  through its root half alone. The companion talks to the per-user half, whose enrollment has no node, and the server
+  lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
+  the server and the companion as they are:
+  - the root half serves the console user a person socket (FR-27 P11's mechanism) at
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:3786`). The directory is root's and writable by
+    nobody else (`root_only_dir`, `:3945`), so root binds and then hands the socket over (`bind_root_owned`,
+    `:3958`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
+  - `person_may` (`:2759`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
+    socket the same way, and its companion's Devices page was refused there before;
+  - the per-user half asks the root half only when its own answer is `no_node` and it is not root
+    (`agents/roomlerd/src/person_socket.rs:113`). It shows the root half's answer only when that is `ok` (`:121`),
+    and keeps its own on any other answer, a timeout (5 s) or no socket (`:138`).
+  Kill switch: `ROOMLERD_PERSON_SOCKET=0` on the root half, which gives the pre-P2g page.
+- **P2h, the rest of that page on a two-half Mac.** Its Connection column and Overview's online count come from the
+  local `Peers` poll, a synchronous read of the half's own overlay (`LocalApiState::peers`), so after P2g a Mac
+  shows `—` there and the dot falls back to the server's presence. Serving them from the root half means an async
+  `peers` or a mirrored copy, plus a person-scoped `Peers` without the probe and carrier detail. That is a design
+  change to the trait, so it is a phase of its own.
 - **Open, found by AC3's macOS session (§8): Local Network privacy.** macOS 15 asked "Allow 'roomlerd' to find devices
   on local networks?" over the per-user agent, in Apple's generic words: the bundle has no
   `NSLocalNetworkUsageDescription`. On an unattended Mac nobody answers it. A LaunchDaemon run as root is exempt, so
@@ -1090,6 +1110,8 @@ model on Windows, so the three agree on what the mode means.
 | **P2d** | macOS lock hint, layout, display-match | per-verb caps | a field Mac | M |
 | **P2e** | macOS clipboard images + RTF | `ROOMLERD_CLIPBOARD_NATIVE=0` | a field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
+| **P2g** | The companion's Devices page and mesh on a two-half Mac come from the root half, over a person socket it serves the console user; a Linux system install's person socket serves the same two verbs (D2) | `ROOMLERD_PERSON_SOCKET=0` | a tart Mac with both halves, red on 0.4.149; the operator's MacBook | S |
+| **P2h** | The Connection column and Overview's count on a two-half Mac, from the root half (not built) | — | a tart Mac with both halves | S–M |
 | **P3a** | Linux cursor shape: X11 from XFixes (merged #2555); PipeWire's cursor metadata for the portal and mutter arms stays open | `ROOMLERD_X11_CURSOR=0` | a vmtest Ubuntu cell on Xorg, a per-user install, red on 0.4.145 | S → M |
 | **P3b** | Linux lock hint (advisory, `input: "passes"`) + a logind block inhibitor (FR-55 P3) (built) | `ROOMLERD_LOCK_HINT=0`; `power_policy` | a vmtest Ubuntu guest, red on 0.4.142 | S |
 | **P3c** | Linux audio. *P3c-1*: never a microphone; no `opus` without a named device; `rc:audio-unavailable` says why (built). *P3c-2*: the session's monitor through Pulse's client library, per-user and root (D14, built) | P3c-1: — (a privacy fix; an owner names a device to opt back in); P3c-2: `ROOMLERD_AUDIO_SESSION=0` | a Linux host with a microphone and a sound server, red on 0.4.141 | M |
@@ -1273,6 +1295,12 @@ one depends on it.
   new uplink within one sweep, and the control WS stays up; after a `kill -9` and a network change, no exemption
   route is left on any of the three OSes. Red first on the current release. *(Linux and Windows red on 0.4.134 →
   green, 2026-10-14, the WS clause with N14; macOS on 0.4.136 and 0.4.137, 2026-10-15; §8.)*
+- [ ] **AC19 (P2g):** on a Mac with both halves, `roomler devices` as the console user (which is what the companion's
+  Devices page asks) lists the devices the root half's netmap carries, not the Mac alone. It is red on the released
+  0.4.149 first, the root half's own `roomler devices` agrees with it, and `ROOMLERD_PERSON_SOCKET=0` on the root
+  half gives the red again. The same list shows on a Linux system install's companion. The operator's MacBook shows
+  it after its update. `docs/desktop-companion.md` §6 and §12 and `docs/security-baseline.md` §4 describe it, and
+  `docs/README.md` indexes them.
 
 ## 6. Open decisions (operator)
 
