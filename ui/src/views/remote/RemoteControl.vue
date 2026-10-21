@@ -1598,6 +1598,25 @@
             <v-btn value="smoother" size="small" class="flex-grow-1">Smoother</v-btn>
           </v-btn-toggle>
           <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ priorityHint }}</div>
+          <!-- FR-119 P1 — the frame rate, offered only by an agent that can be
+               asked (`fps-high` in its video caps). It answers in rc:video-info:
+               what the stream runs at, and why not when it refused an ask. -->
+          <v-select
+            v-if="frameRateOffered"
+            v-model="frameRatePick"
+            :items="frameRateItems"
+            item-title="title"
+            item-value="value"
+            density="comfortable"
+            variant="outlined"
+            hide-details="auto"
+            prepend-inner-icon="mdi-speedometer"
+            label="Frame rate"
+            :hint="frameRateHint"
+            persistent-hint
+            class="mt-3 mb-2"
+            data-testid="rc-picker-fps"
+          />
 
           </v-tabs-window-item>
 
@@ -2331,6 +2350,7 @@ import {
   type RemoteRecordingItem,
 } from '@/composables/useRemoteRecording'
 import { describePrivacyReason, showsPrivacyRefusal } from '@/composables/usePrivacyMode'
+import { agentOffersHighRefresh, frameRateSummary, type FrameRate } from '@/composables/frameRate'
 import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -3688,6 +3708,25 @@ const priority = computed<RcPriority>({
   get: () => rc.priority.value,
   set: (v: RcPriority) => rc.setPriority(v),
 })
+
+// FR-119 P1 — the frame-rate picker, for an agent advertising `fps-high` only.
+const frameRateOffered = computed(() => agentOffersHighRefresh(agent.value?.capabilities?.video))
+const frameRateItems = computed(() =>
+  rc.frameRateChoices.value.map((o) => ({
+    title: `${o.fps} fps`,
+    value: o.fps,
+    props: { disabled: !o.enabled, subtitle: o.why ?? undefined },
+  })),
+)
+const frameRatePick = computed<FrameRate>({
+  get: () => rc.frameRate.value,
+  set: (v: FrameRate) => rc.setFrameRate(v),
+})
+const frameRateHint = computed(
+  () =>
+    frameRateSummary(rc.frameRateAnswer.value) ??
+    'Above 60 only where this device has shown it can sustain it',
+)
 const priorityOptions = [
   {
     title: 'Balanced',

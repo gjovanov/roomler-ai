@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
+import { frameRateAnswerOf } from '@/composables/frameRate'
 
 // Pure helpers exported for testing. We can't import the full composable
 // here without mocking the WS store; the helpers below are self-contained
@@ -3475,6 +3476,42 @@ describe('P7 — HEVC Rext 4:4:4 codec string', () => {
     // Same Annex-B no-description contract as the worker's default
     // hev1.1.6.L153.B0; profile_idc 4 + the Rext compat flag + Level 5.1.
     expect(HEVC_REXT_CODEC_STRING).toBe('hev1.4.10.L153.B0')
+  })
+})
+
+// FR-119 P1 — the frame-rate answer rides trailing optional keys of
+// rc:video-info, exactly as the agent's `encode::frame_rate::video_info_fields`
+// writes them (its Rust test locks the same bytes).
+describe('rc:video-info frame rate (FR-119 P1)', () => {
+  const head = '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1'
+
+  it('parses the stream rate and a refused ask with its reason', () => {
+    const refused = parseControlInbound(`${head},"fps":60,"fps_asked":120,"fps_reason":"unproven"}`)
+    expect(refused?.kind).toBe('video_info')
+    if (refused?.kind === 'video_info') {
+      expect(refused.info.fps).toBe(60)
+      expect(refused.info.fps_asked).toBe(120)
+      expect(refused.info.fps_reason).toBe('unproven')
+      expect(frameRateAnswerOf(refused.info)).toEqual({ fps: 60, asked: 120, reason: 'unproven' })
+    }
+    const granted = parseControlInbound(`${head},"fps":60}`)
+    if (granted?.kind === 'video_info') {
+      expect(granted.info.fps).toBe(60)
+      expect('fps_asked' in granted.info).toBe(false)
+      expect(frameRateAnswerOf(granted.info)).toEqual({ fps: 60, asked: null, reason: null })
+    }
+  })
+
+  it('carries no frame rate from an agent without fps-high, and drops half a refusal', () => {
+    const plain = parseControlInbound(`${head}}`)
+    if (plain?.kind === 'video_info') {
+      expect('fps' in plain.info).toBe(false)
+      expect(frameRateAnswerOf(plain.info)).toBeNull()
+    }
+    const half = parseControlInbound(`${head},"fps":60,"fps_asked":120}`)
+    if (half?.kind === 'video_info') {
+      expect('fps_asked' in half.info).toBe(false)
+    }
   })
 })
 

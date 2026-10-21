@@ -1127,11 +1127,15 @@ fn input_permission_granted() -> bool {
 /// its probes only where a frame will answer them. The probe child inherits
 /// the environment, so it reads the same answer the daemon would.
 fn video_features() -> Vec<String> {
-    #[allow(unused_mut)]
     let mut features = vec!["chunk-framing".to_string()];
     #[cfg(feature = "synthetic-frame-source")]
     if crate::capture::synthetic_backend::bench_active() {
         features.push("bench".to_string());
+    }
+    // FR-119 P1 — the viewer may ask for more than 60 fps (`rc:fps`); the
+    // answer rides `rc:video-info`. Off unless `ROOMLERD_FPS_HIGH=1`.
+    if crate::encode::fps_high_enabled() {
+        features.push(crate::encode::frame_rate::CAP.to_string());
     }
     features
 }
@@ -2218,6 +2222,22 @@ pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-119 P1 — `fps-high` is off unless `ROOMLERD_FPS_HIGH=1`: until P2
+    /// builds the grant, a viewer must not be offered a picker the agent can
+    /// never honour. `chunk-framing` stays unconditional (FR-17).
+    #[test]
+    fn fps_high_is_not_advertised_by_default() {
+        if tunnel_core::env::node_env("FPS_HIGH").is_some() {
+            return; // a host that set it asked for it; nothing to check here
+        }
+        let features = video_features();
+        assert!(features.iter().any(|f| f == "chunk-framing"));
+        assert!(
+            !features.iter().any(|f| f == crate::encode::frame_rate::CAP),
+            "fps-high advertised with the switch unset: {features:?}"
+        );
+    }
 
     /// FR-84 D4 — the LocalAPI's read of the encoder matrix must never be
     /// what launches the probe. `summarize_cached` reads the `OnceLock` and

@@ -175,7 +175,7 @@ was unchanged (41.5–45 % across runs, within noise of the P1 numbers).
 ⚠️⚠️ **Both production consumers of `Damage` are inert**, which was not obvious
 until it was checked:
 
-- `encode/mod.rs:758` — `set_roi_hints` is a **default no-op that discards its
+- `encode/mod.rs:771` — `set_roi_hints` is a **default no-op that discards its
   arguments**, and no encoder overrides it.
 - `rate_profile::note_real_frame_area` and `Damage::area_permille` have **no
   production callers** — every call site is `#[cfg(test)]`.

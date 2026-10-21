@@ -40,7 +40,7 @@ therefore **increased**.
 ### The six mechanisms
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
-   (`agents/roomlerd/src/encode/mod.rs:192`); on a constrained path `area_min_bitrate_bps()`
+   (`agents/roomlerd/src/encode/mod.rs:196`); on a constrained path `area_min_bitrate_bps()`
    (`:215`) returns exactly it, and `governor.rs:317` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
@@ -61,7 +61,7 @@ therefore **increased**.
 
 4. **The queue budget is denominated in the nominal ceiling.**
    `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:326`, called once at
-   `peer.rs:4779`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
+   `peer.rs:4780`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
    budget is **3.4 seconds** of standing queue. The gate never fired.
 
 5. **The only true latency signal is silent, rejected, or toothless.** `viewer_age_ms=None` in
@@ -71,7 +71,7 @@ therefore **increased**.
    `age_over` cuts **fps** and issues an AIMD MD — which stops at the 1.5 Mbps floor.
 
 6. **Video rides a reliable + ordered DataChannel.** FR-17 stage B exists but is behind a
-   viewer `localStorage` opt-in (`useRemoteControl.ts:2944`). On a lossy mobile link every lost
+   viewer `localStorage` opt-in (`useRemoteControl.ts:2990`). On a lossy mobile link every lost
    chunk head-of-line-blocks the stream *and* burns scarce capacity retransmitting a frame that
    is already stale. `peer.rs:2861` still records "a gap cannot occur".
 

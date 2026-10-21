@@ -31,9 +31,9 @@ at 30 by a constant, and on a fast host the constant is not even the limit: the 
 
 | Path | Today | Anchor |
 |---|---|---|
-| VP9-444 over the DataChannel | 30, or 60 with `ROOMLERD_VP9_FPS=60` | `agents/roomlerd/src/peer.rs:9093` |
+| VP9-444 over the DataChannel | 30, or 60 with `ROOMLERD_VP9_FPS=60` | `agents/roomlerd/src/peer.rs:9121` |
 | H.264 over RTP (OpenH264) | 30: `TARGET_FPS_SW`, and the encoder's own `max_frame_rate(30)` | `peer.rs:98`, `encode/openh264_backend.rs:50` |
-| Hardware encoders | 60 | `peer.rs:105`, `ffmpeg_target_fps` (`peer.rs:9117`) |
+| Hardware encoders | 60 | `peer.rs:105`, `ffmpeg_target_fps` (`peer.rs:9145`) |
 
 ### The Asahi host at the cap, and past it
 
@@ -57,7 +57,7 @@ path, a spinning cube in a window, each arm a fresh session (`ROOMLERD_VP9_*` as
 - **The capture is not the limit.** In the 4:2:0 arms the capture ran at 38–44 fps while the encode stayed under
   30, and the display refreshes at 60 Hz.
 - **Nor the encoder's settings.** The 60 target *doubled* the bitrate ceiling (`initial_bitrate_for_fps`,
-  `encode/mod.rs:685`) and QP fell from 10 to 7, yet a frame still took ~37 ms, and no speed setting helped much.
+  `encode/mod.rs:689`) and QP fell from 10 to 7, yet a frame still took ~37 ms, and no speed setting helped much.
   What does help is the clock the encoder is given (below).
 
 ### What a frame costs, measured offline
@@ -211,7 +211,7 @@ flowchart LR
   it: `tests/l4_latency.rs`'s replay cell read the periodic keyframe at +1 s as an obeyed replay (4 of 5).
 - **The ≤ 1280-px cap is not the limit it looks like.** The cap that shrinks software H.264 "so encode stays under
   the 33 ms 30-fps budget" fires on the host, and 230 ms later the viewer's default resolution (`original`,
-  `ui/src/composables/useRemoteControl.ts:4966`) overrides it: the field already encodes 2048×1080, and with its
+  `ui/src/composables/useRemoteControl.ts:5012`) overrides it: the field already encodes 2048×1080, and with its
   clock that costs 5.5 ms a frame. So P2c, which would have decided the cap from the measured encode, is dropped.
 - **No VP9 quality trade on this host.** With its clock, today's settings (`cpu-used` 6, four tile columns, the
   q-index-16 cap) send 56 fps. `ROOMLERD_VP9_CPU_USED` stays the lever for a host that measures short.

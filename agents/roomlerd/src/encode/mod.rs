@@ -110,6 +110,10 @@ pub mod thread;
 )]
 pub mod viewer_rate;
 
+// FR-119 P1 — the frame rate a viewer asks for (`rc:fps`) and the answer the
+// pump gives it in `rc:video-info`. Pure (unit-tested on the default build).
+pub mod frame_rate;
+
 // Encode-pressure controller — auto-reduces the maxrate ceiling when the
 // SENDER's encoder saturates (avg encode time high), the dynamic version of
 // the field-proven `FFMPEG_FPS=30`. Pure (unit-tested on the default build);
@@ -729,6 +733,15 @@ pub(crate) fn bitrate_base_for_fps(width: u32, height: u32, fps: u32) -> u32 {
 /// `ROOMLERD_SW_FPS_60=0` restores 0.4.141's 30 fps and its base.
 pub fn sw_fps_60_enabled() -> bool {
     tunnel_core::env::flag("SW_FPS_60", cfg!(target_os = "linux"))
+}
+
+/// FR-119 P1 — advertise `fps-high` in `AgentCaps.video`, so a viewer offers
+/// frame rates above 60 and asks for one with `rc:fps`. Default **off**: until
+/// P2 builds the grant, the agent answers every ask at today's cap, and a
+/// picker that can never be honoured is worse than none. The probe child
+/// inherits the environment, so it reads the same answer the daemon would.
+pub fn fps_high_enabled() -> bool {
+    tunnel_core::env::flag("FPS_HIGH", false)
 }
 
 /// FR-112 P2 — 0.4.141's software target, and the floor of the software tier's

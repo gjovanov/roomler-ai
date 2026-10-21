@@ -4292,6 +4292,7 @@ async fn media_pump_vp9_444_dc(
                     cap_reason,
                     None,
                     capturer.arm(),
+                    None,
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc
@@ -5349,6 +5350,10 @@ fn video_info_payload(
     // person at the screen (FR-45 AC8 option b). Omitted elsewhere, so old
     // viewers and non-Linux agents are byte-identical.
     arm: Option<crate::capture::CaptureArm>,
+    // FR-119 P1 — the frame rate the stream runs at, and the viewer's ask with
+    // the reason it was not granted (`encode::frame_rate`). `None` whenever
+    // `fps-high` is off, so every payload is byte-identical to before.
+    fps: Option<crate::encode::frame_rate::Answer>,
 ) -> String {
     let reason = transport_reason
         .map(|r| format!(r#","transport_reason":"{r}""#))
@@ -5369,8 +5374,11 @@ fn video_info_payload(
         .filter(|_| cap_reason.is_some())
         .map(|d| format!(r#","cap_detail":"{d}""#))
         .unwrap_or_default();
+    let fps = fps
+        .map(|a| crate::encode::frame_rate::video_info_fields(&a))
+        .unwrap_or_default();
     format!(
-        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}{cap}{detail}{arm}}}"#,
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}{cap}{detail}{arm}{fps}}}"#,
         if constrained { "relay" } else { "direct" },
     )
 }
@@ -6185,6 +6193,11 @@ async fn media_pump_ffmpeg_dc(
         session_id,
     );
     let mut last_viewers: usize = 0;
+    // FR-119 P1 — the viewer's frame-rate ask and the target it was answered
+    // against, so `rc:video-info` is re-sent when either moves. `fps-high` is
+    // read once per pump (FR-70: no knob is read in the frame path).
+    let fps_high = crate::encode::fps_high_enabled();
+    let mut fps_answered: (Option<u32>, u32) = (None, 0);
     // rc.87 — emit `rc:video-info` so the browser stats badge shows the
     // TRUTH (real encoder + HW + chroma + transport). Badge-truth rc:
     // RETRIED until delivered (see the loop-top block) — the old
@@ -7316,6 +7329,15 @@ async fn media_pump_ffmpeg_dc(
             last_viewers = viewers;
             video_info_sent = false;
         }
+        // FR-119 P1 — a new frame-rate ask, or a new target, re-sends
+        // `rc:video-info`, which carries the answer.
+        if fps_high {
+            let now = (viewer_report.fps_ask(), target_fps);
+            if now != fps_answered {
+                fps_answered = now;
+                video_info_sent = false;
+            }
+        }
 
         // Badge-truth — deliver `rc:video-info` reliably. Attempted whenever
         // undelivered (encoder built + 500 ms since the last try), instead of
@@ -7379,6 +7401,12 @@ async fn media_pump_ffmpeg_dc(
                     cap_reason,
                     cap_detail.as_deref(),
                     capturer.arm(),
+                    // FR-119 P1 — what the stream runs at, and the viewer's
+                    // ask if it asked for more (nothing above the cap is
+                    // granted in P1).
+                    fps_high.then(|| {
+                        crate::encode::frame_rate::answer(fps_answered.0, target_fps, constrained)
+                    }),
                 );
                 // FR-65 — the control-DC lock and send both await; the lock is
                 // shared with every other control-plane writer, and a congested
@@ -9969,6 +9997,21 @@ fn attach_control_handler(
                             new_target = ?new_target,
                             "control: rc:resolution updated"
                         );
+                    }
+                }
+                "rc:fps" => {
+                    // FR-119 P1 — the viewer's frame-rate ask. Stored only; the
+                    // pump answers in `rc:video-info` (`fps`, and `fps_asked` +
+                    // `fps_reason` when it does not grant it), because the pump
+                    // is what knows the session's cap and transport.
+                    match crate::encode::frame_rate::parse_ask(&val) {
+                        Some(fps) => {
+                            viewer_report.store_fps_ask(fps);
+                            info!(%session_id, fps, "control: rc:fps asked");
+                        }
+                        None => {
+                            debug!(%session_id, "control: rc:fps with no offered rate — dropped");
+                        }
                     }
                 }
                 "rc:logs-fetch" => {
@@ -13585,13 +13628,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1}"#
         );
         assert_eq!(
             super::video_info_payload(
-                "vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None, None, None, None
+                "vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None, None, None, None, None
             ),
             r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":2}"#
         );
@@ -13608,6 +13652,7 @@ mod tests {
                 1600,
                 1,
                 Some("lan-captured"),
+                None,
                 None,
                 None,
                 None
@@ -13630,6 +13675,7 @@ mod tests {
                 None,
                 Some("slow-link-cap"),
                 Some("remembered 200 kbps"),
+                None,
                 None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1,"cap_reason":"slow-link-cap","cap_detail":"remembered 200 kbps"}"#
@@ -13647,6 +13693,7 @@ mod tests {
                 None,
                 None,
                 Some("remembered 200 kbps"),
+                None,
                 None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1}"#
@@ -13656,7 +13703,7 @@ mod tests {
         use crate::capture::CaptureArm;
         let arm_of = |arm| {
             super::video_info_payload(
-                "vp9", "libvpx", false, "yuv444", false, 1280, 800, 1, None, None, None, arm,
+                "vp9", "libvpx", false, "yuv444", false, 1280, 800, 1, None, None, None, arm, None,
             )
         };
         let head = r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"direct","native_w":1280,"native_h":800,"viewers":1"#;
@@ -13675,6 +13722,41 @@ mod tests {
             assert_eq!(arm_of(Some(arm)), format!("{head}{tail}"));
         }
         assert_eq!(arm_of(None), format!("{head}}}"));
+    }
+
+    /// FR-119 P1 — the frame-rate answer rides `rc:video-info` as trailing
+    /// optional keys, only when `fps-high` is on: with it off the pump passes
+    /// `None`, so every payload above stays byte-identical.
+    #[test]
+    fn video_info_payload_carries_the_frame_rate_answer() {
+        let payload = |fps| {
+            super::video_info_payload(
+                "h265",
+                "hevc_nvenc",
+                true,
+                "yuv420",
+                false,
+                1920,
+                1080,
+                1,
+                None,
+                None,
+                None,
+                None,
+                fps,
+            )
+        };
+        let head = r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1"#;
+        let answer = crate::encode::frame_rate::answer;
+        assert_eq!(
+            payload(Some(answer(Some(120), 60, false))),
+            format!(r#"{head},"fps":60,"fps_asked":120,"fps_reason":"unproven"}}"#)
+        );
+        assert_eq!(
+            payload(Some(answer(None, 60, false))),
+            format!(r#"{head},"fps":60}}"#)
+        );
+        assert_eq!(payload(None), format!("{head}}}"));
     }
 
     // FR-33 P3 — the reason is named only when the session is relayed AND

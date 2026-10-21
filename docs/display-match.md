@@ -57,7 +57,7 @@ sequenceDiagram
 [`display_match.rs:923`](../agents/roomlerd/src/display_match.rs#L923) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:948`](../agents/roomlerd/src/display_match.rs#L948) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:9965`](../agents/roomlerd/src/peer.rs#L9965)).
+control-channel arm sends the answer ([`peer.rs:9993`](../agents/roomlerd/src/peer.rs#L9993)).
 
 ### The answers
 
@@ -77,7 +77,7 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:3977`](../ui/src/views/remote/RemoteControl.vue#L3977)
+puts the answer under the toggle ([`RemoteControl.vue:4016`](../ui/src/views/remote/RemoteControl.vue#L4016)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
