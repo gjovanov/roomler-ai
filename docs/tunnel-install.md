@@ -159,6 +159,14 @@ sudo dpkg -i /tmp/roomler-cli.deb
 # `roomler` is now on $PATH at /usr/bin/roomler
 ```
 
+> **On an arm64 host** (FR-97 P7b) the same two downloads are
+> `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
+> aarch64 CLI, and the proxy answers 404 for it rather than hand over the
+> x86_64 one. `install.sh --role tunnel` picks the arch by itself
+> (`scripts/install.sh:682-686`), and the aarch64 wizard asks for
+> `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
+> 2.35 or later, as the x86_64 agent does.
+
 > ⚠️ **On Debian 12 and Ubuntu 22.04 this `.deb` cannot install** (#2472).
 > `tunnel-v0.3.0-rc.266` depends on `libssl3t64`, the name Debian 13 and
 > Ubuntu 24.04 use; these two call it `libssl3`. `dpkg -i` leaves the package

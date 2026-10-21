@@ -153,7 +153,7 @@ and never outliving the daemon (FR-97 P0e).
 
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
-| The desktop companion | ✅ | 🟡 x86_64 `.deb` and `.rpm`; none for arm64 or Arch | ✅ in the `.pkg` | `.github/workflows/release-agent.yml:733-744`, `:822-827` |
+| The desktop companion | ✅ | 🟡 a `.deb` and an `.rpm` for x86_64 and, since 0.4.138, arm64 (FR-93 P6d, P6e); none for a host with neither dpkg nor rpm, such as Arch (FR-97 D17) | ✅ in the `.pkg` | `.github/workflows/release-agent.yml:733-744`, `:822-827`, `:914` |
 | Its pages on a system install | ✅ | 🟡 the safety pages | ❓ never run | `docs/desktop-companion.md` |
 | The host stays awake during a session | ✅ `PowerCreateRequest` | ✅ a logind block inhibitor | ✅ `IOPMAssertion`; a closed lid with no external display sleeps anyway (§8) | `agents/roomlerd/src/power.rs:643-656` |
 | A received file lands as the signed-in person | ✅ | ✅ the person at seat0's Downloads | ✅ | `agents/roomlerd/src/files.rs:209-227` |
@@ -176,7 +176,7 @@ and never outliving the daemon (FR-97 P0e).
 | The tunnel client updates itself (`roomler self-update`) | ✅ | ❌ | ❌ | `agents/roomler-cli/src/update.rs:96-100`; FR-97 P6b |
 | Processors the daemon runs on | 🟡 x64; ❌ ARM64 | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel | `agents/roomlerd/wix-perMachine/main.wxs:81`; `.github/workflows/release-agent.yml:2582`; FR-97 D6 |
 | Hardware encoding on Linux arm64 | — | ❌ | — | the arm64 build has no `ffmpeg-encoder` (`.github/workflows/release-agent.yml:1093`); FR-97 P7a |
-| The standalone tunnel client and the wizard on Linux arm64 | — | ❌ | — | x86_64 builds only (`.github/workflows/release-tunnel.yml:127-130`, `.github/workflows/release-setup.yml:184-187`); FR-97 P7b |
+| The standalone tunnel client and the wizard on Linux arm64 | — | ✅ from 0.4.149 (FR-97 P7b): the wizard with the agent release, the tunnel client with the first tunnel release from then on. Before it, x86_64 builds only, and `install.sh --role tunnel` handed an arm64 host the x86_64 CLI | — | `.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:255`; the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:197`) |
 
 Release feature sets per OS, which decide what ships: Linux x86_64
 `.github/workflows/release-agent.yml:530`, Linux arm64 `:1093`, Windows x64 `:1549`, macOS arm64
