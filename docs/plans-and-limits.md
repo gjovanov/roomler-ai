@@ -1,8 +1,9 @@
 # Plans and limits — what each plan allows, and where the code holds the line
 
 **Status:** shipped in [FR-115](fr/FR-115-pricing-reshape.md) (#2557): the ladder and per-seat
-billing (P1+P2), the concurrent-session cap (P3), the meeting cap (P5). The relay allowance
-(P4) is designed, not built. Claims were checked against the code at `cd2085ef6`.
+billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b since
+2026-10-21), and the meeting cap (P5). The relay allowance (P4) is built for DERP and switched
+off; its TURN half is not built yet. Claims were checked against the code at `cd2085ef6`.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
 This page is the engineering view: where the numbers live, the one place they are compared,
@@ -93,7 +94,7 @@ another pod — are where the design is unusual:
 - **Concurrent sessions are counted by the hub that owns the device.** Tenant affinity puts
   an org's devices and controllers on one pod, so that pod's count is the org's; a request
   relayed from another pod carries the cap its gate read.
-- **P3b makes the count cluster-wide** (`rc.session_slots`, shipped dark): one record per
+- **P3b makes the count cluster-wide** (`rc.session_slots`, on in production since 2026-10-21): one record per
   payer in Redis (`crates/core/src/cluster/session_slots.rs`), claimed atomically, renewed
   every 30 s by the pod that holds the session, and freed within 90 s of a pod dying. An
   org's own sessions and the external (FR-52) sessions its members run for it share its
@@ -152,6 +153,7 @@ Each fence now has an integration test on a server without `saas`.
 | Switch | Turns off |
 |---|---|
 | `ROOMLER__RC__ORG_SESSION_CAP=false` | the concurrent-session cap |
+| `ROOMLER__RC__SESSION_SLOTS=false` | P3b's cluster-wide count: back to P3's count on the device's hub, and external (FR-52) sessions uncapped. On in production; it takes effect on a rollout restart, since the ConfigMap carries no content hash |
 | `ROOMLER__MEETINGS__FREE_CAP=false` | the meeting-length cap |
 | `ROOMLER__STRIPE__SEAT_SYNC=false` | the quantity reconcile (the quantity is then set at checkout only) |
 | an org's `settings.plan_enforcement = off` | every **staged** limit for that org (never an established one) |
@@ -159,9 +161,8 @@ Each fence now has an integration test on a server without `saas`.
 
 ## 8. Not built yet
 
-- **The relay allowance (P4):** DERP and TURN bytes past the plan's allowance are throttled,
+- **The relay allowance on TURN (P4c):** TURN bytes past the plan's allowance are throttled,
   never refused (a host behind symmetric NAT has no other path). Needs per-org TURN
-  attribution first.
-- **Cross-org sessions (P3b):** a session to another org's device counts against the
-  controller's org.
+  attribution first. The DERP half (P4a) is built, on the API pods and the regional PoPs, and
+  stays switched off (`relay_allowance.enabled`) until the fleet measurement it waits on.
 - **Exit nodes on Free (P4d):** after the throttle exists.
