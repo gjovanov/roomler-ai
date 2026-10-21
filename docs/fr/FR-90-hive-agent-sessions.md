@@ -2446,6 +2446,89 @@ sequenceDiagram
 - Not in P3-7: the egress proxy (design §7.2's third change), which the sandbox sends every
   command through, and `roomler connect` (P3-9).
 
+**P3-8, `ssh_run`, as designed (P3-8-0).** A session runs one command on another device of its
+organization over Roomler SSH, as the account that device's SSH policy maps, and gets its exit
+code and output. It never holds a key: its own device's daemon is the SSH client, with an
+ephemeral key minted for the one call.
+
+Today's device-originated leg (`rc:ssh.request`, `roomler ssh` from a laptop) runs under the
+origin device's owner: "the origin's owner is the person whose permissions this runs under"
+(`crates/modules/network/src/agent_arms.rs:158`). A session that used it would borrow its owner's
+SSH rights, the fallback P3-7 refused for tunnels. So a session's SSH is its own, and it reaches
+SSH's four gates (`docs/roomler-ssh.md`) the way a session's egress reaches the tunnel policies.
+
+```mermaid
+sequenceDiagram
+    participant S as the session's tool
+    participant D as its device (roomlerd)
+    participant V as vault
+    participant N as network module
+    participant T as target device
+    S->>D: ssh_run (device T, command, timeout)
+    Note over S,D: a person approves the call
+    D->>V: rc:vault.ssh, believed only from the record's device at its fence
+    V->>V: Cedar ssh:run for the session's role and T's account, recorded
+    V-->>D: an ssh_ticket, signed: session, fence, owner, origin, target, account, end
+    D->>N: rc:ssh.request toward T, the ticket and a fresh public key
+    N->>N: the ticket checked, gates 1 and 3, ssh_audit names the session
+    N->>T: rc:ssh.grant, one_command, its session within the ticket
+    T-->>N: rc:ssh.grant_ack, gate 4 (FR-83)
+    N-->>D: rc:ssh.response, the ticket echoed, T's host key
+    D->>T: one exec over the overlay, the host key checked
+    Note over T: its consent_mode may ask a person here, up to 30 s
+    T-->>D: exit code, stdout, stderr
+```
+
+| Piece | Design |
+|---|---|
+| who decides | the vault first: Cedar's `ssh:run`, its principal the session, its resource the target as P3-7-1a's `Node` (`crates/modules/vault/src/policy.cedarschema:54`), its context the asking device and `account`, the account the target's `SshPolicy` maps (`daemon`, `console_user` or `named`), read from its row. Then SSH's own gates, which a ticket does not skip |
+| the ask | `rc:vault.ssh {req_id, session_id, fence, target, ttl_secs}`, believed as a lease request is: the session's record, at its fence, on the asking device. The target is a live device of the organization, named by id, else `no_target`; never the asking device itself |
+| the ticket | the vault's answer, `rc:vault.ssh.granted`: a token signed by core's auth service under an audience of its own, `ssh_ticket`. It names the session at its fence, its owner, the origin device, the target, the account decided on and an end at most 900 s away, and is recorded before it is sent, as a `net_grant` is, its allow naming `ticket:<id>` where a grant's names `grant:<id>` (`crates/modules/vault/src/lease.rs:649`). The answer carries the target's `os`, which the vault read for Cedar |
+| at the network module | `rc:ssh.request` gains `ssh_ticket`, verified as P3-7-2a's `bind_net_grant` verifies a `net_grant` (`crates/modules/network/src/tunnel.rs:547`): on an agent's own WS, in its organization, from the device it names, toward the target it names (the request's target resolved first, then compared by id), before its end, with no leeway, and the account the target's policy maps still the one decided on. The principal is then the session. Gate 2 (`SSH_DEVICE` on a person's role) is the vault's decision in its place; gates 1, 3 and 4 hold as for anyone, `can_originate` on the origin device included |
+| gate 3 for a session | which `SshPolicy` allowlists a session matches: decision 22 |
+| the session's bound | `session_secs` is asked as the tool's timeout plus the target's 30 s prompt, and the network module clamps it to what is left of the ticket. The target ends the session there (`rc:ssh.grant`'s `session_secs`) |
+| one command | `rc:ssh.grant` gains `one_command`, set for a session's request, and so does FR-105's pending row, so a grant the SYSTEM service claims holds it too. The target serves such a session one `exec` and refuses any other request: a shell, a PTY, a forward, a subsystem. A target that does not advertise `ssh-one-command` is refused a session's request |
+| the client | the session's own daemon. An ed25519 key minted per call, as `roomler ssh` mints one (`agents/roomler-cli/src/sshcmd.rs:274`), its private half in daemon memory alone; then one `exec` to the target's overlay address on `russh`'s client. That is the crate the daemon links for its SSH server (`ssh-server`), whose client only the server's own tests drive today (`agents/roomlerd/src/ssh.rs:3006`). The target's host key is checked against `rc:ssh.response`'s `host_pubkey`, and an answer without one is refused |
+| the tool | `ssh_run {device, command, timeout_s}` on the toolbelt, `device` a device's id as `net_socks` names its exit, where the device's owner turned on `hive_ssh` (device-owned, default off, never pushable) beside `vault_enabled`. The settings `ask` for it, as for the vault's uses: a person approves every call. `command` is one line, at most 8 KiB, for the target's own shell: SSH carries a string, and the target runs it with PowerShell on Windows and bash elsewhere (`agents/roomlerd/src/exec.rs:603`). The answer holds the target's `os`, the exit code, and stdout and stderr, each at most 64 KiB, as `vault_exec`'s are (`agents/roomlerd/src/hive/vault_exec.rs:47`). A timeout past 300 s is refused |
+| the account and consent | the target's `SshPolicy.account_mode` and `consent_mode`, as for any caller. A person at the target may be asked before the command runs, for up to the prompt's 30 s (`agents/roomlerd/src/consent.rs:62`), and the prompt names the session, its owner and its device |
+| the audit | `ssh_audit` gains `session_id` and `ssh_ticket_id`. Its `user_id` is the session's owner, `origin_agent_id` the session's device and `source` `session`; `grant_id` is still the target's grant. `ssh_activity` stays the target's claim |
+| the kill switches | `vault.tenants`; the device's `hive_ssh`; the org's `remote_ssh_enabled`; the target's `ssh_enabled` |
+
+- ⚠️ **A ticket, not a grant.** `rc:ssh.grant` is already the target's single-use grant (FR-83),
+  and `grant_refused` already the target's refusal of it. A session's request carries both, so
+  the vault's token is named apart and no field, log line or audit row can mean either.
+- ⚠️ **A session never borrows its owner's SSH rights.** Its request carries its own ticket, the
+  vault's decision for its role, and a request whose ticket does not hold is refused
+  (`ticket_refused`), never served as the owner's. The owner's `SSH_DEVICE` is not read for it:
+  a session's permissions are its role's, not intersected with its owner's (design §8.1).
+- ⚠️ **An older server ignores the ticket**, an unknown field, and would answer the request as
+  the owner's. So `rc:ssh.response` echoes `ssh_ticket_id`, as `rc:tunnel.opened` echoes
+  `net_grant_id` (P3-7-2a), and the daemon never dials on an answer that does not echo the
+  ticket it presented.
+- ⚠️ **Never its own device.** A session already runs there, as its account. SSH would run its
+  command as whatever that device's policy maps, and `daemon` is SYSTEM or root: an escalation,
+  not a reach. So no ticket names the device it runs on. The auth service signs none and checks
+  none, and the vault refuses the ask (`bad_request`, recorded as `own_device`).
+- ⚠️ **The account is decided, not discovered.** Cedar sees the account the target maps, so an
+  organization can forbid a session the daemon's: `forbid (principal, action ==
+  Roomler::Action::"ssh:run", resource) when { context.account == "daemon" };`. The ticket
+  carries the account, and a policy changed to another since the vault decided refuses the
+  request (`ticket_refused`).
+- ⚠️ **One command is the target's rule, not the client's.** A daemon holding the key could ask
+  the target for anything a key may ask for. So the grant says `one_command` and the target
+  enforces it; a target too old to read the field is refused a session's request, not trusted
+  with it.
+- ⚠️ **The key never reaches the session**, nor its transcript. The daemon mints it, presents it
+  once and drops it, and the target's grant is single use and lives 60 s
+  (`crates/remote_control/src/models.rs:2491`). `roomler ssh` runs the system `ssh`
+  (`agents/roomler-cli/src/sshcmd.rs:94`), which would need the key in a file; the daemon does
+  not.
+- ⚠️ **The target's consent still applies.** A `consent_mode` that prompts holds the session's
+  command for a person at the target, and the session reads a refusal or a timeout in words.
+- **Not in P3-8:** `fleet_exec`, which runs as SYSTEM or root and waits on decision 5 (P3-8-3); a
+  session's SSH to a device of another organization; a shell, a forward, `scp` or `sftp` for a
+  session; an approval card for `ssh:run`.
+
 **The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1286`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
@@ -2514,7 +2597,12 @@ sequenceDiagram
 | P3-7-3a | the device's half, asking and opening: `rc:vault.net` from the daemon's vault client, a grant used only for what was asked; a flow's tunnels opened under its grant, the flow ended for good when the server refuses the grant or opens without its echo | the `vault` feature in no release build; nothing asks before P3-7-3c | — |
 | P3-7-3b | the listeners: one per tool call on loopback, served only to the session's account; RFC 1929 in the SOCKS5 front, on session listeners alone; each gone with its flows, both halves, at the grant's end | the `vault` feature in no release build | — |
 | P3-7-3c | `hive_net` (device-owned, default off, never pushable) and the tools `net_socks` and `net_forward` | device `hive_net = false`; the `vault` feature in no release build | — |
-| P3-8 | `ssh_run` and `fleet_exec` as tools | the existing SSH and exec gates | — |
+| P3-8-0 | `ssh_run`'s design (§3e "P3-8, `ssh_run`, as designed"), and decision 22 | docs only | — |
+| P3-8-1a | the vault's half: Cedar's `ssh:run`, its context the target's `account`; `rc:vault.ssh` answered with an `ssh_ticket`, never naming the asking device | `vault.tenants` | — |
+| P3-8-1b | the network module's half: the ticket verified at `rc:ssh.request`, its account still the target's, the session the principal, gate 3 as decision 22 says, `session_secs` within the ticket, `one_command` on the grant, `ssh_audit` naming the session, the echo | `vault.tenants` | — |
+| P3-8-2a | the target's half: `ssh-one-command`, a session's grant served one `exec` and nothing else, on the worker and on the SYSTEM service | the target's `ssh_enabled` | — |
+| P3-8-2b | the device's half: `hive_ssh`, the vault client's ask, the daemon's SSH client, the tool `ssh_run` | device `hive_ssh = false`; the `vault` feature in no release build | — |
+| P3-8-3 | `fleet_exec` as a tool, as decision 5 says | decision 5 | — |
 | P3-9 | `roomler connect <handle>` for people (knowhow's `roomler_connect(entity)` waits for P4) | — | — |
 | P3k | the field run in the test org, and `docs/vault.md` | — | AC12, AC13, AC19's vault half |
 | P3b | `placeholder` egress, as designed | `vault.placeholder = false` | AC14 |
@@ -2872,6 +2960,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-7-3a | the device's half, asking and opening (`docs/tunnels.md` "The device's half"), with nothing calling it yet (the tools are P3-7-3c's): `rc:vault.net` from the daemon's vault client (`vault::net`), its answer routed by an arm of its own so no log prints the token, a grant used only for exactly what was asked (`LeaseError::NotAsked` for another destination, another port, a destination for SOCKS, or no token) and held to the vault's end on this clock, never past the ceiling; the tunnel driver presenting a flow's grant at every open (`SessionParams.net_grant`, a `SessionGrantRef` whose `Debug` names its id alone), the open refused `net_grant_refused` ending as `GrantError::Refused` and an `rc:tunnel.opened` without the grant's echo as `GrantError::NotBound`, checked after the terminate guard so the exit is told (#1754); both permanent for the flow (`permanent_session_error`, by type), as reopening would present the same grant; the code a named constant both sides share (`vault::NET_GRANT_REFUSED`). Not reachable from the integration suite, which builds the daemon without `vault`: the end to end is P3k's. 7 new tests (4 of the driver, 1 of the flow, 2 of the vault client) and 13 negative controls | the `vault` feature in no release build; nothing asks before P3-7-3c | **merged** #2658 `f5f117b08` |
 | P3-7-3b | the device's listeners (`docs/tunnels.md` "The device's listeners"), with nothing creating one yet (P3-7-3c's tools are the first): a session's flow listening on loopback at a port the system picks, bound before it is handed back, every connection first asked of an admit hook on the flow's listener (`FlowListener::bind_admitting`), a connection refused closed and never held or carried; the hook the one an endpoint asks (`vault_connect`'s `connection_is`, by the connection table on Windows, `/proc/net/tcp` on Linux, the descriptors each process holds on macOS; refused where the system cannot say), so only the session's account is served; a SOCKS5 listener taking RFC 1929 with its own credential alone (the session's id and the listener's capability, compared in constant time) and CONNECT alone (`Target::SessionSocks5`, `accept_connect_authenticated`), every other listener keeping its no-auth; and the flow ended at its grant's end, its listener closed, what it held released and every live connection ended with the carrier, both halves (#2129). Found by a negative control: the flow test's first draft gave its grant 1.5 s, so a connection the hook should have closed was closed by the grant's end instead, and dropping the hook passed; the refusal is now checked within 500 ms, with the flow still alive. 6 new tests (2 of the SOCKS5 front, 1 of the listener, 1 of the carrier, 1 of the flow, 1 of the account check) and 11 negative controls | the `vault` feature in no release build; nothing creates one before P3-7-3c | **merged** #2659 `dfdef6e01` |
 | P3-7-3c | the tools (`docs/tunnels.md` "The tools"), and the device's key for them: `hive_net`, device-owned, default off and never pushable (`the_device_owned_refusals_are_not_pushable` names it), read with the other Hive keys at the daemon's start (`HiveConfig.net`); `net_socks` and `net_forward` on the session's toolbelt, offered and answered only where `hive_net` and `vault_enabled` both hold and the primary enrollment's tunnel client hub is there (`TunnelClientHub::set_primary`), elsewhere unknown tools; both in the session settings' `ask`, so a driver approves every call whatever a repository allows; each call one grant (`rc:vault.net`, P3-7-3a) served on one listener (P3-7-3b): SOCKS5 behind RFC 1929, the username the session's id and the password a capability of 32 random bytes made for that listener, which the answer's `socks5h://` URL carries, or a forward to the one destination the vault granted, in its spelling; at most 8 listeners a run, one more refused before the vault is asked and one that ended giving its place back; refused before the vault is asked where the system cannot say which account connects; every flow a run's tools opened killed when the run ends here (`drop_run`, beside the run's leases) as well as at its grant's end; the grant's token in no answer. Until decision 20 every such flow is rejected `acl_denied` at the server (P3-7-2b). Found in review, before CI: the bound was checked before the vault was asked and the flow recorded after it, so concurrent calls could pass it together, and a call still asking when its run ended here could record a flow `drop_run` would never see; a call now holds its place from the start, in that life of its run alone (`Place`). 16 new tests (6 of the toolbelt, 6 of the call, 2 of the supervisor, 1 of the gate, 1 of the config surface) and 17 negative controls | device `hive_net = false`; the `vault` feature in no release build | **merged** #2660 `adbdadc93` |
+| P3-8-0 | `ssh_run`'s design (§3e "P3-8, `ssh_run`, as designed") and decision 22, docs only: a session runs one command on another device over Roomler SSH, as the account that device maps, and gets its exit code and output; its own daemon is the client, so no key reaches the session. The device-originated leg runs under the origin's owner (`agent_arms.rs:158`), so a session's request carries a ticket of its own: the vault decides Cedar's `ssh:run` and answers with an `ssh_ticket`, named apart because `rc:ssh.grant` is already FR-83's grant to the target. The network module verifies it at `rc:ssh.request` as it verifies a `net_grant`: the session the principal, gate 2 the vault's decision, gates 1, 3 and 4 unchanged, and a ticket that does not hold refused, never served as the owner's. One command is the target's rule: the grant says `one_command`, and a target that does not advertise `ssh-one-command` is refused a session's request. A ticket never names the session's own device, where SSH would be an escalation to whatever its policy maps, and Cedar sees `account`, so an organization can forbid a session the daemon's; the ticket carries it, and a policy changed since refuses the request. The SSH session ends with its ticket, the target's host key is checked against `host_pubkey`, and `command` is one line for the target's own shell, since SSH carries a string. The tool sits behind a device-owned `hive_ssh`, is asked of a person on every call and is capped as `vault_exec` is. Which SSH policies match a session is decision 22 (recommended: only those naming sessions, an empty list admitting none, and a seeded guardrail forbidding `daemon`); `fleet_exec` is left to decision 5 | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3448,6 +3537,26 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - the mint leaves from the device's address, so `aws:SourceIp` can name the devices.
       - What it costs: every device the policy lets lease the secret holds the IAM user's key in
         daemon memory while the lease lasts, and signs with its own clock.
+22. **Which SSH policies a session matches, and whether one forbids the daemon** (P3-8), for the
+    operator to confirm (P3-8-0, §3e "P3-8, `ssh_run`, as designed"). Nothing in P3-8-1a depends
+    on the answer; P3-8-1b builds the first half, and the seeding the second.
+    - *Recommended: only policies that name sessions*, as decision 20 recommends for tunnels.
+      - `SshPolicy` gains `allowed_session_roles`, the vault roles (P3-2b) whose sessions it
+        admits. `allowed_user_ids` and `allowed_role_ids` never match a session.
+      - ⚠️ An empty `allowed_session_roles` admits **no** session: the opposite sense to the two
+        lists beside it, where empty means no restriction
+        (`crates/remote_control/src/models.rs:3056`). The same field must not read both ways.
+      - No SSH policy written before P3-8 opens a device to a session.
+      - What it costs: each device a session may reach says so in its own policy.
+    - *Or: a session matches as its owner does*: the owner's id against `allowed_user_ids`, the
+      owner's roles against `allowed_role_ids`; Cedar's `ssh:run` alone narrows it.
+      - What it costs: empty lists are the common policy and admit anyone, so every device with
+        them admits every session the moment `ssh:run` permits it.
+    - And with either: **whether the vault seeds a guardrail** forbidding `ssh:run` where the
+      target maps `daemon` (SYSTEM or root), beside the two it seeds today (§3e: no
+      materializing mode on Windows, prod values never materialize). *Recommended: seed it.*
+      - It is a `forbid`, so an organization that wants a session as root removes it in writing.
+      - What it costs: a target whose policy maps `daemon` admits no session until then.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
