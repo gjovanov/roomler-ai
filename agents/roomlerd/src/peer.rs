@@ -8037,12 +8037,47 @@ async fn media_pump_ffmpeg_dc(
             if plan_dims != enc_dims
                 && let Some(enc) = encoder.as_mut()
             {
-                let bps = match governor.applied_bps() {
-                    0 => governor
-                        .open_seed_bps()
-                        .map_or(last_ceiling_bps, |s| last_ceiling_bps.min(s)),
-                    applied => last_ceiling_bps.min(applied),
-                };
+                // FR-70 M3a.2 — open the replacement at the ceiling of the
+                // dims it is opened FOR. `last_ceiling_bps` is the old
+                // frame's (M2's pin holds frames at the old dims until the
+                // swap), so a move DOWN opened the replacement at a rate the
+                // controller clamped on its first tick after adoption — the
+                // shadow's first genuine finding (2026-10-21, `hevc_vaapi`:
+                // opened at 25 M, 8 M one tick later, a second open on a
+                // rebuild-bound backend). The same chain the per-frame
+                // ceiling runs below, for the target dims; the learner is
+                // ASKED (`ceiling_for`), never told, so its nominal stays the
+                // frame actually encoded.
+                let target_rate = crate::encode::policy::rate_plan(
+                    plan_dims.0,
+                    plan_dims.1,
+                    cap_native_w,
+                    cap_native_h,
+                    target_fps,
+                    constrained,
+                    codec.label(),
+                    cell_444,
+                    governor.encode_factor(),
+                    matches!(
+                        dims_plan.reason,
+                        crate::encode::policy::RungReason::UserPick
+                    ),
+                    crate::encode::dial_rate_factor_pct(
+                        priority.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                );
+                let target_ceiling = crate::encode::shared_split_ceiling_bps(
+                    governor.ceiling_for(target_rate.ceiling_bps, constrained),
+                    (1 + pipeline.follower_count()) as u32,
+                    crate::encode::area_min_bitrate_bps(plan_dims.0, plan_dims.1, constrained),
+                    constrained,
+                    crate::encode::shared_rate_split_enabled(),
+                );
+                let bps = crate::encode::policy::replacement_open_bps(
+                    target_ceiling,
+                    governor.applied_bps(),
+                    governor.open_seed_bps(),
+                );
                 if let Some(spec) = enc
                     .rebuild_spec_at_dims(plan_dims.0, plan_dims.1, bps)
                     .await

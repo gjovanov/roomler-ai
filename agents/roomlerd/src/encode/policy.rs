@@ -203,6 +203,22 @@ pub(crate) struct RatePlan {
     pub cq_bias: i32,
 }
 
+/// FR-70 M3a.2 — the rate a make-before-break dims replacement opens at: the
+/// controller's applied rate (before it has applied one, the remembered seed),
+/// never above the ceiling of the dims the replacement is opened FOR. Using the
+/// live frame's ceiling instead opened a move DOWN at a rate the controller
+/// clamped on its first tick — a second open on a rebuild-bound backend.
+pub(crate) fn replacement_open_bps(
+    target_ceiling_bps: u32,
+    applied_bps: u32,
+    seed_bps: Option<u32>,
+) -> u32 {
+    match applied_bps {
+        0 => seed_bps.map_or(target_ceiling_bps, |s| target_ceiling_bps.min(s)),
+        applied => target_ceiling_bps.min(applied),
+    }
+}
+
 /// `user_pick`: the rung IS the controller's explicit resolution pick
 /// (`RungReason::UserPick`) — the constrained relief must not soften a
 /// resolution the user chose on purpose (they may be reading at it).
@@ -283,6 +299,47 @@ mod tests {
 
     const NW: u32 = 1920;
     const NH: u32 = 1200;
+
+    /// FR-70 M3a.2 — the field's driven read (2026-10-21, `hevc_vaapi`,
+    /// direct, 1600×900 native, a user-picked move down to 1050×590): the old
+    /// frame's ceiling is the heartbeat's `target_bps` (22 950 000, the 25 M
+    /// rung) and the new frame's is exactly the target the controller set on
+    /// its first tick after adoption (9 873 281, the 8 M rung). A replacement
+    /// opened at the old one was re-rated at once; opened at its own dims'
+    /// ceiling, it starts where the controller will put it.
+    #[test]
+    fn a_dims_replacement_opens_at_the_ceiling_of_the_dims_it_is_opened_for() {
+        let ceiling =
+            |w, h| rate_plan(w, h, 1600, 900, 60, false, "HEVC", false, 1.0, true, 85).ceiling_bps;
+        let (old, new) = (ceiling(1600, 900), ceiling(1050, 590));
+        assert_eq!((old, new), (22_950_000, 9_873_281));
+        let ladder = crate::encode::aimd::coarsen_bitrate;
+        // Before: the old frame's ceiling — the field's inline 25 M.
+        assert_eq!(
+            ladder(replacement_open_bps(old, 22_950_000, None)),
+            25_000_000
+        );
+        // After: the target dims' ceiling — the controller's 8 M.
+        assert_eq!(
+            ladder(replacement_open_bps(new, 22_950_000, None)),
+            8_000_000
+        );
+        // Going UP the ceiling rises; the applied rate stands, as before.
+        assert_eq!(replacement_open_bps(old, 8_000_000, None), 8_000_000);
+    }
+
+    #[test]
+    fn a_replacement_before_any_applied_rate_opens_at_the_seed_under_the_ceiling() {
+        assert_eq!(replacement_open_bps(9_000_000, 0, None), 9_000_000);
+        assert_eq!(
+            replacement_open_bps(9_000_000, 0, Some(4_000_000)),
+            4_000_000
+        );
+        assert_eq!(
+            replacement_open_bps(9_000_000, 0, Some(12_000_000)),
+            9_000_000
+        );
+    }
 
     fn base() -> DimsInputs {
         DimsInputs {
