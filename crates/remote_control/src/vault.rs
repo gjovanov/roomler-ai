@@ -35,6 +35,12 @@
 //! A grant is no lease: it carries no value, and nothing revokes it before
 //! its end. A forward's host is decided and granted in one spelling,
 //! [`canonical_net_host`]'s.
+//!
+//! P3-8-1a — a session asks to run one command on another device with
+//! `rc:vault.ssh`. The vault answers `rc:vault.ssh.granted`, a ticket signed
+//! under an audience of its own (`ssh_ticket`) that never names the asking
+//! device, or `rc:vault.refused` (`no_target` for a target that is no live
+//! device of the organization). A ticket, like a grant, is no lease.
 
 /// Bounds on a lease request, read by both ends: the server refuses past
 /// them (`bad_request`), and a device never asks past them.
@@ -178,6 +184,8 @@ pub enum LeaseRefusal {
     AwaitingApproval,
     /// P3-7-1b — no live device of this organization by the exit's id.
     NoExit,
+    /// P3-8-1a — no live device of this organization by the SSH target's id.
+    NoTarget,
 }
 
 impl LeaseRefusal {
@@ -201,10 +209,11 @@ impl LeaseRefusal {
             Self::Busy => "busy",
             Self::AwaitingApproval => "awaiting_approval",
             Self::NoExit => "no_exit",
+            Self::NoTarget => "no_target",
         }
     }
 
-    pub const ALL: [LeaseRefusal; 16] = [
+    pub const ALL: [LeaseRefusal; 17] = [
         Self::NotServed,
         Self::Unsupported,
         Self::BadRequest,
@@ -221,6 +230,7 @@ impl LeaseRefusal {
         Self::Busy,
         Self::AwaitingApproval,
         Self::NoExit,
+        Self::NoTarget,
     ];
 
     /// Parse a refusal word. `None` for a word this build cannot name, which
@@ -540,6 +550,7 @@ mod tests {
                 "busy",
                 "awaiting_approval",
                 "no_exit",
+                "no_target",
             ]
         );
         for r in LeaseRefusal::ALL {

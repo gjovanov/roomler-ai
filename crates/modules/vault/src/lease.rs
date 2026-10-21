@@ -141,6 +141,9 @@ pub enum Request {
     /// P3-7-1b — a session's own egress ([`crate::net`]), answered in order
     /// with the leases.
     Net(crate::net::NetRequest),
+    /// P3-8-1a — a session's command on another device ([`crate::ssh`]),
+    /// answered in order with the leases.
+    Ssh(crate::ssh::SshRequest),
 }
 
 impl Request {
@@ -152,6 +155,7 @@ impl Request {
             Self::Describe(r) => Some(&r.req_id),
             Self::Activity(_) => None,
             Self::Net(r) => Some(&r.req_id),
+            Self::Ssh(r) => Some(&r.req_id),
         }
     }
 }
@@ -289,6 +293,19 @@ impl AgentMsgHandler for LeaseSocket {
                 port,
                 ttl_secs,
             }),
+            ClientMsg::VaultSsh {
+                req_id,
+                session_id,
+                fence,
+                target,
+                ttl_secs,
+            } => Request::Ssh(crate::ssh::SshRequest {
+                req_id,
+                session_id,
+                fence,
+                target,
+                ttl_secs,
+            }),
             other => return Some(other),
         };
         let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
@@ -407,6 +424,18 @@ async fn answer_in_order(
                         port,
                     }
                 }
+                Err(why) => refusal(&r.req_id, why),
+            },
+            // P3-8-1a — a ticket, never a key.
+            Request::Ssh(r) => match crate::ssh::ticket(&state, conn, r).await {
+                Ok(t) => ServerMsg::VaultSshGranted {
+                    req_id: r.req_id.clone(),
+                    ticket_id: t.ticket_id.to_hex(),
+                    ticket: t.ticket,
+                    expires_at_ms: t.expires_at.timestamp_millis(),
+                    os: t.os,
+                    account: t.account.wire().to_string(),
+                },
                 Err(why) => refusal(&r.req_id, why),
             },
         };
@@ -625,6 +654,8 @@ pub(crate) struct Record<'a> {
     pub(crate) approval: Option<ObjectId>,
     /// P3-7-1b — the grant an allow gave, which its row names as the target.
     pub(crate) grant: Option<ObjectId>,
+    /// P3-8-1a — the ticket an allow gave, which its row names as the target.
+    pub(crate) ticket: Option<ObjectId>,
 }
 
 impl Record<'_> {
@@ -644,11 +675,14 @@ impl Record<'_> {
             ),
             None => (None, None, None, None),
         };
-        let target = match (lease, self.grant, &self.secret) {
-            (Some(id), _, _) => Some(format!("lease:{}", id.to_hex())),
-            (None, Some(id), _) => Some(format!("grant:{}", id.to_hex())),
-            (None, None, None) => Some(format!("asked:{}", self.asked)),
-            (None, None, Some(_)) => self.approval.map(|id| format!("approval:{}", id.to_hex())),
+        let target = match (lease, self.grant, self.ticket, &self.secret) {
+            (Some(id), _, _, _) => Some(format!("lease:{}", id.to_hex())),
+            (None, Some(id), _, _) => Some(format!("grant:{}", id.to_hex())),
+            (None, None, Some(id), _) => Some(format!("ticket:{}", id.to_hex())),
+            (None, None, None, None) => Some(format!("asked:{}", self.asked)),
+            (None, None, None, Some(_)) => {
+                self.approval.map(|id| format!("approval:{}", id.to_hex()))
+            }
         };
         VaultAuditEvent {
             id: None,
@@ -790,6 +824,7 @@ pub(crate) async fn identify<'a>(
         op,
         approval: None,
         grant: None,
+        ticket: None,
     };
     if u64::try_from(session.fence).ok() != Some(fence) {
         let why = LeaseRefusal::StaleFence;

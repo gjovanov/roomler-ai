@@ -25,7 +25,7 @@ use axum::{
     http::StatusCode,
 };
 use bson::{DateTime, Document, doc, oid::ObjectId};
-use roomler_ai_remote_control::vault::canonical_net_host;
+use roomler_ai_remote_control::{models::SshAccountMode, vault::canonical_net_host};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,9 @@ use crate::VaultState;
 use crate::dao::{MAX_POLICIES, MAX_ROLES, is_name_taken};
 use crate::model::{VaultPolicy, VaultRole};
 use crate::policy::{
-    self, ACTION_ASSUME, ACTION_LIST, ACTION_NET_FORWARD, ACTION_NET_SOCKS, ACTION_USE, ACTIONS,
-    Ask as Request, DeviceFacts, GUARDRAILS, MODES, NodeFacts, OSES, OrgNames, SecretFacts,
-    SessionFacts, Verdict,
+    self, ACTION_ASSUME, ACTION_LIST, ACTION_NET_FORWARD, ACTION_NET_SOCKS, ACTION_SSH_RUN,
+    ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS, MODES, NodeFacts, OSES, OrgNames,
+    SecretFacts, SessionFacts, Verdict,
 };
 use crate::routes::{
     Ask, check_description, decide, live_secret, member_tenant, org_slug, record_allow, rfc3339,
@@ -74,8 +74,13 @@ async fn org_names(state: &VaultState, tid: ObjectId) -> Result<OrgNames, ApiErr
 }
 
 /// P3-7 — a node a simulated request names: a live device of this
-/// organization, its facts read from its row.
-async fn live_node(state: &VaultState, tid: ObjectId, raw: &str) -> Result<NodeFacts, ApiError> {
+/// organization, its facts read from its row; and (P3-8) the account its SSH
+/// policy maps, which `ssh:run` reads.
+async fn live_node(
+    state: &VaultState,
+    tid: ObjectId,
+    raw: &str,
+) -> Result<(NodeFacts, SshAccountMode), ApiError> {
     let id = ObjectId::parse_str(raw)
         .map_err(|_| ApiError::BadRequest("resource.node_id is not a device id".into()))?;
     let agent = match state.agents.find_live_in_tenant(tid, id).await {
@@ -87,13 +92,14 @@ async fn live_node(state: &VaultState, tid: ObjectId, raw: &str) -> Result<NodeF
         }
         Err(e) => return Err(e.into()),
     };
-    NodeFacts::new(
+    let node = NodeFacts::new(
         id,
         crate::lease::os_name(agent.os),
         &agent.tags,
         agent.owner_user_id,
     )
-    .map_err(ApiError::BadRequest)
+    .map_err(ApiError::BadRequest)?;
+    Ok((node, agent.ssh_policy.account_mode))
 }
 
 /// Check a policy's text for this organization, its named users included.
@@ -640,6 +646,11 @@ pub struct Simulate {
     pub host: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// P3-8 — `ssh:run`: the account to decide for, as if the node's SSH
+    /// policy mapped it (an `SshAccountMode` word); the one it maps when
+    /// absent.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Policies to decide WITH, as if added: checked like a write.
     #[serde(default)]
     pub with: Vec<String>,
@@ -817,8 +828,10 @@ pub async fn simulate(
             }
         }
         // P3-7 — whether a session in a role, on that device, may open a
-        // SOCKS5 listener, or a forward to one destination, through a node.
-        ACTION_NET_SOCKS | ACTION_NET_FORWARD => {
+        // SOCKS5 listener, or a forward to one destination, through a node;
+        // P3-8 — or run a command on it, as the account its SSH policy maps
+        // (or the one the simulation names).
+        ACTION_NET_SOCKS | ACTION_NET_FORWARD | ACTION_SSH_RUN => {
             let Some(raw) = &body.principal.owner_id else {
                 return Err(ApiError::BadRequest(
                     "principal.owner_id is required".into(),
@@ -832,7 +845,7 @@ pub async fn simulate(
             let Some(raw) = &body.resource.node_id else {
                 return Err(ApiError::BadRequest("resource.node_id is required".into()));
             };
-            let node = live_node(&state, tid, raw).await?;
+            let (node, mapped) = live_node(&state, tid, raw).await?;
             let session = SessionFacts {
                 id: "simulated".into(),
                 owner: session_owner,
@@ -843,6 +856,21 @@ pub async fn simulate(
                 Request::NetSocks {
                     session,
                     node,
+                    device,
+                }
+            } else if body.action == ACTION_SSH_RUN {
+                let account = match body.account.as_deref() {
+                    None => mapped,
+                    Some(word) => SshAccountMode::from_wire(word).ok_or_else(|| {
+                        ApiError::BadRequest(format!(
+                            "account must be daemon, console_user or named — {word} is not one"
+                        ))
+                    })?,
+                };
+                Request::SshRun {
+                    session,
+                    node,
+                    account: account.wire().to_string(),
                     device,
                 }
             } else {

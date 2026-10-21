@@ -312,6 +312,12 @@ mod vault_net_tests;
 /// the device's pod or at its sweep, again at every hello, never expired.
 #[cfg(test)]
 mod vault_revoke_tests;
+/// FR-90 P3-8-1a — a session's command on another device: `rc:vault.ssh`
+/// decided by Cedar's `ssh:run` over the target's row and the account its
+/// SSH policy maps, never the session's own device, answered with a ticket
+/// under its own audience that names exactly what was decided.
+#[cfg(test)]
+mod vault_ssh_tests;
 /// FR-90 P3-1 — the vault's store: off until turned on, administrators
 /// only and every decision recorded, no answer carrying a value, sealed
 /// bytes that do not open where they were moved, no sealing without a KEK.
