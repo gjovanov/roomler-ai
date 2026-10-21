@@ -30,13 +30,25 @@ pub use roomler_ai_remote_control::signaling::RejectKind;
 /// this was always a `TunnelClient`; the node-stack unification (P3b-2) lets
 /// an enrolled **agent** originate tunnels over its own WS, so the principal
 /// is now a typed union rather than a bare `tunnel_client_id`. `AllUsers` /
-/// `UserId{owner}` / `RoleId` policy subjects match EITHER principal (they key
-/// on `user_id`/`role_ids`); only the id-specific subjects
+/// `UserId{owner}` / `RoleId` policy subjects match a tunnel client or an
+/// agent (they key on `user_id`/`role_ids`); only the id-specific subjects
 /// (`TunnelClientId` / `AgentId`) discriminate on the principal kind.
+///
+/// FR-90 P3-7-2a — `Session` is an agent session's own flow, carried by the
+/// device it runs on under a grant the vault signed (`net_grant`). It
+/// matches NO subject yet: which subjects may name a session is decision 20,
+/// and until it is made a session reaches nothing its owner or its device
+/// may ([`subject_matches`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Principal {
     TunnelClient(ObjectId),
     Agent(ObjectId),
+    /// FR-90 P3-7-2a — an agent session, by its id, on the device (`agent_id`)
+    /// whose own WS carries its flows.
+    Session {
+        session_id: ObjectId,
+        agent_id: ObjectId,
+    },
 }
 
 /// Concrete identity for the requesting tunnel origin. The caller
@@ -120,8 +132,18 @@ pub fn evaluate(
 }
 
 /// Does any `PolicySubject` in `subjects` match the requesting
-/// `ResolvedSubject`? `AllUsers` is the catch-all.
+/// `ResolvedSubject`? `AllUsers` is the catch-all, for a person's tunnel
+/// client and for an agent.
+///
+/// ⚠️ FR-90 P3-7-2a — an agent SESSION matches no subject, `AllUsers`
+/// included: which subjects may name a session is decision 20, and a session
+/// that matched its owner's subjects would reach whatever its owner may.
+/// Checked first, before any subject is read, so a subject added later
+/// cannot match a session by accident.
 pub fn subject_matches(subjects: &[PolicySubject], req: &ResolvedSubject) -> bool {
+    if matches!(req.principal, Principal::Session { .. }) {
+        return false;
+    }
     subjects.iter().any(|s| match s {
         PolicySubject::AllUsers => true,
         PolicySubject::UserId { user_id } => *user_id == req.user_id,
@@ -589,6 +611,59 @@ mod tests {
     fn empty_policy_list_denies() {
         let d = eval_tcp(&[], &subject(ObjectId::new()), ObjectId::new(), "h", 1);
         assert!(matches!(d, Decision::Deny { .. }));
+    }
+
+    /// FR-90 P3-7-2a — a session matches no subject before decision 20, not
+    /// even one that names its owner, its device, its id, or everyone: a
+    /// policy written for people and devices opens nothing to a session.
+    #[test]
+    fn a_session_matches_no_subject_yet() {
+        let (owner, device, session, role) = (
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        );
+        let req = ResolvedSubject {
+            user_id: owner,
+            role_ids: vec![role],
+            principal: Principal::Session {
+                session_id: session,
+                agent_id: device,
+            },
+        };
+        let aid = ObjectId::new();
+        for subjects in [
+            vec![PolicySubject::AllUsers],
+            vec![PolicySubject::UserId { user_id: owner }],
+            vec![PolicySubject::RoleId { role_id: role }],
+            vec![PolicySubject::AgentId { agent_id: device }],
+            vec![PolicySubject::TunnelClientId {
+                tunnel_client_id: session,
+            }],
+        ] {
+            assert!(!subject_matches(&subjects, &req), "{subjects:?}");
+            let p = policy(
+                subjects.clone(),
+                vec![PolicyTarget::AllAgents],
+                vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
+            );
+            assert!(
+                matches!(eval_tcp(&[p], &req, aid, "db", 5432), Decision::Deny { .. }),
+                "{subjects:?}"
+            );
+        }
+        // The same subjects match the device itself, as before.
+        let device_req = ResolvedSubject {
+            user_id: owner,
+            role_ids: vec![role],
+            principal: Principal::Agent(device),
+        };
+        assert!(subject_matches(&[PolicySubject::AllUsers], &device_req));
+        assert!(subject_matches(
+            &[PolicySubject::AgentId { agent_id: device }],
+            &device_req
+        ));
     }
 
     #[test]

@@ -1848,6 +1848,19 @@ pub enum ClientMsg {
         /// byte-identical).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         derp_pubkey: Option<String>,
+        /// FR-90 P3-7-2a — the vault's grant (`rc:vault.net.granted`): this
+        /// tunnel carries an agent SESSION's own flows, not the device's.
+        /// Accepted only from an agent's own WS, verified, and bound to the
+        /// tunnel session: its device, its exit, its end, and a forward's
+        /// one destination. A grant that does not hold refuses the open.
+        ///
+        /// ⚠️ A server from before P3-7-2a ignores the field and would open
+        /// the tunnel as the DEVICE's. A device that sends a grant must
+        /// therefore find it echoed in `rc:tunnel.opened`
+        /// (`ServerMsg::TunnelOpened::net_grant_id`) before it carries a
+        /// session's flow over the tunnel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net_grant: Option<String>,
     },
 
     /// Client → server (forwarded to agent): open one TCP forward.
@@ -3558,6 +3571,13 @@ pub enum ServerMsg {
         /// (omitted) for the single-open CLI and for pre-P3b-2 servers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         open_nonce: Option<String>,
+        /// FR-90 P3-7-2a — the id of the grant (`ClientMsg::TunnelOpen::net_grant`)
+        /// this server bound to the tunnel: its flows are the SESSION's.
+        /// Absent when none was sent, and from every server before P3-7-2a,
+        /// which ignores a grant. A device that sent a grant and finds no echo
+        /// must not carry the session's flows over this tunnel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net_grant_id: Option<String>,
     },
 
     /// Server → agent: a tunnel-client wants to open this TCP
@@ -8898,6 +8918,7 @@ mod tests {
             transport: "webrtc-dc-v1".into(),
             open_nonce: None,
             derp_pubkey: None,
+            net_grant: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("$oid"), "extended JSON leaked: {s}");
@@ -9128,6 +9149,7 @@ mod tests {
             ice_servers: vec![],
             quic_auth_token: None,
             open_nonce: None,
+            net_grant_id: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:tunnel.opened""#));
@@ -9135,9 +9157,11 @@ mod tests {
         assert!(s.contains(r#""sctp_rwnd_bytes":8388608"#));
         // Back-compat: a None quic_auth_token must NOT appear on the
         // wire, so a webrtc-dc-v1 controller predating the field parses
-        // TunnelOpened unchanged. Same contract for the P3b-2 open_nonce.
+        // TunnelOpened unchanged. Same contract for the P3b-2 open_nonce,
+        // and for FR-90 P3-7-2a's net_grant_id.
         assert!(!s.contains("quic_auth_token"));
         assert!(!s.contains("open_nonce"));
+        assert!(!s.contains("net_grant_id"));
     }
 
     #[test]
@@ -9150,6 +9174,7 @@ mod tests {
             ice_servers: vec![],
             quic_auth_token: Some("tok-abc123".into()),
             open_nonce: None,
+            net_grant_id: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""transport":"quic-v1""#));
@@ -9198,6 +9223,7 @@ mod tests {
             transport: "webrtc-dc-v1".into(),
             open_nonce: Some("nonce-7f3a".into()),
             derp_pubkey: None,
+            net_grant: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""open_nonce":"nonce-7f3a""#));
@@ -9218,12 +9244,14 @@ mod tests {
             transport: "webrtc-dc-v1".into(),
             open_nonce: None,
             derp_pubkey: None,
+            net_grant: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
             !s.contains("open_nonce"),
             "None nonce leaked onto wire: {s}"
         );
+        assert!(!s.contains("net_grant"), "None grant leaked onto wire: {s}");
     }
 
     #[test]
@@ -9248,6 +9276,7 @@ mod tests {
             ice_servers: vec![],
             quic_auth_token: None,
             open_nonce: Some("nonce-7f3a".into()),
+            net_grant_id: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""open_nonce":"nonce-7f3a""#));
@@ -9257,6 +9286,47 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// FR-90 P3-7-2a — a session's grant rides `rc:tunnel.open`, and the id
+    /// of the grant the server bound comes back on `rc:tunnel.opened`. An
+    /// `opened` from a server before the field reads back with no id: a
+    /// device must take that as "not bound".
+    #[test]
+    fn tunnel_open_carries_a_grant_and_opened_echoes_its_id() {
+        let m = ClientMsg::TunnelOpen {
+            agent_id: ObjectId::new(),
+            transport: "webrtc-dc-v1".into(),
+            open_nonce: Some("n1".into()),
+            derp_pubkey: None,
+            net_grant: Some("the-grant".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""net_grant":"the-grant""#), "{s}");
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(&s).unwrap(),
+            ClientMsg::TunnelOpen { net_grant: Some(ref g), .. } if g == "the-grant"
+        ));
+        let opened = ServerMsg::TunnelOpened {
+            session_id: ObjectId::new(),
+            transport: "webrtc-dc-v1".into(),
+            dc_pool_size: 8,
+            sctp_rwnd_bytes: 0,
+            ice_servers: vec![],
+            quic_auth_token: None,
+            open_nonce: Some("n1".into()),
+            net_grant_id: Some("g1".into()),
+        };
+        let s = serde_json::to_string(&opened).unwrap();
+        assert!(s.contains(r#""net_grant_id":"g1""#), "{s}");
+        let before = r#"{"t":"rc:tunnel.opened","session_id":"6a11682e804368d30edf57c6","transport":"webrtc-dc-v1","dc_pool_size":8,"sctp_rwnd_bytes":0,"ice_servers":[]}"#;
+        assert!(matches!(
+            serde_json::from_str::<ServerMsg>(before).unwrap(),
+            ServerMsg::TunnelOpened {
+                net_grant_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -9331,6 +9401,7 @@ mod tests {
             transport: "quic-derp-v1".into(),
             open_nonce: None,
             derp_pubkey: Some(pk.clone()),
+            net_grant: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(&format!(r#""derp_pubkey":"{pk}""#)));

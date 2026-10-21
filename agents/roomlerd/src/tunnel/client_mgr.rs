@@ -678,11 +678,15 @@ impl TunnelSignalingSink for DaemonSink {
                 transport,
                 open_nonce: _,
                 derp_pubkey,
+                net_grant,
             } => ClientMsg::TunnelOpen {
                 agent_id,
                 transport,
                 open_nonce: Some(self.nonce.clone()),
                 derp_pubkey,
+                // FR-90 P3-7-2a — carried as given: the daemon's own tunnels
+                // send none until P3-7-3.
+                net_grant,
             },
             other => other,
         };
@@ -2077,6 +2081,7 @@ mod tests {
             ice_servers: vec![],
             quic_auth_token: None,
             open_nonce: Some("n1".into()),
+            net_grant_id: None,
         };
         assert!(hub.intercept(opened).is_none(), "opened consumed by nonce");
         assert!(matches!(rx.try_recv(), Ok(ServerMsg::TunnelOpened { .. })));
@@ -2251,6 +2256,7 @@ mod tests {
             ice_servers: vec![],
             quic_auth_token: None,
             open_nonce: Some("fl-9.1".into()),
+            net_grant_id: None,
         })
         .await
         .unwrap();
