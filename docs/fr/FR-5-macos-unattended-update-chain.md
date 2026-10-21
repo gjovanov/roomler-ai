@@ -61,7 +61,7 @@ plists), hands-off only when the job is RUNNING (it is this very install's ances
 The manifest's SHA256 arrives from the same origin as the URL — a transport check, not a
 tamper anchor. Fix: the release signing subkey's ed25519 point (fpr
 `5DB8221F546288DE780C10D3A2C53E5FE6FA485A`) is **compiled into the binary**
-(`agents/roomlerd/src/pgp_verify.rs`); `download_asset` on Linux/macOS fetches
+(`pgp_verify.rs`, in `crates/tunnel-core/src` since FR-97 P6b); `download_asset` on Linux/macOS fetches
 `<asset-url>.asc` and refuses fail-closed. Deliberately not an OpenPGP implementation:
 ~150 lines of RFC 4880 framing for exactly the shape CI emits (one v4 packet, class 0x00,
 EdDSA, SHA-256/512), ring doing the ed25519 (already in the graph — zero new deps).

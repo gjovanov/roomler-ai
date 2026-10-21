@@ -132,7 +132,10 @@ pub mod peer_auth;
 /// FR-27 P11 — the person-at-the-device socket of a Linux system install.
 #[cfg(target_os = "linux")]
 pub mod person_socket;
-pub mod pgp_verify;
+/// The pinned-key `.asc` check, which lives in `tunnel-core` since FR-97 P6b
+/// so the CLI's `self-update` shares it. Re-exported, so `crate::pgp_verify`
+/// still names it.
+pub use tunnel_core::pgp_verify;
 pub mod post_install;
 pub mod preflight;
 /// FR-108 — is someone using this screen? The idle clock, less the machine's

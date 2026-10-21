@@ -104,7 +104,8 @@ manifest cannot deliver anything unsigned, nor a signed older build — but the
 manifest remains the weakest link in the chain, and saying so is more useful
 than implying otherwise.
 
-Separately, the standalone tunnel CLI's own `self-update` does not yet share the
-agent's pinned-key path. On machines that also run the agent this does not apply,
-because there the CLI is a shim with nothing of its own to update.
+The standalone tunnel CLI's own `self-update` checks the same pinned key, on
+every OS, from the first tunnel release that carries the check; before it, the
+CLI checked only the manifest's hash. On machines that also run the agent this
+does not apply, because there the CLI is a shim with nothing of its own to update.
 :::

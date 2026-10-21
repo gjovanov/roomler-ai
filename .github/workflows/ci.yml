@@ -614,6 +614,14 @@ jobs:
         # individually fast (<1s), so the whole step stays well under a minute.
         run: cargo test -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --lib -- --test-threads=1
 
+      - name: Test the tunnel CLI (roomler-cli --lib)
+        # FR-97 P6b: no lane ran the CLI's own tests before this one, so its
+        # self-update (the artifact picked per host, the version an archive
+        # names inside its signed bytes, the dpkg owner, the atomic swap) was
+        # covered by nothing. The release-signature check those rest on is
+        # tunnel-core's `pgp_verify`, tested in the step above.
+        run: cargo test -p roomler-cli --lib
+
       - name: Multi-org shared TUN against real kernel networking
         # The mux's bookkeeping is unit-tested against a fake device; the half
         # that touches the OS — a REFUSED registration leaving no address

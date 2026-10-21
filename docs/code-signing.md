@@ -314,7 +314,7 @@ keeps the version it is already running.
 | Gate | Module | Answers | Enforced on |
 |---|---|---|---|
 | Authenticode + publisher name | `code_signature::verify_publisher` | *Whose* bytes are these? | Windows |
-| Detached `.asc` vs the signing subkey **pinned in the binary** | `pgp_verify::verify_release_artifact` | *Whose* bytes are these? | Linux, macOS (`.deb`, `.pkg`, tarball) — the `.asc` is **required** |
+| Detached `.asc` vs the signing subkey **pinned in the binary** | `pgp_verify::verify_release_artifact` | *Whose* bytes are these? | Linux, macOS (`.deb`, `.pkg`, tarball) — the `.asc` is **required**. Since FR-97 P6b it lives in tunnel-core, and the tunnel CLI's `roomler self-update` requires it too, on every OS |
 | Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | every installable: the `.msi`, and since FR-97 P6a the `.deb`, `.pkg` and tarball |
 
 **Neither is sufficient alone, and the second is the less obvious one.**
