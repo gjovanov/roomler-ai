@@ -6388,13 +6388,15 @@ async fn media_pump_ffmpeg_dc(
     // `pending_dims_open` is the open in flight with the dims it will
     // produce, when it started, and the target those dims came from.
     let mut built_target: Option<TargetResolution> = None;
-    /// The open in flight, the dims it will produce, when it started, and
-    /// the plan target it was opened for (`built_target` at the swap).
+    /// The open in flight, the dims it will produce, when it started, the
+    /// plan target it was opened for (`built_target` at the swap), and the
+    /// FR-70 M3a plan it was spawned under (the shadow's staleness reference).
     type PendingDimsOpen = (
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
         (u32, u32),
         std::time::Instant,
         TargetResolution,
+        Option<crate::encode::plan::SwapSpawn>,
     );
     let mut pending_dims_open: Option<PendingDimsOpen> = None;
     let mut dims_swaps: u32 = 0;
@@ -6813,9 +6815,12 @@ async fn media_pump_ffmpeg_dc(
     // CONSTRAINED session (a QSV open at <=1 Mbps blocks 1.3-2.0 s, measured).
     // Adoption stays quiet-gated below, so the IDR timing is unchanged.
     let bg_rebuild_constrained = crate::encode::bg_rebuild_constrained_enabled();
-    let mut pending_swap: Option<
+    // The rate replacement in flight, and the plan it was spawned under (FR-70
+    // M3a: adopted after that plan moved, it is a stale adoption, counted apart).
+    let mut pending_swap: Option<(
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
-    > = None;
+        Option<crate::encode::plan::SwapSpawn>,
+    )> = None;
     let mut swap_wanted: Option<u32> = None;
     let mut last_swap_at = crate::clock::instant_before(Duration::from_secs(60));
     const SWAP_MIN_INTERVAL: Duration = Duration::from_secs(3);
@@ -7089,21 +7094,28 @@ async fn media_pump_ffmpeg_dc(
         // target follow the plan again. A refused or failed open drops the
         // pending state and the next frame takes the inline path, exactly
         // as before M2.
-        if let Some((handle, _, _, _)) = pending_dims_open.as_ref()
+        if let Some((handle, _, _, _, _)) = pending_dims_open.as_ref()
             && handle.is_finished()
         {
-            let (handle, dims, started, target) = pending_dims_open.take().expect("checked above");
+            let (handle, dims, started, target, spawned) =
+                pending_dims_open.take().expect("checked above");
             let open_ms = started.elapsed().as_millis() as u64;
             match handle.await {
                 Ok(Ok(rebuilt)) => {
-                    // FR-70 M3a — the rate the replacement was opened at, for
-                    // the shadow's judgement after the controller's next tick.
+                    // FR-70 M3a — the rate the replacement was opened at. The
+                    // shadow judges it and its dims at the controller's next
+                    // tick, as it does an inline open — unless the plan moved
+                    // while it opened, which makes it a stale adoption.
                     let built_rate = rebuilt.maxrate_bps() as u32;
                     if let Some(enc) = encoder.as_mut() {
                         let from = encoder_dims.unwrap_or((0, 0));
                         if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                             encoder_dims = Some(dims);
-                            plan_shadow.note_built(built_rate, dims);
+                            log_plan_stale_swap(
+                                &session_id,
+                                codec_label,
+                                plan_shadow.note_dims_swap_adopted(built_rate, dims, spawned),
+                            );
                             // The adopted encoder was built for the target
                             // the open was spawned with; the pin follows it
                             // from here, and the capture cap below it.
@@ -7138,7 +7150,7 @@ async fn media_pump_ffmpeg_dc(
         }
         let swap_start = std::time::Instant::now();
         if bg_rebuild {
-            if let Some(handle) = pending_swap.as_ref()
+            if let Some((handle, _)) = pending_swap.as_ref()
                 && handle.is_finished()
                 // FR-62 — on a CONSTRAINED session HOLD a finished rebuild
                 // until the scene is quiet. Adoption ships an IDR, and a
@@ -7148,7 +7160,7 @@ async fn media_pump_ffmpeg_dc(
                 // and the current encoder keeps producing meanwhile.
                 && (!constrained || last_motion_at.elapsed() >= DEFER_QUIET)
             {
-                let handle = pending_swap.take().unwrap();
+                let (handle, spawned) = pending_swap.take().unwrap();
                 last_swap_at = std::time::Instant::now();
                 match handle.await {
                     Ok(Ok(rebuilt)) => {
@@ -7164,10 +7176,18 @@ async fn media_pump_ffmpeg_dc(
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                // FR-70 M3a — judged against the controller's
-                                // next target: a rate swap adopted at a rate
-                                // the controller has since left is a divergence.
-                                plan_shadow.note_built(maxrate as u32, rebuilt_dims);
+                                // FR-70 M3a — judged at the controller's next
+                                // tick, as an inline open is: re-rated there
+                                // although the plan held is a divergence. A
+                                // plan that moved while it opened (a QSV open
+                                // can outlast two AIMD halvings) makes it a
+                                // stale adoption instead — counted apart, not
+                                // judged.
+                                log_plan_stale_swap(
+                                    &session_id,
+                                    codec_label,
+                                    plan_shadow.note_rate_swap_adopted(maxrate as u32, spawned),
+                                );
                                 video_info_sent = false;
                                 info!(
                                     %session_id, codec_label, maxrate_bps = maxrate,
@@ -7211,9 +7231,12 @@ async fn media_pump_ffmpeg_dc(
                     None => None,
                 };
                 if let Some(spec) = spec {
-                    pending_swap = Some(tokio::task::spawn_blocking(move || {
-                        crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
-                    }));
+                    pending_swap = Some((
+                        tokio::task::spawn_blocking(move || {
+                            crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
+                        }),
+                        plan_shadow.swap_spawn(),
+                    ));
                 }
             }
         }
@@ -8040,6 +8063,7 @@ async fn media_pump_ffmpeg_dc(
                         plan_dims,
                         std::time::Instant::now(),
                         plan_target,
+                        plan_shadow.swap_spawn(),
                     ));
                 }
             }
@@ -8800,9 +8824,11 @@ async fn media_pump_ffmpeg_dc(
         // FR-70 M3a — the controller has ticked: its target becomes the plan's
         // `bitrate_bps` (an epoch move, not a divergence), and an encoder the
         // loop built since the last tick — the inline open above, or a
-        // replacement adopted at the loop top — is judged against it: was it
-        // built at the plan's rate and the plan's dims? A `bitrate` divergence
-        // here is an encoder the controller re-rates on its very next tick.
+        // replacement adopted at the loop top while the plan held — is judged
+        // against it: was it built at the plan's rate and the plan's dims? A
+        // `bitrate` divergence here is an encoder the controller re-rates on
+        // its very next tick. A replacement adopted after the plan moved while
+        // it opened is a stale adoption, counted apart and not judged.
         log_plan_divergences(
             &session_id,
             codec_label,
@@ -9275,6 +9301,10 @@ async fn media_pump_ffmpeg_dc(
                 // with both values (`FR-70 M3a: the shadow plan diverged`).
                 plan_divergences = %plan_shadow.counts(),
                 plan_epoch = plan_shadow.epoch(),
+                // Replacements adopted after the plan moved while they opened
+                // — a make-before-break lag on a rebuild-bound backend, not a
+                // divergence. The first one logs with its three rates.
+                plan_stale_swaps = plan_shadow.stale_swaps(),
                 idr_count = rate_stats.idr_count,
                 // FR-62 A2 — whether the pump is still rationing this encoder's
                 // constrained increases. false ⇒ moves land live (NVENC,
@@ -9334,6 +9364,34 @@ fn log_plan_divergences(
             "FR-70 M3a: the shadow plan diverged from the pump's inline value (first time this session for this field)"
         );
     }
+}
+
+/// FR-70 M3a — log the session's FIRST replacement adopted after the plan
+/// moved while it opened: built at the plan of its spawn, arriving under a
+/// later one. Not a divergence (the loop decided nothing the plan did not);
+/// the heartbeat's `plan_stale_swaps` carries the count.
+#[cfg(feature = "ffmpeg-encoder")]
+fn log_plan_stale_swap(
+    session_id: &bson::oid::ObjectId,
+    codec_label: &str,
+    stale: Option<crate::encode::plan::StaleSwap>,
+) {
+    let Some(s) = stale else {
+        return;
+    };
+    info!(
+        %session_id,
+        codec_label,
+        kind = s.kind,
+        built_bps = s.built_bps,
+        spawned_bps = s.spawned_bps,
+        now_bps = s.now_bps,
+        spawned_w = s.spawned_dims.0,
+        spawned_h = s.spawned_dims.1,
+        now_w = s.now_dims.0,
+        now_h = s.now_dims.1,
+        "FR-70 M3a: a replacement was adopted after the plan moved while it opened (built at the plan of its spawn; first time this session)"
+    );
 }
 
 /// The VP9-444 pump's target rate. An explicit `ROOMLERD_VP9_FPS` pins it (30

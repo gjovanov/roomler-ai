@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; M3b not built)
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; M3b not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -872,6 +872,185 @@ Reverted (the `NEGATIVE CONTROL` marker gone, `grep -c` = 0): the same command
 → **ok, 25 passed / 0 failed**, and `cargo fmt --all -- --check` clean. The
 counter counts; a zero from it is a measurement, not a default.
 
+## M3a.1 — a stale replacement counted apart, and the shadow's first genuine finding (2026-10-21)
+
+Anchors verified against branch `fr70-m3a-swap-judged-at-spawn` (master
+`1022d71a8` + this change). The 2026-10-18 section above keeps its own anchors.
+
+### The field's first read (interim)
+
+The gate's week is not over — the first full read is due 2026-10-26 — but two
+days of fleet sessions were already in `agent_logs`: the upload layer ships every
+event the filter passes, so the INFO heartbeat and the WARN both land there
+(7-day TTL). The read is #1330's method — the WARN line, plus the last
+`plan_divergences` of each FFmpeg DC session — run as server-side aggregations
+over `agent_logs` from 2026-10-19 07:33:52 UTC (0.4.144's publish):
+
+| | |
+|---|---|
+| sessions carrying M3a | **58**, on **9** hosts, 25 384 heartbeats |
+| releases | 0.4.144 (11) · 0.4.145 (15) · 0.4.146 (10) · 0.4.147 (12) · 0.4.148 (10) |
+| backends | `hevc_qsv` 18 · `hevc_nvenc` 14 · `av1_nvenc` 13 · `av1_qsv` 7 · `hevc_videotoolbox` 5 · `hevc_vaapi` 1 |
+| every field zero | **57** sessions — the busiest at `plan_epoch` 202 (CORPLAP-2, `av1_nvenc`, a 3¼-hour session) |
+| a divergence | **1**: `bitrate`, once, in a 2-hour `hevc_qsv` session on 0.4.148 |
+
+⚠️ This is the population the logs reach. The denominator from `remote_sessions`
+is owed by the full read; a host whose log never arrived is "not measured", not
+zero.
+
+**The one divergence, attributed.** `FR-70 M3a: the shadow plan diverged …
+field="bitrate" plan="3000000" inline="12000000"` at 06:54:43 UTC — a stall
+cascade on a rebuild-bound backend (QSV refuses an in-place rate change, so
+every rate move is a background open and a swap):
+
+| UTC | what happened |
+|---|---|
+| 06:54:36.96 | a stall; the AIMD cuts 19.7 M → **10.7 M**, and a rate replacement spawns at that rung, **12 M** |
+| 06:54:40.35 | another stall: **5.4 M** (the 6 M rung). A replacement is already in flight, so this one waits |
+| 06:54:40.54 | the 12 M replacement finishes opening — 3.6 s, on a host that was stalling |
+| 06:54:43.44 | adopted: better than the live 20 M encoder, 6.5 s after it was decided |
+| 06:54:43.44 | the controller's next tick says **2.74 M** (the 3 M rung), and the shadow judges the adoption against that: *plan 3 M, inline 12 M* |
+| 06:54:46.63 → 47.22 | the 3 M replacement opens and is adopted (`SWAP_MIN_INTERVAL` holds the next spawn 3 s after an adoption) |
+
+**It is not a plan bug.** The loop built that replacement at exactly the plan's
+rate at the moment it decided it: `rebuild_spec(bps)` coarsens the controller's
+applied rate onto the ladder, and `after_tick` folds the same
+`governor.applied_bps()` into the plan (`peer.rs:8835`). What the counter
+measured is the plan MOVING during a build that takes seconds — which is what
+make-before-break is, with one swap in flight and an encoder that cannot re-rate
+in place. M3b's loop, reading the plan, would do the same thing. The check
+assumed the build and the judgement are a pass apart; that holds for an inline
+open, and for a replacement whose open is milliseconds, but not for one adopted
+seconds after its spawn while the plan was moving.
+
+### A driven read: the shadow's first genuine finding
+
+The fleet read had **no** M2 dims swap in it at all (resolution moves: 1, on a
+host that did not rebuild; transport flips: 2, both on NVENC; every `rc:priority`
+line was the viewer's initial value), so the dims-replacement half of the check
+had never fired in the field. A session driven from the prod viewer to `zeus`
+(a headless fleet server, `hevc_vaapi`, direct, nobody at the screen), with the
+viewer's Fit mode and the stage shrunk below the DPR-1.5 native box:
+
+| UTC | move | agent side |
+|---|---|---|
+| 11:00:17.905 | resolution **down**, 1600×900 → 1050×590 | `FR-70 M2: dims change`, then adopted 4 ms later — `dims_swaps=1`, no stall |
+| 11:00:17.982 | — | `bitrate` divergence: **plan `8000000`, inline `25000000`** |
+| 11:02:24.715 | resolution **up**, back to 1600×900 | adopted in 8 ms, `dims_swaps=2` — **no** new divergence |
+| 11:03:04 | Priority Balanced → Smoother | `rc:priority updated`; no geometry move on a direct path with the dial's dims caps at their default (off); no divergence |
+
+**The plan held** through that 4 ms open — this is not a stale adoption. The dims
+replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8040`): the
+**old** 1600×900 frame's ceiling and the applied 22.95 M, the 25 M rung. The plan
+already aimed at 1050×590. The controller's first tick after adoption clamped the
+target to the smaller frame's ceiling — 9.87 M, which is 0.43 × 23 M, the pixel
+ratio — the 8 M rung. On this backend `inplace_rate=false`, so that re-rate was a
+**second open** right behind the first. Going up there is no divergence because a
+rising ceiling does not clamp: the AIMD climbs to it.
+
+This is exactly what the `bitrate` check was built for — the open-rate claim
+(the comment above the inline open) asserts the loop never opens an encoder the
+controller re-rates on its first tick, and for a dims replacement going down it
+does, every time. It is a **plan bug** in the gate's sense: M3b's loop, reading
+the plan, would read the same 25 M — during a dims transition the plan's
+`bitrate_bps` is the controller's target under the OLD frame's ceiling while its
+`dims` already name the new one. On a relay session the cost is the IDR after the
+swap, sized for the old frame's rate, into the thin pipe — the lump FR-62's swap
+hold exists to avoid.
+
+**Fix, before M3b** (its own PR, its own red/green — this one reproduces on
+demand): open a dims replacement at the ceiling of the dims it is being opened
+FOR, and make the plan's `bitrate_bps` respect its own `dims`.
+
+### What I got wrong first
+
+The first cut of this change judged every replacement against the plan at its
+SPAWN and never at the next tick. It made the stale case read zero — and would
+also have made the `zeus` finding read zero: judged at its spawn, that
+replacement matched the plan (both said 25 M), and nothing judged the tick. The
+driven session found it before the merge. The judgement is now split on whether
+the plan held, and negative control 2 below locks the branch that would have
+been lost.
+
+### The change
+
+- `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
+  replacement spawns, and the pump carries it beside the handle: `pending_swap`
+  is now `(handle, spawn)` (`peer.rs:7238`), and `PendingDimsOpen` gains a fifth
+  field (`peer.rs:8066`).
+- At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
+  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7189` and
+  `:7117`) asks one question: **did the plan move while it opened?**
+  - **It held** — the common case; opens are milliseconds on most backends: the
+    replacement is judged exactly as an inline open is, against the
+    controller's first target after adoption (`after_tick`, `plan.rs:527`).
+    Re-rated there although the plan did not move is a divergence — the `zeus`
+    finding above.
+  - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
+    the heartbeat (`peer.rs:9307`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:9374`): *`FR-70 M3a: a
+    replacement was adopted after the plan moved while it opened (built at the
+    plan of its spawn; first time this session)`*. Not judged at the tick. That
+    is the lag M4 will trade against an IDR per adoption.
+  - No plan at the spawn: nothing to have moved; judged as held.
+- A **rate** replacement is judged on its rate alone (`rebuild_spec` copies the
+  live encoder's dims, which M2's pin holds while a dims swap opens, so they are
+  not its decision, and a moved geometry does not stale it). A **dims**
+  replacement is judged on rate and dims.
+- Still M3a's rules: no behaviour change, no await, no env read in the frame
+  path, no kill switch.
+
+### Verification
+
+- `encode::plan::tests`, now 20 (13 + 7), on the default build (natively on
+  Windows). Both field cases verbatim: the QSV cascade → a stale adoption,
+  reported once, no divergence
+  (`a_replacement_adopted_after_the_plan_moved_is_stale_not_a_divergence`,
+  `plan.rs:1055`), and the same sequence judged the way M3a first shipped
+  reproduces that field's line — plan `3000000`, inline `12000000` (`:1080`);
+  the `zeus` dims swap → plan held, judged at the tick → plan `8000000`, inline
+  `25000000` (`a_dims_replacement_opened_at_the_old_frame_s_rate_is_a_divergence`,
+  `:1098`). Plus: a replacement built at a plan that held is clean (`:1123`); a
+  dims replacement is judged on its dims, a moved geometry stales a dims
+  replacement but not a rate one (`:1144`); nothing at the spawn → judged as held
+  (`:1192`); reported once, counted every time (`:1214`).
+- **Negative control 1 — the stale branch.** Every replacement treated as held
+  (`moved && false`, marked `NEGATIVE CONTROL 1`) → **FAILED, 3 failed / 17
+  passed**: exactly the three stale-branch tests (`None` where the stale report
+  was expected; `Some("dims")` missing).
+- **Negative control 2 — the held branch, the one the first cut lost.** A held
+  replacement never judged at the tick (`NEGATIVE CONTROL 2`) → **FAILED, 3
+  failed / 17 passed**: exactly the three held-branch tests, the `zeus` case
+  among them (`left: 0, right: 1` — the divergence gone).
+- Both reverted (`grep -c "NEGATIVE CONTROL"` = 0): 20 passed, `cargo fmt
+  --check` clean, `cargo clippy -p roomlerd --lib -- -D warnings` clean.
+- CI's FFmpeg lane, in WSL against the vendored tree:
+  `cargo clippy -p roomlerd --features ffmpeg-encoder,vp9-444,vp9-444-bindgen
+  --all-targets -- -D warnings` clean (the pump wiring compiles only here), and
+  `cargo test -p roomlerd --features ffmpeg-encoder --lib`. ⚠️ The test build
+  ICEs in this WSL (`check_mod_deathness`, module `media_share`, rendering an
+  existing `governor.rs` warning) — the known environmental one that master hits
+  too and CI does not; run with the lint-level workaround in its own target dir.
+
+### What it means for the gate (AC10)
+
+**The gate does not pass yet, and that is the finding working.** The stale QSV
+event is attributed (by hand up to 0.4.149; by `plan_stale_swaps` from the
+release carrying this change). The `zeus` divergence is real: it will recur on
+every backend whenever a dims swap goes down, until the dims replacement opens
+at the target frame's ceiling. So AC10 now waits on that fix, a fresh week after
+it, the full read with the `remote_sessions` denominator, and the driven moves
+the field read showed are missing — a dims swap on a QSV host, a Priority move
+on a relay (where the dial's link-physics cap moves the geometry), a transport
+flip on a rebuild-bound backend.
+
+**An M3b/M4 design input, measured.** A stale adoption is cheap to read and not
+free to have: here 3.8 s at 12 M while the controller wanted 2.7 M, inside a
+congestion event. Whether to start the next replacement sooner than
+`SWAP_MIN_INTERVAL` after a stale adoption — each adoption ships an IDR into the
+congested pipe — is M4's question, and `plan_stale_swaps` is the number it will
+be decided on.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -925,7 +1104,13 @@ counter counts; a zero from it is a measurement, not a default.
       across the fleet's FFmpeg DC sessions over a week on the release carrying
       M3a, and every driven plan move (resolution, Priority, transport) moves
       `plan_epoch` without a divergence. The retirement gate for the inline
-      arithmetic: M3b does not start until it holds.
+      arithmetic: M3b does not start until it holds. *(2026-10-21: the fleet
+      read had 57 of 58 sessions zero; its one divergence was a stale
+      replacement — not a plan bug, counted apart from the release carrying
+      M3a.1. A driven session then found the first GENUINE plan bug: a dims
+      replacement going down opens at the old frame's rate and is re-rated on
+      the next tick. Owed: that fix, a week after it, the full read with the
+      `remote_sessions` denominator, and the missing driven moves — §"M3a.1".)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 
