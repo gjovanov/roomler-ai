@@ -95,8 +95,8 @@ flowchart TB
 | 1 | [FR-99](../fr/FR-99-privacy-mode.md) privacy mode, lock on end, host mute | — |
 | 1 | [FR-100](../fr/FR-100-controller-identity.md) controller identity | FR-52's binding seam |
 | 1 | [FR-101](../fr/FR-101-rc-session-hygiene.md) session hygiene | — |
-| 2 | GPU frame path (zero-copy) | L4, FR-70's media thread |
-| 2 | High refresh: D1 (≤ 1440p at 120, direct paths), then D2 (4K at 144) | L4; D2 needs zero-copy; above 60 on relays waits for FR-17 stage C, FR-74 P5 or FR-63 B1, FR-70 M3 |
+| 2 | [FR-118](../fr/FR-118-gpu-resident-frames.md) GPU frame path (zero-copy) | L4, FR-70's media thread |
+| 2 | [FR-119](../fr/FR-119-high-refresh-streaming.md) high refresh: D1 (≤ 1440p at 120, direct paths), then D2 (4K at 144) | L4; on QSV and NVENC, D1 needs FR-118 too (measured 2026-10-21, below); above 60 on relays waits for FR-17 stage C, FR-74 P5 or FR-63 B1, FR-70 M3 |
 | 2 | Display follows the viewer: a guard for the person at the screen, Linux, several displays | — |
 | 2 | Virtual display (IddCx) | the operator's signing decision |
 | 3 | Relative mouse and auto-switch | — |
@@ -110,6 +110,14 @@ display guard → relative mouse → touch → the virtual display → D2 → HD
 
 These get their numbers when they start. Their designs are recorded here so the decisions made during the
 teardown are not lost.
+
+> [!NOTE]
+> **2026-10-21: the two performance FRs of wave 2 are claimed**, as [FR-118](../fr/FR-118-gpu-resident-frames.md)
+> (zero-copy) and [FR-119](../fr/FR-119-high-refresh-streaming.md) (high refresh). Their specs supersede the
+> notes below. One note did not survive measurement. A 7-day fleet read of the encode stage found 10–12 ms per
+> 1080p–1200p frame on QSV and NVENC, against an 8.3 ms period at 120 fps. So D1 does **not** run on the CPU
+> path on those encoders: it waits for FR-118 there. Only the Mac's VideoToolbox cell (6.3 ms at 3024×1964)
+> fits today, which is why a MacBook host is FR-119's first D1 cell.
 
 **GPU frame path (zero-copy).**
 - **The contract first.** `enum FrameData { Cpu, D3d11, IoSurface, DmaBuf }` with a `to_cpu()` that
