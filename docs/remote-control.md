@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1700` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1505`, `peer.rs:1547`, `peer.rs:1473` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1516`, `peer.rs:1558`, `peer.rs:1484` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -528,13 +528,13 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:12663`](../agents/roomlerd/src/peer.rs#L12663)) sends it
+The pump ([`peer.rs:12675`](../agents/roomlerd/src/peer.rs#L12675)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5475`](../agents/roomlerd/src/peer.rs#L5475); the viewer parses it
-at [`useRemoteControl.ts:1467`](../ui/src/composables/useRemoteControl.ts#L1467)
+[`peer.rs:5486`](../agents/roomlerd/src/peer.rs#L5486); the viewer parses it
+at [`useRemoteControl.ts:1488`](../ui/src/composables/useRemoteControl.ts#L1488)
 and puts it on the toggle's title
-([`RemoteControl.vue:3210`](../ui/src/views/remote/RemoteControl.vue#L3210)).
+([`RemoteControl.vue:3209`](../ui/src/views/remote/RemoteControl.vue#L3209)).
 
 | `code` | Means |
 |---|---|
@@ -559,24 +559,26 @@ the recorder already runs as the person at the screen, it records the monitor
 in its own process. Before P3c-2 it refused its start on every Linux host,
 because the `.monitor` pick never matched.
 
-### 5.1d A locked host, and a session that keeps the host awake (FR-97 P3b)
+### 5.1d A locked host, and a session that keeps the host awake (FR-97 P3b, P2d-1)
 
 What the viewer is told when the host's screen locks, and what holds the
 machine awake while a session is live, per OS:
 
 | | Windows | Linux | macOS |
 |---|---|---|---|
-| The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:331`](../agents/roomlerd/src/lock_state.rs#L331)); GNOME, KDE and light-locker set it | P2d |
-| What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | — |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9548`](../agents/roomlerd/src/peer.rs#L9548)), retried until the control DC carries it | — |
-| The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" ([`RemoteControl.vue:98`](../ui/src/views/remote/RemoteControl.vue#L98)) | — |
+| The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
+| What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:9702`](../agents/roomlerd/src/peer.rs#L9702)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1421`](../ui/src/composables/useRemoteControl.ts#L1421) `hostLockedChipTitle`) |
+| A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
 
-⚠️ **The Linux hint is advisory and never a `LockState`.** The pump's overlay
-and the input path keep reading the Windows probe, which says Unlocked on
-Linux. Feeding the hint there would blank a lock screen the viewer can see and
-stop the very keystrokes that unlock it. `ROOMLERD_LOCK_HINT=0` turns the hint
-off.
+⚠️ **The Linux and macOS hints are advisory and never the pump's `LockState`.**
+The pump's overlay and the input path keep reading the Windows probe, which
+says Unlocked on both. Feeding the hint there would blank a lock screen the
+viewer can see and stop the very keystrokes that unlock it. On a Mac the
+consent probe alone reads it (`probe_lock_state_service`), as on Windows.
+`ROOMLERD_LOCK_HINT=0` turns the hint off on both.
 
 ⚠️ **The inhibitor is the FR-55 half, and it sits beside FR-93 P5h's.** P5h
 holds a logind **delay** inhibitor during a session so that a sleep the person
@@ -1102,6 +1104,13 @@ never gates the outcome. (Rendering the panel on the secure desktop was
 considered and rejected — modern Win11 restricts windows there, it is
 `WDA_EXCLUDEFROMCAPTURE` so unobservable, and unlock-then-approve is the sounder
 flow anyway.)
+
+A Mac says the same since FR-97 P2d-1: its prompt (the panel, or the
+companion's) is drawn in the console user's session, out of sight while that
+session's screen is locked or another user has the console, and the GUI
+session's half reads both from the session dictionary
+([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)).
+A Linux host does not say it yet (§5.1d).
 
 `prompt_then_email` is "and", not "then" — the mail goes out at once. What is
 sequential is the two windows: the host modal closes after the attended window
@@ -1747,8 +1756,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12584`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12562`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3819`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12531`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12596`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12574`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3819`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12543`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:576`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:315`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:753`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:407`, #2326) |
@@ -1911,7 +1920,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8431`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8453`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2014,7 +2023,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4337`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4358`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -2047,7 +2056,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:3995`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4016`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 
@@ -2230,7 +2239,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1728`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1739`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:257` joins it), and sessions
@@ -2727,8 +2736,8 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
-(`agents/roomlerd/src/peer.rs:1540`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:10290`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:1551`) and its `rc:layout.set` arm
+(`agents/roomlerd/src/peer.rs:10302`) serve both platforms.
 
 ```mermaid
 sequenceDiagram

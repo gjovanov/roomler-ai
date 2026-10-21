@@ -222,12 +222,12 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ❌ | Built (`indicator/mac.rs`), not in the release set (`release-agent.yml:2564-2580`) | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
-| R5 | "Host is locked" consent hint | ✅ | ✅ since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:331`) | ❌ | `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-311`), on purpose for Linux: the hint never becomes one | P2d, P3b |
+| R5 | "Host is locked" consent hint | ✅ | 🟡 since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:347`), in a session; a request waiting for consent is not told (P2d-1 found it: the prompt's probe answers `None` here) | ✅ since P2d-1: advisory, from the session dictionary (`lock_state.rs:357`), in a session (`input: "unknown"`) and at a prompt | The pump's `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-326`), on purpose: the hint never becomes its overlay. *P2d-1:* the prompt's probe asks a Mac's session (`lock_state.rs:301-320`) | P2d-1, P3b |
 | R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ❌ | Windows-only cap (`caps.rs:1574-1578` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:1669-1676`), and on Linux only in an X11 session, without `set` under GNOME (`:854`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ❌ | `display_match.rs:574`. *P3e-2:* `agents/roomlerd/src/display_match.rs:262` `x11_offered`; the viewer's toggle followed the OS until P3e-2 | P2d, P3e |
 | R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ❌ | Forced off (`clipboard.rs:818-822` before P3e-3a) ✔ while advertised (`caps.rs:1630-1638`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:632` `x11_gate` | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:959` | P2e, P3e |
-| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9791-9794`) | FR-93 P7 |
+| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:9803-9806`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 picture only | No SCK audio; cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:321-322`) | P2a, P2f |
 | R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:222`) | D2 |
@@ -314,7 +314,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94). ✅ FR-94 and FR-105's docs already say so |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-55` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only. ✅ Both say so since P0c-4, as do both homepages |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1286,1360`). ✅ **P8:** both name the hosts, measured 2026-10-18: the manifest's asset URLs are `github.com`, redirected to `release-assets.githubusercontent.com`; `install.ps1`'s companion is one too, and its VC++ runtime comes from `aka.ms` |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3200` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3199` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
@@ -325,7 +325,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9785`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9807`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.
@@ -623,11 +623,20 @@ test of the SIGKILL property itself.
   already held), focus with the Accessibility API (`AXUIElement` raise and `kAXFrontmostAttribute`), launch
   allowlisted apps through LaunchServices (`open -b <bundle id>`). It runs in the GUI worker and crosses FR-43's
   delegate channel like the other `rc:*` kinds.
-- **P2d, the small ones.** `host_locked` from the session dictionary's lock flag (`CGSessionCopyCurrentDictionary`),
-  which keep-busy already reads (`keep_busy/host_mac.rs:15-19`): advisory only, never an input gate (FR-92's rule,
-  `FR-92-keep-busy.md:53`). Layout through TIS (`TISCopyCurrentKeyboardInputSource` / `TISSelectInputSource`).
-  Display-match through `CGDisplaySetDisplayMode` with a restore guard: macOS has no `CDS_FULLSCREEN`-style
-  auto-revert, so the daemon owns the restore, after a crash too. The cursor shape needs AppKit and follows D3.
+- **P2d, the small ones.** *P2d-1, the lock hint (built):* the session dictionary's lock flag
+  (`CGSessionCopyCurrentDictionary`), read as keep busy reads it (`keep_busy/host_mac.rs:187`), reaches the viewer at
+  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1428-1495`): whether
+  the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
+  as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
+  `signaling.rs:3732`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
+  Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
+  way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
+  says it in a session only: its read is a `loginctl` run, which does not belong on the signalling loop, so a prompt
+  there is not told (R5). *P2d-2:* layout through TIS (`TISCopyCurrentKeyboardInputSource` /
+  `TISSelectInputSource`). Display-match through `CGDisplaySetDisplayMode` with a restore guard: macOS has no
+  `CDS_FULLSCREEN`-style auto-revert, so the daemon owns the restore, after a crash too. The cursor shape needs AppKit
+  and follows D3.
 - **P2e, clipboard.** Image watching on the `NSPasteboard` change count (the Windows sequence-number shape); RTF as
   `public.rtf` beside the HTML lane.
 - **P2f, a microphone for recordings.** cpal on macOS, `NSMicrophoneUsageDescription` in the bundle (a missing key
@@ -1123,7 +1132,8 @@ model on Windows, so the three agree on what the mode means.
 | **P2a** | macOS system audio (SCK) | `ROOMLERD_SCK_AUDIO=0` | a field Mac | M–L |
 | **P2b** | macOS native consent panel (D3) | the release feature set | one Mac, then the field Macs | S–M |
 | **P2c** | macOS Remote Apps | `[apps] enabled` | a field Mac | M–L |
-| **P2d** | macOS lock hint, layout, display-match | per-verb caps | a field Mac | M |
+| **P2d-1** | macOS lock hint: the session dictionary's lock, to the viewer's chip in a session (`input: "unknown"`) and to a request waiting for consent (`host_locked`); the chip's neutral title (built) | `ROOMLERD_LOCK_HINT=0` | a tart Mac, red on 0.4.149 | S |
+| **P2d-2** | macOS layout, display-match | per-verb caps | a field Mac | M |
 | **P2e** | macOS clipboard images + RTF | `ROOMLERD_CLIPBOARD_NATIVE=0` | a field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P2g** | The companion's Devices page and mesh on a two-half Mac come from the root half, over a person socket it serves the console user; a Linux system install's person socket serves the same two verbs (D2) | `ROOMLERD_PERSON_SOCKET=0` | a tart Mac with both halves, red on 0.4.149; the operator's MacBook | S |
@@ -1515,3 +1525,4 @@ one depends on it.
 | 2026-10-21 | the box's released 0.4.149 (it had updated itself since P2g's run), then P2h's branch built natively on the box (`24de08500`), swapped in by a unit drop-in and restored afterwards | the lab's Asahi box (Fedora Asahi Remix 42), a system install | 🔴→🟢 **P2h (AC19), Linux.** As the desktop user, `roomler peers` was refused by the person socket on 0.4.149. On the branch it listed 23 peers, 13 online (9 direct, 4 relayed), with no endpoint field. Root's own answer was the same 23 with 54 endpoint fields. `roomler devices` (P2g) kept its 18 items, and `flows` stayed refused |
 | 2026-10-21 | this phase's candidate: the `.pkg` from release-lane rehearsal 39597475586 on `24de08500` (`728938fd…`) | the same tart set-up as P2g's candidate, on a fresh clone; both rows deleted and the VM destroyed afterwards | 🟢 **P2h (AC19), macOS.** As the console user, `roomler peers` listed 7 peers with no endpoint field (root: the same 7, with 11), and `roomler status` carried the root half's overlay address (`100.65.20.9`) and MagicDNS domain. With `ROOMLERD_PERSON_SOCKET=0` on the root half, both were empty again, as on P2g's candidate (its row above) |
 | 2026-10-21 | the `install.sh` prod serves after the day's promotes (`hosted-20261021-adbdadc`, then `-f72df08`; the script `4740b861…`, carrying #2641), and the `setup-v0.4.149` aarch64 wizard through `/api/setup/linux-aarch64` | real arm64: the lab's Asahi box (Fedora Asahi Remix 42, 16 KiB pages), throwaway rootless podman, Debian 13 and Fedora 42, each enrolled as a tunnel client (revoked after) | 🟢 **P7b, the served install (AC14).** `/api/tunnel/installer/linux-aarch64/health` answered 200 (400 that morning). On Debian the script took the aarch64 `.deb`, and dpkg set up `roomler-cli 0.4.149-1 arm64`. On Fedora it fetched *"the roomler CLI (tarball, linux-aarch64) via the proxy"*. Both ran `roomler 0.4.149` and enrolled. The wizard came through the served route with its release sidecar's digest, aarch64 with no unresolved library, and was alive after 15 s with its *Roomler Setup* window, in both containers. The morning's red on the 0.4.147 script is this log's earlier row |
+| 2026-10-21 | released 0.4.149 | a fresh throwaway tart Mac (vmtest-golden), both halves enrolled standard in the vmtest org (the root half with the overlay), `auto_update` off, the per-user half granting its owner unasked; a Playwright viewer on mars against prod; both rows deleted and the VM destroyed afterwards | 🔴 **P2d-1 (AC8's lock hint).** A session connected; the screen was locked by `SACLockScreenImmediate` in the console user's session, and the window server's own flag (`CGSSessionScreenIsLocked`) was set within 1 s. The viewer stayed connected, and in 60 s no "Host locked" chip and no `rc:host_locked` arrived. Then, still locked, the device was set to prompt its owner (`prompt_owner`): the worker logged a prompt (`have_surface=true`, the companion) and no lock line, and the viewer said only "Waiting for the agent to allow the connection…" for 45 s |

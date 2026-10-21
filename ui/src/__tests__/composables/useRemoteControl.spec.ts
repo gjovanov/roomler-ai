@@ -91,6 +91,7 @@ import {
   friendlyRcError,
   nextDirPath,
   parseControlInbound,
+  hostLockedChipTitle,
   idleSecondsLeft,
   layoutSetWireMessage,
   parseAppsListReply,
@@ -2112,21 +2113,37 @@ describe('parseControlInbound', () => {
 
   it('parses a well-formed rc:host_locked locked=true', () => {
     const r = parseControlInbound('{"t":"rc:host_locked","locked":true}')
-    expect(r).toEqual({ kind: 'host_locked', locked: true, inputPasses: false })
+    expect(r).toEqual({ kind: 'host_locked', locked: true, input: 'suppressed' })
   })
 
   it('parses a well-formed rc:host_locked locked=false', () => {
     const r = parseControlInbound('{"t":"rc:host_locked","locked":false}')
-    expect(r).toEqual({ kind: 'host_locked', locked: false, inputPasses: false })
+    expect(r).toEqual({ kind: 'host_locked', locked: false, input: 'suppressed' })
   })
 
   it('FR-97 P3b: a Linux lock hint says the lock screen takes input', () => {
     // The agent's payload (`host_locked_advisory_payload`, peer.rs).
     const r = parseControlInbound('{"t":"rc:host_locked","locked":true,"input":"passes"}')
-    expect(r).toEqual({ kind: 'host_locked', locked: true, inputPasses: true })
-    // Only the one word counts: anything else is Windows' meaning.
+    expect(r).toEqual({ kind: 'host_locked', locked: true, input: 'passes' })
+    // Only the known words count: anything else is Windows' meaning.
     const other = parseControlInbound('{"t":"rc:host_locked","locked":true,"input":"suppressed"}')
-    expect(other).toEqual({ kind: 'host_locked', locked: true, inputPasses: false })
+    expect(other).toEqual({ kind: 'host_locked', locked: true, input: 'suppressed' })
+    const odd = parseControlInbound('{"t":"rc:host_locked","locked":true,"input":"blocked"}')
+    expect(odd).toEqual({ kind: 'host_locked', locked: true, input: 'suppressed' })
+  })
+
+  it('FR-97 P2d-1: a Mac lock hint claims neither way about input', () => {
+    // `lock_state::LOCK_SCREEN_INPUT` on a Mac.
+    const r = parseControlInbound('{"t":"rc:host_locked","locked":true,"input":"unknown"}')
+    expect(r).toEqual({ kind: 'host_locked', locked: true, input: 'unknown' })
+  })
+
+  it('FR-97 P2d-1: the Host locked chip says only what the host said', () => {
+    expect(hostLockedChipTitle('passes')).toMatch(/type the password to unlock/)
+    expect(hostLockedChipTitle('suppressed')).toMatch(/input is suppressed/)
+    const unknown = hostLockedChipTitle('unknown')
+    expect(unknown).toBe('The remote host is on its lock screen.')
+    expect(unknown).not.toMatch(/input/i)
   })
 
   // FR-93 P1 — the agent's wire shape (input/reach.rs `payload`, locked there).

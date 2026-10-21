@@ -53,6 +53,9 @@ mod host_gnome;
 mod host_linux;
 #[cfg(all(target_os = "macos", feature = "enigo-input"))]
 mod host_mac;
+/// FR-97 P2d-1 — the console session's lock, which `lock_state` reports too.
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+pub(crate) use host_mac::screen_locked as mac_screen_locked;
 #[cfg(all(target_os = "windows", feature = "enigo-input"))]
 mod host_win;
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]

@@ -39,7 +39,7 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 ### 2.2 What the fleet measures today (7 days to 2026-10-21, read-only)
 
 From `agent_logs`: 142 538 FFmpeg DC pump heartbeats from 11 hosts, read-only, from mars. The "encode"
-column is the pump's `avg_encode_ms` (`peer.rs:9185`): the time inside `encode_sync`, so **conversion,
+column is the pump's `avg_encode_ms` (`peer.rs:9196`): the time inside `encode_sync`, so **conversion,
 copies, upload, submission and the packet drain together** (§3). The fps columns are the delivered rate
 between consecutive heartbeats (spaced 2.0 s). The median sits at 16–17 fps on almost every host because an
 idle desktop produces few frames, which is not a limit. So the table shows the top of the distribution, p99
