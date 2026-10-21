@@ -727,12 +727,12 @@ forms that the per-frame readers are now defined as:
 `rate_profile::{constrained_queue_budget_bytes_at,
 direct_queue_budget_bytes_at, direct_queue_hard_budget_bytes_at, hrd_pct_for}`
 (`rate_profile.rs:405,540,564,578`), `encode::priority_relay_cap_for` over
-`PriorityCaps` (`encode/mod.rs:1018,1036`), and
+`PriorityCaps` (`encode/mod.rs:1024,1036`), and
 `Pipeline::merged_priority_cap_by` (`media_share.rs:340`). Each reader is its
 explicit form applied, and a test locks each pair
 (`the_budget_readers_equal_their_explicit_window_forms` `rate_profile.rs:1215`,
 `priority_relay_cap_for_is_priority_relay_cap_over_explicit_caps`
-`encode/mod.rs:1962`, `the_knobs_resolve_to_what_the_per_frame_readers_read`).
+`encode/mod.rs:1968`, `the_knobs_resolve_to_what_the_per_frame_readers_read`).
 
 **Facts and decisions — the split the design asked for.** The producer reads
 facts and emits decisions; what it was NOT given is as deliberate as what it

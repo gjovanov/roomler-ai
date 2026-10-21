@@ -80,13 +80,19 @@ that asked for 120 and sees 60 is told why, as FR-108 tells the display-match re
 What fps a host sustains depends on its capture backend, panel refresh, encoder and geometry. It is a **cell**,
 and as with encoder cells, the probe proves an open and only a session proves the cell:
 
-- A session that ran at the higher target for 60 s, at ≥ 0.9 × the target with p99 inter-frame time under two
-  periods, writes the class to the agent's cache (the caps cache's keying: build, hardware fingerprint, knobs).
+- A trial runs the class at the higher target and judges only **moving content**. Capture is event-driven, so
+  an idle desktop delivers few frames: the fleet's median window is 16–17 fps with 60 targeted, and a rule over
+  wall time would fail every capable host that sat still. So the trial keeps only active stretches, frames at
+  most three periods apart, and a frame the pump drops for the viewer or the link ends a stretch. Once it has
+  seen 10 s of motion, a class that ran at ≥ 0.9 × the target with p99 inter-frame time under two periods is
+  proven and written to the agent's cache (the caps cache's keying: build, hardware fingerprint, knobs).
+  (The first draft said 60 s at ≥ 0.9 × the target; P2b-1 measured that rule against event-driven capture and
+  replaced it, §4.3.)
 - A class that fails that test is not granted again until the build, the hardware or the knobs change.
 - `fps_deny` (`name:fps`, the `encoder_cells_deny` shape) removes classes. It is honoured at **every** entry
   point (the grant and the trial), pushable through remote config with `MANAGE_AGENTS`, and only ever removes.
 - The first grant on an unproven host is a **trial**, never a promise. The viewer's picker says "trial", and
-  the trial ends at 60 if the 60 s test fails.
+  the stream goes back to 60 if the trial fails.
 
 ### 3.4 The encoder and the rate law
 
@@ -135,7 +141,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH` (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is not reported yet |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b owed**: the grant, the rate class and its trial, `fps_deny`, the fps swap, the slot-first gate above 60 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache, pure and not yet called. **P2b-2 owed**: the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, and the wiring |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | — |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -224,6 +230,52 @@ operator's `ROOMLERD_FFMPEG_FPS` reaches anything here.
 
 This is AC1's pts half: red on master's rule, green here.
 
+### 4.3 P2b-1 — the grant, the trial, `fps_deny` and the rate-class cache, as built (2026-10-21)
+
+This is the decision half of P2b. It is pure and unit-tested, and nothing calls it yet. P2b-2 wires it into the
+pump: the fps swap, a capture pace that moves without a reopen, and the trial run.
+
+| Piece | What it decides | Where |
+|---|---|---|
+| `grant()` | above the cap only when every condition holds; otherwise refused at the cap, with one named reason | `agents/roomlerd/src/encode/frame_rate.rs` |
+| `pipe_covers()` | the pipe input: nothing measured says the path carries less than the ceiling at the asked rate | the same |
+| `TrialMeter` | whether this host sustains the rate while the content moves | the same |
+| `parse_fps_deny` / `fps_denied` | the owner's removals, in the `encoder_cells_deny` shape (`name:fps`, `*` for every encoder) | the same |
+| `fps_class_cache` | what trials concluded, next to the probe cache and under its key | `agents/roomlerd/src/encode/fps_class_cache.rs` |
+
+- **The refusal order** follows what a viewer can see and act on: `constrained`, then `refresh` (the captured
+  screen refreshes slower than the ask), then `denied`, then `unproven` (a failed trial), then `pipe`. A class
+  never tried is granted as a **trial**; a proven one is granted without one.
+- **The pipe input** reads the FR-79 belief's pushed-back estimate (`capacity_bps`), and no push-back is no
+  claim. ⚠️ Never the belief's floor: at 60 fps the floor is the content's weight at 60, always under the ceiling
+  at 120, so reading it as a limit would refuse every healthy session.
+- **The trial judges what the host did.** A frame the pump drops for the viewer or the link (the viewer-rate
+  divisor, the byte gate) ends the stretch (`TrialMeter::pause`). Counted, one drop in fifty puts a two-period
+  gap at the p99 and fails a host that kept up, and the verdict is cached as a fact about the host.
+- **The cache** keeps one verdict per class, the newest. It is keyed exactly like the probe cache (build,
+  hardware fingerprint, knobs hash), so any change forgets it. Any miss reads as unproven, a verdict older than
+  a week is forgotten, and `ROOMLERD_CAPS_CACHE=0` switches it off with the probe cache. ⚠️ macOS has no
+  hardware fingerprint, so no key and no cache: there, every session's first ask above the cap is a trial.
+- **Tests:**
+  - every refusal reason, and the order between them;
+  - proven against trial;
+  - an unknown refresh rate deciding nothing;
+  - the pipe input with and without a push-back;
+  - the trial on steady motion, an encoder that cannot keep up, a slower screen, pauses between bursts, 30 fps
+    content, a rare late frame, and frames dropped for the viewer;
+  - the deny list's parse;
+  - the cache's read-back, newest-wins, key change, damaged file and age.
+- **Negative controls,** six, run together:
+  - pauses counted as frames;
+  - the refresh check skipped;
+  - a failed verdict ignored by the cache;
+  - the cache key ignored;
+  - a dropped frame counted;
+  - no push-back read as a refusal.
+
+  Exactly the seven tests that guard them failed: 17 passed, 7 failed. The first control fails two tests, because
+  "a pause is not evidence" and "content slower than three periods is not evidence" are one rule.
+
 ## 5. Acceptance criteria
 
 - [ ] **AC1 — P0 measured.** The pts test is red on master and green after P2. L0's 120 and 144 cells hold their
@@ -238,8 +290,8 @@ This is AC1's pts half: red on master's rule, green here.
   under 16.7 ms, on a 120 Hz-or-faster viewer. The red run is the same pair on today's build, at ≤ 60.
 - [ ] **AC5 — the rate law.** At 60 fps the ceiling is byte-identical to today's at every geometry (a table
   test). At 120 and 144 it follows the measured α and the class band top.
-- [ ] **AC6 — trial and denial.** A host that cannot sustain 120 falls back to 60 within the trial's 60 s,
-  reports `unproven`, and is not trialled again until its build, hardware or knobs change. A denied class is
+- [ ] **AC6 — trial and denial.** A host that cannot sustain 120 falls back to 60 once its trial has seen 10 s of
+  moving content, reports `unproven`, and is not trialled again until its build, hardware or knobs change. A denied class is
   never granted, at either entry point. Tests on both.
 - [ ] **AC7 — latency does not get worse.** L4 on AC4's pair at 120 vs 60: p50 and p95 no higher at 120.
 - [ ] **AC8 — docs.** `docs/remote-control.md` (the frame-rate classes, the gate, the wire), `docs/rate-control.md`

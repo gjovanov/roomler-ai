@@ -114,6 +114,12 @@ pub mod viewer_rate;
 // pump gives it in `rc:video-info`. Pure (unit-tested on the default build).
 pub mod frame_rate;
 
+// FR-119 P2b — what trials concluded about this host's rate classes, next to
+// the probe cache and under its key. Built in P2b-1; P2b-2 wires it into the
+// pump and removes this allow. Until then nothing outside its tests calls it.
+#[allow(dead_code)]
+pub mod fps_class_cache;
+
 // Encode-pressure controller — auto-reduces the maxrate ceiling when the
 // SENDER's encoder saturates (avg encode time high), the dynamic version of
 // the field-proven `FFMPEG_FPS=30`. Pure (unit-tested on the default build);
