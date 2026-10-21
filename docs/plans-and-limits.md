@@ -136,11 +136,11 @@ subscription's item instead of starting a second one (`crates/services/src/strip
 
 Every org is created on `free`, on every server (`crates/services/src/dao/tenant.rs:284`).
 On the hosted service that is a plan; on a self-hosted server it only means nobody sold the
-org anything. `Core::plans_sold` (`crates/core/src/state.rs:127`) is true only where the
-hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:285`); the
+org anything. `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the
+hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:298`); the
 published self-host image and the compose build both leave it out. With it false,
 `roomler_core::quota` refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and
-the session cap (`crates/modules/remote/src/controller.rs:698`) and the meeting sweep
+the session cap (`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`) stand down.
 
 ⚠️ Until FR-115 found it, nothing exempted a self-hosted server: the device cap had always
