@@ -173,8 +173,8 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > unconfigured, and `apt-get -f install` removes it again. Use the plain tarball
 > below. `install.sh --role tunnel` checks that `roomler` runs and falls back
 > to the tarball on its own. The CLI now declares both names
-> (`agents/roomler-cli/Cargo.toml`), so the next tunnel release's `.deb`
-> installs on both generations.
+> (`agents/roomler-cli/Cargo.toml`), so from tunnel-v0.4.149 on, the `.deb` is
+> built to install on both generations.
 
 **Linux (plain tarball):**
 
@@ -475,8 +475,9 @@ Then it installs by host:
 A binary in a root-owned directory needs root to replace, and `dpkg -i` always
 does: run `sudo roomler self-update`. Under `sudo` it reads the server from your
 own config, not root's (which has no enrollment), unless `--config` names one. The
-Linux and macOS install works from the first tunnel release after P6b; an older CLI
-there points at the manual download.
+Linux and macOS install works from tunnel-v0.4.149, the first tunnel release after
+P6b (field-verified on it: a tarball, a `.deb` and a Mac); an older CLI there, such as
+rc.266, points at the manual download.
 This is the single updater for tunnel-only hosts.
 
 **Daemon hosts** (installed a "be-accessed" role — the agent MSI) do NOT need
