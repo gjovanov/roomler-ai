@@ -94,6 +94,9 @@ test.describe('Rooms', () => {
     // silently started resolving to the nav's collapsed "Search devices" box
     // when the devices-first nav landed, and a hidden element is not a
     // meaningful assertion about the explore page.
-    await expect(page.getByLabel('Search', { exact: true })).toBeVisible()
+    // By ROLE as well: FR-116 P2 gave the app bar's Search icon button its
+    // accessible name, so a bare `getByLabel('Search')` matched that button
+    // and this field together (a strict-mode violation, #2647).
+    await expect(page.getByRole('textbox', { name: 'Search', exact: true })).toBeVisible()
   })
 })

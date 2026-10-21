@@ -202,11 +202,20 @@ FAILED=$(echo "$CLEAN" \
   | awk '/^  [0-9]+ failed/{f=1;next} /^  [0-9]+ (flaky|skipped|passed|interrupted|did not run)/{f=0} f' \
   | grep -oE '\[chromium\] › [^ ]+ › .*' | sed 's/ *$//' | sort -u)
 
+# Only the list's ENTRIES are patterns, never its comments. `grep -F -f` has no
+# comment syntax: every line of the file was a pattern, and its one bare "#"
+# line matched any failure carrying a "#", as a title's issue number does
+# ("… (#1631)"), passing it as EXPECTED. Measured 2026-10-21:
+# remote-switch-device.spec.ts could not fail the night. A blank line would be
+# worse still (the empty pattern matches every failure), so both are dropped.
+EXPECTED="$OUT/expected-failures.patterns"
+grep -vE '^[[:space:]]*(#|$)' "$REPO/scripts/e2e-expected-failures.txt" | tr -d '\r' > "$EXPECTED"
+
 UNEXPECTED=""
 if [ -n "$FAILED" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    if ! grep -qFf "$REPO/scripts/e2e-expected-failures.txt" <<< "$f"; then
+    if ! grep -qFf "$EXPECTED" <<< "$f"; then
       UNEXPECTED+="$f"$'\n'
     fi
   done <<< "$FAILED"
@@ -234,7 +243,7 @@ if [ -n "$UNEXPECTED" ]; then
   UNEXPECTED=""
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    grep -qFf "$REPO/scripts/e2e-expected-failures.txt" <<< "$f" || UNEXPECTED+="$f"$'\n'
+    grep -qFf "$EXPECTED" <<< "$f" || UNEXPECTED+="$f"$'\n'
   done <<< "$VFAILED"
 fi
 
