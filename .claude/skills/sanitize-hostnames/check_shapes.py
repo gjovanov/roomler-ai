@@ -73,14 +73,24 @@ EXIT_ERROR = 20
 # wolf on ordinary prose is a guard someone deletes. The map-based sweep is
 # what covers the ~10% of generated names that happen to be all letters; this
 # guard is for the class, not for completeness.
+#
+# ⚠️⚠️ The edges are B and E below, NEVER `\b`. `\b` counts `_` as part of a
+# word, so a tag glued to an identifier -- a test named `fn <tag>_layout()`, a
+# fixture `<tag>_dump.txt` -- has no word boundary on that side, and every
+# shape here would walk straight past it. Measured 2026-10-21: one asset tag
+# sat in a Rust test name for three months and then outlived two whole-history
+# rewrites, because the sweep's rules were `\b`-bounded too. A letter or a
+# digit continues a hostname; `_`, `-`, `.` and everything else end it.
+B = r"(?<![A-Za-z0-9])"  # start: not glued to a letter or digit before it
+E = r"(?![A-Za-z0-9])"   # end: not glued to a letter or digit after it
 SHAPES = [
-    (r"DESKTOP-(?=[A-Z0-9]{7}\b)[A-Z]*[0-9][A-Z0-9]*\b",
+    (r"DESKTOP-(?=[A-Z0-9]{7}" + E + r")[A-Z]*[0-9][A-Z0-9]*" + E,
      "Windows auto-generated desktop hostname"),
-    (r"LAPTOP-(?=[A-Z0-9]{7,8}\b)[A-Z]*[0-9][A-Z0-9]*\b",
+    (r"LAPTOP-(?=[A-Z0-9]{7,8}" + E + r")[A-Z]*[0-9][A-Z0-9]*" + E,
      "Windows auto-generated laptop hostname"),
-    (r"WIN-(?=[A-Z0-9]{11}\b)[A-Z]*[0-9][A-Z0-9]*\b",
+    (r"WIN-(?=[A-Z0-9]{11}" + E + r")[A-Z]*[0-9][A-Z0-9]*" + E,
      "Windows Server auto-generated hostname"),
-    (r"\bPC[0-9]{4,6}\b", "corp asset tag, PC-prefixed"),
+    (B + r"PC[0-9]{4,6}" + E, "corp asset tag, PC-prefixed"),
     # Generalised from a single hard-coded prefix on 2026-09-05. A corp DNS
     # server surfaced in `nslookup` output during a field test and NOTHING
     # caught it: not the map (unlisted) and not this file, whose only
@@ -99,10 +109,10 @@ SHAPES = [
     # ⚠️ The cost is a tag whose three letters happen to all fall in a-f
     # (~1.2% of prefixes) — those fall to the map, exactly as the ~10% of
     # all-letter Windows names above do. This guard is for the class.
-    (r"\b(?![0-9A-Fa-f]{3}[0-9]{5,}\b)[A-Z]{3}[0-9]{5,}\b",
+    (B + r"(?![0-9A-Fa-f]{3}[0-9]{5,}" + E + r")[A-Z]{3}[0-9]{5,}" + E,
      "corp asset tag, three-letter prefix + 5+ digits"),
-    (r"\b[A-Za-z]{3,}-XMG-[A-Za-z0-9]+\b", "owner-name-prefixed laptop hostname"),
-    (r"\b[A-Za-z]{3,}s-MacBook[A-Za-z0-9-]*", "Apple default '<owner>s-MacBook'"),
+    (B + r"[A-Za-z]{3,}-XMG-[A-Za-z0-9]+" + E, "owner-name-prefixed laptop hostname"),
+    (B + r"[A-Za-z]{3,}s-MacBook[A-Za-z0-9-]*", "Apple default '<owner>s-MacBook'"),
 ]
 
 # Tokens that match a shape and are NOT machine names. Every entry is a
@@ -114,8 +124,8 @@ SHAPES = [
 # numeric run -- but every real PC-prefixed asset tag here is PC + 5 digits, so
 # that entry matched the tags themselves and the guard silently ignored the
 # whole class it exists to catch. A planted canary is what exposed it. The
-# entry was also redundant: the shapes are already \b-anchored, so they cannot
-# match inside a longer number.
+# entry was also redundant: the shapes are already anchored by B and E, so
+# they cannot match inside a longer number.
 #
 # ⚠️ This file and sanitize.py are themselves SCANNED, so neither may name a
 # real machine even as an example -- the guard caught sanitize.py's own
@@ -157,13 +167,20 @@ def staged_files(root):
     A pre-commit hook must judge the STAGED blob, not the file on disk: those
     differ under `git add -p`, and the working-tree copy can be clean while the
     staged one is not. Reads content out of the index with `git show :<path>`.
+
+    A binary file comes back with content None rather than not at all: its
+    NAME is still scanned (see scan()), and a screenshot named after the
+    machine it shows is the commonest way a binary would carry one.
     """
     names = subprocess.run(
         ["git", "-C", str(root), "diff", "--cached", "--name-only",
          "--diff-filter=ACMR", "-z"],
         capture_output=True, check=True)
     for name in names.stdout.decode("utf-8", "replace").split("\0"):
-        if not name or Path(name).suffix.lower() in SKIP_SUFFIXES:
+        if not name:
+            continue
+        if Path(name).suffix.lower() in SKIP_SUFFIXES:
+            yield name, None
             continue
         blob = subprocess.run(["git", "-C", str(root), "show", ":" + name],
                               capture_output=True)
@@ -171,21 +188,33 @@ def staged_files(root):
             yield name, blob.stdout.decode("utf-8", "replace")
 
 
+def matches(text):
+    """(offset, token, why) for every shape hit the allowlist does not exempt."""
+    for shape, why in SHAPES:
+        for m in re.finditer(shape, text, re.I):
+            if not ALLOW.fullmatch(m.group(0)):
+                yield m.start(), m.group(0), why
+
+
 def scan(root: Path, staged=False):
     findings = []
     sources = (staged_files(root) if staged
-               else ((str(p.relative_to(root).as_posix()), read_text(p)) for p in walk(root)))
+               else ((p.relative_to(root).as_posix(),
+                      None if p.suffix.lower() in SKIP_SUFFIXES else read_text(p))
+                     for p in walk(root, include_binary=True)))
     for name, text in sources:
-        p = Path(name)
+        # ⚠️ The PATH is a surface of its own. Content scanning never sees it,
+        # and git-filter-repo's --replace-text never rewrites it -- so an e2e
+        # spec NAMED after a corp laptop outlived two whole-history rewrites
+        # (measured 2026-10-21), and this guard, reading content only, could
+        # not have flagged it. A path hit reports `name` where a line number
+        # would go.
+        for _, tok, why in matches(name):
+            findings.append((name, "name", tok, why))
         if text is None:
             continue
-        for shape, why in SHAPES:
-            for m in re.finditer(shape, text, re.I):
-                tok = m.group(0)
-                if ALLOW.fullmatch(tok):
-                    continue
-                line = text.count("\n", 0, m.start()) + 1
-                findings.append((p.as_posix(), line, tok, why))
+        for start, tok, why in matches(text):
+            findings.append((name, text.count("\n", 0, start) + 1, tok, why))
     return findings
 
 
