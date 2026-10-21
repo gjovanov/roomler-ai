@@ -40,6 +40,9 @@
   against the last three releases' real artifacts (§8).
 - P6e-1, a daemon that never dies on a log sink (#1538: no panicking prints, no unbounded launchd stdout), merged
   (#2478), red → green on a Linux container and under a real launchd (§8).
+- P6e-2, the FR-43 supervisor recording a Mac GUI worker that a signal killed, or that exited with a code the agent
+  did not choose, built (#P6E2PR). Measured first on a tart Mac (§8): `launchctl asuser` execs into `sudo`, which
+  passes the worker's end through as its own.
 - P6d, `install.sh --uninstall`, merged (#2485), field-verified on the branch (§8): six containers, a vmtest Ubuntu
   guest per install type and a tart Mac with both halves, against the served script's red.
 - P6c, `service install --as-service` (alias `--system`) on Linux and macOS, merged (#2488): field-verified on a
@@ -261,7 +264,7 @@ and the consent chain's fallbacks.
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:902`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
-| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | ❌ | `macos_supervisor.rs` never calls `crash_recorder` | P6e |
+| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:238-262`, `:595-601`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1180-1189` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3122`, `session_end.rs:220`) | P4d |
@@ -961,8 +964,8 @@ model on Windows, so the three agree on what the mode means.
   - *Open, Windows parity, by reading only:* nothing removes the config on Windows. `install.ps1 -Uninstall` doesn't,
     the MSI's tables have no `RemoveFolderEx`, and `roomlerd service uninstall` deletes no file but its own task XML.
     So a Windows uninstall would leave the credential that the Unix uninstall now removes. This is unmeasured.
-- **P6e, macOS supervision.** The FR-43 supervisor records a worker that dies before its own panic hook (stderr tail →
-  `record_with_log_tail`); drop the launchd `StandardOutPath` duplication and the daemon's `eprintln!`s (#1538).
+- **P6e, macOS supervision.** The FR-43 supervisor records a worker that dies before its own panic hook (P6e-2);
+  drop the launchd `StandardOutPath` duplication and the daemon's `eprintln!`s (#1538).
   - **P6e-1, never die on a log sink (#1538, built).** `eprintln!` panics when the write fails, and the daemon's
     stderr is a sink it does not own.
     - *The crash, located.* 0.4.93's panic was in `run_cmd`'s single-instance check. A duplicate `roomlerd run`
@@ -977,8 +980,22 @@ model on Windows, so the three agree on what the mode means.
     - *The plists.* `com.roomler.agent` and `com.roomler.daemon` send stdout to `/dev/null`. It carried only
       tracing's console copy of the rotating log, unrotated: 13.9 MB and 42 MB on one Mac. stderr keeps its
       file, so an agent that cannot start still says why there, and the vmtest lane reads it.
-  - **P6e-2, the supervisor's crash record** for a worker that dies before its panic hook: open. The FR-43
-    supervisor is default-off (`macos_supervise_gui_worker`).
+  - **P6e-2, the supervisor's crash record (built, #P6E2PR).** A worker that a signal ends never reaches its own
+    panic hook, so nothing recorded a `kill -9`, a fault inside a framework, or a kill by the system.
+    - *Measured first, on a tart Mac (§8).* The child the supervisor reaps is `sudo`: `launchctl asuser` execs into
+      it. `sudo` passes the worker's end through as its own, so the supervisor's wait status is the worker's.
+    - *What counts.* Any signal but SIGTERM, SIGHUP and SIGINT (a logout, a closed terminal, a person), and any
+      exit code but 0 and the four the agent exits with on purpose: the Windows supervisor's list, less its
+      session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:238-262`). Exit code 9 is a restart someone
+      asked for, and signal 9 is a kill. Only the wait status tells them apart, and a test holds that.
+    - *Where it goes.* `WriterContext::Supervisor`, which off Windows is the writing process's own dir: the root
+      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:595-601`).
+    - *Its tail* is the daemon's own log, as on Windows. The worker's stderr is the daemon's `StandardErrorPath`,
+      which a signal death writes nothing to. Its rolling log is in the person's home, which a root daemon does not
+      read, and nothing ties the two halves to one org.
+    - *Tests.* The classifier runs on every platform, and the wait-status reading on Linux. CI's macOS job runs
+      both on a Mac, where the build also checks the Darwin signal numbers against `libc`.
+    - It is off with the FR-43 supervisor (`macos_supervise_gui_worker`, default off).
 - **P6f, a fresh private staging directory per download** on Windows and macOS, as Linux has had since FR-96's
   security review. **Settled without a build.**
   - *Windows* got exactly that with GHSA-r3xj-4wh9-xh2v, released in 0.4.142 (`updater.rs:1218`).
@@ -1016,7 +1033,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1173-1189`).
+  test (`ci.yml:1277-1293`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;
@@ -1064,7 +1081,7 @@ model on Windows, so the three agree on what the mode means.
 | **P6b** | `roomler self-update` on Unix + the pinned PGP check | — | Linux + Mac tunnel-only hosts | M |
 | **P6c** | `service install --as-service` (alias `--system`) on Linux + macOS (merged, #2488) | — (a new verb) | a vmtest Ubuntu guest, red on 0.4.143; the 0.4.144 candidate; the macOS stop's mechanism on a tart Mac | S |
 | **P6d** | `install.sh --uninstall [--keep-config]` (built) | — (a new flag; the install path is unchanged) | six throwaway containers on four distros, a vmtest Ubuntu guest per install type, a tart Mac with both halves; red on the served script | S |
-| **P6e** | macOS supervisor crash capture; #1538 (P6e-1, never die on a log sink: built) | — (a liveness fix) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143 | S |
+| **P6e** | macOS supervisor crash capture (P6e-2: built, #P6E2PR); #1538 (P6e-1, never die on a log sink: built) | P6e-1: — (a liveness fix). P6e-2: the FR-43 supervisor's own `macos_supervise_gui_worker` (default off) | a field Mac; a duplicate start with stderr on `/dev/full`, red on 0.4.143. P6e-2: a tart Mac with both halves, its worker SIGKILLed, red on 0.4.148 | S |
 | **P6f** | Private staging dir on Windows + macOS (settled: Windows by GHSA-r3xj-4wh9-xh2v, macOS measured private) | — | Win10, Win11, a Mac | S |
 | **P7a** | Linux arm64 hardware encode | the release feature set | an arm64 lab host | M |
 | **P7b** | arm64 tunnel CLI + wizard (built #2641; rides 0.4.149 for the wizard, the next tunnel release for the CLI) | — (new artifacts; x86_64's names and tokens unchanged) | an arm64 vmtest guest | S |
@@ -1391,3 +1408,4 @@ one depends on it.
 | 2026-10-20 | released 0.4.147, then the **0.4.148 candidate** (roomlerd `4f59674f…` from the candidate `.deb` `4cf805d6…`, release run 39498665680); the deployed viewer `index-DL-wSxxQ.js` (`hosted-20261020-5ffa1d8`, which carries #2623's viewer half) | a fresh vmtest Ubuntu 24.04 cell, a per-user install: GNOME 46 on Xorg, then XFCE 4.18 on Xorg; the production viewer (Playwright) | **The 0.4.148 release check.** 🔴 0.4.147: `caps.layout = null` and no chip; `clipboard-image-events: not-watched`, and no push after a GTK copy. 🟢 The candidate. **P3e-1:** on GNOME, `["report"]`, `rc:layout` 4 ms after the control DC opened, and the chip following GNOME's Super+Space both ways. On XFCE, `["report","set"]`; the viewer's own Settings picker, clicked, switched to `de-DE` in 555 ms and back in 535 ms, the X group following. **P3e-3a:** the word gone, and `clipboard:img-begin {96x64, 216 B}` 0.3 s after the copy, unasked. **P3e-2:** the deployed viewer offered the toggle to the Linux host by the device's word and sent on a click. 3 min after the X server started, the candidate answered `refused: attended`, presence's 5 min not yet passed. On XFCE past 5 min it switched (`on: true, 640x480`, 40 ms) and handed the screen back 0.2 s later with `refused: attended`. ⚠️ **The pointer clamp**, measured with the agent out of the loop: with the pointer at (1000, 700), `xrandr` to 640×480 clamped it to (639, 479) and reset the X idle clock from 1503 ms to 53 ms. With the pointer already inside, the clock was untouched. ⚠️ **The viewer's default-ON never left the page at connect** (#2638): 0 display-match messages before any click, on 0.4.147 and the candidate alike |
 | 2026-10-20 | the 0.4.148 candidate (above), then the clamp fix's candidate `8577d5e5…` (a release-profile build of the branch without `ffmpeg-encoder`) | the same cell on XFCE. The pointer was put at (1000, 700) by a client warp, outside the 640×480 a 946×598 stage gets, then nobody touched it for 5 min 20 s. The deployed viewer's own toggle, clicked | 🔴→🟢 **The pointer clamp, fixed.** The 0.4.148 candidate switched (`on: true, 640x480`) and handed the screen back 0.2 s later with `refused: attended`. The fix's candidate switched (`on: true, 640x480`, 49 ms), and the viewer said "the host runs at 640×480 for this session". The screen still read 640×480 3 s and 12 s later, and the session's end restored 1280×800. Read afterwards, the pointer sat at (639, 479), and the X server's last counted input was 22:40:50Z, the moment of the switch: the clamp happened, and it was not taken for a person |
 | 2026-10-20 | the served `install.sh` (0.4.148's server), then #2641's `install.sh` and its rehearsal artifacts (tunnel run 39508967436, setup run 39508972421, both green; each arm64 job smoke-ran what it built on the arm64 runner) | a throwaway vmtest ARM cell, `vmtest-a-scr-225109`: Ubuntu 24.04.4 arm64 under QEMU TCG, glibc 2.39. It was made tunnel-only by the served script's own `--uninstall`, since the daemon's package ships a `roomler` shim. No `--token`, so enrollment was skipped | 🔴→🟢 **P7b, the arm64 tunnel CLI and wizard.** The served `install.sh --role tunnel` failed (RC=1): dpkg answered *"package architecture (amd64) does not match system (arm64)"*. The fallback tarball then put an x86-64 binary (ELF `e_machine` 62) on PATH, *"Exec format error"*, *"no working `roomler` on PATH"*, and its own warning blamed unmet dependencies. #2641's `install.sh` against prod said *"serves no aarch64 build of the roomler CLI yet"* and installed nothing. Against a stand-in proxy serving the rehearsal's artifacts, it asked for `linux-aarch64/health`, then `linux-deb-aarch64`. dpkg set up `roomler-cli 0.4.148-1` (arm64) with its OpenSSL dependency met, and `roomler 0.4.148` ran (`e_machine` 183). The rehearsal's aarch64 wizard, after the runtime libraries a person installs (webkit2gtk-4.1, the tray library, librsvg), ran under Xvfb and was alive after 15 s, with its "Roomler Setup" window on the display |
+| 2026-10-21 | — (no roomler: the supervisor's own spawn line with `/bin/sleep` as the worker) | a throwaway tart Mac (a vmtest-golden clone), macOS 15.7.7 arm64, sudo 1.9.13p2, `admin` (uid 501) at the console. As root, perl forked a child into its own process group that exec'd `launchctl asuser 501 /usr/bin/sudo -u '#501' /bin/sleep 300`, as `spawn_worker` does, then signalled the sleep and decoded the child's wait status. Destroyed after | **P6e-2's premise, measured.** The group was `sudo` (the forked pid itself) and the sleep, as uid 501: `launchctl asuser` execs into `sudo`, so the child the supervisor reaps is `sudo`. `sudo` passed the worker's end through as its own: `kill -KILL`, `-SEGV`, `-BUS`, `-ABRT`, `-TERM` and `-HUP` came back as signals 9, 11, 10, 6, 15 and 1 (raw statuses 9, 11, 10, 6, 15, 1; no core bit). `exit 7` came back as code 7 (raw 1792) and `exit 0` as code 0. Nothing was left in the group after any of them |

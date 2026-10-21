@@ -1205,10 +1205,13 @@ jobs:
       # supervisor had never compiled for a Mac at all. FR-90 P3-5b-1:
       # `vault_proxy::`, the vault's proxy engines (the system's roots read
       # from the Mac's keychain here), which `vault::` does not match.
+      # FR-97 P6e-2: `macos_supervisor::` rides the same test build. Its crash
+      # classifier reads Darwin's signal numbers off a wait status, and a Mac
+      # is the only runner where they are checked against `libc`.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault -- hive:: vault:: vault_proxy::
+          cargo test -p roomlerd --lib --features hive,vault -- hive:: vault:: vault_proxy:: macos_supervisor::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
