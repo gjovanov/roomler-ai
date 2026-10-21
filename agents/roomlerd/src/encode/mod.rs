@@ -742,9 +742,9 @@ pub fn sw_fps_60_enabled() -> bool {
 }
 
 /// FR-119 P1 — advertise `fps-high` in `AgentCaps.video`, so a viewer offers
-/// frame rates above 60 and asks for one with `rc:fps`. Default **off**: until
-/// P2 builds the grant, the agent answers every ask at today's cap, and a
-/// picker that can never be honoured is worse than none. The probe child
+/// frame rates above 60 and asks for one with `rc:fps`, and (P2b) let the pump
+/// grant one. `ROOMLERD_FPS_HIGH`, or the `fps_high` config key through the
+/// bridge. Default **off** until the field has proven the grant. The probe child
 /// inherits the environment, so it reads the same answer the daemon would.
 pub fn fps_high_enabled() -> bool {
     tunnel_core::env::flag("FPS_HIGH", false)

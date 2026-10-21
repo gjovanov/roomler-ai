@@ -1524,6 +1524,13 @@ pub struct AgentConfig {
     /// result that opened a hardware cell. Built-in: on.
     #[serde(default)]
     pub caps_cache: Option<bool>,
+    /// FR-119 — offer a viewer that asks a frame rate above 60
+    /// (`ROOMLERD_FPS_HIGH`): advertise `fps-high`, and grant a higher rate
+    /// only on a direct path, on a rate class this host has proven (or as a
+    /// trial), and where the pipe covers it. Built-in: off. Read at start,
+    /// with the hello's capabilities, so a change needs a restart.
+    #[serde(default)]
+    pub fps_high: Option<bool>,
     /// FR-77 — encoder cells this device must not open or advertise,
     /// comma-separated `name:chroma` (`hevc_qsv:yuv444`). Unset = the
     /// built-in list; `none` = deny nothing. Env
@@ -2889,6 +2896,7 @@ pub fn test_fixture() -> AgentConfig {
         relay_probe: None,
         text_mod_neutralize: None,
         caps_cache: None,
+        fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
         vaapi_device: None,
@@ -3012,7 +3020,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 89] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 90] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3115,6 +3123,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 89]
         ("RELAY_PROBE", cfg.relay_probe),
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
         ("CAPS_CACHE", cfg.caps_cache),
+        ("FPS_HIGH", cfg.fps_high),
     ]
 }
 
