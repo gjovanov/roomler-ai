@@ -27,19 +27,19 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 
 | Step | Where | What it costs |
 |---|---|---|
-| WGC reads every arrived frame back, **inside `FrameArrived`**, before the latest-wins slot | `capture/wgc_backend.rs:557` → `copy_to_cpu` `:710` (`CopyResource` `:743`, then a synchronous `Map` and a row copy into a `Vec`) | A GPU → CPU copy plus a CPU stall per frame, including frames the slot then drops |
-| WGC's D3D11 device is on the **default adapter** | `create_d3d11_device` `wgc_backend.rs:668`, `None` at `:679` ("defer until that's a real field issue") | Which GPU holds the frames is not decided by anyone |
+| WGC reads every arrived frame back, **inside `FrameArrived`**, before the latest-wins slot | `capture/wgc_backend.rs:577` → `copy_to_cpu` `:738` (`CopyResource` `:771`, then a synchronous `Map` and a row copy into a `Vec`) | A GPU → CPU copy plus a CPU stall per frame, including frames the slot then drops |
+| WGC's D3D11 device is on the **default adapter** | `create_d3d11_device` `wgc_backend.rs:696`, `None` at `:707` ("defer until that's a real field issue") | Which GPU holds the frames is not decided by anyone |
 | The SystemContext DXGI arm reads back too, and its device is bound to the adapter that **owns the output** | `system_context/dxgi_direct.rs:366` (`find_primary_output` `:1071`); `read_acquired` `:861`; its Phase B GPU scale still ends in a readback (`vp_blt_and_read` `:702`) | Desktop Duplication cannot cross adapters (`E_INVALIDARG`), so on that arm the capture adapter is fixed |
 | `Frame` owns a `Vec<u8>` | `capture/mod.rs:82`, `data` at `:87`; `PixelFormat` is `Bgra`, `Nv12` or `I420` (`:278`) | The contract has no way to say "this frame is on the GPU" |
-| The pump converts BGRA → NV12 (or I444) **on the CPU**, BT.601 limited range | `FfmpegEncoder::convert_bgra` `encode/ffmpeg/encoder.rs:1728` (dcv, banded threads above 2 MP); the matrix is `encode/color.rs:16` | Per-pixel CPU work on every frame |
-| …then copies the planes into an `AVFrame`, uploads it for the VAAPI / D3D12 / Vulkan encoders, and submits | `encode_sync` `encoder.rs:2282`; `HwKind` `encode/ffmpeg/hwframes.rs:50` (those three kinds only) | The VAAPI, D3D12 and Vulkan cells make the full GPU → CPU → GPU round trip in our code; NVENC, QSV and AMF do the upload inside `send_frame` |
+| The pump converts BGRA → NV12 (or I444) **on the CPU**, BT.601 limited range | `FfmpegEncoder::convert_bgra` `encode/ffmpeg/encoder.rs:1794` (dcv, banded threads above 2 MP); the matrix is `encode/color.rs:16` | Per-pixel CPU work on every frame |
+| …then copies the planes into an `AVFrame`, uploads it for the VAAPI / D3D12 / Vulkan encoders, and submits | `encode_sync` `encoder.rs:2349`; `HwKind` `encode/ffmpeg/hwframes.rs:50` (those three kinds only) | The VAAPI, D3D12 and Vulkan cells make the full GPU → CPU → GPU round trip in our code; NVENC, QSV and AMF do the upload inside `send_frame` |
 | The portal arm copies twice | `capture/portal/pipewire.rs:806` (out of the PipeWire buffer), then the helper's stdout into the daemon (`capture/portal/wire.rs`, which argues for exactly this as a first version); a DmaBuf buffer is reported, never read | Two CPU copies, by design until a measurement says otherwise |
 | macOS copies the `CGDisplayStream` surface into the `Vec` | `capture/scrap_backend.rs` (the vendored scrap's quartz arm) | One copy per frame |
 
 ### 2.2 What the fleet measures today (7 days to 2026-10-21, read-only)
 
 From `agent_logs`: 142 538 FFmpeg DC pump heartbeats from 11 hosts, read-only, from mars. The "encode"
-column is the pump's `avg_encode_ms` (`peer.rs:9152`): the time inside `encode_sync`, so **conversion,
+column is the pump's `avg_encode_ms` (`peer.rs:9157`): the time inside `encode_sync`, so **conversion,
 copies, upload, submission and the packet drain together** (§3). The fps columns are the delivered rate
 between consecutive heartbeats (spaced 2.0 s). The median sits at 16–17 fps on almost every host because an
 idle desktop produces few frames, which is not a limit. So the table shows the top of the distribution, p99
@@ -99,7 +99,7 @@ only when it asks:
 | Consumer | Anchor | After C0 |
 |---|---|---|
 | the pump's CPU resample | `encode/resample.rs:461`, `:463` | `cpu()`; on the GPU path the scale happens on the GPU first (§4.3), so it passes through |
-| `FfmpegEncoder::convert_bgra` | `encode/ffmpeg/encoder.rs:1728` | takes the GPU surface instead, on a GPU cell |
+| `FfmpegEncoder::convert_bgra` | `encode/ffmpeg/encoder.rs:1794` | takes the GPU surface instead, on a GPU cell |
 | libvpx (VP9 4:4:4), openh264, Media Foundation | `encode/libvpx.rs`, `encode/openh264_backend.rs:455`, `encode/mf/sync_pipeline.rs:313` | `cpu()`, unchanged |
 | the idle detector's hash | `session_idle.rs:218` | `cpu()`; it samples a few rows, and the cost is measured in P2 |
 | the recorder and its pointer | `recording/recorder.rs`, `recording/pointer.rs` | `cpu()`, unchanged |
@@ -196,7 +196,7 @@ flowchart LR
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread (WGC, DXGI). Then a fleet week, read per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | — |
+| P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from WGC's capture thread (the DXGI arm is split with P4). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1), ships with the next agent release; the fleet read is AC1 |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | — |
 | P2 | **Windows, WGC → QSV, the first cell.** The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | — |
 | P3 | NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
@@ -207,6 +207,35 @@ flowchart LR
 
 P0 decides the rest. If convert + copy + upload turn out to be a small share of the encode stage on a backend,
 that backend's phase is not built, and the reason is recorded here.
+
+### 5.1 P0 — as built (2026-10-21)
+
+Telemetry only, on the FFmpeg DC pump's heartbeat. No knob is read in the frame path, and nothing changes
+what the pump does.
+
+| Heartbeat field | What it times | Where |
+|---|---|---|
+| `avg_convert_ms` | `convert_bgra` and the `AVFrame` build: the CPU colour conversion and a plane copy | `encode_sync`, `agents/roomlerd/src/encode/ffmpeg/encoder.rs` |
+| `avg_upload_ms` | the hardware-frame upload: VAAPI, D3D12 and Vulkan; zero for every other encoder | the same |
+| `avg_submit_ms` | `send_frame`, where NVENC, QSV and AMF upload a software frame themselves | the same |
+| `avg_drain_ms` | receiving the packets | the same |
+| `avg_readback_ms` | WGC's copy of the capture surface into CPU memory, on its capture thread. This is off the pump's clock, so `avg_capture_ms` never contained it | the `FrameArrived` handler, `agents/roomlerd/src/capture/wgc_backend.rs` |
+
+- **The four parts add up to the encode stage** (`avg_encode_ms` also includes the hop to FR-70's encoder
+  thread). They are cumulative per encoder (`StageTimes`, carried by `rate_stats()`) and reported per frame
+  over each heartbeat window. A background swap keeps the encoder struct, so it keeps counting. An inline
+  re-open builds a new encoder, and each encoder carries its own id, so a window never diffs two encoders'
+  totals.
+- **The DXGI arm is not split here.** Its readback runs while the pump waits for the worker's reply, so it is
+  already inside `avg_capture_ms`, together with the acquire wait. It is split with P4. Every other backend
+  reports `avg_readback_ms = 0`: scrap copies on the pump's clock, and the synthetic source has nothing to
+  read back.
+- **Tests:** five. They cover the window rule (the per-frame difference, an empty window, a new encoder
+  starting its own window even after it has counted more frames, distinct ids) and the readback window
+  (including a reopened capturer).
+- **Negative controls:** run together, each fails exactly its target, 2 failed / 3 passed. In NC1 the window
+  ignores the encoder id: `left: None, right: Some([12.0, 1.0, 2.0, 0.5])`. In NC2 the readback window loses its
+  reopen rule and panics on the u64 underflow the rule prevents.
 
 ## 6. Acceptance criteria
 

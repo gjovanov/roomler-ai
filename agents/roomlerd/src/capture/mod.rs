@@ -366,6 +366,19 @@ pub(crate) fn downscale_bgra_2x(
     (dst, dw, dh)
 }
 
+/// FR-118 P0 — per-frame readback milliseconds over the window between two
+/// [`ScreenCapture::readback_totals`] readings. A total that went backwards
+/// means the capturer was reopened (its counters start at zero), so the window
+/// is everything the new one counted. 0.0 when the window read nothing back.
+pub fn readback_window_ms(now: (u64, u64), base: (u64, u64)) -> f64 {
+    let base = if now.0 < base.0 { (0, 0) } else { base };
+    let frames = now.0 - base.0;
+    if frames == 0 {
+        return 0.0;
+    }
+    now.1.saturating_sub(base.1) as f64 / frames as f64 / 1000.0
+}
+
 #[async_trait::async_trait]
 pub trait ScreenCapture: Send {
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
@@ -393,6 +406,15 @@ pub trait ScreenCapture: Send {
     /// Backends that cannot tell (the pre-FR-29 default) report 0.
     fn frames_unchanged(&self) -> u64 {
         0
+    }
+
+    /// FR-118 P0 — the backend's own copy of a GPU surface into CPU memory,
+    /// cumulative `(frames, microseconds)`, for a backend that does it OFF the
+    /// pump's clock: WGC reads back on its capture thread, inside
+    /// `FrameArrived`, so the pump's `avg_capture_ms` never contained it.
+    /// `None` from every backend that does not measure it.
+    fn readback_totals(&self) -> Option<(u64, u64)> {
+        None
     }
 
     /// FR-93 P3e — what a running capture that delivers nothing is waiting
@@ -3397,6 +3419,18 @@ mod frame_tests {
         );
         // Degenerate frame area never divides by zero.
         assert_eq!(Damage::Tracked(vec![full]).area_permille(0), Some(0));
+    }
+
+    /// FR-118 P0 — the readback window: per frame, in milliseconds, between
+    /// two readings of the backend's totals.
+    #[test]
+    fn readback_window_is_per_frame_since_the_last_reading() {
+        assert_eq!(readback_window_ms((160, 600_000), (100, 300_000)), 5.0);
+        // Nothing read back in the window.
+        assert_eq!(readback_window_ms((100, 300_000), (100, 300_000)), 0.0);
+        assert_eq!(readback_window_ms((0, 0), (0, 0)), 0.0);
+        // A reopened capturer counts from zero again: its window is all of it.
+        assert_eq!(readback_window_ms((20, 80_000), (100, 300_000)), 4.0);
     }
 
     // Phase B — native-dims truth on scaled frames.

@@ -31,13 +31,13 @@ what it costs in installer size and ships with integration and e2e tests.
   `--disable-everything` plus hardware encoders only: static in `roomlerd.exe`, shared `libavcodec.so` in the .deb,
   dylibs in `roomlerd.app`. No decoders, demuxers, muxers, filters or swscale. **Linux arm64 has no FFmpeg at all**
   (openh264 + libvpx).
-- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2202`)
+- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2224`)
   and a synthetic source with a decodable 64-bit counter strip (`capture/synthetic_backend.rs:41`); `EncoderThread`
   (`encode/thread.rs:118`); the cells, denylist and probe cache; the child-process probe pattern (`encode/caps.rs`); the
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
   consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1103`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
-  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:10637`); `.roomler-partial` staging (`files.rs`).
+  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:10661`); `.roomler-partial` staging (`files.rs`).
 
 ## Decisions taken with the operator (2026-09-25)
 
@@ -90,7 +90,7 @@ what it costs in installer size and ships with integration and e2e tests.
   it is wall-clock. A lock screen or `ACCESS_LOST` re-acquires and inserts a black gap; it never aborts. A fast user
   switch terminates the worker, so the recording ends `session_changed` — a recording never follows a user switch.
 - **Recording encoder profile.** A new `RateMode { ConstantQuality { q }, Vbr { … } }` and an explicit GOP are threaded
-  through `build_encoder` (`encode/ffmpeg/encoder.rs:1422`) and `encoder_options` (`:240`); today both force
+  through `build_encoder` (`encode/ffmpeg/encoder.rs:1487`) and `encoder_options` (`:240`); today both force
   maxrate/bufsize and a 64 800-frame GOP (`:51`).
 
   | Backend | Recording options |

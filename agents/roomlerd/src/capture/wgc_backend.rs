@@ -106,6 +106,11 @@ struct SharedSlot {
     /// the capture rate. Ratio against `arrived_total` is the
     /// interesting number.
     dropped_stale: std::sync::atomic::AtomicU64,
+    /// FR-118 P0 — successful CPU readbacks (`copy_to_cpu`), and the time they
+    /// took, in the handler. Off the pump's clock, so `avg_capture_ms` cannot
+    /// see it; [`ScreenCapture::readback_totals`] reports it.
+    readback_total: std::sync::atomic::AtomicU64,
+    readback_us_total: std::sync::atomic::AtomicU64,
 }
 
 /// Internal frame representation carried from the event handler to
@@ -216,6 +221,8 @@ impl WgcCapture {
             notify: Notify::new(),
             arrived_total: std::sync::atomic::AtomicU64::new(0),
             dropped_stale: std::sync::atomic::AtomicU64::new(0),
+            readback_total: std::sync::atomic::AtomicU64::new(0),
+            readback_us_total: std::sync::atomic::AtomicU64::new(0),
         });
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -368,6 +375,18 @@ impl ScreenCapture for WgcCapture {
             return Ok(None);
         };
         Ok(Some(payload_to_frame(payload, self.monitor, self.start)))
+    }
+
+    fn readback_totals(&self) -> Option<(u64, u64)> {
+        let frames = self
+            .shared
+            .readback_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let us = self
+            .shared
+            .readback_us_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some((frames, us))
     }
 
     fn monitor_count(&self) -> u8 {
@@ -554,6 +573,7 @@ fn worker_main(
             };
 
             // Copy to staging (allocated on first use / size change).
+            let readback_started = Instant::now();
             let bgra = match copy_to_cpu(
                 &handler_d3d_device,
                 &handler_d3d_context,
@@ -568,6 +588,14 @@ fn worker_main(
                     return Ok(());
                 }
             };
+            // FR-118 P0 — counted only when it succeeded, like a frame.
+            handler_shared.readback_us_total.fetch_add(
+                readback_started.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            handler_shared
+                .readback_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let stride = w * 4;
 
             // DirtyRegions() lands on the IDirect3D11CaptureFrame2

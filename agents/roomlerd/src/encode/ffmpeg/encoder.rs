@@ -657,6 +657,9 @@ pub struct FfmpegEncoder {
     /// counter: it cost this investigation a wrong conclusion.
     swaps: u32,
     idr_count: u64,
+    /// FR-118 P0 — where `encode_sync`'s time goes, cumulative for this
+    /// encoder (a background swap keeps the struct, so it keeps counting).
+    stage: StageTimes,
     /// FR-85 P1b — a RECORDING encoder's GOP (frames between keyframes).
     /// `None` for every live encoder, whose keyframes are on demand only
     /// (`KEYFRAME_INTERVAL`); kept so a rebuild reproduces it.
@@ -789,6 +792,67 @@ pub struct RateStats {
     /// direct QSV session lands here and in NEITHER of the two above.
     pub swaps: u32,
     pub idr_count: u64,
+    /// FR-118 P0 — the encode stage, split.
+    pub stage: StageTimes,
+}
+
+/// FR-118 P0 — where `encode_sync`'s time goes, cumulative for one encoder.
+///
+/// The heartbeat's `avg_encode_ms` times the whole call, so it cannot say how
+/// much of a frame is the CPU round trip FR-118 would remove and how much is
+/// the hardware encode. The four parts, in call order:
+///
+/// - `convert`: `convert_bgra` and the `AVFrame` build (CPU colour conversion
+///   and a plane copy);
+/// - `upload`: the hardware-frame upload, VAAPI / D3D12 / Vulkan only (zero
+///   elsewhere);
+/// - `submit`: `send_frame`, where NVENC, QSV and AMF upload a software frame
+///   themselves;
+/// - `drain`: receiving the packets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageTimes {
+    /// Which encoder these counters belong to. An inline re-open builds a new
+    /// encoder whose counters start at zero, so a window that crosses one must
+    /// not be diffed against the old encoder's totals.
+    pub encoder_id: u64,
+    pub frames: u64,
+    pub convert_us: u64,
+    pub upload_us: u64,
+    pub submit_us: u64,
+    pub drain_us: u64,
+}
+
+impl StageTimes {
+    fn for_new_encoder() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            encoder_id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ..Self::default()
+        }
+    }
+
+    /// Per-frame milliseconds `[convert, upload, submit, drain]` over the
+    /// window since `prev`. A different encoder than `prev`'s means everything
+    /// this one counted is the window. `None` when the window encoded nothing.
+    pub fn window_ms_since(&self, prev: &StageTimes) -> Option<[f64; 4]> {
+        let base = if prev.encoder_id == self.encoder_id {
+            *prev
+        } else {
+            StageTimes::default()
+        };
+        let frames = self.frames.saturating_sub(base.frames);
+        if frames == 0 {
+            return None;
+        }
+        let per_frame =
+            |now: u64, then: u64| now.saturating_sub(then) as f64 / frames as f64 / 1000.0;
+        Some([
+            per_frame(self.convert_us, base.convert_us),
+            per_frame(self.upload_us, base.upload_us),
+            per_frame(self.submit_us, base.submit_us),
+            per_frame(self.drain_us, base.drain_us),
+        ])
+    }
 }
 
 /// FR-62 A1 — the HRD/VBV window (percent of maxrate) this backend opens with:
@@ -1256,6 +1320,7 @@ impl FfmpegEncoder {
             rebuilds: 0,
             swaps: 0,
             idr_count: 0,
+            stage: StageTimes::for_new_encoder(),
             gop_override: None,
             counter_pts: false,
         })
@@ -1523,6 +1588,7 @@ impl FfmpegEncoder {
                         rebuilds: 0,
                         swaps: 0,
                         idr_count: 0,
+                        stage: StageTimes::for_new_encoder(),
                         gop_override: recording.map(|r| r.gop),
                         counter_pts: recording.is_some(),
                     });
@@ -2170,6 +2236,7 @@ impl FfmpegEncoder {
             rebuilds: self.rebuilds,
             swaps: self.swaps,
             idr_count: self.idr_count,
+            stage: self.stage,
         }
     }
 
@@ -2290,22 +2357,36 @@ impl FfmpegEncoder {
             ));
         }
 
+        // FR-118 P0 — each step timed apart (`StageTimes`). A frame that fails
+        // part-way is not counted: it is not a frame the stage carried.
+        let t0 = std::time::Instant::now();
         self.convert_bgra(frame)?;
         let av = self.build_av_frame(frame.monotonic_us)?;
+        let t1 = std::time::Instant::now();
         // FR-77 P4 — a VAAPI encoder takes the pool's hardware frame, not the
         // software one it was built from.
         let av = match &self.hw {
             Some(frames) => frames.upload(&av)?,
             None => av,
         };
+        let t2 = std::time::Instant::now();
         self.encoder
             .send_frame(&av)
             .map_err(|e| anyhow!("ffmpeg send_frame failed: {}", e))?;
+        let t3 = std::time::Instant::now();
 
         self.force_keyframe = false;
         self.frame_count += 1;
 
-        self.drain_packets()
+        let packets = self.drain_packets()?;
+        let t4 = std::time::Instant::now();
+        let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
+        self.stage.frames += 1;
+        self.stage.convert_us += us(t0, t1);
+        self.stage.upload_us += us(t1, t2);
+        self.stage.submit_us += us(t2, t3);
+        self.stage.drain_us += us(t3, t4);
+        Ok(packets)
     }
 }
 
@@ -2571,6 +2652,63 @@ fn copy_plane_into_av(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FR-118 P0 — the encode stage, split ─────────────────────────────
+
+    fn stage(encoder_id: u64, frames: u64, us: [u64; 4]) -> StageTimes {
+        StageTimes {
+            encoder_id,
+            frames,
+            convert_us: us[0],
+            upload_us: us[1],
+            submit_us: us[2],
+            drain_us: us[3],
+        }
+    }
+
+    /// The heartbeat's window is the difference between two readings of the
+    /// same encoder, per frame, in milliseconds.
+    #[test]
+    fn a_window_is_the_per_frame_difference_since_the_last_heartbeat() {
+        let base = stage(7, 100, [500_000, 0, 200_000, 50_000]);
+        let now = stage(7, 160, [1_100_000, 0, 320_000, 80_000]);
+        assert_eq!(now.window_ms_since(&base), Some([10.0, 0.0, 2.0, 0.5]));
+    }
+
+    /// A window that encoded nothing reports nothing, never a division by
+    /// zero, and never the last window's numbers again.
+    #[test]
+    fn a_window_without_a_frame_is_none() {
+        let base = stage(7, 100, [500_000, 0, 200_000, 50_000]);
+        assert_eq!(base.window_ms_since(&base), None);
+        assert_eq!(
+            StageTimes::default().window_ms_since(&StageTimes::default()),
+            None
+        );
+    }
+
+    /// An inline re-open builds a new encoder whose counters start at zero.
+    /// Diffing it against the old one's totals would saturate every part to
+    /// zero (or, with more frames, mix two encoders): the window is
+    /// everything the new encoder counted.
+    #[test]
+    fn a_new_encoder_starts_its_own_window() {
+        let old = stage(7, 5_000, [50_000_000, 0, 9_000_000, 1_000_000]);
+        let new = stage(8, 40, [480_000, 40_000, 80_000, 20_000]);
+        assert_eq!(new.window_ms_since(&old), Some([12.0, 1.0, 2.0, 0.5]));
+        // Even when the new encoder has already counted MORE frames.
+        let busy = stage(8, 6_000, [72_000_000, 0, 12_000_000, 3_000_000]);
+        assert_eq!(busy.window_ms_since(&old), Some([12.0, 0.0, 2.0, 0.5]));
+    }
+
+    /// Every encoder gets its own id, so the rule above can tell them apart.
+    #[test]
+    fn each_new_encoder_gets_a_distinct_id() {
+        let a = StageTimes::for_new_encoder();
+        let b = StageTimes::for_new_encoder();
+        assert_ne!(a.encoder_id, b.encoder_id);
+        assert_ne!(a.encoder_id, 0, "0 is the default's id, never an encoder's");
+    }
 
     // ── FR-85 P1b — the recording profile ───────────────────────────────
 
