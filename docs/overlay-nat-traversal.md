@@ -379,7 +379,7 @@ cascade's guarantees while replacing its reactive counters:
   a carrier going away must not take R4's tunnel route with it.
 - **WireGuard is its whole header, never its first byte (#2002).** The mux splits each
   inbound payload between the WG and tunnel routes with `payload_is_wg_or_disco`
-  ([`derp.rs:269`](../crates/tunnel-core/src/transport/derp.rs#L269)), and the server's
+  ([`derp_frame.rs:39`](../crates/remote_control/src/derp_frame.rs#L39)), and the server's
   relay reads the same function to decide what its tunnel shaper applies to
   ([`modules/network/src/derp.rs:602`](../crates/modules/network/src/derp.rs#L602)). It
   read the first byte only, 1..=4, and quinn **greases QUIC's fixed bit** by default
@@ -402,10 +402,10 @@ cascade's guarantees while replacing its reactive counters:
   peer, and the last caller of `tunnel_conn_for` takes it, so a Hive replica stream on it
   would take a `quic-derp-v1` tunnel's route between the same two devices, and a second
   stream between the pair the first's. `hive_conn_for(peer, tag)`
-  ([`derp.rs:521`](../crates/tunnel-core/src/transport/derp.rs#L521)) vends a route per
+  ([`derp.rs:495`](../crates/tunnel-core/src/transport/derp.rs#L495)) vends a route per
   stream, tagged with its grant's id: its payloads travel as `RMHIVE01` · the 12-byte tag ·
   the packet, and `deliver` splits them off FIRST
-  ([`derp.rs:596`](../crates/tunnel-core/src/transport/derp.rs#L596)), so they never reach
+  ([`derp.rs:570`](../crates/tunnel-core/src/transport/derp.rs#L570)), so they never reach
   the WG or tunnel consumer. ⚠️ A Hive miss (a tag nobody holds, or a frame cut short) is
   counted in its own `hive_drops` and never reported `Unrouted`, since that event sends the
   runtime after a WG peer to follow. ⚠️ Retirement follows #32's rule: a dropped Hive conn

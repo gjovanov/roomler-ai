@@ -37,7 +37,7 @@ That is the whole asymmetry.
 
 **What is NOT forced is two enrollments.** That comes from us: the hub keys a device's
 control WS on `agent_id` and a second connection displaces the first
-(`crates/modules/fleet/src/hub.rs:92`), so we gave each half its own identity and the
+(`crates/modules/fleet/src/hub.rs:94`), so we gave each half its own identity and the
 Mac became two rows. Cost, paid daily: every `roomler exec` / `roomler ssh` must target
 the *right* row (the GUI row cannot reach root, the root row cannot see the screen), the
 install needs two tokens, and Devices shows one machine twice.
@@ -98,9 +98,9 @@ the session has to reach the worker some other way.
 ### Why not "let the worker open its own WS for the session"
 
 Tempting, and it would remove the IPC entirely. It cannot work as-is: `Hub::register_agent`
-(`crates/modules/fleet/src/hub.rs:374`) is keyed on `agent_id`, and a second connection
+(`crates/modules/fleet/src/hub.rs:376`) is keyed on `agent_id`, and a second connection
 **displaces** the first — the displaced socket is cancelled within milliseconds by design
-(`hub.rs:92-97`). A worker dialling in as the same device would knock the daemon's control
+(`hub.rs:94-99`). A worker dialling in as the same device would knock the daemon's control
 WS off the air, which is precisely the login/displace/relaunch loop P1's stand-down exists
 to prevent. Making it work would mean teaching the server about session-scoped secondary
 connections: a server change, a new authenticated surface, and a new way for a compromised

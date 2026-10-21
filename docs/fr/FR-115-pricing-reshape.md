@@ -129,12 +129,12 @@ landed yet is computed at one seat, the floor, so a missing number can only unde
 
 Every org is created on `free` (`crates/services/src/dao/tenant.rs:284`), on every server.
 On the hosted service that is a plan; on a self-hosted server it is only the absence of
-one. So `Core::plans_sold` (`crates/core/src/state.rs:127`) is true only where the hosted
-`saas` module is compiled in and switched on (`crates/api/src/state.rs:285`). The published
+one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the hosted
+`saas` module is compiled in and switched on (`crates/api/src/state.rs:298`). The published
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
-(`crates/modules/remote/src/controller.rs:698`) and the meeting sweep
+(`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`).
 
 ⚠️ Found while documenting P5, after P1 and P3 had merged. Without the flag, P1's
@@ -190,30 +190,31 @@ a live session is **never** ended by the fence (`business-model.md` §6 rule 4).
 like the device cap: no org is over it today.
 
 **As built (P3).** The authz gate reads the cap from the device's org
-(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:605`) and hands it to the hub
+(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:652`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1524`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1577`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
-must count against the controller's org. That is **P3b**; until it lands, a cross-org session
-counts against the device's org, and an outsider's session (FR-52's extauth path) opens
+must count against the controller's org. That is **P3b** (#2637, merged dark); until
+`rc.session_slots` is switched on, a cross-org session counts against the device's org, and an
+outsider's session (FR-52's extauth path) opens
 uncapped. A refusal is `org_session_limit`
 (`crates/remote_control/src/error.rs:41`), which the viewer does not retry
-(`ui/src/composables/useRemoteControl.ts:716`). It names the person and the device holding
+(`ui/src/composables/useRemoteControl.ts:722`). It names the person and the device holding
 the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
 session ending or Business. Kill switch `rc.org_session_cap = false`.
 
 ### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
-(`crates/modules/fleet/src/hub.rs:1512`). Under tenant affinity, that hub holds every live
+(`crates/modules/fleet/src/hub.rs:1565`). Under tenant affinity, that hub holds every live
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
 uncapped (`crates/modules/remote/src/extauth.rs:305`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
-instant can both pass (`hub.rs:1520`).
+instant can both pass (`hub.rs:1573`).
 
 **The record: session slots in the cluster directory.** C-1's directory
 (`crates/core/src/cluster/directory.rs`) already keeps per-entity records in Redis on exactly
@@ -253,7 +254,7 @@ sequenceDiagram
 **Why this is durable.**
 
 - **One atomic claim.** The Lua claim drops expired members, checks the count and adds the
-  session in one step, so the race at `hub.rs:1520` closes.
+  session in one step, so the race at `hub.rs:1573` closes.
 - **It heals itself.** A lease lives 90 s and is renewed every 30 s by the pod that holds the
   session. A pod that dies stops renewing, and its slots free themselves within 90 s. A Redis
   restart loses the set, but renewal is an upsert, so within one renewal round every live
@@ -338,7 +339,7 @@ commitment 2). A throttle that delays a WireGuard handshake past its retry windo
 into "down" for exactly the hosts that have no other path: symmetric NAT, full-tunnel VPNs. So
 the throttle shapes **bulk only**:
 
-| Frame class (`crates/tunnel-core/src/transport/derp.rs:269`) | Throttled when over allowance? |
+| Frame class (`crates/remote_control/src/derp_frame.rs:39`) | Throttled when over allowance? |
 |---|---|
 | WireGuard types 1–3 (handshake initiation, response, cookie) | **never**: tiny, and the handshake must complete |
 | disco (`DISCO_MAGIC`), the path-upgrade probes | **never**: they are how a pair climbs back off DERP |
@@ -369,9 +370,9 @@ flowchart LR
   lock-free lookup, and only for frames already past the ACL; it is measured with FR-20's bench
   (`crates/modules/network/src/derp.rs:704`) against FR-18's latency budget before it ships.
 - **PoPs are DB-free and must stay so.** Tickets cannot carry the flag: they live 24 h and are
-  checked once, at connect (`crates/remote_control/src/derp_ticket.rs:32`). Instead the API,
+  checked once, at connect (`crates/remote_control/src/derp_ticket.rs:33`). Instead the API,
   which already polls each PoP's `/stats`, sends the PoP the set on that poll, signed with the
-  ticket signer, which the PoP already verifies (`crates/derp-relay/src/main.rs:47`). A PoP
+  ticket signer, which the PoP already verifies (`crates/derp-relay/src/main.rs:50`). A PoP
   that has not heard a fresh set within 3 poll periods drops it: it fails open, never closed.
 - **The bucket** is per network (the org's mesh), at O3's rate: 1 Mbit/s on Free, 4 Mbit/s on
   paid plans. Over the bucket, a frame is dropped, as R4 already does for tunnels: WireGuard
@@ -533,8 +534,8 @@ room is piped across workers. That is O4.
 | P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | ✅ merged #2565 (`069981677`), promoted 2026-10-20 (`hosted-20261020-9776afb`); AC1 and AC2 field-verified on prod |
 | P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | ✅ merged #2565 (`069981677`) against the fake; proven against Stripe's test mode, including a test-card checkout in a real browser (#2604, AC3 + AC4). A Free `year` price that put annual on every page was fixed by #2603 |
 | P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`73bc6daeb`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
-| P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | 📝 planned 2026-10-20 (*P3b, as proposed*: session slots in the cluster directory); O6 + O7 decided by the operator 2026-10-20 |
-| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 design approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `e918d9e56`) is on the API pods, shipped dark; P4a-3 (#2629, `5ffa1d84e`) is the analytics surface; P4a-2 (#2633, the PoPs via the signed `/stats` poll) is in review. O3's measurement comes before the switch is turned on |
+| P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | 🟡 merged dark 2026-10-20: #2637 (`ac470bba5`), session slots in the cluster directory (*P3b, as proposed*), with O6 + O7 as the operator decided them that day. The integration lane ran all 11 `org_session_cap` tests, two pods among them. Next: a promote, then the field run with the switch on (two test orgs, red first with it off) |
+| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 design approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `e918d9e56`) is on the API pods, shipped dark; P4a-3 (#2629, `5ffa1d84e`) is the analytics surface; P4a-2 (#2633, `be50cfb0a`) merged 2026-10-20: the PoPs throttle by the set the API signs and pushes on its `/stats` poll, and a PoP that holds no set throttles nothing. O3's measurement comes before the switch is turned on |
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | 🟡 designed 2026-10-20 (#2619); P4b-1 (#2622, `df7648ccf`) merged dark: TURN usernames name the paying org (`:org-`), and the statsdb collector is off. Next: pin coturn (it runs `:latest`), bring the worker ConfigMaps into the deploy repo, add `redis-statsdb` one worker at a time; P4b-2 the PoPs |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
