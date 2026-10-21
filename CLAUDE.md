@@ -783,12 +783,13 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
 - **[MEDIUM]** [2026-08-23] **User sessions are irrevocable** — no `token_epoch`
   check, no password-change route, no refresh rotation. `docs/security-baseline.md` §1.
 - **[MEDIUM]** [2026-08-23] **The updater's manifest is unsigned** — version + url +
-  hash are not attested as a unit — and the tunnel CLI's separate `self-update` does
-  not share `download_asset`, so it is not key-pinned. Publisher trust on the
+  hash are not attested as a unit. Publisher trust on the
   artifact itself is closed on all three platforms (`ship-it` skill §3), and so,
   since FR-97 P6a, is the downgrade the manifest allowed: every installable must state
   the claimed version inside its signed bytes (`docs/code-signing.md` §7b), so a
-  hostile manifest can withhold an update but no longer swap in an older one.
+  hostile manifest can withhold an update but no longer swap in an older one. The
+  tunnel CLI's `self-update` is key-pinned too since FR-97 P6b (tunnel-core's
+  `pgp_verify`, every OS), from the first tunnel release that carries it.
 - **[MEDIUM]** [2026-04-17, rewritten 2026-08-29 by **FR-27**, #854] Host consent now
   has a **`PromptSurface` chain** — native (`win`·`mac`·`x11`) → companion
   (`roomler-desktop` over LocalAPI) → notification (Linux, the desktop's own, with
@@ -824,11 +825,12 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
   SHA-256 and fails OPEN when the manifest carries no digest** — the same hole the
   agent updater closed, in the binary that is the sole updater on tunnel-only hosts.
   Rated LOW after measuring the exposure: it has exactly one caller, the manual
-  subcommand — no timer, no daemon-driven invocation. ⚠️ The fix is not a
-  copy-paste: `code_signature.rs` lives in `roomlerd`, which depends **on**
-  `roomler-cli`. The shared home is `crates/tunnel-core`, but it is on `windows-sys`
-  **0.61** while the agent is on **0.59**, so the WinTrust bindings must be
-  re-checked on the move, not assumed.
+  subcommand — no timer, no daemon-driven invocation. **Fixed on master by FR-97 P6b,
+  open until a tunnel release ships it**: the CLI requires the artifact's `.asc`
+  against the pinned key on every OS (`pgp_verify`, moved to `crates/tunnel-core`).
+  ⚠️ It shares the PGP check, NOT `code_signature.rs`: WinTrust stays in `roomlerd`
+  (tunnel-core is on `windows-sys` **0.61**, the agent on **0.59**), and no OS needed
+  it, because Windows takes the same `.asc` check.
 - **[LOW]** [2026-04-20] NVENC `ActivateObject` returns 0x8000FFFF on RTX 5090
   Blackwell for H.264/HEVC/AV1 MFTs regardless of adapter binding. The cascade routes
   around it; AV1 has no alternative and is filtered from advertised caps by the

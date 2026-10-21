@@ -62,6 +62,9 @@ pub mod overlay;
 /// address is reached through the mesh (remote desktop's ICE). Ungated: the
 /// overlay WRITES it, but a build without one still asks.
 pub mod overlay_footprint;
+/// The pinned-key check of a release artifact's `.asc` sidecar. Here, not in
+/// the agent, so the CLI's `self-update` shares it (FR-97 P6b).
+pub mod pgp_verify;
 pub mod policy;
 pub mod signaling;
 /// The tunnel-session driver's signaling seam — the cloneable sink + single-

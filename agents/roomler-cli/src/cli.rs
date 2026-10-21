@@ -1002,7 +1002,7 @@ where
                      Update with:  roomlerd self-update"
                 );
             }
-            let cfg = config::load(cli.config).context("loading tunnel config")?;
+            let cfg = update::config_for_self_update(cli.config)?;
             update::self_update(&cfg, check).await
         }
         // Read-only LocalAPI verbs: no config/token — talk straight to the

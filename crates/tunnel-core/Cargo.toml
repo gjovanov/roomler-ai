@@ -112,7 +112,13 @@ blake2 = { version = "0.10", optional = true }
 # authenticator"), so its comparison must be constant-time. Already in the
 # lock transitively; this makes it a real dependency rather than an accident.
 subtle = { version = "2.6", optional = true, default-features = false }
-base64 = { workspace = true, optional = true }
+# Unconditional since FR-97 P6b: `pgp_verify` de-armors the release `.asc`
+# sidecars for the agent's updater AND the CLI's `self-update`, and the CLI
+# builds this crate without `overlay`.
+base64 = { workspace = true }
+# `pgp_verify`'s ed25519 check. Already in the graph through rustls, quinn and
+# rcgen (all ring-only, above), so a direct dependency compiles nothing new.
+ring = "0.17"
 
 # Overlay direct LAN path (rc.131/132): enumerate the node's local interface
 # IPv4s so a multi-homed host advertises ALL its LAN endpoints (not just the
@@ -193,7 +199,7 @@ libc = "0.2"
 
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
-overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs", "dep:blake2", "dep:subtle"]
+overlay = ["dep:boringtun", "dep:if-addrs", "dep:blake2", "dep:subtle"]
 # Phase 3: the OS TUN device (`overlay::tun::SystemTun`) on top of the WG
 # core. `overlay` alone gives the WG device + the bridge logic + the
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
