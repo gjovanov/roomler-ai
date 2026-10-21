@@ -117,7 +117,7 @@
         </template>
         <v-list-item-title>{{ s.title }}</v-list-item-title>
         <v-list-item-subtitle>
-          {{ s.device_name || s.device_id }} · {{ s.folder }}
+          {{ agentLabel(s.device_id, s.device_name || s.device_id) }} · {{ s.folder }}
           <span v-if="s.account"> · {{ s.account }}</span>
           <span v-if="s.refusal"> · {{ s.refusal }}</span>
           <span v-else-if="s.end_reason"> · {{ s.end_reason }}</span>
@@ -216,6 +216,7 @@ import { useI18n } from 'vue-i18n'
 import { isAdopted, isLive, useHiveStore, type HiveSession, type HiveSessionStatus } from '@/stores/hive'
 import { useDeviceStore } from '@/stores/devices'
 import { useAuthStore } from '@/stores/auth'
+import { useNodeLabel } from '@/composables/useNodeLabel'
 import HivePurgeDialog from '@/components/hive/HivePurgeDialog.vue'
 import { MAX_QUERY_CHARS, snippetParts, useHiveSearch, type SearchHit } from '@/composables/useHiveSearch'
 
@@ -226,6 +227,11 @@ const hive = useHiveStore()
 const devices = useDeviceStore()
 const auth = useAuthStore()
 const tenantId = computed(() => route.params.tenantId as string)
+// FR-116 AC4 — a session names its device as the Devices page does: the
+// session keeps the machine name it was made on (`device_name`), so a device
+// renamed "Reception PC" read DESKTOP-… here. The join is the device id; the
+// kept name only for a device this org no longer lists.
+const { agentLabel, ensureLoaded } = useNodeLabel()
 
 // ─── P2i-3 — the search box ────────────────────────────────────────────────
 
@@ -391,6 +397,8 @@ onMounted(() => {
   void hive.fetchSessions(tenantId.value)
   // Asked again at every visit: archive replicas come and go.
   void hive.checkSearchable(tenantId.value)
+  // The devices each row is named by (the shell has usually loaded them).
+  ensureLoaded(tenantId.value)
 })
 </script>
 

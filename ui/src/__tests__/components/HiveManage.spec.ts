@@ -21,6 +21,19 @@ const hoisted = vi.hoisted(() => ({
   sessions: [] as unknown[],
   copied: {} as Record<string, boolean>,
   user: { id: 'u1' } as { id: string } | null,
+  /** The org's devices, as the shell has loaded them (FR-116 AC4). */
+  agents: [] as { id: string; name: string; display_name?: string }[],
+}))
+vi.mock('@/stores/agents', () => ({
+  useAgentStore: () => ({
+    get agents() {
+      return hoisted.agents
+    },
+    fetchAgents: vi.fn(),
+  }),
+}))
+vi.mock('@/stores/tunnelClients', () => ({
+  useTunnelClientStore: () => ({ clients: [], fetchTunnelClients: vi.fn() }),
 }))
 vi.mock('@/stores/hive', async (importOriginal) => {
   const real = await importOriginal<typeof import('@/stores/hive')>()
@@ -106,6 +119,7 @@ beforeEach(() => {
   hoisted.sessions = [session()]
   hoisted.copied = { t1: true }
   hoisted.user = { id: 'u1' }
+  hoisted.agents = []
   hoisted.checkServed.mockResolvedValue(true)
 })
 
@@ -217,5 +231,30 @@ describe('HiveManage (FR-90 P2j-5)', () => {
     const accepted = render()
     await flushPromises()
     expect(by(accepted, 'in-progress').exists(), 'accepted: no longer in flight').toBe(false)
+  })
+})
+
+describe('HiveManage — the device by its display name (FR-116 AC4)', () => {
+  it('names the device as the Devices page does, and keeps the session’s name only for a device not listed', async () => {
+    hoisted.agents = [{ id: 'd1', name: 'laptop', display_name: 'Reception PC' }]
+    const w = render()
+    await flushPromises()
+    await open(w)
+    expect(textOf(w, 'explain'), 'the listed device, by its display name').toContain('managed session on Reception PC')
+    hoisted.manage.mockResolvedValue({
+      outcome: 'accepted',
+      session: session({ origin: undefined, status: 'running', accepted_at: 'now' }),
+    })
+    await by(w, 'submit').trigger('click')
+    await flushPromises()
+    expect(textOf(w, 'outcome'), 'said with the display name').toContain('It is a managed session now, on Reception PC.')
+    w.unmount()
+
+    // A device this org no longer lists: the machine name the session kept.
+    hoisted.agents = [{ id: 'other', name: 'elsewhere', display_name: 'Elsewhere' }]
+    const gone = render()
+    await flushPromises()
+    await open(gone)
+    expect(textOf(gone, 'explain'), 'the kept name').toContain('managed session on laptop')
   })
 })

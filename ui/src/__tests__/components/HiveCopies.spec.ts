@@ -259,6 +259,21 @@ describe('HiveCopies (FR-90 P2j-1)', () => {
     expect(notMovable(w), 'an adopted session stays').toContain('stays where it runs')
   })
 
+  it('names the target by its display name, the move’s kept name only for a device not listed (FR-116 AC4)', async () => {
+    // The move kept the machine name; the Devices page calls the device "Big box".
+    const promotion = { id: 'm1', to: 'd', to_name: 'workstation', folder: '/work/app', from: 'p', from_fence: 2, by: 'u-owner', state: 'syncing', started_at: '', deadline: '', teleport: false, fork: false }
+    let w = await render(record({ promotion }))
+    expect(w.find('[data-testid="hive-copies-moving"]').text(), 'the listed device, by its display name').toContain(
+      'Moving to Big box: the copy is catching up.',
+    )
+    w.unmount()
+
+    w = await render(record({ promotion: { ...promotion, to: 'gone', to_name: 'gone-box' } }))
+    expect(w.find('[data-testid="hive-copies-moving"]').text(), 'a device not listed: the kept name').toContain(
+      'Moving to gone-box: the copy is catching up.',
+    )
+  })
+
   it('warns when a copy that is no target holds more than every target', async () => {
     const w = await render(
       record({}, [member('p', 'primary', 'joined', 40), member('a', 'owner', 'joined', 31), member('arch', 'archive', 'joined', 40)]),
