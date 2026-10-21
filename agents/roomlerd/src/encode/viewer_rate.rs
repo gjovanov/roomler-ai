@@ -356,6 +356,10 @@ pub struct ViewerFeedback {
     report: std::sync::atomic::AtomicU32,
     age: std::sync::atomic::AtomicU64,
     link: std::sync::atomic::AtomicU64,
+    /// FR-119 P1 — the frame rate this viewer asked for with `rc:fps`; `0` =
+    /// it never asked. Unlike the three reports above this is not a per-window
+    /// signal: it stands until the viewer asks again, so it is read, never taken.
+    fps_asked: std::sync::atomic::AtomicU32,
 }
 
 impl ViewerFeedback {
@@ -372,6 +376,20 @@ impl ViewerFeedback {
     /// Consume the decode report, leaving "no signal" behind.
     pub fn take_report(&self) -> u32 {
         self.report.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// FR-119 P1 — record the viewer's frame-rate ask (`rc:fps`).
+    pub fn store_fps_ask(&self, fps: u32) {
+        self.fps_asked
+            .store(fps, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// FR-119 P1 — the viewer's standing frame-rate ask, if it made one.
+    pub fn fps_ask(&self) -> Option<u32> {
+        match self.fps_asked.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            fps => Some(fps),
+        }
     }
 
     /// The reported fps WITHOUT consuming the report — session telemetry

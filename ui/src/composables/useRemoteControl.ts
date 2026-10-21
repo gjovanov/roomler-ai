@@ -111,6 +111,15 @@ import {
 import { keepBusySetMessage, parseKeepBusyState, type KeepBusyRequest, type KeepBusyState } from './keepBusy'
 import { parseDisplayMatchState, type DisplayMatchState } from './displayMatch'
 import {
+  FRAME_RATE_STORAGE_KEY,
+  agentOffersHighRefresh,
+  fpsWireMessage,
+  frameRateAnswerOf,
+  frameRateOptions,
+  toFrameRate,
+  type FrameRate,
+} from './frameRate'
+import {
   createRelAccumulator,
   relativeAutoSwitchedOff,
   relativeButtonMessage,
@@ -1118,6 +1127,13 @@ export interface RcVideoInfo {
   /** FR-93 P2 — did a person at the screen have to allow this capture?
    *  `true` only for the portal. Present exactly when `capture_arm` is. */
   attended?: boolean
+  /** FR-119 P1 — the frame rate the stream runs at. Present only from an agent
+   *  advertising `fps-high` (`composables/frameRate.ts`). */
+  fps?: number
+  /** FR-119 P1 — the viewer's `rc:fps` ask and why the agent did not grant it
+   *  (`'unproven'`, `'constrained'`). Present together, only when refused. */
+  fps_asked?: number
+  fps_reason?: string
 }
 
 /** FR-93 P2 (FR-45 AC8 option b) — the capture pill: which Linux arm serves
@@ -1489,6 +1505,16 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         // FR-93 P2 — optional; only a Linux agent names its arm.
         ...(typeof obj.capture_arm === 'string' && obj.capture_arm.length > 0
           ? { capture_arm: obj.capture_arm, attended: obj.attended === true }
+          : {}),
+        // FR-119 P1 — optional; only an agent advertising `fps-high` says
+        // what the stream runs at, and, when it refused an ask, what and why.
+        ...(typeof obj.fps === 'number' && Number.isFinite(obj.fps)
+          ? {
+              fps: obj.fps,
+              ...(typeof obj.fps_asked === 'number' && typeof obj.fps_reason === 'string'
+                ? { fps_asked: obj.fps_asked, fps_reason: obj.fps_reason }
+                : {}),
+            }
           : {}),
       },
     }
@@ -2062,6 +2088,26 @@ function readStoredScalePct(): number {
 function persistScalePct(n: number) {
   try {
     globalThis.localStorage?.setItem(SCALE_CUSTOM_PCT_STORAGE_KEY, String(n))
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** FR-119 P1 — the viewer's frame-rate pick, per browser (a high-refresh screen
+ *  is a property of where the viewer sits, not of the device it controls).
+ *  60, today's rate, when nothing valid is stored. */
+function readStoredFrameRate(): FrameRate {
+  try {
+    return toFrameRate(globalThis.localStorage?.getItem(FRAME_RATE_STORAGE_KEY)) ?? 60
+  } catch {
+    /* privacy mode: default */
+  }
+  return 60
+}
+
+function persistFrameRate(fps: FrameRate) {
+  try {
+    globalThis.localStorage?.setItem(FRAME_RATE_STORAGE_KEY, String(fps))
   } catch {
     /* best-effort */
   }
@@ -5050,6 +5096,12 @@ export function useRemoteControl(
   const resolution = ref<RcResolutionSetting>({ mode: 'original' })
   // Tracks the last agentId we loaded + persist under. Set in connect().
   let resolutionAgentId: string | null = null
+  /** FR-119 P1 — the frame rate this viewer asks for (`rc:fps`), remembered per
+   *  browser. Sent only to an agent advertising `fps-high`. */
+  const frameRate = ref<FrameRate>(readStoredFrameRate())
+  /** FR-119 P1 — the picker's options for the connected agent. The host's
+   *  screen refresh is not reported yet, so it decides nothing here. */
+  const frameRateChoices = computed(() => frameRateOptions(agent?.value?.capabilities?.video, null))
   /** Per-agent codec override bookkeeping Ã¢ÂÂ set in connect(), cleared in
    *  disconnect() so an idle post-session global pick can't silently write
    *  the last agent's override. */
@@ -6908,6 +6960,26 @@ export function useRemoteControl(
     if (resolutionAgentId) persistResolution(resolutionAgentId, next)
     sendResolutionPreference()
   }
+
+  /** FR-119 P1 — send the frame-rate pick over the control DC, to an agent that
+   *  advertises `fps-high` only: an older one cannot parse `rc:fps`. No-op while
+   *  the channel is closed; `channels.control.onopen` calls this, so a reload
+   *  re-asks without a click. The answer comes back in `rc:video-info`. */
+  function sendFrameRatePreference() {
+    if (!agentOffersHighRefresh(agent?.value?.capabilities?.video)) return
+    sendControl(fpsWireMessage(frameRate.value))
+  }
+
+  /** FR-119 P1 — the viewer picked a frame rate. */
+  function setFrameRate(next: FrameRate) {
+    frameRate.value = next
+    persistFrameRate(next)
+    sendFrameRatePreference()
+  }
+
+  /** FR-119 P1 — the agent's answer, from the latest `rc:video-info`; `null`
+   *  from an agent without `fps-high`. */
+  const frameRateAnswer = computed(() => frameRateAnswerOf(videoInfo.value))
 
   /** Switch render path. Only takes effect on the next `connect()` Ã¢ÂÂ
    *  switching mid-session would require tearing down the receiver
@@ -9815,6 +9887,8 @@ export function useRemoteControl(
       // rc.199 Ã¢ÂÂ re-emit the stored Priority dial so a reloaded session
       // restores the operator's sharpness/smoothness choice without a click.
       sendPriorityPreference()
+      // FR-119 P1 — re-ask for the stored frame rate (agents with fps-high only).
+      sendFrameRatePreference()
     }
     // The control DC closing while the session still reports
     // 'connected' means the transport died under us (SCTP teardown
@@ -13072,6 +13146,11 @@ export function useRemoteControl(
     setScaleCustomPercent,
     resolution,
     setResolution,
+    /** FR-119 P1 — the frame-rate pick, its options, and the agent's answer. */
+    frameRate,
+    frameRateChoices,
+    frameRateAnswer,
+    setFrameRate,
     renderPath,
     setRenderPath,
     webcodecsSupported,
