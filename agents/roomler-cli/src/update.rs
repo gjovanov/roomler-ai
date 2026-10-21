@@ -579,9 +579,128 @@ fn deb_version_is(version: &str, offered: &str) -> bool {
     upstream.replace('~', "-") == offered
 }
 
+/// The config `self-update` reads its server from. Run under `sudo` (a
+/// root-owned install dir, `dpkg -i`), the default config path is root's own,
+/// which has no enrollment. So, without an explicit `--config`, a config not
+/// found there is read from the invoking user's home (`SUDO_USER`), at the same
+/// place relative to it. Only its server URL is used, and that user could run
+/// the update as root anyway, so reading their own file grants nothing.
+pub fn config_for_self_update(path: Option<std::path::PathBuf>) -> Result<TunnelConfig> {
+    let explicit = path.is_some();
+    match crate::config::load(path) {
+        Ok(cfg) => Ok(cfg),
+        Err(e) if !explicit => match sudo_user_config_path() {
+            Some(p) if p.exists() => crate::config::load(Some(p.clone())).with_context(|| {
+                format!("loading the invoking user's tunnel config {}", p.display())
+            }),
+            _ => Err(e).context("loading tunnel config"),
+        },
+        Err(e) => Err(e).context("loading tunnel config"),
+    }
+}
+
+/// The invoking user's config under `sudo`: the default path, re-based from
+/// this process's home onto theirs.
+#[cfg(unix)]
+fn sudo_user_config_path() -> Option<std::path::PathBuf> {
+    let user = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "root")?;
+    let their_home = home_of(&user)?;
+    let ours = crate::config::default_config_path().ok()?;
+    let our_home = directories::BaseDirs::new()?.home_dir().to_path_buf();
+    rebase_home(&ours, &our_home, &their_home)
+}
+
+#[cfg(not(unix))]
+fn sudo_user_config_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// `path` moved from under `from` to under `to`; `None` when it is not under
+/// `from`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn rebase_home(
+    path: &std::path::Path,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    path.strip_prefix(from).ok().map(|rel| to.join(rel))
+}
+
+/// An account's home directory (`getpwnam_r`, the buffer grown on `ERANGE`).
+#[cfg(unix)]
+fn home_of(user: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(user).ok()?;
+    let mut buf = vec![0 as libc::c_char; 1024];
+    // SAFETY: an all-zero `passwd` is a valid value (null pointers, zero ids).
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    loop {
+        // SAFETY: every pointer is to memory this frame owns, sized as
+        // passed; the answer points into `buf`, read below while it lives.
+        let rc = unsafe {
+            libc::getpwnam_r(
+                name.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 64 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        break;
+    }
+    // SAFETY: `pw_dir` is non-null and points into `buf`, which is alive.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        dir.to_bytes(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FR-97 P6b — `sudo roomler self-update` reads the invoking user's config.
+    #[test]
+    fn a_config_path_moves_from_one_home_to_another() {
+        use std::path::Path;
+        assert_eq!(
+            rebase_home(
+                Path::new("/root/.config/x/config.toml"),
+                Path::new("/root"),
+                Path::new("/home/u"),
+            )
+            .as_deref(),
+            Some(Path::new("/home/u/.config/x/config.toml"))
+        );
+        assert_eq!(
+            rebase_home(
+                Path::new("/etc/x.toml"),
+                Path::new("/root"),
+                Path::new("/home/u")
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_has_a_home() {
+        assert_eq!(
+            home_of("root").as_deref(),
+            Some(std::path::Path::new("/root"))
+        );
+        assert_eq!(home_of("no-such-account-p6b"), None);
+    }
 
     #[test]
     fn rc_compare() {

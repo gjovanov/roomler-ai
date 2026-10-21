@@ -473,8 +473,10 @@ Then it installs by host:
 | Linux where the binary came from the `.deb` (`install.sh --role tunnel` on Debian and Ubuntu) | `dpkg -i` of the verified `.deb`, so dpkg's record names the version on disk |
 
 A binary in a root-owned directory needs root to replace, and `dpkg -i` always
-does: run `sudo roomler self-update`. The Linux and macOS install works from the
-first tunnel release after P6b; an older CLI there points at the manual download.
+does: run `sudo roomler self-update`. Under `sudo` it reads the server from your
+own config, not root's (which has no enrollment), unless `--config` names one. The
+Linux and macOS install works from the first tunnel release after P6b; an older CLI
+there points at the manual download.
 This is the single updater for tunnel-only hosts.
 
 **Daemon hosts** (installed a "be-accessed" role — the agent MSI) do NOT need
