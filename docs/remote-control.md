@@ -1452,18 +1452,18 @@ holds:
 sequenceDiagram
   autonumber
   participant B as Viewer (browser)
-  participant H as Hub (relays; records the verdict)
+  participant H as Hub (relays, records the verdict)
   participant D as Device (roomlerd)
-  Note over D: P1a: one P-256 key per enrollment,<br/>peer-auth/&lt;tenant&gt;.json; the public half<br/>rides the hello and the device row
+  Note over D: P1a: one P-256 key per enrollment,<br/>peer-auth/#lt;tenant#gt;.json, the public half<br/>rides the hello and the device row
   Note over B: P2b: one P-256 key per user,<br/>non-extractable, in IndexedDB
   B->>H: rc:sdp.offer + peer_auth {nonce, key, sig}
   H->>D: relayed verbatim
-  Note over D: P1c: verify the offer (role "offer", empty answer fp);<br/>look the key up for this user, remember it if new
+  Note over D: P1c: verify the offer (role "offer", empty answer fp),<br/>look the key up for this user, remember it if new
   Note over D: P1b: sign the answer (role "answer",<br/>both fingerprints, the same nonce)
   D->>H: rc:sdp.answer + peer_auth {key, sig} + peer_auth_verdict
   Note over H: records the verdict on session_started<br/>(the device's word), relays the rest
   H->>B: rc:sdp.answer + peer_auth {key, sig}
-  Note over B: P2a: verify BEFORE setRemoteDescription;<br/>pin the key per (user, device) on first use
+  Note over B: P2a: verify BEFORE setRemoteDescription,<br/>pin the key per (user, device) on first use
   B-->>D: DTLS only with the certificates both signatures named
 ```
 
@@ -1690,7 +1690,7 @@ sequenceDiagram
         A->>A: tick (an eighth of the limit, between 0.25 s and 5 s)
     end
     A->>V: rc:idle ends_in_ms (control channel, a fifth of the limit before the end)
-    Note over V: countdown banner; any input sent from here withdraws it
+    Note over V: countdown banner, any input sent from here withdraws it
     Note over A: limit reached: the device-end arm, as for the host's Disconnect
     A->>A: peer.stop_serving()
     A->>S: rc:terminate idle_timeout, limit=idle
@@ -1971,7 +1971,7 @@ sequenceDiagram
             O-->>V: rc:session.created, via the relay
         else nobody holds it
             P-->>V: rc:error agent_offline (error_code, controller.rs:508)
-            Note over V: a first connect fails fast with the reason;<br/>a mid-ladder attempt rides on (isRetryableRcErrorCode).<br/>No client timer was involved either way
+            Note over V: a first connect fails fast with the reason,<br/>a mid-ladder attempt rides on (isRetryableRcErrorCode).<br/>No client timer was involved either way
         end
     end
 ```
@@ -2158,7 +2158,7 @@ sequenceDiagram
     participant B as Viewer
     participant H as API pod (hub)
     participant A as Agent (a corporate laptop)
-    Note over A: MAJOR network change — "probing the control WS now"<br/>the WS is now half-open; the probe does not conclude
+    Note over A: MAJOR network change — "probing the control WS now"<br/>the WS is now half-open, the probe does not conclude
     Note over B,A: ~5 s later the live session's ICE pair moves — media stops
     B->>H: rc:terminate controller_hangup (the ladder, after the 4 s pc grace)
     B->>H: rc:session.request — attempt 2, after_drop

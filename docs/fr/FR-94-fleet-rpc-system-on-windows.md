@@ -95,7 +95,7 @@ sequenceDiagram
   participant W as worker (session 1, the user)
   participant V as service (session 0, SYSTEM)
   A->>S: POST /api/tenant/{tid}/agent/{id}/exec
-  S->>S: gates 1–3 (authorize); exec_pending {request_id, agent_id, command, run_as, state: pending, claim_by}
+  S->>S: gates 1–3 (authorize), exec_pending {request_id, agent_id, command, run_as, state: pending, claim_by}
   S->>W: rc:rpc.exec {request_id, …, via_service: true}
   W->>W: consent, as today
   W->>V: doorbell {request_id} (local pipe, carries no authority)
@@ -104,7 +104,7 @@ sequenceDiagram
   S-->>V: the command (single use)
   V->>V: gate 4 (exec_enabled from the anchor), run as SYSTEM or console_user, same bounds as exec.rs
   V->>S: POST /api/agent/service/rpc/{request_id}/result (the same credential)
-  S->>S: claimed → done; this pod's waiter, or the caller's pod polling the row
+  S->>S: claimed → done, this pod's waiter, or the caller's pod polling the row
   S->>A: 200 {outcome, ran_as}
 ```
 

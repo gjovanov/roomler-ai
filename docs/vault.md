@@ -824,7 +824,7 @@ sequenceDiagram
     participant A as a person (approve)
     participant T as its toolbelt (roomlerd)
     participant V as vault
-    M->>T: vault_exec {argv: ["psql", …], env: {PGPASSWORD: "db/main#password"}}
+    M->>T: vault_exec {argv: ["psql", …], env: {PGPASSWORD: "db/main#35;password"}}
     T->>A: approve? (the settings ask for every vault_exec)
     A-->>T: allow
     T->>T: argv[0] a bare name, found in the system's own directories, root's
@@ -904,7 +904,7 @@ sequenceDiagram
     participant A as a person (approve)
     participant T as its toolbelt (roomlerd)
     participant V as vault
-    M->>T: vault_render {template: "user={{ db/main#user }}\npass={{ db/main#password }}", dest: "db.env"}
+    M->>T: vault_render {template: "user={{ db/main#35;user }}\npass={{ db/main#35;password }}", dest: "db.env"}
     T->>A: approve? (the settings ask for every vault_render)
     A-->>T: allow
     T->>V: rc:vault.lease {mode: file, audience: "db.env"}, one per secret
@@ -954,13 +954,13 @@ sequenceDiagram
     participant T as its toolbelt (roomlerd)
     participant V as vault
     participant A as a person (approve)
-    M->>T: vault_request {handle: "db/main#password", mode: exec, audience: "psql", ttl_s: 600}
+    M->>T: vault_request {handle: "db/main#35;password", mode: exec, audience: "psql", ttl_s: 600}
     Note over T: allowed in the settings: it hands the session nothing
     T->>V: rc:vault.lease {mode: exec, audience: "psql"}
     Note over V: secret:use, with every guardrail, recorded
     V-->>T: rc:vault.leased: held, marked asked for ahead
     T-->>M: {lease_id, handle, mode, audience, ttl_s}
-    M->>T: vault_exec {argv: ["psql", …], env: {PGPASSWORD: "db/main#password"}}
+    M->>T: vault_exec {argv: ["psql", …], env: {PGPASSWORD: "db/main#35;password"}}
     T->>A: approve? (the settings ask for every use, §14)
     A-->>T: allow
     T->>T: the lease asked for ahead covers the run: taken, nothing asked again
@@ -1487,7 +1487,7 @@ sequenceDiagram
     participant U as upstream (Postgres)
     M->>T: vault_connect {handle, engine, upstream, ca?}
     Note over M,T: asked of a person first, as every use is
-    T->>V: lease #user, #password (and the CA), proxy mode, toward host:port
+    T->>V: lease #35;user, #35;password (and the CA), proxy mode, toward host:port
     Note over V: proxy-only-named-audiences:<br/>an upstream the secret names, exactly
     V-->>T: the leases, sealed to the device's key
     T->>E: bind proxies/<id>/.s.PGSQL.5432, the account's, 0600
@@ -1552,7 +1552,7 @@ sequenceDiagram
     Note over A: one of the secret's hosts, the signature good
     A-->>S: SUCCESS
     S->>A: SIGN_REQUEST: the sign-in
-    A-->>S: the signature; the key stays in the agent
+    A-->>S: the signature, the key stays in the agent
     S->>H: the sign-in, signed
     H-->>S: in, as git
     Note over A: the first lease let go closes the agent
@@ -1621,7 +1621,7 @@ sequenceDiagram
     participant S as the session's tool
     participant D as device (roomlerd)
     participant V as vault
-    S->>D: vault_exec {env: {PGUSER: "db/dyn#user", PGPASSWORD: "db/dyn#password"}}
+    S->>D: vault_exec {env: {PGUSER: "db/dyn#35;user", PGPASSWORD: "db/dyn#35;password"}}
     D->>V: rc:vault.lease {secret: db/dyn, mode: short-lived} (no field: the secret as a whole)
     V->>V: the pairing guardrails, then Cedar's secret:use toward the secret's one audience
     V-->>D: rc:vault.leased {provider: postgres, n: 0, sealed: {audience, fields}}
@@ -1698,7 +1698,7 @@ sequenceDiagram
     participant D as device (roomlerd)
     participant V as vault
     participant P as the issuer's database
-    S->>D: vault_exec, env DBU = db/dyn#user and DBP = db/dyn#password
+    S->>D: vault_exec, env DBU = db/dyn#35;user and DBP = db/dyn#35;password
     D->>V: rc:vault.describe db/dyn
     V-->>D: kind dynamic, provider postgres, mysql or kubernetes, its credential's fields
     D->>V: rc:vault.lease db/dyn in short-lived, once for both names

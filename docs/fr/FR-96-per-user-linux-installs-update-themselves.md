@@ -71,7 +71,7 @@ sequenceDiagram
     U->>U: download_asset: size floor, digest, PGP (the pinned key)
     U->>U: install as root: dpkg / apt-get, or the tarball
     U->>D: RestartDaemon, over /run/user/<uid>/roomler.sock (deferred while busy, D1)
-    Note over D: exits 9; systemd --user relaunches the new binary
+    Note over D: exits 9, systemd --user relaunches the new binary
 ```
 
 | piece | reused or new | where |

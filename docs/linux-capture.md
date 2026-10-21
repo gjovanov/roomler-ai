@@ -741,7 +741,7 @@ sequenceDiagram
     participant S as drm_cursor::publish / latest
     participant T as CursorTracker::poll<br/>(the cursor channel, 120 Hz)
     participant V as the viewer
-    Note over W: at open: UNIVERSAL_PLANES, then ATOMIC,<br/>then CURSOR_PLANE_HOTSPOT; each plane's type
+    Note over W: at open: UNIVERSAL_PLANES, then ATOMIC,<br/>then CURSOR_PLANE_HOTSPOT, each plane's type
     loop every frame a session pulls
         W->>K: the primary plane, by its type: the frame
         W->>K: the cursor plane on that CRTC: CRTC_X/Y, HOTSPOT_X/Y
@@ -909,8 +909,8 @@ sequenceDiagram
     participant V as the viewer
     G->>G: idle past its delay: the CRTC off, every plane empty
     W->>W: no plane bound, a connector connected, no CRTC driving a mode: Dark
-    W-->>P: "no frame", every 250 ms while dark; waits_for = DisplayWake
-    P->>V: rc:media-waiting for "display_wake" (once; again every 30 min)
+    W-->>P: "no frame", every 250 ms while dark, waits_for = DisplayWake
+    P->>V: rc:media-waiting for "display_wake" (once, again every 30 min)
     Note over P,V: no keepalive while it waits: a decoded frame would clear the notice
     V->>P: the viewer moves the mouse
     P->>G: the move, through uinput: someone is at the computer
@@ -1091,7 +1091,7 @@ sequenceDiagram
     participant PW as PipeWire<br/>(dlopen'd libpipewire)
 
     D->>D: companion::graphical_session()<br/>a logind session with Type=x11|wayland, Active=yes
-    D->>H: spawn as that user: XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS,<br/>DISPLAY / WAYLAND_DISPLAY; stdout piped, stderr inherited
+    D->>H: spawn as that user: XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS,<br/>DISPLAY / WAYLAND_DISPLAY, stdout piped, stderr inherited
     H->>XDP: CreateSession — on ScreenCast, or on RemoteDesktop when input is wanted
     opt portal_input
         H->>XDP: SelectDevices (keyboard + pointer, persist)
@@ -1101,7 +1101,7 @@ sequenceDiagram
     Note over XDP: first use: a consent dialog for the person at the screen<br/>later uses: restored from the token, ~15 ms, no dialog
     XDP-->>H: Response: streams (node_id, logical size), restore_token
     H->>XDP: OpenPipeWireRemote → fd
-    H->>PW: connect the fd; pw_stream with the EnumFormat POD
+    H->>PW: connect the fd, pw_stream with the EnumFormat POD
     PW-->>H: param_changed (a fixated format) → process (buffers)
     alt the stream started
         H-->>D: one marked handshake line, then RPWF-framed BGRA frames on stdout
@@ -1392,7 +1392,7 @@ sequenceDiagram
     P->>V: rc:media-waiting {for: person_at_screen, waits_ms, hint} (control DC, retried)
     Note over V: "Waiting for the person at the screen to share it."<br/>the watchdog counts no stall until the deadline
     K-->>P: the person shared: the capture
-    P->>V: frames; the first one clears the notice
+    P->>V: frames, the first one clears the notice
 ```
 
 | | what | where |
@@ -1568,7 +1568,7 @@ sequenceDiagram
     H->>S: subscribe PipeWireStreamAdded, BEFORE Start
     H->>R: Start, which starts the linked screencast first
     S-->>H: PipeWireStreamAdded(node_id)
-    Note over H: frames go to the daemon on stdout;<br/>InputMsg lines come from it on stdin
+    Note over H: frames go to the daemon on stdout,<br/>InputMsg lines come from it on stdin
     H->>R: NotifyPointerMotionAbsolute(stream, x, y) · NotifyPointerButton ·<br/>NotifyPointerAxis · NotifyKeyboardKeycode …
 ```
 
@@ -1868,7 +1868,7 @@ sequenceDiagram
     participant V as the viewer
     S->>C: Stop (GNOME's pill) / End (KDE's tray menu)
     C->>H: Closed
-    H->>C: who closed it? (mutter: a new session; KDE: KWin's bus owner, the lock)
+    H->>C: who closed it? (mutter: a new session, KDE: KWin's bus owner, the lock)
     C-->>H: allowed / the same KWin, unlocked
     H->>H: exit 5 (EXIT_STOPPED_AT_SCREEN)
     H-->>P: the frames stop, and the status says why (StoppedAtScreen)
@@ -1938,7 +1938,7 @@ sequenceDiagram
     Note over L: the computer sleeps
     Note over V: redials, the notice kept on the stage (P5j)
     L-->>D: PrepareForSleep(false), after the wake
-    Note over V: reconnects by itself; the new session names<br/>whatever holds the picture back (a lock: §5.3)
+    Note over V: reconnects by itself, the new session names<br/>whatever holds the picture back (a lock: §5.3)
 ```
 
 | | what | why |

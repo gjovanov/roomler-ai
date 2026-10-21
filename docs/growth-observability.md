@@ -2042,7 +2042,7 @@ sequenceDiagram
     Note over V: ≥ 30 s since the request? feature true? storage can keep the day?<br/>not yet prompted this UTC day? — else nothing
     V->>V: record today as prompted, then show the strip inline in the ended state
     alt dismiss, or Connect again
-        V->>V: the strip goes; nothing is posted
+        V->>V: the strip goes, nothing is posted
     else thumb (+ chips) + Send
         V->>S: POST /api/tenant/{tid}/session/{sid}/feedback {rating, reasons}
         S-->>V: 201 (stored) · 409 already_rated | too_early · 422 code · 403 · 404

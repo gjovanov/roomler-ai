@@ -247,7 +247,7 @@ sequenceDiagram
         R-->>H: one holder
         H-->>G: org_session_limit, naming who holds the slot and on which device
     else Redis unreachable
-        H->>H: fail soft: P3's pod-local count for a same-org session; an external one is allowed, and counted
+        H->>H: fail soft: P3's pod-local count for a same-org session, an external one is allowed, and counted
     end
 ```
 

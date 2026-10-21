@@ -548,7 +548,7 @@ sequenceDiagram
   S-->>C: dial the overlay address on port 2223, pin the SERVICE's host key
   C->>W: TCP to port 2223 (intercepted by SplitTun, no socket bound)
   W->>V: the SSH pipe: Data frames, ciphertext only
-  V-->>C: authenticated by the grant key; a shell as SYSTEM (session 0) or the console user
+  V-->>C: authenticated by the grant key, a shell as SYSTEM (session 0) or the console user
 ```
 
 - **The pipe** is `\\.\pipe\roomler-ssh-service`: the doorbell's DACL, created
