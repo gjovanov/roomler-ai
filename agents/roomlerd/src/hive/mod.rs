@@ -87,6 +87,10 @@ mod hosted;
 mod importer;
 mod lines;
 mod materializer;
+/// FR-90 P3-7-3c — `net_socks` and `net_forward`: a session's own egress, on
+/// a loopback listener served to its account alone.
+#[cfg(feature = "vault")]
+mod net_tools;
 mod packer;
 mod procs;
 mod purger;
