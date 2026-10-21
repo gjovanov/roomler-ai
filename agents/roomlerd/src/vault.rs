@@ -392,6 +392,75 @@ mod client {
         })
     }
 
+    /// FR-90 P3-8-2b — what a session asks for to run one command on
+    /// another device of its organization over Roomler SSH (`rc:vault.ssh`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SshAsk {
+        pub session_id: ObjectId,
+        /// The fence the session runs at here.
+        pub fence: u64,
+        /// The device the command runs on. Never this one: the vault refuses
+        /// that ask.
+        pub target: ObjectId,
+        pub ttl_secs: u32,
+    }
+
+    /// FR-90 P3-8-2b — the vault's ticket for it, what `rc:ssh.request`
+    /// presents, and what the device can show the person it asks.
+    ///
+    /// ⚠️ `ticket` is a credential until its end: `Debug` names it by its id
+    /// alone, and nothing logs it.
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct SshTicket {
+        pub ticket_id: String,
+        pub ticket: String,
+        /// The target's OS as its row holds it (`linux`, `macos`, `windows`),
+        /// whose shell meets the command.
+        pub os: String,
+        /// The account the target's policy maps, which the command runs as
+        /// (an `SshAccountMode` word).
+        pub account: String,
+        /// When it ends, on this daemon's clock: the vault's end, and never
+        /// later than the longest a lease lives from its answer.
+        pub until: Instant,
+    }
+
+    impl std::fmt::Debug for SshTicket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SshTicket")
+                .field("ticket_id", &self.ticket_id)
+                .field("os", &self.os)
+                .field("account", &self.account)
+                .field("until", &self.until)
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// FR-90 P3-8-2b — the ticket an answer makes. The daemon cannot read
+    /// a ticket's claims, and need not: the network module binds every one of
+    /// them where the request arrives. What it can check is that the answer
+    /// is whole.
+    fn ssh_granted(
+        ticket_id: &str,
+        ticket: &str,
+        expires_at_ms: i64,
+        os: &str,
+        account: &str,
+    ) -> Result<SshTicket, LeaseError> {
+        if ticket_id.is_empty() || ticket.is_empty() || account.is_empty() {
+            return Err(LeaseError::NotAsked);
+        }
+        let left =
+            (expires_at_ms - now_ms()).clamp(0, i64::from(lease_limits::MAX_TTL_SECS) * 1000);
+        Ok(SshTicket {
+            ticket_id: ticket_id.to_string(),
+            ticket: ticket.to_string(),
+            os: os.to_string(),
+            account: account.to_string(),
+            until: Instant::now() + Duration::from_millis(u64::try_from(left).unwrap_or(0)),
+        })
+    }
+
     /// What a request waits for, by kind.
     enum Waiting {
         Lease {
@@ -409,6 +478,10 @@ mod client {
             ask: NetAsk,
             reply: oneshot::Sender<Result<NetGrant, LeaseError>>,
         },
+        /// FR-90 P3-8-2b.
+        Ssh {
+            reply: oneshot::Sender<Result<SshTicket, LeaseError>>,
+        },
     }
 
     impl Waiting {
@@ -425,6 +498,9 @@ mod client {
                     let _ = reply.send(Err(why));
                 }
                 Self::Net { reply, .. } => {
+                    let _ = reply.send(Err(why));
+                }
+                Self::Ssh { reply } => {
                     let _ = reply.send(Err(why));
                 }
             }
@@ -710,6 +786,24 @@ mod client {
             self.wait(&req_id, answer, ANSWER_DEADLINE).await
         }
 
+        /// FR-90 P3-8-2b — ask the vault for a ticket to run one command on
+        /// another device (`rc:vault.ssh`). The vault decides Cedar's
+        /// `ssh:run` for the account the target's policy maps, and answers
+        /// with a ticket the network module holds the SSH request to.
+        pub async fn ssh(&self, ask: SshAsk) -> Result<SshTicket, LeaseError> {
+            let req_id = new_req_id();
+            let frame = ClientMsg::VaultSsh {
+                req_id: req_id.clone(),
+                session_id: ask.session_id,
+                fence: ask.fence,
+                target: ask.target,
+                ttl_secs: ask.ttl_secs,
+            };
+            let (reply, answer) = oneshot::channel();
+            self.send(&req_id, frame, Waiting::Ssh { reply })?;
+            self.wait(&req_id, answer, ANSWER_DEADLINE).await
+        }
+
         /// `rc:vault.leased`: open it, hold it, and answer the request.
         pub fn on_leased(
             &self,
@@ -844,6 +938,33 @@ mod client {
                 }
                 Some(other) => other.fail(LeaseError::NoAnswer),
                 None => debug!(req_id, grant_id, "vault: a grant nobody here waits for"),
+            }
+        }
+
+        /// FR-90 P3-8-2b — `rc:vault.ssh.granted`: answer the request with
+        /// its ticket, if the answer is whole. Never logs the ticket.
+        pub fn on_ssh_granted(
+            &self,
+            req_id: &str,
+            ticket_id: &str,
+            ticket: &str,
+            expires_at_ms: i64,
+            os: &str,
+            account: &str,
+        ) {
+            match lock(&self.pending).remove(req_id) {
+                Some(Waiting::Ssh { reply }) => {
+                    let granted = ssh_granted(ticket_id, ticket, expires_at_ms, os, account);
+                    if granted.is_err() {
+                        warn!(
+                            req_id,
+                            ticket_id, "vault: a ticket that is not whole — refused"
+                        );
+                    }
+                    let _ = reply.send(granted);
+                }
+                Some(other) => other.fail(LeaseError::NoAnswer),
+                None => debug!(req_id, ticket_id, "vault: a ticket nobody here waits for"),
             }
         }
 
@@ -1116,6 +1237,23 @@ mod client {
         CLIENT.on_net_granted(req_id, grant_id, token, expires_at_ms, host, port);
     }
 
+    /// FR-90 P3-8-2b — the daemon's [`Client::ssh`].
+    pub async fn ssh(ask: SshAsk) -> Result<SshTicket, LeaseError> {
+        CLIENT.ssh(ask).await
+    }
+
+    /// FR-90 P3-8-2b — the daemon's [`Client::on_ssh_granted`].
+    pub fn on_ssh_granted(
+        req_id: &str,
+        ticket_id: &str,
+        ticket: &str,
+        expires_at_ms: i64,
+        os: &str,
+        account: &str,
+    ) {
+        CLIENT.on_ssh_granted(req_id, ticket_id, ticket, expires_at_ms, os, account);
+    }
+
     /// The daemon's [`Client::drop_run`]: hive's supervisor calls it when a
     /// run stops being live here.
     pub fn drop_run(session: ObjectId, fence: u64) {
@@ -1221,7 +1359,8 @@ mod tests {
         use tokio::sync::mpsc;
 
         use super::super::{
-            Client, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, Report, hello_key,
+            Client, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, Report, SshAsk,
+            SshTicket, hello_key,
         };
         use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, fake_k8s, fake_mysql, made};
 
@@ -1470,6 +1609,116 @@ mod tests {
             })
             .await;
             assert_eq!(refused, Err(LeaseError::Refused("no_exit".into())));
+        }
+
+        /// FR-90 P3-8-2b — ask for a ticket and answer the `rc:vault.ssh` it
+        /// sends with `answer`; the asker's result.
+        async fn ticketed_as(
+            c: &Arc<Client>,
+            rx: &mut mpsc::Receiver<ClientMsg>,
+            ask: SshAsk,
+            answer: impl FnOnce(&Client, &str),
+        ) -> Result<SshTicket, LeaseError> {
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.ssh(ask).await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultSsh { req_id, .. } => req_id,
+                other => panic!("{other:?}"),
+            };
+            answer(c.as_ref(), &req_id);
+            asker.await.unwrap()
+        }
+
+        /// FR-90 P3-8-2b — a session's command on another device goes out
+        /// as `rc:vault.ssh`, naming what it asks, and its ticket comes back
+        /// to its asker with the target's os and account, its end no later
+        /// than the ceiling from now. `Debug` never shows the ticket.
+        #[tokio::test]
+        async fn an_ssh_ticket_comes_back_to_its_asker() {
+            let (c, mut rx) = connected();
+            let ask = SshAsk {
+                session_id: ObjectId::new(),
+                fence: 3,
+                target: ObjectId::new(),
+                ttl_secs: 330,
+            };
+            let asker = {
+                let (c, ask) = (c.clone(), ask.clone());
+                tokio::spawn(async move { c.ssh(ask).await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultSsh {
+                    req_id,
+                    session_id,
+                    fence,
+                    target,
+                    ttl_secs,
+                } => {
+                    assert_eq!(
+                        (session_id, fence, target, ttl_secs),
+                        (ask.session_id, 3, ask.target, 330)
+                    );
+                    req_id
+                }
+                other => panic!("{other:?}"),
+            };
+            // An end past the ceiling is held to it.
+            c.on_ssh_granted(
+                &req_id,
+                "k1",
+                "a.b.c",
+                in_ms(3_600_000),
+                "linux",
+                "console_user",
+            );
+            let t = asker.await.unwrap().expect("ticketed");
+            assert_eq!(
+                (
+                    t.ticket_id.as_str(),
+                    t.ticket.as_str(),
+                    t.os.as_str(),
+                    t.account.as_str()
+                ),
+                ("k1", "a.b.c", "linux", "console_user")
+            );
+            assert!(
+                t.until
+                    <= Instant::now() + Duration::from_secs(u64::from(lease_limits::MAX_TTL_SECS))
+            );
+            assert!(!format!("{t:?}").contains("a.b.c"), "{t:?}");
+        }
+
+        /// FR-90 P3-8-2b — an answer that is not whole is refused here,
+        /// never used: no ticket id, no ticket, no account. A refusal answers
+        /// in the vault's own word, the session's own device's included.
+        #[tokio::test]
+        async fn an_ssh_ticket_that_is_not_whole_is_refused() {
+            let (c, mut rx) = connected();
+            let ask = SshAsk {
+                session_id: ObjectId::new(),
+                fence: 1,
+                target: ObjectId::new(),
+                ttl_secs: 60,
+            };
+            for (id, ticket, account) in [("", "t", "daemon"), ("k", "", "daemon"), ("k", "t", "")]
+            {
+                let got = ticketed_as(&c, &mut rx, ask.clone(), |c, req| {
+                    c.on_ssh_granted(req, id, ticket, in_ms(60_000), "linux", account)
+                })
+                .await;
+                assert_eq!(
+                    got,
+                    Err(LeaseError::NotAsked),
+                    "{id:?} {ticket:?} {account:?}"
+                );
+            }
+            let refused = ticketed_as(&c, &mut rx, ask, |c, req| {
+                c.on_refused(req, "bad_request", None)
+            })
+            .await;
+            assert_eq!(refused, Err(LeaseError::Refused("bad_request".into())));
         }
 
         /// P3-4e-2 — the next lease request on the connection, within a

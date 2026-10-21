@@ -885,6 +885,47 @@ pub fn netstack_pinger(
         handle: ns_handle_tx(&cfg.tenant_id).subscribe(),
     }))
 }
+
+/// FR-90 P3-8-2b — the netstack dialer for this daemon's own SSH client
+/// ([`crate::ssh_client`]), watching the primary's handle channel, where
+/// agent sessions run. `None` unless this node is in netstack mode: an
+/// OS-TUN node dials through its routes ([`crate::ssh_client::OsDialer`]).
+#[cfg(feature = "ssh-server")]
+pub fn netstack_dialer(cfg: &AgentConfig) -> Option<Arc<dyn crate::ssh_client::OverlayDialer>> {
+    use tunnel_core::overlay::netstack::NetstackHandle;
+
+    netstack_socks_port(cfg)?;
+
+    struct NsDialer {
+        handle: watch::Receiver<Option<NetstackHandle>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::ssh_client::OverlayDialer for NsDialer {
+        async fn dial(
+            &self,
+            address: &str,
+            port: u16,
+        ) -> Result<Box<dyn crate::ssh_client::Stream>, String> {
+            let ip: std::net::IpAddr = address
+                .parse()
+                .map_err(|_| format!("{address} is not an overlay address"))?;
+            let handle = self
+                .handle
+                .borrow()
+                .clone()
+                .ok_or_else(|| "netstack not up yet (mesh not joined)".to_string())?;
+            let stream = handle
+                .connect(std::net::SocketAddr::new(ip, port))
+                .await
+                .map_err(|e| format!("{address}:{port}: {e}"))?;
+            Ok(Box::new(stream))
+        }
+    }
+
+    Some(Arc::new(NsDialer {
+        handle: ns_handle_tx(&cfg.tenant_id).subscribe(),
+    }))
+}
 #[cfg(not(feature = "overlay-netstack"))]
 fn netstack_tun_factory(
     _socks_port: u16,

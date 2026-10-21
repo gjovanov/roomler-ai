@@ -31,6 +31,10 @@ pub struct SshGrantAnswer {
     pub grant_id: Option<String>,
     pub expires_at_ms: Option<u64>,
     pub error: Option<String>,
+    /// FR-90 P3-8-2b — the agent session's ticket the server held the
+    /// request to, echoed. `None` on a person's request, and from a server
+    /// before P3-8-1b, which ignored the ticket and answered as the owner's.
+    pub ssh_ticket_id: Option<String>,
 }
 
 type Pending = HashMap<String, oneshot::Sender<SshGrantAnswer>>;
