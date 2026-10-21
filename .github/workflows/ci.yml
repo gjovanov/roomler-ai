@@ -1902,7 +1902,20 @@ jobs:
           bash .claude/hooks/gh-account-guard-selftest.sh
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+            # ⚠️ A history rewrite (the sanitize-hostnames sweep) force-pushes
+            # master and every open PR's head together, and the synchronize
+            # event that fires for a PR can still name the PRE-rewrite base,
+            # which no longer exists. `git log A..B` against a missing A is an
+            # error (exit 20), not a pass: measured 2026-10-21 on two open
+            # PRs. The fork point on the CURRENT base branch selects the same
+            # commits, so fall back to it -- the PR twin of the push path's
+            # missing-BEFORE fallback below.
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              BASE=$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" "$HEAD_SHA")
+            fi
+            RANGE="$BASE..$HEAD_SHA"
           else
             # A push to master. `github.event.before` is the zero sha for the
             # first push to a new branch and for a force-push over a deleted

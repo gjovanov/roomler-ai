@@ -89,13 +89,15 @@ python3 $S/sanitize.py --map $M --gen-filter-repo ~/sanitize/replace.txt
 python3 $S/sanitize.py --map $M --gen-filename-callback ~/sanitize/filename-callback.py
 git clone --mirror https://github.com/<owner>/<repo>.git ~/sanitize/repo.git
 cd ~/sanitize/repo.git
+git config --unset remote.origin.mirror    # from here a bare `git push` would MIRROR
+git for-each-ref --format='%(objectname) %(refname)' > ../pre-refs.txt   # the leases
 git for-each-ref --format="delete %(refname)" refs/pull | git update-ref --stdin
-python3 ~/bin/git-filter-repo \
+python3 ~/bin/git-filter-repo --sdr --no-fetch \
     --replace-text      ~/sanitize/replace.txt \
     --replace-message   ~/sanitize/replace.txt \
     --filename-callback ~/sanitize/filename-callback.py \
     --replace-refs delete-no-add --force
-git push --mirror https://github.com/<owner>/<repo>.git      # irreversible
+# then push each CHANGED head and tag with its own lease -- see "Pushing a rewrite"
 ```
 
 ### When step 2b reports a canary
@@ -127,11 +129,18 @@ with a hole in the repo scan and CI too.
 | CI job **No real machine names** | the merge | required status check on `master` |
 | the sweep below | after publication | run it by hand |
 
-Layer 3 has run three times now. Each run force-pushes ~700 branches and ~660
+Layer 3 has run four times now. Each run force-pushes ~1000 branches and ~700
 tags with GitHub Actions disabled around it, and it still **cannot remove
 anything from GitHub** — the pre-rewrite commits stay reachable by SHA through
 `refs/pull/*` until GitHub Support runs GC. Treat every sweep as damage
 control, and the hook as the actual fix.
+
+⚠️ Measured on the fourth run (2026-10-21): what `refs/pull/*` keeps is the
+unsanitised history of **every** earlier run, not just the latest. 66 of the
+map's 76 keys were still in the object database, all reachable only through
+pull refs, across 2358 pull requests. A rewrite that nobody follows up with a
+Support GC has cleaned what people *browse*, and nothing that a fetch by SHA
+can reach.
 
 ⚠️ **Set `core.hooksPath` in every clone.** It is per-clone config, so a fresh
 clone has no hook until someone runs that line. Worktrees **share** that config
@@ -352,6 +361,46 @@ grep for it alone would pass on the bug.
   in one file and restores with a plain `git clone`.
 - Branches that exist only locally are not in a mirror clone and so are not
   rewritten. They keep the old content until deleted or rebuilt.
+
+### Pushing a rewrite (the procedure the fourth run used)
+
+That run froze pushes for 8 minutes: 5063 commits filtered in 2m15s, and 1730
+refs pushed in ~2 min with 0 rejections. What made it short and safe:
+
+- **Drop `refs/pull/*` BEFORE filtering.** Pull refs reach the old history of
+  every PR. Keeping them tripled the commits and projected ~27 min, all of it
+  spent on refs that cannot be pushed anyway. Record them first
+  (`pre-refs.txt`): GitHub Support asks how many pull requests are affected.
+- **Rules only for keys that occur.** A key that appears nowhere is a no-op
+  rule that costs one regex pass over every blob. A case-insensitive
+  *substring* search of the object database can only over-select, so cutting
+  the map to those keys is safe. The run cut 76 keys to 11. Then verify
+  against the **full** map afterwards.
+- **`--sdr --no-fetch`.** With `remote.origin.mirror` unset, `--sdr` fetches
+  `+refs/*:refs/*`, which brings every pull ref straight back.
+- **Verify before pushing.** Check every key under both boundaries, and every
+  shape, in blobs, commit messages, tag messages and paths. Ref counts, the
+  commit count and the set of identities must be unchanged, and master's tree
+  must be **identical**. Every tip tree that changed must differ only in paths
+  that held a name.
+- **Push each CHANGED ref with its own lease:**
+  `git push --porcelain origin --force-with-lease=<ref>:<pre-rewrite-sha> <new>:<ref>`,
+  in batches of ~100. A ref someone moved after the clone is *rejected and
+  listed*, never clobbered. That replaces both `--mirror` (it would try to
+  delete `refs/pull/*`) and a freeze nobody can enforce. Announce a short
+  freeze to every active session anyway.
+- **Actions OFF around the push, with a trap that turns it back on.** ~700
+  release tags would each fire a signed release build onto the fleet's
+  updater. ⚠️ The permissions GET right after the disabling PUT still read
+  `enabled: true`. The run count before and after is the actual proof.
+- **Then a fresh clone of the remote**, scanned the same way. That checks the
+  surface, not the source.
+- ⚠️ **Open PRs come out without CI on their new heads.** A synchronize event
+  that fires while Actions is off is simply dropped. One that lands after the
+  re-enable names the pre-rewrite base: `ci.yml`'s identity job now falls back
+  for that case, but other jobs may not. Close and immediately reopen each
+  affected PR to get a fresh event against the new base, and tell its owner
+  first, because two re-triggers start two run sets.
 
 ## Adding a name
 
