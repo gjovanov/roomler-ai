@@ -59,6 +59,12 @@ On a tunnel-only machine the CLI updates itself:
 roomler self-update
 ```
 
+Before it replaces anything it checks the release's signature against the key
+built into the CLI, and on Linux and macOS that the archive is the version it was
+offered as. Where the CLI sits in a system folder, or came from the `.deb`, run it
+as `sudo roomler self-update`. On Linux and macOS this works from the first tunnel
+release that carries it; an older CLI there points you at the download instead.
+
 :::warning On a machine that also runs the agent, `self-update` refuses
 That is deliberate. On an agent host the installer owns the whole node stack,
 and the `roomler` command is a thin shim that re-execs the agent's own command

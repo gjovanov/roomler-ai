@@ -124,7 +124,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 | Checks a download is the version it was offered as | ✅ | ✅ | ✅ |
 | One-command uninstall | ✅ | ✅ | ✅ |
 | An ephemeral device removes itself when it stops | ✅ | ✅ | ✅ |
-| The tunnel client (`roomler self-update`) updates itself | ✅ | ❌ | ❌ |
+| The tunnel client (`roomler self-update`) updates itself | ✅ | ✅ from the next tunnel release | ✅ from the next tunnel release |
 | Processors the agent runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |
 | Hardware video encoding on Linux ARM | — | ❌ | — |
 | The tunnel client and the wizard on Linux ARM | — | ✅ from 0.4.149: the wizard with the agent release, the tunnel client with the first tunnel release from then on | — |

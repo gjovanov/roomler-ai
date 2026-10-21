@@ -113,8 +113,10 @@ thiserror = { workspace = true }
 # Hashing (for machine_id derivation)
 sha2 = { workspace = true }
 hex = { workspace = true }
-# ed25519 verify for the pinned-key `.asc` check (`pgp_verify`). Already in
-# the graph via remote_control/derp-relay — a direct dep adds no compilation.
+# The device key (`peer_auth`) and the vault proxy's SCRAM. (The pinned-key
+# `.asc` check that first brought it here, `pgp_verify`, moved to tunnel-core
+# in FR-97 P6b.) Already in the graph via remote_control/derp-relay — a direct
+# dep adds no compilation.
 ring = "0.17"
 
 # ObjectId for session keys (mirrors the shared protocol)

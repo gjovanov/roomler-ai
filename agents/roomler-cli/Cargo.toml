@@ -102,6 +102,12 @@ rpassword = "7.5.4"
 # quietly on EPIPE instead of panicking — Rust starts with SIGPIPE ignored.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# FR-97 P6b — `self-update` on Linux and macOS reads the binary out of the
+# release tarball in memory (nothing is extracted to disk), and writes the
+# verified `.deb` into a private dir before `dpkg -i`.
+flate2 = "1"
+tar = "0.4"
+tempfile = { workspace = true }
 
 # build.rs embeds a Windows VERSIONINFO resource into roomler.exe. See
 # agents/roomlerd/Cargo.toml for why this is embed-resource rather than
