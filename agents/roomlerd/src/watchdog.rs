@@ -39,12 +39,25 @@
 //! need to thread an `Arc<Watchdog>` through their signatures, and
 //! integration tests that don't [`install`] one just have ticks
 //! become silent no-ops — the pump code stays clean.
+//!
+//! ## Stages (#2551)
+//!
+//! A tick says a pump is alive, not where it is. The signaling loop awaits
+//! inside its select arms, so a stall is one arm whose await never returns,
+//! and the INFO log is silent while it waits. Each arm therefore enters a
+//! named stage ([`enter`]): a [`StageGuard`] that puts the pump back to
+//! [`IDLE_STAGE`] when the arm's scope ends, however it ends. A stall report
+//! then names the stage it froze in: `signaling=93s@ws.text:rc:ssh.response`
+//! ([`stall_summary`]). The summary also reaches the crash sidecar, which
+//! the next worker uploads, so the stage arrives even when the log line is
+//! lost to the exit.
 
 // FR-97 P6e (#1538) — the print macros panic on a failing stdout or stderr, and
 // a panic on a watchdog thread is swallowed with the exit it was about to take.
 // Lines go through `crate::logging::say_on_stderr` (and `tracing`).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -180,6 +193,10 @@ pub const RESTART_REQUESTED_EXIT_CODE: i32 = 9;
 /// functions and the `run` task.
 static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
 
+/// #2551 — the stage a pump is in when no arm holds it: waiting in its
+/// `select!` for the next event.
+pub const IDLE_STAGE: &str = "select";
+
 struct PumpState {
     last_tick: Instant,
     /// When false, the watchdog ignores this pump. Used to gate
@@ -187,6 +204,8 @@ struct PumpState {
     /// go silent for hours when no controller is connected.
     active: bool,
     threshold: Duration,
+    /// #2551 — where the pump is: the arm it entered, or [`IDLE_STAGE`].
+    stage: Cow<'static, str>,
 }
 
 pub struct Watchdog {
@@ -216,8 +235,39 @@ impl Watchdog {
                     last_tick: Instant::now(),
                     active,
                     threshold,
+                    stage: Cow::Borrowed(IDLE_STAGE),
                 },
             );
+        }
+    }
+
+    /// #2551 — record the stage a pump is in. A pump that was never
+    /// registered keeps no stage, as [`Self::tick`] keeps no tick.
+    pub fn set_stage(&self, name: &'static str, stage: impl Into<Cow<'static, str>>) {
+        if let Ok(mut m) = self.pumps.lock()
+            && let Some(p) = m.get_mut(name)
+        {
+            p.stage = stage.into();
+        }
+    }
+
+    /// #2551 — the stage a pump is in, if it is registered.
+    pub fn stage_of(&self, name: &str) -> Option<String> {
+        let m = self.pumps.lock().ok()?;
+        m.get(name).map(|p| p.stage.to_string())
+    }
+
+    /// #2551 — enter a stage on THIS watchdog until the guard drops. The
+    /// free [`enter`] is the same on the installed one.
+    pub fn enter(
+        self: &Arc<Self>,
+        name: &'static str,
+        stage: impl Into<Cow<'static, str>>,
+    ) -> StageGuard {
+        self.set_stage(name, stage);
+        StageGuard {
+            wd: Some(Arc::clone(self)),
+            pump: name,
         }
     }
 
@@ -308,6 +358,62 @@ pub fn gate(name: &'static str, active: bool) {
     if let Some(wd) = WATCHDOG.get() {
         wd.gate(name, active);
     }
+}
+
+/// #2551 — record the stage a pump is in, on the installed watchdog. Same
+/// no-op semantics as [`tick`]. Use it to refine a stage inside an arm that
+/// already holds a [`StageGuard`]; the guard still resets it on exit.
+pub fn stage(name: &'static str, stage: impl Into<Cow<'static, str>>) {
+    if let Some(wd) = WATCHDOG.get() {
+        wd.set_stage(name, stage);
+    }
+}
+
+/// #2551 — enter a stage until the returned guard drops: the first line of a
+/// select arm, so a stall names the arm it froze in. A no-op guard when no
+/// watchdog is installed.
+pub fn enter(name: &'static str, stage: impl Into<Cow<'static, str>>) -> StageGuard {
+    match WATCHDOG.get() {
+        Some(wd) => wd.enter(name, stage),
+        None => StageGuard {
+            wd: None,
+            pump: name,
+        },
+    }
+}
+
+/// #2551 — puts its pump back to [`IDLE_STAGE`] when it drops, so an arm that
+/// leaves early (`continue`, `break`, `?`) cannot leave its name behind for a
+/// later stall to be blamed on.
+#[must_use = "the stage ends when the guard drops: bind it to a named variable"]
+pub struct StageGuard {
+    wd: Option<Arc<Watchdog>>,
+    pump: &'static str,
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if let Some(wd) = &self.wd {
+            wd.set_stage(self.pump, IDLE_STAGE);
+        }
+    }
+}
+
+/// #2551 — the stall summary: `name=Ns` for each stalled pump, plus
+/// `@stage` when its stage is known. The `name=Ns` prefix stays as it was,
+/// so anything that parsed the old summary still does.
+pub fn stall_summary(
+    stalled: &[(&'static str, Duration)],
+    stage_of: impl Fn(&'static str) -> Option<String>,
+) -> String {
+    stalled
+        .iter()
+        .map(|(n, d)| match stage_of(n) {
+            Some(s) if !s.is_empty() => format!("{n}={}s@{s}", d.as_secs()),
+            _ => format!("{n}={}s", d.as_secs()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether a watchdog is installed. Used by tests + diagnostic
@@ -428,11 +534,10 @@ pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
 /// extremely-unlikely-but-technically-possible case where exit
 /// doesn't terminate the process.
 pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
-    let summary: Vec<String> = stalled
-        .iter()
-        .map(|(n, d)| format!("{n}={}s", d.as_secs()))
-        .collect();
-    let summary = summary.join(", ");
+    // #2551 — with the stage each pump froze in. This takes the pump lock
+    // `scan_at` has just released; were it ever held for good, `scan_at` would
+    // have blocked first, and the thread watchdog exits without it.
+    let summary = stall_summary(stalled, |n| WATCHDOG.get().and_then(|wd| wd.stage_of(n)));
     // FR-97 P6e (#1538) — a panic here would lose the exit below (see the
     // module doc), so never `eprintln!`.
     crate::logging::say_on_stderr(format_args!(
@@ -1060,5 +1165,90 @@ mod tests {
         assert!(postrm.contains("deb-systemd-helper mask \"$unit\""));
         assert!(postrm.contains("deb-systemd-helper purge \"$unit\""));
         assert!(postrm.contains("deb-systemd-helper unmask \"$unit\""));
+    }
+
+    /// #2551 — a pump starts idle, an arm's guard names it, a refinement
+    /// replaces the name, and the guard puts it back when it drops.
+    #[test]
+    fn a_stage_is_named_while_its_guard_lives() {
+        let wd = Watchdog::new();
+        wd.register("signaling", Duration::from_secs(90), true);
+        assert_eq!(wd.stage_of("signaling").as_deref(), Some(IDLE_STAGE));
+        {
+            let _stage = wd.enter("signaling", "ws.text");
+            assert_eq!(wd.stage_of("signaling").as_deref(), Some("ws.text"));
+            wd.set_stage("signaling", format!("ws.text:{}", "rc:ssh.response"));
+            assert_eq!(
+                wd.stage_of("signaling").as_deref(),
+                Some("ws.text:rc:ssh.response")
+            );
+        }
+        assert_eq!(wd.stage_of("signaling").as_deref(), Some(IDLE_STAGE));
+    }
+
+    /// #2551 — an arm that leaves early (`continue` here) leaves no name
+    /// behind, or a later stall in the select itself would be blamed on it.
+    #[test]
+    fn an_arm_that_leaves_early_leaves_no_stage_behind() {
+        let wd = Watchdog::new();
+        wd.register("signaling", Duration::from_secs(90), true);
+        for round in 0..2 {
+            let _stage = wd.enter("signaling", "outbound");
+            if round == 0 {
+                continue;
+            }
+        }
+        assert_eq!(wd.stage_of("signaling").as_deref(), Some(IDLE_STAGE));
+    }
+
+    /// Like a tick, a stage on a pump nobody registered is dropped.
+    #[test]
+    fn an_unregistered_pump_keeps_no_stage() {
+        let wd = Watchdog::new();
+        wd.set_stage("nope", "keepalive");
+        assert_eq!(wd.stage_of("nope"), None);
+    }
+
+    /// #2551 — the summary names each pump's stage after its `name=Ns`, which
+    /// is unchanged, so a parser of the old summary still finds the pump.
+    #[test]
+    fn the_stall_summary_names_the_stage() {
+        let one = [("signaling", Duration::from_secs(93))];
+        assert_eq!(
+            stall_summary(&one, |_| Some("ws.text:rc:ssh.response".into())),
+            "signaling=93s@ws.text:rc:ssh.response"
+        );
+        assert_eq!(stall_summary(&one, |_| None), "signaling=93s");
+        assert_eq!(
+            stall_summary(&one, |_| Some(String::new())),
+            "signaling=93s"
+        );
+        let two = [
+            ("encoder", Duration::from_secs(31)),
+            ("signaling", Duration::from_secs(104)),
+        ];
+        let s = stall_summary(&two, |n| {
+            (n == "signaling").then(|| "heartbeat".to_string())
+        });
+        assert_eq!(s, "encoder=31s, signaling=104s@heartbeat");
+        let pumps: Vec<&str> = s
+            .split(", ")
+            .map(|p| p.split('=').next().unwrap())
+            .collect();
+        assert_eq!(pumps, ["encoder", "signaling"]);
+    }
+
+    /// #2551 — end to end on one watchdog: a pump that froze inside an arm is
+    /// reported stalled, with that arm's name.
+    #[test]
+    fn a_frozen_arm_is_named_in_the_stall_it_causes() {
+        let wd = Watchdog::new();
+        wd.register("signaling", Duration::from_secs(90), true);
+        let _frozen = wd.enter("signaling", "device_end");
+        let stalled = wd.scan_at(Instant::now() + Duration::from_secs(100));
+        assert_eq!(stalled.len(), 1);
+        let summary = stall_summary(&stalled, |n| wd.stage_of(n));
+        assert!(summary.starts_with("signaling="), "{summary}");
+        assert!(summary.ends_with("s@device_end"), "{summary}");
     }
 }
