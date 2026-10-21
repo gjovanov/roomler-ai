@@ -386,7 +386,7 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1219`](../crates/modules/network/src/routes/agent_ssh.rs#L1219)).
+  [`agent_ssh.rs:1240`](../crates/modules/network/src/routes/agent_ssh.rs#L1240)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
@@ -1257,11 +1257,69 @@ it presented (P3-8-2b).
 
 | Piece | Where |
 |---|---|
-| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831)), `one_command` on `rc:ssh.grant` ([`:3529`](../crates/remote_control/src/signaling.rs#L3529)), `ssh_ticket_id` on `rc:ssh.response` ([`:3570`](../crates/remote_control/src/signaling.rs#L3570)); `RpcCap::SshOneCommand` ([`models.rs:1129`](../crates/remote_control/src/models.rs#L1129)) and the three refusals ([`models.rs:4766`](../crates/remote_control/src/models.rs#L4766)) |
+| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831)), `one_command` on `rc:ssh.grant` ([`:3529`](../crates/remote_control/src/signaling.rs#L3529)), `ssh_ticket_id` on `rc:ssh.response` ([`:3570`](../crates/remote_control/src/signaling.rs#L3570)); `RpcCap::SshOneCommand` ([`models.rs:1129`](../crates/remote_control/src/models.rs#L1129)) and the three refusals ([`models.rs:4773`](../crates/remote_control/src/models.rs#L4773)) |
 | the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
-| the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:942`](../crates/modules/network/src/routes/agent_ssh.rs#L942)) |
-| the audit | the `session` source and the session's ids ([`agent_ssh.rs:846`](../crates/modules/network/src/routes/agent_ssh.rs#L846)) |
-| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. P3-8-2a: the target holding `one_command`. P3-8-2b: the device's client and tool |
+| the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
+| the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
+| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. P3-8-2b: the device's client and tool. The target holding `one_command` (P3-8-2a) is the next section |
+
+### A session's grant on the target: one command (FR-90 P3-8-2a)
+
+The grant a session's request earns says `one_command`, and the **target**
+holds the session it opens to exactly that: one `exec`, on one channel. It is
+the target's rule, not the client's. The session's daemon holds the key, and
+a key may ask for anything a key may ask for, so only the device being reached
+can keep the session to what its ticket was decided for.
+
+| The session asks for | What it gets |
+|---|---|
+| a session channel | the first one. A second is refused (`administratively prohibited`): it could carry a second command |
+| `exec` | the first one runs. Any later one is refused with the reason on stderr. The attempt is spent when it is asked, so a refused or failed `exec` is not followed by another |
+| a terminal (`pty-req`) | refused before it is recorded. The command runs without one |
+| a shell | refused, with the reason on stderr |
+| a subsystem, `sftp` included | refused, with the reason on stderr |
+| a forward (`direct-tcpip`) | refused, even to a destination this device's `forward_acl` admits, and reported as a denied forward |
+| `-R`, agent or X11 forwarding | what every session gets: nothing (none is implemented) |
+
+```mermaid
+flowchart LR
+    S["server: a session's grant<br/>one_command"] --> R{"the device's SYSTEM service<br/>published one_command?"}
+    R -- "yes, and it serves this account" --> V["the service claims it<br/>(claim says one_command=true)"]
+    R -- "no" --> W["the worker records it<br/>(its own ssh-one-command)"]
+    V --> H["the SSH server: one exec,<br/>on one channel"]
+    W --> H
+```
+
+**Who says the device can hold it.** The worker's hello advertises
+`ssh-one-command`, and P3-8-1b sends a session's grant to no connection that
+does not. That word speaks for the worker's own server. On an anchored Windows
+device, a grant may instead go to the SYSTEM service (FR-105), whose build can
+be older than the worker's. So the service says it for itself:
+- its endpoint publish carries `one_command: true`, and a session's grant is
+  routed to the service only when the published record says so. Otherwise the
+  worker serves it, as it serves any grant outside the service's reach;
+- its claim carries `one_command=true`, and a session's grant is handed to no
+  claim that does not say so: the same 404 as every other refusal, audited
+  `claim_refused`. Routing already keeps such a grant from a service that
+  never said the word, so this is the backstop for one whose build changed
+  since it published.
+
+⚠️ **The attempt counts, not the success.** A session that sent an `exec`
+the device refused, or whose command failed to start, has used its one
+command. Retrying would let a session probe the device's rules one refusal at
+a time.
+
+⚠️ **The key-list path is never one-command.** A key in the device's own
+`ssh_authorized_keys` is the owner's break-glass access, and no agent
+session's grant backs it.
+
+| Piece | Where |
+|---|---|
+| the grant's field | `Grant::one_command` ([`ssh.rs:2834`](../agents/roomlerd/src/ssh.rs#L2834)), recorded by `record_grant` ([`:2910`](../agents/roomlerd/src/ssh.rs#L2910)), resolved into the session's policy ([`:826`](../agents/roomlerd/src/ssh.rs#L826)) |
+| the rules | one channel ([`ssh.rs:1680`](../agents/roomlerd/src/ssh.rs#L1680)), no forward ([`:1746`](../agents/roomlerd/src/ssh.rs#L1746)), one `exec` ([`:1841`](../agents/roomlerd/src/ssh.rs#L1841)), no shell ([`:1949`](../agents/roomlerd/src/ssh.rs#L1949)), no terminal ([`:1988`](../agents/roomlerd/src/ssh.rs#L1988)), no subsystem ([`:2091`](../agents/roomlerd/src/ssh.rs#L2091)) |
+| the device's word | `ssh-one-command` in the hello ([`caps.rs:1932`](../agents/roomlerd/src/encode/caps.rs#L1932)) |
+| the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
+| the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2653`](../crates/remote_control/src/models.rs#L2653)) |
 
 ## 5. Roadmap
 

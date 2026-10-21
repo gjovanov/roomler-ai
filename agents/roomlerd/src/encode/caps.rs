@@ -1929,6 +1929,13 @@ fn rpc_caps() -> Vec<String> {
         // hold the caller for it. A property of the BUILD, like `ssh`: the
         // ack is sent even when the device refuses — that is the point.
         caps.push(RpcCap::SshGrantAck);
+        // FR-90 P3-8-2a. This build's SSH server holds an agent session's
+        // grant (`one_command`) to ONE `exec` and nothing else. Distinct from
+        // `ssh`, its prefix, because every build before it would read past
+        // the field and serve that session's key a shell: the server sends a
+        // session's grant only to a device that says this. A property of the
+        // BUILD; the SYSTEM service says it for itself, when it publishes.
+        caps.push(RpcCap::SshOneCommand);
     }
     // FR-52 P4 — this build can ADMIT an external session: bind it to a
     // verified login, check its offer's MAC, seal its answer. The server opens
@@ -2389,6 +2396,14 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::SshGrantAck.wire()),
             cfg!(feature = "ssh-server"),
             "ssh-grant-ack must be advertised exactly when the SSH server is built"
+        );
+        // FR-90 P3-8-2a — and so does one command: the server sends an agent
+        // session's grant only where this is said, and the SSH server is what
+        // holds it there.
+        assert_eq!(
+            advertised.iter().any(|v| v == RpcCap::SshOneCommand.wire()),
+            cfg!(feature = "ssh-server"),
+            "ssh-one-command must be advertised exactly when the SSH server is built"
         );
         // FR-97 P5a — `console-user` on every Unix build and never on
         // Windows, whose `console_user` is its SYSTEM service's: a Windows

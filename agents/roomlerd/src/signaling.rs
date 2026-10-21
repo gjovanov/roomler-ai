@@ -5224,12 +5224,11 @@ async fn handle_server_msg(
             session_secs,
             consent_mode,
             via_service,
-            // FR-90 P3-8-1b — an agent session's grant, held to one command.
-            // This build does not advertise `ssh-one-command`, and the server
-            // sends a session's grant only to a device that does, so no grant
-            // this build receives carries it; holding one to one command is
-            // P3-8-2a's.
-            one_command: _,
+            // FR-90 P3-8-2a — an agent session's grant, held to ONE command by
+            // this device's SSH server (`ssh::Grant::one_command`), whichever
+            // of the two serves it: the worker's below, or the SYSTEM
+            // service's, which takes it from its own claim.
+            one_command,
         } => {
             #[cfg(feature = "ssh-server")]
             if via_service {
@@ -5294,14 +5293,16 @@ async fn handle_server_msg(
                         }
                     });
                 }
-                // The service pulled what it needs from the server; nothing
-                // here is the worker's to hold.
+                // The service pulled what it needs from the server, its claim
+                // carrying `one_command` too; nothing here is the worker's to
+                // hold.
                 let _ = (
                     public_key,
                     account,
                     consent_mode,
                     expires_at_ms,
                     session_secs,
+                    one_command,
                 );
             } else {
                 use roomler_ai_remote_control::models::SshGrantRefusal;
@@ -5321,6 +5322,7 @@ async fn handle_server_msg(
                         consent_mode,
                         expires_at_ms,
                         session_secs,
+                        one_command,
                     ) {
                         Ok(()) => None,
                         Err(e) => {
@@ -5349,6 +5351,7 @@ async fn handle_server_msg(
                     expires_at_ms,
                     session_secs,
                     via_service,
+                    one_command,
                 );
                 warn!(
                     %grant_id, %caller,
