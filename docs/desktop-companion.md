@@ -286,14 +286,22 @@ sequenceDiagram
   (`localapi::connect_unix_served_by_root`).
 - **"This device" is the root half's row.** The per-user half's own row has no node, so the
   machine's netmap does not carry it, and it is not in the list.
-- **Still the per-user half's: the Connection column and the Overview page's network
-  fields.** They come from the half's own synchronous `Peers` and `Status`, and that half runs
-  no overlay. So on a Mac:
-  - the Connection column shows `—`, and the dot falls back to the server's presence;
-  - Overview shows no online count and "(no overlay IP)", with no MagicDNS or exit line,
-    though the machine holds an address.
+- **The live view comes from the root half too (FR-97 P2h).** The Connection column and the
+  Overview page read `Peers` and `Status`, which the half answered from its own overlay. It
+  runs none, so before P2h a Mac showed:
+  - `—` in the Connection column, with the dot falling back to the server's presence;
+  - no online count and "(no overlay IP)" on Overview, with no MagicDNS or exit line.
 
-  Serving them from the root half too is FR-97 P2h.
+  Both requests now pass through one async hook (`LocalApiState::status_view` /
+  `peers_view`, which default to the sync reads). When the half holds no overlay address of
+  its own (`person_socket::network_view_wanted`), its hook answers:
+  - `Peers` with the root half's peers, as the person socket serves them: the link (online,
+    direct or relayed and over what, round trip) without any endpoint;
+  - `Status` with its own name, version and server link, plus the root half's overlay
+    addresses, exit status and MagicDNS (`person_socket::with_machine_network`).
+
+  A root half that is slow to answer (1.5 s) leaves the half's own answer on screen for that
+  poll.
 - The root half's person socket, its directory and the uid check: §12 and the
   [security baseline](security-baseline.md) §4.
 
@@ -592,7 +600,8 @@ tries first:
 - it follows the active graphical session's user;
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
-  and the mesh, read-only (§6).
+  and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
+  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`).
 
 Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
 views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
