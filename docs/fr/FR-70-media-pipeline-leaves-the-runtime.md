@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; M3b not built)
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; M3b not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -1051,6 +1051,127 @@ congestion event. Whether to start the next replacement sooner than
 congested pipe — is M4's question, and `plan_stale_swaps` is the number it will
 be decided on.
 
+## M3a.2 — a dims replacement opens at the ceiling of the dims it is opened for (2026-10-21)
+
+Anchors verified against branch `fr70-m3a2-dims-replacement-target-ceiling`
+(master `96f3a6884`, which carries #2662, + this change). The sections above
+keep their own anchors.
+
+This is the fix §"M3a.1" named, done before M3b as that section requires.
+
+### What was wrong
+
+A dims replacement opened at `min(last_ceiling_bps, applied)`.
+`last_ceiling_bps` is the ceiling of the last frame the pump planned. M2's pin
+holds every frame at the OLD dims until the swap, so that is the old frame's
+ceiling. On a move down, the applied rate fits under the old ceiling but not the
+new one. The replacement opened at the old frame's rung, and the controller's
+first tick after adoption clamped the target to the new frame's ceiling and
+re-rated it. On a rebuild-bound backend (`inplace_rate=false`), that re-rate is
+a second open right behind the first. On a relay, the replacement's opening IDR
+is sized for the old frame's rate and goes into the thin pipe.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as pump (frame path)
+    participant O as blocking open
+    participant C as controller tick
+    Note over P: the plan moves 1600×900 → 1050×590<br/>M2's pin keeps frames at 1600×900
+    alt before — the old frame's ceiling (0.4.148, zeus)
+        P->>O: open at min(22.95 M ceiling, 22.95 M applied) → the 25 M rung
+        O-->>P: adopted 4 ms later
+        C->>P: target 9.87 M, the new frame's ceiling → the 8 M rung
+        P->>O: re-rate: a SECOND open (inplace_rate=false)
+    else after — the ceiling of the dims it is opened for
+        P->>O: open at min(9.87 M ceiling, 22.95 M applied) → the 8 M rung
+        O-->>P: adopted
+        C->>P: target 9.87 M → the 8 M rung, already applied: nothing to do
+    end
+```
+
+### The change
+
+| Where | What |
+|---|---|
+| `policy::replacement_open_bps` (`policy.rs:211`) | the applied rate (or, before the controller has applied one, the remembered seed), never above the ceiling of the dims the replacement is opened FOR |
+| the dims spawn (`peer.rs:8040`, the rate at `:8076`) | computes that ceiling at the plan dims with the same chain as the per-frame ceiling (`peer.rs:8193`–`8231`): `rate_plan` with the same native dims, fps, codec, chroma, encode factor, user-pick and dial factor → the learner's lift → the shared-pipeline split, floored at the plan dims' area floor |
+| `CeilingLearner::ceiling_for` (`ceiling_learn.rs:138`), `RateGovernor::ceiling_for` (`governor.rs:519`) | asks the learner instead of telling it: `effective_ceiling` without recording the nominal, so the learner's judgements stay on the frame actually encoded. `effective_ceiling` now delegates to it, so the two cannot drift |
+
+- **A move up changes nothing.** The applied rate already sits under the old
+  ceiling, and the old ceiling sits under the new one. Only a move down, whose
+  applied rate exceeds the new ceiling, opens lower: at the rung the controller's
+  first tick would apply anyway. `rebuild_spec_at_dims` coarsens the rate the
+  same way `set_bitrate` does (`encoder.rs:2206`, `:2322`), so that tick finds
+  the encoder already on its rung and does nothing.
+- **No kill switch, on purpose.** The change moves one transient to the rate the
+  next tick applies anyway; it removes an open and adds no state. Its alarm is
+  the shadow's own `bitrate` field: a wrong target ceiling reads as a divergence
+  on the first adoption, in either direction. A switch would add a branch to the
+  frame path that M3b deletes.
+
+### What it does not change: the half that is M3b's
+
+§"M3a.1" named two halves: open the replacement at its own dims' ceiling, and
+make the plan's `bitrate_bps` respect its own `dims`. Only the first belongs to
+M3a. The plan's `bitrate_bps` is the controller's standing target, passed
+through (`produce`, `plan.rs:233`), because the producer does not own the
+controller until M4 (the module doc, "Facts and decisions"). The second half is
+therefore a **design requirement on M3b**: when the loop opens a dims
+replacement *from the plan*, the plan must name the rate under the plan dims'
+ceiling — the number this change computes — and not the controller's target
+under the old ceiling. Otherwise M3b ships this bug again. The `after_tick`
+judgement (`plan.rs:527`) would catch it, exactly as it caught this one.
+
+### Verification
+
+- **`encode::policy`, +2 tests, using the field's numbers.**
+  `rate_plan(1600, 900, …)` = 22 950 000 and `rate_plan(1050, 590, …)` =
+  9 873 281. Opening at the old frame's ceiling lands on the 25 M rung (the
+  field's inline value). Opening at the target dims' ceiling lands on the 8 M
+  rung (the field's plan value). A move up is unchanged
+  (`a_dims_replacement_opens_at_the_ceiling_of_the_dims_it_is_opened_for`,
+  `policy.rs:311`). Before any applied rate, the seed is used, capped by the
+  ceiling (`:332`).
+- **`encode::ceiling_learn`, +1 test.** `ceiling_for` answers as
+  `effective_ceiling` would and leaves the nominal on the frame being encoded
+  (`ceiling_learn.rs:304`). The no-side-effect half is enforced by the compiler
+  (`&self`). The test pins the equality, which a later re-implementation of
+  either function could break.
+- **Negative control A.** `replacement_open_bps` made to ignore its ceiling in
+  both arms (marked `NEGATIVE CONTROL A`) → **FAILED, 2 failed / 91 passed**:
+  exactly the two policy tests. The failures are the field's own pair
+  (`left: 25000000, right: 8000000`) and the seed case
+  (`left: 12000000, right: 9000000`).
+- **Negative control B (planted, then discarded as the wrong control).**
+  Breaking `ceiling_for`'s body failed 11 existing learner and governor tests,
+  which shows the delegation is exercised by the whole suite. It did **not**
+  fail the new test, because both sides of that test moved together. The
+  property that test guards is a type signature, and no planted body can break
+  it.
+- **Both reverted** (`grep -c "NEGATIVE CONTROL"` = 0): 93 passed across
+  policy, learner, governor and plan. `cargo fmt --check` and
+  `cargo clippy -p roomlerd --lib -- -D warnings` are clean.
+- **CI's FFmpeg lane, in WSL.** `cargo clippy -p roomlerd --features
+  ffmpeg-encoder,vp9-444,vp9-444-bindgen --all-targets -- -D warnings` is
+  clean; the pump wiring compiles only here. `cargo test -p roomlerd --features
+  ffmpeg-encoder --lib` (with the ICE workaround from §"M3a.1"): 1762 passed,
+  2 failed. The two failures are environmental and unrelated: an Xvfb display
+  already taken, and a WSL connect timeout.
+- ⚠️ **No unit test reaches the pump's call site.** The dims spawn sits inside
+  `media_pump_ffmpeg_dc`. The field verifies it: **red** on 0.4.148 (the `zeus`
+  move in §"M3a.1"'s table: plan `8000000`, inline `25000000`, reproducible on
+  demand), and **green owed** on the release that carries this change — the
+  same driven move with no `bitrate` divergence and no re-rate in the tick
+  after the adoption.
+
+### For the gate (AC10)
+
+This ships in 0.4.150 at the earliest; 0.4.149 was cut before #2662. The fresh
+week that AC10 needs starts when that release reaches the fleet, and the `zeus`
+move is its first driven check. Still owed: the full read with the
+`remote_sessions` denominator, and the three driven moves §"M3a.1" lists.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -1110,7 +1231,8 @@ be decided on.
       M3a.1. A driven session then found the first GENUINE plan bug: a dims
       replacement going down opens at the old frame's rate and is re-rated on
       the next tick. Owed: that fix, a week after it, the full read with the
-      `remote_sessions` denominator, and the missing driven moves — §"M3a.1".)*
+      `remote_sessions` denominator, and the missing driven moves — §"M3a.1".
+      The fix is §"M3a.2", in 0.4.150 at the earliest; the week starts there.)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 
