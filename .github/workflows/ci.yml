@@ -1394,12 +1394,14 @@ jobs:
       # FR-90 P3-5b-1: `vault_proxy::` — the vault's proxy engines, against a
       # fake upstream over real TLS. `proxy` is the only mode a session on
       # Windows gets (decision 17), and `vault::` does not match the module.
+      # FR-90 P3-8-2a: `ssh_service::` — the SYSTEM service's claim and publish
+      # are `cfg(windows)`, so no other lane runs what they say of one command.
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         if: ${{ !cancelled() }}
         # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
         # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy::
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy:: ssh_service::
 
       # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
       # border and badge, the native consent panel, and the privacy curtain

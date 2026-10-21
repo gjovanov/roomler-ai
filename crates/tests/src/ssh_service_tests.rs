@@ -137,6 +137,22 @@ async fn claim(app: &TestApp, service: &str, grant_id: &str) -> reqwest::Respons
         .unwrap()
 }
 
+/// FR-90 P3-8-2a — a claim from a service that holds an agent session's
+/// grant to one command, as its build says on every claim.
+async fn claim_holding_one_command(
+    app: &TestApp,
+    service: &str,
+    grant_id: &str,
+) -> reqwest::Response {
+    app.auth_post(
+        &format!("/api/agent/service/ssh/{grant_id}/claim?one_command=true"),
+        service,
+    )
+    .send()
+    .await
+    .unwrap()
+}
+
 /// A Windows device on the mesh: enrolled, an overlay address, SSH policy
 /// `account_mode`, anchored, its service's endpoint published with
 /// `ceiling`, and a raw socket advertising `rpc`.
@@ -730,4 +746,108 @@ async fn the_kill_switch_restores_the_worker_path() {
     };
     let (body, ()) = tokio::join!(request_session(&app, &seeded, &dev.agent_id), target);
     assert_eq!(body["port"], json!(2222), "{body}");
+}
+
+/// FR-90 P3-8-2a — the claim is where an agent session's grant would reach a
+/// service too old to hold it to one command, so it is the backstop:
+/// - such a grant is not handed to a claim that does not say
+///   `one_command=true` (the same 404 as every other refusal, audited
+///   `claim_refused`), and is to one that does, the word with it;
+/// - a person's grant is still handed to a claim that says nothing, which is
+///   the positive control;
+/// - what the service publishes of one command is what the record holds, and
+///   false when it says nothing.
+///
+/// No policy admits a session before decision 22, so the session's grant is
+/// written as `decide` would write it.
+#[tokio::test]
+async fn a_sessions_grant_is_claimed_only_by_a_service_that_holds_one_command() {
+    use roomler_ai_remote_control::models::SshPending;
+    use roomler_ai_services::dao::ssh_pending::SshPendingDao;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("sshonecmd").await;
+    enable_org_ssh(&app, &seeded).await;
+    let dev = device(
+        &app,
+        &seeded,
+        "win-onecmd",
+        "100.64.0.71",
+        "daemon",
+        "system",
+        SERVICE_CAPABLE,
+    )
+    .await;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let aid = ObjectId::parse_str(&dev.agent_id).unwrap();
+
+    // The record holds what the service said of one command.
+    let held = || async {
+        let row = app
+            .db
+            .collection::<bson::Document>("agents")
+            .find_one(bson::doc! { "_id": aid })
+            .await
+            .unwrap()
+            .expect("the device's row");
+        row.get_document("ssh_service")
+            .expect("an endpoint")
+            .get_bool("one_command")
+            .unwrap_or(false)
+    };
+    assert!(!held().await, "published without the word");
+    let republished = publish(
+        &app,
+        &dev.service,
+        json!({ "host_pubkey": service_key(), "ceiling": "system", "one_command": true }),
+    )
+    .await;
+    assert_eq!(republished.status(), 200);
+    assert!(held().await, "published with it");
+
+    let now = bson::DateTime::now();
+    let at = |secs: i64| bson::DateTime::from_millis(now.timestamp_millis() + secs * 1000);
+    let row = |grant_id: &str, one_command: bool| SshPending {
+        id: None,
+        grant_id: grant_id.to_string(),
+        tenant_id: tid,
+        agent_id: aid,
+        public_key: session_key(),
+        caller: "agent session 0 of someone (via a device)".to_string(),
+        account_mode: "daemon".to_string(),
+        expires_at_ms: (now.timestamp_millis() + 60_000) as u64,
+        session_secs: 60,
+        consent_mode: None,
+        one_command,
+        state: SshPending::PENDING.to_string(),
+        created_at: now,
+        claim_by: at(10),
+        expires_at: at(120),
+        claimed_at: None,
+    };
+    let dao = SshPendingDao::new(&app.db);
+    let (person, session) = (ObjectId::new().to_hex(), ObjectId::new().to_hex());
+    dao.insert(&row(&person, false)).await.unwrap();
+    dao.insert(&row(&session, true)).await.unwrap();
+
+    // A person's grant, to a claim that says nothing: handed over, as before.
+    let claimed = claim(&app, &dev.service, &person).await;
+    assert_eq!(claimed.status(), 200, "the positive control");
+    let body: Value = claimed.json().await.unwrap();
+    assert!(body.get("one_command").is_none(), "{body}");
+
+    // A session's, to a claim that says nothing: refused, and audited.
+    assert_eq!(claim(&app, &dev.service, &session).await.status(), 404);
+    let rows = audit_rows(&app, &seeded).await;
+    assert!(
+        rows.iter()
+            .any(|r| r["denied"] == json!("claim_refused") && r["grant_id"] == json!(session)),
+        "the refused claim is audited: {rows:?}"
+    );
+
+    // …and to a claim that holds one command: handed over, with the word.
+    let claimed = claim_holding_one_command(&app, &dev.service, &session).await;
+    assert_eq!(claimed.status(), 200);
+    let body: Value = claimed.json().await.unwrap();
+    assert_eq!(body["one_command"], json!(true), "{body}");
 }

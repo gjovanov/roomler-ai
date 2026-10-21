@@ -562,7 +562,7 @@ async fn decide(
     } = spec;
     // FR-105 — who serves this grant: the device's SYSTEM service, or its
     // worker (on an attended Windows install, the signed-in user).
-    let via_service = routes_ssh_via_service(state, agent, account_mode);
+    let via_service = routes_ssh_via_service(state, agent, account_mode, session.is_some());
     let consent_mode = Some(effective_wire_consent(consent_mode));
     let msg = ServerMsg::SshGrant {
         grant_id: grant_id.clone(),
@@ -759,7 +759,29 @@ const SERVICE_CLAIM_POLL: std::time::Duration = std::time::Duration::from_millis
 /// service published with its OWN credential) and the device's live word (the
 /// service is up and answering the worker). A worker that lies about the word
 /// gains nothing: the caller pins a key only the real service holds.
-pub fn routes_ssh_via_service(state: &NetworkState, agent: &Agent, mode: SshAccountMode) -> bool {
+///
+/// FR-90 P3-8-2a — and an agent session's grant (`one_command`) only to a
+/// service that published that it holds one command. Otherwise the worker
+/// serves it, as it serves any grant outside the service's reach, and the
+/// worker's own `ssh-one-command` speaks for that.
+pub fn routes_ssh_via_service(
+    state: &NetworkState,
+    agent: &Agent,
+    mode: SshAccountMode,
+    one_command: bool,
+) -> bool {
+    state.fleet.settings.rc.ssh_via_service
+        && service_endpoint_serves(agent, mode, one_command)
+        && agent
+            .id
+            .is_some_and(|id| state.fleet.rc_hub.agent_supports_ssh_system(id) == Some(true))
+}
+
+/// The record's half of [`routes_ssh_via_service`]: a Windows device whose
+/// service published an endpoint under its CURRENT anchor, with a host key,
+/// a ceiling that permits `mode`, and, for an agent session's grant, the word
+/// that it holds one command.
+fn service_endpoint_serves(agent: &Agent, mode: SshAccountMode, one_command: bool) -> bool {
     let Some(anchor) = agent
         .exec_anchor
         .as_ref()
@@ -767,14 +789,13 @@ pub fn routes_ssh_via_service(state: &NetworkState, agent: &Agent, mode: SshAcco
     else {
         return false;
     };
-    state.fleet.settings.rc.ssh_via_service
-        && matches!(agent.os, OsKind::Windows)
+    matches!(agent.os, OsKind::Windows)
         && agent.ssh_service.as_ref().is_some_and(|s| {
-            s.anchor_id == anchor.anchor_id && !s.host_pubkey.is_empty() && s.ceiling.permits(mode)
+            s.anchor_id == anchor.anchor_id
+                && !s.host_pubkey.is_empty()
+                && s.ceiling.permits(mode)
+                && (s.one_command || !one_command)
         })
-        && agent
-            .id
-            .is_some_and(|id| state.fleet.rc_hub.agent_supports_ssh_system(id) == Some(true))
 }
 
 /// FR-105 — what `ssh_audit.ran_as` records: the server's decision about who
@@ -1256,6 +1277,10 @@ pub struct ServiceSshEndpointBody {
     /// The anchor's `ssh` ceiling, as the service read it from the anchor
     /// file only SYSTEM and Administrators can write.
     pub ceiling: SshServiceCeiling,
+    /// FR-90 P3-8-2a — the service holds an agent session's grant to one
+    /// command. A service before it says nothing: false.
+    #[serde(default)]
+    pub one_command: bool,
 }
 
 /// The service publishes its SSH endpoint, with its OWN credential: the
@@ -1286,6 +1311,7 @@ pub async fn publish_service_endpoint(
         ceiling: body.ceiling,
         anchor_id,
         published_at: bson::DateTime::now(),
+        one_command: body.one_command,
     };
     match state
         .fleet
@@ -1296,6 +1322,7 @@ pub async fn publish_service_endpoint(
         Ok(true) => {
             info!(
                 agent = %svc.agent_id, ceiling = ?endpoint.ceiling,
+                one_command = endpoint.one_command,
                 "ssh: the SYSTEM service published its endpoint"
             );
             Ok(Json(serde_json::json!({ "ok": true })))
@@ -1330,6 +1357,15 @@ pub struct ClaimedSshGrant {
     pub one_command: bool,
 }
 
+/// What a claim says of the service that sends it.
+#[derive(Debug, Default, Deserialize)]
+pub struct ServiceClaimQuery {
+    /// FR-90 P3-8-2a — `one_command=true`: this service holds an agent
+    /// session's grant to one command. Absent from every claim before it.
+    #[serde(default)]
+    pub one_command: bool,
+}
+
 /// `POST /api/agent/service/ssh/{grant_id}/claim`, with the service's own
 /// credential. Single use, this device's only, inside the caller's wait. The
 /// claim IS the grant's acknowledgement: a caller waiting on this pod is told
@@ -1338,16 +1374,22 @@ pub struct ClaimedSshGrant {
 /// Anything else is a 404 and an audit row (`claim_refused`) with no user:
 /// unknown, claimed already, withdrawn, expired, another device's. The
 /// reasons are not told apart, so a forged ring learns nothing.
+///
+/// FR-90 P3-8-2a — and an agent session's grant, to a claim that does not say
+/// `one_command=true`: a service too old to hold one command would serve that
+/// session's key a shell. Routing already keeps such a grant from a service
+/// that never published the word; this holds if its build changed since.
 pub async fn claim_service_grant(
     State(state): State<NetworkState>,
     headers: axum::http::HeaderMap,
     Path(grant_id): Path<String>,
+    Query(claim): Query<ServiceClaimQuery>,
 ) -> Result<Json<ClaimedSshGrant>, ApiError> {
     let svc =
         roomler_ai_mod_fleet::auth_agent::authenticate_service(&state.fleet, &headers).await?;
     match state
         .ssh_pending
-        .claim(&grant_id, svc.agent_id, svc.tenant_id)
+        .claim(&grant_id, svc.agent_id, svc.tenant_id, claim.one_command)
         .await
     {
         Ok(Some(row)) => {
@@ -2238,5 +2280,104 @@ mod session_tests {
         );
         assert_eq!(person.source, "cli");
         assert_eq!((person.session_id, person.ssh_ticket_id), (None, None));
+    }
+}
+
+/// FR-90 P3-8-2a — which grants a device's SYSTEM service is sent.
+#[cfg(test)]
+mod service_route_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::ExecAnchor;
+
+    /// A Windows device anchored as `anchor-1`, whose service published under
+    /// `published.0`, saying `published.1` of one command; or published
+    /// nothing.
+    fn device(published: Option<(&str, bool)>) -> Agent {
+        let mut a: Agent = serde_json::from_str(
+            r#"{
+                "tenant_id":"000000000000000000000001",
+                "owner_user_id":"000000000000000000000002",
+                "name":"winbox","machine_id":"m","os":"windows",
+                "agent_version":"0.4.150","agent_token_hash":"",
+                "status":"online","last_seen_at":{"$date":{"$numberLong":"0"}},
+                "created_at":{"$date":{"$numberLong":"0"}},
+                "updated_at":{"$date":{"$numberLong":"0"}},
+                "deleted_at":null
+            }"#,
+        )
+        .unwrap();
+        a.exec_anchor = Some(ExecAnchor {
+            anchored_at: bson::DateTime::now(),
+            anchored_by: ObjectId::new(),
+            anchor_id: "anchor-1".to_string(),
+        });
+        a.ssh_service = published.map(|(anchor_id, one_command)| SshServiceEndpoint {
+            host_pubkey: "the service's host key".to_string(),
+            ceiling: SshServiceCeiling::System,
+            anchor_id: anchor_id.to_string(),
+            published_at: bson::DateTime::now(),
+            one_command,
+        });
+        a
+    }
+
+    /// A person's grant goes to a current service whatever it said of one
+    /// command; an agent session's only to one that said it holds one. The
+    /// rest of the rule is unchanged: never under another anchor, nor where
+    /// nothing was published.
+    #[test]
+    fn a_sessions_grant_goes_to_the_service_only_if_it_holds_one_command() {
+        let mode = SshAccountMode::Daemon;
+        let said = |one_command| device(Some(("anchor-1", one_command)));
+        assert!(service_endpoint_serves(&said(false), mode, false));
+        assert!(service_endpoint_serves(&said(true), mode, false));
+        assert!(
+            !service_endpoint_serves(&said(false), mode, true),
+            "a service that never said it holds one command"
+        );
+        assert!(service_endpoint_serves(&said(true), mode, true));
+        assert!(!service_endpoint_serves(
+            &device(Some(("anchor-0", true))),
+            mode,
+            true
+        ));
+        assert!(!service_endpoint_serves(&device(None), mode, true));
+    }
+
+    /// A record a service published before P3-8-2a reads as not holding one
+    /// command, and so does a publish that does not say it.
+    #[test]
+    fn what_a_service_never_said_of_one_command_is_false() {
+        let stored = bson::doc! {
+            "host_pubkey": "k",
+            "ceiling": "system",
+            "anchor_id": "a",
+            "published_at": bson::DateTime::now(),
+        };
+        let endpoint: SshServiceEndpoint = bson::from_document(stored).unwrap();
+        assert!(!endpoint.one_command);
+        let body: ServiceSshEndpointBody =
+            serde_json::from_str(r#"{"host_pubkey":"k","ceiling":"system"}"#).unwrap();
+        assert!(!body.one_command);
+        let body: ServiceSshEndpointBody =
+            serde_json::from_str(r#"{"host_pubkey":"k","ceiling":"system","one_command":true}"#)
+                .unwrap();
+        assert!(body.one_command);
+    }
+
+    /// A claim holds one command only when it says so; every claim before
+    /// P3-8-2a says nothing, beside the `tid` the front proxy hashes on.
+    #[test]
+    fn a_claim_holds_one_command_only_when_it_says_so() {
+        let said = |query: &str| {
+            let uri: axum::http::Uri = format!("http://pod/claim?{query}").parse().unwrap();
+            Query::<ServiceClaimQuery>::try_from_uri(&uri)
+                .unwrap()
+                .0
+                .one_command
+        };
+        assert!(!said("tid=000000000000000000000001"));
+        assert!(said("tid=000000000000000000000001&one_command=true"));
+        assert!(!said("one_command=false"));
     }
 }
