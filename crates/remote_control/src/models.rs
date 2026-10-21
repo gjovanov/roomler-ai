@@ -2565,6 +2565,27 @@ pub enum SshAccountMode {
     Named,
 }
 
+impl SshAccountMode {
+    /// FR-90 P3-8-1a — the word for each mode, as serde spells it: what
+    /// `rc:ssh.grant` carries, and what the vault's `ssh:run` reads as
+    /// `context.account` and its ticket names. ⚠️ A compatibility surface,
+    /// locked by test against serde's own spelling.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Daemon => "daemon",
+            Self::ConsoleUser => "console_user",
+            Self::Named => "named",
+        }
+    }
+
+    pub const ALL: [SshAccountMode; 3] = [Self::Daemon, Self::ConsoleUser, Self::Named];
+
+    /// Parse a mode's word. `None` for a word this build cannot name.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.wire() == s)
+    }
+}
+
 /// FR-105 — how far an anchored Windows device's SYSTEM service will go with
 /// roomler SSH. Set on the device, elevated (`roomlerd anchor ssh <…>`), in
 /// the anchor file only SYSTEM and Administrators can write, and published by
@@ -8025,6 +8046,24 @@ mod tests {
             ..Default::default()
         };
         assert!(acking.has_rpc(RpcCap::SshGrantAck));
+    }
+
+    /// FR-90 P3-8-1a — an account mode's word is serde's, spelled out here so
+    /// a rename is a deliberate edit: a policy's `context.account ==
+    /// "daemon"` and a ticket's account must read what `rc:ssh.grant` sends.
+    #[test]
+    fn ssh_account_mode_words_are_locked_and_are_serdes() {
+        let words: Vec<&str> = SshAccountMode::ALL.iter().map(|m| m.wire()).collect();
+        assert_eq!(words, ["daemon", "console_user", "named"]);
+        for m in SshAccountMode::ALL {
+            assert_eq!(
+                serde_json::to_value(m).unwrap(),
+                serde_json::json!(m.wire())
+            );
+            assert_eq!(SshAccountMode::from_wire(m.wire()), Some(m));
+        }
+        assert_eq!(SshAccountMode::from_wire("root"), None);
+        assert_eq!(SshAccountMode::from_wire("Daemon"), None);
     }
 
     /// FR-90 — `hive` is matched by equality, in both directions that

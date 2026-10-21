@@ -1597,6 +1597,29 @@ pub enum ClientMsg {
         ttl_secs: u32,
     },
 
+    /// FR-90 P3-8-1a — a session on this device asks to run one command on
+    /// `target` over Roomler SSH (`ssh_run`). Believed as a lease request is
+    /// (the session's record, at its fence, on this device), decided by
+    /// Cedar's `ssh:run`, and answered with [`ServerMsg::VaultSshGranted`] or
+    /// [`ServerMsg::VaultRefused`], naming `req_id`.
+    ///
+    /// ⚠️ `tenant_id` and the origin device come from the authenticated WS,
+    /// NOT from this frame, and the target is never that device: a session
+    /// already runs there, as its own account.
+    #[serde(rename = "rc:vault.ssh")]
+    VaultSsh {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The device the command runs on.
+        #[serde(with = "oid_hex")]
+        target: ObjectId,
+        /// How long the session wants it, in seconds. The vault clamps it to
+        /// a lease's bounds ([`crate::vault::lease_limits`]).
+        ttl_secs: u32,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2532,6 +2555,7 @@ impl ClientMsg {
             ClientMsg::VaultDescribe { .. } => "rc:vault.describe",
             ClientMsg::VaultActivity { .. } => "rc:vault.activity",
             ClientMsg::VaultNet { .. } => "rc:vault.net",
+            ClientMsg::VaultSsh { .. } => "rc:vault.ssh",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2657,7 +2681,8 @@ impl ClientMsg {
             | ClientMsg::VaultList { .. }
             | ClientMsg::VaultDescribe { .. }
             | ClientMsg::VaultActivity { .. }
-            | ClientMsg::VaultNet { .. } => Owner::Vault,
+            | ClientMsg::VaultNet { .. }
+            | ClientMsg::VaultSsh { .. } => Owner::Vault,
         }
     }
 }
@@ -2708,6 +2733,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.describe", Owner::Vault),
     ("rc:vault.activity", Owner::Vault),
     ("rc:vault.net", Owner::Vault),
+    ("rc:vault.ssh", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -4699,6 +4725,29 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "is_zero_u16")]
         port: u16,
     },
+
+    /// FR-90 P3-8-1a — the vault allowed a session's command on another
+    /// device ([`ClientMsg::VaultSsh`]): `ticket`, a token signed by the
+    /// server under its own audience (`ssh_ticket`), which the device attaches
+    /// to `rc:ssh.request` (P3-8-1b). Sent only on the connection that asked,
+    /// never pushed. Named a ticket, not a grant: `rc:ssh.grant` is the
+    /// target's (FR-83), and the request carries both.
+    #[serde(rename = "rc:vault.ssh.granted")]
+    VaultSshGranted {
+        req_id: String,
+        /// The ticket's id, as the vault records its allow (`ticket:<id>`).
+        ticket_id: String,
+        ticket: String,
+        /// When it ends, in whole seconds as the ticket names it.
+        expires_at_ms: i64,
+        /// The target's OS as its row holds it (`linux`, `macos`,
+        /// `windows`), which the vault read for Cedar: the session's command
+        /// meets that system's shell.
+        os: String,
+        /// The account the target's SSH policy maps, which the vault decided
+        /// on (a [`crate::models::SshAccountMode`] word) and the ticket names.
+        account: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -5602,6 +5651,57 @@ mod tests {
             v.get("host").is_none() && v.get("port").is_none(),
             "SOCKS names no destination: {v}"
         );
+    }
+
+    /// FR-90 P3-8-1a — a session's ask for one command on another device, and
+    /// its ticket, as they cross the wire; both read back the same, and the
+    /// ask belongs to the vault.
+    #[test]
+    fn vault_ssh_wire_shape_is_locked() {
+        let (sid, target) = (ObjectId::new(), ObjectId::new());
+        let ask = ClientMsg::VaultSsh {
+            req_id: "s1".into(),
+            session_id: sid,
+            fence: 4,
+            target,
+            ttl_secs: 120,
+        };
+        let v = serde_json::to_value(&ask).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:vault.ssh", "req_id": "s1", "session_id": sid.to_hex(),
+                "fence": 4, "target": target.to_hex(), "ttl_secs": 120,
+            })
+        );
+        let back: ClientMsg = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::VaultSsh { target: t, fence: 4, ttl_secs: 120, .. } if t == target
+        ));
+        assert_eq!(back.namespace(), Owner::Vault);
+
+        let granted = ServerMsg::VaultSshGranted {
+            req_id: "s1".into(),
+            ticket_id: "k1".into(),
+            ticket: "the-signed-ticket".into(),
+            expires_at_ms: 1_700_000_120_000,
+            os: "linux".into(),
+            account: "console_user".into(),
+        };
+        let v = serde_json::to_value(&granted).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:vault.ssh.granted", "req_id": "s1", "ticket_id": "k1",
+                "ticket": "the-signed-ticket", "expires_at_ms": 1_700_000_120_000_i64,
+                "os": "linux", "account": "console_user",
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::VaultSshGranted { ref account, .. } if account == "console_user"
+        ));
     }
 
     /// FR-83 — the ack's wire shape. "Recorded" is the ABSENCE of `refused`,

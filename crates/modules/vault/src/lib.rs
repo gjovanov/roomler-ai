@@ -19,7 +19,9 @@
 //! is released (P3-4e, [`approval`]): a card in the session's room, answered
 //! by one of its drivers. A session's own egress is the vault's to decide
 //! too (P3-7-1b, [`net`]): a grant, signed under its own audience, that the
-//! network module checks without calling the vault.
+//! network module checks without calling the vault. So is a session's command
+//! on another device over Roomler SSH (P3-8-1a, [`ssh`]): a ticket, likewise
+//! under its own audience, never naming the device the session runs on.
 //!
 //! The module's switch defaults OFF (`[modules] vault`), and a
 //! `vault.tenants` list both switches it on and limits it to the
@@ -52,6 +54,7 @@ pub mod revoke;
 pub mod routes;
 pub mod rrn;
 pub mod scope;
+pub mod ssh;
 
 /// The module's state: the core, and what the vault owns.
 #[derive(Clone)]

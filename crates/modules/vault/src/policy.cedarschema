@@ -47,10 +47,10 @@ namespace Roomler {
     owner: User,
   };
 
-  // P3-7 — a device a session's flow exits through, named by its id, as its
-  // row holds it: `os` and `tags` as for `Device`, and its owner. A policy
-  // names exits by their tags (`resource.tags.contains("office")`), or one
-  // by its id.
+  // P3-7 — a device a session's flow exits through, or (P3-8) its command
+  // runs on, named by its id, as its row holds it: `os` and `tags` as for
+  // `Device`, and its owner. A policy names nodes by their tags
+  // (`resource.tags.contains("office")`), or one by its id.
   entity Node = {
     os: String,
     tags: Set<String>,
@@ -116,6 +116,20 @@ namespace Roomler {
       device: Device,
       host: String,
       port: Long,
+    },
+  };
+
+  // P3-8 — a session running one command on `resource` over Roomler SSH, as
+  // `account`: the account that device's SSH policy maps (`daemon`,
+  // `console_user` or `named`), read from its row, so an organization can
+  // forbid a session the daemon's (SYSTEM or root). Never the device the
+  // session runs on: no ticket names it. Nothing implies it.
+  action "ssh:run" appliesTo {
+    principal: [Session],
+    resource: [Node],
+    context: {
+      device: Device,
+      account: String,
     },
   };
 }
