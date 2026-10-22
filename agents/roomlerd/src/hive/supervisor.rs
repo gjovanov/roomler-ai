@@ -54,8 +54,9 @@ use roomler_hive_node::checkpoint::Checkpoint;
 #[cfg(unix)]
 use roomler_hive_node::launch::unix_base_env;
 use roomler_hive_node::launch::{
-    APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SettingsSpec, attributed_prompt,
-    config_dir_in, history_path_in, parent_history_in, toolbelt_mcp_config, user_input_line,
+    APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SandboxProxy, SettingsSpec,
+    attributed_prompt, config_dir_in, history_path_in, parent_history_in, toolbelt_mcp_config,
+    user_input_line,
 };
 use roomler_hive_node::stream_json::{Limits, parse_line};
 use roomler_hive_node::{TranscriptEvent, approval_outcome};
@@ -102,10 +103,15 @@ const MAX_WAITING: usize = INPUT_QUEUE / 2;
 /// resume keeps what the session has (its own edits included). A copy that
 /// fails is skipped: memory never stops a session.
 ///
+/// FR-90 P3b-1b-2 — `$5`, when set, is the session's cache directory, made AS
+/// THE ACCOUNT: the one place outside its working directory and temp a
+/// sandboxed command writes (decision 31). One that cannot be made stops the
+/// start, since the sandbox cannot run without it.
+///
 /// P1i-2 — on Windows `roomlerd hive-prep` does this, run as the console user
 /// ([`crate::hive_win::prep`]); the harness's folder is its working directory.
 #[cfg(unix)]
-const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { if [ -n "$3" ]; then if [ -f "$3/CLAUDE.md" ] && [ ! -e "$1/CLAUDE.md" ] && [ ! -L "$1/CLAUDE.md" ]; then cp -- "$3/CLAUDE.md" "$1/CLAUDE.md" 2>/dev/null; fi; if [ -f "$3/MEMORY.md" ] && [ ! -e "$4/MEMORY.md" ] && [ ! -L "$4/MEMORY.md" ]; then mkdir -p -- "$4" 2>/dev/null && cp -- "$3/MEMORY.md" "$4/MEMORY.md" 2>/dev/null; fi; fi; true; } && cd -- "$2" && shift 4 && exec "$@""#;
+const WRAPPER: &str = r#"umask 077 && mkdir -p -- "$1" && { [ -z "$5" ] || mkdir -p -- "$5"; } && { if [ -n "$3" ]; then if [ -f "$3/CLAUDE.md" ] && [ ! -e "$1/CLAUDE.md" ] && [ ! -L "$1/CLAUDE.md" ]; then cp -- "$3/CLAUDE.md" "$1/CLAUDE.md" 2>/dev/null; fi; if [ -f "$3/MEMORY.md" ] && [ ! -e "$4/MEMORY.md" ] && [ ! -L "$4/MEMORY.md" ]; then mkdir -p -- "$4" 2>/dev/null && cp -- "$3/MEMORY.md" "$4/MEMORY.md" 2>/dev/null; fi; fi; true; } && cd -- "$2" && shift 5 && exec "$@""#;
 /// Each session's runtime files (settings, MCP config, toolbelt socket, core
 /// memory): the daemon's own, cleared at boot.
 #[cfg(target_os = "linux")]
@@ -429,6 +435,37 @@ struct Spawned {
     history: bool,
     /// P2b-3b — the session's checkpoints, taken while it is replicated.
     checkpoints: super::checkpointer::Checkpoints,
+}
+
+/// FR-90 P3b-1b-2 — a run's egress proxy while its start is under way:
+/// stopped if the start goes no further, kept once the run is live, when
+/// `unlive` stops it. Unix's alone: a Windows session never runs sandboxed.
+#[cfg(all(unix, feature = "vault"))]
+struct EgressServed(Option<(ObjectId, u64)>);
+
+#[cfg(all(unix, feature = "vault"))]
+impl EgressServed {
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn of(session: ObjectId, fence: u64) -> Self {
+        Self(Some((session, fence)))
+    }
+
+    /// The run is live: `unlive` stops its proxy from now on.
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(all(unix, feature = "vault"))]
+impl Drop for EgressServed {
+    fn drop(&mut self) {
+        if let Some((session, fence)) = self.0.take() {
+            super::egress::drop_run(session, fence);
+        }
+    }
 }
 
 /// P1d-2 — where a session the device hosted stood when its last daemon
@@ -1472,6 +1509,31 @@ impl Supervisor {
         }
     }
 
+    /// FR-90 P3b-1b-2 — the sandbox gate for a start as `account`, where the
+    /// owner turned on `hive_egress`. A build without the vault has no proxy
+    /// to send a sandboxed session's commands through, so it refuses.
+    async fn sandbox_gate(&self, account: &str) -> Result<(), (HiveRefusal, String)> {
+        #[cfg(feature = "vault")]
+        {
+            super::sandbox::gate(
+                account,
+                self.cfg.harness.as_deref(),
+                matches!(self.launcher, Launcher::AsMappedAccount),
+            )
+            .await
+        }
+        #[cfg(not(feature = "vault"))]
+        {
+            let _ = account;
+            Err((
+                HiveRefusal::SandboxUnavailable,
+                "hive_egress needs a build with the vault, which decides each host a sandboxed \
+                 session reaches"
+                    .into(),
+            ))
+        }
+    }
+
     /// FR-90 P3-8-2b-2 — how a session runs one command on another device
     /// (`ssh_run`): where the vault is offered and the device's owner turned
     /// `hive_ssh` on. None otherwise, and then `ssh_run` is not offered.
@@ -2033,6 +2095,13 @@ impl Supervisor {
         if matches!(self.launcher, Launcher::AsMappedAccount)
             && let Err((r, detail)) =
                 super::sudo::gate(&account, self.cfg.allow_passwordless_sudo).await
+        {
+            return Answer::refused(r, detail);
+        }
+        // FR-90 P3b-1b-2 — where the owner turned on `hive_egress`, the session
+        // runs in Claude Code's sandbox or not at all (decision 28).
+        if self.cfg.egress
+            && let Err((r, detail)) = self.sandbox_gate(&account).await
         {
             return Answer::refused(r, detail);
         }
@@ -2647,6 +2716,13 @@ impl Supervisor {
         if matches!(self.launcher, Launcher::AsMappedAccount)
             && let Err((r, detail)) =
                 super::sudo::gate(&account, self.cfg.allow_passwordless_sudo).await
+        {
+            return Answer::refused(r, detail);
+        }
+        // FR-90 P3b-1b-2 — a session moved or teleported here runs sandboxed
+        // too, so it is refused now rather than after its lease moved.
+        if self.cfg.egress
+            && let Err((r, detail)) = self.sandbox_gate(&account).await
         {
             return Answer::refused(r, detail);
         }
@@ -3935,6 +4011,9 @@ impl Supervisor {
         // with every connection on it.
         #[cfg(feature = "vault")]
         super::net_tools::drop_run(session, fence);
+        // FR-90 P3b-1b-2 — and its egress proxy, with every connection on it.
+        #[cfg(feature = "vault")]
+        super::egress::drop_run(session, fence);
     }
 
     /// P1d-2 — a session resumed after its daemon went down. A turn the
@@ -4265,8 +4344,41 @@ impl Supervisor {
         let ssh_tools = ssh.is_some();
         #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
         let ssh_tools = false;
-        let settings = write_settings(&self.runtime, &sid, vault.is_some(), net_tools, ssh_tools)
-            .map_err(|e| {
+        // FR-90 P3b-1b-2 — where the owner turned on `hive_egress` (the sandbox
+        // gate let the start through), the session's egress proxy: its ports
+        // in the settings that turn the sandbox on, its cache made by the
+        // wrapper. Gone with the run (`unlive`), or now if the start goes no
+        // further.
+        #[cfg(feature = "vault")]
+        let (sandbox, egress) = if self.cfg.egress {
+            let fronts = super::egress::start(
+                (order.session_id, order.fence),
+                uid,
+                Arc::new(super::egress::VaultDecider),
+                Arc::new(super::egress::SystemDialer),
+            )
+            .map_err(|e| (HiveRefusal::SandboxUnavailable, e))?;
+            let served = EgressServed::of(order.session_id, order.fence);
+            let sandbox = SandboxProxy {
+                http_port: fronts.http.port(),
+                socks_port: fronts.socks.port(),
+                cache: roomler_hive_node::launch::cache_dir_in(&session_state_dir(&home, &sid)),
+            };
+            (Some(sandbox), served)
+        } else {
+            (None, EgressServed::none())
+        };
+        #[cfg(not(feature = "vault"))]
+        let sandbox: Option<SandboxProxy> = None;
+        let settings = write_settings(
+            &self.runtime,
+            &sid,
+            vault.is_some(),
+            net_tools,
+            ssh_tools,
+            sandbox.clone(),
+        )
+        .map_err(|e| {
             (
                 HiveRefusal::LaunchFailed,
                 format!("writing the session settings: {e}"),
@@ -4378,6 +4490,12 @@ impl Supervisor {
                     .map_or_else(Default::default, |d| d.as_os_str().to_os_string()),
             )
             .arg(spec.auto_memory_dir())
+            // P3b-1b-2 — the session's cache, for a sandboxed session alone.
+            .arg(
+                sandbox
+                    .as_ref()
+                    .map_or_else(Default::default, |s| s.cache.as_os_str().to_os_string()),
+            )
             .arg(&spec.harness)
             .args(spec.args());
         // A clean environment: none of the daemon's (root's, with its
@@ -4430,14 +4548,19 @@ impl Supervisor {
             cmd.env("ANTHROPIC_API_KEY", token);
         }
         match cmd.spawn() {
-            Ok(child) => Ok(Spawned {
-                child,
-                token,
-                toolbelt,
-                // P2f-3a — a fork's first launch resumes its parent's.
-                history: spec.resume || spec.fork_of.is_some(),
-                checkpoints,
-            }),
+            Ok(child) => {
+                // P3b-1b-2 — the run is live: its proxy stays until `unlive`.
+                #[cfg(feature = "vault")]
+                egress.keep();
+                Ok(Spawned {
+                    child,
+                    token,
+                    toolbelt,
+                    // P2f-3a — a fork's first launch resumes its parent's.
+                    history: spec.resume || spec.fork_of.is_some(),
+                    checkpoints,
+                })
+            }
             // The toolbelt goes with the failed start: dropping it removes
             // its socket.
             Err(e) => {
@@ -4514,8 +4637,15 @@ impl Supervisor {
         let ssh_tools = ssh.is_some();
         #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
         let ssh_tools = false;
-        let settings = write_settings(&self.runtime, &sid, vault.is_some(), net_tools, ssh_tools)
-            .map_err(|e| failed("writing the session settings", e))?;
+        let settings = write_settings(
+            &self.runtime,
+            &sid,
+            vault.is_some(),
+            net_tools,
+            ssh_tools,
+            None,
+        )
+        .map_err(|e| failed("writing the session settings", e))?;
         let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
         let run = toolbelt::Run {
             session: order.session_id,
@@ -4664,8 +4794,15 @@ fn session_dir(runtime: &Path, dir: &Path, peer: &str) -> Result<(), String> {
 /// file.
 #[cfg(unix)]
 fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = match &cfg.harness {
-        Some(h) => vec![h.clone()],
+    resolve_harness_for(cfg.harness.as_deref(), home)
+}
+
+/// [`resolve_harness`], from the configured harness alone: FR-90 P3b-1b-2's
+/// sandbox gate asks the one the launch would run.
+#[cfg(unix)]
+pub(super) fn resolve_harness_for(harness: Option<&Path>, home: &Path) -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = match harness {
+        Some(h) => vec![h.to_path_buf()],
         None => vec![
             home.join(".local/bin/claude"),
             PathBuf::from("/usr/local/bin/claude"),
@@ -4687,12 +4824,16 @@ fn resolve_harness(cfg: &HiveConfig, home: &Path) -> Option<PathBuf> {
 ///
 /// On Windows both directories are made first, each with its DACL
 /// ([`session_dir`]), and the file takes the session directory's.
+///
+/// FR-90 P3b-1b-2 — `sandbox`, the session's egress proxy and cache, turns
+/// Claude Code's sandbox on: where the owner turned on `hive_egress`.
 fn write_settings(
     runtime: &Path,
     sid: &str,
     vault_tools: bool,
     net_tools: bool,
     ssh_tools: bool,
+    sandbox: Option<SandboxProxy>,
 ) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     #[cfg(unix)]
@@ -4728,7 +4869,7 @@ fn write_settings(
     let doc = SettingsSpec {
         api_key_helper: None,
         auto_memory_directory: None,
-        sandbox_proxy: None,
+        sandbox_proxy: sandbox,
         extra_read_denies,
         session_start_hook,
         // P3-4b — the vault's reads need no person: their gate is the
@@ -5053,6 +5194,23 @@ fn harness_path(home: &Path) -> String {
         "{home}/.local/bin:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
         home = home.display()
     )
+}
+
+/// FR-90 P3b-1b-2 — [`harness_path`]'s directories: where the sandbox gate
+/// looks for the tools Claude Code's sandbox finds on it.
+#[cfg(all(target_os = "linux", feature = "vault"))]
+pub(super) fn harness_dirs(home: &Path) -> Vec<PathBuf> {
+    harness_path(home).split(':').map(PathBuf::from).collect()
+}
+
+/// FR-90 P3b-1b-2 — the environment the harness runs in, for the sandbox
+/// gate's `--version`: the launch's own base.
+#[cfg(all(unix, feature = "vault"))]
+pub(super) fn harness_env(
+    home: &Path,
+    account: &str,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    unix_base_env(home, account, Some(&harness_path(home)))
 }
 
 /// FR-90 P2f-2d — where a teleport refused for its folder's own work could
@@ -6400,6 +6558,7 @@ done
             store_quota_mib: None,
             net: false,
             ssh: false,
+            egress: false,
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -7665,7 +7824,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "offered", true, false, false).unwrap();
+        write_settings(&runtime, "offered", true, false, false, None).unwrap();
         let offered = read("offered");
         #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
         let mut allowed: Vec<&str> = toolbelt::VAULT_TOOLS.to_vec();
@@ -7695,7 +7854,7 @@ done
                 "{offered}"
             );
         }
-        write_settings(&runtime, "not-offered", false, false, false).unwrap();
+        write_settings(&runtime, "not-offered", false, false, false, None).unwrap();
         let doc = read("not-offered");
         assert!(
             doc["permissions"].get("allow").is_none(),
@@ -7723,7 +7882,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "net", true, true, false).unwrap();
+        write_settings(&runtime, "net", true, true, false, None).unwrap();
         let doc = read("net");
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::NET_TOOLS);
@@ -7734,11 +7893,268 @@ done
                 "{tool} is never allowed without a person: {doc}"
             );
         }
-        write_settings(&runtime, "no-net", true, false, false).unwrap();
+        write_settings(&runtime, "no-net", true, false, false, None).unwrap();
         let doc = read("no-net");
         assert!(
             !doc["permissions"]["ask"].to_string().contains("net_"),
             "not offered, not named: {doc}"
+        );
+    }
+
+    /// FR-90 P3b-1b-2 — where the owner turned on `hive_egress`, a session's
+    /// settings turn Claude Code's sandbox on, their proxy ports those of the
+    /// run's own egress proxy, which is serving; the wrapper made the
+    /// session's cache as the account; and the proxy ends with the run. A
+    /// session on a device without it runs as before: no sandbox, no proxy.
+    ///
+    /// The gate is passed by an account no system has: it refuses only what
+    /// it can see, and the launch is the rig's, as the daemon.
+    #[cfg(all(unix, feature = "vault"))]
+    #[tokio::test]
+    async fn a_session_on_an_egress_device_runs_sandboxed_behind_its_proxy() {
+        let mut r = rig_with(
+            true,
+            4,
+            |cfg| {
+                cfg.egress = true;
+                for account in cfg.accounts.values_mut() {
+                    *account = NO_SUCH_ACCOUNT.to_string();
+                }
+            },
+            |s| s,
+        );
+        let o = order(&r);
+        let sid = o.session_id;
+        assert_eq!(
+            r.sup.start(o, true).await,
+            Answer::accepted(NO_SUCH_ACCOUNT)
+        );
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        let run = r.root.path().join("run").join(sid.to_hex());
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run.join("settings.json")).unwrap())
+                .unwrap();
+        let sandbox = &settings["sandbox"];
+        assert_eq!(sandbox["enabled"], true, "{settings}");
+        assert_eq!(sandbox["failIfUnavailable"], true);
+        assert_eq!(sandbox["allowUnsandboxedCommands"], false);
+        let port = |key: &str| u16::try_from(sandbox["network"][key].as_u64().unwrap()).unwrap();
+        let (http, socks) = (port("httpProxyPort"), port("socksProxyPort"));
+        for p in [http, socks] {
+            tokio::net::TcpStream::connect(("127.0.0.1", p))
+                .await
+                .expect("the run's egress proxy is serving");
+        }
+        let cache = roomler_hive_node::launch::cache_dir_in(&session_state_dir(
+            &r.root.path().join("home"),
+            &sid.to_hex(),
+        ));
+        // The wrapper makes it before it runs the harness, and the run is
+        // reported up as soon as it is spawned: the report can come first.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.is_dir() {
+            assert!(
+                Instant::now() < deadline,
+                "the wrapper never made the session's cache"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            sandbox["filesystem"]["allowWrite"],
+            serde_json::json!([cache.to_string_lossy()])
+        );
+        assert!(
+            settings["env"]["CARGO_HOME"]
+                .as_str()
+                .is_some_and(|c| Path::new(c).starts_with(&cache)),
+            "the caches point under it: {settings}"
+        );
+
+        r.sup.stop(sid, 1, "owner".into());
+        assert_eq!(
+            until_ended(&mut r, sid).await.as_deref(),
+            Some("stopped (owner)")
+        );
+        // Each front lets its port go as it sees the run end.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for p in [http, socks] {
+            while tokio::net::TcpStream::connect(("127.0.0.1", p))
+                .await
+                .is_ok()
+            {
+                assert!(Instant::now() < deadline, "the proxy ends with the run");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(
+            !super::super::egress::drop_run(sid, 1),
+            "nothing of the run's is left to stop"
+        );
+
+        // Without `hive_egress`: no sandbox, no proxy, no cache.
+        let mut plain = rig(true, 4);
+        let o = order(&plain);
+        let sid = o.session_id;
+        assert_eq!(plain.sup.start(o, true).await, Answer::accepted("dev"));
+        assert_eq!(next_state(&mut plain, sid).await.0, HiveRunState::Idle);
+        let run = plain.root.path().join("run").join(sid.to_hex());
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(settings["sandbox"].get("enabled").is_none(), "{settings}");
+        assert!(settings.get("env").is_none(), "{settings}");
+        assert!(!super::super::egress::drop_run(sid, 1), "no proxy");
+        plain.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut plain, sid).await;
+    }
+
+    /// FR-90 P3b-1b-2 — an account name no system has, for a test the
+    /// sandbox gate must let through: it judges only what it can see.
+    #[cfg(all(unix, feature = "vault"))]
+    const NO_SUCH_ACCOUNT: &str = "roomler-p3b-no-such-account";
+
+    /// FR-90 P3b-1b-2 — this test's own account, for a test the sandbox gate
+    /// must refuse: it looks the account up, and judges only what it finds.
+    /// None as root, whose account no session runs as (uid 0 is refused, so
+    /// the gate would find none), or where the uid has no account (a
+    /// container's).
+    #[cfg(all(unix, feature = "vault"))]
+    fn own_account() -> Option<String> {
+        // SAFETY: getuid reads our own credentials.
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 {
+            return None;
+        }
+        crate::exec::account_name(uid).ok()
+    }
+
+    /// FR-90 P3b-1b-2 — on a device whose owner turned on `hive_egress`, a
+    /// start the sandbox cannot hold is refused `sandbox_unavailable` before
+    /// anything is made: here the device takes no leases, so no vault would
+    /// decide its hosts. Nothing runs, and no proxy is left behind.
+    #[cfg(all(unix, feature = "vault"))]
+    #[tokio::test]
+    async fn a_start_the_sandbox_cannot_hold_is_refused_before_anything_is_made() {
+        let Some(me) = own_account() else {
+            return;
+        };
+        let mut r = rig_with(
+            true,
+            4,
+            |cfg| {
+                cfg.egress = true;
+                for account in cfg.accounts.values_mut() {
+                    *account = me.clone();
+                }
+            },
+            |s| s,
+        );
+        let o = order(&r);
+        let sid = o.session_id;
+        let answer = r.sup.start(o, true).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::SandboxUnavailable),
+            "{answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("takes no leases")),
+            "the refusal says what to fix: {answer:?}"
+        );
+        assert_eq!(r.sup.live_count(), 0, "nothing runs");
+        assert!(
+            !r.root.path().join("run").join(sid.to_hex()).exists(),
+            "nothing is made"
+        );
+        assert!(!super::super::egress::drop_run(sid, 1), "no proxy");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), r.reports.recv())
+                .await
+                .map_or(true, |m| !matches!(m, Some(ClientMsg::HiveState { .. }))),
+            "no run is reported"
+        );
+    }
+
+    /// FR-90 P3b-1b-2 — so is a session moved or teleported here, at its
+    /// prepare: it would run sandboxed too, and is refused before its lease
+    /// moves rather than after. A refused prepare admits no join.
+    #[cfg(all(unix, feature = "vault"))]
+    #[tokio::test]
+    async fn a_teleport_the_sandbox_cannot_hold_is_refused_at_its_prepare() {
+        let Some(me) = own_account() else {
+            return;
+        };
+        let r = rig_with(
+            true,
+            4,
+            |cfg| {
+                cfg.egress = true;
+                for account in cfg.accounts.values_mut() {
+                    *account = me.clone();
+                }
+            },
+            |mut s| {
+                // Past the gate, the folder is asked about next: in process.
+                s.checkpoint_runner = Some(super::super::checkpointer::Runner::InProcess {
+                    ceiling: PathBuf::from("/tmp"),
+                });
+                s
+            },
+        );
+        let o = at_fence(&order(&r), 2);
+        let answer = r.sup.prepare_teleport(&o, true, false).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::SandboxUnavailable),
+            "{answer:?}"
+        );
+        assert!(
+            !r.sup.teleport_admitted(o.session_id, 1),
+            "a refused prepare admits no join"
+        );
+    }
+
+    /// FR-90 P3b-1b-2 — a start that fails after its egress proxy began
+    /// leaves no proxy behind: here a file stands where the run's directory
+    /// goes, so its settings cannot be written.
+    #[cfg(all(unix, feature = "vault"))]
+    #[tokio::test]
+    async fn a_start_that_fails_after_its_proxy_began_leaves_none_behind() {
+        let r = rig_with(
+            true,
+            4,
+            |cfg| {
+                cfg.egress = true;
+                for account in cfg.accounts.values_mut() {
+                    *account = NO_SUCH_ACCOUNT.to_string();
+                }
+            },
+            |s| s,
+        );
+        let o = order(&r);
+        let sid = o.session_id;
+        let runtime = r.root.path().join("run");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join(sid.to_hex()), "").unwrap();
+        let answer = r.sup.start(o, true).await;
+        assert_eq!(
+            answer.refused,
+            Some(HiveRefusal::LaunchFailed),
+            "{answer:?}"
+        );
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("writing the session settings")),
+            "{answer:?}"
+        );
+        assert!(
+            !super::super::egress::drop_run(sid, 1),
+            "the proxy went with the start"
         );
     }
 
@@ -7754,7 +8170,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "ssh", true, false, true).unwrap();
+        write_settings(&runtime, "ssh", true, false, true, None).unwrap();
         let doc = read("ssh");
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::SSH_TOOLS);
@@ -7763,13 +8179,13 @@ done
             !doc["permissions"]["allow"].to_string().contains("ssh_run"),
             "ssh_run is never allowed without a person: {doc}"
         );
-        write_settings(&runtime, "both", true, true, true).unwrap();
+        write_settings(&runtime, "both", true, true, true, None).unwrap();
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::NET_TOOLS);
         asked.extend(toolbelt::SSH_TOOLS);
         assert_eq!(read("both")["permissions"]["ask"], serde_json::json!(asked));
         for (sid, vault, ssh) in [("no-ssh", true, false), ("no-vault", false, true)] {
-            write_settings(&runtime, sid, vault, false, ssh).unwrap();
+            write_settings(&runtime, sid, vault, false, ssh, None).unwrap();
             let doc = read(sid);
             assert!(
                 !doc["permissions"].to_string().contains("ssh_run"),

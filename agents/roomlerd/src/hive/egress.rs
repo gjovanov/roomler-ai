@@ -222,29 +222,36 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// dialing with `dial`. A run already served is stopped first: one run, one
 /// pair of fronts. Refused where this system cannot say who connects to a
 /// loopback port.
-pub async fn start(
+///
+/// Not `async`: a session's launch, which starts it, is not. It must be
+/// called within the daemon's runtime, which serves the fronts.
+pub fn start(
     run: RunKey,
     peer: Peer,
     decide: Arc<dyn Decide>,
     dial: Arc<dyn Dial>,
 ) -> Result<Fronts, String> {
     let admit = super::vault_connect::session_admit(peer)?;
-    start_admitting(run, admit, decide, dial).await
+    start_admitting(run, admit, decide, dial)
+}
+
+/// A loopback listener at a port the system picks, for the runtime.
+fn loopback(front: &str) -> Result<TcpListener, String> {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|l| l.set_nonblocking(true).map(|()| l))
+        .map_err(|e| format!("the egress proxy's {front} front: {e}"))?;
+    TcpListener::from_std(listener).map_err(|e| format!("the egress proxy's {front} front: {e}"))
 }
 
 /// [`start`], with the admission given.
-async fn start_admitting(
+fn start_admitting(
     run: RunKey,
     admit: Admit,
     decide: Arc<dyn Decide>,
     dial: Arc<dyn Dial>,
 ) -> Result<Fronts, String> {
-    let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .map_err(|e| format!("the egress proxy's HTTP front: {e}"))?;
-    let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .map_err(|e| format!("the egress proxy's SOCKS5 front: {e}"))?;
+    let http = loopback("HTTP")?;
+    let socks = loopback("SOCKS5")?;
     let fronts = Fronts {
         http: http
             .local_addr()

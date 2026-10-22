@@ -862,7 +862,7 @@ where the device takes leases: its owner's `vault_enabled` on, a build with
 `vault`, the primary connection
 ([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L458)). Wherever it
 offers them, the session's settings allow them (`permissions.allow`,
-[`launch.rs:410`](../crates/hive-node/src/launch.rs#L410)), so no person is
+[`launch.rs:412`](../crates/hive-node/src/launch.rs#L412)), so no person is
 asked to approve each one: they only read, and their gate is the vault's own
 policy, decided and recorded by the server. A call the harness cancels gets
 no answer, and the daemon stops waiting for it.
@@ -881,7 +881,7 @@ no answer, and the daemon stops waiting for it.
 > - **Offered and allowed together.** The daemon decides once, at a run's
 >   launch, whether its toolbelt offers the tools, and writes the settings'
 >   allow from the same answer
->   ([`supervisor.rs:4253`](../agents/roomlerd/src/hive/supervisor.rs#L4253)).
+>   ([`supervisor.rs:4332`](../agents/roomlerd/src/hive/supervisor.rs#L4332)).
 >   It records whether the primary connection takes leases before it resumes
 >   any run ([`signaling.rs:1625`](../agents/roomlerd/src/signaling.rs#L1625)).
 
@@ -955,21 +955,21 @@ device share): a path could match nothing a device asks for.
 > it out of the allow list is not enough. The session's settings list
 > `vault_exec` and `vault_render` under `permissions.ask`
 > ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L432), written
-> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4770)).
+> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4911)).
 > - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
 >   FR-90 spec's open decision 7), and an allow there would skip the person.
 >   Claude Code reads deny, then ask, then allow, across every settings file,
 >   so an ask prompts whatever another file allows. Until this was found,
 >   while `vault_render` was written, the uses were only kept out of `allow`.
 > - ⚠️ **Not by marking the tools as requiring user interaction**
->   ([`launch.rs:420`](../crates/hive-node/src/launch.rs#L420)). A
+>   ([`launch.rs:422`](../crates/hive-node/src/launch.rs#L422)). A
 >   `--permission-prompt-tool` can never approve such a tool: Claude Code
 >   turns its allow into a deny, and `approve` is that tool.
 
 | Piece | Where |
 |---|---|
 | the tool | `vault_exec` in [`toolbelt.rs:952`](../agents/roomlerd/src/hive/toolbelt.rs#L952), offered with the reads where the device takes leases, and asked for in the settings |
-| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4302`](../agents/roomlerd/src/hive/supervisor.rs#L4302)); none on Windows |
+| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4414`](../agents/roomlerd/src/hive/supervisor.rs#L4414)); none on Windows |
 | letting go | `Client::release` ([`vault.rs:1146`](../agents/roomlerd/src/vault.rs#L1146)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
@@ -1002,8 +1002,8 @@ sequenceDiagram
 | the directory | `<runtime>/<session>/secrets/`, made by the daemon, its own, `0711`: the session's account opens a file whose name it knows, and lists nothing. A link or a file in its place is refused, never followed | [`vault_render.rs:170`](../agents/roomlerd/src/hive/vault_render.rs#L170) |
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
 | its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272), [`:1153`](../agents/roomlerd/src/vault.rs#L1153) |
-| a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:732`](../agents/roomlerd/src/hive/supervisor.rs#L732), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
-| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4724`](../agents/roomlerd/src/hive/supervisor.rs#L4724) |
+| a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:769`](../agents/roomlerd/src/hive/supervisor.rs#L769), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
+| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4865`](../agents/roomlerd/src/hive/supervisor.rs#L4865) |
 
 > [!WARNING]
 > - **`file` is a materializing mode** (design §8.5). The session's account
@@ -1054,7 +1054,7 @@ sequenceDiagram
 | the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:102`](../agents/roomlerd/src/hive/vault_request.rs#L102), [`vault.rs:159`](../agents/roomlerd/src/vault.rs#L159) |
 | its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:1182`](../agents/roomlerd/src/vault.rs#L1182), [`vault_exec.rs:615`](../agents/roomlerd/src/hive/vault_exec.rs#L615), the lookup both tools share (`leased_values`, P3-6b-2b) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:293`](../agents/roomlerd/src/hive/vault_render.rs#L293) |
-| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4751`](../agents/roomlerd/src/hive/supervisor.rs#L4751) |
+| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4892`](../agents/roomlerd/src/hive/supervisor.rs#L4892) |
 
 > [!IMPORTANT]
 > **A use takes the lease by what it is, not by its id.** The design had the
@@ -1104,7 +1104,7 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9270`](../crates/remote_control/src/models.rs#L9270) |
+| the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9274`](../crates/remote_control/src/models.rs#L9274) |
 | the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:689`](../agents/roomlerd/src/vault.rs#L689), [`vault_exec.rs:470`](../agents/roomlerd/src/hive/vault_exec.rs#L470), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
 | the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1553`](../crates/remote_control/src/signaling.rs#L1553), [`vault.rs:340`](../crates/remote_control/src/vault.rs#L340) |
 | the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:460`](../crates/modules/vault/src/lease.rs#L460) |
@@ -2473,9 +2473,8 @@ request would be. `simulate/replay` decides the recorded ones again.
 ### The device's half: the session's egress proxy (P3b-1b-1)
 
 The daemon's egress proxy is what Claude Code's sandbox sends a session's
-commands through. P3b-1b-1 builds it, with no caller: no run starts one
-before P3b-1b-2 turns it on, for the devices whose owner turns on
-`hive_egress`.
+commands through. P3b-1b-1 builds it, and from P3b-1b-2 each run starts
+its own on the devices whose owner turns on `hive_egress` (below).
 
 ```mermaid
 sequenceDiagram
@@ -2532,9 +2531,63 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:225`](../agents/roomlerd/src/hive/egress.rs#L225)), `drop_run` ([`:284`](../agents/roomlerd/src/hive/egress.rs#L284)), a connection ([`carry`, `:340`](../agents/roomlerd/src/hive/egress.rs#L340)), the decision kept per run ([`decided`, `:433`](../agents/roomlerd/src/hive/egress.rs#L433)), `dialable` ([`:623`](../agents/roomlerd/src/hive/egress.rs#L623)), what is kept ([`decision_of`, `:702`](../agents/roomlerd/src/hive/egress.rs#L702)) |
+| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:228`](../agents/roomlerd/src/hive/egress.rs#L228)), `drop_run` ([`:291`](../agents/roomlerd/src/hive/egress.rs#L291)), a connection ([`carry`, `:347`](../agents/roomlerd/src/hive/egress.rs#L347)), the decision kept per run ([`decided`, `:440`](../agents/roomlerd/src/hive/egress.rs#L440)), `dialable` ([`:630`](../agents/roomlerd/src/hive/egress.rs#L630)), what is kept ([`decision_of`, `:709`](../agents/roomlerd/src/hive/egress.rs#L709)) |
 | the ask | the lease client's `egress` ([`vault.rs:909`](../agents/roomlerd/src/vault.rs#L909)) and `on_egress_allowed` ([`:1107`](../agents/roomlerd/src/vault.rs#L1107)), which refuses an allow for anything but what was asked |
-| what comes next | P3b-1b-2: `hive_egress`, the session's sandbox settings, and the proxy started with each run and ended with it |
+| the run's | P3b-1b-2, below: started before the harness, so its ports are in the settings, and stopped with the run |
+
+### The session's sandbox (P3b-1b-2)
+
+Where the device's owner turns on `hive_egress`, every session on the
+device runs in Claude Code's sandbox, its commands' connections sent
+through the run's egress proxy (decision 28). The settings the daemon
+writes for the session turn it on:
+
+| Setting | Why |
+|---|---|
+| `sandbox.enabled` | the sandbox, around every Bash, PowerShell and Monitor command and what it starts |
+| `sandbox.failIfUnavailable` | a host where the sandbox cannot run refuses to start; it never runs the session unsandboxed |
+| `sandbox.allowUnsandboxedCommands: false` | no command retries outside the sandbox. It also makes the sandbox admin-required: a repository's own `.claude/settings.json` cannot add `excludedCommands`, `allowWrite` entries or proxy ports to loosen it |
+| `sandbox.network.httpProxyPort`, `socksProxyPort` | the run's egress proxy, which replaces Claude Code's own: every host is the vault's to decide |
+| `sandbox.filesystem.allowWrite` | the session's cache, `~/.roomler/hive/<session>/cache`, beside its Claude Code configuration (decision 31) |
+| `sandbox.filesystem.denyWrite` | the home's paths that run code later, outside the sandbox, even where the working directory is the home: `~/.local/bin`, `~/.config/systemd`, the shells' startup files, `~/.ssh`, `~/.gitconfig`, `~/.claude`, `~/Library/LaunchAgents`, and more |
+| `env` | each package manager's cache under the session's: `XDG_CACHE_HOME`, `npm_config_cache`, `YARN_CACHE_FOLDER`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `CARGO_HOME`, `GOMODCACHE`, `GOCACHE` and `GRADLE_USER_HOME` |
+
+Before any of it, a gate refuses the start `sandbox_unavailable`, saying
+what to fix, where the sandbox would not hold. A session moved or
+teleported here meets the same gate at its prepare, before its lease
+moves:
+
+| Refused where | Because |
+|---|---|
+| Windows | Claude Code has no sandbox there; Windows is P3b-5's |
+| the device takes no leases (`vault_enabled`) | no vault would decide the hosts its commands reach |
+| Linux without `bwrap` or `socat` | the sandbox's isolation, and the relay that carries a command's connections to the proxy |
+| Claude Code before 2.1.285, or one that does not say its version | before it, a repository's `excludedCommands` merged in, and a command matching one ran outside the sandbox, past the proxy |
+| a build without the `vault` feature | there is no proxy |
+
+> [!WARNING]
+> - **The harness is asked its version as the session's account**, never
+>   as the daemon: the harness can be the account's own
+>   (`~/.local/bin/claude`), which the daemon never runs as itself.
+> - **Writes go nowhere in the home but the session's cache** (decision 31,
+>   pending the operator's word). Every package manager's cache is pointed
+>   there, so nothing a sandboxed command writes is read by anything outside
+>   a sandbox: a cache poisoned in the home would be read by the account's
+>   next ordinary build. A tool that writes anywhere else in the home fails
+>   inside the sandbox.
+> - **The sandbox holds commands only.** Hooks, MCP servers (`roomler`'s
+>   alone) and Claude Code's file tools run outside it, with the device's
+>   network, and hold nothing but what the session holds.
+> - **The proxy starts before the harness** and ends with the run; a start
+>   that goes no further stops it. The cache stays with the session's state
+>   until the session is purged.
+
+| Piece | Where |
+|---|---|
+| the gate | [`hive/sandbox.rs`](../agents/roomlerd/src/hive/sandbox.rs) |
+| the settings | `SandboxProxy` and its document ([`launch.rs`](../crates/hive-node/src/launch.rs)): `CACHE_VARS`, `HOME_DENY_WRITE` |
+| the run's proxy | the launch in [`hive/supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs), and `unlive` |
+| the switch | `hive_egress` ([`config.rs`](../crates/agent-core/src/config.rs)), never pushable |
 
 ## 25. Audit
 
@@ -2631,5 +2684,5 @@ its lease (§15).
 | Step | Builds |
 |---|---|
 | P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), the device's client built (P3-8-2b-1), and its tool built (P3-8-2b-2) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; for `roomler connect`, built (§23: the vault's half, P3-9-1; the daemon's ask and its renewing endpoint, P3-9-2a; the LocalAPI verb and the foreground command, P3-9-2b), the operator's word on decision 26, who may run it on Windows (its design: §3e "P3-9, `roomler connect`, as designed") |
-| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy is built too, with no caller (P3b-1b-1, §24). `hive_egress` and the session's sandbox (P3b-1b-2), the device's half of a placeholder (P3b-3), AWS (P3b-4) and Windows (P3b-5) are left |
+| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy and the session's sandbox around it are built too (P3b-1b-1 and P3b-1b-2, §24). The device's half of a placeholder (P3b-3), AWS (P3b-4) and Windows (P3b-5) are left |
 | P3k | the field run in the test organization |

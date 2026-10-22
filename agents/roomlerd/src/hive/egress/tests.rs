@@ -78,9 +78,7 @@ fn run_key() -> RunKey {
 
 async fn serve(vault: Arc<FakeVault>) -> (RunKey, Fronts) {
     let run = run_key();
-    let fronts = start_admitting(run, admit_all(), vault, Arc::new(ToEcho(echo().await)))
-        .await
-        .unwrap();
+    let fronts = start_admitting(run, admit_all(), vault, Arc::new(ToEcho(echo().await))).unwrap();
     (run, fronts)
 }
 
@@ -364,9 +362,8 @@ async fn what_cannot_be_decided_is_never_asked() {
 
     let refusing: Admit = Arc::new(|_: &TcpStream, _: SocketAddr| Err("uid 4242".into()));
     let run = run_key();
-    let fronts = start_admitting(run, refusing, vault.clone(), Arc::new(ToEcho(echo().await)))
-        .await
-        .unwrap();
+    let fronts =
+        start_admitting(run, refusing, vault.clone(), Arc::new(ToEcho(echo().await))).unwrap();
     let mut tcp = TcpStream::connect(fronts.http).await.unwrap();
     let _ = tcp
         .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\n\r\n")
