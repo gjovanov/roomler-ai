@@ -439,11 +439,11 @@ struct Spawned {
 
 /// FR-90 P3b-1b-2 — a run's egress proxy while its start is under way:
 /// stopped if the start goes no further, kept once the run is live, when
-/// `unlive` stops it.
-#[cfg(feature = "vault")]
+/// `unlive` stops it. Unix's alone: a Windows session never runs sandboxed.
+#[cfg(all(unix, feature = "vault"))]
 struct EgressServed(Option<(ObjectId, u64)>);
 
-#[cfg(feature = "vault")]
+#[cfg(all(unix, feature = "vault"))]
 impl EgressServed {
     fn none() -> Self {
         Self(None)
@@ -459,7 +459,7 @@ impl EgressServed {
     }
 }
 
-#[cfg(feature = "vault")]
+#[cfg(all(unix, feature = "vault"))]
 impl Drop for EgressServed {
     fn drop(&mut self) {
         if let Some((session, fence)) = self.0.take() {
@@ -7949,7 +7949,16 @@ done
             &r.root.path().join("home"),
             &sid.to_hex(),
         ));
-        assert!(cache.is_dir(), "the wrapper made the session's cache");
+        // The wrapper makes it before it runs the harness, and the run is
+        // reported up as soon as it is spawned: the report can come first.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.is_dir() {
+            assert!(
+                Instant::now() < deadline,
+                "the wrapper never made the session's cache"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
             sandbox["filesystem"]["allowWrite"],
             serde_json::json!([cache.to_string_lossy()])
@@ -7966,13 +7975,16 @@ done
             until_ended(&mut r, sid).await.as_deref(),
             Some("stopped (owner)")
         );
+        // Each front lets its port go as it sees the run end.
+        let deadline = Instant::now() + Duration::from_secs(10);
         for p in [http, socks] {
-            assert!(
-                tokio::net::TcpStream::connect(("127.0.0.1", p))
-                    .await
-                    .is_err(),
-                "the proxy ends with the run"
-            );
+            while tokio::net::TcpStream::connect(("127.0.0.1", p))
+                .await
+                .is_ok()
+            {
+                assert!(Instant::now() < deadline, "the proxy ends with the run");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         assert!(
             !super::super::egress::drop_run(sid, 1),
