@@ -1845,6 +1845,27 @@ async fn vault_request_asks_a_dynamic_secret_whole_and_its_uses_share_one_creden
          vault_exec and vault_render serve it"
     );
     assert_eq!(vault.leases_asked().len(), 1, "nothing asked for a proxy");
+    // FR-90 P3b-3c-2 — nor is a placeholder a dynamic secret's.
+    c.send(tool_call(
+        5,
+        "vault_request",
+        json!({"handle": "db/dyn#user", "mode": "placeholder", "audience": "https://api.example"}),
+    ))
+    .await;
+    let m = c.recv().await;
+    assert_eq!(m["result"]["isError"], true, "{m}");
+    assert!(
+        m["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("a placeholder holds a static secret's value"),
+        "{m}"
+    );
+    assert_eq!(
+        vault.leases_asked().len(),
+        1,
+        "nothing asked for a placeholder"
+    );
 }
 
 /// P3-5b-2 — the answer to a `vault_connect` call: its JSON, or its error
@@ -4622,7 +4643,7 @@ async fn a_placeholder_call_binds_each_variable_to_its_own_lease() {
         !answer.to_string().contains("the value of"),
         "no value reaches the session: {answer}"
     );
-    assert_eq!(answer["audience"], "https://api.github.com");
+    assert_eq!(answer["audiences"], json!(["https://api.github.com"]));
     assert_eq!(answer["ttl_s"], 300);
     let bound = placeholder::bound(session, fence, "api.github.com", 443);
     let lease_of: HashMap<&str, &str> = bound
@@ -4815,4 +4836,195 @@ async fn a_placeholder_call_refused_by_its_checks_asks_the_vault_nothing() {
     }
     assert!(vault.leases_asked().is_empty());
     assert_eq!(placeholder::held(session, 1), 0);
+}
+
+/// FR-90 P3b-3c-2 — one placeholder per variable, whatever its audiences:
+/// each audience its own lease, the placeholder bound toward each with that
+/// audience's lease, and a lease let go taking its audience alone.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn one_placeholder_goes_to_every_audience_its_call_names() {
+    use super::super::placeholder;
+    let vault = placeholder_vault(&["github/bot#token"]);
+    let (session, fence) = (ObjectId::new(), 1);
+    let answer = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({
+            "env": {"GH_TOKEN": "github/bot#token"},
+            "audience": ["https://api.github.com", "https://github.com"],
+        }),
+    )
+    .await
+    .unwrap();
+    let leases = vault.leases_asked();
+    assert_eq!(leases.len(), 2, "one lease per audience: {leases:?}");
+    assert!(
+        leases[0].3.ends_with("for https://api.github.com 300s"),
+        "{leases:?}"
+    );
+    assert!(
+        leases[1].3.ends_with("for https://github.com 300s"),
+        "{leases:?}"
+    );
+    assert_eq!(
+        answer["audiences"],
+        json!(["https://api.github.com", "https://github.com"])
+    );
+    let token = answer["env"]["GH_TOKEN"].as_str().unwrap();
+    let api = placeholder::bound(session, fence, "api.github.com", 443);
+    let web = placeholder::bound(session, fence, "github.com", 443);
+    assert_eq!((api.len(), web.len()), (1, 1));
+    assert_eq!(
+        (api[0].token.as_str(), web[0].token.as_str()),
+        (token, token),
+        "one placeholder"
+    );
+    assert_ne!(
+        api[0].lease_id, web[0].lease_id,
+        "each audience its own lease"
+    );
+    assert_eq!(placeholder::held(session, fence), 2);
+    vault.release(std::slice::from_ref(&api[0].lease_id));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !placeholder::bound(session, fence, "api.github.com", 443).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the binding went with its lease"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let left = placeholder::bound(session, fence, "github.com", 443);
+    assert_eq!(left.len(), 1, "the other audience's stays");
+    assert_eq!(left[0].token, token);
+    placeholder::drop_run(session, fence);
+}
+
+/// FR-90 P3b-3c-2 — a lease asked ahead through `vault_request`, in mode
+/// `placeholder`, is the one `vault_placeholder` takes: the same audience,
+/// in its one spelling.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_placeholder_takes_the_lease_vault_request_asked_ahead() {
+    use super::super::{placeholder, vault_request};
+    let vault = placeholder_vault(&["github/bot#token"]);
+    let (session, fence) = (ObjectId::new(), 1);
+    let ahead = vault_request::call(
+        &vault,
+        session,
+        fence,
+        &json!({
+            "handle": "github/bot#token",
+            "mode": "placeholder",
+            "audience": "https://api.github.com",
+            "ttl_s": 600,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ahead["mode"], "placeholder");
+    let answer = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({"env": {"GH_TOKEN": "github/bot#token"}, "audience": "https://api.github.com"}),
+    )
+    .await
+    .unwrap();
+    let kinds: Vec<String> = vault.leases_asked().into_iter().map(|a| a.0).collect();
+    assert_eq!(kinds, ["ahead_placeholder"], "no lease of its own");
+    let bound = placeholder::bound(session, fence, "api.github.com", 443);
+    assert_eq!(bound.len(), 1);
+    assert_eq!(bound[0].lease_id, ahead["lease_id"].as_str().unwrap());
+    assert_eq!(answer["ttl_s"], 600);
+    placeholder::drop_run(session, fence);
+}
+
+/// FR-90 P3b-3c-2 — `vault_placeholder` is offered where the run's egress
+/// proxy serves the session and the vault is offered, and nowhere else:
+/// elsewhere it is an unknown tool, and the vault is asked nothing. Where it
+/// is offered, it is listed last, and a call answers its placeholders. Its
+/// settings name is the name offered, under the `roomler` server.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn vault_placeholder_is_offered_only_behind_the_egress_proxy() {
+    use super::super::{egress, placeholder};
+    let names = |list: &Value| -> Vec<String> {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let args =
+        json!({"env": {"GH_TOKEN": "github/bot#token"}, "audience": "https://api.github.com"});
+    let vault = Arc::new(placeholder_vault(&["github/bot#token"]));
+    let belt = |session: ObjectId, vault: Option<Arc<dyn VaultTools>>| {
+        belt_running(
+            me(),
+            Run {
+                session,
+                fence: 1,
+                vault,
+                exec: None,
+                net: None,
+                #[cfg(feature = "ssh-server")]
+                ssh: None,
+            },
+            quick(),
+        )
+    };
+    // The vault without the proxy, and the proxy without the vault.
+    let offers: [(Option<Arc<dyn VaultTools>>, bool); 2] =
+        [(Some(vault.clone()), false), (None, true)];
+    for (offered, served) in offers {
+        let session = ObjectId::new();
+        if served {
+            egress::serve_for_test(session, 1);
+        }
+        let b = belt(session, offered);
+        let mut c = Client::connect(&b).await;
+        c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+            .await;
+        let listed = names(&c.recv().await);
+        assert!(!listed.iter().any(|n| n == placeholder::TOOL), "{listed:?}");
+        c.send(tool_call(2, placeholder::TOOL, args.clone())).await;
+        assert_eq!(c.recv().await["error"]["code"], -32602, "not offered here");
+        egress::drop_run(session, 1);
+    }
+    assert!(vault.leases_asked().is_empty(), "nothing asked");
+
+    let session = ObjectId::new();
+    egress::serve_for_test(session, 1);
+    let b = belt(session, Some(vault.clone()));
+    let mut c = Client::connect(&b).await;
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))
+        .await;
+    let list = c.recv().await;
+    let listed = names(&list);
+    assert_eq!(
+        listed.last().map(String::as_str),
+        Some(placeholder::TOOL),
+        "{list}"
+    );
+    let tool = list["result"]["tools"].as_array().unwrap().last().unwrap();
+    assert_eq!(tool["inputSchema"]["required"], json!(["env", "audience"]));
+    assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
+    assert_eq!(
+        PLACEHOLDER_TOOLS[0],
+        format!("mcp__roomler__{}", placeholder::TOOL)
+    );
+    c.send(tool_call(2, placeholder::TOOL, args)).await;
+    let answered = c.recv().await;
+    let text = answered["result"]["content"][0]["text"].as_str().unwrap();
+    let answer: Value = serde_json::from_str(text).unwrap();
+    assert!(
+        placeholder::is_placeholder(answer["env"]["GH_TOKEN"].as_str().unwrap()),
+        "{answered}"
+    );
+    assert_eq!(vault.leases_asked().len(), 1);
+    egress::drop_run(session, 1);
+    placeholder::drop_run(session, 1);
 }

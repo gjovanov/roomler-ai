@@ -84,6 +84,15 @@
 //! SSH client then runs it as the account the target maps, with a key minted
 //! for the call, which the session never holds. Asked for in the settings on
 //! every call ([`SSH_TOOLS`]).
+//!
+//! # `placeholder` (FR-90 P3b-3c-2)
+//!
+//! Where the run's egress proxy serves the session (the owner turned
+//! `hive_egress` on), `vault_placeholder` holds secrets as placeholders the
+//! session's commands send in their stead ([`super::placeholder`]); the proxy
+//! swaps each value in, toward the secret's audiences alone, in
+//! `Authorization` alone (`egress::swap`). Asked for in the settings on every
+//! call ([`PLACEHOLDER_TOOLS`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -451,6 +460,13 @@ pub(crate) const NET_TOOLS: [&str; 2] = ["mcp__roomler__net_socks", "mcp__roomle
 /// account that device maps.
 #[cfg(feature = "vault")]
 pub(crate) const SSH_TOOLS: [&str; 1] = ["mcp__roomler__ssh_run"];
+
+/// FR-90 P3b-3c-2 — `vault_placeholder`, as the session's settings name it:
+/// asked of a person on every call, like the vault's other uses. Each binds
+/// a secret's value to the hosts it may go to, for the session's commands to
+/// send in a placeholder's guise.
+#[cfg(feature = "vault")]
+pub(crate) const PLACEHOLDER_TOOLS: [&str; 1] = ["mcp__roomler__vault_placeholder"];
 
 /// FR-90 P3-4b — the daemon's vault for a run's toolbelt: its lease client,
 /// where the primary connection takes leases; otherwise none, and the vault
@@ -1056,7 +1072,9 @@ fn vault_tools() -> Vec<Value> {
                         upstream as it names it, a database's host:port, an origin for http \
                         and kubernetes, or an ssh:// host, one lease per field it signs in \
                         with: #user and #password, #token, #cert and #key, or #key and \
-                        #host_keys). A later use that names the same \
+                        #host_keys), or placeholder (for vault_placeholder, where it is \
+                        offered, audience the origin the value goes to, one lease per \
+                        audience). A later use that names the same \
                         secret toward the same \
                         audience takes this lease instead of asking again, while it lasts \
                         (ttl_s, 30 to 900 seconds). A dynamic secret is asked for whole, in \
@@ -1067,8 +1085,8 @@ fn vault_tools() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "handle": {"type": "string", "description": "a secret: a path or rrn:<org>:secret:<path>, with #<field> for a structured secret's field"},
-                "mode": {"type": "string", "enum": ["exec", "file", "proxy"]},
-                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port, for http and kubernetes its origin, such as https://github.com, or for ssh its host, such as ssh://git@github.com"},
+                "mode": {"type": "string", "enum": ["exec", "file", "proxy", "placeholder"]},
+                "audience": {"type": "string", "description": "exec: the program's bare name, such as psql; file: the file's bare name, such as kubeconfig; proxy: the upstream's host:port, for http and kubernetes its origin, such as https://github.com, or for ssh its host, such as ssh://git@github.com; placeholder: the origin the value goes to, such as https://api.github.com"},
                 "ttl_s": {"type": "integer", "minimum": 30, "maximum": 900},
             },
             "required": ["handle", "mode", "audience"],
@@ -1160,6 +1178,59 @@ fn ssh_tools() -> Vec<Value> {
     })]
 }
 
+/// FR-90 P3b-3c-2 — whether this session may hold a placeholder: where the
+/// run's egress proxy serves it (the owner turned `hive_egress` on), since
+/// the proxy is what swaps the value in. Anywhere else a placeholder would
+/// carry nothing.
+#[cfg(feature = "vault")]
+fn placeholder_offered(ctx: &Ctx) -> bool {
+    super::egress::serving(ctx.session, ctx.fence)
+}
+
+/// FR-90 P3b-3c-2 — a secret held as a placeholder, swapped for its value by
+/// the session's egress proxy toward the secret's audiences alone. Offered
+/// where that proxy serves the session ([`placeholder_offered`]).
+#[cfg(feature = "vault")]
+fn placeholder_tools() -> Vec<Value> {
+    use super::placeholder::{MAX_AUDIENCES, MAX_ENV, MAX_TTL, MIN_TTL, TOOL};
+    vec![json!({
+        "name": TOOL,
+        "description": format!(
+            "Holds secrets of the organization's vault as placeholders, for this session's \
+             commands to send in their stead. For each variable of env (NAME: secret, 1 to \
+             {MAX_ENV}), it answers an opaque placeholder (rph_…) to set in a command's \
+             environment, such as GH_TOKEN. Where a command sends a placeholder in a \
+             request's Authorization header (a token, a bearer token, or the password of \
+             git's basic authentication) to one of the audiences, this device's egress proxy \
+             swaps the secret's value in, inside TLS it terminates for that host. Sent \
+             anywhere else, or in a URL, another header or a body, it goes out as itself and \
+             carries nothing. audience is the origin the value goes to, as the secret's \
+             audiences name it (https://host[:port]), or a list of up to {MAX_AUDIENCES}: gh \
+             sends one token to https://api.github.com and, through git, to \
+             https://github.com. The placeholders work for ttl_s seconds ({MIN_TTL} to \
+             {MAX_TTL}). A person approves every call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "NAME: the secret, a path or rrn:<org>:secret:<path>, with #<field> for a structured secret's field",
+                },
+                "audience": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": "the origin the value goes to, such as https://api.github.com, or a list of them",
+                },
+                "ttl_s": {"type": "integer", "minimum": MIN_TTL, "maximum": MAX_TTL},
+            },
+            "required": ["env", "audience"],
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true},
+    })]
+}
+
 /// One vault tool call, from asking to answering: what the vault says, as
 /// text, or why it said nothing, as an error the model reads.
 async fn vault_tool(
@@ -1218,6 +1289,11 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
     #[cfg(feature = "vault")]
     if name == "vault_request" {
         return super::vault_request::call(vault.as_ref(), ctx.session, ctx.fence, args).await;
+    }
+    // FR-90 P3b-3c-2 — reached only where it is offered (`tools/call`).
+    #[cfg(feature = "vault")]
+    if name == super::placeholder::TOOL {
+        return super::placeholder::call(vault.as_ref(), ctx.session, ctx.fence, args).await;
     }
     #[cfg(feature = "vault")]
     if name == super::net_tools::SOCKS || name == super::net_tools::FORWARD {
@@ -1383,6 +1459,12 @@ async fn on_message(
             if ctx.vault.is_some() && ctx.ssh.is_some() {
                 tools.extend(ssh_tools());
             }
+            // FR-90 P3b-3c-2 — and a placeholder, where the run's egress
+            // proxy serves the session: the proxy is what swaps it in.
+            #[cfg(feature = "vault")]
+            if ctx.vault.is_some() && placeholder_offered(ctx) {
+                tools.extend(placeholder_tools());
+            }
             reply(&id, json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -1396,7 +1478,11 @@ async fn on_message(
             let ssh = ctx.ssh.is_some() && name == super::ssh_tools::RUN;
             #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
             let ssh = false;
-            let vault = ctx.vault.is_some() && (is_vault_tool(name) || net || ssh);
+            #[cfg(feature = "vault")]
+            let placeholder = name == super::placeholder::TOOL && placeholder_offered(ctx);
+            #[cfg(not(feature = "vault"))]
+            let placeholder = false;
+            let vault = ctx.vault.is_some() && (is_vault_tool(name) || net || ssh || placeholder);
             if name != "approve" && !vault {
                 error(&id, -32602, "unknown tool")
             } else {

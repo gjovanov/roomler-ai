@@ -48,6 +48,28 @@ fn a_request_names_a_secret_a_mode_a_use_takes_and_its_audience() {
     )
     .unwrap();
     assert_eq!(ssh.audience, "ssh://git@github.com");
+    // P3b-3c-2 — or `placeholder`, toward the origin `vault_placeholder`
+    // will name, in the one spelling it asks its leases in.
+    let placeholder = parse(&json!({
+        "handle": "github/bot#token",
+        "mode": "placeholder",
+        "audience": "https://api.github.com",
+        "ttl_s": 600,
+    }))
+    .unwrap();
+    assert_eq!(
+        (
+            placeholder.mode,
+            placeholder.audience.as_str(),
+            placeholder.ttl
+        ),
+        ("placeholder", "https://api.github.com", 600)
+    );
+    let ported = parse(
+        &json!({"handle": "git/bot#token", "mode": "placeholder", "audience": "https://git.example:8443"}),
+    )
+    .unwrap();
+    assert_eq!(ported.audience, "https://git.example:8443");
 }
 
 #[test]
@@ -74,6 +96,14 @@ fn a_request_no_use_could_take_is_refused() {
         json!({"handle": "db/main", "mode": "exec", "audience": "-rf"}),
         json!({"handle": "db/main", "mode": "exec", "audience": "psql", "ttl_s": 29}),
         json!({"handle": "db/main", "mode": "exec", "audience": "psql", "ttl_s": 901}),
+        // P3b-3c-2 — a placeholder's audience is an origin in its one
+        // spelling, as vault_placeholder names it: no bare host, no case, no
+        // 443, no path.
+        json!({"handle": "github/bot", "mode": "placeholder", "audience": "api.github.com"}),
+        json!({"handle": "github/bot", "mode": "placeholder", "audience": "https://API.github.com"}),
+        json!({"handle": "github/bot", "mode": "placeholder", "audience": "https://api.github.com:443"}),
+        json!({"handle": "github/bot", "mode": "placeholder", "audience": "https://api.github.com/user"}),
+        json!({"handle": "github/bot", "mode": "placeholder", "audience": "https://api.github.com", "ttl_s": 29}),
     ] {
         assert!(parse(&bad).is_err(), "{bad}");
     }

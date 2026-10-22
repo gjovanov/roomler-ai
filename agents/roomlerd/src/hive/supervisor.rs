@@ -4898,6 +4898,9 @@ fn write_settings(
         let secrets = dir.join(super::vault_render::SECRETS_DIR);
         extra_read_denies.push(format!("Read(/{}/**)", secrets.display()));
     }
+    // P3b-3c-2 — a placeholder, where the session runs behind its egress
+    // proxy: the proxy is what swaps it in, and the toolbelt offers it there.
+    let placeholder_tools = vault_tools && sandbox.is_some();
     // P0e — the key helper is the DAEMON's (the sidecar runs it); the session
     // has no `apiKeyHelper`, so nothing in it can print the provider's key.
     let doc = SettingsSpec {
@@ -4911,9 +4914,10 @@ fn write_settings(
         // (P3-4c-3) neither does asking a lease ahead, which hands nothing.
         allow_tools: vault_allow_tools(vault_tools),
         // P3-4c — and each of its uses asks one, whatever a repository's
-        // own settings allow; so does each egress listener (P3-7-3c), and
-        // each command run on another device (P3-8-2b-2).
-        ask_tools: vault_use_tools(vault_tools, net_tools, ssh_tools),
+        // own settings allow; so does each egress listener (P3-7-3c), each
+        // command run on another device (P3-8-2b-2), and each placeholder
+        // (P3b-3c-2).
+        ask_tools: vault_use_tools(vault_tools, net_tools, ssh_tools, placeholder_tools),
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
@@ -4942,7 +4946,15 @@ fn vault_allow_tools(vault_tools: bool) -> Vec<String> {
 ///
 /// FR-90 P3-8-2b-2 — and `ssh_run`, wherever it is offered: each call runs a
 /// command on another device, as whatever account that device maps.
-fn vault_use_tools(vault_tools: bool, net_tools: bool, ssh_tools: bool) -> Vec<String> {
+///
+/// FR-90 P3b-3c-2 — and `vault_placeholder`, wherever it is offered: each
+/// call binds a secret's value to the hosts it may go to.
+fn vault_use_tools(
+    vault_tools: bool,
+    net_tools: bool,
+    ssh_tools: bool,
+    placeholder_tools: bool,
+) -> Vec<String> {
     #[cfg(feature = "vault")]
     if vault_tools {
         let mut ask: Vec<String> = toolbelt::VAULT_USE_TOOLS.map(String::from).to_vec();
@@ -4952,10 +4964,13 @@ fn vault_use_tools(vault_tools: bool, net_tools: bool, ssh_tools: bool) -> Vec<S
         if ssh_tools {
             ask.extend(toolbelt::SSH_TOOLS.map(String::from));
         }
+        if placeholder_tools {
+            ask.extend(toolbelt::PLACEHOLDER_TOOLS.map(String::from));
+        }
         return ask;
     }
     #[cfg(not(feature = "vault"))]
-    let _ = (vault_tools, net_tools, ssh_tools);
+    let _ = (vault_tools, net_tools, ssh_tools, placeholder_tools);
     Vec::new()
 }
 
@@ -7952,6 +7967,47 @@ done
             !doc["permissions"]["ask"].to_string().contains("net_"),
             "not offered, not named: {doc}"
         );
+    }
+
+    /// FR-90 P3b-3c-2 — `vault_placeholder` is ASKED for on every call where
+    /// the session runs behind its egress proxy (its settings carry the
+    /// sandbox) and the vault is offered: never allowed outright, and named
+    /// nowhere else.
+    #[cfg(feature = "vault")]
+    #[test]
+    fn the_settings_ask_for_vault_placeholder_behind_the_egress_proxy() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let read = |sid: &str| -> serde_json::Value {
+            let path = runtime.join(sid).join("settings.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let sandbox = || {
+            Some(SandboxProxy {
+                http_port: 18080,
+                socks_port: 18081,
+                cache: root.path().join("cache"),
+                trust: None,
+            })
+        };
+        write_settings(&runtime, "sandboxed", true, false, false, sandbox()).unwrap();
+        let doc = read("sandboxed");
+        let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
+        asked.extend(toolbelt::PLACEHOLDER_TOOLS);
+        assert_eq!(doc["permissions"]["ask"], serde_json::json!(asked), "{doc}");
+        assert!(
+            !doc["permissions"]["allow"]
+                .to_string()
+                .contains("vault_placeholder"),
+            "never allowed without a person: {doc}"
+        );
+        for (sid, vault, sandbox) in [("plain", true, None), ("no-vault", false, sandbox())] {
+            write_settings(&runtime, sid, vault, false, false, sandbox).unwrap();
+            assert!(
+                !read(sid).to_string().contains("vault_placeholder"),
+                "{sid}: not offered, not named"
+            );
+        }
     }
 
     /// FR-90 P3b-1b-2 — where the owner turned on `hive_egress`, a session's
