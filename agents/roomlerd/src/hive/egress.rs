@@ -13,7 +13,7 @@
 //! | the host | in its one spelling (`canonical_net_host`); one it cannot spell is refused unasked |
 //! | the decision | the vault's, asked once per host, port and run (`rc:vault.egress`) and kept for the run, an allow or a denial. A request that got no decision (no answer, busy, unavailable) is refused, and the next connection asks again |
 //! | the dial | from this device, never through a tunnel exit: the name resolved by the OS's resolver, which MagicDNS steers, and never to an address of this host's loopback, a link-local, an unspecified, a multicast or a broadcast one, nor a cloud's metadata service, whatever the vault allowed |
-//! | the bytes | relayed as they are: no TLS is terminated here (P3b-3 adds it, for an audience host of a placeholder) |
+//! | the bytes | relayed as they are, never decrypted, but to a host the run holds a placeholder for (P3b-3c-1, [`swap`]): there TLS is terminated under the run's CA, and the placeholder swapped for its value in `Authorization` |
 //! | its CA | made with the run (P3b-3b, [`ca`]): what P3b-3c terminates TLS under, and what the session's tools are told to trust ([`ca_of`]) |
 //! | its end | the run's ([`drop_run`]): both listeners close, and every connection on them ends |
 //!
@@ -39,13 +39,20 @@ use roomler_ai_remote_control::vault::{LeaseRefusal, canonical_net_host};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OnceCell, Semaphore};
+use tokio_rustls::rustls::ClientConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tunnel_core::flow_listener::Admit;
 use tunnel_core::socks5;
+use zeroize::Zeroizing;
+
+use super::placeholder;
 
 /// FR-90 P3b-3b — the run's own CA, and the trust the session is told of.
 pub mod ca;
+/// FR-90 P3b-3c-1 — TLS terminated for a placeholder's audience, and the
+/// placeholder swapped for its value.
+mod swap;
 
 /// A session's run, by its session and fence.
 pub type RunKey = (ObjectId, u64);
@@ -104,6 +111,38 @@ pub trait Dial: Send + Sync + 'static {
     async fn dial(&self, host: &str, port: u16) -> Result<TcpStream, Refusal>;
 }
 
+/// FR-90 P3b-3c-1 — what a placeholder's value is read from: the vault
+/// client's leases, in the daemon ([`LeaseValues`]).
+pub trait Values: Send + Sync + 'static {
+    /// What `lease_id` holds, while it is held.
+    fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>>;
+}
+
+/// FR-90 P3b-3c-1 — what a host the run holds a placeholder for is verified
+/// against, where the proxy terminates its connection.
+#[derive(Clone)]
+pub enum Roots {
+    /// This device's, as `proxy` mode reads them: once a run, at its first
+    /// termination.
+    System,
+    /// These alone: the tests'.
+    #[cfg(test)]
+    Given(Arc<tokio_rustls::rustls::RootCertStore>),
+}
+
+/// What a run's proxy asks of the daemon.
+#[derive(Clone)]
+pub struct Seams {
+    /// The vault's decision for a host ([`VaultDecider`]).
+    pub decide: Arc<dyn Decide>,
+    /// The dial ([`SystemDialer`]).
+    pub dial: Arc<dyn Dial>,
+    /// FR-90 P3b-3c-1 — a placeholder's value ([`LeaseValues`]).
+    pub values: Arc<dyn Values>,
+    /// FR-90 P3b-3c-1 — what a placeholder's audience is verified against.
+    pub roots: Roots,
+}
+
 /// Why a connection was not carried: what its client is told, and what the
 /// log says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +164,9 @@ pub enum Refusal {
     Unreachable(String),
     /// An address answered, refusing the connection.
     ConnectionRefused(String),
+    /// FR-90 P3b-3c-1 — a host the run holds a placeholder for, whose TLS
+    /// did not verify: nothing is swapped toward a host nobody proved.
+    Unverified(String),
 }
 
 impl Refusal {
@@ -135,7 +177,9 @@ impl Refusal {
             Self::NotConnect(_) => (405, "Method Not Allowed"),
             Self::Denied(_) | Self::NotDialable(_) => (403, "Forbidden"),
             Self::Undecided(_) | Self::Busy(_) => (503, "Service Unavailable"),
-            Self::Unreachable(_) | Self::ConnectionRefused(_) => (502, "Bad Gateway"),
+            Self::Unreachable(_) | Self::ConnectionRefused(_) | Self::Unverified(_) => {
+                (502, "Bad Gateway")
+            }
         }
     }
 
@@ -145,9 +189,11 @@ impl Refusal {
             Self::Denied(_) | Self::NotDialable(_) => REP_NOT_ALLOWED,
             Self::Unreachable(_) => REP_HOST_UNREACHABLE,
             Self::ConnectionRefused(_) => REP_REFUSED,
-            Self::BadRequest(_) | Self::NotConnect(_) | Self::Undecided(_) | Self::Busy(_) => {
-                socks5::REP_GENERAL_FAILURE
-            }
+            Self::BadRequest(_)
+            | Self::NotConnect(_)
+            | Self::Undecided(_)
+            | Self::Busy(_)
+            | Self::Unverified(_) => socks5::REP_GENERAL_FAILURE,
         }
     }
 
@@ -176,6 +222,10 @@ impl Refusal {
             Self::Unreachable(_) | Self::ConnectionRefused(_) => {
                 format!("roomler egress proxy: {target} could not be reached\n")
             }
+            Self::Unverified(why) => format!(
+                "roomler egress proxy: {target}'s certificate did not verify on this device \
+                 ({why}), so no placeholder is swapped toward it\n"
+            ),
         }
     }
 }
@@ -210,6 +260,32 @@ struct RunState {
     open: Arc<Semaphore>,
     /// FR-90 P3b-3b — made with the run, gone with it.
     ca: Arc<ca::SessionCa>,
+    /// FR-90 P3b-3c-1 — the TLS the run's audiences are verified with, made
+    /// at its first termination.
+    upstream: OnceCell<Arc<ClientConfig>>,
+}
+
+impl RunState {
+    /// FR-90 P3b-3c-1 — the run's TLS to its audiences: made once, at its
+    /// first termination, from `roots`. The system's are read off the
+    /// runtime's threads: a keychain can be slow to read.
+    async fn upstream_tls(&self, roots: &Roots) -> Result<Arc<ClientConfig>, String> {
+        self.upstream
+            .get_or_try_init(|| async {
+                let store = match roots {
+                    Roots::System => {
+                        tokio::task::spawn_blocking(|| crate::vault_proxy::tls::roots(None))
+                            .await
+                            .map_err(|e| e.to_string())??
+                    }
+                    #[cfg(test)]
+                    Roots::Given(store) => store.clone(),
+                };
+                swap::upstream_config(store)
+            })
+            .await
+            .cloned()
+    }
 }
 
 /// Every run's proxy: ended with the run ([`drop_run`]).
@@ -238,7 +314,15 @@ pub fn start(
     dial: Arc<dyn Dial>,
 ) -> Result<Fronts, String> {
     let admit = super::vault_connect::session_admit(peer)?;
-    start_admitting(run, admit, decide, dial)
+    // FR-90 P3b-3c-1 — a placeholder's value from the daemon's leases, its
+    // audience verified against this device's roots.
+    let seams = Seams {
+        decide,
+        dial,
+        values: Arc::new(LeaseValues),
+        roots: Roots::System,
+    };
+    start_admitting(run, admit, seams)
 }
 
 /// A loopback listener at a port the system picks, for the runtime.
@@ -249,13 +333,8 @@ fn loopback(front: &str) -> Result<TcpListener, String> {
     TcpListener::from_std(listener).map_err(|e| format!("the egress proxy's {front} front: {e}"))
 }
 
-/// [`start`], with the admission given.
-fn start_admitting(
-    run: RunKey,
-    admit: Admit,
-    decide: Arc<dyn Decide>,
-    dial: Arc<dyn Dial>,
-) -> Result<Fronts, String> {
+/// [`start`], with the admission and the seams given.
+fn start_admitting(run: RunKey, admit: Admit, seams: Seams) -> Result<Fronts, String> {
     let http = loopback("HTTP")?;
     let socks = loopback("SOCKS5")?;
     let fronts = Fronts {
@@ -271,6 +350,7 @@ fn start_admitting(
         decisions: Mutex::default(),
         open: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         ca: Arc::new(ca::SessionCa::new(run.0)?),
+        upstream: OnceCell::new(),
     });
     if let Some(old) = runs().insert(run, state.clone()) {
         old.stop.cancel();
@@ -282,8 +362,7 @@ fn start_admitting(
             run,
             state.clone(),
             admit.clone(),
-            decide.clone(),
-            dial.clone(),
+            seams.clone(),
         ));
     }
     info!(
@@ -320,8 +399,7 @@ async fn accept(
     run: RunKey,
     state: Arc<RunState>,
     admit: Admit,
-    decide: Arc<dyn Decide>,
-    dial: Arc<dyn Dial>,
+    seams: Seams,
 ) {
     let Ok(local) = listener.local_addr() else {
         return;
@@ -346,26 +424,12 @@ async fn accept(
             );
             continue;
         }
-        tokio::spawn(carry(
-            front,
-            tcp,
-            run,
-            state.clone(),
-            decide.clone(),
-            dial.clone(),
-        ));
+        tokio::spawn(carry(front, tcp, run, state.clone(), seams.clone()));
     }
 }
 
 /// One connection: where it goes, whether it may, and the bytes.
-async fn carry(
-    front: Front,
-    mut tcp: TcpStream,
-    run: RunKey,
-    state: Arc<RunState>,
-    decide: Arc<dyn Decide>,
-    dial: Arc<dyn Dial>,
-) {
+async fn carry(front: Front, mut tcp: TcpStream, run: RunKey, state: Arc<RunState>, seams: Seams) {
     let Ok(_open) = state.open.clone().try_acquire_owned() else {
         refuse(
             front,
@@ -391,9 +455,9 @@ async fn carry(
         }
     };
     let shown = target_text(&asked_host, port);
-    let reached = reach(&state, run, &asked_host, port, &*decide, &*dial).await;
-    let upstream = match reached {
-        Ok(upstream) => upstream,
+    let reached = reach(&state, run, &asked_host, port, &*seams.decide, &*seams.dial).await;
+    let (host, upstream) = match reached {
+        Ok(reached) => reached,
         Err(refusal) => {
             match &refusal {
                 Refusal::Denied(word) => info!(
@@ -413,6 +477,14 @@ async fn carry(
             return;
         }
     };
+    // FR-90 P3b-3c-1 — a host the run holds a placeholder for: TLS
+    // terminated under the run's CA, and the placeholder swapped in. Every
+    // other host is carried as it comes, never decrypted.
+    if !placeholder::bound(run.0, run.1, &host, port).is_empty() {
+        let target = swap::Target { host, port, shown };
+        swap::carry(front, tcp, upstream, early, target, run, state, seams).await;
+        return;
+    }
     if !accepted(front, &mut tcp).await {
         return;
     }
@@ -421,7 +493,8 @@ async fn carry(
 }
 
 /// From the host the client named to a connection to it: its one spelling,
-/// the run's decision, the dial.
+/// the run's decision, the dial. The host in its one spelling, and the
+/// connection.
 async fn reach(
     state: &RunState,
     run: RunKey,
@@ -429,7 +502,7 @@ async fn reach(
     port: u16,
     decide: &dyn Decide,
     dial: &dyn Dial,
-) -> Result<TcpStream, Refusal> {
+) -> Result<(String, TcpStream), Refusal> {
     let Some(host) = canonical_net_host(asked_host) else {
         return Err(Refusal::BadRequest(format!(
             "{asked_host:?} is not a host this proxy can decide"
@@ -441,7 +514,7 @@ async fn reach(
         Decision::Undecided(why) => return Err(Refusal::Undecided(why)),
     }
     match tokio::time::timeout(Duration::from_secs(DIAL_SECS), dial.dial(&host, port)).await {
-        Ok(dialed) => dialed,
+        Ok(dialed) => dialed.map(|tcp| (host, tcp)),
         Err(_) => Err(Refusal::Unreachable(format!(
             "no answer within {DIAL_SECS} s"
         ))),
@@ -714,6 +787,15 @@ impl Decide for VaultDecider {
             })
             .await,
         )
+    }
+}
+
+/// FR-90 P3b-3c-1 — the daemon's values: its vault client's held leases.
+pub struct LeaseValues;
+
+impl Values for LeaseValues {
+    fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
+        crate::vault::CLIENT.with_value(lease_id, |v| Zeroizing::new(v.to_vec()))
     }
 }
 
