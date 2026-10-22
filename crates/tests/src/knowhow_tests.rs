@@ -159,11 +159,7 @@ async fn an_organization_knowhow_does_not_serve_sees_none_of_it() {
     .await;
 
     let (code, body) = call(app.auth_get(&kpath(&a.tenant_id, ""), &a.admin.access_token)).await;
-    assert_eq!(
-        (code, body["entities"].clone()),
-        (200, json!(0)),
-        "{body}"
-    );
+    assert_eq!((code, body["entities"].clone()), (200, json!(0)), "{body}");
     for path in ["", "/search", "/history"] {
         let (code, body) =
             call(app.auth_get(&kpath(&b.tenant_id, path), &b.admin.access_token)).await;
@@ -200,11 +196,8 @@ async fn an_organization_knowhow_does_not_serve_sees_none_of_it() {
     // Outside an organization the answer is about membership, never about
     // the gate: the same for one served and one not.
     for (org, outsider) in [(&a, &b), (&b, &a)] {
-        let (code, body) = call(app.auth_get(
-            &kpath(&org.tenant_id, ""),
-            &outsider.admin.access_token,
-        ))
-        .await;
+        let (code, body) =
+            call(app.auth_get(&kpath(&org.tenant_id, ""), &outsider.admin.access_token)).await;
         assert_eq!(
             (code, body["error"].clone()),
             (403, json!("not_a_member")),
@@ -266,7 +259,11 @@ async fn the_map_is_read_from_member_up_and_changed_by_admins() {
         body["message"].as_str().unwrap().contains("KNOWHOW_VIEW"),
         "{body}"
     );
-    assert_ne!(body["error"], json!("not_a_member"), "a refusal, not an eviction");
+    assert_ne!(
+        body["error"],
+        json!("not_a_member"),
+        "a refusal, not an eviction"
+    );
 
     // An admin changes it.
     hold_only(&app, &t, &t.member.id, "admin").await;
@@ -303,10 +300,17 @@ async fn an_entity_is_put_on_the_map_found_and_named_once() {
     .await;
     assert_eq!(code, 201, "{made}");
     assert_eq!(
-        (made["rev"].clone(), made["status"].clone(), made["source"].clone()),
+        (
+            made["rev"].clone(),
+            made["status"].clone(),
+            made["source"].clone()
+        ),
         (json!(1), json!("active"), json!("person"))
     );
-    assert_eq!(made["attrs"], json!({ "engine": "mongodb", "replicas": [1, 2, 3] }));
+    assert_eq!(
+        made["attrs"],
+        json!({ "engine": "mongodb", "replicas": [1, 2, 3] })
+    );
     assert_eq!(made["owner_id"], json!(t.member.id));
     let facts = made["facts"].as_array().unwrap();
     assert_eq!(
@@ -361,7 +365,11 @@ async fn an_entity_is_put_on_the_map_found_and_named_once() {
         );
     }
     let (code, body) = call(app.auth_get(&kpath(&t.tenant_id, "/search?limit=1"), owner)).await;
-    assert_eq!((code, body["truncated"].clone()), (200, json!(true)), "{body}");
+    assert_eq!(
+        (code, body["truncated"].clone()),
+        (200, json!(true)),
+        "{body}"
+    );
 
     // Named once.
     let (code, body) = create(
@@ -388,7 +396,11 @@ async fn an_entity_is_put_on_the_map_found_and_named_once() {
             owner,
         ))
         .await;
-        assert_eq!((code, card["entity"]["kind"].clone()), (200, json!(kind)), "{card}");
+        assert_eq!(
+            (code, card["entity"]["kind"].clone()),
+            (200, json!(kind)),
+            "{card}"
+        );
     }
     let (code, _) = call(app.auth_get(
         &kpath(&t.tenant_id, "/entity?kind=cluster&key=prod-mongo"),
@@ -400,16 +412,43 @@ async fn an_entity_is_put_on_the_map_found_and_named_once() {
     // Never a person's machine; one spelling; nothing a document could read
     // as a path or an operator.
     for (bad, why) in [
-        (json!({ "kind": "machine", "key": "mars", "name": "mars" }), "machine"),
+        (
+            json!({ "kind": "machine", "key": "mars", "name": "mars" }),
+            "machine",
+        ),
         (json!({ "kind": "server", "key": "x", "name": "x" }), "kind"),
-        (json!({ "kind": "database", "key": "Prod", "name": "x" }), "key"),
-        (json!({ "kind": "database", "key": "a//b", "name": "x" }), "key"),
-        (json!({ "kind": "database", "key": "x", "name": "  " }), "name"),
-        (json!({ "kind": "database", "key": "x", "name": "x", "env": "Prod" }), "env"),
-        (json!({ "kind": "database", "key": "x", "name": "x", "attrs": { "$where": 1 } }), "attrs"),
-        (json!({ "kind": "database", "key": "x", "name": "x", "attrs": { "a.b": 1 } }), "attrs"),
-        (json!({ "kind": "database", "key": "x", "name": "x", "facts": { "port": null } }), "fact"),
-        (json!({ "kind": "database", "key": "x", "name": "x", "owner_id": ObjectId::new().to_hex() }), "owner"),
+        (
+            json!({ "kind": "database", "key": "Prod", "name": "x" }),
+            "key",
+        ),
+        (
+            json!({ "kind": "database", "key": "a//b", "name": "x" }),
+            "key",
+        ),
+        (
+            json!({ "kind": "database", "key": "x", "name": "  " }),
+            "name",
+        ),
+        (
+            json!({ "kind": "database", "key": "x", "name": "x", "env": "Prod" }),
+            "env",
+        ),
+        (
+            json!({ "kind": "database", "key": "x", "name": "x", "attrs": { "$where": 1 } }),
+            "attrs",
+        ),
+        (
+            json!({ "kind": "database", "key": "x", "name": "x", "attrs": { "a.b": 1 } }),
+            "attrs",
+        ),
+        (
+            json!({ "kind": "database", "key": "x", "name": "x", "facts": { "port": null } }),
+            "fact",
+        ),
+        (
+            json!({ "kind": "database", "key": "x", "name": "x", "owner_id": ObjectId::new().to_hex() }),
+            "owner",
+        ),
     ] {
         let (code, body) = create(&app, &t, owner, bad.clone()).await;
         assert_eq!(code, 400, "{why}: {bad} → {body}");
@@ -480,7 +519,10 @@ async fn a_change_is_made_at_the_rev_it_was_read_and_keeps_every_other_facts_pro
             .unwrap()
     };
     assert_eq!(
-        (fact(&after, "port")["value"].clone(), fact(&after, "port")["by"].clone()),
+        (
+            fact(&after, "port")["value"].clone(),
+            fact(&after, "port")["by"].clone()
+        ),
         (json!(6432), json!(t.member.id)),
         "the editor's value, the editor's fact"
     );
@@ -497,18 +539,22 @@ async fn a_change_is_made_at_the_rev_it_was_read_and_keeps_every_other_facts_pro
     // At a rev already gone: refused, and nothing changed.
     let (code, body) = call(at(1, json!({ "name": "Stale" }))).await;
     assert_eq!(code, 409, "{body}");
-    let (_, card) = call(app.auth_get(
-        &kpath(&t.tenant_id, &format!("/entity/{id}")),
-        editor,
-    ))
-    .await;
+    let (_, card) =
+        call(app.auth_get(&kpath(&t.tenant_id, &format!("/entity/{id}")), editor)).await;
     assert_eq!(
-        (card["entity"]["name"].clone(), card["entity"]["rev"].clone()),
+        (
+            card["entity"]["name"].clone(),
+            card["entity"]["rev"].clone()
+        ),
         (json!("Orders"), json!(2))
     );
 
     // A change that changes nothing writes nothing.
-    let (code, same) = call(at(2, json!({ "name": "Orders", "facts": { "engine": "postgres" } }))).await;
+    let (code, same) = call(at(
+        2,
+        json!({ "name": "Orders", "facts": { "engine": "postgres" } }),
+    ))
+    .await;
     assert_eq!((code, same["rev"].clone()), (200, json!(2)), "{same}");
     let (code, body) = call(at(2, json!({}))).await;
     assert_eq!(code, 400, "nothing to change: {body}");
@@ -647,7 +693,10 @@ async fn links_walk_both_ways_and_go_with_what_they_link() {
         .collect();
     assert_eq!(archives.len(), 3, "{hist}");
     assert_eq!(
-        archives.iter().filter(|(t, c)| *t == "edge" && *c == "entity_archived").count(),
+        archives
+            .iter()
+            .filter(|(t, c)| *t == "edge" && *c == "entity_archived")
+            .count(),
         2,
         "{hist}"
     );
@@ -663,7 +712,9 @@ async fn links_walk_both_ways_and_go_with_what_they_link() {
     assert_eq!(code, 201);
     let eid = edge["id"].as_str().unwrap();
     let epath = kpath(&t.tenant_id, &format!("/edge/{eid}"));
-    let (code, changed) = call(patch(&app, &epath, owner).json(&json!({ "rev": 1, "attrs": { "via": "forward" } }))).await;
+    let (code, changed) =
+        call(patch(&app, &epath, owner).json(&json!({ "rev": 1, "attrs": { "via": "forward" } })))
+            .await;
     assert_eq!((code, changed["rev"].clone()), (200, json!(2)), "{changed}");
     let (code, _) = call(patch(&app, &epath, owner).json(&json!({ "rev": 1, "attrs": {} }))).await;
     assert_eq!(code, 409);
@@ -692,8 +743,12 @@ async fn an_id_of_another_organization_answers_as_a_bogus_one() {
         assert_eq!(code, 404, "{path}: {body}");
     }
     let (code, _) = call(
-        patch(&app, &kpath(&b.tenant_id, &format!("/entity/{theirs}")), tok)
-            .json(&json!({ "rev": rev, "name": "mine now" })),
+        patch(
+            &app,
+            &kpath(&b.tenant_id, &format!("/entity/{theirs}")),
+            tok,
+        )
+        .json(&json!({ "rev": rev, "name": "mine now" })),
     )
     .await;
     assert_eq!(code, 404);
@@ -718,7 +773,10 @@ async fn an_id_of_another_organization_answers_as_a_bogus_one() {
     ))
     .await;
     assert_eq!(
-        (card["entity"]["name"].clone(), card["entity"]["rev"].clone()),
+        (
+            card["entity"]["name"].clone(),
+            card["entity"]["rev"].clone()
+        ),
         (json!("theirs"), json!(rev))
     );
 }
