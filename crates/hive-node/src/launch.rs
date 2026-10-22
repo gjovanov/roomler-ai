@@ -395,7 +395,9 @@ pub struct SettingsSpec {
     pub api_key_helper: Option<String>,
     /// The session's memory snapshot directory (design §10.3).
     pub auto_memory_directory: Option<PathBuf>,
-    /// The session's egress proxy, when the sandbox is on (Linux, macOS, WSL2).
+    /// The session's egress proxy and its cache, when the sandbox is on
+    /// (Linux, macOS, WSL2): FR-90 P3b-1b-2, where the owner turned on
+    /// `hive_egress`.
     pub sandbox_proxy: Option<SandboxProxy>,
     /// Paths the model's Read tool must not open, beyond the defaults.
     pub extra_read_denies: Vec<String>,
@@ -420,12 +422,66 @@ pub struct SettingsSpec {
     pub ask_tools: Vec<String>,
 }
 
-/// Where the sandbox sends sandboxed commands' traffic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where the sandbox sends sandboxed commands' traffic, and (FR-90 P3b-1b-2)
+/// where they keep what their package managers cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProxy {
     pub http_port: u16,
     pub socks_port: u16,
+    /// The session's own cache directory ([`cache_dir_in`]): the one place
+    /// outside its working directory and temp a sandboxed command writes.
+    pub cache: PathBuf,
 }
+
+/// FR-90 P3b-1b-2 — the session's cache directory, beside its
+/// `CLAUDE_CONFIG_DIR` ([`config_dir_in`]) and gone with it (decision 31).
+pub fn cache_dir_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("cache")
+}
+
+/// FR-90 P3b-1b-2 — the package managers' caches, each pointed under the
+/// session's cache directory by its own variable, so nothing a sandboxed
+/// command writes is ever read outside a sandbox (decision 31): the
+/// account's own caches are written by nothing a session runs.
+pub const CACHE_VARS: &[(&str, &str)] = &[
+    ("XDG_CACHE_HOME", "xdg"),
+    ("npm_config_cache", "npm"),
+    ("YARN_CACHE_FOLDER", "yarn"),
+    ("PIP_CACHE_DIR", "pip"),
+    ("UV_CACHE_DIR", "uv"),
+    ("CARGO_HOME", "cargo"),
+    ("GOMODCACHE", "go/mod"),
+    ("GOCACHE", "go/build"),
+    ("GRADLE_USER_HOME", "gradle"),
+];
+
+/// FR-90 P3b-1b-2 — the paths in the account's home no sandboxed command
+/// writes, even where its working directory is the home: each runs code
+/// later, outside the sandbox, or changes what the next session launches.
+/// Defence beside the cache: with no working directory in the home, nothing
+/// there was writable anyway (decision 31).
+pub const HOME_DENY_WRITE: &[&str] = &[
+    "~/.local/bin",
+    "~/.config/systemd",
+    "~/.config/autostart",
+    "~/.config/environment.d",
+    "~/.config/git",
+    "~/.config/fish",
+    "~/.ssh",
+    "~/.gitconfig",
+    "~/.profile",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.bashrc",
+    "~/.zshrc",
+    "~/.zprofile",
+    "~/.zshenv",
+    "~/.zlogin",
+    "~/.pam_environment",
+    "~/.claude",
+    "~/.claude.json",
+    "~/Library/LaunchAgents",
+];
 
 impl SettingsSpec {
     /// The settings document.
@@ -470,10 +526,29 @@ impl SettingsSpec {
         // sandbox that comes on, ours or the user's, would take Bash out of
         // the approvals. In a Hive session a person decides.
         doc["sandbox"] = json!({"autoAllowBashIfSandboxed": false});
-        if let Some(p) = self.sandbox_proxy {
-            doc["sandbox"]["enabled"] = json!(true);
-            doc["sandbox"]["network"] =
+        if let Some(p) = &self.sandbox_proxy {
+            let sandbox = &mut doc["sandbox"];
+            sandbox["enabled"] = json!(true);
+            // P3b-1b-2 — a host where the sandbox cannot run refuses the start
+            // rather than run the session unsandboxed (decision 28), and no
+            // command retries outside it. The second also makes the sandbox
+            // admin-required: a repository's own settings cannot loosen it
+            // (Claude Code 2.1.285 and later, which the daemon holds to).
+            sandbox["failIfUnavailable"] = json!(true);
+            sandbox["allowUnsandboxedCommands"] = json!(false);
+            sandbox["network"] =
                 json!({"httpProxyPort": p.http_port, "socksProxyPort": p.socks_port});
+            // Decision 31 — the working directory, temp, and the session's own
+            // cache: never the home, whose files run code later outside it.
+            sandbox["filesystem"] = json!({
+                "allowWrite": [p.cache.to_string_lossy()],
+                "denyWrite": HOME_DENY_WRITE,
+            });
+            let env: serde_json::Map<String, Value> = CACHE_VARS
+                .iter()
+                .map(|(var, sub)| (var.to_string(), json!(p.cache.join(sub).to_string_lossy())))
+                .collect();
+            doc["env"] = Value::Object(env);
         }
         doc
     }
@@ -757,6 +832,7 @@ mod tests {
             sandbox_proxy: Some(SandboxProxy {
                 http_port: 47001,
                 socks_port: 47002,
+                cache: cache_dir_in(&root().join("state")),
             }),
             extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
             session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
@@ -797,6 +873,50 @@ mod tests {
         assert!(doc["autoMemoryDirectory"].is_string());
         assert_eq!(doc["sandbox"]["enabled"], true);
         assert_eq!(doc["sandbox"]["autoAllowBashIfSandboxed"], false);
+        // P3b-1b-2 — no start unsandboxed, no retry outside it.
+        assert_eq!(doc["sandbox"]["failIfUnavailable"], true);
+        assert_eq!(doc["sandbox"]["allowUnsandboxedCommands"], false);
+        assert!(
+            doc["sandbox"].get("excludedCommands").is_none(),
+            "no command runs outside the sandbox"
+        );
+        // Decision 31 — writes to the session's own cache, never the home's
+        // code-running paths; every cache variable points under it.
+        let cache = cache_dir_in(&root().join("state"));
+        assert_eq!(
+            doc["sandbox"]["filesystem"]["allowWrite"],
+            json!([cache.to_string_lossy()])
+        );
+        let denied = doc["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap();
+        for path in [
+            "~/.local/bin",
+            "~/.config/systemd",
+            "~/.ssh",
+            "~/.bashrc",
+            "~/.claude",
+        ] {
+            assert!(denied.iter().any(|d| d == path), "{path}");
+        }
+        let env = doc["env"].as_object().unwrap();
+        assert_eq!(env.len(), CACHE_VARS.len());
+        for (var, sub) in CACHE_VARS {
+            let at = PathBuf::from(env[*var].as_str().unwrap());
+            assert!(at.starts_with(&cache), "{var} is under the cache");
+            assert!(at.ends_with(sub), "{var}");
+        }
+        // Each by its name: a cache left out would be written in the home.
+        for var in [
+            "XDG_CACHE_HOME",
+            "npm_config_cache",
+            "PIP_CACHE_DIR",
+            "CARGO_HOME",
+            "GOMODCACHE",
+            "GOCACHE",
+        ] {
+            assert!(env.contains_key(var), "{var} points under the cache");
+        }
         // No sandbox where we set none (P1; native Windows) — and should one
         // come on anyway, a sandboxed command still asks a person.
         let bare = SettingsSpec {
@@ -822,6 +942,10 @@ mod tests {
             bare["sandbox"],
             json!({"autoAllowBashIfSandboxed": false}),
             "{bare}"
+        );
+        assert!(
+            bare.get("env").is_none(),
+            "no sandbox, no cache: a session's own caches are its account's"
         );
         // No helper until the sidecar issues tokens: the key is absent, never
         // an empty command the harness would try to run.

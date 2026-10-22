@@ -214,6 +214,13 @@ pub enum HiveRefusal {
     /// copy would be refused there only after the lease moved; the detail
     /// names a sibling folder the session could go to instead.
     FolderDirty,
+    /// FR-90 P3b-1b-2 — the device's owner turned on `hive_egress`, so every
+    /// session here runs in Claude Code's sandbox, and this one cannot: no
+    /// sandbox on this system (Windows), none of its tools (`bubblewrap`,
+    /// `socat`), a harness older than the one that keeps a repository from
+    /// loosening it, or no vault to decide its hosts. Never a session run
+    /// unsandboxed instead.
+    SandboxUnavailable,
     /// A word this build does not know.
     Other,
 }
@@ -231,12 +238,13 @@ impl HiveRefusal {
             Self::AtCapacity => "at_capacity",
             Self::PasswordlessSudo => "passwordless_sudo",
             Self::FolderDirty => "folder_dirty",
+            Self::SandboxUnavailable => "sandbox_unavailable",
             Self::Other => "other",
         }
     }
 
     /// Every word this build knows.
-    pub const ALL: [HiveRefusal; 10] = [
+    pub const ALL: [HiveRefusal; 11] = [
         Self::HiveDisabled,
         Self::NoAccount,
         Self::NoConsoleUser,
@@ -246,6 +254,7 @@ impl HiveRefusal {
         Self::AtCapacity,
         Self::PasswordlessSudo,
         Self::FolderDirty,
+        Self::SandboxUnavailable,
         Self::Other,
     ];
 }
@@ -1234,6 +1243,7 @@ mod tests {
                 "at_capacity",
                 "passwordless_sudo",
                 "folder_dirty",
+                "sandbox_unavailable",
                 "other",
             ]
         );
