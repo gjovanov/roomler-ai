@@ -28,6 +28,7 @@ use cedar_policy::{
     ActionConstraint, Authorizer, Context, Decision, Effect, Entities, EntityUid, Policy, PolicyId,
     PolicySet, Request, Schema, ValidationMode, ValidationWarning, Validator,
 };
+use roomler_ai_remote_control::vault::canonical_net_host;
 use serde_json::{Value, json};
 
 use crate::rrn::check_path;
@@ -58,6 +59,7 @@ pub const ACTIONS: &[&str] = &[
     ACTION_NET_FORWARD,
     ACTION_SSH_RUN,
     ACTION_CONNECT,
+    ACTION_NET_EGRESS,
 ];
 pub const ACTION_ASSUME: &str = "role:assume";
 pub const ACTION_USE: &str = "secret:use";
@@ -79,6 +81,11 @@ pub const ACTION_SSH_RUN: &str = "ssh:run";
 /// owner: `secret:use` is a session's alone, so no policy written for
 /// sessions admits a person.
 pub const ACTION_CONNECT: &str = "secret:connect";
+/// P3b-1a — a session's command reaching one host through the session's
+/// egress proxy, on the device the session runs on (decision 27;
+/// `docs/fr/FR-90-hive-agent-sessions.md` §3e, "P3b, `placeholder` egress,
+/// as designed"). The vault seeds no permit for it: default deny.
+pub const ACTION_NET_EGRESS: &str = "net:egress";
 
 /// P3-9-1 — the actions only a permit that NAMES them in its scope admits
 /// ([`decide`]). A policy whose scope names no action
@@ -327,6 +334,23 @@ pub fn check_policy(text: &str, names: &OrgNames) -> Result<CheckedPolicy, Strin
                     .map_err(|_| format!("Node::{id:?} is not a device id"))?;
                 nodes.insert(node);
             }
+            // P3b-1a — a host in its one spelling, the one a request is
+            // decided under. Any other would match no request, and a
+            // `forbid` naming it would forbid nothing.
+            "Host" => match canonical_net_host(&id) {
+                Some(one) if one == id => {}
+                Some(one) => {
+                    return Err(format!(
+                        "Host::{id:?} is not a spelling a request is decided under: write \
+                         Host::{one:?}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "Host::{id:?} is not a host: a DNS name or an address, without a port"
+                    ));
+                }
+            },
             "Session" => {
                 return Err(
                     "a policy never names one session: name the role sessions assume".into(),
@@ -560,6 +584,15 @@ pub enum Ask {
         port: u16,
         device: DeviceFacts,
     },
+    /// P3b-1a — `net:egress`: may `session`'s commands, on `device`, reach
+    /// `host:port` through the session's egress proxy? `host` in its one
+    /// spelling (`canonical_net_host`), as the vault decides a request.
+    NetEgress {
+        session: SessionFacts,
+        host: String,
+        port: u16,
+        device: DeviceFacts,
+    },
     /// P3-8 — `ssh:run`: may `session`, on `device`, run one command on
     /// `node` over Roomler SSH, as `account` (the account `node`'s SSH policy
     /// maps, as an `SshAccountMode` word)?
@@ -699,6 +732,7 @@ impl Ask {
             Self::ListSecret { .. } => ACTION_LIST,
             Self::NetSocks { .. } => ACTION_NET_SOCKS,
             Self::NetForward { .. } => ACTION_NET_FORWARD,
+            Self::NetEgress { .. } => ACTION_NET_EGRESS,
             Self::SshRun { .. } => ACTION_SSH_RUN,
             Self::ConnectSecret { .. } => ACTION_CONNECT,
         }
@@ -799,6 +833,18 @@ impl Ask {
                 "action": ACTION_NET_FORWARD,
                 "session": session_doc(session),
                 "node": node_doc(node),
+                "host": host,
+                "port": i32::from(*port),
+                "device": device(d),
+            },
+            Self::NetEgress {
+                session,
+                host,
+                port,
+                device: d,
+            } => bson::doc! {
+                "action": ACTION_NET_EGRESS,
+                "session": session_doc(session),
                 "host": host,
                 "port": i32::from(*port),
                 "device": device(d),
@@ -933,6 +979,12 @@ impl Ask {
                 port: u16::try_from(doc.get_i32("port").ok()?).ok()?,
                 device: device(doc.get_document("device").ok()?)?,
             }),
+            ACTION_NET_EGRESS => Some(Self::NetEgress {
+                session: session(doc.get_document("session").ok()?)?,
+                host: doc.get_str("host").ok()?.to_string(),
+                port: u16::try_from(doc.get_i32("port").ok()?).ok()?,
+                device: device(doc.get_document("device").ok()?)?,
+            }),
             ACTION_SSH_RUN => Some(Self::SshRun {
                 session: session(doc.get_document("session").ok()?)?,
                 node: node(doc.get_document("node").ok()?)?,
@@ -1041,6 +1093,26 @@ impl Ask {
                     node_uid,
                     entities,
                     json!({ "device": device.json(), "host": host, "port": port }),
+                )
+            }
+            Self::NetEgress {
+                session,
+                host,
+                port,
+                device,
+            } => {
+                let (session_uid, mut entities) = session_entities(session);
+                let host_uid = uid("Host", host);
+                entities.push(json!({
+                    "uid": host_uid,
+                    "attrs": { "name": host, "port": port },
+                    "parents": [],
+                }));
+                (
+                    session_uid,
+                    host_uid,
+                    entities,
+                    json!({ "device": device.json() }),
                 )
             }
             Self::SshRun {
@@ -2046,22 +2118,123 @@ mod tests {
         );
     }
 
+    fn net_egress(role: Option<&str>, host: &str, port: u16) -> Ask {
+        Ask::NetEgress {
+            session: session(role),
+            host: host.into(),
+            port,
+            device: device("linux", &[]),
+        }
+    }
+
+    const DEV_REACHES_PYPI: &str = r#"permit (principal in Roomler::Role::"dev",
+        action == Roomler::Action::"net:egress",
+        resource == Roomler::Host::"pypi.org") when { resource.port == 443 };"#;
+
+    const DEV_REACHES_PYTHONHOSTED: &str = r#"permit (principal in Roomler::Role::"dev",
+        action == Roomler::Action::"net:egress",
+        resource) when { resource.name like "*.pythonhosted.org" && resource.port == 443 };"#;
+
+    /// P3b-1a — a session's role reaches the hosts a policy names, by name or
+    /// by pattern, on the port it names, and nothing else: no host is
+    /// reached that no policy names (no guardrail permits, and none seeds a
+    /// permit), and a `forbid` beats them all.
+    #[test]
+    fn a_role_reaches_the_hosts_a_policy_names_and_nothing_else() {
+        let set = set_with(&[DEV_REACHES_PYPI, DEV_REACHES_PYTHONHOSTED]);
+        for (host, port) in [("pypi.org", 443), ("files.pythonhosted.org", 443)] {
+            assert!(
+                decide(&set, &net_egress(Some("dev"), host, port)).allow,
+                "{host}:{port}"
+            );
+        }
+        for (ask, why) in [
+            (net_egress(Some("dev"), "pypi.org", 80), "another port"),
+            (net_egress(Some("dev"), "evil.example", 443), "another host"),
+            (
+                net_egress(Some("dev"), "pythonhosted.org.evil.example", 443),
+                "a name that only begins as the pattern ends",
+            ),
+            (
+                net_egress(Some("deployer"), "pypi.org", 443),
+                "another role",
+            ),
+            (net_egress(None, "pypi.org", 443), "no role"),
+            (
+                net_forward(Some("dev"), &[], "pypi.org", 443),
+                "an egress permit opens no forward",
+            ),
+        ] {
+            assert!(!decide(&set, &ask).allow, "{why}");
+        }
+        assert!(
+            !decide(&set_with(&[]), &net_egress(Some("dev"), "pypi.org", 443)).allow,
+            "the guardrails alone: default deny"
+        );
+        let forbidden = set_with(&[
+            r#"permit (principal in Roomler::Role::"dev", action == Roomler::Action::"net:egress", resource);"#,
+            r#"forbid (principal, action == Roomler::Action::"net:egress", resource == Roomler::Host::"pypi.org");"#,
+        ]);
+        let verdict = decide(&forbidden, &net_egress(Some("dev"), "pypi.org", 443));
+        assert!(!verdict.allow);
+        assert_eq!(verdict.determining, ["policy:1"]);
+        assert!(decide(&forbidden, &net_egress(Some("dev"), "crates.io", 443)).allow);
+    }
+
+    /// P3b-1a — a policy names a host only in the spelling a request is
+    /// decided under, so no `forbid` names a host it can never match; the
+    /// refusal says which spelling to write.
+    #[test]
+    fn a_policy_names_a_host_in_the_spelling_a_request_is_decided_under() {
+        let policy = |host: &str| {
+            format!(
+                r#"forbid (principal, action == Roomler::Action::"net:egress", resource == Roomler::Host::"{host}");"#
+            )
+        };
+        for host in ["pypi.org", "10.0.0.5", "2001:db8::1", "db_1.internal"] {
+            assert!(check_policy(&policy(host), &names()).is_ok(), "{host}");
+        }
+        for (host, one) in [
+            ("PyPI.org", "pypi.org"),
+            ("pypi.org.", "pypi.org"),
+            ("::ffff:10.0.0.5", "10.0.0.5"),
+            ("2001:DB8::1", "2001:db8::1"),
+        ] {
+            let refused = check_policy(&policy(host), &names()).expect_err(host);
+            assert!(
+                refused.contains(&format!("write Host::{one:?}")),
+                "{host}: {refused}"
+            );
+        }
+        for host in ["pypi.org:443", "010.0.0.5", "", "a b"] {
+            let refused = check_policy(&policy(host), &names()).expect_err(host);
+            assert!(refused.contains("is not a host"), "{host}: {refused}");
+        }
+    }
+
     /// P3-7 — a net request reads back from its record exactly, and decides
-    /// alike; a port past `u16` makes the row unreadable.
+    /// alike; a port past `u16` makes the row unreadable. P3b-1a — an egress
+    /// request too.
     #[test]
     fn a_net_request_reads_back_from_its_record() {
         for ask in [
             net_socks(Some("dev"), &["office"]),
             net_forward(Some("dev"), &["office"], "db.internal", 5432),
+            net_egress(Some("dev"), "pypi.org", 443),
         ] {
             let back = Ask::from_doc(&ask.to_doc()).expect("reads back");
             assert_eq!(format!("{back:?}"), format!("{ask:?}"));
             let set = set_with(&[DEV_SOCKS_THROUGH_OFFICE]);
             assert_eq!(decide(&set, &back), decide(&set, &ask));
         }
-        let mut doc = net_forward(Some("dev"), &[], "db.internal", 5432).to_doc();
-        doc.insert("port", 70_000_i32);
-        assert!(Ask::from_doc(&doc).is_none());
+        for ask in [
+            net_forward(Some("dev"), &[], "db.internal", 5432),
+            net_egress(Some("dev"), "pypi.org", 443),
+        ] {
+            let mut doc = ask.to_doc();
+            doc.insert("port", 70_000_i32);
+            assert!(Ask::from_doc(&doc).is_none(), "{ask:?}");
+        }
     }
 
     /// P3-7 — a policy may name an exit by its device's id, which the route

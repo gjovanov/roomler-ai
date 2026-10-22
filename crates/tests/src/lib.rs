@@ -300,6 +300,11 @@ mod vault_connect_tests;
 /// paired by guardrails.
 #[cfg(test)]
 mod vault_dynamic_tests;
+/// FR-90 P3b-1a — a session's egress allowlist: `rc:vault.egress` decided by
+/// Cedar's `net:egress`, believed as a lease is, the host decided, recorded
+/// and answered in its one spelling, nothing reached that no policy names.
+#[cfg(test)]
+mod vault_egress_tests;
 /// FR-90 P3-3a — a device's vault key as the fleet stores it: from every
 /// hello, never a malformed one, and gone with the hello that drops it.
 #[cfg(test)]

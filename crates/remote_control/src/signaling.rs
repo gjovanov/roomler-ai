@@ -1661,6 +1661,35 @@ pub enum ClientMsg {
         ttl_secs: u32,
     },
 
+    /// FR-90 P3b-1a — a session on this device asks whether its commands may
+    /// reach `host:port` through the session's egress proxy (decision 27).
+    /// Believed as a lease request is (the session's record, at its fence,
+    /// on this device), decided by Cedar's `net:egress`, and answered with
+    /// [`ServerMsg::VaultEgressAllowed`] or [`ServerMsg::VaultRefused`],
+    /// naming `req_id`. The device asks once per host and run, and keeps the
+    /// answer for the run.
+    ///
+    /// ⚠️ `tenant_id` and the device come from the authenticated WS, NOT from
+    /// this frame. The vault decides the host as
+    /// [`crate::vault::canonical_net_host`] spells it, and answers that
+    /// spelling.
+    #[serde(rename = "rc:vault.egress")]
+    VaultEgress {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        /// The host a command dials: a DNS name or an address, no port.
+        /// Absent reads as empty, which the vault refuses `bad_request`: a
+        /// frame the server cannot decode is never answered, and the device
+        /// would wait on it.
+        #[serde(default)]
+        host: String,
+        /// The port it dials. Absent reads as 0, refused likewise.
+        #[serde(default)]
+        port: u16,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2598,6 +2627,7 @@ impl ClientMsg {
             ClientMsg::VaultNet { .. } => "rc:vault.net",
             ClientMsg::VaultSsh { .. } => "rc:vault.ssh",
             ClientMsg::VaultConnect { .. } => "rc:vault.connect",
+            ClientMsg::VaultEgress { .. } => "rc:vault.egress",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2725,7 +2755,8 @@ impl ClientMsg {
             | ClientMsg::VaultActivity { .. }
             | ClientMsg::VaultNet { .. }
             | ClientMsg::VaultSsh { .. }
-            | ClientMsg::VaultConnect { .. } => Owner::Vault,
+            | ClientMsg::VaultConnect { .. }
+            | ClientMsg::VaultEgress { .. } => Owner::Vault,
         }
     }
 }
@@ -2778,6 +2809,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.net", Owner::Vault),
     ("rc:vault.ssh", Owner::Vault),
     ("rc:vault.connect", Owner::Vault),
+    ("rc:vault.egress", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -4807,6 +4839,22 @@ pub enum ServerMsg {
         /// on (a [`crate::models::SshAccountMode`] word) and the ticket names.
         account: String,
     },
+
+    /// FR-90 P3b-1a — the vault allowed a session's commands to reach one
+    /// host through the session's egress proxy ([`ClientMsg::VaultEgress`]).
+    /// Sent only on the connection that asked, never pushed. No token: the
+    /// daemon whose proxy dials is the one that asked, so no third party
+    /// checks the answer. It is no lease: nothing revokes it, and the device
+    /// keeps it for the session's run there.
+    #[serde(rename = "rc:vault.egress.allowed")]
+    VaultEgressAllowed {
+        req_id: String,
+        /// The host exactly as decided, in
+        /// [`crate::vault::canonical_net_host`]'s spelling, which the device
+        /// dials.
+        host: String,
+        port: u16,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -5760,6 +5808,61 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(v).unwrap(),
             ServerMsg::VaultSshGranted { ref account, .. } if account == "console_user"
+        ));
+    }
+
+    /// FR-90 P3b-1a — a session's ask to reach one host through its egress
+    /// proxy, and the allow, as they cross the wire; both read back the same,
+    /// the ask is the vault's, and an ask missing its host or port still
+    /// decodes, so the vault can refuse it rather than leave it unanswered.
+    #[test]
+    fn vault_egress_wire_shape_is_locked() {
+        let sid = ObjectId::new();
+        let ask = ClientMsg::VaultEgress {
+            req_id: "e1".into(),
+            session_id: sid,
+            fence: 4,
+            host: "pypi.org".into(),
+            port: 443,
+        };
+        let v = serde_json::to_value(&ask).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:vault.egress", "req_id": "e1", "session_id": sid.to_hex(),
+                "fence": 4, "host": "pypi.org", "port": 443,
+            })
+        );
+        let back: ClientMsg = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::VaultEgress { ref host, port: 443, fence: 4, .. } if host == "pypi.org"
+        ));
+        assert_eq!(back.namespace(), Owner::Vault);
+        let bare: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:vault.egress", "req_id": "e2", "session_id": sid.to_hex(), "fence": 4,
+        }))
+        .unwrap();
+        assert!(matches!(
+            bare,
+            ClientMsg::VaultEgress { ref host, port: 0, .. } if host.is_empty()
+        ));
+
+        let allowed = ServerMsg::VaultEgressAllowed {
+            req_id: "e1".into(),
+            host: "pypi.org".into(),
+            port: 443,
+        };
+        let v = serde_json::to_value(&allowed).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:vault.egress.allowed", "req_id": "e1", "host": "pypi.org", "port": 443,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ServerMsg>(v).unwrap(),
+            ServerMsg::VaultEgressAllowed { ref host, port: 443, .. } if host == "pypi.org"
         ));
     }
 
