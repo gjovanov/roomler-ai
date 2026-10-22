@@ -2760,6 +2760,76 @@ design above:
   renewal was due missed a lease shortened in the meantime, and a clock that stood still while
   the device slept.
 
+**P3b, `placeholder` egress, as designed (P3b-0).** A session holds a secret as a placeholder: an
+opaque token in its environment, which its tools send as they would send the value. The value
+never reaches the session. The daemon's egress proxy swaps it in on the way out, and only toward
+the secret's audiences (design §8.5). This is the mode for a tool that holds a credential itself
+and has no endpoint to sign in for it: `gh` with `GH_TOKEN`, `aws` with an access key, an SDK
+with a bearer token. It needs what P3-7 left out: the session's egress proxy (design §7.2's third
+change), which Claude Code's sandbox sends every sandboxed command through.
+
+```mermaid
+sequenceDiagram
+    participant S as the session (its commands, in the sandbox)
+    participant D as roomlerd (the toolbelt, the session's egress proxy)
+    participant V as vault
+    participant A as an audience host (api.github.com)
+    participant O as any other allowed host
+    S->>D: vault_placeholder {handle, audience}, approved by a person
+    D->>V: rc:vault.lease {mode: placeholder, audience}, one per field
+    V-->>D: the field, sealed to the device
+    D-->>S: GH_TOKEN=rph_… (a placeholder, never the value)
+    S->>D: CONNECT api.github.com:443, through the sandbox's proxy port
+    D->>D: the connection's account the session's, the host on its allowlist (decision 27)
+    D->>D: an audience of a placeholder the session holds: TLS terminated under the session's CA
+    S->>D: GET /user with Authorization: token rph_…
+    D->>A: Authorization carrying the value, over TLS the proxy verified
+    A-->>S: the answer, back through the proxy
+    S->>D: CONNECT pypi.org:443
+    D->>O: the bytes as they are, never decrypted
+```
+
+| Piece | Design |
+|---|---|
+| the sandbox | Claude Code's own, on every session of a device whose owner turns on `hive_egress` (decision 28): `sandbox.enabled`; `failIfUnavailable`, so a host without bubblewrap and socat refuses the start rather than run unsandboxed; `allowUnsandboxedCommands: false`, so no command retries outside it, which also makes the sandbox admin-required, and a repository's `.claude/settings.json` cannot loosen it; `network.httpProxyPort` and `socksProxyPort`, the session's proxy; no `excludedCommands`. `SettingsSpec` has carried the ports since P0 (`crates/hive-node/src/launch.rs:399`), and the daemon has never set them (`agents/roomlerd/src/hive/supervisor.rs:4731`) |
+| ⚠️ its filesystem layer | on, its writes widened to the account's home (`filesystem.allowWrite`). Its protected paths, which no `allowWrite` opens, are what keep a session from loosening its own sandbox: the session's user settings in `CLAUDE_CONFIG_DIR` (`~<account>/.roomler/hive/<session>/claude`) and a repository's `.claude` files stay write-denied to its commands. With `filesystem.disabled` a command could write those user settings, which an admin-required sandbox still honours |
+| the egress proxy | in the daemon, one per session: an HTTP CONNECT front and a SOCKS5 front on loopback, each connection served only to the session's account (P3-7-3b's `session_admit`, `agents/roomlerd/src/hive/vault_connect.rs:2385`). It dials from this device, never through a tunnel exit, resolves mesh names as the daemon does, and ends with the run |
+| its allowlist | decision 27. ⚠️ An empty allowlist refuses everything; it never means unrestricted |
+| a placeholder | one per lease in mode `placeholder`: `rph_` and 32 base32 characters, 160 bits from the OS CSPRNG, made by the daemon when the lease arrives and known to nobody else. The lease is asked as any is (`rc:vault.lease`), its audience the origin the value goes to, spelled as `proxy` mode's HTTP engine spells it (`https://api.github.com`). Today the vault releases no value in this mode (`LEASE_MODES`, `crates/modules/vault/src/lease.rs:86`). Of the seeded guardrails (`crates/modules/vault/src/policy.rs:121`), `dynamic-only-short-lived` already refuses it for a dynamic secret and `windows-proxy-only` on Windows (decision 30); `prod-never-materializes` does not, since nothing materializes. The tool `vault_placeholder {handle, audience}` answers the assignments to set (`GH_TOKEN=rph_…`), as `vault_connect` answers `env` |
+| TLS termination | only on a connection to an audience host of a placeholder the session holds, and only when the name the client gives (CONNECT, SNI) and the name the upstream proves agree. Every other connection is passed through and never decrypted. The upstream's TLS is verified as `proxy` mode verifies it (`docs/vault.md` §19). A per-session CA (ECDSA P-256), its key in daemon memory only and new at every start, signs one leaf per host, kept for the run |
+| trusting the CA | the session's settings `env`: `NODE_EXTRA_CA_CERTS` (the CA), and `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `AWS_CA_BUNDLE` and `GIT_SSL_CAINFO` (a bundle of the system's roots and the CA): the variables Claude Code's own TLS termination sets, and two it does not. ⚠️ No system trust store is ever changed: an EDR flags it, and it would trust the CA for every process |
+| substitution | every placeholder the session holds, in a request's headers and its body (bounded, `identity` encoding only), and only on a connection to that placeholder's audience. Never in the URL. A placeholder bound anywhere else goes out as it is, so the value never leaves |
+| AWS | SigV4 signs the request with the secret key, so a substitution alone breaks it. The proxy checks the signature made with the placeholder pair, then signs again with the value. A streaming, presigned or SigV4A request fails rather than carry a placeholder's signature (P3b-4) |
+| Go programs on macOS | decision 29 |
+| Windows | decision 30 |
+| the audit | `vault_audit` for each lease, as for any. A substitution is not a decision, so it is not recorded. The proxy's log names the session, the host and the placeholder's lease, never a value |
+| the kill switches | `vault.placeholder` (server, default off): no lease in this mode leaves the vault. `hive_egress` (device-owned, default off, never pushable): no sandbox, no proxy, no placeholder |
+
+- ⚠️ **The value never reaches the session.** Its processes, its environment and its files hold
+  only the placeholder; the daemon, a different OS principal, holds the value. That is why Claude
+  Code's own `mask` credentials are not used: their real value sits in the harness, whose
+  environment the Read tool reaches at `/proc/self/environ` (design §8.5).
+- ⚠️ **Bound to its audiences.** A placeholder is swapped only on a connection to a host its
+  secret names, matched exactly as `proxy` mode matches them. One smuggled into a request to any
+  other host goes out as an opaque string.
+- ⚠️ **Never the URL**, which lands in logs, histories and `Referer` headers (Managed Agents' own
+  rule).
+- ⚠️ **Decrypt only what a substitution needs.** Every other connection passes through untouched:
+  the session's other traffic is not inspected, and a client that pins its certificates does not
+  break.
+- ⚠️ **The sandbox covers commands only**: Bash, PowerShell and Monitor. Hooks, MCP servers and the
+  file tools run outside it, with the device's network, and the allowlist does not bind them. They
+  hold nothing but placeholders either, so a placeholder they send directly carries nothing. The
+  only MCP server is `roomler` (`--strict-mcp-config`).
+- ⚠️ **HTTP/1.1 toward the client** (its ALPN offers `http/1.1`), because a substitution reads the
+  request: an HTTP/2 client falls back, and HTTP/3, being UDP, cannot leave the sandbox at all.
+- **Not in P3b:**
+  - knowhow's audiences in the allowlist (P4);
+  - a placeholder after a WebSocket upgrade, or in HTTP/2;
+  - non-HTTP protocols: a database's secret is `proxy` mode's (P3-5);
+  - any system trust store;
+  - a placeholder in a URL.
+
 **The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1370`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
@@ -2841,7 +2911,12 @@ design above:
 | P3-9-2a | the device's half, without its caller: the lease client's `rc:vault.connect`, each lease held for the endpoint that asked; a session's `vault_connect` endpoint, served for a person's account and renewed while it is held (decision 25) | the `vault` feature in no release build; no caller | — |
 | P3-9-2b | LocalAPI `Connect` on the daemon's own endpoint only, held to the accounts decision 26 says; the endpoint released when the asking connection closes; `roomler connect <handle>` in the foreground (knowhow's `roomler_connect(entity)` waits for P4) | device `vault_enabled = false`; the `vault` feature in no release build | — |
 | P3k | the field run in the test org, and `docs/vault.md` | — | AC12, AC13, AC19's vault half |
-| P3b | `placeholder` egress, as designed | `vault.placeholder = false` | AC14 |
+| P3b-0 | `placeholder` egress's design (§3e "P3b, `placeholder` egress, as designed"), and decisions 27–30 | docs only | — |
+| P3b-1 | the session's egress proxy and its sandbox: `hive_egress` (device-owned, default off, never pushable); a session's settings turning the sandbox on, its filesystem layer widened to the account's home, its proxy ports set; the CONNECT and SOCKS5 fronts served to the session's account; the allowlist as decision 27 says; no TLS terminated yet | device `hive_egress = false` | — |
+| P3b-2 | placeholder leases, the vault's half: `placeholder` released to the daemon, sealed as any lease, its audience the host the value goes to, held there by a twin of `proxy-only-named-audiences` | `vault.placeholder` (default off) | — |
+| P3b-3 | the device's half: `vault_placeholder`, the per-session CA and its trust, TLS termination for an audience host, and substitution in headers and body | device `hive_egress = false`; `vault.placeholder` | AC14 (`gh`) |
+| P3b-4 | AWS: a SigV4 signature checked, then signed again with the value | the same | AC14 (`aws`) |
+| P3b-5 | Windows, as decision 30 says: today `guardrail:windows-proxy-only` refuses the mode there | the same | — |
 
 ### 3f. The brain
 
@@ -3206,7 +3281,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-9-0 | `roomler connect`'s design (§3e "P3-9, `roomler connect`, as designed"), docs only: a person's `roomler connect <handle>` gets a local endpoint that signs in to the secret's upstream as the secret's user, the value held in daemon memory. It acts as the device's owner, read from the device's row (decision 23, decided by the operator on 2026-10-21), through the daemon's own LocalAPI endpoint only. Cedar decides a new action, `secret:connect` (principal `User`), so no policy written for sessions admits a person. The ask is a frame of its own, `rc:vault.connect`. The endpoint serves the one account that asked, with the engines a session's `vault_connect` has. `vault_audit` records `principal: user`, the owner, and the device. Decisions 24 (a person's prod paths and approvals) and 25 (how long the endpoint lives) are the operator's | docs only | **merged** #2701 `63c8c7b00`; decisions 24 and 25 decided 2026-10-21 (§6) |
 | P3-9-1 | the vault's half of `roomler connect` (`docs/vault.md` §23), with nothing asking yet (P3-9-2's daemon is the first): `rc:vault.connect`, one frame per field, answered as a lease is (`rc:vault.leased` · `rc:vault.refused`). The principal is the device's owner as its row names them, who must be a member (`owner_not_member` otherwise), in the roles they hold. Cedar's `secret:connect` (`User` → `Secret`) decides, over the set without the permits whose scope names no action (`NAMED_ONLY`), so neither a session's policy nor an action-less permit admits a person; it has three guardrails of its own: `connect-only-named-audiences`, `connect-never-dynamic` and `connect-never-prod` (decision 24). A deny someone's yes would lift is `approval_unavailable` (decision 24), found by deciding again with an approver in every role who is not the person; no card. The field sealed to the device's key, the allow recorded and the lease written (no session, fence 0, the owner) before it is sent; 30 requests a minute per device, past it `busy`, unrecorded. A person's lease is taken back as any is, and when the device's row names another owner (`owner_changed`) or its owner leaves (`owner_not_member`). `vault.people`, opt-in, lends only to the organizations it lists. `simulate` decides `secret:connect` for the device's owner. As built: §3e "P3-9", "As built (P3-9-1)" | `vault.people` (default off); the `vault` feature in no release build | **merged** #2704 `5261b9bad` |
 | P3-9-2a | the device's half of `roomler connect`, without its caller (`docs/vault.md` §23, "The device's half"; P3-9-2b's LocalAPI verb is the first): the lease client's `Client::connect` sends `rc:vault.connect` and holds each answer as any lease, for the endpoint that asked (`Holder::Person`), until its expiry, `rc:vault.revoke` or the endpoint's close (`drop_person`). A session's `vault_connect` endpoint opens for a person too, its lease source the person's and the account it serves the one that asked (on Unix under `<runtime>/person-<uid>`, at most 8 an account), and it is renewed while it is held (decision 25): a third of the TTL ahead every field is asked for again, new connections read the new leases and live ones stay up; a lease taken back cuts its connections and is asked for once more; a renewal the vault cannot answer is asked again every 10 s, one it refuses serves to the leases' end, then closes, saying why. Found writing it: decision 26 | the `vault` feature in no release build; no caller | **merged** #2705 `6d927f1d3` |
-| P3-9-2b | `roomler connect`, the person's command (`docs/vault.md` §23, "The person's command"): the LocalAPI's `Connect {args}` and `ConnectStatus {id}`, on the daemon's own endpoint only (`person_may` refuses both), held to decision 26's recommendation: root or the daemon's own uid on Unix; SYSTEM, an elevated administrator or the daemon's own account on Windows, read with the account in one opening of the client's token at accept time. The endpoint serves the account that asked, and lives as long as the connection that opened it, which alone may read where it stands. The daemon holds each endpoint by id (`person_connect`), and makes the runtime directory where no session has yet. The command stays in the foreground, writes a kubeconfig or `known_hosts` for the client, reports a renewal and a refusal, and ends at Ctrl-C. P3-9-2a's `allow`s go | the `vault` feature in no release build; device `vault_enabled = false`; `vault.people` (default off) | **in review** |
+| P3-9-2b | `roomler connect`, the person's command (`docs/vault.md` §23, "The person's command"): the LocalAPI's `Connect {args}` and `ConnectStatus {id}`, on the daemon's own endpoint only (`person_may` refuses both), held to decision 26's recommendation: root or the daemon's own uid on Unix; SYSTEM, an elevated administrator or the daemon's own account on Windows, read with the account in one opening of the client's token at accept time. The endpoint serves the account that asked, and lives as long as the connection that opened it, which alone may read where it stands. The daemon holds each endpoint by id (`person_connect`), and makes the runtime directory where no session has yet. The command stays in the foreground, writes a kubeconfig or `known_hosts` for the client, reports a renewal and a refusal, and ends at Ctrl-C. P3-9-2a's `allow`s go | the `vault` feature in no release build; device `vault_enabled = false`; `vault.people` (default off) | **merged** #2706 `7b5560a62` |
+| P3b-0 | `placeholder` egress's design (§3e "P3b, `placeholder` egress, as designed"), docs only: a session holds a secret as an opaque placeholder in its environment, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, so the value never reaches the session. It needs the session's egress proxy, which P3-7 left out: Claude Code's own sandbox, on every session of a device whose owner opts in, sends every command through it (`sandbox.network.httpProxyPort`/`socksProxyPort`), its filesystem layer kept on because its protected paths keep a session from loosening its own sandbox. TLS is terminated under a per-session CA only for an audience host of a placeholder the session holds; everything else passes through undecrypted; no system trust store is ever changed. Steps P3b-1 to P3b-5. Decisions 27 (the allowlist before knowhow), 28 (which sessions run sandboxed), 29 (Go programs on macOS) and 30 (Windows) are the operator's | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3868,6 +3944,65 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         screen can.
     - *Built in P3-9-2b as recommended, pending the operator's word.* A wider answer changes one
       gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2280`), and its test.
+27. **What a session's egress proxy allows, before knowhow** (P3b-1), for the operator to confirm
+    (P3b-0, §3e "P3b, `placeholder` egress, as designed"). The design's §7.2 takes the allowlist
+    from the session's role and the knowhow audiences it may reach, and knowhow is P4. Nothing in
+    P3b-0 depends on the answer; P3b-1 does.
+    - *Recommended: the hosts the session's role allows, decided by Cedar.* A new action,
+      `net:egress` (principal `Session`, resource a `Host`: its name and port), default deny. It is
+      decided once per host and run, kept for the run, and its denials are recorded, as P3-7's
+      `net:socks` decides a listener. The vault seeds nothing, so a session on such a device reaches
+      no host until a policy names it.
+      - What it costs: an organization writes a policy before such a session can install a
+        package, and each new host waits on one vault decision.
+    - *Or: a device-owned list* (`hive_egress_allow`, host patterns, never pushable), beside
+      `hive_egress`.
+      - What it costs: it is kept per device, and the vault's roles do not narrow it.
+    - *Or: every host*, the proxy doing nothing but swap placeholders.
+      - What it costs: no egress control at all, against the design's "an empty allowlist refuses
+        everything".
+28. **Which sessions run in Claude Code's sandbox** (P3b-1), for the operator to confirm (P3b-0).
+    - *Recommended: every session of a device whose owner turns on `hive_egress`*, and no other.
+      On such a device, a host without bubblewrap and socat refuses the start
+      (`failIfUnavailable`) rather than run a session unsandboxed.
+      - What it costs: there, a session's commands reach only what the allowlist allows, where
+        today they reach everything the account can.
+    - *Or: every session on every device*, the design's §7.2 reading.
+      - What it costs: every Linux device needs bubblewrap and socat before any session starts,
+        and every session loses its open network at its next start.
+    - *Or: only a session whose role permits `placeholder`.*
+      - What it costs: the settings are written at the launch, before any tool asks, so a role
+        that changes during the session does not change them.
+29. **`gh` and other Go programs on macOS** (P3b-3), for the operator to confirm (P3b-0). On macOS,
+    Go verifies TLS with the keychain and never reads `SSL_CERT_FILE`, so a per-session CA does not
+    reach it. Claude Code's `enableWeakerNetworkIsolation` lets a Go program reach the system's
+    trust service from inside the sandbox, which helps only with a CA the keychain already trusts,
+    such as a corporate one.
+    - *Recommended: no placeholder for Go programs on macOS in P3b.* AC14's `gh` is proven on
+      Linux. On macOS a placeholder reaches a Go program as an opaque string that its server
+      refuses, and nothing leaks.
+      - What it costs: `gh`, `terraform` and every other Go program cannot use a placeholder on a
+        Mac.
+    - *Or: a CA per device, trusted for TLS in the login keychain of the session's account*,
+      installed when the owner turns on `hive_egress` and with their consent, since macOS asks
+      before trust settings change.
+      - What it costs: every process of that account trusts the CA while it is installed, and its
+        key outlives a run.
+30. **Placeholders on Windows** (P3b-5), for the operator to confirm (P3b-0). On native Windows,
+    Claude Code runs commands unsandboxed, so nothing forces them through the proxy. Today the
+    vault refuses the mode there: `guardrail:windows-proxy-only` (decision 17, AC13;
+    `crates/modules/vault/src/policy.rs:123`) forbids every mode but `proxy` on Windows.
+    - *Recommended: offer them, with the proxy advisory*: `HTTPS_PROXY` and the CA variables in the
+      session's settings, as the design's §7.2 says of Windows, and the guardrail widened to
+      `proxy` and `placeholder`. Its reason holds for both, since the value stays in the daemon
+      either way. A tool that ignores the proxy sends the placeholder itself, which carries
+      nothing. A tool that trusts only the Windows store (.NET, Schannel, Go) cannot use a
+      placeholder, since that store is never changed.
+      - What it costs: the allowlist binds only the tools that honour the proxy, and a guardrail
+        decision 17 set changes, in writing.
+    - *Or: keep the guardrail as decision 17 set it*, refusing `placeholder` on Windows until a
+      sandbox exists there.
+      - What it costs: AC14 holds on Linux and macOS only.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
