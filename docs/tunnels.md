@@ -971,7 +971,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| asking | `vault::net` ([`vault.rs:776`](../agents/roomlerd/src/vault.rs#L776)) and its answer `on_net_granted` ([`:924`](../agents/roomlerd/src/vault.rs#L924)), held to what was asked by `net_granted` ([`:363`](../agents/roomlerd/src/vault.rs#L363)); the answer's own arm in the daemon's signalling ([`signaling.rs:6302`](../agents/roomlerd/src/signaling.rs#L6302)) |
+| asking | `vault::net` ([`vault.rs:863`](../agents/roomlerd/src/vault.rs#L863)) and its answer `on_net_granted` ([`:1010`](../agents/roomlerd/src/vault.rs#L1010)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6302`](../agents/roomlerd/src/signaling.rs#L6302)) |
 | presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
 | the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1737`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1737)) |
 | the code | `NET_GRANT_REFUSED` ([`vault.rs:547`](../crates/remote_control/src/vault.rs#L547)), shared by the server and the device |
@@ -1012,7 +1012,7 @@ flowchart LR
 | Piece | Where |
 |---|---|
 | the hook | `Admit` ([`flow_listener.rs:122`](../crates/tunnel-core/src/flow_listener.rs#L122)), `FlowListener::bind_admitting` ([`:133`](../crates/tunnel-core/src/flow_listener.rs#L133)), asked before the hold ([`:304`](../crates/tunnel-core/src/flow_listener.rs#L304)) |
-| the account | `connection_is` ([`vault_connect.rs:1726`](../agents/roomlerd/src/hive/vault_connect.rs#L1726)), the session listener's hook `session_admit` ([`:1789`](../agents/roomlerd/src/hive/vault_connect.rs#L1789)) |
+| the account | `connection_is` ([`vault_connect.rs:2336`](../agents/roomlerd/src/hive/vault_connect.rs#L2336)), the session listener's hook `session_admit` ([`:2399`](../agents/roomlerd/src/hive/vault_connect.rs#L2399)) |
 | RFC 1929 | `Socks5Credential` ([`socks5.rs:95`](../crates/tunnel-core/src/socks5.rs#L95)), `accept_connect_authenticated` ([`:122`](../crates/tunnel-core/src/socks5.rs#L122)); `Target::SessionSocks5` ([`driver.rs:376`](../crates/tunnel-core/src/driver.rs#L376)), served in the carrier ([`:676`](../crates/tunnel-core/src/driver.rs#L676)) |
 | the flow | `create_session_flow` ([`client_mgr.rs:462`](../agents/roomlerd/src/tunnel/client_mgr.rs#L462)), ended at the grant's end ([`:495`](../agents/roomlerd/src/tunnel/client_mgr.rs#L495)) |
 | tests | `socks5::tests` (2), `flow_listener::tests` (1), `driver::tests::a_session_carrier_forwards_its_credentials_connections_alone`, `tunnel::client_mgr::tests::a_session_flow_serves_whom_it_admits_and_ends_with_its_grant`, `hive::vault_connect::tests::a_session_listener_admits_its_account_alone`: 6, and 11 negative controls |

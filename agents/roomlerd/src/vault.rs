@@ -159,12 +159,38 @@ mod client {
         pub ahead: bool,
     }
 
+    /// FR-90 P3-9-2 — what a person's endpoint asks for (`roomler connect`,
+    /// `rc:vault.connect`): one field of a secret, toward the upstream the
+    /// endpoint signs in to, for the device's owner. It names no person: the
+    /// vault reads the owner from the device's row.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PersonAsk {
+        /// The endpoint the lease serves, by the id this daemon gave it: what
+        /// lets go of its leases when it closes ([`Client::drop_person`]).
+        pub endpoint: u64,
+        /// A path, or an RRN of this organization.
+        pub secret: String,
+        /// Empty for a static secret's one field.
+        pub field: String,
+        pub audience: String,
+        pub ttl_secs: u32,
+    }
+
+    /// FR-90 P3-9-2 — whose a held lease is: a session's run, or a person's
+    /// endpoint, by the id this daemon gave it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Holder {
+        Session { id: ObjectId, fence: u64 },
+        Person(u64),
+    }
+
     /// A lease this daemon holds: what it is, never its value.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct LeaseInfo {
         pub lease_id: String,
-        pub session_id: ObjectId,
-        pub fence: u64,
+        /// The run, or (P3-9-2) the person's endpoint, it was asked for: what
+        /// lets it go when that ends.
+        pub holder: Holder,
         pub secret: String,
         pub field: String,
         pub n: i64,
@@ -461,10 +487,51 @@ mod client {
         })
     }
 
+    /// What a lease request asked, as its answer is held: a session's
+    /// ([`LeaseAsk`]) or (P3-9-2) a person's endpoint's ([`PersonAsk`]).
+    struct Asked {
+        holder: Holder,
+        secret: String,
+        field: String,
+        mode: String,
+        audience: String,
+        ahead: bool,
+    }
+
+    impl From<LeaseAsk> for Asked {
+        fn from(a: LeaseAsk) -> Self {
+            Self {
+                holder: Holder::Session {
+                    id: a.session_id,
+                    fence: a.fence,
+                },
+                secret: a.secret,
+                field: a.field,
+                mode: a.mode,
+                audience: a.audience,
+                ahead: a.ahead,
+            }
+        }
+    }
+
+    impl From<PersonAsk> for Asked {
+        /// Always `proxy`: a person's lease serves an endpoint, never a value.
+        fn from(a: PersonAsk) -> Self {
+            Self {
+                holder: Holder::Person(a.endpoint),
+                secret: a.secret,
+                field: a.field,
+                mode: "proxy".into(),
+                audience: a.audience,
+                ahead: false,
+            }
+        }
+    }
+
     /// What a request waits for, by kind.
     enum Waiting {
         Lease {
-            ask: LeaseAsk,
+            asked: Asked,
             reply: oneshot::Sender<Result<LeaseInfo, LeaseError>>,
         },
         List {
@@ -714,8 +781,28 @@ mod client {
                 ttl_secs: ask.ttl_secs,
             };
             let (reply, answer) = oneshot::channel();
-            self.send(&req_id, frame, Waiting::Lease { ask, reply })?;
+            let asked = ask.into();
+            self.send(&req_id, frame, Waiting::Lease { asked, reply })?;
             self.wait(&req_id, answer, deadline).await
+        }
+
+        /// FR-90 P3-9-2 — ask for a person's lease (`rc:vault.connect`), and
+        /// wait [`ANSWER_DEADLINE`] for the answer. It is held as any lease
+        /// is, for `ask.endpoint`, until its expiry, `rc:vault.revoke`, or
+        /// that endpoint's end ([`Self::drop_person`]).
+        pub async fn connect(&self, ask: PersonAsk) -> Result<LeaseInfo, LeaseError> {
+            let req_id = new_req_id();
+            let frame = ClientMsg::VaultConnect {
+                req_id: req_id.clone(),
+                secret: ask.secret.clone(),
+                field: ask.field.clone(),
+                audience: ask.audience.clone(),
+                ttl_secs: ask.ttl_secs,
+            };
+            let (reply, answer) = oneshot::channel();
+            let asked = ask.into();
+            self.send(&req_id, frame, Waiting::Lease { asked, reply })?;
+            self.wait(&req_id, answer, ANSWER_DEADLINE).await
         }
 
         /// P3-4b — what the session's role may list under `prefix`.
@@ -833,7 +920,7 @@ mod client {
                 return self.on_refused(req_id, LeaseRefusal::Unsupported.wire(), None);
             }
             let (ask, reply) = match lock(&self.pending).remove(req_id) {
-                Some(Waiting::Lease { ask, reply }) => (ask, reply),
+                Some(Waiting::Lease { asked, reply }) => (asked, reply),
                 // An answer of the wrong kind answers nothing it was asked.
                 Some(other) => return other.fail(LeaseError::NoAnswer),
                 None => {
@@ -855,8 +942,7 @@ mod client {
             let until = Instant::now() + Duration::from_millis(u64::try_from(left).unwrap_or(0));
             let info = LeaseInfo {
                 lease_id: lease_id.to_string(),
-                session_id: ask.session_id,
-                fence: ask.fence,
+                holder: ask.holder,
                 secret: ask.secret,
                 field: ask.field,
                 n,
@@ -1033,8 +1119,11 @@ mod client {
                 .filter(|(_, h)| {
                     let i = &h.info;
                     i.ahead
-                        && i.session_id == ask.session_id
-                        && i.fence == ask.fence
+                        && i.holder
+                            == Holder::Session {
+                                id: ask.session_id,
+                                fence: ask.fence,
+                            }
                         && i.secret == ask.secret
                         && i.field == ask.field
                         && i.mode == ask.mode
@@ -1055,7 +1144,14 @@ mod client {
 
         /// The run of `session` at `fence` ended here: its leases go with it.
         pub fn drop_run(&self, session: ObjectId, fence: u64) -> usize {
-            let_go(self.take(|h| h.info.session_id == session && h.info.fence == fence))
+            let run = Holder::Session { id: session, fence };
+            let_go(self.take(|h| h.info.holder == run))
+        }
+
+        /// FR-90 P3-9-2 — a person's endpoint closed: its leases go with it,
+        /// and nothing any other endpoint or run holds.
+        pub fn drop_person(&self, endpoint: u64) -> usize {
+            let_go(self.take(|h| h.info.holder == Holder::Person(endpoint)))
         }
 
         /// Let go of every lease past its time.
@@ -1270,6 +1366,23 @@ mod client {
             info!(%session, fence, dropped, "vault: a run's leases let go with it");
         }
     }
+
+    /// FR-90 P3-9-2 — the daemon's [`Client::connect`].
+    pub async fn connect(ask: PersonAsk) -> Result<LeaseInfo, LeaseError> {
+        CLIENT.connect(ask).await
+    }
+
+    /// FR-90 P3-9-2 — the daemon's [`Client::drop_person`]: a person's
+    /// endpoint calls it as it closes.
+    pub fn drop_person(endpoint: u64) {
+        let dropped = CLIENT.drop_person(endpoint);
+        if dropped > 0 {
+            info!(
+                endpoint,
+                dropped, "vault: a person's endpoint's leases let go with it"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1367,8 +1480,8 @@ mod tests {
         use tokio::sync::mpsc;
 
         use super::super::{
-            Client, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, Report, SshAsk,
-            SshTicket, hello_key,
+            Client, Holder, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, PersonAsk,
+            Report, SshAsk, SshTicket, hello_key,
         };
         use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, fake_k8s, fake_mysql, made};
 
@@ -1502,7 +1615,9 @@ mod tests {
 
         fn req_id_of(frame: ClientMsg) -> String {
             match frame {
-                ClientMsg::VaultLease { req_id, .. } => req_id,
+                ClientMsg::VaultLease { req_id, .. } | ClientMsg::VaultConnect { req_id, .. } => {
+                    req_id
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -2122,8 +2237,8 @@ mod tests {
             );
             let info = asker.await.unwrap().unwrap();
             assert_eq!(
-                (info.lease_id.as_str(), info.n, info.session_id, info.fence),
-                ("L1", 7, sid, 3)
+                (info.lease_id.as_str(), info.n, info.holder),
+                ("L1", 7, Holder::Session { id: sid, fence: 3 })
             );
             assert_eq!(
                 c.with_value("L1", |v| v.to_vec()).unwrap(),
@@ -2357,6 +2472,135 @@ mod tests {
             let mut left: Vec<String> = c.held().into_iter().map(|l| l.lease_id).collect();
             left.sort();
             assert_eq!(left, ["L2", "L3"]);
+        }
+
+        /// FR-90 P3-9-2 — a person's lease for `endpoint`: asked, answered
+        /// `lease_id`, held until `expires_at_ms`.
+        async fn person_lease(
+            c: &Arc<Client>,
+            rx: &mut mpsc::Receiver<ClientMsg>,
+            lease_id: &str,
+            endpoint: u64,
+            expires_at_ms: i64,
+        ) -> LeaseInfo {
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    c.connect(PersonAsk {
+                        endpoint,
+                        secret: "db/orders".into(),
+                        field: "password".into(),
+                        audience: "db.internal:5432".into(),
+                        ttl_secs: 600,
+                    })
+                    .await
+                })
+            };
+            let req_id = next_ask(rx).await;
+            c.on_leased(
+                &req_id,
+                lease_id,
+                2,
+                &sealed_for_us(b"canary-person-value"),
+                expires_at_ms,
+                None,
+            );
+            asker.await.unwrap().unwrap()
+        }
+
+        /// FR-90 P3-9-2 — a person's ask names no session and no person: one
+        /// field, toward its upstream. The answer opens with this daemon's
+        /// key, as any lease does, and is held for the endpoint that asked,
+        /// in `proxy`: what it serves is an endpoint, never a value.
+        #[tokio::test]
+        async fn a_persons_lease_is_asked_with_no_session_and_held_for_its_endpoint() {
+            let (c, mut rx) = connected();
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    c.connect(PersonAsk {
+                        endpoint: 7,
+                        secret: "db/orders".into(),
+                        field: "password".into(),
+                        audience: "db.internal:5432".into(),
+                        ttl_secs: 600,
+                    })
+                    .await
+                })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultConnect {
+                    req_id,
+                    secret,
+                    field,
+                    audience,
+                    ttl_secs,
+                } => {
+                    assert_eq!(
+                        (secret.as_str(), field.as_str(), audience.as_str(), ttl_secs),
+                        ("db/orders", "password", "db.internal:5432", 600)
+                    );
+                    assert!(req_id.len() <= lease_limits::MAX_REQ_ID_LEN);
+                    req_id
+                }
+                other => panic!("{other:?}"),
+            };
+            c.on_leased(
+                &req_id,
+                "P1",
+                2,
+                &sealed_for_us(b"canary-person-value"),
+                in_ms(600_000),
+                None,
+            );
+            let info = asker.await.unwrap().unwrap();
+            assert_eq!(info.holder, Holder::Person(7));
+            assert_eq!((info.mode.as_str(), info.ahead), ("proxy", false));
+            assert_eq!(
+                c.with_value("P1", |v| v.to_vec()).unwrap(),
+                b"canary-person-value"
+            );
+
+            // A refusal answers it in the vault's word, decision 24's
+            // included, and nothing is held for it.
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    c.connect(PersonAsk {
+                        endpoint: 7,
+                        secret: "db/orders".into(),
+                        field: "user".into(),
+                        audience: "db.internal:5432".into(),
+                        ttl_secs: 600,
+                    })
+                    .await
+                })
+            };
+            let req_id = next_ask(&mut rx).await;
+            c.on_refused(&req_id, "approval_unavailable", None);
+            assert_eq!(
+                asker.await.unwrap(),
+                Err(LeaseError::Refused("approval_unavailable".into()))
+            );
+            assert_eq!(c.held(), [info]);
+        }
+
+        /// FR-90 P3-9-2 — an endpoint that closes takes its own leases and
+        /// nothing else: not another endpoint's, not a session's; and a run
+        /// that ends takes none of an endpoint's.
+        #[tokio::test]
+        async fn an_endpoint_that_closes_takes_only_its_own_leases() {
+            let (c, mut rx) = connected();
+            let sid = ObjectId::new();
+            lease(&c, &mut rx, "L1", sid, 1, in_ms(60_000)).await;
+            person_lease(&c, &mut rx, "P1", 7, in_ms(60_000)).await;
+            person_lease(&c, &mut rx, "P2", 7, in_ms(60_000)).await;
+            person_lease(&c, &mut rx, "P3", 8, in_ms(60_000)).await;
+            assert_eq!(c.drop_person(7), 2);
+            assert!(c.with_value("P1", |_| ()).is_none());
+            assert_eq!(c.drop_run(sid, 1), 1);
+            let left: Vec<String> = c.held().into_iter().map(|l| l.lease_id).collect();
+            assert_eq!(left, ["P3"]);
         }
 
         /// P3-4c-2 — a file written with a lease's value goes whenever the

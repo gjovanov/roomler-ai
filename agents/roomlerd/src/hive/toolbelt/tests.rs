@@ -2655,6 +2655,416 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     assert!(ended.is_ok(), "the connection ended with the lease");
 }
 
+/// FR-90 P3-9-2 — a person's leases over the fake vault: each asked for
+/// recorded with the endpoint it is for, refused while `refuse` says so, and
+/// every lease an endpoint was given let go when it closes.
+#[cfg(feature = "vault")]
+struct FakePersonLeases {
+    vault: Arc<FakeVault>,
+    asked: std::sync::Mutex<Vec<(u64, String)>>,
+    refuse: std::sync::Mutex<Option<super::super::vault_connect::Refused>>,
+    given: std::sync::Mutex<Vec<(u64, String)>>,
+    dropped: std::sync::Mutex<Vec<u64>>,
+}
+
+#[cfg(feature = "vault")]
+impl FakePersonLeases {
+    fn over(vault: &Arc<FakeVault>) -> Arc<Self> {
+        Arc::new(Self {
+            vault: Arc::clone(vault),
+            asked: Default::default(),
+            refuse: Default::default(),
+            given: Default::default(),
+            dropped: Default::default(),
+        })
+    }
+
+    /// The leases endpoint `id` holds now, in the order they were given.
+    fn holding(&self, id: u64) -> Vec<String> {
+        let held = self.vault.held.lock().unwrap();
+        self.given
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, l)| *e == id && held.contains_key(l))
+            .map(|(_, l)| l.clone())
+            .collect()
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+}
+
+#[cfg(feature = "vault")]
+#[async_trait::async_trait]
+impl super::super::vault_connect::PersonLeases for FakePersonLeases {
+    async fn connect(
+        &self,
+        id: u64,
+        handle: &super::super::vault_exec::Handle,
+        upstream: &str,
+        ttl_secs: u32,
+    ) -> Result<String, super::super::vault_connect::Refused> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((id, format!("{handle} for {upstream} {ttl_secs}s")));
+        if let Some(refused) = self.refuse.lock().unwrap().clone() {
+            return Err(refused);
+        }
+        let lease = self
+            .vault
+            .lease(ObjectId::default(), 0, handle, "proxy", upstream, ttl_secs)
+            .await
+            .map_err(|why| super::super::vault_connect::Refused { why, again: false })?;
+        self.given.lock().unwrap().push((id, lease.clone()));
+        Ok(lease)
+    }
+
+    fn drop_person(&self, id: u64) {
+        self.dropped.lock().unwrap().push(id);
+        let mine: Vec<String> = self
+            .given
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, _)| *e == id)
+            .map(|(_, l)| l.clone())
+            .collect();
+        self.vault.release(&mine);
+    }
+}
+
+/// FR-90 P3-9-2 — a person's HTTP endpoint over the fake vault, `token` its
+/// bearer and `ca` its upstream's CA, renewed on a quick clock: its answer,
+/// its control, and the upstream it reaches.
+#[cfg(feature = "vault")]
+async fn person_http(
+    dir: &Path,
+    vault: &Arc<FakeVault>,
+    leases: &Arc<FakePersonLeases>,
+    port: u16,
+) -> Result<(Value, super::super::vault_connect::Control), String> {
+    use super::super::vault_connect::{At, Person, Timing as Renewing, open_person};
+    // Unix: the person's own directory under the runtime, the daemon's at
+    // `0711`, which a database's socket would be made under.
+    #[cfg(unix)]
+    let place = {
+        // SAFETY: geteuid reads our own credentials.
+        let uid = unsafe { libc::geteuid() };
+        let place = super::super::vault_connect::person_dir(dir, uid)?;
+        let mode = std::fs::metadata(&place).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o711, "{}", place.display());
+        assert_eq!(place, dir.join(format!("person-{uid}")));
+        place
+    };
+    #[cfg(unix)]
+    let at = At {
+        dir: &place,
+        owner: None,
+    };
+    #[cfg(windows)]
+    let sid = {
+        let _ = dir;
+        me()
+    };
+    #[cfg(windows)]
+    let at = At(&sid);
+    let person = Person {
+        leases: Arc::clone(leases) as Arc<dyn super::super::vault_connect::PersonLeases>,
+        // Each test's own account, so the endpoints of tests that run at
+        // once are counted apart.
+        account: ObjectId::new().to_hex(),
+        timing: Renewing {
+            margin_div: 3,
+            floor: Duration::from_millis(100),
+            recheck: Duration::from_millis(50),
+        },
+    };
+    let args = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": format!("https://localhost:{port}"),
+        "auth": "bearer",
+        "ca": "pki/git-ca",
+        "ttl_s": 60,
+    });
+    open_person(Arc::clone(vault) as Arc<dyn VaultTools>, person, at, &args).await
+}
+
+/// FR-90 P3-9-2 — a fake vault holding `git/bot`'s token and the upstream's
+/// CA.
+#[cfg(feature = "vault")]
+fn person_vault(token: &str, ca: &str) -> Arc<FakeVault> {
+    Arc::new(FakeVault {
+        values: [
+            ("git/bot#token".to_string(), token.as_bytes().to_vec()),
+            ("pki/git-ca".to_string(), ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    })
+}
+
+/// Wait up to 10 s for `done`.
+#[cfg(feature = "vault")]
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !done() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not within 10 s: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// One request through a person's endpoint at `dial`, on `h`: what the
+/// upstream saw of its credential.
+#[cfg(feature = "vault")]
+async fn bearer_through(
+    h: &mut tokio::net::TcpStream,
+    saw: &mut mpsc::UnboundedReceiver<crate::vault_proxy::testing::HttpSaw>,
+) -> Vec<String> {
+    h.write_all(b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let response = http_response(h).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    s.values("authorization")
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// FR-90 P3-9-2 — a person's endpoint serves with leases asked for the
+/// device's owner, and renews them while it is held (decision 25): a margin
+/// before they end every field is asked for again, the connections it serves
+/// stay up, a new one reads the new leases, and the old ones are let go.
+/// Closing it lets go of every lease it holds and stops serving.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_persons_endpoint_renews_its_leases_while_it_is_held() {
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let vault = person_vault(&token, &ca);
+    let leases = FakePersonLeases::over(&vault);
+    let dir = tempfile::tempdir().unwrap();
+    let (answer, control) = person_http(dir.path(), &vault, &leases, port)
+        .await
+        .unwrap();
+    assert!(!answer.to_string().contains(&token), "no value: {answer}");
+    let id = answer["id"]
+        .as_u64()
+        .expect("a person's endpoint names its id");
+    assert_eq!(id, control.id);
+    assert!(
+        answer["note"].as_str().unwrap().contains("renewed"),
+        "{answer}"
+    );
+    let upstream = format!("https://localhost:{port}");
+    assert_eq!(
+        *leases.asked.lock().unwrap(),
+        [
+            (id, format!("git/bot#token for {upstream} 60s")),
+            (id, format!("pki/git-ca for {upstream} 60s")),
+        ]
+    );
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut kept = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_through(&mut kept, &mut saw).await,
+        [format!("Bearer {token}")]
+    );
+
+    // A margin before its leases end, they are asked for again.
+    let first = leases.holding(id);
+    assert_eq!(first.len(), 2);
+    for l in &first {
+        vault
+            .lefts
+            .lock()
+            .unwrap()
+            .insert(l.clone(), Duration::from_secs(1));
+    }
+    until("one renewal", || control.state().renewals == 1).await;
+    assert_eq!(leases.asked(), 4);
+    let second = leases.holding(id);
+    assert_eq!(second.len(), 2);
+    assert!(
+        first
+            .iter()
+            .all(|l| vault.released.lock().unwrap().contains(l)),
+        "the old leases are let go"
+    );
+    assert!(control.state().left > Duration::from_secs(30));
+
+    // The connection it served stays up, and a new one reads the new
+    // leases.
+    assert_eq!(
+        bearer_through(&mut kept, &mut saw).await,
+        [format!("Bearer {token}")]
+    );
+    vault
+        .held
+        .lock()
+        .unwrap()
+        .insert(second[0].clone(), b"rotated-token".to_vec());
+    let mut fresh = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_through(&mut fresh, &mut saw).await,
+        ["Bearer rotated-token".to_string()]
+    );
+
+    // Closed: every lease it holds is let go, and it serves no more.
+    control.close("the person left");
+    until("the endpoint's leases let go", || {
+        leases.dropped.lock().unwrap().contains(&id)
+    })
+    .await;
+    assert!(leases.holding(id).is_empty());
+    assert_eq!(control.state().closed.as_deref(), Some("the person left"));
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut kept, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "its connections end with it");
+}
+
+/// FR-90 P3-9-2 — a lease of a person's endpoint taken back before its
+/// renewal (`rc:vault.revoke`) cuts every connection it serves, and is asked
+/// for again at once: the endpoint serves on under the new leases.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_lease_taken_back_cuts_a_persons_connections_and_is_asked_for_again() {
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let vault = person_vault(&token, &ca);
+    let leases = FakePersonLeases::over(&vault);
+    let dir = tempfile::tempdir().unwrap();
+    let (answer, control) = person_http(dir.path(), &vault, &leases, port)
+        .await
+        .unwrap();
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut live = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_through(&mut live, &mut saw).await,
+        [format!("Bearer {token}")]
+    );
+    let mut rest = Vec::new();
+    let open = tokio::time::timeout(
+        Duration::from_millis(300),
+        tokio::io::AsyncReadExt::read_to_end(&mut live, &mut rest),
+    )
+    .await;
+    assert!(open.is_err(), "kept alive until something cuts it");
+
+    let taken = leases.holding(control.id)[0].clone();
+    vault.release(&[taken]);
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut live, &mut rest),
+    )
+    .await;
+    assert!(ended.is_ok(), "a lease taken back cuts its connection");
+    until("asked for again", || control.state().renewals == 1).await;
+    assert_eq!(control.state().closed, None);
+    let mut after = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_through(&mut after, &mut saw).await,
+        [format!("Bearer {token}")]
+    );
+    control.close("done");
+}
+
+/// FR-90 P3-9-2 — a renewal the vault cannot answer is asked again while the
+/// leases last; one it refuses leaves the endpoint serving to its leases'
+/// end, then closed with why, every lease let go.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_renewal_refused_serves_to_the_leases_end_then_closes() {
+    use super::super::vault_connect::Refused;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let vault = person_vault(&token, &ca);
+    let leases = FakePersonLeases::over(&vault);
+    let dir = tempfile::tempdir().unwrap();
+    let (answer, control) = person_http(dir.path(), &vault, &leases, port)
+        .await
+        .unwrap();
+    let id = control.id;
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let held = leases.holding(id);
+    for l in &held {
+        vault
+            .lefts
+            .lock()
+            .unwrap()
+            .insert(l.clone(), Duration::from_secs(1));
+    }
+
+    // Unanswered: asked again, and nothing is refused yet.
+    *leases.refuse.lock().unwrap() = Some(Refused {
+        why: "the vault did not answer".into(),
+        again: true,
+    });
+    until("asked again", || leases.asked() >= 4).await;
+    assert_eq!(control.state().refused, None);
+
+    // Refused: it serves on under the leases it holds.
+    *leases.refuse.lock().unwrap() = Some(Refused {
+        why: "the vault refused: denied".into(),
+        again: false,
+    });
+    until("the refusal", || control.state().refused.is_some()).await;
+    assert_eq!(
+        control.state().refused.as_deref(),
+        Some("git/bot#token: the vault refused: denied")
+    );
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_through(&mut h, &mut saw).await,
+        [format!("Bearer {token}")]
+    );
+    assert_eq!(leases.holding(id), held, "nothing was given in their place");
+
+    // Its leases end: it closes, saying why.
+    vault.release(&held);
+    until("closed", || control.state().closed.is_some()).await;
+    assert_eq!(
+        control.state().closed.as_deref(),
+        Some(
+            "its leases ended, and the vault refused to renew them: git/bot#token: the vault \
+             refused: denied"
+        )
+    );
+    until("the endpoint's leases let go", || {
+        leases.dropped.lock().unwrap().contains(&id)
+    })
+    .await;
+}
+
 /// P3-5e-2 — `vault_connect` serves a Kubernetes API server. The secret's
 /// cert and key are leased and presented in each connection's handshake,
 /// and the answer is a kubeconfig with no credential, naming the endpoint.

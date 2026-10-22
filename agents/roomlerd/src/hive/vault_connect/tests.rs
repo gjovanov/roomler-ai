@@ -654,3 +654,61 @@ async fn the_agent_pipe_opens_as_win32_openssh_opens_it() {
         }
     }
 }
+
+/// FR-90 P3-9-2 — why a person's lease was not given, in the person's words:
+/// the vault's own word decides whether asking again could help, and no
+/// connection or no answer always could. Decision 24's refusal says what it
+/// means, and so does a server switch that lends nothing to people.
+#[test]
+fn a_persons_refusal_says_what_it_means_and_whether_to_ask_again() {
+    use crate::vault::LeaseError;
+    let refused = |word: &str| person_why(LeaseError::Refused(word.into()));
+    let denied = refused("denied");
+    assert!(!denied.again);
+    assert!(denied.why.contains("the device's owner"), "{}", denied.why);
+    let approval = refused("approval_unavailable");
+    assert!(!approval.again);
+    assert!(
+        approval.why.contains("approval_unavailable"),
+        "{}",
+        approval.why
+    );
+    assert!(refused("not_served").why.contains("vault.people"));
+    for word in ["unavailable", "undecided", "busy"] {
+        assert!(refused(word).again, "{word}");
+    }
+    for word in ["no_secret", "disabled", "no_value", "bad_request"] {
+        let r = refused(word);
+        assert!(!r.again, "{word}");
+        assert_eq!(r.why, format!("the vault refused: {word}"));
+    }
+    // A word a newer server sends is a refusal this build cannot name: not
+    // asked again.
+    assert!(!refused("from_a_newer_server").again);
+    for (e, again) in [
+        (LeaseError::NotConnected, true),
+        (LeaseError::NoAnswer, true),
+        (LeaseError::Unopenable, true),
+        (LeaseError::AwaitingApproval("a1".into()), false),
+        (LeaseError::NotAsked, false),
+    ] {
+        assert_eq!(person_why(e.clone()).again, again, "{e:?}");
+    }
+    // The daemon's own leases for a person let go of nothing an endpoint
+    // that never held one would name.
+    DaemonPersonLeases.drop_person(u64::MAX);
+}
+
+/// FR-90 P3-9-2 — the daemon renews a person's endpoint before its leases
+/// end whatever TTL it asked for: even the shortest lease leaves a margin no
+/// shorter than the floor between two renewals, and a sleeping clock is
+/// looked at again well within the longest.
+#[test]
+fn the_daemon_renews_even_the_shortest_lease_in_time() {
+    use roomler_ai_remote_control::vault::lease_limits::{MAX_TTL_SECS, MIN_TTL_SECS};
+    let t = Timing::DAEMON;
+    let margin = std::time::Duration::from_secs(u64::from(MIN_TTL_SECS / t.margin_div));
+    assert!(t.margin_div >= 2);
+    assert!(margin >= t.floor, "{margin:?} < {:?}", t.floor);
+    assert!(t.recheck < std::time::Duration::from_secs(u64::from(MAX_TTL_SECS / t.margin_div)));
+}
