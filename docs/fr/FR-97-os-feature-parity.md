@@ -87,7 +87,7 @@
   events (Windows' sequence number in another form), so copied images are watched there and text is no longer
   polled every second; merged (#2632). P3e-3b, RTF on X11, needs an X selection owner of our own and is not built.
 - P2e-1, copied images on a Mac: the same gate from `NSPasteboard`'s change count, so a Mac's copied images are
-  watched and its text is read only when it changed, built (#P2E1PR). Measured first on the operator's MacBook
+  watched and its text is read only when it changed, built (#2722). Measured first on the operator's MacBook
   (macOS 27): without the gate, a session read the general pasteboard every second (§8). P2e-2, RTF as
   `public.rtf`, is not built.
 - P3g needed no build of its own: FR-93 P6d and P6e ship the companion as an `.rpm` and for aarch64 (since
@@ -1174,7 +1174,7 @@ model on Windows, so the three agree on what the mode means.
 | **P2c** | macOS Remote Apps | `[apps] enabled` | a field Mac | M–L |
 | **P2d-1** | macOS lock hint: the session dictionary's lock, to the viewer's chip in a session (`input: "unknown"`) and to a request waiting for consent (`host_locked`); the chip's neutral title. Released in 0.4.150 (#2683) | `ROOMLERD_LOCK_HINT=0` | a tart Mac, red on 0.4.149 | S |
 | **P2d-2** | macOS layout, display-match | per-verb caps | a field Mac | M |
-| **P2e** | macOS clipboard images + RTF. *P2e-1* (copied images, behind the pasteboard's change count; built, #P2E1PR); *P2e-2* (RTF as `public.rtf`) not built | P2e-1: `ROOMLERD_CLIPBOARD_MAC_WATCH=0`; P2e-2: `ROOMLERD_CLIPBOARD_NATIVE=0` | a tart Mac, red on 0.4.153; then the field Mac | S–M |
+| **P2e** | macOS clipboard images + RTF. *P2e-1* (copied images, behind the pasteboard's change count; built, #2722); *P2e-2* (RTF as `public.rtf`) not built | P2e-1: `ROOMLERD_CLIPBOARD_MAC_WATCH=0`; P2e-2: `ROOMLERD_CLIPBOARD_NATIVE=0` | a tart Mac, red on 0.4.153; then the field Mac | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P2g** | The companion's Devices page and mesh on a two-half Mac come from the root half, over a person socket it serves the console user; a Linux system install's person socket serves the same two verbs (D2). Released in 0.4.150 (#2663) | `ROOMLERD_PERSON_SOCKET=0` | a tart Mac with both halves, red on 0.4.149; the operator's MacBook | S |
 | **P2h** | The rest of the network view on a two-half Mac from the root half: the Connection column, Overview's count, its overlay address, MagicDNS line and exit status; the person socket serves `Peers` without endpoints. Released in 0.4.150 (#2674) | `ROOMLERD_PERSON_SOCKET=0` | a tart Mac with both halves | S–M |
