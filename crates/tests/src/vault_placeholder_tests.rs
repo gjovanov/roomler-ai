@@ -15,9 +15,9 @@
 //! - a placeholder's audience is an origin its secret names, exactly
 //!   (`guardrail:placeholder-only-named-audiences`), a refusal recorded with
 //!   its request;
-//! - a Windows device holds none (`guardrail:windows-proxy-only`, decision
-//!   17) until P3b-5 widens it with the Windows device's half, as decision 30
-//!   decided.
+//! - a Windows device holds one too (P3b-5-1): `guardrail:windows-proxy-only`
+//!   (decision 17) allows `placeholder` beside `proxy`, as decision 30
+//!   decided, and still refuses every mode that hands a value over.
 
 use bson::{doc, oid::ObjectId};
 use serde_json::{Value, json};
@@ -128,29 +128,52 @@ async fn the_vault_releases_no_placeholder_unless_vault_placeholder_lists_the_or
     }
 }
 
-/// FR-90 P3b-2 — a Windows device holds no placeholder yet:
-/// `windows-proxy-only` (decision 17, AC13) refuses every mode but `proxy`
-/// there, recorded with its request, until P3b-5 widens it with the Windows
-/// device's half, as decision 30 decided.
+/// FR-90 P3b-5-1 — a Windows device holds a placeholder, as decision 30
+/// decided: `windows-proxy-only` (decision 17, AC13) allows `placeholder`
+/// beside `proxy` there, in both of which the value stays in the daemon, and
+/// still refuses a mode that hands it over, recorded with its request. The
+/// placeholder's origin is held to its secret's on Windows as elsewhere.
 #[tokio::test]
-async fn a_windows_device_holds_no_placeholder() {
+async fn a_windows_device_holds_a_placeholder_and_is_handed_no_value() {
     let app = placeholder_app("*").await;
     let t = app.seed_tenant("vaultphwin").await;
-    seed_vault(&app, &t).await;
+    let value = seed_vault(&app, &t).await;
     name_audience(&app, &t, "db/main", ORIGIN).await;
     let mut win = device(&app, &t, "lease-phwin", "windows", TAKES_LEASES, true).await;
     let (sid, fence) = start(&app, &t, &mut win, "C:\\src\\ph", Some("dev")).await;
     let answer = ask(&mut win, "w1", frame(&sid, fence, "placeholder", ORIGIN)).await;
-    assert_eq!(refused(&answer), "denied", "{answer}");
+    assert_eq!(opened(&win, &answer), value, "{answer}");
+    let elsewhere = ask(
+        &mut win,
+        "w2",
+        frame(&sid, fence, "placeholder", "https://evil.example"),
+    )
+    .await;
+    assert_eq!(refused(&elsewhere), "denied", "{elsewhere}");
+    let env = ask(
+        &mut win,
+        "w3",
+        json!({ "session_id": sid, "fence": fence, "secret": "db/main", "mode": "env" }),
+    )
+    .await;
+    assert_eq!(refused(&env), "denied", "{env}");
     let denied = rows(
         &app,
         "vault_audit",
         doc! { "action": "secret:use", "decision": "deny" },
     )
     .await;
-    assert_eq!(denied.len(), 1, "{denied:?}");
+    let mut reasons: Vec<&str> = denied
+        .iter()
+        .map(|row| row.get_str("reason").unwrap())
+        .collect();
+    reasons.sort_unstable();
     assert_eq!(
-        denied[0].get_str("reason").unwrap(),
-        "guardrail:windows-proxy-only"
+        reasons,
+        [
+            "guardrail:placeholder-only-named-audiences",
+            "guardrail:windows-proxy-only"
+        ],
+        "{denied:?}"
     );
 }

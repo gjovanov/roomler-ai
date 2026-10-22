@@ -215,11 +215,13 @@ pub enum HiveRefusal {
     /// names a sibling folder the session could go to instead.
     FolderDirty,
     /// FR-90 P3b-1b-2 — the device's owner turned on `hive_egress`, so every
-    /// session here runs in Claude Code's sandbox, and this one cannot: no
-    /// sandbox on this system (Windows), none of its tools (`bubblewrap`,
-    /// `socat`), a harness older than the one that keeps a repository from
-    /// loosening it, or no vault to decide its hosts. Never a session run
-    /// unsandboxed instead.
+    /// session here runs behind its egress proxy, in Claude Code's sandbox
+    /// where one runs, and this one cannot: none of the sandbox's tools
+    /// (`bubblewrap`, `socat`), a harness older than the one that keeps a
+    /// repository from loosening it, or no vault to decide its hosts. Never a
+    /// session run unsandboxed instead where a sandbox runs. (P3b-5-1) On
+    /// Windows, where none does, the proxy is advisory, and only the vault is
+    /// needed.
     SandboxUnavailable,
     /// A word this build does not know.
     Other,

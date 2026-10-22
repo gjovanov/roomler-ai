@@ -128,10 +128,11 @@ pub struct Guardrail {
 pub const GUARDRAILS: &[Guardrail] = &[
     Guardrail {
         id: "guardrail:windows-proxy-only",
-        why: "Windows has no Claude Code sandbox, so a session there gets a secret only through \
-              a proxy that authenticates for it (AC13; decision 17)",
+        why: "Windows has no Claude Code sandbox, so a session there gets a secret only where \
+              the value stays in the daemon: through a proxy that authenticates for it, or as a \
+              placeholder its egress proxy swaps the value in for (AC13; decisions 17 and 30)",
         text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
-when { context.device.os == "windows" && context.mode != "proxy" };"#,
+when { context.device.os == "windows" && !["proxy", "placeholder"].contains(context.mode) };"#,
     },
     Guardrail {
         id: "guardrail:prod-never-materializes",
@@ -1388,6 +1389,10 @@ mod tests {
         }
     }
 
+    /// Decision 17 — Windows has no sandbox, so a session there gets a secret
+    /// only where the value stays in the daemon: `proxy`, and (decision 30,
+    /// P3b-5-1) `placeholder`. Every mode that hands the value over is
+    /// refused there.
     #[test]
     fn windows_gets_a_secret_through_a_proxy_only() {
         let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
@@ -1399,14 +1404,19 @@ mod tests {
             )
             .allow
         );
-        for mode in [
-            "file",
-            "env",
-            "exec",
-            "short-lived",
-            "identity",
-            "placeholder",
-        ] {
+        // A placeholder toward an origin its secret names: allowed.
+        let gh = "https://api.github.com";
+        let mut placeholder = use_secret(Some("dev"), "ci/gh", &[], "placeholder", "windows");
+        if let Ask::UseSecret {
+            secret, audience, ..
+        } = &mut placeholder
+        {
+            *audience = gh.into();
+            secret.audiences = vec![gh.to_string()];
+        }
+        let v = decide(&set, &placeholder);
+        assert!(v.allow, "{v:?}");
+        for mode in ["file", "env", "exec", "short-lived", "identity"] {
             // P3-6b — `short-lived` with the one kind it is for, so only
             // the guardrail this test is about decides.
             let ask = use_secret(Some("dev"), "staging/db", &[], mode, "windows");
@@ -1619,9 +1629,9 @@ mod tests {
 
     /// P3b-2 — a placeholder is swapped in only toward an origin its secret
     /// names, exactly, by its own guardrail; and the guardrails already
-    /// seeded hold it where they should: never a dynamic secret's field,
-    /// not on Windows until P3b-5 (decision 17's guardrail, which decision 30
-    /// widens there), while a prod secret may be one, since nothing
+    /// seeded hold it where they should: never a dynamic secret's field, and
+    /// (P3b-5-1) on Windows as elsewhere, decision 30 having widened decision
+    /// 17's guardrail there, while a prod secret may be one, since nothing
     /// materializes.
     #[test]
     fn a_placeholder_goes_only_toward_an_origin_its_secret_names() {
@@ -1662,8 +1672,17 @@ mod tests {
             );
         }
         let windows = decide(&set, &with("ci/gh", gh, &[gh], "windows"));
-        assert!(!windows.allow);
-        assert_eq!(windows.determining, ["guardrail:windows-proxy-only"]);
+        assert!(windows.allow, "{windows:?}");
+        let elsewhere = decide(
+            &set,
+            &with("ci/gh", "https://evil.example", &[gh], "windows"),
+        );
+        assert!(!elsewhere.allow);
+        assert_eq!(
+            elsewhere.determining,
+            ["guardrail:placeholder-only-named-audiences"],
+            "on Windows too, the origin is held to the secret's"
+        );
         let mut dynamic = with("ci/gh", gh, &[gh], "linux");
         if let Ask::UseSecret { secret, .. } = &mut dynamic {
             secret.kind = "dynamic".into();

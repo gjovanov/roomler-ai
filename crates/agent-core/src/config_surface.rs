@@ -535,7 +535,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "bool",
-        description: "FR-90 - run every agent session on this device in Claude Code's sandbox: its commands reach only the hosts the organization's vault allows the session's role (net:egress), through a proxy in this daemon, and write only to their working directory, temp, and the session's own cache. A session is refused where the sandbox cannot run: Linux without bubblewrap and socat, Claude Code before 2.1.285, Windows. Only with vault_enabled. Never settable by the server. Default: OFF.",
+        description: "FR-90 - run every agent session on this device in Claude Code's sandbox: its commands reach only the hosts the organization's vault allows the session's role (net:egress), through a proxy in this daemon, and write only to their working directory, temp, and the session's own cache. A session is refused where the sandbox cannot run: Linux without bubblewrap and socat, Claude Code before 2.1.285. On Windows, where no sandbox runs, every session gets the proxy named in its environment, advisory. Only with vault_enabled. Never settable by the server. Default: OFF.",
     },
     KeyMeta {
         key: "ssh_enabled",

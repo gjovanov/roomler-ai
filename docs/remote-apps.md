@@ -314,7 +314,7 @@ Streaming **one application window** instead of the monitor reuses FR-45's
 whole portal pipeline with a single change: `SelectSources(types = WINDOW)`
 (`SOURCE_WINDOW`, `agents/roomlerd/src/capture/portal/screencast.rs:95`) behind
 `ROOMLERD_WINDOW_CAPTURE` (`agents/roomlerd/src/capture/portal/backend.rs:77`,
-config key `window_capture`, `crates/agent-core/src/config.rs:933`). It is
+config key `window_capture`, `crates/agent-core/src/config.rs:934`). It is
 **attended by construction**: the portal answers by showing the person at the
 screen a window picker, and nothing agent-side can name a window — GNOME
 refuses the only API that could supply an id, so mutter's `RecordWindow` route
@@ -400,7 +400,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2900`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2901`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.
