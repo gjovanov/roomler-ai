@@ -4652,6 +4652,14 @@ async fn a_placeholder_call_binds_each_variable_to_its_own_lease() {
         .collect();
     assert_eq!(lease_of.len(), 2, "{bound:?}");
     assert_ne!(lease_of[token], lease_of[app], "each its own lease");
+    // P3b-4-2 — each binding names its secret and field: what pairs an AWS
+    // key's placeholders (decision 33).
+    let named: HashMap<&str, (&str, &str)> = bound
+        .iter()
+        .map(|b| (b.token.as_str(), (b.secret.as_str(), b.field.as_str())))
+        .collect();
+    assert_eq!(named[token], ("github/bot", "token"));
+    assert_eq!(named[app], ("github/bot", "app"));
     assert!(placeholder::bound(session, fence, "api.github.com", 8443).is_empty());
     assert!(placeholder::bound(session, fence, "github.com", 443).is_empty());
     assert!(placeholder::bound(session, fence + 1, "api.github.com", 443).is_empty());
@@ -4885,6 +4893,13 @@ async fn one_placeholder_goes_to_every_audience_its_call_names() {
         api[0].lease_id, web[0].lease_id,
         "each audience its own lease"
     );
+    for b in [&api[0], &web[0]] {
+        assert_eq!(
+            (b.secret.as_str(), b.field.as_str()),
+            ("github/bot", "token"),
+            "each binding names its secret and field"
+        );
+    }
     assert_eq!(placeholder::held(session, fence), 2);
     vault.release(std::slice::from_ref(&api[0].lease_id));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

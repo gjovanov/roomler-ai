@@ -1641,7 +1641,7 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:231`, `agents/roomlerd/src/vault_proxy/mod.rs:63`, `agents/roomlerd/src/vault_proxy/mod.rs:115`, `vault_connect.rs:178` |
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:231`, `agents/roomlerd/src/vault_proxy/mod.rs:62`, `agents/roomlerd/src/vault_proxy/mod.rs:114`, `vault_connect.rs:178` |
 | its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:913` |
 | the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1241` |
 | the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1347`, `vault_connect.rs:1370`, `vault_connect.rs:1378`, `vault_connect.rs:1029`, `vault_connect.rs:1071` |
@@ -1890,7 +1890,7 @@ sequenceDiagram
 | Step | Built |
 |---|---|
 | the client | one request per connection, over TLS verified against the issuer's `ca` (or the system's roots), on the HTTP/1 client the `http` engine dials with. The issuer signs in by `admin_token` in `Authorization`, or by `admin_cert` and `admin_key` in the handshake, the key read again for each connection's TLS alone ([`k8s_mint.rs:466`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L466)). Each request has ten seconds, and an answer at most 4 MiB, read into memory that is zeroed when it drops, and that grows without leaving a copy behind ([`:541`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L541)) |
-| the issuer | the bundle's one audience, an origin as the `http` engine reads one, `origin_of` ([`mod.rs:115`](../agents/roomlerd/src/vault_proxy/mod.rs#L115)), moved from `hive::vault_connect` for it as `upstream_of` was. Its `namespace` must be a name Kubernetes gives a namespace and its `service_account` one it gives an account, since both go into a request's path; one credential, never both; `audiences` one per line ([`k8s_mint.rs:94`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L94)) |
+| the issuer | the bundle's one audience, an origin as the `http` engine reads one, `origin_of` ([`mod.rs:114`](../agents/roomlerd/src/vault_proxy/mod.rs#L114)), moved from `hive::vault_connect` for it as `upstream_of` was. Its `namespace` must be a name Kubernetes gives a namespace and its `service_account` one it gives an account, since both go into a request's path; one credential, never both; `audiences` one per line ([`k8s_mint.rs:94`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L94)) |
 | the sweep | first, at every mint: the namespace's Secrets labelled `roomler.ai/lease`, and each whose name is a minted one and whose `roomler.ai/until` has passed, deleted on its uid. An issuer that may not list is not swept, and the mint goes on ([`k8s_mint.rs:357`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L357)) |
 | the mint | an empty `Opaque` Secret `roomler-<lease id>`, labelled with its lease and annotated with its end (RFC 3339); then a `TokenRequest` bound to it by name and uid (`boundObjectRef`), `expirationSeconds` the lease's TTL or 600, whichever is longer, and the issuer's `audiences` where it names some. A token refused takes the Secret back on its uid, and the mint is refused in the API server's words ([`k8s_mint.rs:251`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L251)) |
 | the credential | `token`, `server` (the audience), `ca` (the issuer's, or empty where the system's roots verify the API server) and `namespace`; no issuer field ([`k8s_mint.rs:196`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L196)) |
@@ -2531,7 +2531,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:310`](../agents/roomlerd/src/hive/egress.rs#L310)), `drop_run` ([`:424`](../agents/roomlerd/src/hive/egress.rs#L424)), a connection ([`carry`, `:472`](../agents/roomlerd/src/hive/egress.rs#L472)), the decision kept per run ([`decided`, `:567`](../agents/roomlerd/src/hive/egress.rs#L567)), `dialable` ([`:757`](../agents/roomlerd/src/hive/egress.rs#L757)), what is kept ([`decision_of`, `:845`](../agents/roomlerd/src/hive/egress.rs#L845)) |
+| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:317`](../agents/roomlerd/src/hive/egress.rs#L317)), `drop_run` ([`:432`](../agents/roomlerd/src/hive/egress.rs#L432)), a connection ([`carry`, `:480`](../agents/roomlerd/src/hive/egress.rs#L480)), the decision kept per run ([`decided`, `:575`](../agents/roomlerd/src/hive/egress.rs#L575)), `dialable` ([`:765`](../agents/roomlerd/src/hive/egress.rs#L765)), what is kept ([`decision_of`, `:853`](../agents/roomlerd/src/hive/egress.rs#L853)) |
 | the ask | the lease client's `egress` ([`vault.rs:909`](../agents/roomlerd/src/vault.rs#L909)) and `on_egress_allowed` ([`:1107`](../agents/roomlerd/src/vault.rs#L1107)), which refuses an allow for anything but what was asked |
 | the run's | P3b-1b-2, below: started before the harness, so its ports are in the settings, and stopped with the run |
 
@@ -2715,8 +2715,8 @@ sequenceDiagram
 | the audience | TLS first, before the client is told it is through: verified against this device's roots, read once a run as `proxy` mode reads them (§19, "The HTTP engine"), as the host the client named, offering HTTP/1.1 alone. One that does not verify is refused, `502` on the HTTP front and a general failure on SOCKS5, with why. Nothing is decrypted, and nothing is swapped toward a host nobody proved |
 | the client's hello | read with rustls, and not answered. One that names another host (SNI), offers protocols without HTTP/1.1 (ALPN), or is no TLS hello is carried as it came, on a new dial, never decrypted |
 | the client's TLS | under the run's CA, its leaf for the host, offering HTTP/1.1 alone |
-| a request | its `Host` names the connection's host and port (443 where it names none), as does an absolute form's authority, else `421 Misdirected Request`. A second `Host` is `400`; an upgrade, `501`. Sent on in origin form, less the hop-by-hop headers and `Expect` |
-| the swap | in `Authorization` alone (decision 32): each placeholder of this audience the run holds, as written (`token …`, `Bearer …`), and inside `Basic`'s credentials, decoded and encoded again (git). A placeholder anywhere else (the URL, another header, the body) goes out as itself, as does one in AWS's signature, which P3b-4 signs again. A value no header can carry (a line break, a control character) refuses the request, `502`, and it is never sent |
+| a request | its `Host` names the connection's host and port (443 where it names none), as does an absolute form's authority, else `421 Misdirected Request`. A second `Host` is `400`; an upgrade, `501`. Sent on in origin form, less the hop-by-hop headers and `Expect`, which stays where an AWS signature signs it (P3b-4-2) |
+| the swap | in `Authorization` alone (decision 32): each placeholder of this audience the run holds, as written (`token …`, `Bearer …`), and inside `Basic`'s credentials, decoded and encoded again (git). A placeholder anywhere else (the URL, another header, the body) goes out as itself. AWS's signature is never swapped: one naming a placeholder of this audience is signed again first (P3b-4-2, below). Nor is an AWS secret key's placeholder (`secret_access_key`), anywhere: it signs, and goes out as itself. A value no header can carry (a line break, a control character) refuses the request, `502`, and it is never sent |
 | the value | read from its lease as each request goes: a placeholder whose lease was let go goes out as itself |
 | the response | streamed back as it came, less the hop-by-hop headers |
 | the log | the session, the host, and the lease of each placeholder swapped, at `debug`; never a value |
@@ -2742,13 +2742,13 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| which connections: a host the run holds a placeholder for | `carry` in [`hive/egress.rs:523`](../agents/roomlerd/src/hive/egress.rs#L523) |
-| the run's TLS to its audiences, made once | `RunState::upstream_tls` ([`egress.rs:272`](../agents/roomlerd/src/hive/egress.rs#L272)) |
-| a placeholder's value | `Values` ([`egress.rs:116`](../agents/roomlerd/src/hive/egress.rs#L116)), `LeaseValues` ([`:834`](../agents/roomlerd/src/hive/egress.rs#L834)) |
-| the order: the audience verified, the client told, its hello read, its TLS | `carry` in [`hive/egress/swap.rs:135`](../agents/roomlerd/src/hive/egress/swap.rs#L135) |
-| the hello, read and judged | `read_hello` ([`:294`](../agents/roomlerd/src/hive/egress/swap.rs#L294)), `judge` ([`:342`](../agents/roomlerd/src/hive/egress/swap.rs#L342)) |
-| a request's names | `outbound` ([`:530`](../agents/roomlerd/src/hive/egress/swap.rs#L530)), `names` ([`:599`](../agents/roomlerd/src/hive/egress/swap.rs#L599)) |
-| the swap | `swap` ([`:636`](../agents/roomlerd/src/hive/egress/swap.rs#L636)), `swap_authorization` ([`:671`](../agents/roomlerd/src/hive/egress/swap.rs#L671)) |
+| which connections: a host the run holds a placeholder for | `carry` in [`hive/egress.rs:531`](../agents/roomlerd/src/hive/egress.rs#L531) |
+| the run's TLS to its audiences, made once | `RunState::upstream_tls` ([`egress.rs:279`](../agents/roomlerd/src/hive/egress.rs#L279)) |
+| a placeholder's value | `Values` ([`egress.rs:120`](../agents/roomlerd/src/hive/egress.rs#L120)), `LeaseValues` ([`:842`](../agents/roomlerd/src/hive/egress.rs#L842)) |
+| the order: the audience verified, the client told, its hello read, its TLS | `carry` in [`hive/egress/swap.rs:136`](../agents/roomlerd/src/hive/egress/swap.rs#L136) |
+| the hello, read and judged | `read_hello` ([`:295`](../agents/roomlerd/src/hive/egress/swap.rs#L295)), `judge` ([`:343`](../agents/roomlerd/src/hive/egress/swap.rs#L343)) |
+| a request's names | `outbound` ([`:540`](../agents/roomlerd/src/hive/egress/swap.rs#L540)), `names` ([`:613`](../agents/roomlerd/src/hive/egress/swap.rs#L613)) |
+| the swap | `swap` ([`:650`](../agents/roomlerd/src/hive/egress/swap.rs#L650)), `swap_authorization` ([`:691`](../agents/roomlerd/src/hive/egress/swap.rs#L691)) |
 | the tests | [`hive/egress/swap/tests.rs`](../agents/roomlerd/src/hive/egress/swap/tests.rs): 17, against a test audience under a CA of its own |
 
 ### The tool, and its audiences (P3b-3c-2)
@@ -2795,7 +2795,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the offer, the tool, its settings name | `placeholder_offered` ([`hive/toolbelt.rs:1186`](../agents/roomlerd/src/hive/toolbelt.rs#L1186)), `placeholder_tools` ([`:1194`](../agents/roomlerd/src/hive/toolbelt.rs#L1194)), `PLACEHOLDER_TOOLS` ([`:469`](../agents/roomlerd/src/hive/toolbelt.rs#L469)) |
-| the call, its audiences, its bindings | `call` ([`hive/placeholder.rs:329`](../agents/roomlerd/src/hive/placeholder.rs#L329)), `audience_of` ([`:224`](../agents/roomlerd/src/hive/placeholder.rs#L224)), `bind` ([`:164`](../agents/roomlerd/src/hive/placeholder.rs#L164)) |
+| the call, its audiences, its bindings | `call` ([`hive/placeholder.rs:351`](../agents/roomlerd/src/hive/placeholder.rs#L351)), `audience_of` ([`:246`](../agents/roomlerd/src/hive/placeholder.rs#L246)), `bind` ([`:184`](../agents/roomlerd/src/hive/placeholder.rs#L184)) |
 | the settings | `vault_use_tools` in [`hive/supervisor.rs:4952`](../agents/roomlerd/src/hive/supervisor.rs#L4952) |
 | asked ahead | `parse` in [`hive/vault_request.rs:37`](../agents/roomlerd/src/hive/vault_request.rs#L37) |
 
@@ -2803,8 +2803,9 @@ sequenceDiagram
 
 AWS signs a request with the secret key, by SigV4, and the key goes nowhere
 (the FR-90 spec, §3e "P3b-4, AWS, as designed"). P3b-4-1 builds SigV4 in
-the daemon, with no caller: P3b-4-2's proxy checks a session's signature,
-made with a placeholder pair, and signs the request again with the value.
+the daemon. Its caller is P3b-4-2's proxy, which checks a session's
+signature, made with a placeholder pair, and signs the request again with
+the value (below).
 
 | Piece | What holds |
 |---|---|
@@ -2827,10 +2828,95 @@ made with a placeholder pair, and signs the request again with the value.
 
 | Piece | Where |
 |---|---|
-| the header | `parse`, `Signed` in [`vault_proxy/sigv4.rs:70`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L70) |
-| the canonical request | `canonical_request` ([`:142`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L142)) |
-| the key and the signature | `signing_key` ([`:257`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L257)), `signature` ([`:273`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L273)) |
+| the header | `parse`, `Signed` in [`vault_proxy/sigv4.rs:71`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L71) |
+| the canonical request | `canonical_request` ([`:143`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L143)) |
+| the key and the signature | `signing_key` ([`:258`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L258)), `signature` ([`:274`](../agents/roomlerd/src/vault_proxy/sigv4.rs#L274)) |
 | the tests | [`vault_proxy/sigv4/tests.rs`](../agents/roomlerd/src/vault_proxy/sigv4/tests.rs): 7 |
+
+### AWS signed again (P3b-4-2)
+
+A request the session's `aws` signs with a placeholder pair reaches AWS
+signed with the value. The proxy checks the session's signature with the
+secret key's placeholder, then signs the same request again with the secret
+key's value, `Credential=` naming the access key's own id. The secret key
+goes nowhere: AWS sees a signature made with it, as from any SDK.
+
+```mermaid
+sequenceDiagram
+    participant S as the session's aws (in the sandbox)
+    participant P as the run's egress proxy
+    participant L as the daemon's leases
+    participant A as AWS (sts.eu-central-1.amazonaws.com)
+    S->>P: CONNECT, terminated as for any audience (the swap, above)
+    S->>P: GetCallerIdentity, Authorization AWS4-HMAC-SHA256 Credential=rph_…
+    P->>P: the pair by the secret's fields, toward this audience (decision 33)
+    P->>P: the body's hash, from x-amz-content-sha256 or the body read whole
+    P->>P: the signature checked, the secret key's placeholder as the key
+    alt it does not check, or a request not signed again
+        P-->>S: refused with why, and never sent
+    else it checks
+        P->>L: the access key, the secret key and any session token, their values now
+        P->>P: the token swapped, the request signed again with the secret key's value
+        P->>A: the request, Credential naming the access key's own id
+        A-->>S: the response, as it came
+    end
+```
+
+| Piece | What holds |
+|---|---|
+| which requests | one whose `Authorization` is AWS's (its scheme starts `AWS`) and names a placeholder of this audience. One naming none goes on as it came, and the swap passes every AWS signature by |
+| its form | SigV4 (`AWS4-HMAC-SHA256`), the request's one `Authorization`, its `Credential=` naming an `access_key_id` placeholder, its `X-Amz-Date` carried |
+| the pair | decision 33: a binding records its secret and field (`vault_placeholder` names both), and the same secret's `secret_access_key` placeholder toward this audience is the key. Its `session_token` placeholder, where `X-Amz-Security-Token` carries it, is the token |
+| the body's hash | `x-amz-content-sha256` where the request carries one (S3): a digest, `UNSIGNED-PAYLOAD` or `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, the body going on as it came. Where it carries none, the body is read whole and hashed: up to 8 MiB, at most 4 at once a run, each held until it is sent |
+| the check | the canonical request rebuilt from the request as it came, and signed with the key's placeholder as the key, gives the request's signature, compared in constant time |
+| signed again | the token's value in `X-Amz-Security-Token`, the canonical request rebuilt with it, the signature made with the secret key's value, and `Credential=` given the access key's. The date, the scope, the signed headers and every other value go on as they came |
+| a signed header | goes on as it came. One that would not (a hop-by-hop header, or one `Connection` names) refuses the request; `Expect`, where it is signed, stays |
+| the secret key | its placeholder is swapped nowhere, `Authorization` included: it signs, and goes out as itself wherever a session writes it |
+| the log | the session, the host, and the leases of the access key and the secret key, at `debug`; never a value |
+
+Each request the proxy does not sign again is answered with why, and is
+never sent:
+
+| What | Answer |
+|---|---|
+| a signature that does not check with the pair: signed with another key, or another secret's | `403` |
+| the secret key's placeholder in `Credential=`, or any but an access key's | `403` |
+| an access key with no `secret_access_key` placeholder of its secret toward the host | `403` |
+| a lease of the pair let go | `403` |
+| a header that does not read as SigV4, a second `Authorization`, no `X-Amz-Date` | `400` |
+| SigV4A or another AWS scheme, signed chunks (`STREAMING-AWS4-…`), a signed header that does not go on | `501` |
+| a body past 8 MiB with no `x-amz-content-sha256`: refused before a byte is read where its length is said up front | `413` |
+| an access key's value that is no id, a session token's that no header can carry | `502` |
+
+> [!WARNING]
+> - **The check is not the gate.** A session that holds the placeholder
+>   pair signs what it likes, as it could with the key; the audiences the
+>   secret names, and AWS's own policies on the key, bound it. The check
+>   turns a canonical request the proxy and the SDK build differently into a
+>   refusal with a reason, where AWS would answer `SignatureDoesNotMatch`
+>   after the value had signed it.
+> - **The secret key's value goes nowhere but into the HMAC.** `Credential=`
+>   takes the value of an `access_key_id` placeholder alone, and the swap
+>   passes a `secret_access_key` placeholder by. A session that writes the
+>   secret key's placeholder in `Credential=` is refused; one that writes it
+>   anywhere else sends the placeholder, never the value.
+> - **Its rules are botocore's.** Each signature the tests expect AWS to be
+>   sent is botocore's own, for the same request with AWS's example pair,
+>   computed before the code was: a query (STS by GET), a form body (STS by
+>   POST), S3's path as sent, and a session token.
+> - **A body read whole is bounded.** 8 MiB, and 4 at once a run, so 256
+>   connections do not hold 256 bodies. S3's uploads carry
+>   `x-amz-content-sha256` and stream.
+
+| Piece | Where |
+|---|---|
+| the step, before the swap | `forward` in [`hive/egress/swap.rs:481`](../agents/roomlerd/src/hive/egress/swap.rs#L481) |
+| which requests, the check, signed again | `resign` in [`hive/egress/swap/aws.rs:89`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L89) |
+| the pair | `pair` ([`:271`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L271)); a binding's secret and field, `Bound` ([`hive/placeholder.rs:59`](../agents/roomlerd/src/hive/placeholder.rs#L59)) |
+| the body's hash, and its bound | `payload` ([`:339`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L339)), `MAX_BODIES` ([`hive/egress.rs:74`](../agents/roomlerd/src/hive/egress.rs#L74)) |
+| a signed `Expect` kept | `outbound` ([`hive/egress/swap.rs:540`](../agents/roomlerd/src/hive/egress/swap.rs#L540)) |
+| the secret key, never swapped | `signs_only` ([`hive/egress/swap/aws.rs:67`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L67)), which `swap` reads |
+| the tests | [`hive/egress/swap/tests/aws.rs`](../agents/roomlerd/src/hive/egress/swap/tests/aws.rs): 8, against the swap's test audience |
 
 ## 25. Audit
 
@@ -2927,5 +3013,5 @@ its lease (§15).
 | Step | Builds |
 |---|---|
 | P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), the device's client built (P3-8-2b-1), and its tool built (P3-8-2b-2) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; for `roomler connect`, built (§23: the vault's half, P3-9-1; the daemon's ask and its renewing endpoint, P3-9-2a; the LocalAPI verb and the foreground command, P3-9-2b), the operator's word on decision 26, who may run it on Windows (its design: §3e "P3-9, `roomler connect`, as designed") |
-| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy and the session's sandbox around it are built too (P3b-1b-1 and P3b-1b-2, §24). Of the device's half of a placeholder (P3b-3, §24), the placeholder (P3b-3a), the session's CA (P3b-3b), the swap (P3b-3c-1, in `Authorization` alone as decision 32 recommends, pending the operator's word) and the tool, offered behind the proxy alone and toward several audiences (P3b-3c-2), are built. AWS (P3b-4: a session's SigV4 signature, made with the placeholder pair, checked and signed again with the value; its design in the FR-90 spec, §3e "P3b-4, AWS, as designed", with decisions 33 and 34; SigV4 itself built in P3b-4-1, §24, its caller P3b-4-2) and Windows (P3b-5) are left |
+| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy and the session's sandbox around it are built too (P3b-1b-1 and P3b-1b-2, §24). Of the device's half of a placeholder (P3b-3, §24), the placeholder (P3b-3a), the session's CA (P3b-3b), the swap (P3b-3c-1, in `Authorization` alone as decision 32 recommends, pending the operator's word) and the tool, offered behind the proxy alone and toward several audiences (P3b-3c-2), are built, and so is AWS (P3b-4: a session's SigV4 signature, made with the placeholder pair, checked and signed again with the value; its design in the FR-90 spec, §3e "P3b-4, AWS, as designed"; SigV4 itself in P3b-4-1 and its caller in P3b-4-2, §24, decisions 33 and 34 built as recommended, pending the operator's word). Windows (P3b-5) is left |
 | P3k | the field run in the test organization |
