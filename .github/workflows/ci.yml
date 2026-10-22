@@ -1216,10 +1216,15 @@ jobs:
       # FR-97 P6e-2: `macos_supervisor::` rides the same test build. Its crash
       # classifier reads Darwin's signal numbers off a wait status, and a Mac
       # is the only runner where they are checked against `libc`.
+      # FR-97 P2e-1: so does the clipboard's change gate against the real
+      # pasteboard. Its write replaces whatever was copied, so the test skips
+      # unless `ROOMLERD_TEST_MAC_PASTEBOARD=1`; a runner has nobody's copy to lose.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
+        env:
+          ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault -- hive:: vault:: vault_proxy:: macos_supervisor::
+          cargo test -p roomlerd --lib --features hive,vault,clipboard -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the

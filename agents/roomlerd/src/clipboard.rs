@@ -182,23 +182,24 @@ impl Clipboard {
                 // pre-existing clipboard as a "change".
                 let mut watchers: std::collections::HashMap<u64, WatcherState> =
                     std::collections::HashMap::new();
-                // FR-97 P3e-3a — the X11 change gate, opened with the first
-                // watcher and kept; `None` outside an X11 session.
-                #[cfg(target_os = "linux")]
-                let mut gate: Option<x11_gate::Gate> = None;
-                #[cfg(target_os = "linux")]
+                // FR-97 P3e-3a / P2e-1 — the change gate (an X11 session's
+                // owner events, a Mac's change count), opened with the first
+                // watcher and kept; `None` where there is none.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let mut gate: Option<change_gate::Gate> = None;
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let mut gate_tried = false;
                 loop {
                     // Block indefinitely when nothing is watching (the
                     // pre-v2 behavior — zero idle wakeups); poll at the
                     // tick cadence while any watcher is installed.
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     let tick = if gate.is_some() {
                         GATED_TICK
                     } else {
                         WATCH_TICK
                     };
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     let tick = WATCH_TICK;
                     let cmd = if !watchers.is_empty() {
                         match rx.recv_timeout(tick) {
@@ -239,15 +240,15 @@ impl Clipboard {
                             let _ = reply.send(worker_write_native(&mut cb, &payload, &mut marks));
                         }
                         Some(ClipboardCmd::Watch { id, events, tx }) => {
-                            #[cfg(target_os = "linux")]
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
                             let gate_seq = {
                                 if gate.is_none() && !gate_tried {
                                     gate_tried = true;
-                                    gate = x11_gate::Gate::open();
+                                    gate = change_gate::Gate::open();
                                 }
                                 gate_tick(&mut gate)
                             };
-                            #[cfg(not(target_os = "linux"))]
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let gate_seq = None;
                             watchers.insert(id, install_watcher(&mut cb, events, tx, gate_seq));
                         }
@@ -261,9 +262,9 @@ impl Clipboard {
                             // worker can fall back to blocking recv.
                             watchers.retain(|_, w| !w.receiver_gone());
                             // One read of the gate per tick, for every watcher.
-                            #[cfg(target_os = "linux")]
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
                             let gate_seq = gate_tick(&mut gate);
-                            #[cfg(not(target_os = "linux"))]
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let gate_seq = None;
                             for w in watchers.values_mut() {
                                 watch_tick(&mut cb, w, &marks, gate_seq);
@@ -272,8 +273,10 @@ impl Clipboard {
                     }
                     // FR-97 P3e-3a — no watcher, no gate: an idle worker
                     // blocks on its commands and would read no events, and
-                    // an X server buffers what a client does not read.
-                    #[cfg(target_os = "linux")]
+                    // an X server buffers what a client does not read. A
+                    // Mac's gate holds nothing, but the next one starts
+                    // from the count at the next watch, as X11's does.
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     if watchers.is_empty() && gate.is_some() {
                         gate = None;
                         gate_tried = false;
@@ -535,10 +538,18 @@ const WATCH_TICK: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(not(windows))]
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// FR-97 P3e-3a — behind the X11 change gate an unchanged tick is one event
-/// drain on a local socket, so it runs at Windows' cadence.
-#[cfg(target_os = "linux")]
+/// FR-97 P3e-3a / P2e-1 — behind a change gate an unchanged tick is one event
+/// drain on a local socket (X11) or one change-count read (a Mac), so it runs
+/// at Windows' cadence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const GATED_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+// FR-97 P3e-3a / P2e-1 — this OS's clipboard change gate. Windows has its own
+// sequence number and needs neither.
+#[cfg(target_os = "macos")]
+use self::mac_gate as change_gate;
+#[cfg(target_os = "linux")]
+use self::x11_gate as change_gate;
 
 /// Content the worker itself last wrote to the OS clipboard. The
 /// change watcher treats matching state as "our own write" and stays
@@ -570,9 +581,9 @@ struct SelfMarks {
 struct WatcherState {
     events: WatchEvents,
     tx: tokio::sync::mpsc::Sender<ClipboardChange>,
-    /// Windows' sequence number, or (FR-97 P3e-3a) the X11 change gate's
+    /// Windows' sequence number, or (FR-97 P3e-3a, P2e-1) the change gate's
     /// counter, as this watcher last saw it.
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     last_seen_seq: u32,
     last_text_hash: u64,
     last_img_hash: u64,
@@ -603,9 +614,9 @@ fn win_clipboard_seq() -> Option<u32> {
 
 /// FR-97 P3e-3a — the gate's counter for this tick; a gate whose connection
 /// broke is dropped, and its watchers fall back to the ungated path.
-#[cfg(target_os = "linux")]
-fn gate_tick(gate: &mut Option<x11_gate::Gate>) -> Option<u32> {
-    let seq = gate.as_mut().and_then(x11_gate::Gate::seq);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn gate_tick(gate: &mut Option<change_gate::Gate>) -> Option<u32> {
+    let seq = gate.as_mut().and_then(change_gate::Gate::seq);
     if seq.is_none() {
         *gate = None;
     }
@@ -721,6 +732,80 @@ pub(crate) mod x11_gate {
     pub fn available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| Gate::open().is_some())
+    }
+}
+
+/// FR-97 P2e-1 — a Mac's clipboard change gate: `NSPasteboard`'s change count,
+/// which the pasteboard server moves on every write by any app (Windows'
+/// sequence number in another form). An unchanged tick reads the count and
+/// nothing else, so copied images can be watched, and text is read when it
+/// changed rather than every second.
+///
+/// - **Fewer reads of the person's copy.** Without the gate a session read the
+///   general pasteboard's text and html every second (measured on macOS 27,
+///   FR-97 §8). Apple's pasteboard privacy may ask the person before an app
+///   reads what another app copied; a read the gate skips cannot ask.
+/// - **Our own writes** move the count too; the content hashes in
+///   [`SelfMarks`] still swallow them, as on every OS.
+/// - **Outside the console session** (a root daemon) the pasteboard server
+///   cannot be reached at all, so the count never moves and the gate reads
+///   nothing, where every read would have failed anyway.
+///
+/// Kill switch `ROOMLERD_CLIPBOARD_MAC_WATCH=0`: no gate, as before P2e-1.
+#[cfg(target_os = "macos")]
+pub(crate) mod mac_gate {
+    use objc2_app_kit::NSPasteboard;
+
+    /// FR-97 P2e-1 — kill switch `ROOMLERD_CLIPBOARD_MAC_WATCH=0`.
+    pub fn enabled() -> bool {
+        tunnel_core::env::flag("CLIPBOARD_MAC_WATCH", true)
+    }
+
+    pub struct Gate {
+        last: isize,
+        seq: u32,
+    }
+
+    impl Gate {
+        /// `None` with the switch off.
+        pub fn open() -> Option<Self> {
+            enabled().then(Self::connect)
+        }
+
+        /// The gate, whatever the switch says: what [`Gate::open`] does once
+        /// it decided to (and what the real-pasteboard test drives).
+        pub(super) fn connect() -> Self {
+            Self {
+                last: change_count(),
+                // Never 0: the watcher reads 0 as "no counter".
+                seq: 1,
+            }
+        }
+
+        /// The change counter, one more whenever the change count moved since
+        /// the last call. Always `Some`: the count can always be asked.
+        pub fn seq(&mut self) -> Option<u32> {
+            let now = change_count();
+            if now != self.last {
+                self.last = now;
+                self.seq = self.seq.wrapping_add(1).max(1);
+            }
+            Some(self.seq)
+        }
+    }
+
+    fn change_count() -> isize {
+        // The clipboard worker is not the main thread, so it drains AppKit's
+        // autoreleased temporaries itself, as arboard does around its reads.
+        objc2::rc::autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount())
+    }
+
+    /// Whether copied images on this host are watched: wherever the switch is
+    /// on. Not asked of this process's own pasteboard: on a supervised Mac the
+    /// root daemon says the hello, and a delegated session's clipboard runs in
+    /// the GUI worker, inside the console session.
+    pub fn available() -> bool {
+        enabled()
     }
 }
 
@@ -972,7 +1057,8 @@ fn install_watcher(
     // Image watching needs the Windows sequence-number gate to bound
     // `get_image` calls; without it (a window station that denies
     // clipboard access) fall back to text-only watching. FR-97 P3e-3a —
-    // on Linux, the X11 change gate (`gate_seq`, `None` without one).
+    // on Linux, the X11 change gate (`gate_seq`, `None` without one); P2e-1,
+    // a Mac's change-count gate.
     #[cfg(windows)]
     let events = if events.image && win_clipboard_seq().is_none() {
         tracing::warn!("clipboard: no sequence-number access — image watching disabled");
@@ -985,13 +1071,13 @@ fn install_watcher(
     };
     #[cfg(windows)]
     let _ = gate_seq;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let events = WatchEvents {
         image: events.image && gate_seq.is_some(),
         native: false,
         ..events
     };
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let events = {
         let _ = gate_seq;
         WatchEvents {
@@ -1024,7 +1110,7 @@ fn install_watcher(
         tx,
         #[cfg(windows)]
         last_seen_seq: win_clipboard_seq().unwrap_or(0),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         last_seen_seq: gate_seq.unwrap_or(0),
         last_text_hash: text_hash,
         last_img_hash: 0,
@@ -1059,9 +1145,10 @@ fn watch_tick(
         }
         // Sequence number unavailable → hash polling below still works.
     }
-    // FR-97 P3e-3a — the X11 change gate: no owner change, nothing read.
-    // Our own writes pass it and are swallowed by the hashes below.
-    #[cfg(target_os = "linux")]
+    // FR-97 P3e-3a / P2e-1 — the change gate (X11's owner events, a Mac's
+    // change count): no change, nothing read. Our own writes pass it and are
+    // swallowed by the hashes below.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     match gate_seq {
         Some(seq) => {
             if !w.retry && seq == w.last_seen_seq {
@@ -1072,7 +1159,7 @@ fn watch_tick(
         // No gate, or it broke: text is read every tick, images never.
         None => w.events.image = false,
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let _ = gate_seq;
     w.retry = false;
     // v2.2 — richest format wins, native (RTF) on top: only RTF
@@ -1159,17 +1246,20 @@ fn watch_tick(
             // Forwarder task gone — an Unwatch is on its way; stay quiet.
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
-        // Load-bearing on Windows and Linux, where the image block below
-        // follows; redundant everywhere else, where it is the last statement
-        // of the function. Scoped rather than removed — deleting it would
-        // fall through into the image path.
-        #[cfg_attr(not(any(windows, target_os = "linux")), allow(clippy::needless_return))]
+        // Load-bearing on Windows, Linux and macOS, where the image block
+        // below follows; redundant on any other OS, where it is the last
+        // statement of the function. Scoped rather than removed — deleting it
+        // would fall through into the image path.
+        #[cfg_attr(
+            not(any(windows, target_os = "linux", target_os = "macos")),
+            allow(clippy::needless_return)
+        )]
         return;
     }
     // Empty text — maybe an image. Only behind a change gate (Windows'
-    // sequence number; FR-97 P3e-3a, the X11 gate), which bounds how often
-    // we pay for a full image read + PNG encode.
-    #[cfg(any(windows, target_os = "linux"))]
+    // sequence number; FR-97 P3e-3a, the X11 gate; P2e-1, a Mac's change
+    // count), which bounds how often we pay for a full image read + PNG encode.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     if w.events.image {
         let img = match cb.get_image() {
             Ok(i) => i,
@@ -1864,6 +1954,51 @@ mod x11_gate_tests {
             assert_ne!(owner, win, "the counter moved while CLIPBOARD stayed ours");
         }
         eprintln!("x11-real: the clipboard gate counted an owner change ({before} → {after})");
+    }
+}
+
+/// FR-97 P2e-1 — the change gate against the real pasteboard (CI's macOS job,
+/// `ROOMLERD_TEST_MAC_PASTEBOARD=1`): a write moves the change count, as a copy
+/// does, and the gate counts it and then holds. Only under the variable: the
+/// write replaces whatever the person at this Mac had copied.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_gate_tests {
+    use super::mac_gate::Gate;
+
+    const PROBE: &str = "FR-97 P2e-1 change-gate probe";
+
+    #[test]
+    fn mac_real_the_gate_counts_a_copy() {
+        if std::env::var("ROOMLERD_TEST_MAC_PASTEBOARD").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_MAC_PASTEBOARD unset — skipping (CI's macOS job sets it)");
+            return;
+        }
+        let mut gate = Gate::connect();
+        let before = gate.seq().expect("a counter");
+        assert_ne!(before, 0, "the watcher reads 0 as no counter");
+        let mut cb = arboard::Clipboard::new().expect("the general pasteboard");
+        cb.set_text(PROBE).expect("a write");
+        let mut after = before;
+        for _ in 0..50 {
+            after = gate.seq().expect("a counter");
+            if after != before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_ne!(after, before, "the write was counted");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Only a write moves it. A parallel test may write meanwhile, so a later
+        // count must come with a copy other than ours.
+        let later = gate.seq().expect("a counter");
+        if later != after {
+            assert_ne!(
+                cb.get_text().ok().as_deref(),
+                Some(PROBE),
+                "the counter moved while the copy stayed ours"
+            );
+        }
+        eprintln!("mac-real: the clipboard gate counted a write ({before} → {after})");
     }
 }
 

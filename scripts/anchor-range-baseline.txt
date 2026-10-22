@@ -18,7 +18,6 @@ docs/fr/FR-66-config-probe-false-re-enrollment-error.md	crates/agent-core/src/co
 docs/fr/FR-85-hq-screen-recording.md	crates/modules/fleet/src/hub.rs:1117-881
 docs/linux-capture.md	main.rs:3498-3486
 docs/multi-org.md	crates/agent-core/src/config.rs:2114-2109
-docs/overlay-key-rotation.md	agents/roomlerd/src/encode/caps.rs:1812-1800
 docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
 docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
 docs/overlay-key-rotation.md	config_surface.rs:1096-1069
