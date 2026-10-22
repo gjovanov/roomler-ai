@@ -697,12 +697,176 @@ pub(crate) fn linux_companion_path() -> Option<std::path::PathBuf> {
 ///
 /// Either way the session's bus and display go along as `--setenv`: a
 /// transient unit starts with an empty environment.
+///
+/// ⚠️ #2713 — and a ROOT daemon's unit also gets the desktop session's own
+/// environment (an allowlist, [`SESSION_ENV_KEYS`]), read from the user's
+/// systemd manager. A system unit inherits nothing of the desktop, so a
+/// companion started this way had no `XDG_CURRENT_DESKTOP` (the desktop's
+/// default apps live in `<desktop>-mimeapps.list`), no per-user Flatpak dir
+/// in `XDG_DATA_DIRS`, the system locale and no `XAUTHORITY`; measured
+/// 2026-10-22 on a Fedora Asahi GNOME box, where that companion is what the
+/// person clicked View screen in. A per-user daemon's `--user` unit inherits
+/// the manager's environment already.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn systemd_run_command(
     sess: &GraphicalSession,
     exe: &std::path::Path,
     args: &[&str],
     user_manager: bool,
+) -> std::process::Command {
+    let session_env = if user_manager {
+        Vec::new()
+    } else {
+        user_manager_environment(sess)
+            .map(|text| session_env_pairs(&text))
+            .unwrap_or_default()
+    };
+    systemd_run_command_with(sess, exe, args, user_manager, &session_env)
+}
+
+/// #2713 — the keys of the desktop session's environment that a companion
+/// the daemon starts must carry, to behave like one the desktop started:
+/// which desktop it is, where apps and their defaults are found, X11 auth,
+/// input methods, theme, a chosen browser and the locale (plus every `LC_*`,
+/// see [`session_env_pairs`]).
+///
+/// ⚠️ An ALLOWLIST, not the whole environment. The values are the user's own
+/// (no privilege crosses: the companion runs as that user), but the bus,
+/// display and runtime dir keep coming from logind as before, and loader
+/// plumbing (`LD_*`, `GTK_MODULES`) has no business in a process the daemon
+/// starts. Widen it only with a measured need.
+#[cfg(all(unix, not(target_os = "macos")))]
+const SESSION_ENV_KEYS: &[&str] = &[
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "DESKTOP_SESSION",
+    "XDG_MENU_PREFIX",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_DIRS",
+    "XAUTHORITY",
+    "KDE_FULL_SESSION",
+    "KDE_SESSION_VERSION",
+    "GTK_THEME",
+    "GTK_IM_MODULE",
+    "QT_IM_MODULE",
+    "XMODIFIERS",
+    "QT_QPA_PLATFORMTHEME",
+    "BROWSER",
+    "LANG",
+    "LANGUAGE",
+];
+
+/// #2713 — the allowlisted `KEY=VALUE` pairs out of `systemctl --user
+/// show-environment`, plus every `LC_*`. A value systemd had to shell-escape
+/// (`KEY=$'…'`), an empty one, or one with a control character is skipped,
+/// never decoded: nothing on the allowlist legitimately needs one.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn session_env_pairs(show_environment: &str) -> Vec<(String, String)> {
+    show_environment
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| {
+            SESSION_ENV_KEYS.contains(key)
+                || key.strip_prefix("LC_").is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+                })
+        })
+        .filter(|(_, value)| {
+            !value.is_empty()
+                && value.len() <= 4096
+                && !value.starts_with("$'")
+                && !value.chars().any(char::is_control)
+        })
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// #2713 — the session user's systemd manager environment as text, read by
+/// running `systemctl --user show-environment` AS that user (a root daemon
+/// drops through [`crate::exec::drop_to_std`], the one privilege story),
+/// bounded at 5 s. `None` when it cannot be read: the companion then starts
+/// as it always did, with logind's four variables.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn user_manager_environment(sess: &GraphicalSession) -> Option<String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sess;
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Stdio;
+        let mut cmd = std::process::Command::new("systemctl");
+        cmd.args(["--user", "show-environment"])
+            .env_clear()
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
+            .env("XDG_RUNTIME_DIR", format!("/run/user/{}", sess.uid))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path=/run/user/{}/bus", sess.uid),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // SAFETY: geteuid reads our own credentials; it cannot fail.
+        if unsafe { libc::geteuid() } == 0
+            && let Err(e) = crate::exec::drop_to_std(&mut cmd, &sess.name)
+        {
+            tracing::debug!(%e, "companion: cannot read the session's environment");
+            return None;
+        }
+        let text = stdout_bounded(cmd, std::time::Duration::from_secs(5))?;
+        Some(text)
+    }
+}
+
+/// Run `cmd` (stdout piped) and return its stdout when it exits 0 within
+/// `limit`; a child still running at the deadline is killed. A wedged user
+/// manager must not hold the companion's launch hostage.
+#[cfg(target_os = "linux")]
+fn stdout_bounded(mut cmd: std::process::Command, limit: std::time::Duration) -> Option<String> {
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = reader.join().unwrap_or_default();
+                return status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&out).into_owned());
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::debug!("companion: the session's environment did not arrive in time");
+                return None;
+            }
+        }
+    }
+}
+
+/// [`systemd_run_command`] over an already-read session environment: the
+/// pure half, so the argv is tested without a user manager to ask.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemd_run_command_with(
+    sess: &GraphicalSession,
+    exe: &std::path::Path,
+    args: &[&str],
+    user_manager: bool,
+    session_env: &[(String, String)],
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new("systemd-run");
     if user_manager {
@@ -724,6 +888,9 @@ pub(crate) fn systemd_run_command(
     }
     if let Some(wayland) = &sess.wayland_display {
         cmd.arg(format!("--setenv=WAYLAND_DISPLAY={wayland}"));
+    }
+    for (key, value) in session_env {
+        cmd.arg(format!("--setenv={key}={value}"));
     }
     cmd.arg(exe.as_os_str());
     cmd.args(args);
@@ -755,15 +922,13 @@ pub(crate) struct GraphicalSession {
     /// carried rather than re-derived at each call site.
     ///
     /// ⚠️ The allow is scoped to lanes with no reader rather than blanket, so
-    /// if the portal helper ever stops using this the warning comes back
-    /// instead of staying suppressed forever. Kept unconditional (rather than
-    /// `cfg`-gated) because gating one field fragments the struct, its single
-    /// constructor and the guard that fills it, for a string that costs
-    /// nothing to carry.
-    #[cfg_attr(
-        not(all(target_os = "linux", feature = "portal-capture")),
-        allow(dead_code)
-    )]
+    /// if its readers (the portal helper, and since #2713 the read of the
+    /// session's environment on every Linux build) ever stop using this, the
+    /// warning comes back instead of staying suppressed forever. Kept
+    /// unconditional (rather than `cfg`-gated) because gating one field
+    /// fragments the struct, its single constructor and the guard that fills
+    /// it, for a string that costs nothing to carry.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) name: String,
     pub(crate) display: Option<String>,
     pub(crate) wayland_display: Option<String>,
@@ -1582,11 +1747,13 @@ mod tests {
             wayland_display: Some("wayland-0".into()),
         };
         let argv = |user: bool| -> Vec<String> {
-            let cmd = super::systemd_run_command(
+            // The pure half: no user manager is asked from a test.
+            let cmd = super::systemd_run_command_with(
                 &sess,
                 std::path::Path::new("/usr/bin/roomler-desktop"),
                 &["--first-run"],
                 user,
+                &[],
             );
             assert_eq!(cmd.get_program(), "systemd-run");
             cmd.get_args()
@@ -1614,6 +1781,149 @@ mod tests {
         assert_eq!(user[0], "--user");
         assert!(!user.iter().any(|a| a.starts_with("--uid=")), "{user:?}");
         assert!(user.contains(&"--setenv=DISPLAY=:0".to_string()));
+    }
+
+    /// #2713 — REAL `systemctl --user show-environment` output, captured on
+    /// 2026-10-22 from the lab's Fedora Asahi GNOME box (its `HOSTNAME` line
+    /// left out): the box where View screen, in a companion the daemon had
+    /// started, opened a text editor.
+    /// The allowlist keeps the desktop's identity, its data dirs (with the
+    /// user's own Flatpak exports), X auth, the locale and the input method,
+    /// and drops the rest, every `$'…'`-escaped value included.
+    #[test]
+    fn the_session_environment_keeps_the_allowlist_only() {
+        const REAL: &str = "\
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+HOME=/home/wlab
+LANG=C.UTF-8
+LOGNAME=wlab
+PATH=/home/wlab/.cargo/bin:/home/wlab/.local/bin:/home/wlab/bin:/usr/local/bin:/usr/bin:/usr/local/sbin
+SHELL=/bin/bash
+USER=wlab
+XDG_DATA_DIRS=/home/wlab/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/
+XDG_RUNTIME_DIR=/run/user/1001
+DEBUGINFOD_IMA_CERT_PATH=/etc/keys/ima:
+DEBUGINFOD_URLS=$'https://debuginfod.fedoraproject.org/ '
+DESKTOP_SESSION=gnome
+DISPLAY=:0
+EDITOR=/usr/bin/nano
+GDMSESSION=gnome
+GDM_LANG=C.UTF-8
+GNOME_SETUP_DISPLAY=:1
+GPG_TTY=$'not a tty'
+HISTCONTROL=ignoredups
+HISTSIZE=1000
+KDEDIRS=/usr
+LESSOPEN=$'||/usr/bin/lesspipe.sh %s'
+MAIL=/var/spool/mail/wlab
+PWD=/home/wlab
+QT_IM_MODULE=ibus
+SESSION_MANAGER=local/unix:@/tmp/.ICE-unix/2160711,unix/unix:/tmp/.ICE-unix/2160711
+SHLVL=0
+SSH_ASKPASS=/usr/bin/ksshaskpass
+SSH_AUTH_SOCK=/run/user/1001/keyring/ssh
+USERNAME=wlab
+WAYLAND_DISPLAY=wayland-0
+XAUTHORITY=/run/user/1001/.mutter-Xwaylandauth.XEYMX3
+XDG_CURRENT_DESKTOP=GNOME
+XDG_MENU_PREFIX=gnome-
+XDG_SESSION_CLASS=user
+XDG_SESSION_DESKTOP=gnome
+XDG_SESSION_TYPE=wayland
+XMODIFIERS=@im=ibus
+";
+        let pairs = super::session_env_pairs(REAL);
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "LANG",
+                "XDG_DATA_DIRS",
+                "DESKTOP_SESSION",
+                "QT_IM_MODULE",
+                "XAUTHORITY",
+                "XDG_CURRENT_DESKTOP",
+                "XDG_MENU_PREFIX",
+                "XDG_SESSION_DESKTOP",
+                "XDG_SESSION_TYPE",
+                "XMODIFIERS",
+            ]
+        );
+        let value = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            value("XDG_DATA_DIRS"),
+            Some(
+                "/home/wlab/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:\
+                 /usr/local/share/:/usr/share/"
+            ),
+            "the user's own Flatpak exports, which the companion's old unit lacked"
+        );
+        assert_eq!(
+            value("XMODIFIERS"),
+            Some("@im=ibus"),
+            "a value keeps its own '='"
+        );
+
+        // Every LC_* is kept; an odd LC_ name, an escaped value and an empty
+        // one are not.
+        assert_eq!(
+            super::session_env_pairs(
+                "LC_TIME=de_AT.UTF-8\nLC_=x\nLC_time=x\nLANGUAGE=$'de\\x1b'\nBROWSER=\n"
+            ),
+            [("LC_TIME".to_string(), "de_AT.UTF-8".to_string())]
+        );
+    }
+
+    /// #2713 — a root daemon's companion carries the session's pairs as
+    /// `--setenv`, after logind's and BEFORE the program, so systemd-run
+    /// reads them as its own options rather than as the companion's
+    /// arguments.
+    #[test]
+    fn a_root_daemons_companion_carries_the_session_environment() {
+        let sess = super::GraphicalSession {
+            uid: 1000,
+            name: "ana".into(),
+            display: None,
+            wayland_display: Some("wayland-0".into()),
+        };
+        let env = [
+            ("XDG_CURRENT_DESKTOP".to_string(), "GNOME".to_string()),
+            (
+                "XDG_DATA_DIRS".to_string(),
+                "/home/ana/.local/share/flatpak/exports/share:/usr/share/".to_string(),
+            ),
+        ];
+        let cmd = super::systemd_run_command_with(
+            &sess,
+            std::path::Path::new("/usr/bin/roomler-desktop"),
+            &[],
+            false,
+            &env,
+        );
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = |a: &str| {
+            argv.iter()
+                .position(|x| x == a)
+                .unwrap_or_else(|| panic!("{a} missing: {argv:?}"))
+        };
+        let program = at("/usr/bin/roomler-desktop");
+        assert_eq!(program, argv.len() - 1, "the program last: {argv:?}");
+        assert!(
+            at("--setenv=WAYLAND_DISPLAY=wayland-0") < at("--setenv=XDG_CURRENT_DESKTOP=GNOME")
+        );
+        assert!(at("--setenv=XDG_CURRENT_DESKTOP=GNOME") < program);
+        assert!(
+            at("--setenv=XDG_DATA_DIRS=/home/ana/.local/share/flatpak/exports/share:/usr/share/")
+                < program
+        );
     }
 
     /// Both samples are REAL `loginctl list-sessions --no-legend --no-pager`

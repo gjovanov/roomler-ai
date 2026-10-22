@@ -98,7 +98,7 @@ The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
 9. **Mutter records `monitors[0]`, not the primary** (`portal/mutter.rs:268-289`; `primary` parsed, unread, `:317`).
 10. **`graphical_session()` is first-match**: any `Active` x11/wayland session in list order, the greeter
     accepted for capture, `Seat`/`Remote` ignored, and `WAYLAND_DISPLAY` guessed as `wayland-0`
-    (`companion.rs:796-854`, `:849`).
+    (`companion.rs:961-1019`, `:1014`).
 11. **Mutter-direct capture has no input at all** (`portal/mod.rs:604-606`, `:650`); no
     `org.gnome.Mutter.RemoteDesktop`, libei or `ConnectToEIS` code exists. A headless-mutter host is view-only.
 12. **Release-all warps the pointer to (0,0)** — GNOME's Activities hot corner — on **both** injectors: #1945
@@ -306,7 +306,7 @@ between worktrees or inside one. Every capture/input knob flip forces a fresh ca
 
 ### 4.1 One desktop-session resolver
 
-`desktop::session()` replaces the five ad-hoc lookups (`companion.rs:796`, `recording/launch.rs:1442-1470`,
+`desktop::session()` replaces the five ad-hoc lookups (`companion.rs:961`, `recording/launch.rs:1442-1470`,
 `apps/linux.rs:501-511`, `keep_busy/logind.rs:91-110`, and the scrap arm's reliance on the daemon's own
 `DISPLAY`):
 

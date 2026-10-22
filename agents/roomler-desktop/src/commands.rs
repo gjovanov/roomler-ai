@@ -984,15 +984,85 @@ pub fn open_web_or_browser<R: tauri::Runtime>(
             Err(e) => tracing::warn!(%e, "webview window failed — falling back to the browser"),
         }
     }
-    // shell::open is deprecated in favour of tauri-plugin-opener, but the
-    // shell plugin is already shipped + initialised here; not worth a new
-    // plugin dependency for the fallback path.
+    open_in_browser(app, url)
+}
+
+/// The default browser, for everything but Linux. shell::open is deprecated
+/// in favour of tauri-plugin-opener, but the shell plugin is already shipped
+/// + initialised here; not worth a new plugin dependency for this path.
+#[cfg(not(target_os = "linux"))]
+fn open_in_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) -> Result<(), String> {
     #[allow(deprecated)]
     {
         use tauri_plugin_shell::ShellExt;
         app.shell()
             .open(url, None)
             .map_err(|e| format!("opening browser: {e}"))
+    }
+}
+
+/// #2713 — Linux opens a link ONLY with the app registered for its scheme,
+/// which for `https` is the person's web browser, and otherwise says there is
+/// none, in the page and in a dialog.
+///
+/// ⚠️ Not `xdg-open` (what `shell::open` runs). When no app claims the
+/// scheme, xdg-open (GNOME: `gio open`) falls back to the URL's CONTENT
+/// type: it fetches the page, sees `text/html` and hands the URL to the
+/// `text/html` default. Measured 2026-10-22 on a Fedora Asahi GNOME box with
+/// no browser installed: View screen opened the viewer's URL in GNOME Text
+/// Editor, which showed the page's HTML. A missing browser has to be an
+/// error the person can act on, never a text editor.
+///
+/// ⚠️ The lookup reads the desktop's defaults through `XDG_CURRENT_DESKTOP`
+/// (`gnome-mimeapps.list`, `kde-mimeapps.list`) and `XDG_DATA_DIRS` (where a
+/// per-user Flatpak browser is exported). A companion the daemon started
+/// had neither until the daemon began passing the session's environment on
+/// (`roomlerd`'s `systemd_run_command`, same issue).
+#[cfg(target_os = "linux")]
+fn open_in_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) -> Result<(), String> {
+    use gio::prelude::*;
+    let result = match url_scheme(url) {
+        None => Err(format!("not a link that can be opened: {url}")),
+        Some(scheme) => match gio::AppInfo::default_for_uri_scheme(scheme) {
+            None => Err(no_handler_message(scheme)),
+            Some(handler) => handler
+                .launch_uris(&[url], None::<&gio::AppLaunchContext>)
+                .map_err(|e| format!("{} could not open the link: {e}", handler.name())),
+        },
+    };
+    if let Err(e) = &result {
+        tracing::warn!(%e, "opening a link failed");
+        use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
+        app.dialog()
+            .message(e.as_str())
+            .title("Roomler")
+            .kind(MessageDialogKind::Warning)
+            .show(|_| {});
+    }
+    result
+}
+
+/// A link's scheme (`https` of `https://…`), when it has a valid one: per
+/// RFC 3986, a letter followed by letters, digits, `+`, `-` or `.`.
+#[cfg(any(target_os = "linux", test))]
+fn url_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once(':')?;
+    let mut bytes = scheme.bytes();
+    let valid = bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    (valid && !rest.is_empty()).then_some(scheme)
+}
+
+/// What the person reads when nothing on this computer opens `scheme` links.
+#[cfg(any(target_os = "linux", test))]
+fn no_handler_message(scheme: &str) -> String {
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        "No web browser is set up on this computer, so the link cannot open. Install one \
+         (Firefox, for example) or choose a default web browser in your desktop's settings, \
+         then try again."
+            .to_string()
+    } else {
+        format!("Nothing on this computer opens {scheme}: links.")
     }
 }
 
@@ -3281,5 +3351,44 @@ mod tests {
             assert_eq!(files_dir_value_for(Path::new("/home/bob/in"), home), "~/in");
             assert_eq!(files_dir_value_for(Path::new("/srv/in"), home), "/srv/in");
         }
+    }
+
+    /// #2713 — the Linux opener asks for the app registered for a link's
+    /// SCHEME, so the scheme has to come out exactly; anything that is not a
+    /// link yields none and becomes an error, never a guess.
+    #[test]
+    fn a_link_scheme_comes_out_exactly() {
+        assert_eq!(
+            url_scheme("https://roomler.ai/tenant/t/agent/a/remote"),
+            Some("https")
+        );
+        assert_eq!(url_scheme("http://127.0.0.1:5000/"), Some("http"));
+        assert_eq!(url_scheme("web+roomler:x"), Some("web+roomler"));
+        for not_a_link in [
+            "",
+            "https",
+            "https:",
+            "://x",
+            "1https://x",
+            "ht tps://x",
+            "/tmp/a.html",
+        ] {
+            assert_eq!(url_scheme(not_a_link), None, "{not_a_link:?}");
+        }
+    }
+
+    /// #2713 — with no browser the person reads what to do about it, whatever
+    /// the scheme's case; another scheme is named as it is.
+    #[test]
+    fn no_browser_says_what_to_do() {
+        for scheme in ["https", "http", "HTTPS"] {
+            let m = no_handler_message(scheme);
+            assert!(m.starts_with("No web browser is set up"), "{m}");
+            assert!(m.contains("default web browser"), "{m}");
+        }
+        assert_eq!(
+            no_handler_message("mailto"),
+            "Nothing on this computer opens mailto: links."
+        );
     }
 }
