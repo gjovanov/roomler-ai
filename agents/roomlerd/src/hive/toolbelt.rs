@@ -1192,7 +1192,7 @@ fn placeholder_offered(ctx: &Ctx) -> bool {
 /// where that proxy serves the session ([`placeholder_offered`]).
 #[cfg(feature = "vault")]
 fn placeholder_tools() -> Vec<Value> {
-    use super::placeholder::{MAX_AUDIENCES, MAX_ENV, MAX_TTL, MIN_TTL, TOOL};
+    use super::placeholder::{MAX_AUDIENCES, MAX_ENV, MAX_TTL, MIN_TTL, TOOL, WINDOWS_NOTE};
     vec![json!({
         "name": TOOL,
         "description": format!(
@@ -1202,13 +1202,17 @@ fn placeholder_tools() -> Vec<Value> {
              environment, such as GH_TOKEN. Where a command sends a placeholder in a \
              request's Authorization header (a token, a bearer token, or the password of \
              git's basic authentication) to one of the audiences, this device's egress proxy \
-             swaps the secret's value in, inside TLS it terminates for that host. Sent \
-             anywhere else, or in a URL, another header or a body, it goes out as itself and \
-             carries nothing. audience is the origin the value goes to, as the secret's \
-             audiences name it (https://host[:port]), or a list of up to {MAX_AUDIENCES}: gh \
-             sends one token to https://api.github.com and, through git, to \
-             https://github.com. The placeholders work for ttl_s seconds ({MIN_TTL} to \
-             {MAX_TTL}). A person approves every call."
+             swaps the secret's value in, inside TLS it terminates for that host. For AWS, \
+             set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and any AWS_SESSION_TOKEN to one \
+             secret's access_key_id, secret_access_key and session_token, toward the AWS \
+             endpoints the secret names: the aws CLI signs with the placeholders, and the \
+             proxy checks that signature and signs the request again with the values. Sent \
+             anywhere else, or in a URL, another header or a body, a placeholder goes out as \
+             itself and carries nothing. audience is the origin the value goes to, as the \
+             secret's audiences name it (https://host[:port]), or a list of up to \
+             {MAX_AUDIENCES}: gh sends one token to https://api.github.com and, through git, \
+             to https://github.com. The placeholders work for ttl_s seconds ({MIN_TTL} to \
+             {MAX_TTL}). A person approves every call.{WINDOWS_NOTE}"
         ),
         "inputSchema": {
             "type": "object",

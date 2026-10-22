@@ -606,10 +606,11 @@ pub struct AgentConfig {
     /// FR-90 P3b-1b-2 — run every agent session on this device in Claude
     /// Code's sandbox, its commands' connections sent through the session's
     /// egress proxy, each host decided by the organization's vault
-    /// (`net:egress`; decisions 27 and 28). Only beside `vault_enabled`, and
-    /// not on Windows before P3b-5. Default OFF, and never pushable: whether
-    /// a session here reaches the network only as the vault decides is the
-    /// owner's call.
+    /// (`net:egress`; decisions 27 and 28). Only beside `vault_enabled`. On
+    /// Windows, where no sandbox runs, every session gets the proxy named in
+    /// its environment, advisory (P3b-5-1, decision 30). Default OFF, and
+    /// never pushable: whether a session here reaches the network only as
+    /// the vault decides is the owner's call.
     #[serde(default)]
     pub hive_egress: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to

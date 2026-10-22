@@ -1075,7 +1075,8 @@ when { ["file", "env", "exec", "raw"].contains(context.mode) };     // prod neve
 
 forbid (principal, action == Roomler::Action::"secret:use", resource)
 when { principal has device && principal.device.os == "windows"
-       && context.mode != "proxy" };                                  // no Claude Code sandbox there
+       && !["proxy", "placeholder"].contains(context.mode) };       // no Claude Code sandbox there
+                                                    // (`placeholder`: decision 30, FR-90 P3b-5-1)
 
 forbid (principal in Roomler::Role::"reviewer",
         action in [Roomler::Action::"secret:use", Roomler::Action::"secret:read",

@@ -395,10 +395,10 @@ pub struct SettingsSpec {
     pub api_key_helper: Option<String>,
     /// The session's memory snapshot directory (design §10.3).
     pub auto_memory_directory: Option<PathBuf>,
-    /// The session's egress proxy and its cache, when the sandbox is on
-    /// (Linux, macOS, WSL2): FR-90 P3b-1b-2, where the owner turned on
-    /// `hive_egress`.
-    pub sandbox_proxy: Option<SandboxProxy>,
+    /// The session's egress proxy, where the owner turned on `hive_egress`:
+    /// the sandbox holding its commands to it (Linux, macOS, WSL2: FR-90
+    /// P3b-1b-2), or their environment naming it (native Windows: P3b-5-1).
+    pub egress: Option<EgressProxy>,
     /// Paths the model's Read tool must not open, beyond the defaults.
     pub extra_read_denies: Vec<String>,
     /// FR-90 P2e-7 — the command a `SessionStart` hook runs on a resume, and
@@ -422,6 +422,16 @@ pub struct SettingsSpec {
     pub ask_tools: Vec<String>,
 }
 
+/// FR-90 P3b-5-1 — how a session's commands reach its egress proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressProxy {
+    /// Held to it by Claude Code's sandbox (Linux, macOS, WSL2): P3b-1b-2.
+    Sandboxed(SandboxProxy),
+    /// Named to them by their environment alone, on native Windows, where
+    /// no sandbox runs (decision 30): P3b-5-1.
+    Advisory(AdvisoryProxy),
+}
+
 /// Where the sandbox sends sandboxed commands' traffic, and (FR-90 P3b-1b-2)
 /// where they keep what their package managers cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +446,45 @@ pub struct SandboxProxy {
     /// trust variable.
     pub trust: Option<Trust>,
 }
+
+/// FR-90 P3b-5-1 — the session's egress proxy as its environment names it,
+/// where no sandbox holds its commands to it (native Windows: decision 30).
+/// Claude Code follows the same variables for its own traffic (decision 35),
+/// and proxies nothing on loopback, its model route included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisoryProxy {
+    pub http_port: u16,
+    pub socks_port: u16,
+    /// As a sandboxed session's ([`SandboxProxy::trust`]).
+    pub trust: Option<Trust>,
+}
+
+/// FR-90 P3b-5-1 — the variables that name the HTTP front, for HTTPS and
+/// HTTP alike. One spelling: Windows' variables have no case.
+pub const PROXY_VARS: &[&str] = &["HTTPS_PROXY", "HTTP_PROXY"];
+
+/// FR-90 P3b-5-1 — the variable that names the SOCKS5 front, the proxy
+/// resolving (`socks5h`): for a tool that reads no other. Claude Code does
+/// not.
+pub const SOCKS_VAR: &str = "ALL_PROXY";
+
+/// FR-90 P3b-5-1 — loopback, never proxied: the proxy dials none of it.
+pub const NO_PROXY: (&str, &str) = ("NO_PROXY", "localhost,127.0.0.1,::1");
+
+/// FR-90 P3b-5-1 — Claude Code's own traffic that is not the session's work
+/// (telemetry, error reports, update checks), turned off where that traffic
+/// would pass the session's egress proxy (decision 35), so the vault is not
+/// asked about it.
+pub const QUIET_VAR: (&str, &str) = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+
+/// FR-90 P3b-5-1 — git held to OpenSSL, which reads `GIT_SSL_CAINFO`: on
+/// Windows its other backend, Schannel, reads the Windows store alone.
+/// Written beside the bundle, never without it.
+pub const GIT_OPENSSL: &[(&str, &str)] = &[
+    ("GIT_CONFIG_COUNT", "1"),
+    ("GIT_CONFIG_KEY_0", "http.sslBackend"),
+    ("GIT_CONFIG_VALUE_0", "openssl"),
+];
 
 /// FR-90 P3b-3b — where a sandboxed session's trust lies, as files.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,41 +604,77 @@ impl SettingsSpec {
         // sandbox that comes on, ours or the user's, would take Bash out of
         // the approvals. In a Hive session a person decides.
         doc["sandbox"] = json!({"autoAllowBashIfSandboxed": false});
-        if let Some(p) = &self.sandbox_proxy {
-            let sandbox = &mut doc["sandbox"];
-            sandbox["enabled"] = json!(true);
-            // P3b-1b-2 — a host where the sandbox cannot run refuses the start
-            // rather than run the session unsandboxed (decision 28), and no
-            // command retries outside it. The second also makes the sandbox
-            // admin-required: a repository's own settings cannot loosen it
-            // (Claude Code 2.1.285 and later, which the daemon holds to).
-            sandbox["failIfUnavailable"] = json!(true);
-            sandbox["allowUnsandboxedCommands"] = json!(false);
-            sandbox["network"] =
-                json!({"httpProxyPort": p.http_port, "socksProxyPort": p.socks_port});
-            // Decision 31 — the working directory, temp, and the session's own
-            // cache: never the home, whose files run code later outside it.
-            sandbox["filesystem"] = json!({
-                "allowWrite": [p.cache.to_string_lossy()],
-                "denyWrite": HOME_DENY_WRITE,
-            });
-            let mut env: serde_json::Map<String, Value> = CACHE_VARS
-                .iter()
-                .map(|(var, sub)| (var.to_string(), json!(p.cache.join(sub).to_string_lossy())))
-                .collect();
-            // P3b-3b — the session's CA, added to Node's roots; the bundle in
-            // place of every other tool's, where there is one.
-            if let Some(t) = &p.trust {
-                env.insert(CA_VAR.into(), json!(t.ca.to_string_lossy()));
-                if let Some(bundle) = &t.bundle {
-                    for var in BUNDLE_VARS {
-                        env.insert((*var).into(), json!(bundle.to_string_lossy()));
+        match &self.egress {
+            Some(EgressProxy::Sandboxed(p)) => sandboxed(&mut doc, p),
+            // P3b-5-1 — no sandbox key: none runs here, and
+            // `failIfUnavailable` would end the session at its start. The
+            // proxy as the environment names it, to the commands and to
+            // Claude Code alike (decision 35).
+            Some(EgressProxy::Advisory(p)) => {
+                let http = format!("http://127.0.0.1:{}", p.http_port);
+                let mut env: serde_json::Map<String, Value> = PROXY_VARS
+                    .iter()
+                    .map(|var| ((*var).to_string(), json!(http)))
+                    .collect();
+                env.insert(
+                    SOCKS_VAR.into(),
+                    json!(format!("socks5h://127.0.0.1:{}", p.socks_port)),
+                );
+                for (var, value) in [NO_PROXY, QUIET_VAR] {
+                    env.insert(var.into(), json!(value));
+                }
+                trust_env(&mut env, p.trust.as_ref());
+                if p.trust.as_ref().is_some_and(|t| t.bundle.is_some()) {
+                    for (var, value) in GIT_OPENSSL {
+                        env.insert((*var).into(), json!(value));
                     }
                 }
+                doc["env"] = Value::Object(env);
             }
-            doc["env"] = Value::Object(env);
+            None => {}
         }
         doc
+    }
+}
+
+/// FR-90 P3b-1b-2 — the sandbox on, holding a session's commands to its
+/// egress proxy, and their caches in its own.
+fn sandboxed(doc: &mut Value, p: &SandboxProxy) {
+    let sandbox = &mut doc["sandbox"];
+    sandbox["enabled"] = json!(true);
+    // P3b-1b-2 — a host where the sandbox cannot run refuses the start rather
+    // than run the session unsandboxed (decision 28), and no command retries
+    // outside it. The second also makes the sandbox admin-required: a
+    // repository's own settings cannot loosen it (Claude Code 2.1.285 and
+    // later, which the daemon holds to).
+    sandbox["failIfUnavailable"] = json!(true);
+    sandbox["allowUnsandboxedCommands"] = json!(false);
+    sandbox["network"] = json!({"httpProxyPort": p.http_port, "socksProxyPort": p.socks_port});
+    // Decision 31 — the working directory, temp, and the session's own cache:
+    // never the home, whose files run code later outside it.
+    sandbox["filesystem"] = json!({
+        "allowWrite": [p.cache.to_string_lossy()],
+        "denyWrite": HOME_DENY_WRITE,
+    });
+    let mut env: serde_json::Map<String, Value> = CACHE_VARS
+        .iter()
+        .map(|(var, sub)| (var.to_string(), json!(p.cache.join(sub).to_string_lossy())))
+        .collect();
+    trust_env(&mut env, p.trust.as_ref());
+    doc["env"] = Value::Object(env);
+}
+
+/// FR-90 P3b-3b — the session's CA, added to Node's roots; the bundle in
+/// place of every other tool's, where there is one.
+fn trust_env(env: &mut serde_json::Map<String, Value>, trust: Option<&Trust>) {
+    let Some(t) = trust else {
+        return;
+    };
+    env.insert(CA_VAR.into(), json!(t.ca.to_string_lossy()));
+    if let Some(bundle) = &t.bundle {
+        for var in BUNDLE_VARS {
+            env.insert((*var).into(), json!(bundle.to_string_lossy()));
+        }
     }
 }
 
@@ -872,7 +957,7 @@ mod tests {
         let doc = SettingsSpec {
             api_key_helper: None,
             auto_memory_directory: None,
-            sandbox_proxy: Some(SandboxProxy {
+            egress: Some(EgressProxy::Sandboxed(SandboxProxy {
                 http_port: 47001,
                 socks_port: 47002,
                 cache: cache_dir_in(&root().join("state")),
@@ -880,7 +965,7 @@ mod tests {
                     ca: ca.clone(),
                     bundle: None,
                 }),
-            }),
+            })),
             extra_read_denies: vec![],
             session_start_hook: None,
             allow_tools: vec![],
@@ -896,12 +981,12 @@ mod tests {
         let none = SettingsSpec {
             api_key_helper: None,
             auto_memory_directory: None,
-            sandbox_proxy: Some(SandboxProxy {
+            egress: Some(EgressProxy::Sandboxed(SandboxProxy {
                 http_port: 47001,
                 socks_port: 47002,
                 cache: cache_dir_in(&root().join("state")),
                 trust: None,
-            }),
+            })),
             extra_read_denies: vec![],
             session_start_hook: None,
             allow_tools: vec![],
@@ -913,12 +998,76 @@ mod tests {
         assert_eq!(env.len(), CACHE_VARS.len(), "the caches alone");
     }
 
+    /// FR-90 P3b-5-1 — on native Windows, the proxy as the environment names
+    /// it: no sandbox key (`failIfUnavailable` would end the session at its
+    /// start) and no cache moved; the HTTP front for HTTPS and HTTP, the
+    /// SOCKS5 one for a tool that reads no other, loopback never proxied,
+    /// Claude Code's non-essential traffic off, the trust as a sandboxed
+    /// session's, and git held to OpenSSL beside the bundle alone.
+    #[test]
+    fn an_advisory_proxy_is_named_by_the_environment_alone() {
+        let ca = root().join("run").join("ca.pem");
+        let bundle = root().join("run").join("ca-bundle.pem");
+        let with = |bundle: Option<PathBuf>| {
+            SettingsSpec {
+                api_key_helper: None,
+                auto_memory_directory: None,
+                egress: Some(EgressProxy::Advisory(AdvisoryProxy {
+                    http_port: 47001,
+                    socks_port: 47002,
+                    trust: Some(Trust {
+                        ca: ca.clone(),
+                        bundle,
+                    }),
+                })),
+                extra_read_denies: vec![],
+                session_start_hook: None,
+                allow_tools: vec![],
+                ask_tools: vec![],
+            }
+            .to_json()
+        };
+        let doc = with(Some(bundle.clone()));
+        assert_eq!(
+            doc["sandbox"],
+            json!({"autoAllowBashIfSandboxed": false}),
+            "no sandbox key: {doc}"
+        );
+        let env = doc["env"].as_object().unwrap();
+        assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:47001");
+        assert_eq!(env["HTTP_PROXY"], "http://127.0.0.1:47001");
+        assert_eq!(env["ALL_PROXY"], "socks5h://127.0.0.1:47002");
+        assert_eq!(env["NO_PROXY"], "localhost,127.0.0.1,::1");
+        assert_eq!(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1");
+        assert_eq!(env[CA_VAR], json!(ca.to_string_lossy()));
+        for var in BUNDLE_VARS {
+            assert_eq!(env[*var], json!(bundle.to_string_lossy()), "{var}");
+        }
+        assert_eq!(env["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(env["GIT_CONFIG_KEY_0"], "http.sslBackend");
+        assert_eq!(env["GIT_CONFIG_VALUE_0"], "openssl");
+        for (var, _) in CACHE_VARS {
+            assert!(!env.contains_key(*var), "{var}: no cache moved");
+        }
+        assert_eq!(
+            env.len(),
+            PROXY_VARS.len() + 3 + 1 + BUNDLE_VARS.len() + GIT_OPENSSL.len(),
+            "{env:?}"
+        );
+        // With no bundle, git keeps its own backend and its own roots.
+        let doc = with(None);
+        let env = doc["env"].as_object().unwrap();
+        assert!(!env.contains_key("GIT_CONFIG_COUNT"), "{env:?}");
+        assert!(!env.contains_key("GIT_SSL_CAINFO"));
+        assert_eq!(env[CA_VAR], json!(ca.to_string_lossy()));
+    }
+
     #[test]
     fn settings_deny_proc_and_carry_the_helper_memory_dir_and_sandbox() {
         let doc = SettingsSpec {
             api_key_helper: Some("roomler hive token --session 6f1c".into()),
             auto_memory_directory: Some(root().join("memory")),
-            sandbox_proxy: Some(SandboxProxy {
+            egress: Some(EgressProxy::Sandboxed(SandboxProxy {
                 http_port: 47001,
                 socks_port: 47002,
                 cache: cache_dir_in(&root().join("state")),
@@ -926,7 +1075,7 @@ mod tests {
                     ca: root().join("run").join("ca.pem"),
                     bundle: Some(root().join("run").join("ca-bundle.pem")),
                 }),
-            }),
+            })),
             extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
             session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
             allow_tools: vec!["mcp__roomler__vault_list".into()],
@@ -1033,7 +1182,7 @@ mod tests {
         let bare = SettingsSpec {
             api_key_helper: None,
             auto_memory_directory: None,
-            sandbox_proxy: None,
+            egress: None,
             extra_read_denies: vec![],
             session_start_hook: None,
             allow_tools: vec![],
