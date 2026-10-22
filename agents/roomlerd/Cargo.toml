@@ -464,6 +464,9 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSEvent",
     "NSFont",
     "NSGraphics",
+    # FR-97 P2e-1 — the clipboard's change gate reads the general pasteboard's
+    # change count (`clipboard::mac_gate`). arboard already compiles it.
+    "NSPasteboard",
     "NSResponder",
     "NSScreen",
     "NSTextField",
@@ -624,7 +627,9 @@ enigo-input = ["dep:enigo", "dep:x11rb"]
 # enabling it here is a no-op on other platforms.
 # FR-97 P3e-3a adds `dep:x11rb` (Linux-only, already in the lockfile): the
 # change gate for an X11 clipboard is XFixes' selection-owner events.
-clipboard = ["dep:arboard", "dep:png", "dep:clipboard-win", "dep:x11rb"]
+# FR-97 P2e-1 adds `dep:objc2` + `dep:objc2-app-kit` (macOS-only, in the
+# lockfile through arboard): a Mac's gate is NSPasteboard's change count.
+clipboard = ["dep:arboard", "dep:png", "dep:clipboard-win", "dep:x11rb", "dep:objc2", "dep:objc2-app-kit"]
 # Enables the Windows viewer-indicator overlay — topmost layered
 # click-through window drawn on the controlled host to signal "someone
 # is watching". Excluded from screen capture via SetWindowDisplayAffinity

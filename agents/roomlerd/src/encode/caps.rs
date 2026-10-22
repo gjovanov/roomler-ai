@@ -649,9 +649,10 @@ pub(crate) struct HostFacts {
     /// Linux: why there is no way to the computer's sound, by the route's own
     /// code ([`linux_audio_refusal`]). `None` elsewhere, and where there is one.
     pub(crate) linux_audio_refusal: Option<crate::audio_source::AudioUnavailableCode>,
-    /// The clipboard watcher reports copied images: Windows, and (FR-97
-    /// P3e-3a) a Linux X11 session whose server takes the change gate
-    /// (`clipboard::x11_gate`); `clipboard::install_watcher` drops image
+    /// The clipboard watcher reports copied images: Windows, (FR-97 P3e-3a)
+    /// a Linux X11 session whose server takes the change gate
+    /// (`clipboard::x11_gate`), and (P2e-1) a Mac, behind its change count
+    /// (`clipboard::mac_gate`); `clipboard::install_watcher` drops image
     /// events elsewhere.
     pub(crate) watches_clipboard_images: bool,
     /// This process has a clipboard to reach at all.
@@ -721,13 +722,18 @@ fn layout_reachable() -> bool {
 }
 
 /// FR-97 P3e-3a — see [`HostFacts::watches_clipboard_images`]. Asks the X
-/// server once (a connection and XFixes' version), for the hello.
+/// server once (a connection and XFixes' version), for the hello. P2e-1 — a
+/// Mac asks only its kill switch.
 fn watches_clipboard_images() -> bool {
     #[cfg(all(target_os = "linux", feature = "clipboard"))]
     {
         crate::clipboard::x11_gate::available()
     }
-    #[cfg(not(all(target_os = "linux", feature = "clipboard")))]
+    #[cfg(all(target_os = "macos", feature = "clipboard"))]
+    {
+        crate::clipboard::mac_gate::available()
+    }
+    #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "clipboard")))]
     {
         cfg!(target_os = "windows")
     }
@@ -3004,7 +3010,13 @@ mod tests {
             f.watches_clipboard_images,
             crate::clipboard::x11_gate::available()
         );
-        #[cfg(not(all(target_os = "linux", feature = "clipboard")))]
+        // FR-97 P2e-1 — on a Mac, wherever its kill switch is on.
+        #[cfg(all(target_os = "macos", feature = "clipboard"))]
+        assert_eq!(
+            f.watches_clipboard_images,
+            crate::clipboard::mac_gate::available()
+        );
+        #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "clipboard")))]
         assert_eq!(f.watches_clipboard_images, cfg!(target_os = "windows"));
         if cfg!(target_os = "windows") {
             assert!(f.layout_reachable && f.layout_switchable);
