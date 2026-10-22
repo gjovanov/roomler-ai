@@ -557,7 +557,8 @@ pub async fn create(
                         .join(", ")
                 )));
             };
-            crate::dynamic::check_audiences(&body.audiences).map_err(ApiError::BadRequest)?;
+            crate::dynamic::check_audiences(Some(p), &body.audiences)
+                .map_err(ApiError::BadRequest)?;
             Some(p.name.to_string())
         }
         (KIND_DYNAMIC, None) => {
@@ -714,11 +715,13 @@ pub async fn update(
     }
 
     let secret = live_secret(&state, tid, id).await?;
-    // P3-6b — a dynamic secret keeps its one audience.
+    // P3-6b — a dynamic secret keeps its one audience; (P3-6e-1) an
+    // `aws_sts` one, its region's STS endpoint.
     if secret.kind == KIND_DYNAMIC
         && let Some(a) = &body.audiences
     {
-        crate::dynamic::check_audiences(a).map_err(ApiError::BadRequest)?;
+        crate::dynamic::check_audiences(crate::dynamic::provider_of(&secret), a)
+            .map_err(ApiError::BadRequest)?;
     }
     let slug = org_slug(&state, tid).await?;
     ask.rrn = Some(secret_rrn(&slug, &secret.path));
