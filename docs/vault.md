@@ -955,7 +955,7 @@ device share): a path could match nothing a device asks for.
 > it out of the allow list is not enough. The session's settings list
 > `vault_exec` and `vault_render` under `permissions.ask`
 > ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L432), written
-> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4914)).
+> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4945)).
 > - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
 >   FR-90 spec's open decision 7), and an allow there would skip the person.
 >   Claude Code reads deny, then ask, then allow, across every settings file,
@@ -969,7 +969,7 @@ device share): a path could match nothing a device asks for.
 | Piece | Where |
 |---|---|
 | the tool | `vault_exec` in [`toolbelt.rs:952`](../agents/roomlerd/src/hive/toolbelt.rs#L952), offered with the reads where the device takes leases, and asked for in the settings |
-| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4417`](../agents/roomlerd/src/hive/supervisor.rs#L4417)); none on Windows |
+| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4448`](../agents/roomlerd/src/hive/supervisor.rs#L4448)); none on Windows |
 | letting go | `Client::release` ([`vault.rs:1146`](../agents/roomlerd/src/vault.rs#L1146)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
@@ -1003,7 +1003,7 @@ sequenceDiagram
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
 | its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272), [`:1153`](../agents/roomlerd/src/vault.rs#L1153) |
 | a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:769`](../agents/roomlerd/src/hive/supervisor.rs#L769), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
-| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4868`](../agents/roomlerd/src/hive/supervisor.rs#L4868) |
+| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4899`](../agents/roomlerd/src/hive/supervisor.rs#L4899) |
 
 > [!WARNING]
 > - **`file` is a materializing mode** (design §8.5). The session's account
@@ -1054,7 +1054,7 @@ sequenceDiagram
 | the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:102`](../agents/roomlerd/src/hive/vault_request.rs#L102), [`vault.rs:159`](../agents/roomlerd/src/vault.rs#L159) |
 | its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:1182`](../agents/roomlerd/src/vault.rs#L1182), [`vault_exec.rs:616`](../agents/roomlerd/src/hive/vault_exec.rs#L616), the lookup both tools share (`leased_values`, P3-6b-2b) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:293`](../agents/roomlerd/src/hive/vault_render.rs#L293) |
-| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4895`](../agents/roomlerd/src/hive/supervisor.rs#L4895) |
+| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4926`](../agents/roomlerd/src/hive/supervisor.rs#L4926) |
 
 > [!IMPORTANT]
 > **A use takes the lease by what it is, not by its id.** The design had the
@@ -2531,7 +2531,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:228`](../agents/roomlerd/src/hive/egress.rs#L228)), `drop_run` ([`:291`](../agents/roomlerd/src/hive/egress.rs#L291)), a connection ([`carry`, `:347`](../agents/roomlerd/src/hive/egress.rs#L347)), the decision kept per run ([`decided`, `:440`](../agents/roomlerd/src/hive/egress.rs#L440)), `dialable` ([`:630`](../agents/roomlerd/src/hive/egress.rs#L630)), what is kept ([`decision_of`, `:709`](../agents/roomlerd/src/hive/egress.rs#L709)) |
+| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:234`](../agents/roomlerd/src/hive/egress.rs#L234)), `drop_run` ([`:305`](../agents/roomlerd/src/hive/egress.rs#L305)), a connection ([`carry`, `:361`](../agents/roomlerd/src/hive/egress.rs#L361)), the decision kept per run ([`decided`, `:454`](../agents/roomlerd/src/hive/egress.rs#L454)), `dialable` ([`:644`](../agents/roomlerd/src/hive/egress.rs#L644)), what is kept ([`decision_of`, `:723`](../agents/roomlerd/src/hive/egress.rs#L723)) |
 | the ask | the lease client's `egress` ([`vault.rs:909`](../agents/roomlerd/src/vault.rs#L909)) and `on_egress_allowed` ([`:1107`](../agents/roomlerd/src/vault.rs#L1107)), which refuses an allow for anything but what was asked |
 | the run's | P3b-1b-2, below: started before the harness, so its ports are in the settings, and stopped with the run |
 
@@ -2631,6 +2631,49 @@ sequenceDiagram
 |---|---|
 | the call, the placeholder, the run's registry | [`hive/placeholder.rs`](../agents/roomlerd/src/hive/placeholder.rs) |
 | the run's end taking them | `unlive` in [`hive/supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs) |
+
+### The session's CA and its trust (P3b-3b)
+
+The egress proxy will terminate TLS for an audience host of a placeholder
+the session holds (P3b-3c), and only for one. It does so under a CA of the
+session's own, which the session's tools are told to trust. P3b-3b builds
+the CA and the trust. Nothing is terminated yet.
+
+```mermaid
+sequenceDiagram
+    participant D as roomlerd
+    participant P as the run's egress proxy
+    participant S as the session (its settings, its tools)
+    D->>P: start the run's proxy
+    P->>P: a CA of the run's own, ECDSA P-256, its key in memory only
+    D->>S: ca.pem and ca-bundle.pem beside the session's settings
+    D->>S: settings env naming them
+    Note over P,S: P3b-3c: a leaf per audience host, presented to the session's tools
+```
+
+| Piece | What holds |
+|---|---|
+| the CA | ECDSA P-256, made with each run's proxy, its key in daemon memory only, never written: a new run, a new CA. A CA for one level, signing certificates and CRLs only, named for its session, valid from an hour before it was made for 400 days |
+| a leaf | made for a host when first asked for, and kept for the run, at most 64. ECDSA P-256, the host its one subject alternative name (a DNS name or an IP address), for server authentication only, valid from an hour before it was made for 30 days, and made again a day before that ends |
+| `ca.pem` | the CA alone, named by `NODE_EXTRA_CA_CERTS`, which ADDS it to Node's roots |
+| `ca-bundle.pem` | the system's roots, then the CA, named by `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `AWS_CA_BUNDLE` and `GIT_SSL_CAINFO`, which REPLACE a tool's roots: so every host the tool trusted, it still trusts |
+
+> [!WARNING]
+> - **No system trust store is ever changed.** An EDR flags it, and it
+>   would trust the CA for every process on the device. Only the session's
+>   own tools are told of it, through its settings.
+> - **With no system root to read, no bundle.** A bundle of the CA alone
+>   would make every tool that reads one refuse every other host, so then
+>   only `NODE_EXTRA_CA_CERTS`, which adds, is set.
+> - **The CA signs a leaf for whatever host it is asked.** What decides
+>   that a host is terminated at all is the proxy (P3b-3c), and only for an
+>   audience of a placeholder the session holds.
+
+| Piece | Where |
+|---|---|
+| the CA, its leaves, the bundle | [`hive/egress/ca.rs`](../agents/roomlerd/src/hive/egress/ca.rs) |
+| the run's CA, made and dropped with its proxy | `start_admitting`, `ca_of` in [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs) |
+| the files and the variables | `write_trust` in [`hive/supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs); `Trust`, `CA_VAR`, `BUNDLE_VARS` in [`launch.rs`](../crates/hive-node/src/launch.rs) |
 
 ## 25. Audit
 
