@@ -81,6 +81,11 @@
 mod checkpointer;
 #[cfg(unix)]
 mod child;
+/// FR-90 P3b-1b-1 — a session's egress proxy: the fronts Claude Code's
+/// sandbox sends its commands through, each host decided by the vault. No
+/// run starts one before P3b-1b-2.
+#[cfg(feature = "vault")]
+pub mod egress;
 pub mod framing;
 pub mod gates;
 mod hosted;

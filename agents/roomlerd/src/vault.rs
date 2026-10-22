@@ -418,6 +418,19 @@ mod client {
         })
     }
 
+    /// FR-90 P3b-1b-1 — what a session's egress proxy asks (`rc:vault.egress`,
+    /// decision 27): may this run's commands reach `host:port`? `host` in its
+    /// one spelling ([`canonical_net_host`]): the proxy asks in no other, and
+    /// an answer naming any other is refused here.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct EgressAsk {
+        pub session_id: ObjectId,
+        /// The fence the session runs at here.
+        pub fence: u64,
+        pub host: String,
+        pub port: u16,
+    }
+
     /// FR-90 P3-8-2b — what a session asks for to run one command on
     /// another device of its organization over Roomler SSH (`rc:vault.ssh`).
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +562,11 @@ mod client {
         Ssh {
             reply: oneshot::Sender<Result<SshTicket, LeaseError>>,
         },
+        /// FR-90 P3b-1b-1.
+        Egress {
+            ask: EgressAsk,
+            reply: oneshot::Sender<Result<(), LeaseError>>,
+        },
     }
 
     impl Waiting {
@@ -568,6 +586,9 @@ mod client {
                     let _ = reply.send(Err(why));
                 }
                 Self::Ssh { reply } => {
+                    let _ = reply.send(Err(why));
+                }
+                Self::Egress { reply, .. } => {
                     let _ = reply.send(Err(why));
                 }
             }
@@ -881,6 +902,24 @@ mod client {
             self.wait(&req_id, answer, ANSWER_DEADLINE).await
         }
 
+        /// FR-90 P3b-1b-1 — ask the vault whether a session's commands may
+        /// reach one host through its egress proxy (`rc:vault.egress`). The
+        /// vault decides by its policies (`net:egress`); `Ok` is its allow,
+        /// for exactly what was asked.
+        pub async fn egress(&self, ask: EgressAsk) -> Result<(), LeaseError> {
+            let req_id = new_req_id();
+            let frame = ClientMsg::VaultEgress {
+                req_id: req_id.clone(),
+                session_id: ask.session_id,
+                fence: ask.fence,
+                host: ask.host.clone(),
+                port: ask.port,
+            };
+            let (reply, answer) = oneshot::channel();
+            self.send(&req_id, frame, Waiting::Egress { ask, reply })?;
+            self.wait(&req_id, answer, ANSWER_DEADLINE).await
+        }
+
         /// FR-90 P3-8-2b — ask the vault for a ticket to run one command on
         /// another device (`rc:vault.ssh`). The vault decides Cedar's
         /// `ssh:run` for the account the target's policy maps, and answers
@@ -1059,6 +1098,35 @@ mod client {
                 }
                 Some(other) => other.fail(LeaseError::NoAnswer),
                 None => debug!(req_id, ticket_id, "vault: a ticket nobody here waits for"),
+            }
+        }
+
+        /// FR-90 P3b-1b-1 — `rc:vault.egress.allowed`: answer the request, if
+        /// the allow names exactly the host and port asked, in the vault's
+        /// one spelling.
+        pub fn on_egress_allowed(&self, req_id: &str, host: &str, port: u16) {
+            match lock(&self.pending).remove(req_id) {
+                Some(Waiting::Egress { ask, reply }) => {
+                    let allowed = if canonical_net_host(&ask.host).as_deref() == Some(host)
+                        && port == ask.port
+                    {
+                        Ok(())
+                    } else {
+                        warn!(
+                            req_id,
+                            host,
+                            port,
+                            "vault: an egress allow for something other than was asked — refused"
+                        );
+                        Err(LeaseError::NotAsked)
+                    };
+                    let _ = reply.send(allowed);
+                }
+                Some(other) => other.fail(LeaseError::NoAnswer),
+                None => debug!(
+                    req_id,
+                    host, port, "vault: an egress allow nobody here waits for"
+                ),
             }
         }
 
@@ -1346,6 +1414,16 @@ mod client {
         CLIENT.ssh(ask).await
     }
 
+    /// FR-90 P3b-1b-1 — the daemon's [`Client::egress`].
+    pub async fn egress(ask: EgressAsk) -> Result<(), LeaseError> {
+        CLIENT.egress(ask).await
+    }
+
+    /// FR-90 P3b-1b-1 — the daemon's [`Client::on_egress_allowed`].
+    pub fn on_egress_allowed(req_id: &str, host: &str, port: u16) {
+        CLIENT.on_egress_allowed(req_id, host, port);
+    }
+
     /// FR-90 P3-8-2b — the daemon's [`Client::on_ssh_granted`].
     pub fn on_ssh_granted(
         req_id: &str,
@@ -1480,8 +1558,8 @@ mod tests {
         use tokio::sync::mpsc;
 
         use super::super::{
-            Client, Holder, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant, PersonAsk,
-            Report, SshAsk, SshTicket, hello_key,
+            Client, EgressAsk, Holder, LeaseAsk, LeaseError, LeaseInfo, Listing, NetAsk, NetGrant,
+            PersonAsk, Report, SshAsk, SshTicket, hello_key,
         };
         use crate::vault_proxy::testing::{FakeIssuer, fake_issuer, fake_k8s, fake_mysql, made};
 
@@ -1732,6 +1810,66 @@ mod tests {
             })
             .await;
             assert_eq!(refused, Err(LeaseError::Refused("no_exit".into())));
+        }
+
+        /// FR-90 P3b-1b-1 — ask whether a session's commands may reach a host
+        /// and answer the `rc:vault.egress` it sends with `answer`; the
+        /// asker's result.
+        async fn egress_as(
+            c: &Arc<Client>,
+            rx: &mut mpsc::Receiver<ClientMsg>,
+            ask: EgressAsk,
+            answer: impl FnOnce(&Client, &str),
+        ) -> Result<(), LeaseError> {
+            let asker = {
+                let c = c.clone();
+                tokio::spawn(async move { c.egress(ask).await })
+            };
+            let req_id = match rx.recv().await.unwrap() {
+                ClientMsg::VaultEgress {
+                    req_id,
+                    fence,
+                    host,
+                    port,
+                    ..
+                } => {
+                    assert_eq!((fence, host.as_str(), port), (3, "pypi.org", 443));
+                    req_id
+                }
+                other => panic!("{other:?}"),
+            };
+            answer(c.as_ref(), &req_id);
+            asker.await.unwrap()
+        }
+
+        /// FR-90 P3b-1b-1 — a session's egress proxy asks with
+        /// `rc:vault.egress`, naming the host and port, and the allow comes
+        /// back to its asker only for exactly those: another host or port is
+        /// refused here, never used. A refusal answers in the vault's word.
+        #[tokio::test]
+        async fn an_egress_allow_comes_back_only_for_what_was_asked() {
+            let (c, mut rx) = connected();
+            let ask = || EgressAsk {
+                session_id: ObjectId::new(),
+                fence: 3,
+                host: "pypi.org".into(),
+                port: 443,
+            };
+            let allowed = egress_as(&c, &mut rx, ask(), |c, id| {
+                c.on_egress_allowed(id, "pypi.org", 443)
+            })
+            .await;
+            assert_eq!(allowed, Ok(()));
+            for (host, port) in [("evil.example", 443), ("pypi.org", 80), ("PyPI.org", 443)] {
+                let got = egress_as(&c, &mut rx, ask(), |c, id| {
+                    c.on_egress_allowed(id, host, port)
+                })
+                .await;
+                assert_eq!(got, Err(LeaseError::NotAsked), "{host}:{port}");
+            }
+            let refused =
+                egress_as(&c, &mut rx, ask(), |c, id| c.on_refused(id, "denied", None)).await;
+            assert_eq!(refused, Err(LeaseError::Refused("denied".into())));
         }
 
         /// FR-90 P3-8-2b — ask for a ticket and answer the `rc:vault.ssh` it
