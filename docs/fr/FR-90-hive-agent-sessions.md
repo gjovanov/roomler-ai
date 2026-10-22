@@ -2837,6 +2837,61 @@ sequenceDiagram
 - `ssh_run`;
 - `fleet_exec`, with a person approving every call.
 
+**P3b-4, AWS, as designed (P3b-4-0).** AWS signs a request with the secret key, by SigV4, and
+sends the key itself nowhere: the `Authorization` header carries the access key's id in
+`Credential=` and an HMAC over the request in `Signature=`. A placeholder swapped into that header
+(P3b-3c-1) would only break the signature, so P3b-3c-1 leaves AWS's signatures as they are. P3b-4
+signs them again: the session's `aws` signs with the placeholder pair, the proxy checks that
+signature with the secret key's placeholder, and signs the same request again with the value.
+
+```mermaid
+sequenceDiagram
+    participant S as the session's aws
+    participant P as the run's egress proxy
+    participant L as the daemon's leases
+    participant A as AWS (an endpoint the secret names)
+    S->>P: CONNECT sts.amazonaws.com:443, terminated as for any audience
+    S->>P: a request signed with the placeholder pair, Credential naming the access key's placeholder
+    P->>P: the pair, by the secret's fields, toward this audience (decision 33)
+    P->>P: the body's hash, from x-amz-content-sha256 or read whole, bounded
+    P->>P: the signature checked with the secret key's placeholder
+    alt it does not verify, or a request P3b-4 does not sign again
+        P-->>S: refused, and never sent
+    else verified
+        P->>L: the access key, the secret key and any session token, read now
+        P->>P: Credential's access key and the token swapped, the request signed again
+        P->>A: the request, signed with the value
+        A-->>S: the response, as it came
+    end
+```
+
+| Piece | Design |
+|---|---|
+| which requests | one whose `Authorization` is `AWS4-HMAC-SHA256 Credential=<id>/<date>/<region>/<service>/aws4_request, SignedHeaders=…, Signature=…`, its `<id>` a placeholder this connection's audience holds. Any other goes on as P3b-3c-1 sends it |
+| the pair | decision 33: by the secret's fields, the names P3-6e gives AWS's (`access_key_id`, `secret_access_key`, `session_token`). A binding records its secret and field; the access key's placeholder names its binding, and that secret's `secret_access_key` binding toward the same audience signs. A `session_token` binding, where there is one, is `X-Amz-Security-Token`'s |
+| the body's hash | the value of `x-amz-content-sha256` where the request carries one (S3): a hex digest, `UNSIGNED-PAYLOAD` or `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, the body going on as it came. Where it carries none, the body read whole and hashed, up to 8 MiB |
+| the check | the canonical request rebuilt from the request as it came (its path encoded once for S3 and twice for every other service, as SigV4 says), the string to sign from its `X-Amz-Date` and scope, and the signature computed with the secret key's placeholder as the key. It must equal `Signature=`, compared in constant time |
+| signed again | the token's placeholder swapped in `X-Amz-Security-Token`, the canonical request rebuilt where that header is signed, the signature computed with the secret key's value, and `Credential=` given the access key's value. Nothing else changes: the date, the scope, the signed headers and their values go on as they came |
+| a signed header | goes on as it came. One the proxy would drop (a hop-by-hop header) refuses the request, which is never sent; `Expect`, where it is signed, stays |
+| refused | signed chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, with or without a trailer), whose every chunk's signature chains from the header's; SigV4A (`AWS4-ECDSA-P256-SHA256`); a body past 8 MiB with no `x-amz-content-sha256`; a check that fails. A presigned URL carries the placeholder's id in its query, and the URL is never swapped: AWS refuses it |
+| its audiences | decision 34: origins, as every placeholder's, each endpoint the secret names |
+| the code | SigV4 in the daemon, the canonical request and the signing key's HMAC chain, checked against AWS's own published examples. P3-6e-2's minter takes the same code where decision 21 puts it on the device |
+
+- ⚠️ **The check is not the gate.** A session holding the placeholder pair can sign whatever it
+  likes, as it could with the key; the audience (the endpoints the secret names) and AWS's own
+  policies on the key are what bound it. What the check buys is a refusal with a reason where the
+  proxy's canonical request and the SDK's part ways, instead of AWS's `SignatureDoesNotMatch`
+  after a request went out signed with the value.
+- ⚠️ **The secret key never leaves the daemon.** AWS sees a signature by the key, and an HMAC tells
+  nothing of its key. CloudTrail records the access key's real id, as for any request the key
+  signs.
+- ⚠️ **Nothing a signature covers is changed but what is signed again.** A proxy that dropped or
+  rewrote a signed header would hand AWS a request that no longer matches its signature, so P3b-4
+  refuses such a request rather than send it.
+- **Not in P3b-4:** signed chunks; SigV4A; presigned URLs; a placeholder in a credential file or a
+  profile (`~/.aws`): the variables alone; a dynamic `aws_sts` secret, which `dynamic-only-short-lived`
+  already keeps from placeholder mode.
+
 **P3's steps.** Each is a PR behind its kill switch; §4 tracks them.
 
 | Step | Builds | Kill switch | Criteria |
@@ -2921,7 +2976,9 @@ sequenceDiagram
 | P3b-3b | the per-session CA and its trust: an ECDSA P-256 CA made at each start, its key in daemon memory only, a leaf per host kept for the run, and the bundle (the system's roots and the CA) the session's settings `env` names | device `hive_egress = false` | — |
 | P3b-3c-1 | TLS termination for an audience host of a placeholder the session holds, only where the names agree (the CONNECT's, the hello's, each request's `Host`, the one the upstream proved); the swap, in `Authorization` alone (decision 32) | device `hive_egress = false`; no placeholder is bound before P3b-3c-2 | — |
 | P3b-3c-2 | the tool offered, asked of a person on every call; one placeholder toward several audiences of its secret (`gh` sends one token to `api.github.com` and, through git, to `github.com`) | device `hive_egress = false`; `vault.placeholder` | AC14 (`gh`) |
-| P3b-4 | AWS: a SigV4 signature checked, then signed again with the value | the same | AC14 (`aws`) |
+| P3b-4-0 | AWS's design (§3e "P3b-4, AWS, as designed"), and decisions 33 and 34 | docs only | — |
+| P3b-4-1 | SigV4: the canonical request, the signing key, the signature, checked against AWS's own published examples; no caller | the `vault` feature in no release build; no caller | — |
+| P3b-4-2 | AWS signed again: a binding's secret and field, the pair by decision 33, the body's hash, the check, the new signature, and the refusals | device `hive_egress = false`; `vault.placeholder` | AC14 (`aws`) |
 | P3b-5 | Windows, as decision 30 says: today `guardrail:windows-proxy-only` refuses the mode there | the same | — |
 
 ### 3f. The brain
@@ -3296,7 +3353,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3b-3a | the placeholder, with no caller (`docs/vault.md` §24, "The placeholder"): no tool offers `vault_placeholder` before P3b-3c, when the proxy swaps its value in. A call names its variables, each a secret (`env`, 1 to 8 `NAME: handle`), and the origin the values go to (`audience`, its host in its one spelling); each variable is its own lease in `placeholder` mode toward it, one asked for ahead taken as it is, and its own placeholder, `rph_` and 32 base32 characters from the OS CSPRNG. The placeholders are bound to the run and the audience's host and port, for the proxy to read, and go when their lease is let go or the run ends, at most 64 at once; a refusal lets go of the leases the call took. As built, the call is `{env, audience, ttl_s}` rather than the design's `{handle, audience}`: it names the variables to set, as `vault_exec` does | the `vault` feature in no release build; no caller | **merged** #2730 `52fddc854` |
 | P3b-3b | the session's CA and its trust (`docs/vault.md` §24, "The session's CA and its trust"), with nothing terminated yet (P3b-3c is the first). Each run's egress proxy makes a CA of its own as it starts, ECDSA P-256, its key in daemon memory only and gone with the run: a CA for one level, valid from an hour before for 400 days, which signs a leaf per host when asked (ECDSA P-256, the host its one name, server authentication only, 30 days, made again a day before its end; at most 64 a run). The session's settings name its trust: `ca.pem` for `NODE_EXTRA_CA_CERTS`, which adds it to Node's roots, and `ca-bundle.pem` (the system's roots, then the CA) for `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `AWS_CA_BUNDLE` and `GIT_SSL_CAINFO`, which replace a tool's roots. With no system root to read there is no bundle, and only the variable that adds is set. No system trust store is changed | device `hive_egress = false` | **merged** #2731 `ac235cdf5` |
 | P3b-3c-1 | termination and the swap, with no caller (`docs/vault.md` §24, "The swap"). TLS is terminated only on a connection to a host the run holds a placeholder for, and only where the names agree: the CONNECT's, the hello's, each request's `Host`, and the one the upstream proved. The audience is verified against this device's roots before the client is told it is through, else refused `502`, with nothing decrypted. A hello that names another host, offers no HTTP/1.1, or is no TLS hello at all is carried as it came, on a new dial. The swap is in `Authorization` alone, as written and inside `Basic`'s credentials, each value read from its lease as its request goes (decision 32, built as recommended, pending the operator's word): never the URL, another header or the body, nor an AWS signature, which P3b-4 signs again. A request for another host is `421`, and a value no header can carry refuses its request | device `hive_egress = false`; no placeholder is bound before P3b-3c-2 | **merged** #2732 `0a8689e04` |
-| P3b-3c-2 | the tool (`docs/vault.md` §24, "The tool, and its audiences"). `vault_placeholder` is offered only where the run's egress proxy serves the session, which the toolbelt reads from the proxy itself, and the vault is offered; the session's settings ask a person on every call. `audience` is an origin or a list of up to 4: each variable takes one lease per audience, and one placeholder is bound toward every audience with that audience's lease, so a lease let go takes its own binding alone. `vault_request` takes mode `placeholder`, toward an origin in the one spelling the call asks in, and refuses a dynamic secret there | device `hive_egress = false`; `vault.placeholder` | **in review** |
+| P3b-3c-2 | the tool (`docs/vault.md` §24, "The tool, and its audiences"). `vault_placeholder` is offered only where the run's egress proxy serves the session, which the toolbelt reads from the proxy itself, and the vault is offered; the session's settings ask a person on every call. `audience` is an origin or a list of up to 4: each variable takes one lease per audience, and one placeholder is bound toward every audience with that audience's lease, so a lease let go takes its own binding alone. `vault_request` takes mode `placeholder`, toward an origin in the one spelling the call asks in, and refuses a dynamic secret there | device `hive_egress = false`; `vault.placeholder` | **merged** #2733 `2e302f6e5` |
+| P3b-4-0 | AWS's design (§3e "P3b-4, AWS, as designed"), docs only. The proxy checks a session's SigV4 signature, made with the placeholder pair, and signs the same request again with the value. The pair is found by the secret's fields (decision 33), and AWS's endpoints are origins like every audience (decision 34). The body's hash comes from `x-amz-content-sha256`, or the body is read whole up to 8 MiB. Signed chunks, SigV4A and presigned URLs are refused, and no signed header is changed but what is signed again | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -4080,6 +4138,45 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: any audience that keeps what it is sent hands the value back to the session.
     - *Built in P3b-3c-1 as recommended, pending the operator's word.* A wider answer changes
       `swap` and `swap_authorization` (`agents/roomlerd/src/hive/egress/swap.rs`) and their tests.
+33. **How the proxy pairs an AWS key** (P3b-4), for the operator to confirm (posted in step 218).
+    SigV4 names the access key's id in `Credential=` and signs with the secret key, which the
+    request never carries. From the access key's placeholder alone, the proxy must find the secret
+    key's placeholder, to check the session's signature with, and the secret key's value, to sign
+    again.
+    - *Recommended: by the secret's fields.* A binding records its secret and field. The access
+      key's placeholder names its binding, and the same secret's `secret_access_key` binding
+      toward the same audience is its pair; `session_token`'s, where there is one, is the security
+      token's. The names are the ones P3-6e gives AWS's fields, so one secret serves `vault_exec`
+      and a placeholder alike.
+      - What it costs: an AWS secret must name its fields so.
+    - *Or: by the variables' names* (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+      `AWS_SESSION_TOKEN`) within one call.
+      - What it costs: the pair is whatever the call put under those names, another secret's
+        field included; and a call that sets them under other names never pairs.
+    - *Or: a tool shape of its own* (`vault_placeholder` naming an AWS secret, the three variables
+      set by the tool).
+      - What it costs: a second shape for one tool, for one provider.
+    - *Built in P3b-4-2 as recommended, pending the operator's word.*
+34. **AWS's audiences** (P3b-4), for the operator to confirm (posted in step 218). AWS answers on
+    many hosts: one per service and region (`sts.eu-central-1.amazonaws.com`,
+    `ec2.us-east-1.amazonaws.com`), and for S3 one per bucket where a request names its bucket in
+    the host. A placeholder's audience is one exact origin, held to the secret's `audiences`
+    exactly by `placeholder-only-named-audiences` (P3b-2).
+    - *Recommended: origins, as every placeholder's.* The secret names each endpoint its sessions
+      may reach, and a session names the ones it needs, up to 4 a call. S3 is reached by path (its
+      `addressing_style`), its regional endpoint one origin, or each bucket's own host one origin
+      each.
+      - What it costs: an administrator lists endpoints, and a session that reaches more than four
+        makes more than one call.
+    - *Or: a host pattern* (`https://*.amazonaws.com`) in the secret's audiences, for placeholder
+      mode alone, matched by the vault's guardrail and the proxy alike.
+      - What it costs: the value signs any request toward any host under the pattern, an
+        attacker's own bucket or API Gateway among them. Such a host gets a request signed by the
+        key, never the key: a signature covers its own host, service and region, and AWS refuses
+        it anywhere else. But a pattern undoes what a secret's audiences exist to narrow.
+    - *Built in P3b-4-2 as recommended, pending the operator's word.* A pattern changes
+      `placeholder-only-named-audiences` (`crates/modules/vault/src/policy.rs`) and
+      `placeholder::bound`.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
