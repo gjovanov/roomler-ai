@@ -11,8 +11,8 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:125-146`) persisted to
-`<log_dir>/last-install.json` (`post_install.rs:161`).
+InstallerFailed | Timeout`, `post_install.rs:129-150`) persisted to
+`<log_dir>/last-install.json` (`post_install.rs:165`).
 
 Measured on the fleet:
 
@@ -32,8 +32,8 @@ updates, and not one recorded an outcome.
 `Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2207`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
-(`post_install.rs:221`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:654-679`).
+(`post_install.rs:225`), polling `kill(pid, 0)` for up to 600 s
+(`post_install.rs:997-1022`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
@@ -55,9 +55,9 @@ mostly moot. Fixing (2) alone would be building a systemd mechanism to support a
 wait that should not exist.
 
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
-(`post_install.rs:175`) has **zero callers**. The module doc's claim that "the new
+(`post_install.rs:179`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:80-81`, echoed at `:10`, `:110`, `docs/remote-control.md:1256`)
+(`post_install.rs:84-85`, echoed at `:10`, `:114`, `docs/remote-control.md:1256`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it.
 
@@ -197,7 +197,7 @@ sequenceDiagram
 
 ## Out of scope
 
-- A Unix `ensure_service_running` equivalent (`post_install.rs:467`). Windows needs
+- A Unix `ensure_service_running` equivalent (`post_install.rs:549`). Windows needs
   it because the SCM does not auto-restart; Linux has `Restart=always` +
   `RestartPreventExitStatus=7 8`, and a watcher running `systemctl start` would
   fight the supervisor.
