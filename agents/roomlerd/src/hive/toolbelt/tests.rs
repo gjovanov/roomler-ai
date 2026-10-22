@@ -3065,6 +3065,87 @@ async fn a_renewal_refused_serves_to_the_leases_end_then_closes() {
     .await;
 }
 
+/// FR-90 P3-9-2b — the daemon holds a person's endpoint for the LocalAPI
+/// connection that opened it: served to the account that asked, on Unix under
+/// that account's directory of a runtime root it makes if no session has
+/// yet, read by its id, and let go with its leases when that connection
+/// closes. A second release finds nothing.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_persons_endpoint_is_held_by_its_id_until_its_connection_lets_go() {
+    use super::super::person_connect;
+    use super::super::vault_connect::{PersonLeases, Timing as Renewing};
+    use crate::vault_proxy::testing::{fake_http, made};
+    use tunnel_core::localapi::{Asker, ConnectArgs};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let vault = person_vault(&token, &ca);
+    let leases = FakePersonLeases::over(&vault);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("roomler-hive");
+    #[cfg(unix)]
+    let asker = {
+        // SAFETY: geteuid and getegid read our own credentials.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Asker::Unix { uid, gid }
+    };
+    #[cfg(windows)]
+    let asker = Asker::Windows { sid: me() };
+    let args = ConnectArgs {
+        handle: "git/bot".into(),
+        engine: "http".into(),
+        upstream: format!("https://localhost:{port}"),
+        auth: Some("bearer".into()),
+        ca: Some("pki/git-ca".into()),
+        ttl_s: Some(60),
+        ..ConnectArgs::default()
+    };
+    let (id, answer) = person_connect::open_with(
+        Arc::clone(&vault) as Arc<dyn VaultTools>,
+        Arc::clone(&leases) as Arc<dyn PersonLeases>,
+        &root,
+        &asker,
+        &args,
+        Renewing::DAEMON,
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["id"], json!(id));
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "made as a session's start makes it");
+        // SAFETY: geteuid reads our own credentials.
+        let uid = unsafe { libc::geteuid() };
+        assert!(root.join(format!("person-{uid}")).is_dir());
+    }
+    let state = person_connect::state(id).expect("held");
+    assert!(state.left_s > 0 && state.left_s <= 60, "{state:?}");
+    assert_eq!(
+        (state.renewals, state.refused, state.closed),
+        (0, None, None)
+    );
+    // It serves the account that asked: this test's.
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    assert_eq!(
+        bearer_through(&mut h, &mut saw).await,
+        [format!("Bearer {token}")]
+    );
+
+    // Its connection closes: let go, its leases with it.
+    person_connect::release(id);
+    assert_eq!(person_connect::state(id), None);
+    until("its leases let go", || {
+        leases.dropped.lock().unwrap().contains(&id)
+    })
+    .await;
+    assert!(leases.holding(id).is_empty());
+    person_connect::release(id);
+}
+
 /// P3-5e-2 — `vault_connect` serves a Kubernetes API server. The secret's
 /// cert and key are leased and presented in each connection's handshake,
 /// and the answer is a kubeconfig with no credential, naming the endpoint.

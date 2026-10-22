@@ -1012,7 +1012,7 @@ flowchart LR
 | Piece | Where |
 |---|---|
 | the hook | `Admit` ([`flow_listener.rs:122`](../crates/tunnel-core/src/flow_listener.rs#L122)), `FlowListener::bind_admitting` ([`:133`](../crates/tunnel-core/src/flow_listener.rs#L133)), asked before the hold ([`:304`](../crates/tunnel-core/src/flow_listener.rs#L304)) |
-| the account | `connection_is` ([`vault_connect.rs:2336`](../agents/roomlerd/src/hive/vault_connect.rs#L2336)), the session listener's hook `session_admit` ([`:2399`](../agents/roomlerd/src/hive/vault_connect.rs#L2399)) |
+| the account | `connection_is` ([`vault_connect.rs:2322`](../agents/roomlerd/src/hive/vault_connect.rs#L2322)), the session listener's hook `session_admit` ([`:2385`](../agents/roomlerd/src/hive/vault_connect.rs#L2385)) |
 | RFC 1929 | `Socks5Credential` ([`socks5.rs:95`](../crates/tunnel-core/src/socks5.rs#L95)), `accept_connect_authenticated` ([`:122`](../crates/tunnel-core/src/socks5.rs#L122)); `Target::SessionSocks5` ([`driver.rs:376`](../crates/tunnel-core/src/driver.rs#L376)), served in the carrier ([`:676`](../crates/tunnel-core/src/driver.rs#L676)) |
 | the flow | `create_session_flow` ([`client_mgr.rs:462`](../agents/roomlerd/src/tunnel/client_mgr.rs#L462)), ended at the grant's end ([`:495`](../agents/roomlerd/src/tunnel/client_mgr.rs#L495)) |
 | tests | `socks5::tests` (2), `flow_listener::tests` (1), `driver::tests::a_session_carrier_forwards_its_credentials_connections_alone`, `tunnel::client_mgr::tests::a_session_flow_serves_whom_it_admits_and_ends_with_its_grant`, `hive::vault_connect::tests::a_session_listener_admits_its_account_alone`: 6, and 11 negative controls |
@@ -1083,8 +1083,8 @@ Four parties each say yes, and each for itself:
 | Piece | Where |
 |---|---|
 | the tools | `net_tools` ([`toolbelt.rs:1085`](../agents/roomlerd/src/hive/toolbelt.rs#L1085)), offered in `tools/list` ([`:1377`](../agents/roomlerd/src/hive/toolbelt.rs#L1377)) and answered in `ask_vault` ([`:1222`](../agents/roomlerd/src/hive/toolbelt.rs#L1222)); their names in the settings, `NET_TOOLS` ([`:447`](../agents/roomlerd/src/hive/toolbelt.rs#L447)) |
-| a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:275`](../agents/roomlerd/src/hive/net_tools.rs#L275)), called as the run's leases go ([`supervisor.rs:3936`](../agents/roomlerd/src/hive/supervisor.rs#L3936)) |
-| the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1466`](../agents/roomlerd/src/hive/supervisor.rs#L1466)); the settings' `ask`, `vault_use_tools` ([`:4769`](../agents/roomlerd/src/hive/supervisor.rs#L4769)) |
+| a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:275`](../agents/roomlerd/src/hive/net_tools.rs#L275)), called as the run's leases go ([`supervisor.rs:3937`](../agents/roomlerd/src/hive/supervisor.rs#L3937)) |
+| the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1467`](../agents/roomlerd/src/hive/supervisor.rs#L1467)); the settings' `ask`, `vault_use_tools` ([`:4770`](../agents/roomlerd/src/hive/supervisor.rs#L4770)) |
 | the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`main.rs:4051`](../agents/roomlerd/src/main.rs#L4051)) |
 | tests | `hive::toolbelt::tests` (6), `hive::net_tools::tests` (6: the call's arguments, its capability, the place it holds, a listener made after its run ended), `hive::supervisor::tests` (2: the settings' `ask`, `net_hub`), `hive::gates::tests::hive_net_is_the_owners_word`, `config_surface::tests::hive_net_defaults_off_and_clears_off`: 16, and 17 negative controls |
 
@@ -1109,6 +1109,7 @@ to a running `roomlerd` without any token:
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
 | `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
+| `Connect` · `ConnectStatus` | `roomler connect`'s endpoint and where it stands, held for the connection that opened it. Only root or SYSTEM, an elevated administrator, or the daemon's own account may ask, and never on the person socket (FR-90 P3-9-2b, [vault.md](vault.md) §23) |
 
 ⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
 default 4; `1` is the pre-FR-84 single instance). With one instance, a client that
@@ -1135,6 +1136,7 @@ cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) 
 | `restart` | Restart the daemon through its supervisor — refused when it has none it can prove (FR-84) |
 | `kill <flow-id>` · `rename <name>` · `logs` · `config ls/set/clear` | Node management |
 | `exec` | Run a command on a fleet device — four default-deny gates, full audit ([fleet-rpc.md](fleet-rpc.md)) |
+| `connect <handle>` | A vault secret's upstream through a local endpoint the daemon serves, signed in as the secret's user, held in the foreground (FR-90 P3-9-2b, [vault.md](vault.md) §23) |
 | `diag host` / `diag pair` | Diagnostic evidence bundles (CLI-side, so new probes don't need a fleet rollout) |
 | `self-update` | Tunnel-only hosts update in place; on daemon hosts the MSI/.deb owns the binaries and the shim refuses |
 

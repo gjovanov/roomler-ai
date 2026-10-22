@@ -2113,7 +2113,7 @@ fn print_password_next_steps(state: &localapi::ExternalPasswordState) {
 /// ENOENT must never surface, and `main` prints just this one line). Everything
 /// else keeps its context. Both branches are returned BEFORE any stdout write,
 /// so `--json | jq` on a dead daemon fails cleanly with empty stdout.
-fn daemon_err(e: io::Error) -> anyhow::Error {
+pub(crate) fn daemon_err(e: io::Error) -> anyhow::Error {
     if e.kind() == io::ErrorKind::NotFound {
         anyhow!("roomler daemon not running (is the service started?)")
     } else {

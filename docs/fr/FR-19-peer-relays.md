@@ -1156,7 +1156,7 @@ property to test (E2E-2, E2E-4), not to assert.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite
   `roomler diagnose` as the path-MTU instrument — it is
-  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:593`); only its
+  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:637`); only its
   doc comment describes the probe.
 
 ---

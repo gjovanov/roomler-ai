@@ -431,13 +431,8 @@ pub(crate) fn sweep(runtime_root: &std::path::Path) -> usize {
     gone
 }
 
-// FR-90 P3-9-2a — every `allow` on a person's endpoint goes with P3-9-2b,
-// whose LocalAPI verb is the first caller: its tests are the only one until
-// then.
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use endpoint::Timing;
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use endpoint::person_dir;
 /// FR-90 P3-9-2 — a PERSON's endpoint (`roomler connect`): the endpoint a
 /// session's `vault_connect` gets, for the account this daemon was asked
@@ -454,7 +449,6 @@ pub(crate) use endpoint::{At, Control, Person, PersonLeases, Refused};
 /// FR-90 P3-9-2 — open a person's endpoint: `args` as a session's call names
 /// them ([`parse`]), served at `at` for the account that asked. Answers what
 /// the person is told, and the endpoint's [`Control`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn open_person(
     vault: Arc<dyn VaultTools>,
     person: Person,
@@ -467,7 +461,6 @@ pub(crate) async fn open_person(
 
 /// FR-90 P3-9-2 — the daemon's leases for a person: its lease client's
 /// `rc:vault.connect`, each held for the endpoint that asked.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DaemonPersonLeases;
 
 #[async_trait::async_trait]
@@ -499,7 +492,6 @@ impl PersonLeases for DaemonPersonLeases {
 /// FR-90 P3-9-2 — why a person's lease was not given, in words for the
 /// person, and whether asking again could help: the vault's own word says
 /// so (`is_retryable`), and no connection or no answer always could.
-#[cfg_attr(not(test), allow(dead_code))]
 fn person_why(e: crate::vault::LeaseError) -> Refused {
     use crate::vault::LeaseError;
     use roomler_ai_remote_control::vault::LeaseRefusal;
@@ -1168,7 +1160,6 @@ mod endpoint {
         /// taken as it is.
         Run { session: ObjectId, fence: u64 },
         /// P3-9-2 — a person's endpoint, as the device's owner.
-        #[cfg_attr(not(test), allow(dead_code))]
         Person(Person),
     }
 
@@ -1227,7 +1218,6 @@ mod endpoint {
 
     impl Timing {
         /// The daemon's.
-        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) const DAEMON: Self = Self {
             margin_div: 3,
             floor: Duration::from_secs(10),
@@ -1263,7 +1253,6 @@ mod endpoint {
     /// FR-90 P3-9-2 — a person's endpoint for the account `at` serves, its
     /// leases asked for the device's owner and renewed while it is held:
     /// what the person is told, and the endpoint's [`Control`].
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn open_person(
         vault: Arc<dyn VaultTools>,
         person: Person,
@@ -1746,7 +1735,6 @@ mod endpoint {
     /// FR-90 P3-9-2 — a person's endpoint, as whatever holds it for the
     /// person sees it: where it stands, and its close.
     #[derive(Clone)]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) struct Control {
         pub(crate) id: u64,
         stop: CancellationToken,
@@ -1756,7 +1744,6 @@ mod endpoint {
         vault: Arc<dyn VaultTools>,
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     impl Control {
         /// Where it stands now.
         pub(crate) fn state(&self) -> PersonState {
@@ -2095,7 +2082,6 @@ mod endpoint {
         /// (`0711`), which their endpoints' directories are made under, and
         /// which the sweep at the daemon's start reaches as it reaches a
         /// session's.
-        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn person_dir(runtime_root: &Path, uid: u32) -> Result<PathBuf, String> {
             let dir = runtime_root.join(format!("person-{uid}"));
             private_dir(&dir)?;
