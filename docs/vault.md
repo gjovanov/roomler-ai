@@ -889,7 +889,7 @@ no answer, and the daemon stops waiting for it.
 |---|---|
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1518`](../crates/remote_control/src/signaling.rs#L1518)) and `rc:vault.listed` · `rc:vault.described` ([`:4783`](../crates/remote_control/src/signaling.rs#L4783)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:116`](../crates/modules/vault/src/meta.rs#L116)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:566`](../crates/modules/vault/src/policy.rs#L566)) |
-| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:809`](../agents/roomlerd/src/vault.rs#L809)) |
+| the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:830`](../agents/roomlerd/src/vault.rs#L830)) |
 | the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:919`](../agents/roomlerd/src/hive/toolbelt.rs#L919)), answered by `vault_tool` ([`toolbelt.rs:1164`](../agents/roomlerd/src/hive/toolbelt.rs#L1164)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
@@ -970,7 +970,7 @@ device share): a path could match nothing a device asks for.
 |---|---|
 | the tool | `vault_exec` in [`toolbelt.rs:952`](../agents/roomlerd/src/hive/toolbelt.rs#L952), offered with the reads where the device takes leases, and asked for in the settings |
 | where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4302`](../agents/roomlerd/src/hive/supervisor.rs#L4302)); none on Windows |
-| letting go | `Client::release` ([`vault.rs:1078`](../agents/roomlerd/src/vault.rs#L1078)) |
+| letting go | `Client::release` ([`vault.rs:1146`](../agents/roomlerd/src/vault.rs#L1146)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
 
@@ -1001,7 +1001,7 @@ sequenceDiagram
 | the leases | one per distinct secret, mode `file`, audience the file's name, all asked before anything is written; one refusal writes nothing and lets the others go | [`vault_render.rs:253`](../agents/roomlerd/src/hive/vault_render.rs#L253) |
 | the directory | `<runtime>/<session>/secrets/`, made by the daemon, its own, `0711`: the session's account opens a file whose name it knows, and lists nothing. A link or a file in its place is refused, never followed | [`vault_render.rs:170`](../agents/roomlerd/src/hive/vault_render.rs#L170) |
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
-| its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272), [`:1085`](../agents/roomlerd/src/vault.rs#L1085) |
+| its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272), [`:1153`](../agents/roomlerd/src/vault.rs#L1153) |
 | a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:732`](../agents/roomlerd/src/hive/supervisor.rs#L732), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
 | the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4724`](../agents/roomlerd/src/hive/supervisor.rs#L4724) |
 
@@ -1052,7 +1052,7 @@ sequenceDiagram
 |---|---|---|
 | the call | `handle`: a path or this org's RRN, `#field` for a field. `mode`: `exec`, `file` or (P3-5b-2) `proxy`, the modes a use takes. `audience`: a bare name, by the rule `exec_allow` holds; the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to, `host:port` by that tool's own rule (§19). `ttl_s`: 30 to 900, default 300 | [`vault_request.rs:36`](../agents/roomlerd/src/hive/vault_request.rs#L36) |
 | the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:102`](../agents/roomlerd/src/hive/vault_request.rs#L102), [`vault.rs:159`](../agents/roomlerd/src/vault.rs#L159) |
-| its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:1114`](../agents/roomlerd/src/vault.rs#L1114), [`vault_exec.rs:615`](../agents/roomlerd/src/hive/vault_exec.rs#L615), the lookup both tools share (`leased_values`, P3-6b-2b) |
+| its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:1182`](../agents/roomlerd/src/vault.rs#L1182), [`vault_exec.rs:615`](../agents/roomlerd/src/hive/vault_exec.rs#L615), the lookup both tools share (`leased_values`, P3-6b-2b) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:293`](../agents/roomlerd/src/hive/vault_render.rs#L293) |
 | the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4751`](../agents/roomlerd/src/hive/supervisor.rs#L4751) |
 
@@ -1072,7 +1072,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the tool | `vault_request` in [`toolbelt.rs:1050`](../agents/roomlerd/src/hive/toolbelt.rs#L1050), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L441)) |
-| finding the lease | `Client::find_ahead` ([`vault.rs:1114`](../agents/roomlerd/src/vault.rs#L1114)); how long one has left, `Client::left` ([`vault.rs:1138`](../agents/roomlerd/src/vault.rs#L1138)) |
+| finding the lease | `Client::find_ahead` ([`vault.rs:1182`](../agents/roomlerd/src/vault.rs#L1182)); how long one has left, `Client::left` ([`vault.rs:1206`](../agents/roomlerd/src/vault.rs#L1206)) |
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
 
@@ -1105,7 +1105,7 @@ sequenceDiagram
 | Step | What holds | Where |
 |---|---|---|
 | the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9270`](../crates/remote_control/src/models.rs#L9270) |
-| the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:668`](../agents/roomlerd/src/vault.rs#L668), [`vault_exec.rs:470`](../agents/roomlerd/src/hive/vault_exec.rs#L470), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
+| the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:689`](../agents/roomlerd/src/vault.rs#L689), [`vault_exec.rs:470`](../agents/roomlerd/src/hive/vault_exec.rs#L470), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
 | the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1553`](../crates/remote_control/src/signaling.rs#L1553), [`vault.rs:340`](../crates/remote_control/src/vault.rs#L340) |
 | the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:460`](../crates/modules/vault/src/lease.rs#L460) |
 | the check | every lease the report names was released to this device, for this session in this organization, in the use's mode (`exec` for `exec`, `file` for `render`) and toward its target. Otherwise, or for a kind this server cannot name or a target that is not a bare name, the report is dropped | [`lease.rs:538`](../crates/modules/vault/src/lease.rs#L538), [`dao.rs:572`](../crates/modules/vault/src/dao.rs#L572) |
@@ -1194,7 +1194,7 @@ owner.
 | the routes | `GET …/vault/approval/{id}`: the approval as the session's readers see it, with `may_answer` (the caller drives it now) and `may_approve` (and the policy would take their yes) for the caller. `POST …/vault/approval/{id}` `{answer: "approve" \| "deny"}` | [`approval.rs:595`](../crates/modules/vault/src/approval.rs#L595), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
 | one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:1135`](../crates/modules/vault/src/lease.rs#L1135), [`dao.rs:820`](../crates/modules/vault/src/dao.rs#L820) |
 | the windows | a card waits 10 min for an answer (`APPROVAL_ANSWER_SECS`); a yes is usable for 5 min from the answer (`APPROVAL_USE_SECS`) | [`vault.rs:94`](../crates/remote_control/src/vault.rs#L94) |
-| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:744`](../agents/roomlerd/src/vault.rs#L744), [`vault.rs:976`](../agents/roomlerd/src/vault.rs#L976), [`toolbelt.rs:471`](../agents/roomlerd/src/hive/toolbelt.rs#L471), [`toolbelt.rs:555`](../agents/roomlerd/src/hive/toolbelt.rs#L555) |
+| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:765`](../agents/roomlerd/src/vault.rs#L765), [`vault.rs:1015`](../agents/roomlerd/src/vault.rs#L1015), [`toolbelt.rs:471`](../agents/roomlerd/src/hive/toolbelt.rs#L471), [`toolbelt.rs:555`](../agents/roomlerd/src/hive/toolbelt.rs#L555) |
 | the web app (P3-4e-3) | under a message bound to `{module: "vault"}`, the approval as `GET …/vault/approval/{id}` gives it: where it stands, the deadline while it waits, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve`, else off with why). A refusal is shown in the server's words. The vault edits the card's message whenever the approval moves on, and the new `updated_at` reads it again. The buttons only reflect what the route says; every decision stays the server's | [`VaultApprovalCard.vue`](../ui/src/components/vault/VaultApprovalCard.vue), [`MessageBubble.vue`](../ui/src/components/chat/MessageBubble.vue) |
 | the row | `vault_approvals`, one per card: its request, its status (`pending` · `approved` · `denied` · `used` · `expired` · `withdrawn`), who answered and when, the lease that spent it, and the card's message. A unique index holds one pending card per request | [`model.rs:367`](../crates/modules/vault/src/model.rs#L367), [`lib.rs:370`](../crates/modules/vault/src/lib.rs#L370) |
 
@@ -1720,7 +1720,7 @@ sequenceDiagram
 | its row | `field: ""`, `n: 0`, and `bundle`: each field at the version it carried. It ends at its TTL, or at the first of its versions' `expires_at` |
 | its standing | a new version of any of the issuer's fields takes it back. The write takes back every lease of the secret at once, and a sweep compares each field with the bundle's ([`revoke.rs:258`](../crates/modules/vault/src/revoke.rs#L258)). A provider this build cannot name stands for nothing |
 | the kill switch | `vault.providers` (`ROOMLER__VAULT__PROVIDERS`): empty or `*` is every provider built, and a list only those ([`dynamic.rs:31`](../crates/modules/vault/src/dynamic.rs#L31)). A word that names none serves nothing, so `none` turns them all off. Per secret, `disabled` |
-| the daemon | holds the bundle of a provider it mints for (`postgres`, `mysql`), lent to no tool ("The caller", below), and refuses any other provider's unopened, as `unsupported`: it never takes a bundle for a stored value ([`vault.rs:917`](../agents/roomlerd/src/vault.rs#L917)) |
+| the daemon | holds the bundle of a provider it mints for (`postgres`, `mysql`), lent to no tool ("The caller", below), and refuses any other provider's unopened, as `unsupported`: it never takes a bundle for a stored value ([`vault.rs:956`](../agents/roomlerd/src/vault.rs#L956)) |
 
 - ⚠️ **The vault never mints.** For `postgres` the device does: only it
   reaches the database, as for `proxy`. The bundle carries the issuer's fields
@@ -1794,8 +1794,8 @@ sequenceDiagram
 | the kind | each secret a call names is described first. Its metadata says whether it is dynamic, and names its credential's fields ([`vault_exec.rs:520`](../agents/roomlerd/src/hive/vault_exec.rs#L520)). A secret the session's role may not describe is leased as a stored one |
 | the lease | every name a call gives one dynamic secret shares ONE lease of the secret as a whole, in `short-lived`, with no field and no audience: the vault decides toward the secret's own. A stored secret's names are leased as before ([`vault_exec.rs:573`](../agents/roomlerd/src/hive/vault_exec.rs#L573)) |
 | a field | only the credential's: `#user`, `#password`, `#host`, `#port`, `#database`, or (P3-6f-2) a `kubernetes` token's `#token`, `#server`, `#ca`, `#namespace`. Any other, an issuer's included, or the secret named whole, is refused before anything is leased |
-| the bundle | held in daemon memory and lent to no tool: `with_value` answers nothing for it, and a tool reads only the credential's fields ([`vault.rs:1188`](../agents/roomlerd/src/vault.rs#L1188)). The bundle of a provider this build mints nothing for is refused unopened, as `unsupported`. The providers it mints for are the minters' own list, `postgres`, `mysql` and (P3-6f-2) `kubernetes` ([`minter.rs:25`](../agents/roomlerd/src/vault_proxy/minter.rs#L25)) |
-| the mint | at the lease's first use, once: a use that comes while the mint runs waits for its credential ([`vault.rs:1202`](../agents/roomlerd/src/vault.rs#L1202)). The minter is the one the bundle's provider names (P3-6d-1b, [`minter.rs:44`](../agents/roomlerd/src/vault_proxy/minter.rs#L44)), and the credential ends with the lease: a Postgres role's `VALID UNTIL`, a MySQL user's event, each given in the form its database takes, and (P3-6f-2) a Kubernetes token's own expiry, asked for what is left of the lease, which the deletion of its Secret ends sooner ([`minter.rs:87`](../agents/roomlerd/src/vault_proxy/minter.rs#L87)) |
+| the bundle | held in daemon memory and lent to no tool: `with_value` answers nothing for it, and a tool reads only the credential's fields ([`vault.rs:1256`](../agents/roomlerd/src/vault.rs#L1256)). The bundle of a provider this build mints nothing for is refused unopened, as `unsupported`. The providers it mints for are the minters' own list, `postgres`, `mysql` and (P3-6f-2) `kubernetes` ([`minter.rs:25`](../agents/roomlerd/src/vault_proxy/minter.rs#L25)) |
+| the mint | at the lease's first use, once: a use that comes while the mint runs waits for its credential ([`vault.rs:1270`](../agents/roomlerd/src/vault.rs#L1270)). The minter is the one the bundle's provider names (P3-6d-1b, [`minter.rs:44`](../agents/roomlerd/src/vault_proxy/minter.rs#L44)), and the credential ends with the lease: a Postgres role's `VALID UNTIL`, a MySQL user's event, each given in the form its database takes, and (P3-6f-2) a Kubernetes token's own expiry, asked for what is left of the lease, which the deletion of its Secret ends sooner ([`minter.rs:87`](../agents/roomlerd/src/vault_proxy/minter.rs#L87)) |
 | the revocation | whenever the lease is let go (its expiry, `rc:vault.revoke`, the run's end, or the end of the call that asked for it), in the background, with nothing waiting on it. A mint that ends after its lease was let go takes its own credential back at once ([`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272)) |
 | asked ahead | `vault_request` asks for a dynamic secret whole, in `short-lived`, for `exec` or `file` alike. Its first use mints, and every later use that takes the lease shares the credential. Not for `proxy` ([`vault_request.rs:112`](../agents/roomlerd/src/hive/vault_request.rs#L112)) |
 | the report | a use's report names the short-lived lease once, and the vault keeps it for any use: the lease's audience is where the credential was minted, never the use's target ([`dao.rs:572`](../crates/modules/vault/src/dao.rs#L572)) |
@@ -2308,7 +2308,7 @@ stateDiagram-v2
 
 | Piece | Where |
 |---|---|
-| the ask | `PersonAsk` and `Holder` ([`vault.rs:167`](../agents/roomlerd/src/vault.rs#L167)); `Client::connect` ([`vault.rs:793`](../agents/roomlerd/src/vault.rs#L793)) and `drop_person` ([`vault.rs:1153`](../agents/roomlerd/src/vault.rs#L1153)) |
+| the ask | `PersonAsk` and `Holder` ([`vault.rs:167`](../agents/roomlerd/src/vault.rs#L167)); `Client::connect` ([`vault.rs:814`](../agents/roomlerd/src/vault.rs#L814)) and `drop_person` ([`vault.rs:1221`](../agents/roomlerd/src/vault.rs#L1221)) |
 | the endpoint | `open_person` ([`vault_connect.rs:452`](../agents/roomlerd/src/hive/vault_connect.rs#L452)); the lease source, `PersonLeases` ([`:1169`](../agents/roomlerd/src/hive/vault_connect.rs#L1169)), and the daemon's, `DaemonPersonLeases`, in words for the person (`person_why`, [`:495`](../agents/roomlerd/src/hive/vault_connect.rs#L495)); on Unix, `person_dir` ([`:2085`](../agents/roomlerd/src/hive/vault_connect.rs#L2085)) |
 | the renewal | `renew` ([`vault_connect.rs:1798`](../agents/roomlerd/src/hive/vault_connect.rs#L1798)), `generation` and `swap`; when, `Timing` ([`:1204`](../agents/roomlerd/src/hive/vault_connect.rs#L1204)); what cuts a connection, `Live` ([`:1684`](../agents/roomlerd/src/hive/vault_connect.rs#L1684)); what its holder reads and ends, `Control` ([`:1738`](../agents/roomlerd/src/hive/vault_connect.rs#L1738)) |
 
@@ -2396,7 +2396,8 @@ in Claude Code's own sandbox, which sends each command's connections
 through the session's egress proxy in the daemon. The proxy reaches a host
 only once the vault allows it (decision 27): Cedar's `net:egress` (§7), the
 session the principal and the `Host` the resource, its one spelling and the
-port. P3b-1a builds the vault's half; no device asks before P3b-1b.
+port. P3b-1a builds the vault's half, and P3b-1b-1 the daemon's proxy that
+asks (below); no run starts the proxy before P3b-1b-2.
 
 ```mermaid
 sequenceDiagram
@@ -2467,7 +2468,73 @@ request would be. `simulate/replay` decides the recorded ones again.
 | the wire | `rc:vault.egress` ([`signaling.rs:1676`](../crates/remote_control/src/signaling.rs#L1676)) · `rc:vault.egress.allowed` ([`:4849`](../crates/remote_control/src/signaling.rs#L4849)) · `rc:vault.refused` |
 | the handler | [`egress.rs`](../crates/modules/vault/src/egress.rs) `decide` ([`egress.rs:85`](../crates/modules/vault/src/egress.rs#L85): the checks above), answered in order on the lease queue (§10) |
 | Cedar | the `Host` entity and `net:egress` ([`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema)); `Ask::NetEgress` ([`policy.rs:590`](../crates/modules/vault/src/policy.rs#L590)); a `Host` literal held to its one spelling ([`policy.rs:340`](../crates/modules/vault/src/policy.rs#L340)); `simulate` ([`policy_routes.rs:899`](../crates/modules/vault/src/policy_routes.rs#L899)) |
-| the device's half | P3b-1b: `hive_egress`, the session's sandbox and its proxy, which asks for each new host and keeps the answer for the run |
+| the device's half | the session's egress proxy (P3b-1b-1, below); `hive_egress` and the session's sandbox (P3b-1b-2) |
+
+### The device's half: the session's egress proxy (P3b-1b-1)
+
+The daemon's egress proxy is what Claude Code's sandbox sends a session's
+commands through. P3b-1b-1 builds it, with no caller: no run starts one
+before P3b-1b-2 turns it on, for the devices whose owner turns on
+`hive_egress`.
+
+```mermaid
+sequenceDiagram
+    participant C as a session's command (in the sandbox)
+    participant P as roomlerd (the run's egress proxy)
+    participant V as vault
+    participant H as the host
+    C->>P: CONNECT pypi.org:443, or a SOCKS5 CONNECT, as the session's account
+    P->>P: the account checked, the host taken in its one spelling
+    alt a decision this run already holds
+        P->>P: allowed, or denied, as decided before
+    else asked once per host, port and run
+        P->>V: rc:vault.egress {session_id, fence, host, port}
+        V-->>P: rc:vault.egress.allowed, or rc:vault.refused
+    end
+    P->>P: resolved by the OS, to an address this proxy dials
+    P->>H: dialed from this device
+    P-->>C: 200 Connection established, then the bytes as they are
+```
+
+| Step | Rule |
+|---|---|
+| the fronts | an HTTP `CONNECT` front and a SOCKS5 front with no authentication, each on `127.0.0.1` at a port the system picks: what the sandbox's `httpProxyPort` and `socksProxyPort` will name. Nothing else is served: a plain-HTTP request is answered 405, and a SOCKS5 UDP request `command not supported` |
+| who it serves | the session's account alone, by the check `vault_connect`'s endpoints make. Any other connection is closed unanswered, before the vault is asked anything |
+| the host | in its one spelling. A name it cannot spell (`010.0.0.5`) is refused 400, unasked |
+| the decision | asked once per host, port and run, however many connections wait on it, and kept for the run: an allow, or any refusal the vault made. `busy`, `unavailable` and `undecided`, no answer, or an answer for something else is not kept: the connection is refused and the next one asks again. At most 1024 hosts a run |
+| the dial | the OS's resolver, which MagicDNS steers, then the first address that answers. Never an address of this host's loopback, a link-local, an unspecified, a multicast or a broadcast one, `0.0.0.0/8` (which Linux connects to this host), or AWS's IPv6 metadata service (`fd00:ec2::254`); an IPv4 address written as IPv6 is judged as itself. From this device, never through a tunnel exit |
+| the bytes | relayed both ways as they are, what the client sent behind its `CONNECT` included. No TLS is terminated (P3b-3) |
+| its end | the run's: both fronts close, and every connection on them ends. At most 256 connections open at once |
+
+| Refused because | HTTP | SOCKS5 |
+|---|---|---|
+| a request it cannot read, or a host it cannot spell | 400 | general failure |
+| not `CONNECT` | 405 | — |
+| the vault refused the host | 403, naming the vault's word | not allowed by ruleset |
+| it resolves only to addresses this proxy never dials | 403 | not allowed by ruleset |
+| no decision, or too many hosts or connections | 503 | general failure |
+| no address, or none answered | 502 | host unreachable |
+| the host refused the connection | 502 | connection refused |
+
+> [!WARNING]
+> - **It dials as the daemon**, SYSTEM or root, so it never dials this
+>   host's loopback or a link-local address, whatever a policy says: a session
+>   must not reach, as the daemon, what this host serves only to itself, nor
+>   a cloud's metadata service. A policy that names `localhost` allows
+>   nothing.
+> - **The vault decides names; the proxy checks addresses.** `pypi.org`
+>   resolving to `127.0.0.1` is refused at the dial, whatever was allowed.
+> - **A denial is kept for the run**, as decision 27 says: a policy written
+>   after it reaches the session at its next run. A request that got no
+>   decision is never kept.
+> - **No plain HTTP.** Only `CONNECT` is served, so an `http://` URL sent
+>   through the proxy is refused, and nothing crosses it in clear text.
+
+| Piece | Where |
+|---|---|
+| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:225`](../agents/roomlerd/src/hive/egress.rs#L225)), `drop_run` ([`:284`](../agents/roomlerd/src/hive/egress.rs#L284)), a connection ([`carry`, `:340`](../agents/roomlerd/src/hive/egress.rs#L340)), the decision kept per run ([`decided`, `:433`](../agents/roomlerd/src/hive/egress.rs#L433)), `dialable` ([`:623`](../agents/roomlerd/src/hive/egress.rs#L623)), what is kept ([`decision_of`, `:702`](../agents/roomlerd/src/hive/egress.rs#L702)) |
+| the ask | the lease client's `egress` ([`vault.rs:909`](../agents/roomlerd/src/vault.rs#L909)) and `on_egress_allowed` ([`:1107`](../agents/roomlerd/src/vault.rs#L1107)), which refuses an allow for anything but what was asked |
+| what comes next | P3b-1b-2: `hive_egress`, the session's sandbox settings, and the proxy started with each run and ended with it |
 
 ## 25. Audit
 
@@ -2564,5 +2631,5 @@ its lease (§15).
 | Step | Builds |
 |---|---|
 | P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), the device's client built (P3-8-2b-1), and its tool built (P3-8-2b-2) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; for `roomler connect`, built (§23: the vault's half, P3-9-1; the daemon's ask and its renewing endpoint, P3-9-2a; the LocalAPI verb and the foreground command, P3-9-2b), the operator's word on decision 26, who may run it on Windows (its design: §3e "P3-9, `roomler connect`, as designed") |
-| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The proxy and its sandbox (P3b-1b), the device's half (P3b-3), AWS (P3b-4) and Windows (P3b-5) are left |
+| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy is built too, with no caller (P3b-1b-1, §24). `hive_egress` and the session's sandbox (P3b-1b-2), the device's half of a placeholder (P3b-3), AWS (P3b-4) and Windows (P3b-5) are left |
 | P3k | the field run in the test organization |
