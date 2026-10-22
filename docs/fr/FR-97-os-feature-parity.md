@@ -53,8 +53,8 @@
   had checked only the manifest's SHA-256, and skipped that when the manifest had none. Its field proof waits for
   the first tunnel release that carries it; until then a stand-in proxy proves the refusals (§8).
 - P8-1, every §2.8 doc correction but two, each re-checked against master first, merged (#2489). P8-2 (#2548):
-  `docs/platform-support.md` and its user page, the stale code comments and W7c's last leftovers. AC16 waits only
-  on the two public Wayland pages of #2533.
+  `docs/platform-support.md` and its user page, the stale code comments and W7c's last leftovers. AC16 is ticked:
+  #2533's two public Wayland pages are live since the 2026-10-22 promote (§8).
 - P1d, a Mac's per-org utun, merged (#2492). Run once on the released 0.4.143 (§8): one root daemon in two orgs,
   each on its own utun, and the secondary's mesh through its own. The stale warning is gone, and the port holder
   names a Mac's listener. Its netstack run found #2493 (a second org in netstack mode joined no mesh), fixed on its
@@ -97,6 +97,9 @@
   socket (#2663, #2674), and P2d-1, a Mac saying its screen is locked in a session and while a request waits
   (#2683), shipped in 0.4.150 (2026-10-21) after passing again on its candidate (§8). AC19 is field-verified, the
   operator's MacBook last, once it had updated itself to 0.4.151 (2026-10-22, §8).
+- P2b, a Mac's own consent panel (`viewer-indicator-macos` in the release feature set), merged (#2681) and shipped
+  in 0.4.153 (2026-10-22). Red on 0.4.149, where the desktop app took the prompt; green on a tart Mac's candidate
+  and on the operator's MacBook, a supervised Mac, whose root half drew its own panel on the console (§8).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -223,7 +226,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:253`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:700`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
-| R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | 🟡 P2b: in the release set (`.github/workflows/release-agent.yml:2581`), proven on a Mac (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
+| R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ✅ since 0.4.153 (P2b): in the release set (`.github/workflows/release-agent.yml:2581`); on a supervised Mac the root half draws it (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ❌ | `Unavailable::Platform` (`apps/mod.rs:347`); no `apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | 🟡 since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:347`), in a session; a request waiting for consent is not told (P2d-1 found it: the prompt's probe answers `None` here) | ✅ since P2d-1: advisory, from the session dictionary (`lock_state.rs:357`), in a session (`input: "unknown"`) and at a prompt | The pump's `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-326`), on purpose: the hint never becomes its overlay. *P2d-1:* the prompt's probe asks a Mac's session (`lock_state.rs:301-320`) | P2d-1, P3b |
@@ -1153,7 +1156,7 @@ model on Windows, so the three agree on what the mode means.
 | **P1c** | macOS DNS: MagicDNS + the exit catch-all | `ROOMLERD_MACOS_DNS_STEER=0` | vmtest | M |
 | **P1d** | A macOS per-org utun run once; the stale warning; the port holder. *In review:* run on the released 0.4.143 (§8); the warning removed; the port holder through `lsof` | — | a tart Mac, two orgs | S |
 | **P2a** | macOS system audio (SCK) | `ROOMLERD_SCK_AUDIO=0` | a field Mac | M–L |
-| **P2b** | macOS native consent panel (D3): `viewer-indicator-macos` in the release feature set (built; proven on a tart Mac, red on 0.4.149, and on the operator's MacBook, the root half's own panel included; ships in 0.4.153) | the release feature set | one Mac, then the field Macs | S–M |
+| **P2b** | macOS native consent panel (D3): `viewer-indicator-macos` in the release feature set (merged #2681; proven on a tart Mac, red on 0.4.149, and on the operator's MacBook, the root half's own panel included; released in 0.4.153) | the release feature set | one Mac, then the field Macs | S–M |
 | **P2c** | macOS Remote Apps | `[apps] enabled` | a field Mac | M–L |
 | **P2d-1** | macOS lock hint: the session dictionary's lock, to the viewer's chip in a session (`input: "unknown"`) and to a request waiting for consent (`host_locked`); the chip's neutral title. Released in 0.4.150 (#2683) | `ROOMLERD_LOCK_HINT=0` | a tart Mac, red on 0.4.149 | S |
 | **P2d-2** | macOS layout, display-match | per-verb caps | a field Mac | M |
@@ -1343,11 +1346,15 @@ one depends on it.
   *(The count before P0c, 2026-10-17, §8. P0a, P0b and P0e changed no word, so it stands for "before P0". It
   shows `opus` on every macOS agent and clipboard image events on every Linux and macOS agent, neither of which
   those OSes serve.)*
-- [ ] **AC16 (docs):** `docs/platform-support.md` (a mermaid map, the per-pillar tables, the reason for every ⛔,
+- [x] **AC16 (docs):** `docs/platform-support.md` (a mermaid map, the per-pillar tables, the reason for every ⛔,
   `file:line` anchors), the user-facing `ui/docs/content/reference/platform-support.md`, every row of §2.8
   corrected, and the `docs/README.md` index row.
   *(P8-2, #2548: both pages, the index row, and every §2.8 row but the two public Wayland pages,
   `per-os-permissions.md` and `black-screen.md`, which ride #2533.)*
+  *(#2533 merged on 2026-10-22 and is live since that day's `hosted-20261022-ea2d75e` promote, §8. The served
+  black-screen page had its old step ("A root system service has no logged-in session") on the earlier deploy, and
+  after the roll says a system install captures the person's session on GNOME and KDE Wayland by itself; the served
+  permissions page carries the system-install Wayland row.)*
 - [x] **AC17 (P0e):** a Linux and a Windows exit client that change networks under an active exit re-pin through the
   new uplink within one sweep, and the control WS stays up; after a `kill -9` and a network change, no exemption
   route is left on any of the three OSes. Red first on the current release. *(Linux and Windows red on 0.4.134 →
@@ -1566,3 +1573,5 @@ one depends on it.
 | 2026-10-22 | released 0.4.151 (the operator's MacBook updated itself overnight; it carries P2g and P2h) | the operator's MacBook, both halves, read-only commands as the console user | 🟢 **AC19, the operator's MacBook.** `roomler devices` as the console user answered `overlay: ok` with all 18 of the org's devices (13 online), the same list as any other member; on 0.4.149 it listed the Mac alone (`no_node`, the operator's report of 2026-10-21). `roomler peers` returned the links with no endpoint field, and `roomler status` carried the overlay address and the MagicDNS domain. AC19 ticked |
 | 2026-10-22 | P2b's candidate: the `.pkg` from release-lane rehearsal 39754055046 on `768e78c48` (`d224c282…`; roomlerd `e40dd79f…`) | the operator's MacBook (macOS 27.0.1, SIP on), a supervised Mac: one enrollment, the GUI worker supervised. Installed by a one-shot launchd job that would have put the released 0.4.151 back by itself | 🟢 **P2b (AC8), the field Mac.** Healthy 10 s after the install, both halves; "macOS consent panel available" in the worker's log and the root's; an owner's session over `hevc_videotoolbox` at 53 fps. With the root half set to ask (`auto_grant_session = false`, one restart), its own panel came up on the console (480×240 at the screen-saver level, owned by the root daemon), and a posted click on Approve answered it: `native=true` → `allow=true` → `Granted` → the viewer connected (54 fps). Back on the released 0.4.151 (`8a041507…`) with `auto_grant_session = true` afterwards |
 | 2026-10-22 | the same candidate; a one-shot system-context window | throwaway tart Macs (macOS 15.7.7) with ONLY the root half enrolled; the operator's MacBook for the window | 🔍 **A dead end, kept.** From "panel available" in the ROOT half's log, its panel was taken to be invisible (a LaunchDaemon outside any session) and a gate was built so that only GUI-session processes pump AppKit. Measured instead: a LaunchDaemon's 8-second window showed on the MacBook's console (`osascript` at layer 1000, gone after); on tart the root's panel showed (`native=true`), and a CLI deny, then a click on Approve, each answered it (declined; connected). The gate was withdrawn before it merged |
+| 2026-10-22 | `agent-v0.4.153` (tag run 39771313078 on `ea2d75eff`, the bump #2721; it differs from the rehearsed `3a26e1de7` only in its 28 version lines) | the release and the served manifest; one host per OS; then the operator's org | 🟢 **0.4.153 ships P2b.** Published 11:51:18Z: 37 assets, each of the 12 packages with its `.asc` and `.sha256`; "Resolved MSI ProductVersion: 0.4.153"; `/api/agent/latest-release` serves it first, daemon assets before companions. `self-update --check-only` says "Update available" from 0.4.152 on Windows (signer G ROX LTD) and from 0.4.151 on Linux and on the operator's MacBook (the pinned `.asc`), each package naming itself 0.4.153. An UpdateNow to the org's 13 online devices: all 13 on 0.4.153 and back online within 5 minutes, both halves of the MacBook included |
+| 2026-10-22 | promote `hosted-20261022-ea2d75e` (pods up 12:09Z) | prod, read-only: the served docs; the fleet | 🟢 **AC16.** Before the roll the served `/docs/troubleshooting/black-screen/` still had its old step ("A root system service has no logged-in session"). After it, the page says a system install (a root service) captures the person's session on GNOME and KDE Wayland by itself, and `/docs/remote-desktop/per-os-permissions/` carries the system-install Wayland row: #2533 is live. Also checked: both pods on the image, `/health` 0.4.153, 25 agents online as before, and the mesh (an overlay SSH session) and a SOCKS5 tunnel through a 0.4.153 Windows host both answered |

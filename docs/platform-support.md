@@ -1,8 +1,8 @@
 # Platform support — what each OS serves, and why where it does not
 
 > **FR-97** ([#2082](https://github.com/gjovanov/roomler-ai/issues/2082),
-> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.149** (2026-10-21); a row that says
-> "from 0.4.150" or "since 0.4.150" is on master for the next release. The spec's §2 is the register this page was built from: each
+> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.153** (2026-10-22); a row that says
+> "from 0.4.154" or "since 0.4.154" is on master for the next release. The spec's §2 is the register this page was built from: each
 > gap's evidence, its phase and its field run. This page says what is true now. A change that
 > moves a row moves it here, in the same PR.
 >
