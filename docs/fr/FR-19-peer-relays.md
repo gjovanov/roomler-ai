@@ -731,7 +731,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:2900`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3043`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
@@ -997,8 +997,8 @@ COTURN flush on a host serving live conference media.
 Then take mars's relay down and assert re-selection to zeus without a DERP round trip.
 ⚠️ **Not via `roomler config set`.** The first draft claimed that was *"a config change, not
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
-startup, so the whole surface is `restart_required = true`"* (hardcoded `:596`, `:610`,
-asserted by `every_key_gets_and_applies` `:1237`), and the CLI's live-apply allowlist is
+startup, so the whole surface is `restart_required = true`"* (hardcoded `:604`, `:618`,
+asserted by `every_key_gets_and_applies` `:3184`), and the CLI's live-apply allowlist is
 exactly `exec_enabled | remote_config_enabled` (`localclient.rs:969`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`

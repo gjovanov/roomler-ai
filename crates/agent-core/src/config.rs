@@ -603,6 +603,15 @@ pub struct AgentConfig {
     /// reaches into another device is the owner's call.
     #[serde(default)]
     pub hive_ssh: bool,
+    /// FR-90 P3b-1b-2 — run every agent session on this device in Claude
+    /// Code's sandbox, its commands' connections sent through the session's
+    /// egress proxy, each host decided by the organization's vault
+    /// (`net:egress`; decisions 27 and 28). Only beside `vault_enabled`, and
+    /// not on Windows before P3b-5. Default OFF, and never pushable: whether
+    /// a session here reaches the network only as the vault decides is the
+    /// owner's call.
+    #[serde(default)]
+    pub hive_egress: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2779,6 +2788,7 @@ pub fn test_fixture() -> AgentConfig {
         vault_activity_log: false,
         hive_net: false,
         hive_ssh: false,
+        hive_egress: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

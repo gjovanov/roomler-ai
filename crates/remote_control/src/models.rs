@@ -9256,6 +9256,10 @@ mod tests {
             // reach from every device it runs sessions on into every device
             // whose SSH policy admits a session.
             "hive_ssh",
+            // FR-90 P3b-1b-2 — whether every session here runs sandboxed,
+            // its egress decided by the vault: a server that could clear it
+            // would hand every session here the device's own network.
+            "hive_egress",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

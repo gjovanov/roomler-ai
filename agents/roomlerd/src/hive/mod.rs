@@ -104,6 +104,10 @@ pub(crate) mod person_connect;
 mod procs;
 mod purger;
 mod resume_note;
+/// FR-90 P3b-1b-2 — where the owner turned on `hive_egress`, a session runs
+/// in Claude Code's sandbox or not at all: the gate before its start.
+#[cfg(feature = "vault")]
+pub mod sandbox;
 mod sidecar;
 /// FR-90 P3-8-2b-2 — `ssh_run`: one command on another device of the
 /// organization, through this daemon's own SSH client.

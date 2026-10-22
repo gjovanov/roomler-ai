@@ -56,6 +56,9 @@ pub struct HiveConfig {
     /// FR-90 P3-8-2b-2 — whether a session here is offered `ssh_run`
     /// (`hive_ssh`): one command on another device, where the vault is too.
     pub ssh: bool,
+    /// FR-90 P3b-1b-2 — whether every session here runs in Claude Code's
+    /// sandbox, its commands' egress decided by the vault (`hive_egress`).
+    pub egress: bool,
 }
 
 impl HiveConfig {
@@ -85,6 +88,7 @@ impl HiveConfig {
             store_quota_mib: cfg.hive_store_quota_mib,
             net: cfg.hive_net,
             ssh: cfg.hive_ssh,
+            egress: cfg.hive_egress,
         }
     }
 
@@ -107,6 +111,7 @@ impl HiveConfig {
             store_quota_mib: None,
             net: false,
             ssh: false,
+            egress: false,
         }
     }
 }
@@ -186,6 +191,25 @@ mod tests {
         agent.hive_net = true;
         assert!(!HiveConfig::from_agent(&agent).ssh, "nor egress SSH");
         assert!(!HiveConfig::closed().ssh);
+    }
+
+    /// FR-90 P3b-1b-2 — so is `hive_egress`, the sandbox on every session
+    /// here: neither `hive_net` nor `hive_ssh` turns it on, nor it them.
+    #[test]
+    fn hive_egress_is_the_owners_word() {
+        let mut agent = crate::config::test_fixture();
+        agent.hive_egress = true;
+        let hive = HiveConfig::from_agent(&agent);
+        assert!(hive.egress);
+        assert!(!hive.net && !hive.ssh, "the sandbox offers no tool");
+        agent.hive_egress = false;
+        agent.hive_net = true;
+        agent.hive_ssh = true;
+        assert!(
+            !HiveConfig::from_agent(&agent).egress,
+            "no tool turns it on"
+        );
+        assert!(!HiveConfig::closed().egress);
     }
 
     /// `hive_adopt` is the owner's word, on Windows too since FR-97 P4c
