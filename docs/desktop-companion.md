@@ -68,8 +68,8 @@ on one connection) and closes. Five things poll it at once in a running companio
 | Poller | Where | Interval | Connections per tick |
 |---|---|---|---|
 | service status | `src/front/app.js:166` | 10 s | 0 (reads config, runs `roomlerd service status`) |
-| device view (`Status` + `Peers`) | `src/front/app.js:168` → `cmd_device_view`, `src/commands.rs:254` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:1051` | 2 s, visible only | 1 |
+| device view (`Status` + `Peers`) | `src/front/app.js:168` → `cmd_device_view`, `src/commands.rs:323` | 2 s | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:1818` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:148` | 1.5 s | 1 |
 | consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
 
@@ -124,7 +124,7 @@ A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in
 under the config write lock and restarts its flow; an invalid replacement is refused and the
 old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
-service predates route editing"* (`src/commands.rs:1100`), never as a blank page.
+service predates route editing"* (`src/commands.rs:1869`), never as a blank page.
 
 ⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
@@ -379,7 +379,7 @@ sequenceDiagram
   ago (`RESTART_MIN_INTERVAL`, persisted next to the config, so it also bounds a loop across
   processes), and on the macOS supervisor a worker younger than 30 s.
 - **"Back" means a new process.** The companion waits for a different pid **and** start time
-  (`cmd_restart_wait`, `src/commands.rs:943`) — the leaving process keeps answering for a
+  (`cmd_restart_wait`, `src/commands.rs:1456`) — the leaving process keeps answering for a
   moment, and Windows can hand the relaunched daemon the old pid.
 - ⚠️ **This is local only.** Remote configuration never restarts a daemon: a server push is
   persisted and reported as *applied-pending-restart*, and there is no server message that
@@ -761,7 +761,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:960`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1125`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -812,3 +812,70 @@ flowchart TD
   (`forget_installed_version`, `companion.rs:322`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
   the Windows retry. Windows' refresh at start is older and stays.
+
+## 14. Opening links: View screen and Open Roomler (#2713)
+
+**View screen** on the Devices page (`cmd_open_remote`, `src/commands.rs:1107`), **Open Roomler**
+on the Overview page and the tray all open a link through one function, `open_web_or_browser`
+(`src/commands.rs:976`):
+
+| OS | Where the link opens | When nothing can open it |
+|---|---|---|
+| Windows | the in-app WebView2 window (Chromium: the full viewer works), else the default browser | the browser fallback's error |
+| macOS | the default browser (`open`) | the shell's error |
+| Linux | **the app registered for the link's scheme**, through GIO (`open_in_browser`, `src/commands.rs:1022`) | a dialog and the button's error: *No web browser is set up on this computer…* |
+
+⚠️ **Linux never uses `xdg-open` for this.** When no app claims a link's scheme, xdg-open (GNOME:
+`gio open`) falls back to the link's **content** type: it fetches the page, sees `text/html` and
+hands the link to the `text/html` default. Measured 2026-10-22 on a Fedora Asahi GNOME box with no
+browser installed: View screen opened the viewer's URL in GNOME Text Editor, which showed the
+page's HTML. A missing browser must be an error the person can act on, never a text editor.
+
+```mermaid
+flowchart TD
+    C([View screen / Open Roomler]) --> S{the link's scheme<br/>url_scheme}
+    S -->|none| E1[error: not a link]
+    S -->|https| D{GIO: the default app<br/>for x-scheme-handler/https}
+    D -->|none| E2[dialog + red button:<br/>no web browser is set up]
+    D -->|a browser| L[launch THAT app with the link]
+    X[xdg-open / gio open] -. would have .-> T[sniffed text/html:<br/>the text editor]
+```
+
+### 14.1 A companion the daemon starts carries the desktop's environment
+
+The lookup above reads the desktop's own defaults, which depends on the companion's environment:
+
+| Variable | What it changes |
+|---|---|
+| `XDG_CURRENT_DESKTOP` | GIO reads the desktop's `<desktop>-mimeapps.list` only with it (GNOME's names Firefox, KDE's Falkon) |
+| `XDG_DATA_DIRS` | where apps are found, `~/.local/share/flatpak/exports/share` included: a browser installed as a **per-user Flatpak** is invisible without it |
+| `XAUTHORITY` | X11 authorisation beside `DISPLAY` |
+| `LANG`, `LANGUAGE`, `LC_*` | the person's locale rather than the system's |
+
+A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
+did not: FR-27's consent launch, FR-117's restart after an update
+(`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
+first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:711`). For a
+root daemon that is a transient **system** unit, which inherits nothing of the desktop; its
+environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`,
+`WAYLAND_DISPLAY`) and nothing else.
+
+Since #2713 a root daemon reads the session user's systemd manager environment, the store the
+desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
+privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
+`companion.rs:791`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:739`;
+parsing in `session_env_pairs`, `companion.rs:765`):
+
+- ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
+  runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
+  business in a process the daemon starts, and the bus, display and runtime dir keep coming from
+  logind.
+- ⚠️ A value systemd had to shell-escape (`KEY=$'…'`), an empty one, or one with a control
+  character is skipped, never decoded. Nothing on the allowlist needs one.
+- A per-user daemon's `systemd-run --user` unit inherits the manager's environment already, so it
+  reads nothing. When the manager's environment cannot be read, the companion starts as it always
+  did.
+- 🔑 **Check it on a host:** read the running companion's `/proc/<pid>/environ` (as root) for
+  `XDG_CURRENT_DESKTOP`, and its `/proc/<pid>/cgroup` for which manager started it: a
+  `system.slice/run-…service` is the daemon's launch, an `app-…` scope or service under
+  `user@<uid>.service` is the desktop's.

@@ -69,7 +69,7 @@ it. Do not shift these anchors with code that moved later.*
 | Surface | Where | What it does today |
 |---|---|---|
 | Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:166-168` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
-| swallowed errors | `agents/roomler-desktop/src/commands.rs:1007-1011`, `:1052-1057` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
+| swallowed errors | `agents/roomler-desktop/src/commands.rs:1077-1081`, `:1122-1127` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
 | pipe server | `crates/localapi/src/lib.rs:1796-1871` | ONE listening instance; the next is created only after `connect()` returns |
 | pipe client | `crates/localapi/src/lib.rs:2133-2153` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
