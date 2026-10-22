@@ -2892,6 +2892,55 @@ sequenceDiagram
   profile (`~/.aws`): the variables alone; a dynamic `aws_sts` secret, which `dynamic-only-short-lived`
   already keeps from placeholder mode.
 
+**P3b-5, Windows, as designed (P3b-5-0).** Decision 30 offers placeholders on Windows, the proxy
+advisory. Two facts from Claude Code's own documentation shape how:
+
+- **No sandbox runs there.** "On native Windows, Claude Code runs commands unsandboxed." Its
+  sandbox settings do nothing there, except `failIfUnavailable`, which ends a session at its start
+  wherever the sandbox cannot run, native Windows included. A Windows session's settings therefore
+  carry no sandbox key.
+- **A proxy in the settings reaches Claude Code itself.** Its documentation sends every outbound
+  request Claude Code makes through `HTTPS_PROXY`, its own included, and names no setting that
+  scopes a variable to its commands alone. Loopback is never proxied, so the session's model route
+  (the sidecar on 127.0.0.1) is untouched.
+
+```mermaid
+sequenceDiagram
+    participant H as Claude Code (the console user)
+    participant C as a command it runs (unsandboxed)
+    participant P as the run's egress proxy
+    participant V as vault
+    participant A as a host
+    H->>P: its own HTTPS, through HTTPS_PROXY (decision 35)
+    C->>P: CONNECT host 443, where the command honours HTTPS_PROXY
+    P->>V: rc:vault.egress, once per host and run
+    alt allowed
+        P->>A: the bytes, a placeholder swapped toward its audience
+    else refused
+        P-->>C: 403, with why
+    end
+    C->>A: a command that ignores the variables, direct and undecided, its placeholder carrying nothing
+```
+
+| Piece | Design |
+|---|---|
+| which sessions | every session on a Windows device whose owner turned on `hive_egress`: the proxy started, its variables in the settings, `vault_placeholder` offered. The start is refused only where no vault is offered, as on Linux and macOS. There is no harness floor: none of the settings it guards is written |
+| the proxy | the same egress proxy, started at the launch for the console user (the one account a Windows session runs as), admitting that account's processes alone by the connection's owning SID (`vault_connect::session_admit`, P3-5b-4), stopped with the run |
+| the settings | `env` alone: `HTTPS_PROXY` and `HTTP_PROXY` naming the HTTP front, `ALL_PROXY` the SOCKS5 front (`socks5h`, so the proxy resolves), `NO_PROXY` loopback; P3b-3b's trust variables (Node's CA, the bundle for OpenSSL, Python, curl, AWS and git); git held to OpenSSL (`GIT_CONFIG_COUNT`, `http.sslBackend`), since its Schannel reads the Windows store alone; and Claude Code's non-essential traffic turned off (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`). No sandbox key, and no cache redirected: decision 31's write limits need the sandbox |
+| the harness's own traffic | decision 35: through the proxy, decided by the session's allowlist as its commands' are |
+| a placeholder | as on Linux and macOS: swapped toward its audience, inside TLS the proxy terminates under the run's CA. The tool's answer names, on Windows, the tools that cannot use it |
+| what cannot | a tool that trusts the Windows store alone: Go programs (`gh`), .NET (PowerShell's `Invoke-WebRequest`), Schannel. The store is never changed (P3b-0), so while the run holds a placeholder for a host, such a tool's TLS to that host fails; to every other host it is carried as it comes |
+| the guardrail | `guardrail:windows-proxy-only` allows `proxy` and `placeholder`: in both, the value stays in the daemon. Widened in the PR that builds the device's half, so the vault releases the mode only once a Windows daemon serves it |
+
+- ⚠️ **Advisory means advisory.** A command that ignores the variables reaches the network
+  directly, undecided and unrecorded. It sends a placeholder, which carries nothing, never the
+  value. The allowlist binds only the tools that honour the variables; the value's safety never
+  depended on it.
+- ⚠️ **AC14 on Windows** holds for `aws` (Python: `HTTPS_PROXY`, `AWS_CA_BUNDLE`), not for `gh`,
+  which trusts the Windows store alone.
+- **Not in P3b-5:** a sandbox on Windows; the proxy enforced (the daemon's WFP could hold the
+  console user's processes to it: a later FR); any change to a trust store.
+
 **P3's steps.** Each is a PR behind its kill switch; §4 tracks them.
 
 | Step | Builds | Kill switch | Criteria |
@@ -2979,7 +3028,8 @@ sequenceDiagram
 | P3b-4-0 | AWS's design (§3e "P3b-4, AWS, as designed"), and decisions 33 and 34 | docs only | — |
 | P3b-4-1 | SigV4: the canonical request, the signing key, the signature, checked against AWS's own published examples; no caller | the `vault` feature in no release build; no caller | — |
 | P3b-4-2 | AWS signed again: a binding's secret and field, the pair by decision 33, the body's hash, the check, the new signature, and the refusals | device `hive_egress = false`; `vault.placeholder` | AC14 (`aws`) |
-| P3b-5 | Windows, as decision 30 says: today `guardrail:windows-proxy-only` refuses the mode there | the same | — |
+| P3b-5-0 | Windows' design (§3e "P3b-5, Windows, as designed"), and decision 35 | docs only | — |
+| P3b-5-1 | Windows served, as decision 30 says: the guardrail widened, the proxy started for the console user, the settings' `env` (the proxies, the trust, git's OpenSSL, the non-essential traffic off), the tool offered with its Windows note | device `hive_egress = false`; `vault.placeholder` | AC14 (`aws`, on Windows) |
 
 ### 3f. The brain
 
@@ -3356,7 +3406,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3b-3c-2 | the tool (`docs/vault.md` §24, "The tool, and its audiences"). `vault_placeholder` is offered only where the run's egress proxy serves the session, which the toolbelt reads from the proxy itself, and the vault is offered; the session's settings ask a person on every call. `audience` is an origin or a list of up to 4: each variable takes one lease per audience, and one placeholder is bound toward every audience with that audience's lease, so a lease let go takes its own binding alone. `vault_request` takes mode `placeholder`, toward an origin in the one spelling the call asks in, and refuses a dynamic secret there | device `hive_egress = false`; `vault.placeholder` | **merged** #2733 `2e302f6e5` |
 | P3b-4-0 | AWS's design (§3e "P3b-4, AWS, as designed"), docs only. The proxy checks a session's SigV4 signature, made with the placeholder pair, and signs the same request again with the value. The pair is found by the secret's fields (decision 33), and AWS's endpoints are origins like every audience (decision 34). The body's hash comes from `x-amz-content-sha256`, or the body is read whole up to 8 MiB. Signed chunks, SigV4A and presigned URLs are refused, and no signed header is changed but what is signed again | docs only | **merged** #2734 `851eb989b` |
 | P3b-4-1 | SigV4 itself, with no caller (`docs/vault.md` §24, "AWS's signature"): the header read and written again, the canonical request by botocore's rules (S3's path as sent, every other service's normalized and encoded once more; the query's pairs as sent, sorted; each signed header trimmed and joined), the string to sign, the signing key's HMAC chain and the signature, compared in constant time. Checked against AWS's own published examples, the signing key its documentation derives and the test suite's `get-vanilla`, each computed again independently first | the `vault` feature in no release build; no caller | **merged** #2735 `8e58fa0d3` |
-| P3b-4-2 | AWS signed again (`docs/vault.md` §24, "AWS signed again"). A binding records its secret and field, and a request whose `Authorization` is AWS's and names a placeholder of the connection's audience is signed again before the swap: SigV4 alone, the request's one `Authorization`, `Credential=` naming an `access_key_id` placeholder (any other field's is refused, so the secret key's value never goes out in it), the pair the same secret's `secret_access_key` placeholder toward the audience (decision 33, built as recommended), `X-Amz-Security-Token`'s `session_token` placeholder swapped. The body's hash is `x-amz-content-sha256`'s, the body streaming on, or the body read whole up to 8 MiB, at most 4 at once a run, each held until it is sent. The signature is checked with the key's placeholder, then made again with its value, `Credential=` naming the access key's own id; every other signed header goes on as it came, a signed `Expect` included, and one that would not refuses the request. An AWS secret key's placeholder is swapped nowhere (P3b-3c-1's swap passes it by), so its value goes nowhere but into the HMAC. Signed chunks, SigV4A, a second `Authorization`, no `X-Amz-Date`, a check that fails and a lease let go are each refused with why, never sent. The tests expect what botocore sends for the same requests with AWS's example pair, its signatures computed before the code: STS by GET, by POST with a form body, with a session token, and S3 by path | device `hive_egress = false`; `vault.placeholder` | **in review** |
+| P3b-4-2 | AWS signed again (`docs/vault.md` §24, "AWS signed again"). A binding records its secret and field, and a request whose `Authorization` is AWS's and names a placeholder of the connection's audience is signed again before the swap: SigV4 alone, the request's one `Authorization`, `Credential=` naming an `access_key_id` placeholder (any other field's is refused, so the secret key's value never goes out in it), the pair the same secret's `secret_access_key` placeholder toward the audience (decision 33, built as recommended), `X-Amz-Security-Token`'s `session_token` placeholder swapped. The body's hash is `x-amz-content-sha256`'s, the body streaming on, or the body read whole up to 8 MiB, at most 4 at once a run, each held until it is sent. The signature is checked with the key's placeholder, then made again with its value, `Credential=` naming the access key's own id; every other signed header goes on as it came, a signed `Expect` included, and one that would not refuses the request. An AWS secret key's placeholder is swapped nowhere (P3b-3c-1's swap passes it by), so its value goes nowhere but into the HMAC. Signed chunks, SigV4A, a second `Authorization`, no `X-Amz-Date`, a check that fails and a lease let go are each refused with why, never sent. The tests expect what botocore sends for the same requests with AWS's example pair, its signatures computed before the code: STS by GET, by POST with a form body, with a session token, and S3 by path | device `hive_egress = false`; `vault.placeholder` | **merged** #2736 `6fef7fb43` |
+| P3b-5-0 | Windows' design (§3e "P3b-5, Windows, as designed"), docs only. On native Windows Claude Code runs commands unsandboxed, its sandbox settings do nothing but end a session where `failIfUnavailable` is set, and a proxy named in its settings reaches Claude Code itself as well as its commands. So a Windows session on a `hive_egress` device gets the egress proxy, started for the console user and admitting that account alone, named in its settings' `env` (the proxies, P3b-3b's trust, git held to OpenSSL, the non-essential traffic off), with no sandbox key; the harness's own traffic goes through the proxy too (decision 35, recommended). Tools that trust the Windows store alone (Go's `gh`, .NET, Schannel) cannot use a placeholder, and say so; AC14 holds on Windows for `aws`. The guardrail is widened to `proxy` and `placeholder` with the device's half | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -4075,7 +4126,8 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     `crates/modules/vault/src/policy.rs:130`) forbids every mode but `proxy` on Windows.
     *Decided 2026-10-22 by the operator, on the recommendation*: offer them, the proxy advisory,
     and the guardrail widened to `proxy` and `placeholder` in P3b-5, with the Windows device's half,
-    so the vault releases the mode there only once a Windows daemon serves it.
+    so the vault releases the mode there only once a Windows daemon serves it. *Designed in
+    P3b-5-0* (§3e "P3b-5, Windows, as designed"), which adds decision 35.
     - *Recommended: offer them, with the proxy advisory*: `HTTPS_PROXY` and the CA variables in the
       session's settings, as the design's §7.2 says of Windows, and the guardrail widened to
       `proxy` and `placeholder`. Its reason holds for both, since the value stays in the daemon
@@ -4180,6 +4232,24 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Built in P3b-4-2 as recommended, pending the operator's word.* A pattern changes
       `placeholder-only-named-audiences` (`crates/modules/vault/src/policy.rs`) and
       `placeholder::bound`.
+35. **The harness's own traffic on Windows** (P3b-5), for the operator to confirm (posted in step
+    221). On Linux and macOS the sandbox sends a session's commands through its egress proxy and
+    leaves Claude Code's own traffic as it is. On Windows the proxy is named in the settings'
+    `env`, which Claude Code itself follows too: its WebFetch, a remote MCP server, its telemetry
+    and update checks. Its model route, on loopback, is never proxied.
+    - *Recommended: through the proxy*, decided by the session's allowlist as its commands' are,
+      with its non-essential traffic (telemetry, error reports, update checks) turned off, so the
+      vault is not asked about it. WebFetch and a remote MCP server reach the hosts the role
+      allows, and no other.
+      - What it costs: on Windows, WebFetch and remote MCP servers need their hosts in the role's
+        allowlist, which on Linux and macOS they do not.
+    - *Or: commands alone*, by a `PreToolUse` hook that prefixes each Bash command with the
+      variables.
+      - What it costs: a hook that rewrites every command the model writes, which a command
+        undoes by unsetting the variables; and nothing decides the harness's own hosts.
+    - *Or: the harness's hosts in `NO_PROXY`*.
+      - What it costs: a list nobody can keep, since WebFetch reaches any host.
+    - *Built in P3b-5-1 as recommended, pending the operator's word.*
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
