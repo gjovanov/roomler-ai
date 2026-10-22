@@ -143,10 +143,12 @@ pub(crate) fn device_refusal_message(word: &str) -> &'static str {
              would give the agent root (hive_allow_passwordless_sudo)"
         }
         "folder_dirty" => "the folder on the device holds work of its own",
-        // FR-90 P3b-1b-2 — the device runs every session sandboxed.
+        // FR-90 P3b-1b-2 — the device runs every session behind its egress
+        // proxy: in Claude Code's sandbox, or (P3b-5-1) on Windows, where none
+        // runs, with the proxy named to it.
         "sandbox_unavailable" => {
-            "the device runs every agent session in a sandbox (hive_egress), and cannot run \
-             this one in it"
+            "the device runs every agent session behind its egress proxy (hive_egress), in a \
+             sandbox where one runs, and cannot run this one so"
         }
         // P2f-4b — the server's own words for a start that never reached
         // its device: a terminal session made managed keeps them.

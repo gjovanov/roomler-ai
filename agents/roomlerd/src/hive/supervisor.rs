@@ -51,10 +51,14 @@ use roomler_ai_remote_control::hive::{
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_hive_node::checkpoint::Checkpoint;
+#[cfg(all(windows, feature = "vault"))]
+use roomler_hive_node::launch::AdvisoryProxy;
+#[cfg(all(unix, feature = "vault"))]
+use roomler_hive_node::launch::SandboxProxy;
 #[cfg(unix)]
 use roomler_hive_node::launch::unix_base_env;
 use roomler_hive_node::launch::{
-    APPROVE_TOOL, DISALLOWED_TOOLS, LaunchSpec, PERMISSION_MODE, SandboxProxy, SettingsSpec,
+    APPROVE_TOOL, DISALLOWED_TOOLS, EgressProxy, LaunchSpec, PERMISSION_MODE, SettingsSpec,
     attributed_prompt, config_dir_in, history_path_in, parent_history_in, toolbelt_mcp_config,
     user_input_line,
 };
@@ -439,11 +443,11 @@ struct Spawned {
 
 /// FR-90 P3b-1b-2 — a run's egress proxy while its start is under way:
 /// stopped if the start goes no further, kept once the run is live, when
-/// `unlive` stops it. Unix's alone: a Windows session never runs sandboxed.
-#[cfg(all(unix, feature = "vault"))]
+/// `unlive` stops it. (P3b-5-1) Windows' too, where the proxy is advisory.
+#[cfg(feature = "vault")]
 struct EgressServed(Option<(ObjectId, u64)>);
 
-#[cfg(all(unix, feature = "vault"))]
+#[cfg(feature = "vault")]
 impl EgressServed {
     fn none() -> Self {
         Self(None)
@@ -459,13 +463,64 @@ impl EgressServed {
     }
 }
 
-#[cfg(all(unix, feature = "vault"))]
+#[cfg(feature = "vault")]
 impl Drop for EgressServed {
     fn drop(&mut self) {
         if let Some((session, fence)) = self.0.take() {
             super::egress::drop_run(session, fence);
         }
     }
+}
+
+/// FR-90 P3b-1b-2 — a run's egress proxy as its start made it: its fronts,
+/// its guard, and (P3b-3b) the run's CA as the files that tell the session's
+/// tools to trust it, named in the run's directory, with their text.
+#[cfg(feature = "vault")]
+struct EgressStarted {
+    fronts: super::egress::Fronts,
+    served: EgressServed,
+    trust: roomler_hive_node::launch::Trust,
+    /// The CA, and the bundle where there is one.
+    pems: (String, Option<String>),
+}
+
+/// FR-90 P3b-1b-2 — start `order`'s egress proxy, admitting `peer`'s
+/// processes alone, and name its trust files in `dir`, the run's directory.
+/// With no system root to read, no bundle, so no tool loses its own roots.
+/// Stopped again if the start goes no further (its guard).
+#[cfg(feature = "vault")]
+fn start_egress(
+    order: &StartOrder,
+    peer: super::egress::Peer,
+    dir: &Path,
+) -> Result<EgressStarted, (HiveRefusal, String)> {
+    let fronts = super::egress::start(
+        (order.session_id, order.fence),
+        peer,
+        Arc::new(super::egress::VaultDecider),
+        Arc::new(super::egress::SystemDialer),
+    )
+    .map_err(|e| (HiveRefusal::SandboxUnavailable, e))?;
+    let served = EgressServed::of(order.session_id, order.fence);
+    // P3b-3b — the run's CA, which the proxy made with it.
+    let ca = super::egress::ca_of(order.session_id, order.fence).ok_or((
+        HiveRefusal::SandboxUnavailable,
+        "the session's egress proxy stopped as it started".to_string(),
+    ))?;
+    let ca_pem = ca.pem();
+    let bundle_pem = super::egress::ca::bundle(&ca_pem);
+    let trust = roomler_hive_node::launch::Trust {
+        ca: dir.join(super::egress::ca::CA_FILE),
+        bundle: bundle_pem
+            .as_ref()
+            .map(|_| dir.join(super::egress::ca::BUNDLE_FILE)),
+    };
+    Ok(EgressStarted {
+        fronts,
+        served,
+        trust,
+        pems: (ca_pem, bundle_pem),
+    })
 }
 
 /// P1d-2 — where a session the device hosted stood when its last daemon
@@ -4352,54 +4407,36 @@ impl Supervisor {
         // in the settings that turn the sandbox on, its cache made by the
         // wrapper. Gone with the run (`unlive`), or now if the start goes no
         // further.
+        // P3b-3b — and the files that tell the session's tools to trust the
+        // run's CA: written beside its settings below, before the harness
+        // runs.
         #[cfg(feature = "vault")]
-        let (sandbox, egress) = if self.cfg.egress {
-            let fronts = super::egress::start(
-                (order.session_id, order.fence),
-                uid,
-                Arc::new(super::egress::VaultDecider),
-                Arc::new(super::egress::SystemDialer),
-            )
-            .map_err(|e| (HiveRefusal::SandboxUnavailable, e))?;
-            let served = EgressServed::of(order.session_id, order.fence);
-            // P3b-3b — the run's CA, which the proxy made with it, and the
-            // files that tell the session's tools to trust it: written beside
-            // its settings below, before the harness runs. With no system
-            // root to read, no bundle, so no tool loses its own roots.
-            let ca = super::egress::ca_of(order.session_id, order.fence).ok_or((
-                HiveRefusal::SandboxUnavailable,
-                "the session's egress proxy stopped as it started".to_string(),
-            ))?;
-            let ca_pem = ca.pem();
-            let bundle_pem = super::egress::ca::bundle(&ca_pem);
-            let dir = self.runtime.join(&sid);
-            let trust = roomler_hive_node::launch::Trust {
-                ca: dir.join(super::egress::ca::CA_FILE),
-                bundle: bundle_pem
-                    .as_ref()
-                    .map(|_| dir.join(super::egress::ca::BUNDLE_FILE)),
-            };
+        let (proxy, egress) = if self.cfg.egress {
+            let made = start_egress(order, uid, &self.runtime.join(&sid))?;
             let sandbox = SandboxProxy {
-                http_port: fronts.http.port(),
-                socks_port: fronts.socks.port(),
+                http_port: made.fronts.http.port(),
+                socks_port: made.fronts.socks.port(),
                 cache: roomler_hive_node::launch::cache_dir_in(&session_state_dir(&home, &sid)),
-                trust: Some(trust),
+                trust: Some(made.trust),
             };
-            (Some(sandbox), (served, Some((ca_pem, bundle_pem))))
+            (
+                Some(EgressProxy::Sandboxed(sandbox)),
+                (made.served, Some(made.pems)),
+            )
         } else {
             (None, (EgressServed::none(), None))
         };
         #[cfg(feature = "vault")]
         let (egress, trust_pems) = egress;
         #[cfg(not(feature = "vault"))]
-        let sandbox: Option<SandboxProxy> = None;
+        let proxy: Option<EgressProxy> = None;
         let settings = write_settings(
             &self.runtime,
             &sid,
             vault.is_some(),
             net_tools,
             ssh_tools,
-            sandbox.clone(),
+            proxy.clone(),
         )
         .map_err(|e| {
             (
@@ -4525,11 +4562,10 @@ impl Supervisor {
             )
             .arg(spec.auto_memory_dir())
             // P3b-1b-2 — the session's cache, for a sandboxed session alone.
-            .arg(
-                sandbox
-                    .as_ref()
-                    .map_or_else(Default::default, |s| s.cache.as_os_str().to_os_string()),
-            )
+            .arg(match &proxy {
+                Some(EgressProxy::Sandboxed(s)) => s.cache.as_os_str().to_os_string(),
+                _ => Default::default(),
+            })
             .arg(&spec.harness)
             .args(spec.args());
         // A clean environment: none of the daemon's (root's, with its
@@ -4671,13 +4707,35 @@ impl Supervisor {
         let ssh_tools = ssh.is_some();
         #[cfg(not(all(feature = "vault", feature = "ssh-server")))]
         let ssh_tools = false;
+        // FR-90 P3b-5-1 — where the owner turned on `hive_egress`, the
+        // session's egress proxy, advisory here (decision 30): started for
+        // the console user's processes alone and named in the settings' `env`,
+        // with the files that tell the session's tools to trust the run's CA,
+        // which the directory's DACL lets the user read. Gone with the run
+        // (`unlive`), or now if the start goes no further.
+        #[cfg(feature = "vault")]
+        let (proxy, egress) = if self.cfg.egress {
+            let made = start_egress(order, peer.clone(), &dir)?;
+            write_trust(&dir, &made.pems.0, made.pems.1.as_deref())
+                .map_err(|e| failed("writing the session's trust", e))?;
+            let advisory = AdvisoryProxy {
+                http_port: made.fronts.http.port(),
+                socks_port: made.fronts.socks.port(),
+                trust: Some(made.trust),
+            };
+            (Some(EgressProxy::Advisory(advisory)), made.served)
+        } else {
+            (None, EgressServed::none())
+        };
+        #[cfg(not(feature = "vault"))]
+        let proxy: Option<EgressProxy> = None;
         let settings = write_settings(
             &self.runtime,
             &sid,
             vault.is_some(),
             net_tools,
             ssh_tools,
-            None,
+            proxy,
         )
         .map_err(|e| failed("writing the session settings", e))?;
         let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
@@ -4776,14 +4834,19 @@ impl Supervisor {
             },
         );
         match started {
-            Ok(child) => Ok(Spawned {
-                child: hive_win::HarnessChild::new(child, job),
-                token,
-                toolbelt,
-                // P2f-3a — a fork's first launch resumes its parent's.
-                history: spec.resume || spec.fork_of.is_some(),
-                checkpoints,
-            }),
+            Ok(child) => {
+                // P3b-5-1 — the run is live: its proxy stays until `unlive`.
+                #[cfg(feature = "vault")]
+                egress.keep();
+                Ok(Spawned {
+                    child: hive_win::HarnessChild::new(child, job),
+                    token,
+                    toolbelt,
+                    // P2f-3a — a fork's first launch resumes its parent's.
+                    history: spec.resume || spec.fork_of.is_some(),
+                    checkpoints,
+                })
+            }
             Err(e) => {
                 if let Some(token) = &token {
                     self.tokens.revoke(token);
@@ -4867,7 +4930,7 @@ fn write_settings(
     vault_tools: bool,
     net_tools: bool,
     ssh_tools: bool,
-    sandbox: Option<SandboxProxy>,
+    egress: Option<EgressProxy>,
 ) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     #[cfg(unix)]
@@ -4899,14 +4962,15 @@ fn write_settings(
         extra_read_denies.push(format!("Read(/{}/**)", secrets.display()));
     }
     // P3b-3c-2 — a placeholder, where the session runs behind its egress
-    // proxy: the proxy is what swaps it in, and the toolbelt offers it there.
-    let placeholder_tools = vault_tools && sandbox.is_some();
+    // proxy (P3b-5-1: advisory on Windows): the proxy is what swaps it in,
+    // and the toolbelt offers it there.
+    let placeholder_tools = vault_tools && egress.is_some();
     // P0e — the key helper is the DAEMON's (the sidecar runs it); the session
     // has no `apiKeyHelper`, so nothing in it can print the provider's key.
     let doc = SettingsSpec {
         api_key_helper: None,
         auto_memory_directory: None,
-        sandbox_proxy: sandbox,
+        egress,
         extra_read_denies,
         session_start_hook,
         // P3-4b — the vault's reads need no person: their gate is the
@@ -5248,14 +5312,17 @@ fn harness_path(home: &Path) -> String {
 /// FR-90 P3b-3b — the session's CA, and its bundle where there is one, as
 /// the files its settings name, in the run's own directory. Neither is a
 /// secret, so both are readable by the session's account whatever the
-/// daemon's umask.
-#[cfg(all(unix, feature = "vault"))]
+/// daemon's umask; (P3b-5-1) on Windows, by the directory's DACL, which
+/// they inherit.
+#[cfg(feature = "vault")]
 fn write_trust(dir: &Path, ca: &str, bundle: Option<&str>) -> Result<(), String> {
-    let write = |name: &str, text: &str| {
+    let write = |name: &str, text: &str| -> Result<(), String> {
         let path = dir.join(name);
         std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("{}: {e}", path.display()))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(())
     };
     write(super::egress::ca::CA_FILE, ca)?;
     if let Some(bundle) = bundle {
@@ -7971,11 +8038,12 @@ done
 
     /// FR-90 P3b-3c-2 — `vault_placeholder` is ASKED for on every call where
     /// the session runs behind its egress proxy (its settings carry the
-    /// sandbox) and the vault is offered: never allowed outright, and named
-    /// nowhere else.
+    /// sandbox, or P3b-5-1 the advisory proxy) and the vault is offered:
+    /// never allowed outright, and named nowhere else.
     #[cfg(feature = "vault")]
     #[test]
     fn the_settings_ask_for_vault_placeholder_behind_the_egress_proxy() {
+        use roomler_hive_node::launch::AdvisoryProxy;
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("run");
         let read = |sid: &str| -> serde_json::Value {
@@ -7983,26 +8051,39 @@ done
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
         let sandbox = || {
-            Some(SandboxProxy {
+            Some(EgressProxy::Sandboxed(SandboxProxy {
                 http_port: 18080,
                 socks_port: 18081,
                 cache: root.path().join("cache"),
                 trust: None,
-            })
+            }))
         };
-        write_settings(&runtime, "sandboxed", true, false, false, sandbox()).unwrap();
-        let doc = read("sandboxed");
+        let advisory = || {
+            Some(EgressProxy::Advisory(AdvisoryProxy {
+                http_port: 18080,
+                socks_port: 18081,
+                trust: None,
+            }))
+        };
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::PLACEHOLDER_TOOLS);
-        assert_eq!(doc["permissions"]["ask"], serde_json::json!(asked), "{doc}");
-        assert!(
-            !doc["permissions"]["allow"]
-                .to_string()
-                .contains("vault_placeholder"),
-            "never allowed without a person: {doc}"
-        );
-        for (sid, vault, sandbox) in [("plain", true, None), ("no-vault", false, sandbox())] {
-            write_settings(&runtime, sid, vault, false, false, sandbox).unwrap();
+        for (sid, proxy) in [("sandboxed", sandbox()), ("advisory", advisory())] {
+            write_settings(&runtime, sid, true, false, false, proxy).unwrap();
+            let doc = read(sid);
+            assert_eq!(doc["permissions"]["ask"], serde_json::json!(asked), "{doc}");
+            assert!(
+                !doc["permissions"]["allow"]
+                    .to_string()
+                    .contains("vault_placeholder"),
+                "never allowed without a person: {doc}"
+            );
+        }
+        for (sid, vault, proxy) in [
+            ("plain", true, None),
+            ("no-vault", false, sandbox()),
+            ("no-vault-advisory", false, advisory()),
+        ] {
+            write_settings(&runtime, sid, vault, false, false, proxy).unwrap();
             assert!(
                 !read(sid).to_string().contains("vault_placeholder"),
                 "{sid}: not offered, not named"

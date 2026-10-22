@@ -5027,6 +5027,16 @@ async fn vault_placeholder_is_offered_only_behind_the_egress_proxy() {
     let tool = list["result"]["tools"].as_array().unwrap().last().unwrap();
     assert_eq!(tool["inputSchema"]["required"], json!(["env", "audience"]));
     assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
+    // P3b-5-1 — the model is told how AWS uses a placeholder pair (P3b-4-2),
+    // and on Windows alone which tools cannot use a placeholder.
+    let described = tool["description"].as_str().unwrap();
+    assert!(described.contains("AWS_SECRET_ACCESS_KEY"), "{described}");
+    assert!(described.contains("signs the request again"), "{described}");
+    assert_eq!(
+        described.contains("Windows certificate store"),
+        cfg!(windows),
+        "{described}"
+    );
     assert_eq!(
         PLACEHOLDER_TOOLS[0],
         format!("mcp__roomler__{}", placeholder::TOOL)
@@ -5038,6 +5048,13 @@ async fn vault_placeholder_is_offered_only_behind_the_egress_proxy() {
     assert!(
         placeholder::is_placeholder(answer["env"]["GH_TOKEN"].as_str().unwrap()),
         "{answered}"
+    );
+    let note = answer["note"].as_str().unwrap();
+    assert!(note.contains("AWS signature"), "{note}");
+    assert_eq!(
+        note.contains("Windows certificate store"),
+        cfg!(windows),
+        "{note}"
     );
     assert_eq!(vault.leases_asked().len(), 1);
     egress::drop_run(session, 1);

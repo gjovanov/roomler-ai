@@ -12,7 +12,6 @@
 //!
 //! | Refused where | Because |
 //! |---|---|
-//! | Windows | Claude Code has no sandbox there; P3b-5 serves Windows |
 //! | the device takes no leases | no vault decides the hosts a sandboxed session reaches |
 //! | Linux without `bwrap` or `socat` | the sandbox's isolation and its relay |
 //! | a harness older than [`MIN_HARNESS`], or one that does not say | before it, a repository's own `.claude/settings.json` could add `excludedCommands`, which run outside the sandbox and past the proxy |
@@ -22,6 +21,12 @@
 //! daemon must never run as itself. Its answer is trusted as the harness is
 //! trusted to sandbox at all: the sandbox holds the model's commands, not the
 //! account's owner.
+//!
+//! P3b-5-1 — on Windows no sandbox runs and none is asked for: the session's
+//! egress proxy is advisory there (decision 30), named in its settings'
+//! environment. The gate refuses only a device that takes no leases
+//! ([`decide_advisory`]); no harness version is asked, since none of the
+//! settings its floor guards is written.
 
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -119,6 +124,22 @@ pub fn decide(
     }
 }
 
+/// P3b-5-1 — the gate's word where no sandbox runs (Windows): the session's
+/// egress proxy is advisory there, so a vault to decide its hosts is all a
+/// start needs.
+pub fn decide_advisory(vault: bool) -> Result<(), (HiveRefusal, String)> {
+    if vault {
+        return Ok(());
+    }
+    Err((
+        HiveRefusal::SandboxUnavailable,
+        "hive_egress sends every session's traffic here through its egress proxy, and the \
+         organization's vault decides each host it reaches; this device takes no leases \
+         (vault_enabled), so nothing would be reached"
+            .into(),
+    ))
+}
+
 /// Which file a version was read from: its path, and its size and change
 /// time, so an update asks again.
 #[cfg(unix)]
@@ -152,12 +173,7 @@ pub async fn gate(
     #[cfg(windows)]
     {
         let _ = (account, harness_cfg, as_account);
-        Err((
-            HiveRefusal::SandboxUnavailable,
-            "Claude Code has no sandbox on Windows, and hive_egress runs every session here \
-             sandboxed; Windows is served from P3b-5"
-                .into(),
-        ))
+        decide_advisory(super::toolbelt::daemon_vault().is_some())
     }
     #[cfg(unix)]
     {
@@ -288,6 +304,21 @@ mod tests {
             assert_eq!(refused.0, HiveRefusal::SandboxUnavailable, "{says}");
             assert!(refused.1.contains(says), "{says}: {}", refused.1);
         }
+    }
+
+    /// P3b-5-1 — where no sandbox runs (Windows), a start needs a vault to
+    /// decide its hosts, and nothing more: no tool, no harness version.
+    #[test]
+    fn where_no_sandbox_runs_a_start_needs_the_vault_alone() {
+        assert_eq!(decide_advisory(true), Ok(()));
+        let refused = decide_advisory(false).unwrap_err();
+        assert_eq!(refused.0, HiveRefusal::SandboxUnavailable);
+        assert!(refused.1.contains("takes no leases"), "{}", refused.1);
+        assert!(
+            !refused.1.contains("sandboxed"),
+            "no sandbox is said where none runs: {}",
+            refused.1
+        );
     }
 
     /// The tools are looked for in the directories the harness is given, an

@@ -57,7 +57,9 @@ pub struct HiveConfig {
     /// (`hive_ssh`): one command on another device, where the vault is too.
     pub ssh: bool,
     /// FR-90 P3b-1b-2 — whether every session here runs in Claude Code's
-    /// sandbox, its commands' egress decided by the vault (`hive_egress`).
+    /// sandbox, its commands' egress decided by the vault (`hive_egress`);
+    /// (P3b-5-1) on Windows, where none runs, behind the proxy as its
+    /// environment names it.
     pub egress: bool,
 }
 

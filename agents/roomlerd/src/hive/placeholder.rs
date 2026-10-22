@@ -432,12 +432,26 @@ pub(crate) async fn call(
              the command, or exported in the session's shell). A placeholder is not the value: \
              this device's egress proxy swaps the value in on the way to {toward}, and nowhere \
              else, inside TLS it terminates for those hosts, and only in a request's \
-             Authorization header (as a bearer token, or the password of basic authentication). \
-             Sent anywhere else, or in a URL, another header or a body, it goes out as itself \
-             and carries nothing. It works for ttl_s seconds; ask again after."
+             Authorization header (as a bearer token, or the password of basic authentication), \
+             or in an AWS signature made with one secret's access_key_id and \
+             secret_access_key placeholders, which it signs again with the values. Sent \
+             anywhere else, or in a URL, another header or a body, it goes out as itself and \
+             carries nothing. It works for ttl_s seconds; ask again after.{}",
+            WINDOWS_NOTE
         ),
     }))
 }
+
+/// FR-90 P3b-5-1 — what a session on Windows is told besides, in the tool's
+/// description and its answer: its egress proxy is advisory there, and no
+/// trust store is changed.
+#[cfg(windows)]
+pub const WINDOWS_NOTE: &str = " On Windows, a tool that trusts the Windows certificate store \
+     alone (gh and other Go programs, .NET, PowerShell's Invoke-WebRequest) cannot reach an \
+     audience while a placeholder for it is held: use one that follows HTTPS_PROXY and the CA \
+     variables, such as curl, git, Python, Node or the aws CLI.";
+#[cfg(not(windows))]
+pub const WINDOWS_NOTE: &str = "";
 
 #[cfg(test)]
 mod tests;
