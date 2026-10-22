@@ -11,6 +11,7 @@
 //! | Check, in order | Refused as | Recorded |
 //! |---|---|---|
 //! | the request within its bounds, in a mode that releases a stored value | `bad_request` | no |
+//! | P3b-2 — in `placeholder` mode, `vault.placeholder` lists the organization | `not_served` | no |
 //! | the vault serves the organization | `not_served` | no |
 //! | the device takes leases: its hello advertised `vault` and carried a key | `unsupported` | no |
 //! | a session of the organization whose record places it on THIS device | `not_located` | no |
@@ -79,11 +80,25 @@ use crate::rrn;
 /// The modes a lease may be asked in: those that hand the daemon a STORED
 /// value, and (P3-6b) `short-lived`, which hands it a dynamic secret's
 /// issuer to mint a credential with. `identity` releases nothing (the
-/// session authenticates as itself), and `placeholder` is P3b's: a lease in
-/// either would release a value the policy that permits the mode never
-/// meant to. Which kind each mode leases is the guardrails' to decide
-/// (`dynamic-only-short-lived`, `short-lived-only-dynamic`).
-pub const LEASE_MODES: &[&str] = &["proxy", "file", "env", "exec", "short-lived"];
+/// session authenticates as itself), so a lease in it would release a value
+/// the policy that permits the mode never meant to. P3b-2 — `placeholder`
+/// hands the daemon the value as `proxy` does: the session holds only an
+/// opaque token, which the daemon's egress proxy swaps for the value toward
+/// an origin the secret names (design §8.5), and only where
+/// `vault.placeholder` lists the organization. Which kind each mode leases
+/// is the guardrails' to decide (`dynamic-only-short-lived`,
+/// `short-lived-only-dynamic`, `placeholder-only-named-audiences`).
+pub const LEASE_MODES: &[&str] = &[
+    "proxy",
+    "file",
+    "env",
+    "exec",
+    "short-lived",
+    MODE_PLACEHOLDER,
+];
+
+/// P3b-2 — the mode a placeholder's lease is asked in.
+pub const MODE_PLACEHOLDER: &str = "placeholder";
 
 /// One `rc:vault.lease`, as it arrived.
 #[derive(Debug, Clone)]
@@ -788,6 +803,11 @@ pub async fn lease(state: &VaultState, conn: Conn, req: &LeaseRequest) -> Result
     if !within_bounds(req) {
         return Err(LeaseRefusal::BadRequest.into());
     }
+    // P3b-2 — opt-in: an organization the vault serves holds no placeholder
+    // until `vault.placeholder` lists it, so an upgrade turns no mode on.
+    if req.mode == MODE_PLACEHOLDER && !state.placeholder.serves(conn.tenant_id) {
+        return Err(LeaseRefusal::NotServed.into());
+    }
     let (agent, session, mut rec) = identify(
         state,
         conn,
@@ -1278,8 +1298,10 @@ mod tests {
                 ..req()
             }));
         }
+        // P3b-2 — a placeholder's lease hands the daemon its value.
+        assert!(LEASE_MODES.contains(&"placeholder"));
         // Modes a policy may name that release no value to a daemon.
-        for mode in ["identity", "placeholder", "raw", "shortlived", ""] {
+        for mode in ["identity", "raw", "shortlived", "Placeholder", ""] {
             assert!(
                 !within_bounds(&LeaseRequest {
                     mode: mode.into(),

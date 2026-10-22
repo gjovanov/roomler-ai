@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! Which organizations the vault serves (`vault.tenants`), and (P3-9-1)
-//! whose people it lends to (`vault.people`).
+//! Which organizations the vault serves (`vault.tenants`), (P3-9-1) whose
+//! people it lends to (`vault.people`), and (P3b-2) whose sessions may hold a
+//! secret as a placeholder (`vault.placeholder`).
 //!
 //! `vault.tenants` is the same dial as `hive.tenants` (FR-90 P1g), with the
 //! same rules: empty or `*` is every organization, a list is only those, and
@@ -12,7 +13,9 @@
 //! ⚠️ `vault.people` reads the other way about: empty is NO organization
 //! ([`TenantScope::parse_opt_in`]). A person's `roomler connect` is a new
 //! kind of principal, and an organization the vault already serves for its
-//! sessions must not start lending to its people on an upgrade.
+//! sessions must not start lending to its people on an upgrade. So does
+//! `vault.placeholder` ([`TenantScope::parse_placeholder`]), for the same
+//! reason: a new mode is never turned on by an upgrade.
 //!
 //! A copy of hive's `TenantScope`, not a call into it: the vault depends on
 //! core alone in P3-1, and an edge to hive for one parser would be the
@@ -52,11 +55,21 @@ impl TenantScope {
     /// every one, and otherwise the ids listed, with [`Self::parse`]'s rule
     /// for an entry that is no id.
     pub fn parse_opt_in(raw: &str) -> Self {
+        Self::opt_in(raw, "vault.people")
+    }
+
+    /// P3b-2 — `vault.placeholder` read: opt-in, as `vault.people` is.
+    pub fn parse_placeholder(raw: &str) -> Self {
+        Self::opt_in(raw, "vault.placeholder")
+    }
+
+    /// An opt-in setting read: empty is no organization.
+    fn opt_in(raw: &str, setting: &str) -> Self {
         let entries = entries(raw);
         if entries.is_empty() {
             return Self::nobody();
         }
-        Self::listed(&entries, "vault.people")
+        Self::listed(&entries, setting)
     }
 
     /// `*` anywhere is every organization; otherwise the ids listed, and an
@@ -109,6 +122,21 @@ impl TenantScope {
             Some(ids) => info!(
                 organizations = ids.len(),
                 "vault: lends only to the people of the organizations in vault.people"
+            ),
+        }
+    }
+
+    /// P3b-2 — said once at boot, so the log shows whose sessions may hold a
+    /// placeholder.
+    pub fn log_placeholder(&self) {
+        match &self.0 {
+            None => info!("vault: releases placeholders to every organization it serves"),
+            Some(ids) if ids.is_empty() => {
+                info!("vault: releases no placeholder (vault.placeholder is empty)")
+            }
+            Some(ids) => info!(
+                organizations = ids.len(),
+                "vault: releases placeholders only to the organizations in vault.placeholder"
             ),
         }
     }
@@ -177,6 +205,21 @@ mod tests {
         assert!(!s.serves(oid(B)));
         // A typo lends to nobody, never to everybody.
         let typo = TenantScope::parse_opt_in("65f0000000000000000000aZ");
+        assert!(!typo.serves(oid(A)) && !typo.serves(oid(B)));
+    }
+
+    /// P3b-2 — `vault.placeholder` is opt-in as `vault.people` is: an
+    /// upgrade turns no new mode on.
+    #[test]
+    fn placeholders_are_released_only_where_listed() {
+        for raw in ["", "  ", ","] {
+            let s = TenantScope::parse_placeholder(raw);
+            assert_eq!(s, TenantScope::nobody(), "{raw:?}");
+        }
+        assert_eq!(TenantScope::parse_placeholder("*"), TenantScope::everyone());
+        let s = TenantScope::parse_placeholder(A);
+        assert!(s.serves(oid(A)) && !s.serves(oid(B)));
+        let typo = TenantScope::parse_placeholder("65f0000000000000000000aZ");
         assert!(!typo.serves(oid(A)) && !typo.serves(oid(B)));
     }
 }

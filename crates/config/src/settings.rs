@@ -121,6 +121,16 @@ pub struct VaultSettings {
     /// sweep.
     #[serde(default)]
     pub people: String,
+    /// FR-90 P3b-2 — the organizations whose sessions may hold a secret as
+    /// a PLACEHOLDER (`ROOMLER__VAULT__PLACEHOLDER=<id>,<id>`): the value
+    /// released to the device's daemon, which swaps it in at the session's
+    /// egress proxy toward the secret's audiences only, the session holding
+    /// an opaque token (design §8.5). ⚠️ Opt-in, as `people`: empty — the
+    /// default — is NO organization, `*` every one the vault serves, a list
+    /// only those. Clearing it is the kill switch: every live placeholder
+    /// lease is taken back at its device's next sweep.
+    #[serde(default)]
+    pub placeholder: String,
 }
 
 impl std::fmt::Debug for VaultSettings {
@@ -139,6 +149,7 @@ impl std::fmt::Debug for VaultSettings {
             .field("revoke_sweep_secs", &self.revoke_sweep_secs)
             .field("providers", &self.providers)
             .field("people", &self.people)
+            .field("placeholder", &self.placeholder)
             .finish()
     }
 }
@@ -1842,6 +1853,8 @@ mod vault_settings_tests {
         assert!(absent.tenants.is_empty() && absent.kek.is_empty() && absent.kek_file.is_empty());
         // P3-9-1 — and lends to no organization's people.
         assert!(absent.people.is_empty());
+        // P3b-2 — and releases no value as a placeholder.
+        assert!(absent.placeholder.is_empty());
     }
 
     /// ⚠️ The KEK is the vault's root secret: whatever prints settings must
@@ -1858,6 +1871,7 @@ mod vault_settings_tests {
             revoke_sweep_secs: 0,
             providers: String::new(),
             people: String::new(),
+            placeholder: String::new(),
         };
         let shown = format!("{s:?} {s:#?}");
         assert!(!shown.contains(key), "{shown}");
