@@ -3093,6 +3093,50 @@ outcome to `<log_dir>/last-install.json` with status
 `InstallerFailed` / `Timeout`. Operators + future agent startups
 read the file to surface what actually happened to the upgrade.
 
+**Never leave the service stopped (#2711, Windows perMachine).** The
+watcher is the only actor that outlives the install, so its last act
+settles the `Roomler` SCM service (`post_install.rs`,
+`settle_service`) instead of probing it once. It reads the state with
+QUERY_STATUS, waits out a STOP_PENDING / START_PENDING it did not
+cause, starts the service whenever it reads STOPPED (at most 3 starts),
+and believes RUNNING only once it has held for 15 s, all inside a 2 min
+budget.
+
+```mermaid
+sequenceDiagram
+  participant U as updater (outgoing worker)
+  participant M as msiexec and Restart Manager
+  participant S as Roomler service
+  participant W as post-install watcher
+  U->>M: spawn the MSI /qn, then exit
+  M->>S: RM stop, from InstallValidate
+  M->>S: install, the new host starts
+  M-->>S: a late RM stop, never restored, on some installs
+  M-->>W: msiexec exits
+  W->>S: read StopPending, wait
+  W->>S: read Stopped, StartService
+  W->>S: Running held 15 s, done
+```
+
+> ⚠️ **`sc start` → 1056 is not "running".** `ERROR_SERVICE_ALREADY_RUNNING`
+> means the SCM still holds an instance, and it says the same for a
+> **STOP_PENDING** one. Field, 2026-10-22, CORPLAP-1: Restart Manager
+> stopped the new 0.4.151 host 3.9 s after it started (RestartManager
+> event 10002, no 10003 restore). The newborn worker was in its
+> first-boot capability probe and never heard its stop event, so the
+> stop took 8.4 s. The watcher's one-shot `sc start` landed one second
+> before it completed, got 1056 and recorded `already running`. The
+> host stayed down 30 min, until a person started it. On 10-19 the same
+> late stop had landed 1 s after the start, the worker exited in 1.4 s,
+> and RM's own restore brought the host back. Each update's outcome came
+> down to timing.
+
+> ⚠️ **Every update on such a host shows RestartManager 10006** ("could
+> not be shut down") for `Roomler`: the service's stop takes longer than
+> RM waits. The watcher's settle does not depend on why. It ends any
+> stop it finds in flight by starting the service once the stop
+> completes.
+
 **AgentConfig crash-tracking fields** (all `#[serde(default)]` for
 back-compat — pre-0.1.51 configs continue to load, locked by
 `old_config_without_new_fields_loads_with_defaults`): `last_known_
