@@ -116,7 +116,8 @@ const RUNTIME_DIR: &str = tunnel_core::localapi::hive_adopt::RUNTIME_DIR_MACOS;
 /// The runtime root this daemon writes each session's files under. On Windows
 /// (P1i-2) under the daemon's machine-global directory, where nothing clears
 /// it at boot: each launch gives its session's directory its DACL again.
-fn runtime_root() -> PathBuf {
+/// FR-90 P3-9-2b — and on Unix, a person's endpoints under `person-<uid>`.
+pub(super) fn runtime_root() -> PathBuf {
     #[cfg(unix)]
     return PathBuf::from(RUNTIME_DIR);
     #[cfg(windows)]

@@ -17,6 +17,9 @@
 /// duplicated crates the daemon already contains.
 pub mod cli;
 pub mod config;
+/// FR-90 P3-9-2b — `roomler connect`: a vault secret's upstream through a
+/// local endpoint the daemon serves, held in the foreground.
+pub mod connectcmd;
 /// FR-103 — the tunnel client renews its own token, and the renewal rule
 /// `roomlerd` shares.
 pub mod credential;
