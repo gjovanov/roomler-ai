@@ -351,7 +351,7 @@ the throttle shapes **bulk only**:
 ```mermaid
 flowchart LR
     FL["usage flush, every pod<br/>(derp.rs:178)"] --> L[("stats_usage")]
-    PP["PoP /stats poll<br/>(relay_load.rs:216)"] --> L
+    PP["PoP /stats poll<br/>(relay_load.rs:355)"] --> L
     L --> J["allowance job, one pod, every 5 min:<br/>month-to-date per org vs<br/>relay_bytes_per_month × seats"]
     J -->|plans_sold only| S[("over-allowance set<br/>(Redis, networks of flagged orgs)")]
     S --> A["each API pod: refresh every 60 s<br/>→ DashSet lookup in forward_frame"]
