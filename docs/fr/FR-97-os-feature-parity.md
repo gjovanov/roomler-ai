@@ -632,6 +632,16 @@ test of the SIGKILL property itself.
 
   The click came from a posted mouse event at the button's place in the panel's own layout. System Events does not
   list a borderless window at the screen-saver level, so a UI-scripted click cannot reach it.
+  *Proven on the field Mac (2026-10-22, §8).* The operator's MacBook (macOS 27.0.1, SIP on) is a supervised Mac: one
+  enrollment, so the root half is the one that asks. The same candidate, installed by a one-shot launchd job that
+  would have rolled back by itself, came up healthy in 10 s and served a session over `hevc_videotoolbox`. With the
+  root half set to ask, its own panel came up on the console, and a click on Approve connected the viewer. The Mac
+  went back to the released 0.4.151 afterwards.
+  A dead end on the way, kept: from "macOS consent panel available" in the ROOT half's log, a LaunchDaemon's window
+  was taken to be invisible, and a gate was built so that only GUI-session processes pump AppKit. Measured
+  instead: a system-context window showed on the MacBook's console, and on a tart Mac with only the root half
+  enrolled, the root's panel showed and both a CLI deny and a click on Approve answered it. The gate was withdrawn
+  before it merged; it would have sent a supervised Mac's prompts back to the companion for nothing.
 - **P2c, Remote Apps without AppKit.** List with `CGWindowListCopyWindowInfo` (titles need the Screen Recording grant
   already held), focus with the Accessibility API (`AXUIElement` raise and `kAXFrontmostAttribute`), launch
   allowlisted apps through LaunchServices (`open -b <bundle id>`). It runs in the GUI worker and crosses FR-43's
@@ -1143,7 +1153,7 @@ model on Windows, so the three agree on what the mode means.
 | **P1c** | macOS DNS: MagicDNS + the exit catch-all | `ROOMLERD_MACOS_DNS_STEER=0` | vmtest | M |
 | **P1d** | A macOS per-org utun run once; the stale warning; the port holder. *In review:* run on the released 0.4.143 (§8); the warning removed; the port holder through `lsof` | — | a tart Mac, two orgs | S |
 | **P2a** | macOS system audio (SCK) | `ROOMLERD_SCK_AUDIO=0` | a field Mac | M–L |
-| **P2b** | macOS native consent panel (D3): `viewer-indicator-macos` in the release feature set (built; proven on a tart Mac, red on 0.4.149; the field Mac and a release follow) | the release feature set | one Mac, then the field Macs | S–M |
+| **P2b** | macOS native consent panel (D3): `viewer-indicator-macos` in the release feature set (built; proven on a tart Mac, red on 0.4.149, and on the operator's MacBook, the root half's own panel included; ships in 0.4.153) | the release feature set | one Mac, then the field Macs | S–M |
 | **P2c** | macOS Remote Apps | `[apps] enabled` | a field Mac | M–L |
 | **P2d-1** | macOS lock hint: the session dictionary's lock, to the viewer's chip in a session (`input: "unknown"`) and to a request waiting for consent (`host_locked`); the chip's neutral title. Released in 0.4.150 (#2683) | `ROOMLERD_LOCK_HINT=0` | a tart Mac, red on 0.4.149 | S |
 | **P2d-2** | macOS layout, display-match | per-verb caps | a field Mac | M |
@@ -1239,7 +1249,8 @@ one depends on it.
   and green on its candidate, §8, released in 0.4.150; the deployed viewer shows its neutral title since the
   2026-10-22 promote.)*
   *(The first clause is field-verified on P2b's candidate on a tart Mac, §8: the companion took the prompt on 0.4.149;
-  on the candidate the native panel came up, Approve connected the viewer and Deny declined it.)*
+  on the candidate the native panel came up, Approve connected the viewer and Deny declined it. Then on the
+  operator's MacBook, a supervised Mac, where the root half asked and its own panel answered, 2026-10-22.)*
 - [x] **AC9 (P3a–P3f):** on the Linux lab, the cursor shape follows; the locked hint arrives; a session holds sleep
   off; session audio is never a microphone; received files land as the seat user; layout, display-match and image
   sync work on X11; uinput types a German and a French string.
@@ -1553,3 +1564,5 @@ one depends on it.
 | 2026-10-21 | released 0.4.149 (its `.pkg`, `f7f8d298…`) | a throwaway tart Mac (vmtest-golden, macOS 15.7.7), both halves enrolled standard in the vmtest org, the per-user half asking for consent (`auto_grant_session = false`), the FR-43 supervisor on. A Playwright viewer on mars (purestat aborted) connected to the per-user half through prod | 🔴 **P2b (AC8), the red.** The worker logged *consent prompt surface … native=false … have_surface=true*: the companion, running, took the prompt, and the worker had no window on screen |
 | 2026-10-21 | P2b's candidate: the `.pkg` from release-lane rehearsal 39602057824 on `806a9d17f` (`0d471e7a…`; roomlerd `d7b190ed…`), `viewer-indicator-macos` in the release feature set | the same set-up on a fresh clone; both rows deleted and the VM destroyed afterwards | 🟢 **P2b (AC8), one Mac.** Both halves started, and the worker ran the AppKit loop. **Approve:** the worker logged `native=true` 0.1 s after the viewer's Connect. Within 2 s the window server listed its 480×240 panel at the screen-saver level (1000). A posted click at the Approve button's place in the panel's layout closed it, and the worker logged *native consent panel decision allow=true*, then *outcome=Granted*. The viewer reached "connected" 7 s after its Connect and held 10 s. **Deny:** the same panel, the Deny button: *allow=false*, *outcome=Denied*, and the viewer showed "Someone at that device declined the request." 2.5 s after its Connect. A first attempt clicked through System Events and could not: it lists no window for a borderless panel at that level |
 | 2026-10-22 | released 0.4.151 (the operator's MacBook updated itself overnight; it carries P2g and P2h) | the operator's MacBook, both halves, read-only commands as the console user | 🟢 **AC19, the operator's MacBook.** `roomler devices` as the console user answered `overlay: ok` with all 18 of the org's devices (13 online), the same list as any other member; on 0.4.149 it listed the Mac alone (`no_node`, the operator's report of 2026-10-21). `roomler peers` returned the links with no endpoint field, and `roomler status` carried the overlay address and the MagicDNS domain. AC19 ticked |
+| 2026-10-22 | P2b's candidate: the `.pkg` from release-lane rehearsal 39754055046 on `768e78c48` (`d224c282…`; roomlerd `e40dd79f…`) | the operator's MacBook (macOS 27.0.1, SIP on), a supervised Mac: one enrollment, the GUI worker supervised. Installed by a one-shot launchd job that would have put the released 0.4.151 back by itself | 🟢 **P2b (AC8), the field Mac.** Healthy 10 s after the install, both halves; "macOS consent panel available" in the worker's log and the root's; an owner's session over `hevc_videotoolbox` at 53 fps. With the root half set to ask (`auto_grant_session = false`, one restart), its own panel came up on the console (480×240 at the screen-saver level, owned by the root daemon), and a posted click on Approve answered it: `native=true` → `allow=true` → `Granted` → the viewer connected (54 fps). Back on the released 0.4.151 (`8a041507…`) with `auto_grant_session = true` afterwards |
+| 2026-10-22 | the same candidate; a one-shot system-context window | throwaway tart Macs (macOS 15.7.7) with ONLY the root half enrolled; the operator's MacBook for the window | 🔍 **A dead end, kept.** From "panel available" in the ROOT half's log, its panel was taken to be invisible (a LaunchDaemon outside any session) and a gate was built so that only GUI-session processes pump AppKit. Measured instead: a LaunchDaemon's 8-second window showed on the MacBook's console (`osascript` at layer 1000, gone after); on tart the root's panel showed (`native=true`), and a CLI deny, then a click on Approve, each answered it (declined; connected). The gate was withdrawn before it merged |

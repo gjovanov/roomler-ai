@@ -1273,7 +1273,10 @@ on the main run loop and `#[tokio::main]` parks it, so under
 main thread to `NSApp`. That is why the feature stayed out of the macOS release
 build until FR-97 P2b ran the real-Mac procedure: a candidate on a Mac where the
 daemon started and a prompt both appeared and answered. Approve connected the
-viewer, and Deny declined it. The companion stays the fallback.
+viewer, and Deny declined it. The companion stays the fallback. On a supervised
+Mac the root half is the one that asks (`Request` is never delegated), and it
+draws the panel too: a LaunchDaemon's window reaches the console (measured on
+the operator's MacBook, macOS 27; FR-97 §8, 2026-10-22).
 ⚠️ **The macOS panel appears in the captured stream.** `NSWindowSharingNone` is
 ignored by `CGDisplayStream`, which is what our capture uses. ⚠️ Since FR-27 the marker is written by **all three**
 consent-bearing subsystems — remote control, Fleet-RPC `exec` and Roomler SSH —
