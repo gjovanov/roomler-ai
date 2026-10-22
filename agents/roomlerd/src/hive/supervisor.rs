@@ -4014,6 +4014,9 @@ impl Supervisor {
         // FR-90 P3b-1b-2 — and its egress proxy, with every connection on it.
         #[cfg(feature = "vault")]
         super::egress::drop_run(session, fence);
+        // FR-90 P3b-3a — and every placeholder it held.
+        #[cfg(feature = "vault")]
+        super::placeholder::drop_run(session, fence);
     }
 
     /// P1d-2 — a session resumed after its daemon went down. A turn the
@@ -8155,6 +8158,32 @@ done
         assert!(
             !super::super::egress::drop_run(sid, 1),
             "the proxy went with the start"
+        );
+    }
+
+    /// FR-90 P3b-3a — a run's end takes every placeholder it held with it,
+    /// whichever way it ends: here, its owner stops it.
+    #[cfg(feature = "vault")]
+    #[tokio::test]
+    async fn a_runs_end_takes_its_placeholders_with_it() {
+        use super::super::placeholder;
+        let mut r = rig(true, 4);
+        let o = order(&r);
+        let sid = o.session_id;
+        assert_eq!(r.sup.start(o, true).await, Answer::accepted("dev"));
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        placeholder::bind_for_test(sid, 1, "api.github.com", 443);
+        placeholder::bind_for_test(sid, 1, "github.com", 443);
+        assert_eq!(placeholder::held(sid, 1), 2);
+        r.sup.stop(sid, 1, "owner".into());
+        assert_eq!(
+            until_ended(&mut r, sid).await.as_deref(),
+            Some("stopped (owner)")
+        );
+        assert_eq!(
+            placeholder::held(sid, 1),
+            0,
+            "the run took its placeholders with it"
         );
     }
 

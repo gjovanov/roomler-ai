@@ -4572,3 +4572,247 @@ fn a_tool_says_plainly_what_an_approval_came_to() {
     );
     assert_eq!(APPROVAL_WINDOW, Duration::from_secs(600));
 }
+
+/// FR-90 P3b-3a — a vault holding the secrets the placeholder calls name.
+#[cfg(feature = "vault")]
+fn placeholder_vault(handles: &[&str]) -> FakeVault {
+    FakeVault {
+        values: handles
+            .iter()
+            .map(|h| (h.to_string(), format!("the value of {h}").into_bytes()))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// FR-90 P3b-3a — each variable is its own lease in `placeholder` mode,
+/// toward the audience as it is spelled, and its own placeholder, bound to
+/// the run and the audience's host and port. The answer carries no value,
+/// and the leases outlive the call.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_placeholder_call_binds_each_variable_to_its_own_lease() {
+    use super::super::placeholder;
+    let vault = placeholder_vault(&["github/bot#token", "github/bot#app"]);
+    let (session, fence) = (ObjectId::new(), 3);
+    let answer = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({
+            "env": {"GH_TOKEN": "github/bot#token", "GH_APP": "github/bot#app"},
+            "audience": "https://api.github.com",
+        }),
+    )
+    .await
+    .unwrap();
+    let leases = vault.leases_asked();
+    assert_eq!(leases.len(), 2, "{leases:?}");
+    for (kind, s, f, what) in &leases {
+        assert_eq!(kind, "lease_placeholder");
+        assert_eq!((*s, *f), (session, fence));
+        assert!(what.ends_with("for https://api.github.com 300s"), "{what}");
+    }
+    let token = answer["env"]["GH_TOKEN"].as_str().unwrap();
+    let app = answer["env"]["GH_APP"].as_str().unwrap();
+    assert!(placeholder::is_placeholder(token), "{answer}");
+    assert!(placeholder::is_placeholder(app), "{answer}");
+    assert_ne!(token, app);
+    assert!(
+        !answer.to_string().contains("the value of"),
+        "no value reaches the session: {answer}"
+    );
+    assert_eq!(answer["audience"], "https://api.github.com");
+    assert_eq!(answer["ttl_s"], 300);
+    let bound = placeholder::bound(session, fence, "api.github.com", 443);
+    let lease_of: HashMap<&str, &str> = bound
+        .iter()
+        .map(|b| (b.token.as_str(), b.lease_id.as_str()))
+        .collect();
+    assert_eq!(lease_of.len(), 2, "{bound:?}");
+    assert_ne!(lease_of[token], lease_of[app], "each its own lease");
+    assert!(placeholder::bound(session, fence, "api.github.com", 8443).is_empty());
+    assert!(placeholder::bound(session, fence, "github.com", 443).is_empty());
+    assert!(placeholder::bound(session, fence + 1, "api.github.com", 443).is_empty());
+    assert!(
+        vault.released.lock().unwrap().is_empty(),
+        "the leases last their TTL"
+    );
+    placeholder::drop_run(session, fence);
+}
+
+/// FR-90 P3b-3a — a placeholder goes when its lease is let go (its expiry,
+/// a revocation), and every one when the run ends.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_placeholder_ends_with_its_lease_and_all_with_the_run() {
+    use super::super::placeholder;
+    let vault = placeholder_vault(&["github/bot#token", "github/bot#app"]);
+    let (session, fence) = (ObjectId::new(), 1);
+    let answer = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({
+            "env": {"GH_TOKEN": "github/bot#token", "GH_APP": "github/bot#app"},
+            "audience": "https://api.github.com",
+        }),
+    )
+    .await
+    .unwrap();
+    let token = answer["env"]["GH_TOKEN"].as_str().unwrap().to_string();
+    let bound = placeholder::bound(session, fence, "api.github.com", 443);
+    let ended = bound
+        .iter()
+        .find(|b| b.token == token)
+        .unwrap()
+        .lease_id
+        .clone();
+    vault.release(std::slice::from_ref(&ended));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while placeholder::held(session, fence) != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the placeholder went with its lease"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let left = placeholder::bound(session, fence, "api.github.com", 443);
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0].token, token, "the other stays");
+    assert!(placeholder::drop_run(session, fence));
+    assert_eq!(
+        placeholder::held(session, fence),
+        0,
+        "the run's end takes them all"
+    );
+}
+
+/// FR-90 P3b-3a — a lease the vault refuses leaves no placeholder, and lets
+/// go of the leases the call already took; the refusal names its variable.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_refused_lease_leaves_no_placeholder_and_lets_go_of_the_rest() {
+    use super::super::placeholder;
+    let vault = placeholder_vault(&["github/bot#token"]);
+    let (session, fence) = (ObjectId::new(), 1);
+    // GH_TOKEN is leased first (by name and as written alike), then OTHER.
+    let refused = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({
+            "env": {"GH_TOKEN": "github/bot#token", "OTHER": "github/none#token"},
+            "audience": "https://api.github.com",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("OTHER: the vault refused"), "{refused}");
+    assert_eq!(vault.leases_asked().len(), 2);
+    // The vault issued L0 to GH_TOKEN: it is let go, and nothing else.
+    assert_eq!(*vault.released.lock().unwrap(), ["L0"]);
+    assert!(
+        vault.left("L0").is_none(),
+        "the first lease is no longer held"
+    );
+    assert_eq!(placeholder::held(session, fence), 0, "no placeholder made");
+}
+
+/// FR-90 P3b-3a — a lease asked for ahead, in `placeholder` mode toward the
+/// same audience, is taken as it is: the call asks for none of its own, and
+/// answers the time the ahead lease has left.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_placeholder_takes_a_lease_asked_for_ahead() {
+    use super::super::placeholder;
+    let vault = placeholder_vault(&["github/bot#token"]);
+    let (session, fence) = (ObjectId::new(), 1);
+    let handle = super::super::vault_exec::handle_of("github/bot#token").unwrap();
+    let ahead = vault
+        .lease_ahead(
+            session,
+            fence,
+            &handle,
+            placeholder::MODE,
+            "https://api.github.com",
+            600,
+        )
+        .await
+        .unwrap();
+    let answer = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({"env": {"GH_TOKEN": "github/bot#token"}, "audience": "https://api.github.com"}),
+    )
+    .await
+    .unwrap();
+    let kinds: Vec<String> = vault.leases_asked().into_iter().map(|a| a.0).collect();
+    assert_eq!(kinds, ["ahead_placeholder"], "no lease of its own");
+    let bound = placeholder::bound(session, fence, "api.github.com", 443);
+    assert_eq!(bound.len(), 1);
+    assert_eq!(bound[0].lease_id, ahead);
+    assert_eq!(answer["ttl_s"], 600);
+    placeholder::drop_run(session, fence);
+}
+
+/// FR-90 P3b-3a — a run holds at most so many placeholders: a call that
+/// would take it past them asks the vault nothing.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_run_holds_so_many_placeholders_and_no_more() {
+    use super::super::placeholder;
+    let handles: Vec<String> = (0..8).map(|i| format!("s/{i}#v")).collect();
+    let refs: Vec<&str> = handles.iter().map(String::as_str).collect();
+    let vault = placeholder_vault(&refs);
+    let (session, fence) = (ObjectId::new(), 1);
+    let env: serde_json::Map<String, Value> = (0..8)
+        .map(|i| (format!("V{i}"), json!(format!("s/{i}#v"))))
+        .collect();
+    let calls = placeholder::MAX_PER_RUN / env.len();
+    for _ in 0..calls {
+        placeholder::call(
+            &vault,
+            session,
+            fence,
+            &json!({"env": env, "audience": "https://api.github.com"}),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(placeholder::held(session, fence), placeholder::MAX_PER_RUN);
+    let asked = vault.leases_asked().len();
+    let refused = placeholder::call(
+        &vault,
+        session,
+        fence,
+        &json!({"env": {"V0": "s/0#v"}, "audience": "https://api.github.com"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("more than 64 placeholders"), "{refused}");
+    assert_eq!(vault.leases_asked().len(), asked, "the vault asked nothing");
+    placeholder::drop_run(session, fence);
+}
+
+/// FR-90 P3b-3a — a call refused by its own checks asks the vault nothing.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn a_placeholder_call_refused_by_its_checks_asks_the_vault_nothing() {
+    use super::super::placeholder;
+    let vault = placeholder_vault(&["github/bot#token"]);
+    let session = ObjectId::new();
+    for args in [
+        json!({"env": {"GH_TOKEN": "github/bot#token"}, "audience": "https://API.github.com"}),
+        json!({"env": {"gh_token": "github/bot#token"}, "audience": "https://api.github.com"}),
+        json!({"env": {"GH_TOKEN": "github/bot#token"}}),
+    ] {
+        assert!(
+            placeholder::call(&vault, session, 1, &args).await.is_err(),
+            "{args}"
+        );
+    }
+    assert!(vault.leases_asked().is_empty());
+    assert_eq!(placeholder::held(session, 1), 0);
+}
