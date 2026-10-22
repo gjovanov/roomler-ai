@@ -72,10 +72,14 @@
 //!    it falls back to probing `…\Roomler\roomlerd.exe` for the
 //!    running flavour.
 //! 7. Watcher writes `last-install.json` and exits. Windows
-//!    perMachine: as a last act the watcher runs `sc start` on the
-//!    SCM service — every observed wedge left the service STOPPED
-//!    (the MSI never reached StartServices), and a host that stays
-//!    down is worse than any install verdict. Elsewhere the agent comes back
+//!    perMachine: as a last act the watcher SETTLES the SCM service
+//!    ([`settle_service`], #2711) — waits out a stop or start still in
+//!    flight, starts it whenever it reads STOPPED, and believes RUNNING only
+//!    once it has held for [`SERVICE_STABLE_FOR`]. Every observed wedge left
+//!    the service STOPPED (the MSI never reached StartServices), Restart
+//!    Manager can stop the NEW service after the install has finished, and a
+//!    host that stays down is worse than any install verdict. Elsewhere the
+//!    agent comes back
 //!    at the next logon (the per-user Scheduled Task), within 5 s (systemd,
 //!    `Restart=always`), or through the `.pkg`'s postinstall (launchd skips a
 //!    clean exit); the new binary reads `last-install.json` at startup.
@@ -304,9 +308,14 @@ pub fn watch(
     }
     outcome.finished_unix = Some(unix_now());
     // Last act on Windows perMachine: whatever the verdict, never
-    // leave the host's SCM service stopped.
+    // leave the host's SCM service stopped. The settle can take up to
+    // SERVICE_SETTLE_BUDGET, so the install's own verdict is on disk
+    // first: a watcher that dies mid-settle still leaves it behind.
     #[cfg(target_os = "windows")]
-    ensure_service_running(&mut outcome, install_flavour(origin_exe.as_deref()));
+    {
+        let _ = write_outcome(&outcome);
+        ensure_service_running(&mut outcome, install_flavour(origin_exe.as_deref()));
+    }
     let _ = write_outcome(&outcome);
     Ok(outcome)
 }
@@ -528,15 +537,14 @@ fn run_recovery_cmd(cmd: &str, args: &[&str]) {
 /// Make sure the perMachine SCM service is running before the watcher
 /// exits. Every observed wedge left the service STOPPED (msiexec never
 /// reached StartServices), and nothing else restarts it until a
-/// reboot. `sc start` is effectively idempotent for our purpose:
-/// 1056 (already running) and 1060 (no such service — perUser /
-/// attended flavours never register one) are success-equivalent.
+/// reboot: the host's own stop is a clean one, so the SCM's recovery
+/// actions never fire.
 ///
-/// Best-effort by design: on SystemContext hosts the updater — and
-/// therefore this watcher — runs in the USER-session worker, whose
-/// non-elevated token lacks SERVICE_START on a LocalSystem service
-/// (`sc` exits 5). The verdict string records that honestly instead
-/// of pretending the net exists where it can't act.
+/// Best-effort by design: on an attended host whose console user is not
+/// an administrator, the updater — and therefore this watcher — runs in
+/// a worker whose token lacks SERVICE_START on a LocalSystem service.
+/// The verdict records that honestly ([`ServiceVerdict::Denied`])
+/// instead of pretending the net exists where it can't act.
 #[cfg(target_os = "windows")]
 fn ensure_service_running(
     outcome: &mut InstallOutcome,
@@ -546,32 +554,367 @@ fn ensure_service_running(
         return;
     }
     let name = crate::win_service::NEW_SERVICE_NAME;
-    match std::process::Command::new("sc")
-        .args(["start", name])
-        .output()
-    {
-        Ok(out) => {
-            // sc.exe exits with the raw win32 error code.
-            let code = out.status.code().unwrap_or(-1);
-            let verdict = match code {
-                0 => "started",
-                1056 => "already running",
-                1060 => "not installed (non-SCM flavour)",
-                1058 => "disabled — not starting",
-                5 => "access denied (watcher context lacks SERVICE_START)",
-                _ => "start attempt failed",
-            };
-            tracing::info!(service = name, code, verdict, "post-install service check");
-            if !outcome.note.is_empty() {
-                outcome.note.push_str("; ");
+    let began = std::time::Instant::now();
+    let settle = settle_service(
+        name,
+        &mut ScmService { name },
+        || began.elapsed(),
+        std::thread::sleep,
+    );
+    tracing::info!(
+        service = name,
+        verdict = settle.verdict.words(),
+        starts = settle.starts,
+        seen = %settle.trail(),
+        "post-install service check"
+    );
+    if !outcome.note.is_empty() {
+        outcome.note.push_str("; ");
+    }
+    outcome
+        .note
+        .push_str(&format!("service {name}: {}", settle.describe()));
+}
+
+// ─── #2711 — settle the service, never probe it once ─────────────────────────
+//
+// Field, 2026-10-22, CORPLAP-1 (0.4.149 → 0.4.151): the install finished at
+// 08:15:42.7 and the new service host was running, when Restart Manager — in
+// msiexec's "restart previously shut down applications" step — stopped it
+// again at 08:15:45.16 (RestartManager event 10002) and never restored it
+// (no 10003). The stop took 8.4 s. At 08:15:52.53, one second before it
+// completed, the watcher's single `sc start` got 1056 — which the SCM answers
+// for a STOP_PENDING service too, since it still holds an instance — and
+// recorded "already running". The host stayed down 30 minutes, until a
+// person started it. On 10-19 the same late stop had landed 1 s after the
+// new host started, and RM's own restore brought it back after 10 s: two of
+// ~20 updates on that host, and timing alone decided which way each went.
+//
+// So the watcher reads the STATE, never a start's exit code; waits out a
+// transition someone else has in flight; starts what it finds stopped; and
+// believes RUNNING only once it has held. Everything up to the SCM calls is
+// pure and runs in the tests on every OS ([`ServiceHandle`] is the seam).
+
+/// How long the watcher keeps the service under watch once the installer
+/// has exited. A stop already in flight runs the host's whole stop path —
+/// #1683's 8 s graceful budget for the worker, then a terminate — and a
+/// start the SCM's own; two minutes covers both, with the bounded starts.
+#[cfg(any(target_os = "windows", test))]
+const SERVICE_SETTLE_BUDGET: Duration = Duration::from_secs(120);
+
+/// How long the service must read RUNNING, unbroken, before the watcher
+/// believes it. A single RUNNING read proves only that no stop had reached
+/// the SCM yet: on 2026-10-22 Restart Manager's arrived 3.9 s after the new
+/// host started.
+#[cfg(any(target_os = "windows", test))]
+const SERVICE_STABLE_FOR: Duration = Duration::from_secs(15);
+
+/// Between two reads of the service.
+#[cfg(any(target_os = "windows", test))]
+const SERVICE_POLL: Duration = Duration::from_millis(500);
+
+/// Starts the watcher makes before it gives up on a service that keeps
+/// stopping. A host that dies at start belongs to the SCM's recovery
+/// actions (`win_service::apply_recovery_actions`), not to a loop here.
+#[cfg(any(target_os = "windows", test))]
+const MAX_SERVICE_STARTS: u32 = 3;
+
+/// One read of the SCM service, as the watcher sees it.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceLook {
+    Running,
+    Stopped,
+    StartPending,
+    /// The #2711 read: a stop that is still in flight. `StartService`
+    /// answers 1056 for it, exactly as for a running service.
+    StopPending,
+    /// PAUSED, PAUSE_PENDING or CONTINUE_PENDING — the host accepts no
+    /// pause, so somebody else's transition, waited out like the others.
+    Paused,
+    /// No such service: a flavour that never registers one, or an
+    /// uninstall that removed it meanwhile.
+    Missing,
+    /// The SCM would not answer this token, or could not be reached.
+    Unreadable,
+}
+
+/// Why the watcher stopped watching.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceVerdict {
+    /// RUNNING, unbroken, for [`SERVICE_STABLE_FOR`].
+    Running,
+    /// RUNNING when the budget ran out, but not yet for the whole window.
+    RunningBriefly,
+    /// STOPPED with every start spent, or when the budget ran out.
+    Stopped,
+    /// Still mid-transition when the budget ran out.
+    Unsettled,
+    NotInstalled,
+    Unreadable,
+    /// `ERROR_SERVICE_DISABLED` (1058): somebody disabled it; not ours to undo.
+    Disabled,
+    /// `ERROR_ACCESS_DENIED` (5): this context lacks SERVICE_START.
+    Denied,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl ServiceVerdict {
+    fn words(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::RunningBriefly => "running, but not yet held for the stability window",
+            Self::Stopped => "STOPPED — could not start it",
+            Self::Unsettled => "still changing state when the watch ended",
+            Self::NotInstalled => "not installed (non-SCM flavour)",
+            Self::Unreadable => "unreadable (the SCM would not answer this context)",
+            Self::Disabled => "disabled — not starting",
+            Self::Denied => "access denied (watcher context lacks SERVICE_START)",
+        }
+    }
+}
+
+/// The next move of the settle loop.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceStep {
+    /// Read again after [`SERVICE_POLL`].
+    Wait,
+    /// The service is STOPPED: start it.
+    Start,
+    Done(ServiceVerdict),
+}
+
+/// The decision, from one read and the watch so far. Pure.
+///
+/// ⚠️ A RUNNING read is never enough on its own (see
+/// [`SERVICE_STABLE_FOR`]), and no transition is ever cut short: a
+/// STOP_PENDING service is waited out until it reads STOPPED, and only
+/// then started.
+#[cfg(any(target_os = "windows", test))]
+fn next_service_step(
+    look: ServiceLook,
+    running_for: Duration,
+    starts: u32,
+    elapsed: Duration,
+) -> ServiceStep {
+    let spent = elapsed >= SERVICE_SETTLE_BUDGET;
+    match look {
+        ServiceLook::Missing => ServiceStep::Done(ServiceVerdict::NotInstalled),
+        ServiceLook::Unreadable => ServiceStep::Done(ServiceVerdict::Unreadable),
+        ServiceLook::Running if running_for >= SERVICE_STABLE_FOR => {
+            ServiceStep::Done(ServiceVerdict::Running)
+        }
+        ServiceLook::Running if spent => ServiceStep::Done(ServiceVerdict::RunningBriefly),
+        ServiceLook::Running => ServiceStep::Wait,
+        ServiceLook::Stopped if spent || starts >= MAX_SERVICE_STARTS => {
+            ServiceStep::Done(ServiceVerdict::Stopped)
+        }
+        ServiceLook::Stopped => ServiceStep::Start,
+        ServiceLook::StartPending | ServiceLook::StopPending | ServiceLook::Paused if spent => {
+            ServiceStep::Done(ServiceVerdict::Unsettled)
+        }
+        ServiceLook::StartPending | ServiceLook::StopPending | ServiceLook::Paused => {
+            ServiceStep::Wait
+        }
+    }
+}
+
+/// What a refused start means. `None` = keep watching: 1056
+/// (`ERROR_SERVICE_ALREADY_RUNNING`) says only that the SCM still holds an
+/// instance — a running one, or a STOP_PENDING one, the read #2711's
+/// one-shot check got wrong — so the next read decides; anything unknown is
+/// explained by the next read as well.
+#[cfg(any(target_os = "windows", test))]
+fn start_refusal(code: u32) -> Option<ServiceVerdict> {
+    match code {
+        5 => Some(ServiceVerdict::Denied),
+        1058 => Some(ServiceVerdict::Disabled),
+        // ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE.
+        1060 | 1072 => Some(ServiceVerdict::NotInstalled),
+        _ => None,
+    }
+}
+
+/// The watcher's hands on the service: the SCM in production, a script
+/// in the tests.
+#[cfg(any(target_os = "windows", test))]
+trait ServiceHandle {
+    fn look(&mut self) -> ServiceLook;
+    /// `Err` carries the raw win32 code.
+    fn start(&mut self) -> Result<(), u32>;
+}
+
+/// What the settle saw and did.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug)]
+struct ServiceSettle {
+    verdict: ServiceVerdict,
+    starts: u32,
+    /// Every read, in order, a run of equal reads kept once.
+    seen: Vec<ServiceLook>,
+    /// The last win32 code a start was refused with, if any.
+    refused: Option<u32>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl ServiceSettle {
+    /// The reads, e.g. `StopPending→Stopped→StartPending→Running`, at most
+    /// [`Self::TRAIL_MAX`] of them (a flapping service is cut short).
+    fn trail(&self) -> String {
+        let mut parts: Vec<String> = self
+            .seen
+            .iter()
+            .take(Self::TRAIL_MAX)
+            .map(|l| format!("{l:?}"))
+            .collect();
+        if self.seen.len() > Self::TRAIL_MAX {
+            parts.push(format!("…+{}", self.seen.len() - Self::TRAIL_MAX));
+        }
+        parts.join("→")
+    }
+
+    const TRAIL_MAX: usize = 12;
+
+    /// The `last-install.json` note: the verdict, the starts it took, and the
+    /// reads that led there.
+    fn describe(&self) -> String {
+        let mut s = format!(
+            "{} ({} start{}; seen {}",
+            self.verdict.words(),
+            self.starts,
+            if self.starts == 1 { "" } else { "s" },
+            self.trail()
+        );
+        if let Some(code) = self.refused {
+            s.push_str(&format!("; last start refused with {code}"));
+        }
+        s.push(')');
+        s
+    }
+}
+
+/// Watch the service until it is settled: RUNNING for
+/// [`SERVICE_STABLE_FOR`], or a verdict the watcher cannot act past.
+/// `elapsed` is the time since the watch began; `pause` sleeps.
+#[cfg(any(target_os = "windows", test))]
+fn settle_service(
+    name: &str,
+    svc: &mut impl ServiceHandle,
+    mut elapsed: impl FnMut() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> ServiceSettle {
+    let mut starts = 0;
+    let mut seen: Vec<ServiceLook> = Vec::new();
+    let mut refused = None;
+    let mut running_since: Option<Duration> = None;
+    loop {
+        let now = elapsed();
+        let look = svc.look();
+        if seen.last() != Some(&look) {
+            seen.push(look);
+            tracing::info!(service = name, state = ?look, at_ms = now.as_millis() as u64, "post-install service watch");
+        }
+        running_since = match look {
+            ServiceLook::Running => running_since.or(Some(now)),
+            _ => None,
+        };
+        let running_for = running_since.map_or(Duration::ZERO, |since| now.saturating_sub(since));
+        match next_service_step(look, running_for, starts, now) {
+            ServiceStep::Done(verdict) => {
+                return ServiceSettle {
+                    verdict,
+                    starts,
+                    seen,
+                    refused,
+                };
             }
-            outcome
-                .note
-                .push_str(&format!("service {name}: {verdict} (sc exit {code})"));
+            ServiceStep::Wait => {}
+            ServiceStep::Start => {
+                starts += 1;
+                tracing::warn!(
+                    service = name,
+                    attempt = starts,
+                    at_ms = now.as_millis() as u64,
+                    "post-install: the service is STOPPED after the install — starting it"
+                );
+                if let Err(code) = svc.start() {
+                    tracing::warn!(service = name, code, "post-install: service start refused");
+                    refused = Some(code);
+                    if let Some(verdict) = start_refusal(code) {
+                        return ServiceSettle {
+                            verdict,
+                            starts,
+                            seen,
+                            refused,
+                        };
+                    }
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!(service = name, error = %e, "sc start failed to spawn");
+        pause(SERVICE_POLL);
+    }
+}
+
+/// The SCM, through the `windows-service` crate. The state is read with
+/// QUERY_STATUS alone, so a context that may not START the service still
+/// reports what it saw.
+#[cfg(target_os = "windows")]
+struct ScmService {
+    name: &'static str,
+}
+
+#[cfg(target_os = "windows")]
+impl ServiceHandle for ScmService {
+    fn look(&mut self) -> ServiceLook {
+        use windows_service::service::{ServiceAccess, ServiceState};
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+        let Ok(manager) =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        else {
+            return ServiceLook::Unreadable;
+        };
+        let service = match manager.open_service(self.name, ServiceAccess::QUERY_STATUS) {
+            Ok(s) => s,
+            // ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE.
+            Err(e) if matches!(win32_code(&e), Some(1060 | 1072)) => return ServiceLook::Missing,
+            Err(_) => return ServiceLook::Unreadable,
+        };
+        match service.query_status() {
+            Ok(status) => match status.current_state {
+                ServiceState::Running => ServiceLook::Running,
+                ServiceState::Stopped => ServiceLook::Stopped,
+                ServiceState::StartPending => ServiceLook::StartPending,
+                ServiceState::StopPending => ServiceLook::StopPending,
+                ServiceState::Paused
+                | ServiceState::PausePending
+                | ServiceState::ContinuePending => ServiceLook::Paused,
+            },
+            Err(_) => ServiceLook::Unreadable,
         }
+    }
+
+    fn start(&mut self) -> Result<(), u32> {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+        // u32::MAX: a failure that carried no win32 code — unknown, so the
+        // next read decides (`start_refusal` maps it to "keep watching").
+        let code = |e: windows_service::Error| win32_code(&e).unwrap_or(u32::MAX);
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(code)?;
+        let service = manager
+            .open_service(self.name, ServiceAccess::START)
+            .map_err(code)?;
+        service.start::<&str>(&[]).map_err(code)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win32_code(e: &windows_service::Error) -> Option<u32> {
+    match e {
+        windows_service::Error::Winapi(io) => io.raw_os_error().map(|c| c as u32),
+        _ => None,
     }
 }
 
@@ -976,5 +1319,365 @@ mod tests {
             let json = serde_json::to_string(&status).unwrap();
             assert_eq!(json, expected);
         }
+    }
+
+    // ── #2711 — the service settle ───────────────────────────────────────
+
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    /// How long a start the fake accepts spends in START_PENDING.
+    const FAKE_START_TAKES: Duration = Duration::from_millis(300);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A scripted SCM on a fake clock. `timeline` is the service's state
+    /// from each instant on; a start the fake accepts owns the next
+    /// [`FAKE_START_TAKES`] (START_PENDING, then RUNNING — or STOPPED again
+    /// with `dies_on_start`), and later script entries still happen, which is
+    /// how a stop arriving after a start is written.
+    struct FakeScm {
+        clock: Rc<Cell<Duration>>,
+        timeline: Vec<(Duration, ServiceLook)>,
+        /// What each start answers, in order; once empty, a start is accepted.
+        answers: VecDeque<Result<(), u32>>,
+        dies_on_start: bool,
+        /// When each start came, and the state it found.
+        starts: Vec<(Duration, ServiceLook)>,
+    }
+
+    impl FakeScm {
+        fn new(clock: &Rc<Cell<Duration>>, timeline: &[(u64, ServiceLook)]) -> Self {
+            Self {
+                clock: clock.clone(),
+                timeline: timeline.iter().map(|(t, l)| (ms(*t), *l)).collect(),
+                answers: VecDeque::new(),
+                dies_on_start: false,
+                starts: Vec::new(),
+            }
+        }
+
+        fn at(&self, t: Duration) -> ServiceLook {
+            self.timeline
+                .iter()
+                .rev()
+                .find(|(from, _)| *from <= t)
+                .map_or(ServiceLook::Stopped, |(_, l)| *l)
+        }
+    }
+
+    impl ServiceHandle for FakeScm {
+        fn look(&mut self) -> ServiceLook {
+            self.at(self.clock.get())
+        }
+
+        fn start(&mut self) -> Result<(), u32> {
+            let now = self.clock.get();
+            let state = self.at(now);
+            self.starts.push((now, state));
+            match (self.answers.pop_front().unwrap_or(Ok(())), state) {
+                (Ok(()), ServiceLook::Stopped) => {
+                    let settled = now + FAKE_START_TAKES;
+                    let after = if self.dies_on_start {
+                        ServiceLook::Stopped
+                    } else {
+                        ServiceLook::Running
+                    };
+                    self.timeline
+                        .retain(|(from, _)| *from <= now || *from > settled);
+                    self.timeline.push((now, ServiceLook::StartPending));
+                    self.timeline.push((settled, after));
+                    // Stable: at one instant, the entry pushed last wins.
+                    self.timeline.sort_by_key(|(from, _)| *from);
+                    Ok(())
+                }
+                // The SCM still holds an instance: a running one, or a
+                // STOP_PENDING one — the same 1056 either way.
+                (Ok(()), _) => Err(1056),
+                (Err(code), _) => Err(code),
+            }
+        }
+    }
+
+    /// Run the settle against `scm`; returns it and when the watch ended.
+    fn settle(scm: &mut FakeScm) -> (ServiceSettle, Duration) {
+        let clock = scm.clock.clone();
+        let tick = clock.clone();
+        let s = settle_service("Roomler", scm, || clock.get(), |d| tick.set(tick.get() + d));
+        (s, scm.clock.get())
+    }
+
+    /// The field read of 2026-10-22: the watcher's turn came while Restart
+    /// Manager's late stop was still in flight (STOP_PENDING), and the stop
+    /// completed 1.1 s later. The old one-shot `sc start` got 1056 here and
+    /// recorded "already running"; the host stayed down 30 minutes.
+    ///
+    /// ⚠️ The load-bearing assertion is the second: nothing is started while
+    /// the stop is pending (that answer would be 1056 and prove nothing),
+    /// and the service IS started the moment it reads STOPPED.
+    #[test]
+    fn the_2711_race_a_pending_stop_is_waited_out_then_started() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut scm = FakeScm::new(
+            &clock,
+            &[(0, ServiceLook::StopPending), (1_100, ServiceLook::Stopped)],
+        );
+        let (s, ended) = settle(&mut scm);
+
+        assert_eq!(s.verdict, ServiceVerdict::Running);
+        assert_eq!(
+            scm.starts,
+            vec![(ms(1_500), ServiceLook::Stopped)],
+            "started exactly once, at the first STOPPED read — never into the pending stop"
+        );
+        assert_eq!(
+            s.seen,
+            vec![
+                ServiceLook::StopPending,
+                ServiceLook::Stopped,
+                ServiceLook::Running
+            ]
+        );
+        assert!(
+            ended >= ms(1_800) + SERVICE_STABLE_FOR,
+            "RUNNING is believed only after it held for the window (ended at {ended:?})"
+        );
+        assert_eq!(
+            s.describe(),
+            "running (1 start; seen StopPending→Stopped→Running)"
+        );
+    }
+
+    /// The other half of 2026-10-22: Restart Manager's stop reached the
+    /// SCM 3.9 s AFTER the new host started. A watcher that believed its
+    /// first RUNNING read would have walked away from a host about to stop.
+    #[test]
+    fn running_is_believed_only_once_it_has_held() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut scm = FakeScm::new(
+            &clock,
+            &[
+                (0, ServiceLook::Running),
+                (3_900, ServiceLook::StopPending),
+                (12_300, ServiceLook::Stopped),
+            ],
+        );
+        let (s, _) = settle(&mut scm);
+
+        assert_eq!(s.verdict, ServiceVerdict::Running);
+        assert_eq!(s.starts, 1, "the late stop is caught and undone once");
+        assert_eq!(
+            s.seen,
+            vec![
+                ServiceLook::Running,
+                ServiceLook::StopPending,
+                ServiceLook::Stopped,
+                ServiceLook::Running
+            ]
+        );
+    }
+
+    /// The common install: the service runs, the watcher touches nothing.
+    #[test]
+    fn a_healthy_install_starts_nothing() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut scm = FakeScm::new(&clock, &[(0, ServiceLook::Running)]);
+        let (s, ended) = settle(&mut scm);
+
+        assert_eq!(s.verdict, ServiceVerdict::Running);
+        assert!(scm.starts.is_empty());
+        assert!(
+            (SERVICE_STABLE_FOR..SERVICE_STABLE_FOR + ms(1_000)).contains(&ended),
+            "{ended:?}"
+        );
+        assert_eq!(s.describe(), "running (0 starts; seen Running)");
+    }
+
+    /// 1056 is not "running": it means the SCM still holds an instance,
+    /// which is also what it says for a STOP_PENDING service. So a 1056
+    /// answer never ends the watch — the next read decides.
+    #[test]
+    fn a_1056_answer_never_ends_the_watch() {
+        assert_eq!(start_refusal(1056), None);
+
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut scm = FakeScm::new(&clock, &[(0, ServiceLook::Stopped)]);
+        scm.answers.push_back(Err(1056));
+        let (s, _) = settle(&mut scm);
+
+        assert_eq!(s.verdict, ServiceVerdict::Running);
+        assert_eq!(s.starts, 2, "the refused start is followed by a real one");
+        assert_eq!(s.refused, Some(1056));
+    }
+
+    /// A refusal the watcher cannot act past ends the watch at once, and
+    /// says which it was — never a silent "ok".
+    #[test]
+    fn refusals_end_the_watch_and_name_themselves() {
+        for (code, verdict) in [
+            (5, ServiceVerdict::Denied),
+            (1058, ServiceVerdict::Disabled),
+            (1060, ServiceVerdict::NotInstalled),
+            (1072, ServiceVerdict::NotInstalled),
+        ] {
+            let clock = Rc::new(Cell::new(Duration::ZERO));
+            let mut scm = FakeScm::new(&clock, &[(0, ServiceLook::Stopped)]);
+            scm.answers.push_back(Err(code));
+            let (s, ended) = settle(&mut scm);
+            assert_eq!(s.verdict, verdict, "code {code}");
+            assert_eq!((s.starts, s.refused), (1, Some(code)), "code {code}");
+            assert_eq!(
+                ended,
+                Duration::ZERO,
+                "code {code}: no waiting after a final answer"
+            );
+        }
+    }
+
+    /// A host that dies at every start is not the watcher's to loop on:
+    /// [`MAX_SERVICE_STARTS`], then the SCM's recovery actions own it.
+    #[test]
+    fn a_service_that_keeps_stopping_gets_bounded_starts() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut scm = FakeScm::new(&clock, &[(0, ServiceLook::Stopped)]);
+        scm.dies_on_start = true;
+        let (s, _) = settle(&mut scm);
+
+        assert_eq!(s.verdict, ServiceVerdict::Stopped);
+        assert_eq!(s.starts, MAX_SERVICE_STARTS);
+        assert!(
+            s.describe()
+                .starts_with("STOPPED — could not start it (3 starts;"),
+            "{}",
+            s.describe()
+        );
+    }
+
+    /// Every wait is bounded by the budget, whatever the service does.
+    #[test]
+    fn the_budget_bounds_a_transition_that_never_ends() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut scm = FakeScm::new(&clock, &[(0, ServiceLook::StopPending)]);
+        let (s, ended) = settle(&mut scm);
+
+        assert_eq!(s.verdict, ServiceVerdict::Unsettled);
+        assert!(
+            scm.starts.is_empty(),
+            "a pending stop is never started into"
+        );
+        assert!(
+            (SERVICE_SETTLE_BUDGET..=SERVICE_SETTLE_BUDGET + SERVICE_POLL).contains(&ended),
+            "{ended:?}"
+        );
+    }
+
+    /// No service, or no way to read it: nothing to wait for.
+    #[test]
+    fn missing_or_unreadable_ends_at_once() {
+        for (look, verdict) in [
+            (ServiceLook::Missing, ServiceVerdict::NotInstalled),
+            (ServiceLook::Unreadable, ServiceVerdict::Unreadable),
+        ] {
+            let clock = Rc::new(Cell::new(Duration::ZERO));
+            let mut scm = FakeScm::new(&clock, &[(0, look)]);
+            let (s, ended) = settle(&mut scm);
+            assert_eq!((s.verdict, s.starts, ended), (verdict, 0, Duration::ZERO));
+        }
+    }
+
+    /// The decision for every read, inside and at the edge of the windows.
+    #[test]
+    fn next_service_step_for_every_read() {
+        use ServiceLook as L;
+        use ServiceStep as S;
+        use ServiceVerdict as V;
+        let early = ms(1_000);
+        let late = SERVICE_SETTLE_BUDGET;
+        let cases = [
+            (L::Running, Duration::ZERO, 0, early, S::Wait),
+            (L::Running, SERVICE_STABLE_FOR - ms(1), 0, early, S::Wait),
+            (
+                L::Running,
+                SERVICE_STABLE_FOR,
+                0,
+                early,
+                S::Done(V::Running),
+            ),
+            (L::Running, ms(2_000), 0, late, S::Done(V::RunningBriefly)),
+            (L::Stopped, Duration::ZERO, 0, early, S::Start),
+            (
+                L::Stopped,
+                Duration::ZERO,
+                MAX_SERVICE_STARTS - 1,
+                early,
+                S::Start,
+            ),
+            (
+                L::Stopped,
+                Duration::ZERO,
+                MAX_SERVICE_STARTS,
+                early,
+                S::Done(V::Stopped),
+            ),
+            (L::Stopped, Duration::ZERO, 0, late, S::Done(V::Stopped)),
+            (L::StopPending, Duration::ZERO, 0, early, S::Wait),
+            (L::StartPending, Duration::ZERO, 0, early, S::Wait),
+            (L::Paused, Duration::ZERO, 0, early, S::Wait),
+            (
+                L::StopPending,
+                Duration::ZERO,
+                0,
+                late,
+                S::Done(V::Unsettled),
+            ),
+            (L::Paused, Duration::ZERO, 0, late, S::Done(V::Unsettled)),
+            (
+                L::Missing,
+                Duration::ZERO,
+                0,
+                early,
+                S::Done(V::NotInstalled),
+            ),
+            (
+                L::Unreadable,
+                Duration::ZERO,
+                0,
+                early,
+                S::Done(V::Unreadable),
+            ),
+        ];
+        for (look, running_for, starts, elapsed, want) in cases {
+            assert_eq!(
+                next_service_step(look, running_for, starts, elapsed),
+                want,
+                "{look:?} running_for={running_for:?} starts={starts} elapsed={elapsed:?}"
+            );
+        }
+    }
+
+    /// A flapping service cannot grow the note without bound.
+    #[test]
+    fn the_trail_is_capped() {
+        let seen: Vec<ServiceLook> = (0..30)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ServiceLook::Running
+                } else {
+                    ServiceLook::StopPending
+                }
+            })
+            .collect();
+        let s = ServiceSettle {
+            verdict: ServiceVerdict::Unsettled,
+            starts: 0,
+            seen,
+            refused: None,
+        };
+        let trail = s.trail();
+        assert_eq!(trail.matches('→').count(), ServiceSettle::TRAIL_MAX);
+        assert!(trail.ends_with("→…+18"), "{trail}");
     }
 }
