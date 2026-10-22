@@ -101,6 +101,11 @@ mod packer;
 /// connection that asked.
 #[cfg(feature = "vault")]
 pub(crate) mod person_connect;
+/// FR-90 P3b-3a — `vault_placeholder`: a secret held as a placeholder the
+/// session's egress proxy swaps the value in for. No tool offers it before
+/// P3b-3c.
+#[cfg(feature = "vault")]
+pub mod placeholder;
 mod procs;
 mod purger;
 mod resume_note;

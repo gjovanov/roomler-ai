@@ -115,7 +115,8 @@ pub(crate) struct ExecTarget {
     pub(crate) owner: Option<(u32, u32)>,
 }
 
-fn env_name_ok(name: &str) -> bool {
+/// A variable a value may be handed in: shared with `vault_placeholder`'s.
+pub(crate) fn env_name_ok(name: &str) -> bool {
     let mut bytes = name.bytes();
     let Some(first) = bytes.next() else {
         return false;
