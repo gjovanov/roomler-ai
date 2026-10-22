@@ -3031,6 +3031,75 @@ sequenceDiagram
 | P3b-5-0 | Windows' design (§3e "P3b-5, Windows, as designed"), and decision 35 | docs only | — |
 | P3b-5-1 | Windows served, as decision 30 says: the guardrail widened, the proxy started for the console user, the settings' `env` (the proxies, the trust, git's OpenSSL, the non-essential traffic off), the tool offered with its Windows note | device `hive_egress = false`; `vault.placeholder` | AC14 (`aws`, on Windows) |
 
+**P4, knowhow, as designed (P4-0).** Knowhow is the organization's map: what exists (machines,
+repositories and their checkouts, databases, clusters, services), where it lives, and how a
+session reaches each. Its facts are verified by probes, not remembered (design §9), and it is
+the infrastructure layer the brain (§3f) stands on. It grants nothing: every reach is still
+decided where it is decided today, by the vault for a credential or a session's egress and by
+the network for an overlay route. So a wrong fact misleads a session; it never opens anything.
+
+```mermaid
+sequenceDiagram
+    participant S as the session (its toolbelt)
+    participant D as roomlerd
+    participant K as knowhow (server)
+    participant V as vault (server)
+    S->>D: knowhow_get database/prod-mongo
+    D->>K: rc:knowhow.get, believed from the session's record at its fence
+    K-->>D: its card - facts and their status, paths and their verification, credential handles
+    S->>D: roomler_connect database/prod-mongo, a person approving
+    D->>D: the best verified path from this device
+    D->>V: rc:vault.net for the forward, rc:vault.lease for the credential
+    V-->>D: the grant and the lease, each decided by its own policy
+    D-->>S: the endpoint, the mode, a one-line note
+```
+
+| Piece | Design |
+|---|---|
+| the module | `knowhow` (`crates/modules/knowhow`, `roomler-ai-mod-knowhow`), composed last. Its edges: `knowhow → fleet` (machines, and the Hub to ask a device to scan or probe), `knowhow → network` (overlay addresses, routes, exits, tunnel routes) and `knowhow → hive` (a session's question believed from its record's device and fence, as a lease is). §3a sketched `hive → knowhow`; as `vault → hive` did for the vault, the edge runs the other way. Nothing calls it: a session reaches it over its device's control socket (`rc:knowhow.*`), the SPA over its routes. Its organizations are `knowhow.tenants`, a list that is itself the switch, as `hive.tenants` is (§3g); `[modules] knowhow = false` unmounts it (503), and the SPA gates on `/api/capabilities` |
+| the model | design §9.1: an entity (`kind`, `key`, `name`, `env`, `owner`, `attrs`, `facts`, `access`, `credentials`, `status`, `rev`) and an edge (`from`, `to`, `kind`, `attrs`, `source`, `status`, `rev`); kinds and edge kinds as §9.1 lists them. An unknown kind from a newer server is shown, never refused |
+| the store | per organization, in Mongo: `knowhow_entities`, unique on `{tenant_id, kind, key}` among the live, and `knowhow_edges`, unique on `{tenant_id, from, kind, to}` among the live (each a tombstone partial index, by `$type`); `knowhow_history`, every write appended (who, from which source, what changed). A write is a compare-and-set on `rev`. A neighbourhood is a `$graphLookup` bounded in depth (2) and count. Its routes, indexes and wire names join the composition baseline (FR-69) with the step that adds them |
+| sources | sync from fleet and network (server-side, `active`); device scans (`active`, observed); people (`active`); and, as decision 39 says, a session's proposal (`proposed`). Import from docs waits for P5's reviewer |
+| trust | each fact records its source (`sync`, `scan`, `person`, `session`) and who, and its status. A proposed fact turns active only on a probe's success or a person's word, never on a model's confidence (design §9.2). A scan's facts are its device's claims: a compromised device can lie about what it holds, and it is believed about nothing else |
+| credentials | an entity names the secrets that reach it by handle (the secret's RRN, the role, the modes), never by value; the vault decides every use, as today. A kube token a scan finds is offered for import into the vault, never stored in knowhow |
+| who changes it | decision 36 |
+| who reads it | decision 37; a session reads what its starter may |
+| scans | a device scans only the roots its owner lists, as decision 38 says, as each root's own account and never as the daemon: each repository's remotes, root commit and path; each kube context's server and CA; manifests' service names and images; listening ports and their processes. Metadata alone, never a file's contents |
+| the tools | the toolbelt's `knowhow_search` and `knowhow_get` (reads), `knowhow_verify` (a probe from this device), and `roomler_connect(entity)`: the best verified path from the session's device, its forward or SOCKS listener and its credential in the strongest mode the vault allows, each asked of the vault (P3-7's `rc:vault.net`, a lease), a person approving the call |
+| verification | a probe a device runs (`rc:knowhow.probe`): a TCP connect over the recorded path, the TLS certificate's names and fingerprint, `SELECT 1` through a `vault_connect` endpoint, `kubectl version`. It records `verified {at, from_device, rtt_ms, carrier, ok}`. A fact left unverified for decision 40's days turns `stale`, and a session sees that |
+| the map | design §9.4, in the web app: an entity's neighbourhood with environment and kind filters; its facts, provenance, verification, paths and credential handles ("request access" opens the vault's approval); and "start a session here" |
+| chips | design §5.4's `#` chip: `knowhow://<org>/<kind>/<key>` and the entity's card in the session's context; the same card as an MCP resource; a `UserPromptSubmit` hook for a terminal |
+
+- ⚠️ **A map, not a gate.** Knowhow grants nothing, and nothing that decides consults it: the vault's
+  policies, the network's ACLs and the device's own gates decide every reach as they do today. A
+  planted fact misleads a session toward a host; the reach is still decided as any other is, and a
+  person approves `roomler_connect`.
+- ⚠️ **The node id and the overlay address beside every name** (design §9.2). Labels move and are
+  reused, and MagicDNS can be dead on a GPO-locked desktop and is absent on macOS. A resource
+  behind a secondary organization's device records that organization: exits, org relays and
+  daemon-hosted forwards are primary-org only.
+- ⚠️ **Scans read metadata, never contents.** A credential met in passing (a kubeconfig's token) is
+  offered to the vault and never written to knowhow, so the map holds nothing a session could not
+  be shown.
+- **Not in P4:** the YAML export to a git mirror (a later step); import from docs and the
+  reviewer's proposals (P5); a project's identity; one map across organizations.
+
+**P4's steps.** Each is a PR behind its kill switch; §4 tracks them.
+
+| Step | Builds | Kill switch | Criteria |
+|---|---|---|---|
+| P4-0 | knowhow's design (§3e "P4, knowhow, as designed"), and decisions 36–40 | docs only | — |
+| P4-1 | the module and its store: entities, edges and their history; the people's routes (search, get, a neighbourhood, create, update, archive); `KNOWHOW_VIEW` and `KNOWHOW_EDIT` as decisions 36 and 37 say; `docs/knowhow.md` | `knowhow.tenants`; `[modules] knowhow` | — |
+| P4-2 | fleet and network sync: each device's machine (name, OS, owner, overlay addresses, node id, MagicDNS name), its approved routes, exit, declared tunnel routes and SSH; on enrolment, rename and removal, and at boot | the same | AC15 (machines) |
+| P4-3a | device scans, the server's half: `rc:knowhow.scan` and `rc:knowhow.scanned`, the `knowhow-scan` verb, a scan's facts recorded as its device's | the same | — |
+| P4-3b | device scans, the device's half: `knowhow_scan_roots` as decision 38 says; repositories and checkouts, kube contexts, manifests, listening services | device `knowhow_scan_roots` empty | AC15 (repositories, checkouts) |
+| P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, over `rc:knowhow.*`, believed from the session's record; and `knowhow_propose` as decision 39 says | `[modules] knowhow` | — |
+| P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says | the same | — |
+| P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving | the same; the vault's own gates | AC15 ("through the mesh") |
+| P4-7 | the map in the web app | the SPA | — |
+| P4-8 | chips: `#` in the composer, the MCP resource, the terminal's hook | the same | — |
+| P4k | the field run in the test organization | — | AC15 |
+
 ### 3f. The brain
 
 Central, in the `hive` module: core memory in four scopes (org, project, user, device) with budgets
@@ -3374,7 +3443,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3-6d-1a | the MySQL minter (`docs/vault.md` §20, "The MySQL minter"), with no caller yet (P3-6d-1b's is the first). `vault_proxy::mysql`, MySQL's client protocol as a client of its own: a greeting that must offer TLS and the 4.1 protocol or is sent nothing; an `SSLRequest`, then TLS verified as `proxy`'s is; `caching_sha2_password`, its scramble and, for a full sign-in, the password itself inside that TLS; a switch to `sha256_password` followed inside the TLS, any other plugin refused; `CLIENT_LOCAL_FILES` never offered, and a local file's request refused. `vault_proxy::sha_crypt`, SHA-256 crypt, held to Drepper's published vectors and to the form MySQL 8.4.11 keeps for a known password. `vault_proxy::bundle`, the bundle reader both minters share. `vault_proxy::mysql_mint`: one user per lease, `roomler_<lease id>`, created from its password's `caching_sha2_password` form with an `ATTRIBUTE` naming its lease and its end; each grant a `GRANT`, then `SET DEFAULT ROLE ALL`; its end an `EVENT` that drops it, a refused step taking the user back; the ended swept by their `ATTRIBUTE`; a revocation that refuses a name no mint made before it dials, then `ACCOUNT LOCK`, its connections ended where the issuer may, `DROP USER`, `DROP EVENT`. Tested against a fake MySQL over real TLS that keeps its users and signs a minted one in by its form, and against a real MySQL 8.4.11 (two ignored tests); 19 negative controls | the `vault` feature in no release build | **merged** #2613 `573a11370` |
 | P3-6d-1b | the MySQL minter's caller (`docs/vault.md` §20, "The caller"): `mysql` in `vault::providers`, with Postgres's issuer and minted fields, so the vault declares, checks and leases it as it does `postgres`; `vault_proxy::minter`, the list of providers this build mints for (`MINTS`) and the issuer, mint and revocation chosen by the bundle's provider, each database given the lease's end in its own form (RFC 3339, or whole seconds rounded down); the lease client minting through it; `CLIENT_LOCAL_FILES` checked as the daemon builds. Tested by the lease client against a fake MySQL (one user per lease, its end the lease's in whole seconds, the user and its event taken back), the minter's dispatch, the wire's provider list, and an integration test that a `mysql` issuer is leased whole as a bundle naming its provider; 6 negative controls | device `vault_enabled = false`; `vault.providers` | **merged** #2617 `ca853c840` |
 | P3-6e-0 | AWS STS's design (§3e "P3-6e, AWS STS, as designed") and decision 21, docs only: `aws_sts`, a dynamic secret whose issuer is an IAM user's key and a role it may assume, toward its region's STS endpoint alone; one credential per lease from `AssumeRole`, signed with SigV4, `RoleSessionName` `roomler-<lease>` so CloudTrail joins back to the lease, the role its only scope; minted for 900 s, since STS mints nothing shorter, and ended at the lease's end by the one session policy it passes, an explicit deny once `aws:CurrentTime` is past that end, which AWS enforces against every allow, since STS cannot end one session's credentials and the mint creates nothing a sweep could take back. Found while writing it: a conditional allow beside managed session policies (`PolicyArns`) would rest the end on how IAM combines them, so `PolicyArns` waits until that is proven against AWS; where it is minted, decision 21 (recommended: the server, as decision 18 recommends for GitHub) | docs only | **merged** #2664 `00c686f36` |
-| P3-6e-1 | the vault's half, ahead of its minter (`docs/vault.md` §20, "AWS STS, declared"): `aws_sts` in `vault::providers`, its issuer's fields (`access_key_id`, `secret_access_key`, `role_arn`, `region`, and `external_id` where the role's trust policy asks for one) and its minted credential's (`access_key_id`, `secret_access_key`, `session_token`, `region`). Its one audience is the region's STS endpoint, `https://sts.<region>.amazonaws.com`, exactly, in the `aws` partition, held to at creation and at every `PATCH`. Minted nowhere yet (`MintsOn::Nowhere`): every lease is refused `not_served`, recorded as `provider_has_no_minter`, before anything is opened. Nothing in it depends on decision 21 | `vault.providers` | **in review** |
+| P3-6e-1 | the vault's half, ahead of its minter (`docs/vault.md` §20, "AWS STS, declared"): `aws_sts` in `vault::providers`, its issuer's fields (`access_key_id`, `secret_access_key`, `role_arn`, `region`, and `external_id` where the role's trust policy asks for one) and its minted credential's (`access_key_id`, `secret_access_key`, `session_token`, `region`). Its one audience is the region's STS endpoint, `https://sts.<region>.amazonaws.com`, exactly, in the `aws` partition, held to at creation and at every `PATCH`. Minted nowhere yet (`MintsOn::Nowhere`): every lease is refused `not_served`, recorded as `provider_has_no_minter`, before anything is opened. Nothing in it depends on decision 21 | `vault.providers` | **merged** #2741 `425e0fea3` |
 | P3-6f-0 | a Kubernetes `TokenRequest`'s design (§3e "P3-6f, a Kubernetes `TokenRequest`, as designed"), docs only: `kubernetes`, a dynamic secret whose issuer is a credential for one service account's namespace, minted on the device as a database user is, since only the device reaches a private cluster's API server, so no decision is asked; one token per lease from a `TokenRequest` bound (`boundObjectRef`) to an empty Secret made for the lease, `roomler-<lease>`, so deleting that Secret at the lease's end takes the token back, a stream already signed in running on as a dropped database user's session does; `expirationSeconds` the lease's TTL or 600, since Kubernetes mints nothing shorter; the issuer's credential named `admin_*` so it shares no name with the session's `token`, and kept in a namespace of its own, since `list` on Secrets returns their data and `create` can make a legacy token that never expires; the sweep only where the issuer may list; the cluster's audit log naming the account, not the lease | docs only | **merged** #2666 `34a3cbde7` |
 | P3-6f-1 | the Kubernetes minter (`docs/vault.md` §20, "The Kubernetes minter"), with no caller yet (P3-6f-2's is the first): `vault_proxy::k8s_mint`, one request per connection over TLS verified against the issuer's `ca` or the system's roots, on the `http` engine's HTTP/1 client, signed in by `admin_token` or by `admin_cert` and `admin_key` (the key read again for each connection's TLS alone); the issuer refused before anything is dialled unless its `namespace` and `service_account` are names Kubernetes gives them (both go into a request's path), its credential is one of the two and never both, and its audience an origin, read by `origin_of`, moved from `hive::vault_connect` to `vault_proxy` for it as `upstream_of` was; each mint first sweeps the namespace's Secrets labelled `roomler.ai/lease` whose end has passed, where the issuer may list; then an empty Secret `roomler-<lease>` and a `TokenRequest` bound to it by name and uid, `expirationSeconds` the lease's TTL or 600; a refused token takes the Secret back; the revocation deletes the Secret on its uid, one already gone or replaced under its name (`409`) a revocation done, and only a minted name is ever deleted; an answer at most 4 MiB in ten seconds, read into memory that is zeroed when it drops and that grows without leaving a copy behind. Against a fake API server (TLS, and mTLS for a client certificate): 9 new tests (the mint and its order, a long lease and the issuer's audiences, a refused token, the revocation, the sweep and its absence, a client certificate, the names refused, the minted names) and 13 negative controls, 12 caught; the thirteenth, the sweep's own name check removed, survives by design, since every delete checks the name again, and removing both is caught | the `vault` feature in no release build | **merged** #2673 `a4e3f92cf` |
 | P3-6f-2 | the Kubernetes minter's caller (`docs/vault.md` §20, "The caller"): `kubernetes` in `vault::providers` (issuer `namespace`, `service_account`, `admin_token`, `admin_cert`, `admin_key`, `ca`, `audiences`, the first two required; minted `token`, `server`, `ca`, `namespace`), so the vault declares, checks and leases a Kubernetes issuer by the code it runs for Postgres's; `kubernetes` in the daemon's `MINTS`, so its bundle is held, lent to no tool, and its token minted at the lease's first use; `minter::Minted` one of two (a database user, or a token and the Secret it is bound to), its revocation taking the credential whole, its log naming it by `label()`; the TTL asked what is left of the lease at the mint, at least a second and never past `MAX_TTL_SECS`. The P3-6f design's claim that no issuer field shares a minted field's name, corrected: the issuer's credential is named `admin_*` so it shares no name with the session's `token`, while `ca` and `namespace` are the same value on both sides, as Postgres's `database` is. 2 new tests (the lease client's whole path, a token minted bound to its lease's Secret and taken back; the TTL asked) and 2 extended (the minter's dispatch, now to a Kubernetes issuer too; the providers' lock); 7 negative controls, each caught | device `vault_enabled = false`; `vault.providers` | **merged** #2679 `dd20eb0bb` |
@@ -3410,6 +3479,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P3b-4-2 | AWS signed again (`docs/vault.md` §24, "AWS signed again"). A binding records its secret and field, and a request whose `Authorization` is AWS's and names a placeholder of the connection's audience is signed again before the swap: SigV4 alone, the request's one `Authorization`, `Credential=` naming an `access_key_id` placeholder (any other field's is refused, so the secret key's value never goes out in it), the pair the same secret's `secret_access_key` placeholder toward the audience (decision 33, built as recommended), `X-Amz-Security-Token`'s `session_token` placeholder swapped. The body's hash is `x-amz-content-sha256`'s, the body streaming on, or the body read whole up to 8 MiB, at most 4 at once a run, each held until it is sent. The signature is checked with the key's placeholder, then made again with its value, `Credential=` naming the access key's own id; every other signed header goes on as it came, a signed `Expect` included, and one that would not refuses the request. An AWS secret key's placeholder is swapped nowhere (P3b-3c-1's swap passes it by), so its value goes nowhere but into the HMAC. Signed chunks, SigV4A, a second `Authorization`, no `X-Amz-Date`, a check that fails and a lease let go are each refused with why, never sent. The tests expect what botocore sends for the same requests with AWS's example pair, its signatures computed before the code: STS by GET, by POST with a form body, with a session token, and S3 by path | device `hive_egress = false`; `vault.placeholder` | **merged** #2736 `6fef7fb43` |
 | P3b-5-0 | Windows' design (§3e "P3b-5, Windows, as designed"), docs only. On native Windows Claude Code runs commands unsandboxed, its sandbox settings do nothing but end a session where `failIfUnavailable` is set, and a proxy named in its settings reaches Claude Code itself as well as its commands. So a Windows session on a `hive_egress` device gets the egress proxy, started for the console user and admitting that account alone, named in its settings' `env` (the proxies, P3b-3b's trust, git held to OpenSSL, the non-essential traffic off), with no sandbox key; the harness's own traffic goes through the proxy too (decision 35, recommended). Tools that trust the Windows store alone (Go's `gh`, .NET, Schannel) cannot use a placeholder, and say so; AC14 holds on Windows for `aws`. The guardrail is widened to `proxy` and `placeholder` with the device's half | docs only | **merged** #2737 `a296c4a57` |
 | P3b-5-1 | Windows served (`docs/vault.md` §24, "Windows: the proxy advisory"), as decision 30 decided and P3b-5-0 designed. `guardrail:windows-proxy-only` allows `proxy` and `placeholder`, still refusing every mode that hands a value over. A Windows session on a `hive_egress` device gets the egress proxy, started for the console user and admitting that account alone, and its settings' `env` (`EgressProxy::Advisory`): `HTTPS_PROXY`/`HTTP_PROXY`, `ALL_PROXY` (`socks5h`), `NO_PROXY` loopback, Claude Code's non-essential traffic off, the run's trust (its files written as on Unix, readable through the run directory's DACL), and git held to OpenSSL beside the bundle. No sandbox key: `failIfUnavailable` would end the session at its start. The gate refuses only a device that takes no leases. The harness's own traffic passes the proxy (decision 35, built as recommended). `vault_placeholder` is offered there as elsewhere; its description and answer now tell the model how AWS uses a placeholder pair (P3b-4-2's words), and on Windows which tools cannot use one | device `hive_egress = false`; `vault.placeholder` | **merged** #2738 `f52e81ace` |
+| P4-0 | knowhow's design (§3e "P4, knowhow, as designed"), docs only: the organization's map (machines, repositories and checkouts, databases, clusters, services) with how a session reaches each, its facts verified by probes, granting nothing: the vault and the network still decide every reach. A module of its own, composed last, its edges to `fleet`, `network` and `hive`; a store of entities, edges and their history; sources in order of trust (sync, scans, people, a session's proposals); the toolbelt's reads, a probe, and `roomler_connect(entity)`; the map and `#` chips. P4's steps P4-1 to P4-8 and its field run. Decisions 36 (who changes the map), 37 (who reads it), 38 (what a device scans), 39 (a session's proposals before P5) and 40 (when a fact turns stale) are the operator's | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -3420,7 +3490,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P2k | the field run in the test org on prod (decision 10): AC2, AC4's stale-fence half, AC9, AC10, AC11, AC22–AC26 | — | **field run** 2026-10-16 (§8): AC2, AC9, AC10, AC11, AC22, AC24, AC25, AC26 ticked; AC4 ticked with P2k-7's capture at the provider; findings F1–F5 → P2k-2 to P2k-6. **Re-checked** 2026-10-17 on the promoted server (§8): P2k-2 and P2k-3 (red on 0.4.140, green on 0.4.141) in the field, AC23 (its room clause) and AC27 ticked; then the switch off again (roomler-ai-deploy#36) |
 | P3 | vault and toolbelt: secrets, envelope + KMS, roles, Cedar, `simulate`, leases, approvals; the MCP toolbelt; `proxy` modes; authenticated session SOCKS; `Principal::Session`; dynamic AWS, DB and GitHub credentials; `roomler connect` | `vault.enabled`; per-secret `disabled` | — |
 | P3b | `placeholder` egress: TLS termination for audience hosts, a per-session CA | `vault.placeholder = false` | — |
-| P4 | knowhow: graph, sync, scans, map UI, the access-path compiler, probes, chips | `knowhow.enabled` | — |
+| P4 | knowhow: graph, sync, scans, map UI, the access-path compiler, probes, chips (its design: §3e "P4, knowhow, as designed"; its steps: P4-0 to P4-8, and P4k) | `knowhow.tenants`; `[modules] knowhow` | — |
 | P5 | the learning loop: reviewer on replicas, proposals and review cards, auto-memory harvesting, scanner, contradiction cards, decay, session cards and central search, telemetry, eval sessions | `hive.learning = false`; `session_cards = metadata` | — |
 | P6 | docs: `docs/hive.md`, `docs/vault.md`, `docs/knowhow.md`, `docs/brain.md`; user docs | — | — |
 
@@ -4254,6 +4324,58 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Built in P3b-5-1 as recommended, pending the operator's word.* Another answer changes
       the `Advisory` arm of `SettingsSpec::to_json` (`crates/hive-node/src/launch.rs`) and its
       test.
+36. **Who may change the map** (P4), for the operator to confirm (posted in step 224). The map steers
+    sessions: it grants nothing, but a fact that says where a database lives is where a session goes
+    to look.
+    - *Recommended: a permission of its own, `KNOWHOW_EDIT`, in the managed `admin` row* (and
+      `owner`'s, which bypasses). A member reads the map and proposes; an admin, or a role an org
+      grants it to, writes it. A new bit reconciles additively into every organization's `admin` at
+      the next boot, as any managed bit does.
+      - What it costs: a member who knows a fact proposes it and waits for an admin or a probe.
+    - *Or: every member writes, as a wiki.*
+      - What it costs: any member can point every session at a host of their choosing, which a
+        person approving `roomler_connect` may not catch.
+    - *Or: `MANAGE_AGENTS`, the bit that manages devices.*
+      - What it costs: whoever manages devices manages the map, and an org cannot part the two.
+37. **Who may read the map** (P4), for the operator to confirm (posted in step 224). It holds no
+    value, but it does hold an organization's topology: hosts, addresses, which database a service
+    writes.
+    - *Recommended: a permission of its own, `KNOWHOW_VIEW`, in the managed `member` row and every
+      row above it, not `guest`'s.* A session reads what its starter may.
+      - What it costs: a second bit, and an org that wants the map private to a team narrows a
+        role, since the map has no per-entity scope.
+    - *Or: every member, with no bit.*
+      - What it costs: no role can be kept from the topology.
+    - *Or: per environment, by Cedar, as the vault scopes secrets.*
+      - What it costs: knowhow would need the vault's policy engine (`knowhow → vault`), and every
+        read a decision, for data that holds no value.
+38. **What a device scans** (P4), for the operator to confirm (posted in step 224).
+    - *Recommended: the roots its owner lists in a device-owned `knowhow_scan_roots`*, default
+      empty (nothing scanned), never pushable, each scanned as the account that owns it and never
+      as the daemon, for metadata alone. A scan is the server's request and the device's answer, so
+      a device whose owner lists nothing answers nothing.
+      - What it costs: an owner lists the roots twice where `hive_roots` already names them.
+    - *Or: `hive_roots`, the folders a session may open.*
+      - What it costs: turning sessions on would start scans, and two purposes would share one key.
+    - *Or: roots the server names.*
+      - What it costs: what a device reads would be the server's call, against the rule every
+        device-owned gate keeps (§3g).
+39. **A session's proposals before P5** (P4), for the operator to confirm (posted in step 224).
+    - *Recommended: a toolbelt tool, `knowhow_propose`*, which writes an entity, an edge or a fact
+      as `proposed`: shown as a proposal, never as a fact, until a probe confirms it or a person
+      does. No approval per call, since a proposal changes nothing a session relies on; a ceiling
+      per session, and every proposal names its session.
+      - What it costs: a session can fill the review queue with noise up to its ceiling.
+    - *Or: nothing until P5's reviewer*, which proposes from finished sessions.
+      - What it costs: what a session learns about the infrastructure is lost until P5.
+40. **When a fact turns stale** (P4), for the operator to confirm (posted in step 224).
+    - *Recommended: 30 days unverified, an organization's setting (`knowhow.stale_days`)*. A synced
+      fact never turns stale: it is the server's own, and changes with its source. A stale fact is
+      shown as stale, and a session sees its age.
+      - What it costs: an organization whose probes cannot reach a resource sees it go stale and
+        must say so, or verify it by hand.
+    - *Or: never by itself*, its age shown.
+      - What it costs: a fact a probe last saw a year ago reads as well as one verified today.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
