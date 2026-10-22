@@ -95,8 +95,8 @@
   the root update helper's temp directory was measured to be root's own (§3.11, §8).
 - P2g and P2h, a two-half Mac's companion showing the machine's private network from the root half over the person
   socket (#2663, #2674), and P2d-1, a Mac saying its screen is locked in a session and while a request waits
-  (#2683), shipped in 0.4.150 (2026-10-21) after passing again on its candidate (§8). AC19 waits on the operator's
-  MacBook updating itself.
+  (#2683), shipped in 0.4.150 (2026-10-21) after passing again on its candidate (§8). AC19 is field-verified, the
+  operator's MacBook last, once it had updated itself to 0.4.151 (2026-10-22, §8).
 - The rest of P2–P7 is open.
 
 **Owner:** the agent on all
@@ -1329,7 +1329,7 @@ one depends on it.
   new uplink within one sweep, and the control WS stays up; after a `kill -9` and a network change, no exemption
   route is left on any of the three OSes. Red first on the current release. *(Linux and Windows red on 0.4.134 →
   green, 2026-10-14, the WS clause with N14; macOS on 0.4.136 and 0.4.137, 2026-10-15; §8.)*
-- [ ] **AC19 (P2g, P2h):** on a Mac with both halves, `roomler devices` as the console user (which is what the
+- [x] **AC19 (P2g, P2h):** on a Mac with both halves, `roomler devices` as the console user (which is what the
   companion's Devices page asks) lists the devices the root half's netmap carries, not the Mac alone. It is red on the
   released 0.4.149 first, the root half's own `roomler devices` agrees with it, and `ROOMLERD_PERSON_SOCKET=0` on the
   root half gives the red again. As the console user, `roomler peers` lists the root half's links without any
@@ -1337,6 +1337,9 @@ one depends on it.
   links show on a Linux system install's companion. The operator's MacBook shows it after its update.
   `docs/desktop-companion.md` §6 and §12 and `docs/security-baseline.md` §4 describe it, and `docs/README.md`
   indexes them.
+  *(Field-verified: red on 0.4.149 and green on P2g's and P2h's candidates on tart Macs, the Linux half on the lab's
+  Asahi box, both again on the 0.4.150 candidate, and on the operator's MacBook on the released 0.4.151, 2026-10-22,
+  §8.)*
 
 ## 6. Open decisions (operator)
 
@@ -1535,3 +1538,4 @@ one depends on it.
 | 2026-10-21 | this phase's candidate: the `.pkg` from release-lane rehearsal 39616621756 on `b9a04a6eb` (`33ecd727…`; roomlerd `f9c549a4…`) | the same tart set-up as the red row above, on a fresh clone; both rows deleted and the VM destroyed afterwards | 🟢 **P2d-1 (AC8's lock hint).** A session connected; the screen locked as above, and within a second the viewer received `{"t":"rc:host_locked","locked":true,"input":"unknown"}` and showed the "Host locked" chip, still connected. The deployed viewer titles it "input is suppressed": its parser predates `unknown`, and this phase's neutral title rides the next promote. Then, still locked, the device set to prompt its owner: the worker logged `consent prompt on a LOCKED host — signalling the controller to unlock + approve`, and the viewer said "That device is locked…" 0.3 s after Connect, in place of the generic wait |
 | 2026-10-21 | the 0.4.150 release candidate: the `.pkg` from release-lane rehearsal 39630086882 on the release SHA `91a13698c` (`3e978836…`; roomlerd `9f4a635e…`, `0.4.150`) | two fresh throwaway tart Macs, one after the other, each with both halves enrolled standard in the vmtest org; the rows deleted and the VMs destroyed afterwards | 🟢 **P2d-1, P2g and P2h on the release candidate.** P2d-1 as in the row above: the chip and `rc:host_locked {locked: true, input: "unknown"}` while connected, and "That device is locked…" at a prompt with the worker's lock line. P2g and P2h: as the console user, `roomler devices` answered `overlay: ok` with the root half's 8 devices, `roomler peers` its 7 links with no endpoint field (root: 11), and `roomler status` the overlay address and MagicDNS domain. `ROOMLERD_PERSON_SOCKET=0` on the root half gave the red back (`no_node`, 1 item) |
 | 2026-10-21 | `agent-v0.4.150`, published 16:55:30Z (tag run 39635269321) | GitHub, `roomler.ai`, and one 0.4.149 host per OS: the dev box (Windows), a Linux fleet server, the operator's MacBook (its root daemon) | 🟢 **The release.** 37 assets; each of the 12 packages has its `.asc` and `.sha256`. The tag run logged "Resolved MSI ProductVersion: 0.4.150 (from 0.4.150)", and `/api/agent/latest-release` serves 0.4.150 first, daemon assets before companions. `roomlerd self-update --check-only` on each host verified the offered package and installed nothing: on Windows the signer `G ROX LTD`, on Linux and the Mac the `.asc` against the pinned key; each artifact self-identified, then "Update available: 0.4.149 -> agent-v0.4.150". `setup-v0.4.150` was tagged on the same SHA by the lockstep |
+| 2026-10-22 | released 0.4.151 (the operator's MacBook updated itself overnight; it carries P2g and P2h) | the operator's MacBook, both halves, read-only commands as the console user | 🟢 **AC19, the operator's MacBook.** `roomler devices` as the console user answered `overlay: ok` with all 18 of the org's devices (13 online), the same list as any other member; on 0.4.149 it listed the Mac alone (`no_node`, the operator's report of 2026-10-21). `roomler peers` returned the links with no endpoint field, and `roomler status` carried the overlay address and the MagicDNS domain. AC19 ticked |
