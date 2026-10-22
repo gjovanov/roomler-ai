@@ -17,6 +17,7 @@
 //! | [`mysql_mint`] | a MySQL user minted for one lease, ended by an event, and taken back (P3-6d-1a) |
 //! | [`k8s_mint`] | a Kubernetes service account's token minted for one lease, bound to a Secret its revocation deletes (P3-6f-1) |
 //! | [`minter`] | the minter a dynamic secret's provider names, which the lease client calls (P3-6d-1b) |
+//! | [`sigv4`] | AWS's Signature Version 4: the canonical request, the signing key, the signature (FR-90 P3b-4-1; the session's egress proxy signs with it from P3b-4-2) |
 //!
 //! P3-5b-1 builds these, P3-5c-1 the MongoDB engine, P3-5d-1 the HTTP one
 //! and P3-5f-1 the SSH agent; the endpoint (`hive::vault_connect`) serves
@@ -42,6 +43,10 @@ pub(crate) mod pg_mint;
 pub(crate) mod scram;
 // P3-6d-1 — SHA-256 crypt, the form a MySQL account keeps its password in.
 pub(crate) mod sha_crypt;
+// FR-90 P3b-4-1 — AWS's Signature Version 4. No caller before P3b-4-2, so the
+// build without the tests keeps it all the same.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod sigv4;
 pub(crate) mod ssh_agent;
 #[cfg(test)]
 pub(crate) mod testing;
