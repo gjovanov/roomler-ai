@@ -396,7 +396,11 @@ pub(crate) async fn call(
     #[cfg(unix)]
     let at = {
         let _ = peer;
-        endpoint::At(target.ok_or("this device serves no endpoint for a session")?)
+        let target = target.ok_or("this device serves no endpoint for a session")?;
+        endpoint::At {
+            dir: &target.session_dir,
+            owner: target.owner,
+        }
     };
     #[cfg(windows)]
     let at = {
@@ -425,6 +429,114 @@ pub(crate) fn sweep(runtime_root: &std::path::Path) -> usize {
         }
     }
     gone
+}
+
+// FR-90 P3-9-2a — every `allow` on a person's endpoint goes with P3-9-2b,
+// whose LocalAPI verb is the first caller: its tests are the only one until
+// then.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use endpoint::Timing;
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use endpoint::person_dir;
+/// FR-90 P3-9-2 — a PERSON's endpoint (`roomler connect`): the endpoint a
+/// session's `vault_connect` gets, for the account this daemon was asked
+/// by, its leases asked for the device's owner and renewed while it is held.
+///
+/// | | A session's | A person's |
+/// |---|---|---|
+/// | its leases | `rc:vault.lease`, for the session; one asked for ahead is taken as it is | `rc:vault.connect`, for the device's owner |
+/// | whom it serves | the session's account | the account that asked |
+/// | where, on Unix | `<runtime>/<session>/proxies/<id>` | `<runtime>/person-<uid>/proxies/<id>` ([`person_dir`]) |
+/// | its life | until its first lease is let go | renewed before its leases end, until [`Control::close`]; a lease taken back cuts its connections and is asked for again; a renewal refused serves to the leases' end, then closes |
+pub(crate) use endpoint::{At, Control, Person, PersonLeases, Refused};
+
+/// FR-90 P3-9-2 — open a person's endpoint: `args` as a session's call names
+/// them ([`parse`]), served at `at` for the account that asked. Answers what
+/// the person is told, and the endpoint's [`Control`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn open_person(
+    vault: Arc<dyn VaultTools>,
+    person: Person,
+    at: At<'_>,
+    args: &Value,
+) -> Result<(Value, Control), String> {
+    let req = parse(args)?;
+    endpoint::open_person(vault, person, at, req).await
+}
+
+/// FR-90 P3-9-2 — the daemon's leases for a person: its lease client's
+/// `rc:vault.connect`, each held for the endpoint that asked.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct DaemonPersonLeases;
+
+#[async_trait::async_trait]
+impl PersonLeases for DaemonPersonLeases {
+    async fn connect(
+        &self,
+        id: u64,
+        handle: &Handle,
+        upstream: &str,
+        ttl_secs: u32,
+    ) -> Result<String, Refused> {
+        crate::vault::connect(crate::vault::PersonAsk {
+            endpoint: id,
+            secret: handle.secret.clone(),
+            field: handle.field.clone(),
+            audience: upstream.into(),
+            ttl_secs,
+        })
+        .await
+        .map(|info| info.lease_id)
+        .map_err(person_why)
+    }
+
+    fn drop_person(&self, id: u64) {
+        crate::vault::drop_person(id);
+    }
+}
+
+/// FR-90 P3-9-2 — why a person's lease was not given, in words for the
+/// person, and whether asking again could help: the vault's own word says
+/// so (`is_retryable`), and no connection or no answer always could.
+#[cfg_attr(not(test), allow(dead_code))]
+fn person_why(e: crate::vault::LeaseError) -> Refused {
+    use crate::vault::LeaseError;
+    use roomler_ai_remote_control::vault::LeaseRefusal;
+    let (why, again) = match e {
+        LeaseError::Refused(word) => {
+            let known = LeaseRefusal::from_wire(&word);
+            let why = match known {
+                Some(LeaseRefusal::NotServed) => {
+                    "the vault lends nothing to this organization's people (vault.people)".into()
+                }
+                Some(LeaseRefusal::ApprovalUnavailable) => {
+                    "the vault's policies allow this only with someone's approval, which a \
+                     person's request cannot get yet (approval_unavailable)"
+                        .into()
+                }
+                Some(LeaseRefusal::Denied) => {
+                    "the vault refused: denied (its policies do not allow this for the device's \
+                     owner)"
+                        .into()
+                }
+                _ => format!("the vault refused: {word}"),
+            };
+            (why, known.is_some_and(LeaseRefusal::is_retryable))
+        }
+        LeaseError::AwaitingApproval(_) => (
+            "the vault asked for an approval, which a person's request cannot get yet".into(),
+            false,
+        ),
+        LeaseError::NotConnected => ("this device is not connected to its server".into(), true),
+        LeaseError::NoAnswer => ("the vault did not answer".into(), true),
+        LeaseError::Unopenable => ("the vault's answer did not open".into(), true),
+        LeaseError::NotAsked => (
+            "the vault's answer granted something other than was asked".into(),
+            false,
+        ),
+    };
+    Refused { why, again }
 }
 
 #[cfg(all(unix, test))]
@@ -758,7 +870,8 @@ mod libproc {
 mod endpoint {
     use std::collections::HashMap;
     use std::future::Future;
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
     use std::time::Duration;
 
     use bson::oid::ObjectId;
@@ -774,65 +887,81 @@ mod endpoint {
     use crate::vault_proxy::{http, mongo, pg, ssh_agent, tls};
 
     #[cfg(unix)]
-    pub(crate) use self::socket::PROXIES_DIR;
+    pub(crate) use self::socket::{PROXIES_DIR, person_dir};
 
-    /// Endpoints one run holds open at once. Taken before anything is
-    /// leased, so a call past it asks the vault nothing.
+    /// Endpoints one run (P3-9-2: or one person's account) holds open at
+    /// once. Taken before anything is leased, so a call past it asks the
+    /// vault nothing.
     pub(crate) const MAX_ENDPOINTS: usize = 8;
+
+    fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
     /// Connections one endpoint serves at once.
     pub(crate) const MAX_CONNECTIONS: usize = 16;
 
-    /// How many endpoints each run holds open.
-    static OPEN: LazyLock<Mutex<HashMap<(ObjectId, u64), usize>>> = LazyLock::new(Default::default);
+    /// Whose endpoints count together against [`MAX_ENDPOINTS`]: one run's,
+    /// or (P3-9-2) one account's among those people ask this daemon for.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum Whose {
+        Run(ObjectId, u64),
+        Account(String),
+    }
 
-    /// One run's place among its endpoints, given back when the endpoint
-    /// ends, however it ends.
+    /// How many endpoints each run, and each person's account, holds open.
+    static OPEN: LazyLock<Mutex<HashMap<Whose, usize>>> = LazyLock::new(Default::default);
+
+    /// One place among a run's (or an account's) endpoints, given back when
+    /// the endpoint ends, however it ends.
     pub(crate) struct Slot {
-        run: (ObjectId, u64),
+        whose: Whose,
     }
 
     impl Slot {
-        pub(crate) fn take(session: ObjectId, fence: u64) -> Option<Self> {
+        fn take(whose: Whose) -> Option<Self> {
             let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-            let n = open.entry((session, fence)).or_default();
+            let n = open.entry(whose.clone()).or_default();
             if *n >= MAX_ENDPOINTS {
                 return None;
             }
             *n += 1;
-            Some(Self {
-                run: (session, fence),
-            })
+            Some(Self { whose })
         }
     }
 
     impl Drop for Slot {
         fn drop(&mut self) {
             let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(n) = open.get_mut(&self.run) {
+            if let Some(n) = open.get_mut(&self.whose) {
                 *n -= 1;
                 if *n == 0 {
-                    open.remove(&self.run);
+                    open.remove(&self.whose);
                 }
             }
         }
     }
 
-    /// Where an endpoint is served, and for whom: on Unix the session's
-    /// runtime directory and its account; on Windows its account, by SID.
+    /// Where an endpoint is served, and for whom: on Unix a directory of the
+    /// daemon's own that its socket is made under (the session's runtime
+    /// directory, or (P3-9-2) a person's under the daemon's runtime) and the
+    /// account the socket is handed to; on Windows the account, by SID.
     #[cfg(unix)]
-    pub(crate) struct At<'a>(pub(crate) &'a super::ExecTarget);
+    pub(crate) struct At<'a> {
+        pub(crate) dir: &'a std::path::Path,
+        /// The account's uid and gid; `None`: this daemon's own, which only
+        /// a test serves.
+        pub(crate) owner: Option<(u32, u32)>,
+    }
     #[cfg(windows)]
     pub(crate) struct At<'a>(pub(crate) &'a str);
 
     #[cfg(unix)]
     impl At<'_> {
-        /// The one uid a connection is served for: the session's account,
-        /// or this daemon's own where it runs the session as itself (a test
-        /// does).
+        /// The one uid a connection is served for: the account's, or this
+        /// daemon's own where it serves itself (a test does).
         fn uid(&self) -> u32 {
             // SAFETY: geteuid reads our own credentials; it cannot fail.
-            self.0
-                .owner
+            self.owner
                 .map_or_else(|| unsafe { libc::geteuid() }, |(u, _)| u)
         }
     }
@@ -852,8 +981,9 @@ mod endpoint {
     struct Endpoint {
         vault: Arc<dyn VaultTools>,
         /// The leases the values are read from, by id, in the order the
-        /// call leased them: never a value.
-        values: Vec<String>,
+        /// call leased them: never a value. P3-9-2 — a person's endpoint
+        /// swaps them for the leases it renews; a session's never changes.
+        values: std::sync::RwLock<Vec<String>>,
         host: String,
         port: u16,
         tls: tokio_rustls::TlsConnector,
@@ -888,7 +1018,18 @@ mod endpoint {
     impl Endpoint {
         /// The `i`th of the call's values, read from its lease now.
         fn read(&self, i: usize) -> Option<Zeroizing<String>> {
-            text(self.vault.value(self.values.get(i)?)?)
+            let lease = self
+                .values
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(i)?
+                .clone();
+            text(self.vault.value(&lease)?)
+        }
+
+        /// P3-9-2 — serve a person's renewed leases from now on.
+        fn swap(&self, values: Vec<String>) {
+            *self.values.write().unwrap_or_else(|e| e.into_inner()) = values;
         }
 
         /// The upstream for one connection, its values read from the leases
@@ -995,13 +1136,13 @@ mod endpoint {
         env: serde_json::Map<String, Value>,
     }
 
-    /// What an endpoint is handed as it starts: its leases, those its call
-    /// asked for itself, and how it reaches the upstream.
+    /// What an endpoint is handed as it starts: its leases, how it is held,
+    /// and how it reaches the upstream.
     struct Handover<'a> {
         vault: &'a Arc<dyn VaultTools>,
         leases: &'a [String],
-        /// The leases the call asked for itself: let go when it closes.
-        own: Vec<String>,
+        /// A session's, or (P3-9-2) a person's.
+        kind: Kind,
         /// How many of `leases` hold the values it signs in with; a CA's
         /// comes after them.
         values: usize,
@@ -1012,6 +1153,101 @@ mod endpoint {
         known_hosts: Option<String>,
     }
 
+    /// How an endpoint is held once it is bound.
+    enum Kind {
+        /// A session's: closed when its first lease is let go, and the leases
+        /// its call asked for itself (`own`) let go with it.
+        Run { own: Vec<String> },
+        /// P3-9-2 — a person's: its leases renewed while it is held.
+        Person(PersonHold),
+    }
+
+    /// Whom an endpoint's leases are asked for.
+    enum Source {
+        /// A session's run: a lease asked for ahead toward the upstream is
+        /// taken as it is.
+        Run { session: ObjectId, fence: u64 },
+        /// P3-9-2 — a person's endpoint, as the device's owner.
+        #[cfg_attr(not(test), allow(dead_code))]
+        Person(Person),
+    }
+
+    /// FR-90 P3-9-2 — a person's leases: the daemon's lease client's
+    /// `rc:vault.connect` ([`crate::vault::connect`]), or a test's.
+    #[async_trait::async_trait]
+    pub(crate) trait PersonLeases: Send + Sync {
+        /// A lease of `handle` toward `upstream` for `ttl_secs`, held for
+        /// endpoint `id`: its id, or why not.
+        async fn connect(
+            &self,
+            id: u64,
+            handle: &super::Handle,
+            upstream: &str,
+            ttl_secs: u32,
+        ) -> Result<String, Refused>;
+        /// Let go of every lease endpoint `id` holds.
+        fn drop_person(&self, id: u64);
+    }
+
+    /// FR-90 P3-9-2 — why a person's lease was not given: in words, and
+    /// whether asking again could help (the vault unavailable or busy, no
+    /// connection, no answer) or not (the vault's answer as it stands).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Refused {
+        pub(crate) why: String,
+        pub(crate) again: bool,
+    }
+
+    /// FR-90 P3-9-2 — whom a person's endpoint is for, and how its leases
+    /// are asked for and renewed.
+    pub(crate) struct Person {
+        pub(crate) leases: Arc<dyn PersonLeases>,
+        /// The account it serves, as its endpoints are counted together: a
+        /// uid or a SID, as text.
+        pub(crate) account: String,
+        pub(crate) timing: Timing,
+    }
+
+    /// FR-90 P3-9-2 — when a person's endpoint renews its leases.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Timing {
+        /// Renewed with `1/margin_div` of the TTL asked for still left: a
+        /// 300 s lease, with 3, every 200 s.
+        pub(crate) margin_div: u32,
+        /// The shortest wait between two renewals, and before a renewal the
+        /// vault could not answer is asked again, however short the leases
+        /// come back: a lease cut short by its version's own end must not
+        /// spin the asking.
+        pub(crate) floor: Duration,
+        /// The longest it sleeps before it looks at what its leases have left
+        /// again: a clock that stood still while the device slept must not
+        /// carry a lease past its renewal.
+        pub(crate) recheck: Duration,
+    }
+
+    impl Timing {
+        /// The daemon's.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) const DAEMON: Self = Self {
+            margin_div: 3,
+            floor: Duration::from_secs(10),
+            recheck: Duration::from_secs(30),
+        };
+    }
+
+    /// FR-90 P3-9-2 — what a person's endpoint renews with.
+    struct PersonHold {
+        id: u64,
+        leases: Arc<dyn PersonLeases>,
+        handles: Vec<super::Handle>,
+        upstream: String,
+        ttl: u32,
+        timing: Timing,
+    }
+
+    /// FR-90 P3-9-2 — the ids this daemon gives the endpoints people hold.
+    static NEXT_PERSON: AtomicU64 = AtomicU64::new(1);
+
     pub(crate) async fn open(
         vault: Arc<dyn VaultTools>,
         session: ObjectId,
@@ -1019,12 +1255,36 @@ mod endpoint {
         at: At<'_>,
         req: ConnectRequest,
     ) -> Result<Value, String> {
+        open_from(vault, Source::Run { session, fence }, at, req)
+            .await
+            .map(|(answer, _)| answer)
+    }
+
+    /// FR-90 P3-9-2 — a person's endpoint for the account `at` serves, its
+    /// leases asked for the device's owner and renewed while it is held:
+    /// what the person is told, and the endpoint's [`Control`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn open_person(
+        vault: Arc<dyn VaultTools>,
+        person: Person,
+        at: At<'_>,
+        req: ConnectRequest,
+    ) -> Result<(Value, Control), String> {
+        match open_from(vault, Source::Person(person), at, req).await? {
+            (answer, Some(control)) => Ok((answer, control)),
+            (_, None) => Err("the endpoint opened without its control".into()),
+        }
+    }
+
+    async fn open_from(
+        vault: Arc<dyn VaultTools>,
+        source: Source,
+        at: At<'_>,
+        req: ConnectRequest,
+    ) -> Result<(Value, Option<Control>), String> {
         if req.engine.is_http() {
             loopback::identifies()?;
         }
-        let slot = Slot::take(session, fence).ok_or_else(|| {
-            format!("this session holds {MAX_ENDPOINTS} endpoints already: let one end first")
-        })?;
         // The leases this call asks for itself: let go if no endpoint opens.
         let handles = req.handles();
         let mut held = Releasing {
@@ -1032,21 +1292,61 @@ mod endpoint {
             leases: Vec::with_capacity(handles.len()),
         };
         let mut leases = Vec::with_capacity(handles.len());
-        let wanted = Duration::from_secs(u64::from(req.ttl));
-        for h in &handles {
-            // P3-4c-3 — a lease asked for ahead toward this upstream, lasting
-            // at least as long as the endpoint is asked to, is taken as it is.
-            if let Some(lease) = vault.ahead(session, fence, h, "proxy", &req.upstream, wanted) {
-                leases.push(lease);
-                continue;
+        let (slot, kind) = match source {
+            Source::Run { session, fence } => {
+                let slot = Slot::take(Whose::Run(session, fence)).ok_or_else(|| {
+                    format!(
+                        "this session holds {MAX_ENDPOINTS} endpoints already: let one end first"
+                    )
+                })?;
+                let wanted = Duration::from_secs(u64::from(req.ttl));
+                for h in &handles {
+                    // P3-4c-3 — a lease asked for ahead toward this upstream,
+                    // lasting at least as long as the endpoint is asked to, is
+                    // taken as it is.
+                    if let Some(lease) =
+                        vault.ahead(session, fence, h, "proxy", &req.upstream, wanted)
+                    {
+                        leases.push(lease);
+                        continue;
+                    }
+                    let lease = vault
+                        .lease(session, fence, h, "proxy", &req.upstream, req.ttl)
+                        .await
+                        .map_err(|why| format!("{h}: {why}"))?;
+                    held.leases.push(lease.clone());
+                    leases.push(lease);
+                }
+                let own = held.leases.clone();
+                (slot, Kind::Run { own })
             }
-            let lease = vault
-                .lease(session, fence, h, "proxy", &req.upstream, req.ttl)
-                .await
-                .map_err(|why| format!("{h}: {why}"))?;
-            held.leases.push(lease.clone());
-            leases.push(lease);
-        }
+            // P3-9-2 — every field asked for the device's owner: nothing a
+            // session asked for ahead is ever a person's.
+            Source::Person(person) => {
+                let slot = Slot::take(Whose::Account(person.account.clone())).ok_or_else(|| {
+                    format!("this account holds {MAX_ENDPOINTS} endpoints already: end one first")
+                })?;
+                let id = NEXT_PERSON.fetch_add(1, Ordering::Relaxed);
+                for h in &handles {
+                    let lease = person
+                        .leases
+                        .connect(id, h, &req.upstream, req.ttl)
+                        .await
+                        .map_err(|refused| format!("{h}: {}", refused.why))?;
+                    held.leases.push(lease.clone());
+                    leases.push(lease);
+                }
+                let hold = PersonHold {
+                    id,
+                    leases: person.leases,
+                    handles: handles.clone(),
+                    upstream: req.upstream.clone(),
+                    ttl: req.ttl,
+                    timing: person.timing,
+                };
+                (slot, Kind::Person(hold))
+            }
+        };
         // The values, checked once before anything is served: the endpoint
         // reads them again as each connection starts.
         let value = |lease: &String, h: &super::Handle| {
@@ -1128,7 +1428,7 @@ mod endpoint {
         let handover = Handover {
             vault: &vault,
             leases: &leases,
-            own: held.leases.clone(),
+            kind,
             values: count,
             tls,
             roots,
@@ -1168,19 +1468,26 @@ mod endpoint {
         Ok(answer)
     }
 
-    /// Hand a bound endpoint over to its leases and serve it: whichever is
-    /// let go first closes it, and every connection it holds (`stop_with`).
-    /// Answers what the session is told.
+    /// Hand a bound endpoint over to its leases and serve it. A session's:
+    /// whichever lease is let go first closes it, and every connection it
+    /// holds (`stop_with`). P3-9-2 — a person's: its leases are watched by
+    /// its renewal ([`renew`]) instead, and it closes when its [`Control`]
+    /// says so or a renewal cannot go on. Answers what the asker is told, and
+    /// a person's endpoint's control.
     fn start<P: Place>(
         bound: P,
         dial: Dial,
         front: String,
         req: &ConnectRequest,
         h: Handover<'_>,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, Option<Control>), String> {
         let stop = CancellationToken::new();
+        let watch = match h.kind {
+            Kind::Run { .. } => stop.clone(),
+            Kind::Person(_) => CancellationToken::new(),
+        };
         for lease in h.leases {
-            if !h.vault.stop_with(lease, stop.clone()) {
+            if !h.vault.stop_with(lease, watch.clone()) {
                 stop.cancel();
                 bound.close();
                 return Err(
@@ -1196,7 +1503,7 @@ mod endpoint {
             .map_or(0, |d| d.as_secs());
         let endpoint = Arc::new(Endpoint {
             vault: Arc::clone(h.vault),
-            values: h.leases[..h.values].to_vec(),
+            values: RwLock::new(h.leases[..h.values].to_vec()),
             host: req.host.clone(),
             port: req.port,
             tls: h.tls,
@@ -1208,30 +1515,65 @@ mod endpoint {
             secret: req.secret.clone(),
             user: req.user.clone(),
         });
-        tokio::spawn(serve(bound, endpoint, stop, h.own, h.slot));
+        let live = Live::new(&stop);
+        let renewed = matches!(h.kind, Kind::Person(_));
+        let (release, control) = match h.kind {
+            Kind::Run { own } => (Release::Own(own), None),
+            Kind::Person(hold) => {
+                let state = Arc::new(Mutex::new(PersonState::default()));
+                let current = Arc::new(Mutex::new(h.leases.to_vec()));
+                let control = Control {
+                    id: hold.id,
+                    stop: stop.clone(),
+                    state: Arc::clone(&state),
+                    current: Arc::clone(&current),
+                    vault: Arc::clone(h.vault),
+                };
+                let release = Release::Person {
+                    leases: Arc::clone(&hold.leases),
+                    id: hold.id,
+                };
+                tokio::spawn(renew(Renewal {
+                    vault: Arc::clone(h.vault),
+                    endpoint: Arc::clone(&endpoint),
+                    values: h.values,
+                    live: Arc::clone(&live),
+                    stop: stop.clone(),
+                    state,
+                    current,
+                    watch,
+                    hold,
+                }));
+                (release, Some(control))
+            }
+        };
+        tokio::spawn(serve(bound, endpoint, stop, live, release, h.slot));
+        let ends = if renewed {
+            "It stays open while it is held, its leases renewed before they end; a lease taken \
+             back cuts its connections."
+        } else {
+            "It closes, with its connections, when its lease ends."
+        };
         let note = match req.engine {
             Engine::Ssh => {
                 "Run ssh with env set, and with known_hosts written to a file of your own and \
                  named in -o UserKnownHostsFile=<file> (for git, GIT_SSH_COMMAND=\"ssh -o \
                  UserKnownHostsFile=<file>\"): it signs in to the upstream with the secret's key, \
                  which never leaves this daemon. The agent signs a sign-in to that host only, \
-                 from OpenSSH 8.9 on. It closes, with its connections, when its lease ends."
+                 from OpenSSH 8.9 on."
             }
             Engine::Http => {
                 "Send requests to uri as you would to the upstream, with no credential: the \
-                 endpoint adds the secret's. For git, set env, and use the upstream's own URLs. \
-                 It closes, with its connections, when its lease ends."
+                 endpoint adds the secret's. For git, set env, and use the upstream's own URLs."
             }
             Engine::Kubernetes => {
                 "Write kubeconfig to a file of your own and point KUBECONFIG at it: kubectl then \
                  reaches the cluster as the secret's identity, with no credential of its own, \
-                 exec, attach and port-forward included. It closes, with its connections, when \
-                 its lease ends."
+                 exec, attach and port-forward included."
             }
             Engine::Postgres | Engine::Mongodb => {
                 "Connect with any user name and no password: the endpoint signs in to the \
-                 upstream as the secret's user. It closes, with its connections, when its lease \
-                 ends."
+                 upstream as the secret's user."
             }
         };
         let mut answer = json!({
@@ -1243,7 +1585,7 @@ mod endpoint {
             "uri": dial.uri,
             "env": dial.env,
             "ttl_s": ttl_s,
-            "note": note,
+            "note": format!("{note} {ends}"),
         });
         if req.engine == Engine::Kubernetes {
             answer["kubeconfig"] = json!(kubeconfig(&dial.uri));
@@ -1251,7 +1593,10 @@ mod endpoint {
         if let Some(known_hosts) = h.known_hosts {
             answer["known_hosts"] = json!(known_hosts);
         }
-        Ok(answer)
+        if let Some(c) = &control {
+            answer["id"] = json!(c.id);
+        }
+        Ok((answer, control))
     }
 
     /// P3-5e-2 — a kubeconfig for the endpoint: one cluster whose server is
@@ -1265,16 +1610,19 @@ mod endpoint {
         )
     }
 
-    /// Serve one endpoint until its first lease is let go: each connection
-    /// from the session's account, at most [`MAX_CONNECTIONS`] at once, one
-    /// engine session each. Then it closes, the leases its call asked for
-    /// itself (`own`) are let go rather than held to their expiry, and its
-    /// place among the run's endpoints goes with it.
+    /// Serve one endpoint until `stop`: a session's when its first lease is
+    /// let go, (P3-9-2) a person's when its control or its renewal closes it.
+    /// Each connection from the account it serves, at most
+    /// [`MAX_CONNECTIONS`] at once, one engine session each, and cut by
+    /// `live`. Then it closes, what `release` names is let go rather than
+    /// held to its expiry, and its place among its holder's endpoints goes
+    /// with it.
     async fn serve<P: Place>(
         bound: P,
         endpoint: Arc<Endpoint>,
         stop: CancellationToken,
-        own: Vec<String>,
+        live: Arc<Live>,
+        release: Release,
         _slot: Slot,
     ) {
         let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
@@ -1304,7 +1652,7 @@ mod endpoint {
                 ));
                 continue;
             };
-            let (endpoint, stop) = (Arc::clone(&endpoint), stop.clone());
+            let (endpoint, cut) = (Arc::clone(&endpoint), live.now());
             tokio::spawn(async move {
                 let _permit = permit;
                 let Some(session) = endpoint.session() else {
@@ -1324,7 +1672,7 @@ mod endpoint {
                     }
                 };
                 tokio::select! {
-                    _ = stop.cancelled() => {}
+                    _ = cut.cancelled() => {}
                     served = served => {
                         if let Err(why) = served {
                             debug!(%why, "vault: a proxy connection did not start");
@@ -1334,7 +1682,259 @@ mod endpoint {
             });
         }
         bound.close();
-        endpoint.vault.release(&own);
+        match release {
+            Release::Own(own) => endpoint.vault.release(&own),
+            Release::Person { leases, id } => leases.drop_person(id),
+        }
+    }
+
+    /// What cuts the connections an endpoint serves: its close and, for a
+    /// person's (P3-9-2), its leases taken back, which cuts every connection
+    /// served so far and leaves later ones to a fresh token. Every token is a
+    /// child of the endpoint's stop, so its close cuts them all.
+    struct Live {
+        stop: CancellationToken,
+        now: Mutex<CancellationToken>,
+    }
+
+    impl Live {
+        fn new(stop: &CancellationToken) -> Arc<Self> {
+            Arc::new(Self {
+                stop: stop.clone(),
+                now: Mutex::new(stop.child_token()),
+            })
+        }
+
+        /// What a connection starting now is cut by.
+        fn now(&self) -> CancellationToken {
+            lock(&self.now).clone()
+        }
+
+        /// P3-9-2 — cut every connection served so far.
+        fn cut(&self) {
+            let mut now = lock(&self.now);
+            now.cancel();
+            *now = self.stop.child_token();
+        }
+    }
+
+    /// What an endpoint lets go of as it closes.
+    enum Release {
+        /// A session's: the leases its call asked for itself.
+        Own(Vec<String>),
+        /// P3-9-2 — a person's: every lease it holds, renewed ones included.
+        Person {
+            leases: Arc<dyn PersonLeases>,
+            id: u64,
+        },
+    }
+
+    /// FR-90 P3-9-2 — where a person's endpoint stands, to show the person.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(crate) struct PersonState {
+        /// How long its leases have left, as this daemon holds them.
+        pub(crate) left: Duration,
+        /// How many times its leases were renewed.
+        pub(crate) renewals: u32,
+        /// The vault refused a renewal: the endpoint serves to its leases'
+        /// end, then closes.
+        pub(crate) refused: Option<String>,
+        /// Why it closed, once it has.
+        pub(crate) closed: Option<String>,
+    }
+
+    /// FR-90 P3-9-2 — a person's endpoint, as whatever holds it for the
+    /// person sees it: where it stands, and its close.
+    #[derive(Clone)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) struct Control {
+        pub(crate) id: u64,
+        stop: CancellationToken,
+        state: Arc<Mutex<PersonState>>,
+        /// Its current leases, its CA's included.
+        current: Arc<Mutex<Vec<String>>>,
+        vault: Arc<dyn VaultTools>,
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    impl Control {
+        /// Where it stands now.
+        pub(crate) fn state(&self) -> PersonState {
+            let mut state = lock(&self.state).clone();
+            state.left = lock(&self.current)
+                .iter()
+                .filter_map(|l| self.vault.left(l))
+                .min()
+                .unwrap_or_default();
+            state
+        }
+
+        /// Close it, with every connection it holds, and let go of its
+        /// leases: what the person's leaving does. The first reason given is
+        /// the one kept.
+        pub(crate) fn close(&self, why: &str) {
+            lock(&self.state)
+                .closed
+                .get_or_insert_with(|| why.to_string());
+            self.stop.cancel();
+        }
+    }
+
+    /// FR-90 P3-9-2 — what a person's endpoint's renewal works with.
+    struct Renewal {
+        vault: Arc<dyn VaultTools>,
+        endpoint: Arc<Endpoint>,
+        /// How many of each generation's leases hold the values it signs in
+        /// with; a CA's comes after them.
+        values: usize,
+        live: Arc<Live>,
+        stop: CancellationToken,
+        state: Arc<Mutex<PersonState>>,
+        current: Arc<Mutex<Vec<String>>>,
+        /// Cancelled when any current lease is let go.
+        watch: CancellationToken,
+        hold: PersonHold,
+    }
+
+    /// FR-90 P3-9-2 — renew a person's endpoint's leases while it is held
+    /// (decision 25):
+    /// - a margin before they end, every field asked for again, each a new
+    ///   request the vault decides and records: new connections are served
+    ///   under the new leases, and those it serves stay up;
+    /// - a lease let go before then (`rc:vault.revoke`, or its end) cuts
+    ///   every connection served so far, and asks once more: a value that
+    ///   changed is served again at once, and anything the vault refuses
+    ///   closes it;
+    /// - a renewal the vault cannot answer is asked again while the leases
+    ///   last; one the vault refuses leaves it serving to its leases' end,
+    ///   and then closed with why.
+    async fn renew(mut r: Renewal) {
+        /// What woke the renewal.
+        enum Woke {
+            Closed,
+            LetGo,
+            Tick,
+        }
+        let timing = r.hold.timing;
+        let margin = Duration::from_secs(u64::from(r.hold.ttl / timing.margin_div.max(1)));
+        let mut last: Option<tokio::time::Instant> = None;
+        loop {
+            let left = lock(&r.current)
+                .iter()
+                .filter_map(|l| r.vault.left(l))
+                .min()
+                .unwrap_or_default();
+            let refused = lock(&r.state).refused.clone();
+            let since = last.map_or(Duration::MAX, |t| t.elapsed());
+            // Due once no more than the margin is left, never sooner than the
+            // floor after the last time it asked.
+            if refused.is_none() && left <= margin && since >= timing.floor {
+                last = Some(tokio::time::Instant::now());
+                match generation(&r).await {
+                    Ok(next) if r.stop.is_cancelled() => return r.vault.release(&next.0),
+                    Ok(next) => swap(&mut r, next),
+                    // Asked again after the floor, while the leases last.
+                    Err(f) if f.again => {
+                        debug!(why = %f.why, "vault: a person's endpoint's renewal waits");
+                    }
+                    Err(f) => lock(&r.state).refused = Some(f.why),
+                }
+                continue;
+            }
+            let wait = if refused.is_none() && left <= margin {
+                timing.floor.saturating_sub(since)
+            } else {
+                left.saturating_sub(margin).min(timing.recheck)
+            };
+            let woke = tokio::select! {
+                _ = r.stop.cancelled() => Woke::Closed,
+                _ = r.watch.cancelled() => Woke::LetGo,
+                _ = tokio::time::sleep(wait) => Woke::Tick,
+            };
+            match woke {
+                Woke::Closed => return,
+                Woke::Tick => {}
+                // A lease went before its renewal: taken back, or ended.
+                Woke::LetGo => {
+                    r.live.cut();
+                    if let Some(why) = refused {
+                        return close(
+                            &r,
+                            format!("its leases ended, and the vault refused to renew them: {why}"),
+                        );
+                    }
+                    match generation(&r).await {
+                        Ok(next) if r.stop.is_cancelled() => return r.vault.release(&next.0),
+                        Ok(next) => swap(&mut r, next),
+                        Err(f) => {
+                            return close(
+                                &r,
+                                format!("its leases were let go, and asked for again: {}", f.why),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// FR-90 P3-9-2 — a new generation of a person's endpoint's leases: every
+    /// field asked for again, and watched by a token of its own. Any one
+    /// refused lets go of those already given.
+    async fn generation(r: &Renewal) -> Result<(Vec<String>, CancellationToken), Refused> {
+        let mut got = Vec::with_capacity(r.hold.handles.len());
+        for h in &r.hold.handles {
+            match r
+                .hold
+                .leases
+                .connect(r.hold.id, h, &r.hold.upstream, r.hold.ttl)
+                .await
+            {
+                Ok(lease) => got.push(lease),
+                Err(f) => {
+                    r.vault.release(&got);
+                    return Err(Refused {
+                        why: format!("{h}: {}", f.why),
+                        again: f.again,
+                    });
+                }
+            }
+        }
+        let watch = CancellationToken::new();
+        for lease in &got {
+            if !r.vault.stop_with(lease, watch.clone()) {
+                r.vault.release(&got);
+                return Err(Refused {
+                    why: "a renewed lease ended before it was served".into(),
+                    again: true,
+                });
+            }
+        }
+        Ok((got, watch))
+    }
+
+    /// FR-90 P3-9-2 — serve the new generation: new connections read its
+    /// values, and the old leases are let go. A lease of the old one taken
+    /// back while the new one was asked for cuts what it served.
+    fn swap(r: &mut Renewal, (next, watch): (Vec<String>, CancellationToken)) {
+        let revoked = r.watch.is_cancelled();
+        r.endpoint.swap(next[..r.values.min(next.len())].to_vec());
+        let old = std::mem::replace(&mut *lock(&r.current), next);
+        r.watch = watch;
+        if revoked {
+            r.live.cut();
+        }
+        r.vault.release(&old);
+        let mut state = lock(&r.state);
+        state.renewals += 1;
+        state.refused = None;
+    }
+
+    /// FR-90 P3-9-2 — close a person's endpoint from its renewal, saying
+    /// why.
+    fn close(r: &Renewal, why: String) {
+        lock(&r.state).closed.get_or_insert(why);
+        r.stop.cancel();
     }
 
     /// Tell a client why it is not served, in its engine's wire, and hang
@@ -1490,15 +2090,25 @@ mod endpoint {
                 .map_err(|e| format!("{}: {e}", dir.display()))
         }
 
-        /// A new endpoint's directory, `<session_dir>/proxies/<id>`, and its
-        /// socket, bound and handed to the session's account at `0600`. The
-        /// directory is removed again if any step fails.
+        /// FR-90 P3-9-2 — a person's directory under the daemon's runtime,
+        /// made if absent: `<runtime_root>/person-<uid>`, the daemon's own
+        /// (`0711`), which their endpoints' directories are made under, and
+        /// which the sweep at the daemon's start reaches as it reaches a
+        /// session's.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn person_dir(runtime_root: &Path, uid: u32) -> Result<PathBuf, String> {
+            let dir = runtime_root.join(format!("person-{uid}"));
+            private_dir(&dir)?;
+            Ok(dir)
+        }
+
+        /// A new endpoint's directory, `<at.dir>/proxies/<id>`, and its
+        /// socket, bound and handed to the account at `0600`. The directory
+        /// is removed again if any step fails.
         pub(crate) fn bind(at: &At<'_>, engine: Engine) -> Result<Bound, String> {
             use std::os::unix::fs::PermissionsExt;
-            let super::super::ExecTarget {
-                session_dir, owner, ..
-            } = at.0;
-            let root = session_dir.join(PROXIES_DIR);
+            let owner = at.owner;
+            let root = at.dir.join(PROXIES_DIR);
             private_dir(&root)?;
             // A short id, so the socket's path stays well inside `sun_path`
             // (104 bytes on macOS); `create_dir`, not `create_dir_all`, so a
