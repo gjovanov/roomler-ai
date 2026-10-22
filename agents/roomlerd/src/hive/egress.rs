@@ -379,6 +379,46 @@ pub fn ca_of(session: ObjectId, fence: u64) -> Option<Arc<ca::SessionCa>> {
         .map(|state| Arc::clone(&state.ca))
 }
 
+/// FR-90 P3b-3c-2 — whether `run`'s proxy is serving it: where it is, the
+/// session's commands go through it, and a placeholder the session holds is
+/// swapped in. What the toolbelt offers `vault_placeholder` on.
+pub fn serving(session: ObjectId, fence: u64) -> bool {
+    runs().contains_key(&(session, fence))
+}
+
+/// FR-90 P3b-3c-2 — a run's proxy served for a test: every connection
+/// admitted, every host refused, no value read.
+#[cfg(test)]
+pub(crate) fn serve_for_test(session: ObjectId, fence: u64) -> Fronts {
+    struct Nothing;
+    #[async_trait::async_trait]
+    impl Decide for Nothing {
+        async fn decide(&self, _run: RunKey, _host: &str, _port: u16) -> Decision {
+            Decision::Denied("test".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl Dial for Nothing {
+        async fn dial(&self, _host: &str, _port: u16) -> Result<TcpStream, Refusal> {
+            Err(Refusal::Unreachable("test".into()))
+        }
+    }
+    impl Values for Nothing {
+        fn value(&self, _lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
+            None
+        }
+    }
+    let nothing = Arc::new(Nothing);
+    let seams = Seams {
+        decide: nothing.clone(),
+        dial: nothing.clone(),
+        values: nothing,
+        roots: Roots::System,
+    };
+    let admit: Admit = Arc::new(|_: &TcpStream, _: SocketAddr| Ok(()));
+    start_admitting((session, fence), admit, seams).unwrap()
+}
+
 /// Stop serving `run`: both fronts close and every connection on them ends.
 /// Answers whether it was served.
 pub fn drop_run(session: ObjectId, fence: u64) -> bool {

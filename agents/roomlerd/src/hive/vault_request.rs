@@ -4,9 +4,9 @@
 //!
 //! | Step | What holds |
 //! |---|---|
-//! | the call | `handle` (a path or this org's RRN, `#field` for a field), `mode` (`exec`, `file` or `proxy`, the modes a use takes), `audience` (a bare name: the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to: `host:port`, an origin, or (P3-5f-2) `ssh://[user@]host[:port]`), `ttl_s` (30 to 900, default 300) |
+//! | the call | `handle` (a path or this org's RRN, `#field` for a field), `mode` (`exec`, `file`, `proxy` or, P3b-3c-2, `placeholder`: the modes a use takes), `audience` (a bare name: the program `vault_exec` will run, or the file `vault_render` will write; for `proxy`, the upstream `vault_connect` will sign in to: `host:port`, an origin, or (P3-5f-2) `ssh://[user@]host[:port]`; for `placeholder`, the origin `vault_placeholder` will name, held to its one spelling), `ttl_s` (30 to 900, default 300) |
 //! | the lease | asked for once, decided by the vault's `secret:use` with its guardrails, recorded; held in daemon memory, never handed to the session |
-//! | its use | a later `vault_exec`, `vault_render` or `vault_connect` naming the same secret toward the same audience takes it, while it covers what that call needs, instead of asking again; every such call still asks a person |
+//! | its use | a later `vault_exec`, `vault_render`, `vault_connect` or (P3b-3c-2) `vault_placeholder` naming the same secret toward the same audience takes it, while it covers what that call needs, instead of asking again; every such call still asks a person |
 //! | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go |
 //! | a dynamic secret | P3-6b-2b: asked for as a whole in `short-lived`, whatever the use; the first use that takes it mints its credential, and every later one shares it. Not for `proxy`: `vault_connect` serves no dynamic secret |
 //!
@@ -27,14 +27,14 @@ const DEFAULT_TTL: u32 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AheadRequest {
     pub(crate) handle: Handle,
-    /// `exec`, `file` or `proxy`: the modes a use tool takes.
+    /// `exec`, `file`, `proxy` or (P3b-3c-2) `placeholder`: the modes a use
+    /// tool takes.
     pub(crate) mode: &'static str,
     pub(crate) audience: String,
     pub(crate) ttl: u32,
 }
 
 pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
-    use roomler_ai_remote_control::vault::lease_limits::{MAX_TTL_SECS, MIN_TTL_SECS};
     let handle = args
         .get("handle")
         .and_then(Value::as_str)
@@ -44,10 +44,11 @@ pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
         Some("exec") => "exec",
         Some("file") => "file",
         Some("proxy") => "proxy",
+        Some("placeholder") => super::placeholder::MODE,
         _ => {
             return Err(
-                "mode must be exec (for vault_exec), file (for vault_render) or proxy (for \
-                 vault_connect)"
+                "mode must be exec (for vault_exec), file (for vault_render), proxy (for \
+                 vault_connect) or placeholder (for vault_placeholder)"
                     .into(),
             );
         }
@@ -56,6 +57,17 @@ pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
         .get("audience")
         .and_then(Value::as_str)
         .ok_or("audience is required: the program's or the file's bare name, or an upstream")?;
+    // P3b-3c-2 — a placeholder's audience, in the one spelling
+    // `vault_placeholder` asks its leases in, so that it takes this one.
+    if mode == super::placeholder::MODE {
+        let (host, port) = super::placeholder::audience_of(audience)?;
+        return Ok(AheadRequest {
+            handle,
+            mode,
+            audience: super::placeholder::origin(&host, port),
+            ttl: ttl_of(args)?,
+        });
+    }
     // P3-5b-2 — an upstream, as `vault_connect` will name it: a database's
     // `host:port`, (P3-5d-2) an HTTP upstream's origin, or (P3-5f-2) an SSH
     // host's `ssh://` upstream.
@@ -80,21 +92,24 @@ pub(crate) fn parse(args: &Value) -> Result<AheadRequest, String> {
              starting with `.` or `-`): got {audience:?}"
         ));
     }
-    let ttl = match args.get("ttl_s") {
-        None | Some(Value::Null) => DEFAULT_TTL,
-        Some(v) => match v.as_u64().and_then(|s| u32::try_from(s).ok()) {
-            Some(s) if (MIN_TTL_SECS..=MAX_TTL_SECS).contains(&s) => s,
-            _ => {
-                return Err(format!("ttl_s must be {MIN_TTL_SECS} to {MAX_TTL_SECS}"));
-            }
-        },
-    };
     Ok(AheadRequest {
         handle,
         mode,
         audience: audience.to_string(),
-        ttl,
+        ttl: ttl_of(args)?,
     })
+}
+
+/// The lease's TTL the call names, or the default.
+fn ttl_of(args: &Value) -> Result<u32, String> {
+    use roomler_ai_remote_control::vault::lease_limits::{MAX_TTL_SECS, MIN_TTL_SECS};
+    match args.get("ttl_s") {
+        None | Some(Value::Null) => Ok(DEFAULT_TTL),
+        Some(v) => match v.as_u64().and_then(|s| u32::try_from(s).ok()) {
+            Some(s) if (MIN_TTL_SECS..=MAX_TTL_SECS).contains(&s) => Ok(s),
+            _ => Err(format!("ttl_s must be {MIN_TTL_SECS} to {MAX_TTL_SECS}")),
+        },
+    }
 }
 
 /// What a session's `vault_request` call answers: the lease and how long it
@@ -114,6 +129,16 @@ pub(crate) async fn call(
             return Err(format!(
                 "{}: vault_connect does not sign in with a dynamic secret's credential: vault_exec \
                  and vault_render serve it",
+                req.handle
+            ));
+        }
+        // P3b-3c-2 — nor is a placeholder one's: the vault's own
+        // `dynamic-only-short-lived` refuses it, and asking would only
+        // record that.
+        if req.mode == super::placeholder::MODE {
+            return Err(format!(
+                "{}: a placeholder holds a static secret's value, never a dynamic secret's \
+                 credential: vault_exec and vault_render serve it",
                 req.handle
             ));
         }
