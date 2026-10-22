@@ -443,6 +443,31 @@ is written before it is acted on. Full treatment: [vault.md](vault.md).
 | POST | `…/vault/simulate` | P3-2a — `{action: role:assume · secret:use, principal, resource, device: {os, tags, owner_id}, mode?, audience?, ttl_s?, approver_id?, with?, without?}` → `{decision, determining[{id, name, guardrail}], errors}`. Decides nothing for real; records nothing. Also `secret:list`, `net:socks`, `net:forward` and `ssh:run`, and (P3-9-1) `secret:connect`: `principal.user_id` must be the device's `owner_id`, with no `mode`, and (P3b-1a) `net:egress`: a `host` and a `port`, the host decided in its one spelling, with no `resource` ([vault.md](vault.md) §7, §24) |
 | POST | `…/vault/simulate/replay` | P3-2b — `{with?, without?, days?}` (1–7, default 7): the recorded Cedar decisions of those days, each decided again from the request it recorded → `{days, replayed, unreadable, flipped, flips[{at, action, op, user_id, target, session_id, device_id, was, now, determining}], truncated}`. Decides nothing for real; records nothing |
 
+### Knowhow (FR-90 P4-1, module `knowhow` — mounted only with `[modules] knowhow = true` or a `knowhow.tenants` list)
+
+The org gate reads like the vault's: `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS`) names the
+organizations whose map is kept, a list mounts the module by itself, and a member of any other
+organization gets **404** (`knowhow is not available to this organization`) after the membership
+check. Reads need `KNOWHOW_VIEW` (from `member` up), writes `KNOWHOW_EDIT` (`admin`), which
+includes reading. Every id resolves within the organization, every write is a compare-and-set on
+`rev` appended to `knowhow_history`, and the map grants nothing. Full treatment:
+[knowhow.md](knowhow.md).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/knowhow` | `{entities, edges}`, the live counts |
+| GET | `…/knowhow/search` | `?q=&kind=&env=&limit=` (1–200, default 50) → `{entities[{id, kind, key, name, env?, status, rev, updated_at}], truncated}`, by kind and key; `q` matched as written, case aside |
+| GET | `…/knowhow/entity?kind=…&key=…` | One live entity's card, by its name |
+| GET | `…/knowhow/entity/{id}` | Its card: `{entity{id, kind, key, name, env?, owner_id?, attrs, facts[{path, value, source, by?, observed_at, verified_at?, status}], status, source, rev, created_by?, created_at, updated_by?, updated_at}, links[{direction: out · in, edge, other}], truncated}` |
+| GET | `…/knowhow/map/{id}` | Its neighbourhood: `?depth=` 1 (default) or 2, `?kind=`, `?env=` → `{center, entities, edges, truncated}` |
+| GET | `…/knowhow/history` | The writes, newest first (`?entity=` one entity's, its links' included; `?limit=` 1–200) → `{history[{id, target, target_id, entity_ids, rev, op, source, by?, at, set}]}` |
+| POST | `…/knowhow/entity` | `{kind, key, name, env?, owner_id?, attrs?, facts?: {path: value}}` — **201**; **409** when a live entity holds the kind and key; **400** for `machine` (the fleet's sync records machines) or a spelling outside the rules; **422** for an unknown field |
+| PATCH | `…/knowhow/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?}` — `facts` merged by path, null removing one; `""` clears `env` and `owner_id`; **409** at a rev already gone; `kind` and `key` never change (**422**) |
+| DELETE | `…/knowhow/entity/{id}?rev=…` | Archive it and its links: `{archived, links_archived}` |
+| POST | `…/knowhow/edge` | `{from, to, kind, attrs?}` — **201**; **409** when already linked by that kind; **404** for an end that is not a live entity of the organization |
+| PATCH | `…/knowhow/edge/{id}` | `{rev, attrs}` — its attributes, replaced |
+| DELETE | `…/knowhow/edge/{id}?rev=…` | Archive the link: `{archived}` |
+
 ### Observability
 
 | Method | Path | Purpose |

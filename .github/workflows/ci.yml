@@ -466,6 +466,9 @@ jobs:
       # `roomler-ai-mod-vault` (FR-90 P3-1) with its first commit: a value
       # moved to another place, altered, or held to another KEK does not
       # open; a KEK never prints; paths and fields have one spelling.
+      # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
+      # an attribute have one spelling, and a person's change to one fact
+      # keeps every other fact's provenance.
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -475,7 +478,7 @@ jobs:
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
           -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
-          -p roomler-ai-mod-vault
+          -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above

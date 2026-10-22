@@ -43,6 +43,12 @@ use bson::oid::ObjectId;
 /// FR-90 P3 — `vault` follows it: its leases (P3-3) are held by sessions on
 /// devices, so they are revoked once the sessions have ended and while the
 /// device is still there to be told. P3-1 registers no hooks.
+///
+/// FR-90 P4 — `knowhow` comes last. It holds nothing a device or a member
+/// needs released, only a map of them: its mirror of a removed machine (P4-2)
+/// is archived after every holder has let go, so a holder that fails, which
+/// stops the cascade, leaves the map still showing the device that is still
+/// there. P4-1 registers no hooks.
 pub const HOOK_ORDER: &[&str] = &[
     "hive",
     "vault",
@@ -52,6 +58,7 @@ pub const HOOK_ORDER: &[&str] = &[
     "conference",
     "chat",
     "saas",
+    "knowhow",
 ];
 
 /// What a lease holder freed when an agent was removed — the one piece of

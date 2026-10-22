@@ -57,6 +57,8 @@ pub const EXTRACTED: &[&str] = &[
     "hive",
     #[cfg(feature = "vault")]
     "vault",
+    #[cfg(feature = "knowhow")]
+    "knowhow",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -93,6 +95,10 @@ pub struct Modules {
     /// default): its routes are absent.
     #[cfg(feature = "vault")]
     pub vault: Option<roomler_ai_mod_vault::VaultState>,
+    /// FR-90 P4-1 — knowhow, the organization's map, on core alone; `None`
+    /// when switched off (the default): its routes are absent.
+    #[cfg(feature = "knowhow")]
+    pub knowhow: Option<roomler_ai_mod_knowhow::KnowhowState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -220,6 +226,17 @@ impl Modules {
                 modules.ws.extend(m.ws().handlers);
             }
         }
+        #[cfg(feature = "knowhow")]
+        {
+            // On core alone in P4-1: the map's own store and the people's
+            // routes. Its switch defaults off, like the vault's.
+            modules.knowhow =
+                init_one::<roomler_ai_mod_knowhow::KnowhowState>(core.clone(), settings, ())
+                    .await?;
+            if let Some(m) = &modules.knowhow {
+                modules.ws.extend(m.ws().handlers);
+            }
+        }
 
         let _ = core;
         Ok(modules)
@@ -260,6 +277,10 @@ impl Modules {
         #[cfg(feature = "vault")]
         if self.vault.is_some() {
             ids.push("vault");
+        }
+        #[cfg(feature = "knowhow")]
+        if self.knowhow.is_some() {
+            ids.push("knowhow");
         }
         ids
     }
@@ -302,6 +323,10 @@ impl Modules {
         #[cfg(feature = "vault")]
         if let Some(vault) = &self.vault {
             api = api.merge(vault.routes().with_state(()));
+        }
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            api = api.merge(knowhow.routes().with_state(()));
         }
         api
     }
@@ -484,6 +509,10 @@ impl Modules {
         if let Some(vault) = &self.vault {
             root = root.merge(vault.unlimited_routes().with_state(()));
         }
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            root = root.merge(knowhow.unlimited_routes().with_state(()));
+        }
         root
     }
 
@@ -523,6 +552,10 @@ impl Modules {
         #[cfg(feature = "vault")]
         if let Some(vault) = &self.vault {
             sets.extend(vault.indexes());
+        }
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            sets.extend(knowhow.indexes());
         }
         sets
     }
@@ -565,6 +598,10 @@ impl Modules {
         if let Some(vault) = &self.vault {
             sets.extend(vault.indexes_for(multi_block));
         }
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            sets.extend(knowhow.indexes_for(multi_block));
+        }
         sets
     }
 
@@ -603,6 +640,10 @@ impl Modules {
         #[cfg(feature = "vault")]
         if let Some(vault) = &self.vault {
             jobs.extend(vault.jobs());
+        }
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            jobs.extend(knowhow.jobs());
         }
         jobs
     }
@@ -652,6 +693,11 @@ impl Modules {
         if let Some(vault) = &self.vault {
             core.hooks
                 .register(roomler_ai_mod_vault::VaultState::ID, vault.hooks());
+        }
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            core.hooks
+                .register(roomler_ai_mod_knowhow::KnowhowState::ID, knowhow.hooks());
         }
     }
 
@@ -707,6 +753,10 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        #[cfg(feature = "knowhow")]
+        if let Some(knowhow) = &self.knowhow {
+            knowhow.shutdown().await;
+        }
         #[cfg(feature = "vault")]
         if let Some(vault) = &self.vault {
             vault.shutdown().await;
