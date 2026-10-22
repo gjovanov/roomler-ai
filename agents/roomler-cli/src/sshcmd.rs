@@ -277,14 +277,20 @@ fn mint_session_key() -> Result<ssh_key::PrivateKey> {
 }
 
 /// A directory only the current user can enter, removed on drop.
-struct PrivateDir(PathBuf);
+pub(crate) struct PrivateDir(PathBuf);
 
 impl PrivateDir {
     fn new() -> Result<Self> {
+        Self::named("roomler-ssh")
+    }
+
+    /// FR-90 P3-9-2b — one whose name starts `prefix-`, for `roomler
+    /// connect`'s files too.
+    pub(crate) fn named(prefix: &str) -> Result<Self> {
         // Name from the OS CSPRNG, not the pid or the clock: a predictable
         // name in a shared /tmp is how someone pre-creates the path.
         let nonce: u128 = rand::random();
-        let dir = std::env::temp_dir().join(format!("roomler-ssh-{nonce:032x}"));
+        let dir = std::env::temp_dir().join(format!("{prefix}-{nonce:032x}"));
         std::fs::create_dir(&dir)?;
         #[cfg(unix)]
         {
@@ -294,7 +300,7 @@ impl PrivateDir {
         Ok(Self(dir))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -311,7 +317,7 @@ impl Drop for PrivateDir {
 /// Write owner-only. On Unix the mode is set BEFORE any bytes land —
 /// `ssh` refuses a group/world-readable key, and more to the point a
 /// window where the key exists at 0644 is a window.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]

@@ -841,7 +841,7 @@ no answer, and the daemon stops waiting for it.
 > - **Offered and allowed together.** The daemon decides once, at a run's
 >   launch, whether its toolbelt offers the tools, and writes the settings'
 >   allow from the same answer
->   ([`supervisor.rs:4252`](../agents/roomlerd/src/hive/supervisor.rs#L4252)).
+>   ([`supervisor.rs:4253`](../agents/roomlerd/src/hive/supervisor.rs#L4253)).
 >   It records whether the primary connection takes leases before it resumes
 >   any run ([`signaling.rs:1625`](../agents/roomlerd/src/signaling.rs#L1625)).
 
@@ -915,7 +915,7 @@ device share): a path could match nothing a device asks for.
 > it out of the allow list is not enough. The session's settings list
 > `vault_exec` and `vault_render` under `permissions.ask`
 > ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L432), written
-> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4769)).
+> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L4770)).
 > - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
 >   FR-90 spec's open decision 7), and an allow there would skip the person.
 >   Claude Code reads deny, then ask, then allow, across every settings file,
@@ -929,7 +929,7 @@ device share): a path could match nothing a device asks for.
 | Piece | Where |
 |---|---|
 | the tool | `vault_exec` in [`toolbelt.rs:952`](../agents/roomlerd/src/hive/toolbelt.rs#L952), offered with the reads where the device takes leases, and asked for in the settings |
-| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4301`](../agents/roomlerd/src/hive/supervisor.rs#L4301)); none on Windows |
+| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4302`](../agents/roomlerd/src/hive/supervisor.rs#L4302)); none on Windows |
 | letting go | `Client::release` ([`vault.rs:1078`](../agents/roomlerd/src/vault.rs#L1078)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
@@ -962,8 +962,8 @@ sequenceDiagram
 | the directory | `<runtime>/<session>/secrets/`, made by the daemon, its own, `0711`: the session's account opens a file whose name it knows, and lists nothing. A link or a file in its place is refused, never followed | [`vault_render.rs:170`](../agents/roomlerd/src/hive/vault_render.rs#L170) |
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
 | its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272), [`:1085`](../agents/roomlerd/src/vault.rs#L1085) |
-| a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:731`](../agents/roomlerd/src/hive/supervisor.rs#L731), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
-| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4723`](../agents/roomlerd/src/hive/supervisor.rs#L4723) |
+| a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:732`](../agents/roomlerd/src/hive/supervisor.rs#L732), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
+| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4724`](../agents/roomlerd/src/hive/supervisor.rs#L4724) |
 
 > [!WARNING]
 > - **`file` is a materializing mode** (design §8.5). The session's account
@@ -1014,7 +1014,7 @@ sequenceDiagram
 | the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:102`](../agents/roomlerd/src/hive/vault_request.rs#L102), [`vault.rs:159`](../agents/roomlerd/src/vault.rs#L159) |
 | its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. Otherwise a call asks for its own, as before | [`vault.rs:1114`](../agents/roomlerd/src/vault.rs#L1114), [`vault_exec.rs:615`](../agents/roomlerd/src/hive/vault_exec.rs#L615), the lookup both tools share (`leased_values`, P3-6b-2b) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:293`](../agents/roomlerd/src/hive/vault_render.rs#L293) |
-| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4750`](../agents/roomlerd/src/hive/supervisor.rs#L4750) |
+| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:4751`](../agents/roomlerd/src/hive/supervisor.rs#L4751) |
 
 > [!IMPORTANT]
 > **A use takes the lease by what it is, not by its id.** The design had the
@@ -1602,13 +1602,13 @@ sequenceDiagram
 | Step | What holds | Where |
 |---|---|---|
 | the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:231`, `agents/roomlerd/src/vault_proxy/mod.rs:58`, `agents/roomlerd/src/vault_proxy/mod.rs:110`, `vault_connect.rs:178` |
-| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:921` |
-| the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1251` |
-| the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1358`, `vault_connect.rs:1381`, `vault_connect.rs:1389`, `vault_connect.rs:1037`, `vault_connect.rs:1079` |
-| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). (P3-5f-2) An SSH agent's is `…/ssh-agent.sock`, on Linux and macOS; (P3-5f-3) on Windows it is a named pipe, `\\.\pipe\roomler-vault-<id>`, its DACL the session's account's to open as Win32-OpenSSH opens an agent, for reading and writing whole (`agent_pipe_sddl`; the toolbelt pipe's grant would refuse a session's `ssh.exe`), local clients only, its first instance made before the session is told its name. Either is named in `SSH_AUTH_SOCK`, as OpenSSH and Win32-OpenSSH dial it. Every database endpoint on Windows (P3-5b-4), and an HTTP or Kubernetes one everywhere (P3-5d-2, P3-5e-2; macOS from P3-5d-3), since neither git nor `kubectl` can dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:2108`, `vault_connect.rs:2238`, `vault_connect.rs:1457`, `vault_connect.rs:2526`, `vault_connect.rs:2511` |
-| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a pipe (P3-5f-3), past its DACL, the client's process is read from the pipe (`GetNamedPipeClientProcessId`) and its token's SID compared with the session's, and the next instance is made before the client is looked at, so a second connection always finds one listening. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:2005`, `vault_connect.rs:2207`, `vault_connect.rs:2314`, `vault_connect.rs:562`, `vault_connect.rs:744`, `vault_connect.rs:827`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
-| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket, pipe or port and every connection it holds, an upgraded stream (`kubectl exec`) and an agent's connection included. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1489`, `vault_connect.rs:1686`, `vault_connect.rs:417` |
-| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once. For `kubernetes` (P3-5e-2) the `uri` is the endpoint's origin, and the answer carries a `kubeconfig`: one cluster whose `server` is the endpoint, one context, one user with no credential. For `ssh` (P3-5f-2) `host` is the agent's socket, or (P3-5f-3) on Windows its pipe's name, and `env` names it in `SSH_AUTH_SOCK`; the `uri` is the upstream, which the session's own `ssh` dials; and `known_hosts` holds the hosts' keys under the upstream's name (`[host]:port` where the port is not 22), so `ssh` checks the host by the very keys the agent binds to. Nothing in any of them is secret: the session writes a `kubeconfig` or a `known_hosts` to a file of its own | `vault_connect.rs:1579`, `vault_connect.rs:2443`, `vault_connect.rs:1604`, `vault_connect.rs:2028`, `vault_connect.rs:2223`, `vault_connect.rs:1593` |
+| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:913` |
+| the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1241` |
+| the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1347`, `vault_connect.rs:1370`, `vault_connect.rs:1378`, `vault_connect.rs:1029`, `vault_connect.rs:1071` |
+| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). (P3-5f-2) An SSH agent's is `…/ssh-agent.sock`, on Linux and macOS; (P3-5f-3) on Windows it is a named pipe, `\\.\pipe\roomler-vault-<id>`, its DACL the session's account's to open as Win32-OpenSSH opens an agent, for reading and writing whole (`agent_pipe_sddl`; the toolbelt pipe's grant would refuse a session's `ssh.exe`), local clients only, its first instance made before the session is told its name. Either is named in `SSH_AUTH_SOCK`, as OpenSSH and Win32-OpenSSH dial it. Every database endpoint on Windows (P3-5b-4), and an HTTP or Kubernetes one everywhere (P3-5d-2, P3-5e-2; macOS from P3-5d-3), since neither git nor `kubectl` can dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:2094`, `vault_connect.rs:2224`, `vault_connect.rs:1446`, `vault_connect.rs:2512`, `vault_connect.rs:2497` |
+| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a pipe (P3-5f-3), past its DACL, the client's process is read from the pipe (`GetNamedPipeClientProcessId`) and its token's SID compared with the session's, and the next instance is made before the client is looked at, so a second connection always finds one listening. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:1992`, `vault_connect.rs:2193`, `vault_connect.rs:2300`, `vault_connect.rs:554`, `vault_connect.rs:736`, `vault_connect.rs:819`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
+| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket, pipe or port and every connection it holds, an upgraded stream (`kubectl exec`) and an agent's connection included. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1478`, `vault_connect.rs:1675`, `vault_connect.rs:417` |
+| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once. For `kubernetes` (P3-5e-2) the `uri` is the endpoint's origin, and the answer carries a `kubeconfig`: one cluster whose `server` is the endpoint, one context, one user with no credential. For `ssh` (P3-5f-2) `host` is the agent's socket, or (P3-5f-3) on Windows its pipe's name, and `env` names it in `SSH_AUTH_SOCK`; the `uri` is the upstream, which the session's own `ssh` dials; and `known_hosts` holds the hosts' keys under the upstream's name (`[host]:port` where the port is not 22), so `ssh` checks the host by the very keys the agent binds to. Nothing in any of them is secret: the session writes a `kubeconfig` or a `known_hosts` to a file of its own | `vault_connect.rs:1568`, `vault_connect.rs:2429`, `vault_connect.rs:1593`, `vault_connect.rs:2015`, `vault_connect.rs:2209`, `vault_connect.rs:1582` |
 
 > [!WARNING]
 > - **The settings ASK for every call.** `vault_connect` hands the session no
@@ -1636,7 +1636,7 @@ sequenceDiagram
 >   message answered with the reason, as a server answers it; an HTTP client
 >   (P3-5d-2), its first request, `503`. An SSH agent's protocol carries
 >   no reason (P3-5f-2): its client is hung up on, and `ssh` moves on to
->   its other methods (`vault_connect.rs:1956`).
+>   its other methods (`vault_connect.rs:1943`).
 > - **A use is not reported yet.** `vault_activity` (§17) takes `exec` and
 >   `render`; a `proxy` endpoint's opening is a later step's report.
 
@@ -2101,9 +2101,9 @@ database, an HTTP API, a Kubernetes API server, an SSH host). The value never
 reaches them: the daemon holds it, as it does for a session's `vault_connect`
 (§19). Designed in the spec's §3e, "P3-9, `roomler connect`, as designed".
 P3-9-1 builds the vault's half: the ask, the decision, the lease and its
-revocation. No device asks before P3-9-2, which builds the daemon's verb, the
-endpoint, and the `roomler connect` that stays in the foreground renewing its
-leases while it runs (decision 25).
+revocation. P3-9-2a builds the daemon's ask and the endpoint it serves,
+renewed while it is held, and P3-9-2b the LocalAPI verb and the
+`roomler connect` that holds it in the foreground (decision 25), both below.
 
 ```mermaid
 sequenceDiagram
@@ -2218,7 +2218,8 @@ again (decision 25, P3-9-2).
 | the switch | `vault.people` (`ROOMLER__VAULT__PEOPLE`, [`settings.rs:123`](../crates/config/src/settings.rs#L123)), read by `TenantScope::parse_opt_in` ([`scope.rs:54`](../crates/modules/vault/src/scope.rs#L54)) |
 | `simulate` | `secret:connect` ([`policy_routes.rs:899`](../crates/modules/vault/src/policy_routes.rs#L899)): the principal the device's owner, no mode, and `approver_id` for what a yes would change |
 | the device's half | P3-9-2a, below: the daemon's ask and the endpoint it serves, renewed |
-| what comes next | P3-9-2b: the daemon's LocalAPI `Connect`, on its own endpoint only and never the person socket, held to the accounts decision 26 says; the endpoint released when the asking connection closes; and `roomler connect <handle>` in the foreground |
+| the person's command | P3-9-2b, below: the LocalAPI's `Connect`, on the daemon's own endpoint only, held to decision 26, and `roomler connect` in the foreground |
+| what comes next | P3k: the field run, for an organization listed in `vault.people`; and the operator's word on decision 26 |
 
 **The device's half (P3-9-2a).** The daemon asks a person's leases with its
 lease client (§12): `Client::connect` sends one `rc:vault.connect` for each
@@ -2264,14 +2265,89 @@ stateDiagram-v2
 >   30 s.
 > - **The CA is read once**, when the endpoint opens. A CA that changes later
 >   takes the next `roomler connect`.
-> - **Nothing calls it yet.** P3-9-2b adds the LocalAPI verb and
->   `roomler connect`, and with them the `allow`s on its unused items go.
 
 | Piece | Where |
 |---|---|
 | the ask | `PersonAsk` and `Holder` ([`vault.rs:167`](../agents/roomlerd/src/vault.rs#L167)); `Client::connect` ([`vault.rs:793`](../agents/roomlerd/src/vault.rs#L793)) and `drop_person` ([`vault.rs:1153`](../agents/roomlerd/src/vault.rs#L1153)) |
-| the endpoint | `open_person` ([`vault_connect.rs:458`](../agents/roomlerd/src/hive/vault_connect.rs#L458)); the lease source, `PersonLeases` ([`:1178`](../agents/roomlerd/src/hive/vault_connect.rs#L1178)), and the daemon's, `DaemonPersonLeases`, in words for the person (`person_why`, [`:503`](../agents/roomlerd/src/hive/vault_connect.rs#L503)); on Unix, `person_dir` ([`:2099`](../agents/roomlerd/src/hive/vault_connect.rs#L2099)) |
-| the renewal | `renew` ([`vault_connect.rs:1811`](../agents/roomlerd/src/hive/vault_connect.rs#L1811)), `generation` and `swap`; when, `Timing` ([`:1213`](../agents/roomlerd/src/hive/vault_connect.rs#L1213)); what cuts a connection, `Live` ([`:1695`](../agents/roomlerd/src/hive/vault_connect.rs#L1695)); what its holder reads and ends, `Control` ([`:1750`](../agents/roomlerd/src/hive/vault_connect.rs#L1750)) |
+| the endpoint | `open_person` ([`vault_connect.rs:452`](../agents/roomlerd/src/hive/vault_connect.rs#L452)); the lease source, `PersonLeases` ([`:1169`](../agents/roomlerd/src/hive/vault_connect.rs#L1169)), and the daemon's, `DaemonPersonLeases`, in words for the person (`person_why`, [`:495`](../agents/roomlerd/src/hive/vault_connect.rs#L495)); on Unix, `person_dir` ([`:2085`](../agents/roomlerd/src/hive/vault_connect.rs#L2085)) |
+| the renewal | `renew` ([`vault_connect.rs:1798`](../agents/roomlerd/src/hive/vault_connect.rs#L1798)), `generation` and `swap`; when, `Timing` ([`:1204`](../agents/roomlerd/src/hive/vault_connect.rs#L1204)); what cuts a connection, `Live` ([`:1684`](../agents/roomlerd/src/hive/vault_connect.rs#L1684)); what its holder reads and ends, `Control` ([`:1738`](../agents/roomlerd/src/hive/vault_connect.rs#L1738)) |
+
+**The person's command (P3-9-2b).** `roomler connect` asks the daemon's own
+LocalAPI endpoint for a person's endpoint, and holds it in the foreground:
+
+```sh
+sudo roomler connect db/orders --engine postgres --upstream db.internal:5432
+roomler connect ci/kube --engine kubernetes --upstream https://api.k8s.internal:6443 --auth bearer
+```
+
+It takes a session's `vault_connect` arguments under the same names (§19), and
+the daemon checks them as it checks a session's: `--engine`, `--upstream`,
+`--auth`, `--database`, `--ca`, `--auth-source` and `--ttl` (each lease's life,
+30 to 900 s). It prints where the endpoint is, the connection string, what to
+set, and the daemon's note. A Kubernetes endpoint's kubeconfig and an SSH
+endpoint's `known_hosts` are written to files for the client to read by path.
+Then the command asks every 5 s where the endpoint stands, and says when it
+was renewed or when a renewal was refused. With `--json` the endpoint is one
+line and each change another.
+
+```mermaid
+sequenceDiagram
+    participant P as roomler connect
+    participant L as the daemon's LocalAPI listener
+    participant D as roomlerd (person_connect)
+    participant V as vault
+    P->>L: opens the daemon's own socket or pipe
+    L->>L: who connected, from the OS: a uid and gid, or a token's SID and elevation
+    P->>L: Connect {args}
+    L->>L: decision 26: root or SYSTEM, an elevated administrator, or the daemon's own account
+    L->>D: connect(the account that asked, args)
+    D->>V: rc:vault.connect, one per field, for the device's owner
+    V-->>D: rc:vault.leased
+    D-->>P: Connected {id, endpoint}
+    loop every 5 s, on the same connection
+        P->>L: ConnectStatus {id}
+        L-->>P: ConnectState {left_s, renewals, refused, closed}
+    end
+    P->>L: Ctrl-C ends the command, and the connection with it
+    L->>D: connect_release(id): the endpoint closes, its leases let go
+```
+
+| Where the daemon runs | Who may run `roomler connect` | Whom its endpoint serves |
+|---|---|---|
+| a Linux or macOS system install | root (`sudo`): the daemon's socket is root's, and the person socket refuses the verb | root, so the client runs with `sudo` too |
+| a per-user daemon | its own account, or root | the account that ran it |
+| Windows | SYSTEM, an elevated administrator, or the account Roomler's service runs as (an attended install's person) | the account that ran it, by SID: that account's processes are served whether elevated or not |
+
+> [!WARNING]
+> - **It lends the device OWNER's grants, whoever runs it** (decision 23). So
+>   it is held to who may already act for the whole device: decision 26, its
+>   recommendation, pending the operator's word. On Windows that gate is the
+>   boundary, not the pipe's ACL. The pipe admits every interactive user, an
+>   RDP session's included, and without the gate anyone signed in would reach
+>   the owner's grants.
+> - **The account that passes is the account served.** The listener reads both
+>   from the OS once, before a byte of the request: a uid and gid from the
+>   socket's peer credentials, or a SID and an elevation from one opening of
+>   the client process's token. Nothing the client says names an account.
+> - **Never on the person socket.** Whoever sits at a system install's screen
+>   need not be the device's owner, so `person_may` refuses both verbs there,
+>   with its usual answer: `sudo roomler …`.
+> - **It ends with its connection.** Ctrl-C, a killed command and a closed
+>   terminal all close the connection, and with it the endpoint, its
+>   connections and its leases. A connection reads only the endpoints it
+>   opened, and any other id is refused.
+> - **The files hold nothing secret.** A kubeconfig names the endpoint and no
+>   credential, and `known_hosts` holds the upstream's public host keys. They
+>   are written owner-only into a directory of their own, which goes when the
+>   command ends.
+
+| Piece | Where |
+|---|---|
+| the wire | `Request::Connect` and `ConnectStatus` ([`localapi/src/lib.rs:1539`](../crates/localapi/src/lib.rs#L1539)), `ConnectArgs` ([`:1550`](../crates/localapi/src/lib.rs#L1550)) and `EndpointState` ([`:1579`](../crates/localapi/src/lib.rs#L1579)); `Response::Connected` and `ConnectState` ([`:1907`](../crates/localapi/src/lib.rs#L1907)) |
+| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2280`](../crates/localapi/src/lib.rs#L2280)); the account, `ClientPeer::asker` ([`:2240`](../crates/localapi/src/lib.rs#L2240)); both read from one opening of the token, `token_facts` ([`:2506`](../crates/localapi/src/lib.rs#L2506)) |
+| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3496`](../crates/localapi/src/lib.rs#L3496)); each id kept before its answer is written ([`:3527`](../crates/localapi/src/lib.rs#L3527)), and let go at the connection's end ([`:3558`](../crates/localapi/src/lib.rs#L3558)) |
+| the daemon | `open` ([`person_connect.rs:33`](../agents/roomlerd/src/hive/person_connect.rs#L33)), `state` and `release` ([`:93`](../agents/roomlerd/src/hive/person_connect.rs#L93)); `DaemonState::connect` ([`localapi_state.rs:1726`](../agents/roomlerd/src/localapi_state.rs#L1726)) |
+| the command | `Command::Connect` ([`cli.rs:478`](../agents/roomler-cli/src/cli.rs#L478)); `run` ([`connectcmd.rs:30`](../agents/roomler-cli/src/connectcmd.rs#L30)) and `hold` ([`:71`](../agents/roomler-cli/src/connectcmd.rs#L71)) |
 
 ## 24. Audit
 
@@ -2362,5 +2438,5 @@ its lease (§15).
 
 | Step | Builds |
 |---|---|
-| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), the device's client built (P3-8-2b-1), and its tool built (P3-8-2b-2) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; the rest of `roomler connect` for people, whose vault half is built (§23): P3-9-2, the device's half, the daemon's LocalAPI `Connect` on its own endpoint only, its asks, the endpoint for the account that asked, and `roomler connect <handle>` in the foreground, renewing its leases while it runs (decision 25) (its design: §3e "P3-9, `roomler connect`, as designed") |
+| P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), the device's client built (P3-8-2b-1), and its tool built (P3-8-2b-2) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; for `roomler connect`, built (§23: the vault's half, P3-9-1; the daemon's ask and its renewing endpoint, P3-9-2a; the LocalAPI verb and the foreground command, P3-9-2b), the operator's word on decision 26, who may run it on Windows (its design: §3e "P3-9, `roomler connect`, as designed") |
 | P3k | the field run in the test organization |

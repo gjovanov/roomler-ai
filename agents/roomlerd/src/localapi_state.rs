@@ -1719,6 +1719,36 @@ impl LocalApiState for DaemonState {
         crate::updater::release_install_hold();
     }
 
+    /// FR-90 P3-9-2b — `roomler connect`: a person's endpoint, served to the
+    /// account the LocalAPI listener read, its leases asked for the device's
+    /// owner and renewed while the asking connection stays open.
+    #[cfg(all(hive_host, feature = "vault"))]
+    async fn connect(
+        &self,
+        asker: &tunnel_core::localapi::Asker,
+        args: &tunnel_core::localapi::ConnectArgs,
+    ) -> Response {
+        match crate::hive::person_connect::open(asker, args).await {
+            Ok((id, endpoint)) => Response::Connected { id, endpoint },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    #[cfg(all(hive_host, feature = "vault"))]
+    fn connect_status(&self, id: u64) -> Response {
+        match crate::hive::person_connect::state(id) {
+            Some(state) => Response::ConnectState(state),
+            None => Response::Error {
+                message: format!("no endpoint {id} is held"),
+            },
+        }
+    }
+
+    #[cfg(all(hive_host, feature = "vault"))]
+    fn connect_release(&self, id: u64) {
+        crate::hive::person_connect::release(id);
+    }
+
     /// Fleet RPC — relay an exec to another device over this daemon's own
     /// agent WS and wait for the answer.
     ///
