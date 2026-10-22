@@ -46,7 +46,7 @@ it.
 - **No encryption at rest.** JWTs are HS256 with a shared secret
   (`crates/services/src/auth/mod.rs:301-315`); the only asymmetric key signs DERP tickets
   (`crates/remote_control/src/derp_ticket.rs:92,116`); tenant cloud-storage credentials have a
-  plaintext schema (`crates/db/src/models/tenant.rs:302-220`). The vault brings its own keys.
+  plaintext schema (`crates/db/src/models/tenant.rs:446-457`). The vault brings its own keys.
 - **The primitives exist.** One spawn-as-user path (`agents/roomlerd/src/exec.rs:442,497`); the
   daemon's own PTY (`agents/roomlerd/src/pty/unix.rs:108-187`, ConPTY in
   `agents/roomlerd/src/pty/windows.rs:180-240`); the tmux model (`agents/roomlerd/src/apps/linux.rs:389-433`);
@@ -1381,10 +1381,10 @@ Pids 0 and 1 are refused, because `kill(0, …)` is the daemon's own group and `
 every process.
 
 ⚠️ **A link only root could have made is followed (P1h-3).** The store's directory is locked to
-the daemon with no link on its way (`private_dir`, `hive/supervisor.rs:579`). FR-85's
+the daemon with no link on its way (`private_dir`, `hive/supervisor.rs:1119`). FR-85's
 recording-folder check refuses every link, and on macOS the root daemon's data directory is under
 `/var/root`, where `/var` is the system's own link to `/private/var`: a Mac opened no store and
-refused every session "/var is a symbolic link" (§8, 2026-10-10). `untrusted_link` (`:581`)
+refused every session "/var is a symbolic link" (§8, 2026-10-10). `untrusted_link` (`:1138`)
 follows a link that root owns, in a directory that root owns and that nobody else may write to,
 since only root could have made it, and refuses any other, as before.
 

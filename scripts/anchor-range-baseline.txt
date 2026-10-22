@@ -16,7 +16,6 @@ docs/fr/FR-43-macos-single-enrollment.md	crates/localapi/src/lib.rs:1966-1875
 docs/fr/FR-49-second-org-has-no-mesh.md	agents/roomlerd/src/main.rs:1791-1731
 docs/fr/FR-66-config-probe-false-re-enrollment-error.md	crates/agent-core/src/config.rs:2620-2417
 docs/fr/FR-85-hq-screen-recording.md	crates/modules/fleet/src/hub.rs:1117-881
-docs/fr/FR-90-hive-agent-sessions.md	crates/db/src/models/tenant.rs:302-220
 docs/linux-capture.md	main.rs:3498-3486
 docs/multi-org.md	crates/agent-core/src/config.rs:2114-2109
 docs/overlay-key-rotation.md	agents/roomlerd/src/encode/caps.rs:1812-1800
