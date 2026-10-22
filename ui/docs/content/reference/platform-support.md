@@ -60,7 +60,7 @@ organization chooses it with `roomler org overlay <org> netstack`
 | The computer's sound | ✅ | ✅ | ❌ |
 | Recording with sound | ✅ | ✅ | 🟡 picture only |
 | Ctrl+Alt+Del | ✅ the real one, from a Machine — system install where policy allows | ⛔ sent as ordinary keys, which GNOME and KDE use to log out | ⛔ hidden: it means nothing on a Mac |
-| An approval panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the desktop app asks | ❌ the desktop app asks |
+| An approval panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the desktop app asks | ✅ from agent 0.4.153 · before it, the desktop app asks |
 | "The host is locked" before you connect | ✅ | ❌ | ✅ from agent 0.4.150 |
 | "The host is locked" while you are connected | ✅ | ✅ | ✅ from agent 0.4.150 |
 | The host's cursor, drawn by your browser | ✅ | ✅ system installs, and X11 desktops from agent 0.4.147; a per-user Wayland desktop draws it into the picture | ❌ the cursor is part of the picture |
