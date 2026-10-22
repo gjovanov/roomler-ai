@@ -63,6 +63,10 @@ pub struct Bound {
     /// and its port.
     pub host: String,
     pub port: u16,
+    /// FR-90 P3b-4-2 — the secret and the field the lease is for: what pairs
+    /// an AWS access key's placeholder with its secret key's (decision 33).
+    pub secret: String,
+    pub field: String,
 }
 
 /// Every run's placeholders.
@@ -135,12 +139,28 @@ pub fn drop_run(session: ObjectId, fence: u64) -> bool {
 /// what ends the run's, and of the proxy's swap.
 #[cfg(test)]
 pub(crate) fn bind_for_test(session: ObjectId, fence: u64, host: &str, port: u16) -> String {
+    bind_as_for_test(session, fence, host, port, "test/secret", "value")
+}
+
+/// [`bind_for_test`], its secret and field named: for a test of what pairs
+/// an AWS key's placeholders (P3b-4-2). Its lease is `test-lease-<token>`.
+#[cfg(test)]
+pub(crate) fn bind_as_for_test(
+    session: ObjectId,
+    fence: u64,
+    host: &str,
+    port: u16,
+    secret: &str,
+    field: &str,
+) -> String {
     let token = mint().unwrap();
     runs().entry((session, fence)).or_default().push(Bound {
         token: token.clone(),
         lease_id: format!("test-lease-{token}"),
         host: host.to_string(),
         port,
+        secret: secret.to_string(),
+        field: field.to_string(),
     });
     token
 }
@@ -166,8 +186,8 @@ fn bind(
     run: RunKey,
     token: &str,
     lease_id: &str,
-    host: &str,
-    port: u16,
+    (host, port): (&str, u16),
+    handle: &Handle,
 ) -> Result<(), String> {
     {
         let mut runs = runs();
@@ -182,6 +202,8 @@ fn bind(
             lease_id: lease_id.to_string(),
             host: host.to_string(),
             port,
+            secret: handle.secret.clone(),
+            field: handle.field.clone(),
         });
     }
     let stop = CancellationToken::new();
@@ -346,7 +368,7 @@ pub(crate) async fn call(
         leases: Vec::new(),
     };
     // Each variable's lease toward each audience, in the audiences' order.
-    let mut leases: Vec<(&String, Vec<String>)> = Vec::with_capacity(req.env.len());
+    let mut leases: Vec<(&String, &Handle, Vec<String>)> = Vec::with_capacity(req.env.len());
     for (name, handle) in &req.env {
         let mut each = Vec::with_capacity(audiences.len());
         for audience in &audiences {
@@ -364,7 +386,7 @@ pub(crate) async fn call(
             };
             each.push(lease);
         }
-        leases.push((name, each));
+        leases.push((name, handle, each));
     }
     let mut env = Map::new();
     let mut made: Vec<String> = Vec::with_capacity(leases.len());
@@ -373,7 +395,7 @@ pub(crate) async fn call(
             forget(run, token, None);
         }
     };
-    for (name, each) in &leases {
+    for (name, handle, each) in &leases {
         let token = match mint() {
             Ok(token) => token,
             Err(why) => {
@@ -383,7 +405,7 @@ pub(crate) async fn call(
         };
         made.push(token.clone());
         for (lease, (host, port)) in each.iter().zip(&req.audiences) {
-            if let Err(why) = bind(vault, run, &token, lease, host, *port) {
+            if let Err(why) = bind(vault, run, &token, lease, (host, *port), handle) {
                 unmake(&made);
                 return Err(format!("{name}: {why}"));
             }
@@ -394,7 +416,7 @@ pub(crate) async fn call(
     asked.keep();
     let ttl_s = leases
         .iter()
-        .flat_map(|(_, each)| each)
+        .flat_map(|(_, _, each)| each)
         .filter_map(|lease| vault.left(lease))
         .min()
         .map_or(req.ttl, |left| {

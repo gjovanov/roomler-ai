@@ -43,9 +43,8 @@ pub(crate) mod pg_mint;
 pub(crate) mod scram;
 // P3-6d-1 — SHA-256 crypt, the form a MySQL account keeps its password in.
 pub(crate) mod sha_crypt;
-// FR-90 P3b-4-1 — AWS's Signature Version 4. No caller before P3b-4-2, so the
-// build without the tests keeps it all the same.
-#[cfg_attr(not(test), allow(dead_code))]
+// FR-90 P3b-4-1 — AWS's Signature Version 4: the session's egress proxy signs
+// with it (P3b-4-2).
 pub(crate) mod sigv4;
 pub(crate) mod ssh_agent;
 #[cfg(test)]

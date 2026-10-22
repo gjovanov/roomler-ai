@@ -68,6 +68,10 @@ pub type Peer = String;
 pub const MAX_HOSTS: usize = 1024;
 /// The most connections one run has open at once.
 pub const MAX_CONNECTIONS: usize = 256;
+/// FR-90 P3b-4-2 — the most bodies one run has read whole at once, each to
+/// sign an AWS request again: so a run holds at most this many times 8 MiB,
+/// not one body for each of its connections.
+pub const MAX_BODIES: usize = 4;
 /// How long a client has to say where it goes.
 pub const HANDSHAKE_SECS: u64 = 10;
 /// How long a dial may take, every address together.
@@ -263,6 +267,9 @@ struct RunState {
     /// FR-90 P3b-3c-1 — the TLS the run's audiences are verified with, made
     /// at its first termination.
     upstream: OnceCell<Arc<ClientConfig>>,
+    /// FR-90 P3b-4-2 — a permit for each body read whole, held until it is
+    /// sent.
+    bodies: Arc<Semaphore>,
 }
 
 impl RunState {
@@ -351,6 +358,7 @@ fn start_admitting(run: RunKey, admit: Admit, seams: Seams) -> Result<Fronts, St
         open: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         ca: Arc::new(ca::SessionCa::new(run.0)?),
         upstream: OnceCell::new(),
+        bodies: Arc::new(Semaphore::new(MAX_BODIES)),
     });
     if let Some(old) = runs().insert(run, state.clone()) {
         old.stop.cancel();

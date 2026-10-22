@@ -433,6 +433,7 @@ async fn a_run_asks_about_at_most_so_many_hosts() {
         open: Arc::new(Semaphore::new(1)),
         ca: Arc::new(ca::SessionCa::new(run.0).unwrap()),
         upstream: OnceCell::new(),
+        bodies: Arc::new(Semaphore::new(MAX_BODIES)),
     };
     for i in 0..MAX_HOSTS {
         let _ = decided(&state, run, &format!("h{i}.example"), 443, &vault).await;

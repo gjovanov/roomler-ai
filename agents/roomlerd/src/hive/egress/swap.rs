@@ -12,7 +12,8 @@
 //! | the client's hello | read and not answered. One that names another host (SNI), offers no HTTP/1.1 (ALPN) or is no TLS hello at all is carried as it came, on a new dial |
 //! | the client's TLS | under the run's CA, its leaf for the host ([`super::ca`]), offering HTTP/1.1 alone |
 //! | a request | for this host and port alone (its `Host`, and an absolute form's authority), else `421`; sent on in origin form, less what is one leg's (hop-by-hop). An upgrade is not carried (`501`) |
-//! | the swap | in `Authorization` alone: each placeholder of this audience the run holds, as written, and inside `Basic`'s credentials, decoded and encoded again. Never the URL, another header or the body, where a placeholder goes out as itself (decision 32); nor an AWS signature, which P3b-4 signs again |
+//! | the swap | in `Authorization` alone: each placeholder of this audience the run holds, as written, and inside `Basic`'s credentials, decoded and encoded again. Never the URL, another header or the body, where a placeholder goes out as itself (decision 32); nor an AWS signature, which is signed again; nor, anywhere, an AWS secret key's placeholder, which signs and goes nowhere |
+//! | an AWS signature | one naming a placeholder of this audience: checked with the placeholder pair and signed again with the value ([`aws`], P3b-4-2), before the swap; refused, and never sent, where it is not |
 //! | the value | read from its lease as each request goes ([`super::Values`]): a lease let go swaps nothing |
 //! | the response | streamed back as it came, less what is one leg's |
 //! | its end | the client's, or the run's. An upstream that closes is dialed again for the next request |
@@ -416,9 +417,11 @@ struct Conn {
     leg: Mutex<Option<Leg>>,
 }
 
-/// The upstream's HTTP/1.1 connection, and its task, ended with it.
+/// The upstream's HTTP/1.1 connection, and its task, ended with it. Its
+/// requests' bodies are boxed: a request signed again (P3b-4-2) may carry a
+/// body read whole.
 struct Leg {
-    send: SendRequest<Incoming>,
+    send: SendRequest<Body>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -480,6 +483,13 @@ async fn forward(req: Request<Incoming>, conn: &Conn) -> Response<Body> {
         Ok(req) => req,
         Err((status, why)) => return answer(status, &why),
     };
+    // P3b-4-2 — AWS's signature, where it names a placeholder this audience
+    // holds, checked and signed again with the value; any other request as
+    // it came.
+    let req = match aws::resign(req, conn).await {
+        Ok(req) => req,
+        Err((status, why)) => return answer(status, &why),
+    };
     let req = match swap(req, conn) {
         Ok(req) => req,
         Err(why) => return answer(StatusCode::BAD_GATEWAY, &why),
@@ -499,7 +509,7 @@ async fn forward(req: Request<Incoming>, conn: &Conn) -> Response<Body> {
 /// request went out. The response, and the leg to keep.
 async fn send(
     mut held: Option<Leg>,
-    mut req: Request<Incoming>,
+    mut req: Request<Body>,
     conn: &Conn,
 ) -> Result<(Response<Incoming>, Leg), String> {
     for _ in 0..2 {
@@ -589,7 +599,11 @@ fn outbound(
     parts.version = hyper::Version::HTTP_11;
     parts.extensions = Default::default();
     hop_by_hop(&mut parts.headers);
-    parts.headers.remove(header::EXPECT);
+    // P3b-4-2 — `Expect` goes where an AWS signature signed it: dropped, it
+    // would leave the request no longer matching its signature.
+    if !aws::signs(&parts.headers, "expect") {
+        parts.headers.remove(header::EXPECT);
+    }
     Ok(Request::from_parts(parts, body))
 }
 
@@ -633,11 +647,17 @@ fn inbound(resp: Response<Incoming>) -> Response<Body> {
 /// Each of this audience's placeholders in the request's `Authorization`,
 /// swapped for its value, read now (decision 32). Err where a value is not
 /// one the header can carry: the request is then never sent.
-fn swap(mut req: Request<Incoming>, conn: &Conn) -> Result<Request<Incoming>, String> {
+fn swap<B>(mut req: Request<B>, conn: &Conn) -> Result<Request<B>, String> {
     if !req.headers().contains_key(header::AUTHORIZATION) {
         return Ok(req);
     }
-    let bound = placeholder::bound(conn.run.0, conn.run.1, &conn.target.host, conn.target.port);
+    // P3b-4-2 — an AWS secret key signs and is never sent: its placeholder
+    // is swapped nowhere ([`aws::resign`] takes it, as a key alone).
+    let bound: Vec<Bound> =
+        placeholder::bound(conn.run.0, conn.run.1, &conn.target.host, conn.target.port)
+            .into_iter()
+            .filter(|b| !aws::signs_only(b))
+            .collect();
     if bound.is_empty() {
         return Ok(req);
     }
@@ -677,8 +697,8 @@ fn swap_authorization(
     let raw = value.as_bytes();
     // AWS's signature is made with the secret key: a value swapped in
     // without signing again only breaks it, and S3's answer to a broken one
-    // names the access key it was sent. P3b-4 signs again; until then it
-    // goes out as it is.
+    // names the access key it was sent. One naming a placeholder was signed
+    // again before this ([`aws::resign`]); any other goes out as it is.
     if aws_signed(raw) {
         return Ok(value.clone());
     }
@@ -775,6 +795,9 @@ fn header_of(bytes: &[u8]) -> Result<HeaderValue, String> {
     value.set_sensitive(true);
     Ok(value)
 }
+
+/// FR-90 P3b-4-2 — AWS's signature, checked and signed again with the value.
+mod aws;
 
 #[cfg(test)]
 mod tests;
