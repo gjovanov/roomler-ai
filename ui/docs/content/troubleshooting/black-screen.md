@@ -60,8 +60,8 @@ black screen that a reconnect fixes was almost certainly this.
 ## Linux
 
 :::steps
-1. **Is there a session to capture?** A root system service has no logged-in session. Use the per-user unit on a desktop, or enable virtual-display mode on a headless machine.
-2. **Wayland: is the desktop portal running?** It is started on demand, and if nothing ever triggered it there is no capture source at all. Starting it may not be enough on its own — the portal front-end caches its backend choice at startup and can need a restart after the backend appears.
+1. **Is there a session to capture?** On GNOME and KDE Wayland, a system install (a root service) captures the person's session on screen by itself, and only while it is unlocked and that person can be told who is viewing. At the login screen, on a locked screen or with nobody to tell, the viewer says why instead of showing black. On a headless machine, enable virtual-display mode.
+2. **Wayland on KDE and other portal desktops: is the desktop portal running?** It is started on demand, and if nothing ever triggered it there is no capture source at all. Starting it may not be enough on its own: the portal front-end caches its backend choice at startup and can need a restart after the backend appears. GNOME's per-user installs use GNOME's own screen sharing instead.
 3. **Input does nothing?** Synthetic key events map through the active keyboard layout. A key not on the detected layout **types nothing and reports success**, which looks like some characters working and others not.
 :::
 
