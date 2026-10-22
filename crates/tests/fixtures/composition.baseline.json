@@ -5526,6 +5526,7 @@
     "rc:vault.net",
     "rc:vault.ssh",
     "rc:vault.connect",
+    "rc:vault.egress",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5649,6 +5650,7 @@
     "rc:vault.described",
     "rc:vault.net.granted",
     "rc:vault.ssh.granted",
+    "rc:vault.egress.allowed",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -5730,6 +5732,7 @@
     "rc:vault.activity": "vault",
     "rc:vault.connect": "vault",
     "rc:vault.describe": "vault",
+    "rc:vault.egress": "vault",
     "rc:vault.lease": "vault",
     "rc:vault.list": "vault",
     "rc:vault.net": "vault",

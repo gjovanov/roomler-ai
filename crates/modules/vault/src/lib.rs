@@ -51,6 +51,7 @@ pub mod connect;
 pub mod crypto;
 pub mod dao;
 pub mod dynamic;
+pub mod egress;
 pub mod gate;
 pub mod lease;
 pub mod meta;

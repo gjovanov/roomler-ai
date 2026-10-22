@@ -163,6 +163,9 @@ pub enum Request {
     /// ([`crate::connect`]): in the same queue, so it waits its turn behind
     /// the device's sessions and a flood of it is answered `busy`.
     Connect(crate::connect::ConnectRequest),
+    /// P3b-1a — whether a session's commands may reach one host
+    /// ([`crate::egress`]), answered in order with the leases.
+    Egress(crate::egress::EgressRequest),
 }
 
 impl Request {
@@ -176,6 +179,7 @@ impl Request {
             Self::Net(r) => Some(&r.req_id),
             Self::Ssh(r) => Some(&r.req_id),
             Self::Connect(r) => Some(&r.req_id),
+            Self::Egress(r) => Some(&r.req_id),
         }
     }
 }
@@ -339,6 +343,19 @@ impl AgentMsgHandler for LeaseSocket {
                 audience,
                 ttl_secs,
             }),
+            ClientMsg::VaultEgress {
+                req_id,
+                session_id,
+                fence,
+                host,
+                port,
+            } => Request::Egress(crate::egress::EgressRequest {
+                req_id,
+                session_id,
+                fence,
+                host,
+                port,
+            }),
             other => return Some(other),
         };
         let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
@@ -486,6 +503,15 @@ async fn answer_in_order(
                         provider: None,
                     }
                 }
+                Err(why) => refusal(&r.req_id, why),
+            },
+            // P3b-1a — an allow, never a value, a grant or a lease.
+            Request::Egress(r) => match crate::egress::decide(&state, conn, r).await {
+                Ok((host, port)) => ServerMsg::VaultEgressAllowed {
+                    req_id: r.req_id.clone(),
+                    host,
+                    port,
+                },
                 Err(why) => refusal(&r.req_id, why),
             },
         };

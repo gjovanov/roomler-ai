@@ -57,6 +57,17 @@ namespace Roomler {
     owner: User,
   };
 
+  // P3b-1a — a host a session's commands reach through the session's
+  // egress proxy, named by its one spelling (`canonical_net_host`): a
+  // lowercase name without the root's dot, or an address. `name` is that
+  // spelling, for a pattern (`resource.name like "*.pythonhosted.org"`),
+  // and `port` the port the command dials. A policy names one host by its
+  // name (`Roomler::Host::"pypi.org"`), on every port unless it says which.
+  entity Host = {
+    name: String,
+    port: Long,
+  };
+
   // A person answered an approval card in the session's room.
   type Approval = {
     approver: User,
@@ -135,6 +146,19 @@ namespace Roomler {
       device: Device,
       host: String,
       port: Long,
+    },
+  };
+
+  // P3b-1a — a session's command reaching `resource` through the session's
+  // egress proxy, on the device the session runs on (decision 27). Nothing
+  // implies it, and the vault seeds no permit for it: on a device whose
+  // owner turned on `hive_egress`, a session reaches no host until a
+  // policy names it.
+  action "net:egress" appliesTo {
+    principal: [Session],
+    resource: [Host],
+    context: {
+      device: Device,
     },
   };
 
