@@ -319,6 +319,11 @@ mod vault_meta_tests;
 /// under its own audience that names exactly what was decided.
 #[cfg(test)]
 mod vault_net_tests;
+/// FR-90 P3b-2 — placeholder leases, the vault's half: released only where
+/// `vault.placeholder` lists the organization, toward an origin the secret
+/// names, never on Windows until decision 30.
+#[cfg(test)]
+mod vault_placeholder_tests;
 /// FR-90 P3-3c — revocation: a session's end or move, a changed, disabled
 /// or deleted secret, a new device key, a removed device; told at once on
 /// the device's pod or at its sweep, again at every hello, never expired.

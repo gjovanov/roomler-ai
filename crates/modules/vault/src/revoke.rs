@@ -306,6 +306,19 @@ pub fn verdict(lease: &VaultLease, s: &Standing<'_>) -> Option<RevokeReason> {
     None
 }
 
+/// Whether the vault still serves what `lease` was released for: a session's
+/// lease while it serves the organization (`served`); (P3b-2) a
+/// placeholder's only while `vault.placeholder` lists it too; (P3-9-1) a
+/// person's only while `vault.people` does. The latter two already carry
+/// `served` in them.
+fn served_for(lease: &VaultLease, served: bool, people: bool, placeholder: bool) -> bool {
+    match lease.session_id {
+        Some(_) if lease.mode == crate::lease::MODE_PLACEHOLDER => placeholder,
+        Some(_) => served,
+        None => people,
+    }
+}
+
 /// One revocation, recorded. Best effort: the lease's row already says it
 /// is revoked, and that row is what every check reads.
 async fn record(state: &VaultState, lease: &VaultLease, why: RevokeReason) {
@@ -384,6 +397,8 @@ pub async fn check_device(state: &VaultState, device: ObjectId) -> Result<bool, 
     // P3-9-1 — and a person's lease, only while the vault lends to the
     // organization's people.
     let people_served = served && state.people.serves(tenant);
+    // P3b-2 — and a placeholder's, only while `vault.placeholder` lists it.
+    let placeholder_served = served && state.placeholder.serves(tenant);
     let mut sessions: HashMap<ObjectId, Option<AgentSession>> = HashMap::new();
     let mut secrets: HashMap<ObjectId, Option<VaultSecret>> = HashMap::new();
     // P3-9-1 — the owner a person's lease stands on, read once per check and
@@ -424,11 +439,7 @@ pub async fn check_device(state: &VaultState, device: ObjectId) -> Result<bool, 
         }
         let standing = Standing::of(
             lease,
-            if lease.session_id.is_some() {
-                served
-            } else {
-                people_served
-            },
+            served_for(lease, served, people_served, placeholder_served),
             row.as_ref(),
             session,
             standing_owner,
@@ -639,6 +650,33 @@ mod tests {
                 changed: false,
             }),
         }
+    }
+
+    /// P3b-2 — a placeholder's lease stands only while `vault.placeholder`
+    /// lists its organization, a person's while `vault.people` does, and any
+    /// other session's while the vault serves it: clearing a switch takes
+    /// back what it released, and nothing else.
+    #[test]
+    fn each_lease_stands_on_the_switch_it_was_released_under() {
+        let session = lease();
+        let placeholder = VaultLease {
+            mode: "placeholder".into(),
+            ..lease()
+        };
+        let person = VaultLease {
+            session_id: None,
+            mode: "proxy".into(),
+            ..lease()
+        };
+        // Only `vault.placeholder` cleared.
+        assert!(served_for(&session, true, true, false));
+        assert!(!served_for(&placeholder, true, true, false));
+        assert!(served_for(&person, true, true, false));
+        // Only `vault.people` cleared.
+        assert!(served_for(&placeholder, true, false, true));
+        assert!(!served_for(&person, true, false, true));
+        // The vault itself no longer serving the organization.
+        assert!(!served_for(&session, false, false, false));
     }
 
     /// Each way a lease stops standing has its own word.

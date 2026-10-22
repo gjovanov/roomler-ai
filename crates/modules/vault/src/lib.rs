@@ -25,7 +25,10 @@
 //! And from P3-9-1 a PERSON's use, through an endpoint their device serves
 //! them (`roomler connect`, [`connect`]): decided by Cedar's own
 //! `secret:connect` for the device's owner as its row names them, and lent
-//! only to the organizations `vault.people` lists.
+//! only to the organizations `vault.people` lists. From P3b-2 a session's
+//! lease may be a PLACEHOLDER's (design §8.5): the value released to the
+//! daemon as `proxy` mode's is, toward an origin its secret names, and only
+//! to the organizations `vault.placeholder` lists.
 //!
 //! The module's switch defaults OFF (`[modules] vault`), and a
 //! `vault.tenants` list both switches it on and limits it to the
@@ -95,6 +98,9 @@ pub struct VaultState {
     pub people: Arc<scope::TenantScope>,
     /// P3-9-1 — each device's requests per minute for its owner.
     pub person_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
+    /// P3b-2 — the organizations whose sessions may hold a secret as a
+    /// placeholder (`vault.placeholder`, opt-in: empty is none).
+    pub placeholder: Arc<scope::TenantScope>,
     /// P3-6b — the providers a dynamic secret is leased for
     /// (`vault.providers`).
     pub providers: Arc<dynamic::ProviderScope>,
@@ -133,6 +139,8 @@ impl Module for VaultState {
         scope.log();
         let people = scope::TenantScope::parse_opt_in(&settings.vault.people);
         people.log_people();
+        let placeholder = scope::TenantScope::parse_placeholder(&settings.vault.placeholder);
+        placeholder.log_placeholder();
         let providers = dynamic::ProviderScope::parse(&settings.vault.providers);
         providers.log();
         // Never a boot refusal: a missing or unusable KEK leaves the
@@ -156,6 +164,7 @@ impl Module for VaultState {
             scope: Arc::new(scope),
             people: Arc::new(people),
             person_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
+            placeholder: Arc::new(placeholder),
             providers: Arc::new(providers),
             kek,
             core,

@@ -207,6 +207,16 @@ when { resource.kind == "dynamic" };"#,
         text: r#"forbid (principal, action == Roomler::Action::"secret:connect", resource)
 when { resource.tags.contains("prod") || resource.path == "prod" || resource.path like "prod/*" };"#,
     },
+    // P3b-2 — the placeholder's confused deputy, `proxy-only-named-audiences`'
+    // twin: the daemon swaps the value in on a connection to the origin the
+    // session names, so the origin must be one the secret names. Exactly.
+    Guardrail {
+        id: "guardrail:placeholder-only-named-audiences",
+        why: "in `placeholder` mode a value is swapped in only toward an origin its secret names \
+              in `audiences`, exactly: a placeholder for anywhere else is refused",
+        text: r#"forbid (principal, action == Roomler::Action::"secret:use", resource)
+when { context.mode == "placeholder" && !(resource.audiences.contains(context.audience)) };"#,
+    },
 ];
 
 /// What a policy may name of its organization.
@@ -1533,6 +1543,62 @@ mod tests {
         for mode in ["env", "file"] {
             assert!(decide(&set, &with("anywhere", &[], mode)).allow, "{mode}");
         }
+    }
+
+    /// P3b-2 — a placeholder is swapped in only toward an origin its secret
+    /// names, exactly, by its own guardrail; and the guardrails already
+    /// seeded hold it where they should: never a dynamic secret's field,
+    /// not on Windows until P3b-5 (decision 17's guardrail, which decision 30
+    /// widens there), while a prod secret may be one, since nothing
+    /// materializes.
+    #[test]
+    fn a_placeholder_goes_only_toward_an_origin_its_secret_names() {
+        let any = r#"permit (principal, action == Roomler::Action::"secret:use", resource);"#;
+        let set = set_with(&[any]);
+        let with = |path: &str, audience: &str, audiences: &[&str], os: &str| {
+            let mut ask = use_secret(Some("dev"), path, &[], "placeholder", os);
+            if let Ask::UseSecret {
+                secret,
+                audience: a,
+                ..
+            } = &mut ask
+            {
+                *a = audience.into();
+                secret.audiences = audiences.iter().map(|p| p.to_string()).collect();
+            }
+            ask
+        };
+        let gh = "https://api.github.com";
+        let ok = decide(&set, &with("ci/gh", gh, &[gh], "linux"));
+        assert!(ok.allow && ok.errors.is_empty(), "{ok:?}");
+        let prod = decide(&set, &with("prod/gh", gh, &[gh], "linux"));
+        assert!(prod.allow, "nothing materializes: {prod:?}");
+        for (audience, audiences) in [
+            ("https://evil.example", &[gh][..]),
+            ("https://api.github.com:8443", &[gh][..]),
+            ("https://API.github.com", &[gh][..]),
+            ("api.github.com", &[gh][..]),
+            (gh, &[][..]),
+            ("", &[gh][..]),
+        ] {
+            let v = decide(&set, &with("ci/gh", audience, audiences, "linux"));
+            assert!(!v.allow, "{audience:?} {audiences:?}: {v:?}");
+            assert_eq!(
+                v.determining,
+                ["guardrail:placeholder-only-named-audiences"],
+                "{audience:?}"
+            );
+        }
+        let windows = decide(&set, &with("ci/gh", gh, &[gh], "windows"));
+        assert!(!windows.allow);
+        assert_eq!(windows.determining, ["guardrail:windows-proxy-only"]);
+        let mut dynamic = with("ci/gh", gh, &[gh], "linux");
+        if let Ask::UseSecret { secret, .. } = &mut dynamic {
+            secret.kind = "dynamic".into();
+        }
+        let v = decide(&set, &dynamic);
+        assert!(!v.allow);
+        assert_eq!(v.determining, ["guardrail:dynamic-only-short-lived"]);
     }
 
     /// P3-5a — a request recorded before `audiences` existed reads back

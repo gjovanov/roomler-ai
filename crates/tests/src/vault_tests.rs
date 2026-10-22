@@ -910,6 +910,8 @@ async fn roles_and_policies_are_checked_before_they_are_kept() {
             "guardrail:connect-only-named-audiences",
             "guardrail:connect-never-dynamic",
             "guardrail:connect-never-prod",
+            // P3b-2 — a placeholder's audience, as a proxy's.
+            "guardrail:placeholder-only-named-audiences",
             pid.as_str()
         ],
         "{list}"
