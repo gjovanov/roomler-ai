@@ -110,6 +110,17 @@ pub struct VaultSettings {
     /// that names no provider serves nothing: `none` turns them all off.
     #[serde(default)]
     pub providers: String,
+    /// P3-9-1 — the organizations whose PEOPLE the vault lends to through
+    /// `roomler connect` (`ROOMLER__VAULT__PEOPLE=<id>,<id>`): a person's
+    /// endpoint, decided by Cedar's `secret:connect` for the device's owner.
+    /// ⚠️ Opt-in, the opposite sense to `tenants`: empty — the default — is
+    /// NO organization, `*` every one the vault serves, a list only those.
+    /// An organization the vault serves for its sessions lends nothing to
+    /// its people until it is listed here too. Clearing it is the kill
+    /// switch: every person's live lease is taken back at its device's next
+    /// sweep.
+    #[serde(default)]
+    pub people: String,
 }
 
 impl std::fmt::Debug for VaultSettings {
@@ -127,6 +138,7 @@ impl std::fmt::Debug for VaultSettings {
             .field("kek_file", &self.kek_file)
             .field("revoke_sweep_secs", &self.revoke_sweep_secs)
             .field("providers", &self.providers)
+            .field("people", &self.people)
             .finish()
     }
 }
@@ -1828,6 +1840,8 @@ mod vault_settings_tests {
         assert!(m.switched_off().contains(&"vault"));
         let absent: VaultSettings = toml::from_str("").expect("every key defaults");
         assert!(absent.tenants.is_empty() && absent.kek.is_empty() && absent.kek_file.is_empty());
+        // P3-9-1 — and lends to no organization's people.
+        assert!(absent.people.is_empty());
     }
 
     /// ⚠️ The KEK is the vault's root secret: whatever prints settings must
@@ -1843,6 +1857,7 @@ mod vault_settings_tests {
             kek_file: String::new(),
             revoke_sweep_secs: 0,
             providers: String::new(),
+            people: String::new(),
         };
         let shown = format!("{s:?} {s:#?}");
         assert!(!shown.contains(key), "{shown}");

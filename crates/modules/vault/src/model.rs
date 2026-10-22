@@ -145,7 +145,8 @@ pub struct VaultAuditEvent {
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
     /// `user` in P3-1; `session` and `device` principals arrive with P3-2
-    /// and P3-3.
+    /// and P3-3. P3-9-1 — `user` again for a person's `secret:connect`: the
+    /// device's owner, with the device and no session.
     pub principal: String,
     pub user_id: ObjectId,
     /// The action as a policy names it: `secret:list` | `secret:write` |
@@ -269,10 +270,17 @@ pub struct VaultLease {
     /// included, takes the lease back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<BTreeMap<String, i64>>,
-    pub session_id: ObjectId,
+    /// The session it was released to. P3-9-1 — absent for a PERSON's lease
+    /// (`roomler connect`, [`crate::connect`]), which no session holds, and
+    /// only for one: a lease with no session is checked as its owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<ObjectId>,
+    /// The session's fence; `0` for a person's lease.
     pub fence: i64,
     pub device_id: ObjectId,
-    /// The session's owner, the principal the policy decided for.
+    /// The principal the policy decided for: the session's owner, or
+    /// (P3-9-1) for a person's lease the device's owner as its row named
+    /// them, which the lease stands on until the row names another.
     pub owner_id: ObjectId,
     /// The device key the value was sealed to (`agents.vault_key` at the
     /// time): a later hello with another key means another process, which

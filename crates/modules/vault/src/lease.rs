@@ -144,6 +144,10 @@ pub enum Request {
     /// P3-8-1a — a session's command on another device ([`crate::ssh`]),
     /// answered in order with the leases.
     Ssh(crate::ssh::SshRequest),
+    /// P3-9-1 — a person's use, through an endpoint the device serves them
+    /// ([`crate::connect`]): in the same queue, so it waits its turn behind
+    /// the device's sessions and a flood of it is answered `busy`.
+    Connect(crate::connect::ConnectRequest),
 }
 
 impl Request {
@@ -156,6 +160,7 @@ impl Request {
             Self::Activity(_) => None,
             Self::Net(r) => Some(&r.req_id),
             Self::Ssh(r) => Some(&r.req_id),
+            Self::Connect(r) => Some(&r.req_id),
         }
     }
 }
@@ -306,6 +311,19 @@ impl AgentMsgHandler for LeaseSocket {
                 target,
                 ttl_secs,
             }),
+            ClientMsg::VaultConnect {
+                req_id,
+                secret,
+                field,
+                audience,
+                ttl_secs,
+            } => Request::Connect(crate::connect::ConnectRequest {
+                req_id,
+                secret,
+                field,
+                audience,
+                ttl_secs,
+            }),
             other => return Some(other),
         };
         let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
@@ -436,6 +454,23 @@ async fn answer_in_order(
                     os: t.os,
                     account: t.account.wire().to_string(),
                 },
+                Err(why) => refusal(&r.req_id, why),
+            },
+            // P3-9-1 — a person's lease, answered as a session's is: the
+            // device opens it with the same key, and its revocation reaches
+            // it the same way.
+            Request::Connect(r) => match crate::connect::connect(&state, conn, r).await {
+                Ok(l) => {
+                    state.revoker.hold(conn.device_id);
+                    ServerMsg::VaultLeased {
+                        req_id: r.req_id.clone(),
+                        lease_id: l.lease_id.to_hex(),
+                        n: l.n,
+                        sealed: base64::engine::general_purpose::STANDARD.encode(&l.sealed),
+                        expires_at_ms: l.expires_at.timestamp_millis(),
+                        provider: None,
+                    }
+                }
                 Err(why) => refusal(&r.req_id, why),
             },
         };
@@ -640,13 +675,16 @@ pub(crate) fn reason_of(verdict: &Verdict) -> String {
 pub(crate) struct Record<'a> {
     pub(crate) state: &'a VaultState,
     pub(crate) conn: Conn,
-    pub(crate) session_id: ObjectId,
+    /// The session asking; P3-9-1 — none for a person's request
+    /// ([`crate::connect`]), whose rows name the device's owner as a `user`.
+    pub(crate) session_id: Option<ObjectId>,
     pub(crate) owner: ObjectId,
     pub(crate) asked: &'a str,
     /// Once resolved: the secret, its RRN, the field, and the version.
     pub(crate) secret: Option<(ObjectId, String, String, Option<i64>)>,
     /// The action as a policy names it (`secret:use`, P3-4b's
-    /// `secret:list`), and what exactly: `lease` · `list` · `describe`.
+    /// `secret:list`, P3-9-1's `secret:connect`), and what exactly: `lease`
+    /// · `list` · `describe` · `connect`.
     pub(crate) action: &'static str,
     pub(crate) op: &'static str,
     /// P3-4e — the approval a deny waits on or stands on, which its row
@@ -659,6 +697,15 @@ pub(crate) struct Record<'a> {
 }
 
 impl Record<'_> {
+    /// Who asked, as the audit names a principal: a session, or (P3-9-1) a
+    /// person, the device's owner.
+    fn principal(&self) -> &'static str {
+        match self.session_id {
+            Some(_) => "session",
+            None => "user",
+        }
+    }
+
     pub(crate) fn event(
         &self,
         allow: bool,
@@ -687,7 +734,7 @@ impl Record<'_> {
         VaultAuditEvent {
             id: None,
             tenant_id: self.conn.tenant_id,
-            principal: "session".into(),
+            principal: self.principal().into(),
             user_id: self.owner,
             action: self.action.into(),
             op: self.op.into(),
@@ -698,7 +745,7 @@ impl Record<'_> {
             field,
             n,
             target,
-            session_id: Some(self.session_id),
+            session_id: self.session_id,
             device_id: Some(self.conn.device_id),
             request: request.map(Ask::to_doc),
             at: DateTime::now(),
@@ -714,7 +761,7 @@ impl Record<'_> {
             .record(&self.event(false, reason, None, None))
             .await
         {
-            warn!(session = %self.session_id, %e, "vault: a lease refusal was not recorded");
+            warn!(session = ?self.session_id, device = %self.conn.device_id, %e, "vault: a lease refusal was not recorded");
         }
         why
     }
@@ -816,7 +863,7 @@ pub(crate) async fn identify<'a>(
     let rec = Record {
         state,
         conn,
-        session_id,
+        session_id: Some(session_id),
         owner: session.owner_id,
         asked,
         secret: None,
@@ -1082,7 +1129,7 @@ async fn decide_and_release(
         field: field.to_string(),
         n,
         bundle,
-        session_id: req.session_id,
+        session_id: Some(req.session_id),
         fence: session.fence,
         device_id: rec.conn.device_id,
         owner_id: session.owner_id,
@@ -1164,7 +1211,7 @@ async fn bundle_for<'a>(
 /// One stored version, opened for a lease, and the `expires_at` its writer
 /// gave it. A version past that is never released (P3-3c: P3-1 promised it of
 /// the first step to use a value, and P3-3b did not keep the promise).
-async fn open_one(
+pub(crate) async fn open_one(
     state: &VaultState,
     rec: &Record<'_>,
     kek: &crypto::Kek,

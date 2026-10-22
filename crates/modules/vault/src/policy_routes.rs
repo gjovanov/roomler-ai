@@ -35,9 +35,9 @@ use crate::VaultState;
 use crate::dao::{MAX_POLICIES, MAX_ROLES, is_name_taken};
 use crate::model::{VaultPolicy, VaultRole};
 use crate::policy::{
-    self, ACTION_ASSUME, ACTION_LIST, ACTION_NET_FORWARD, ACTION_NET_SOCKS, ACTION_SSH_RUN,
-    ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS, MODES, NodeFacts, OSES, OrgNames,
-    SecretFacts, SessionFacts, Verdict,
+    self, ACTION_ASSUME, ACTION_CONNECT, ACTION_LIST, ACTION_NET_FORWARD, ACTION_NET_SOCKS,
+    ACTION_SSH_RUN, ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS, MODES, NodeFacts,
+    OSES, OrgNames, SecretFacts, SessionFacts, Verdict,
 };
 use crate::routes::{
     Ask, check_description, decide, live_secret, member_tenant, org_slug, record_allow, rfc3339,
@@ -58,19 +58,25 @@ async fn org_names(state: &VaultState, tid: ObjectId) -> Result<OrgNames, ApiErr
         .into_iter()
         .map(|r| r.name)
         .collect();
-    let groups = state
+    let groups = org_groups(state, tid).await?.into_iter().collect();
+    Ok(OrgNames {
+        secret_prefix: secret_rrn(&slug, ""),
+        roles,
+        groups,
+    })
+}
+
+/// The organization's roomler roles, by name: every Cedar `Group` a policy
+/// may name of it.
+pub(crate) async fn org_groups(state: &VaultState, tid: ObjectId) -> Result<Vec<String>, DaoError> {
+    Ok(state
         .tenants
         .roles
         .find_many(doc! { "tenant_id": tid }, None)
         .await?
         .into_iter()
         .map(|r| r.name)
-        .collect();
-    Ok(OrgNames {
-        secret_prefix: secret_rrn(&slug, ""),
-        roles,
-        groups,
-    })
+        .collect())
 }
 
 /// P3-7 — a node a simulated request names: a live device of this
@@ -753,18 +759,7 @@ pub async fn simulate(
                     "ttl_s must be 1 to {MAX_TTL_S}"
                 )));
             }
-            // P3-4e — the approver in the groups they hold, as a lease
-            // decides them.
-            let approver = match &body.approver_id {
-                Some(raw) => {
-                    let id = parse_user(raw, "approver_id")?;
-                    Some(policy::Approver {
-                        id,
-                        groups: groups_of_member(&state, tid, id).await?,
-                    })
-                }
-                None => None,
-            };
+            let approver = sim_approver(&state, tid, body.approver_id.as_deref()).await?;
             let slug = org_slug(&state, tid).await?;
             Request::UseSecret {
                 session: SessionFacts {
@@ -897,6 +892,64 @@ pub async fn simulate(
                 }
             }
         }
+        // P3-9-1 — whether a person, the device's owner, may use that secret
+        // through an endpoint toward that upstream. `approver_id` asks what
+        // a yes would change, which no real request can get yet (decision
+        // 24).
+        ACTION_CONNECT => {
+            let Some(raw) = &body.principal.user_id else {
+                return Err(ApiError::BadRequest("principal.user_id is required".into()));
+            };
+            let user = parse_user(raw, "principal.user_id")?;
+            if user != owner {
+                return Err(ApiError::BadRequest(
+                    "secret:connect acts as the device's owner: principal.user_id must be \
+                     device.owner_id"
+                        .into(),
+                ));
+            }
+            if !state.tenants.is_member(tid, user).await? {
+                return Err(ApiError::BadRequest(
+                    "principal.user_id is not a member of this organization".into(),
+                ));
+            }
+            if body.mode.is_some() {
+                return Err(ApiError::BadRequest(
+                    "secret:connect has no mode: a person's endpoint is always a proxy".into(),
+                ));
+            }
+            let Some(raw) = &body.resource.secret_id else {
+                return Err(ApiError::BadRequest(
+                    "resource.secret_id is required".into(),
+                ));
+            };
+            let sid = crate::routes::parse_secret_id(raw)?;
+            let secret = live_secret(&state, tid, sid).await?;
+            let ttl_s = body.ttl_s.unwrap_or(900);
+            if !(1..=MAX_TTL_S).contains(&ttl_s) {
+                return Err(ApiError::BadRequest(format!(
+                    "ttl_s must be 1 to {MAX_TTL_S}"
+                )));
+            }
+            let approver = sim_approver(&state, tid, body.approver_id.as_deref()).await?;
+            let slug = org_slug(&state, tid).await?;
+            Request::ConnectSecret {
+                user,
+                groups: groups_of_member(&state, tid, user).await?,
+                secret: SecretFacts {
+                    prefix: secret_rrn(&slug, ""),
+                    path: secret.path.clone(),
+                    kind: secret.kind.clone(),
+                    tags: secret.tags.clone(),
+                    exec_allow: secret.exec_allow.clone(),
+                    audiences: secret.audiences.clone(),
+                },
+                audience: body.audience.clone().unwrap_or_default(),
+                ttl_s,
+                device,
+                approver,
+            }
+        }
         other => {
             return Err(ApiError::BadRequest(format!(
                 "action must be one of {} — {other} is not decided by the vault's policies",
@@ -930,6 +983,23 @@ pub async fn simulate(
         "determining": determining,
         "errors": verdict.errors,
     })))
+}
+
+/// P3-4e — a simulated approver, in the groups they hold, as a lease decides
+/// them.
+async fn sim_approver(
+    state: &VaultState,
+    tid: ObjectId,
+    raw: Option<&str>,
+) -> Result<Option<policy::Approver>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let id = parse_user(raw, "approver_id")?;
+    Ok(Some(policy::Approver {
+        id,
+        groups: groups_of_member(state, tid, id).await?,
+    }))
 }
 
 /// The organization's set as it would be: its stored policies less

@@ -287,6 +287,13 @@ mod vault_activity_tests;
 /// session's room, a driver's answer, and the one lease a yes allows.
 #[cfg(test)]
 mod vault_approval_tests;
+/// FR-90 P3-9-1 — a person's `roomler connect`, the vault's half:
+/// `rc:vault.connect` decided by Cedar's `secret:connect` for the device's
+/// OWNER as its row names them, lent only where `vault.people` lists the
+/// organization, never by a policy written for sessions, and taken back when
+/// the owner changes or leaves.
+#[cfg(test)]
+mod vault_connect_tests;
 /// FR-90 P3-6b-1 — dynamic secrets, the vault's half: declared with a
 /// provider and one audience, holding the issuer's fields alone, leased in
 /// `short-lived` as one bundle sealed to the device, the kind and its mode

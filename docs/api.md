@@ -416,6 +416,8 @@ The org gate reads like Hive's: `vault.tenants` (`ROOMLER__VAULT__TENANTS`) name
 served, a list mounts the module by itself, and a member of any other organization gets **404**
 (`the vault is not available to this organization`) after the membership check. Every route is
 for the organization's `ADMINISTRATOR`s (**403** otherwise), and **no route answers a value**.
+The vault lends to a served organization's PEOPLE (`roomler connect`, P3-9-1) only where
+`vault.people` (`ROOMLER__VAULT__PEOPLE`) lists it, opt-in and empty by default.
 Every `secret:*` and `vault:verify` decision is recorded in `vault_audit`, allow and deny; an allow
 is written before it is acted on. Full treatment: [vault.md](vault.md).
 
@@ -438,7 +440,7 @@ is written before it is acted on. Full treatment: [vault.md](vault.md).
 | DELETE | `…/vault/role/{name}` | P3-2a — tombstone a role; **409** naming the live policies that still name it |
 | GET · POST | `…/vault/policy` | P3-2a — the guardrails, then the organization's policies (`{id, name, description, text, effect, guardrail, rev, …}`); `{name, description?, text}` adds one, checked first (**400** in words) |
 | GET · PUT · DELETE | `…/vault/policy/{id}` | P3-2a — one policy; `PUT {name, description?, text, rev}` replaces it from the revision read (**409** if it moved); a `guardrail:*` id is **400** for `PUT` and `DELETE` |
-| POST | `…/vault/simulate` | P3-2a — `{action: role:assume · secret:use, principal, resource, device: {os, tags, owner_id}, mode?, audience?, ttl_s?, approver_id?, with?, without?}` → `{decision, determining[{id, name, guardrail}], errors}`. Decides nothing for real; records nothing |
+| POST | `…/vault/simulate` | P3-2a — `{action: role:assume · secret:use, principal, resource, device: {os, tags, owner_id}, mode?, audience?, ttl_s?, approver_id?, with?, without?}` → `{decision, determining[{id, name, guardrail}], errors}`. Decides nothing for real; records nothing. Also `secret:list`, `net:socks`, `net:forward` and `ssh:run`, and (P3-9-1) `secret:connect`: `principal.user_id` must be the device's `owner_id`, with no `mode` ([vault.md](vault.md) §7) |
 | POST | `…/vault/simulate/replay` | P3-2b — `{with?, without?, days?}` (1–7, default 7): the recorded Cedar decisions of those days, each decided again from the request it recorded → `{days, replayed, unreadable, flipped, flips[{at, action, op, user_id, target, session_id, device_id, was, now, determining}], truncated}`. Decides nothing for real; records nothing |
 
 ### Observability

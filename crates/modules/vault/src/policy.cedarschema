@@ -96,6 +96,25 @@ namespace Roomler {
     },
   };
 
+  // P3-9-1 — a PERSON using a secret through an endpoint their device serves
+  // them (`roomler connect`): always as a proxy, toward `audience`, the
+  // upstream the endpoint signs in to, for `ttl_s`, from `device`, whose
+  // owner the person is — its row says so, never the request. A person's own
+  // action: `secret:use` is a session's, so no policy written for sessions
+  // admits a person, and only a permit that names this action does.
+  // `approval` is never given yet (decision 24): a policy that asks for one
+  // is refused `approval_unavailable`, since a person has nobody to say yes.
+  action "secret:connect" appliesTo {
+    principal: [User],
+    resource: [Secret],
+    context: {
+      audience: String,
+      ttl_s: Long,
+      device: Device,
+      approval?: Approval,
+    },
+  };
+
   // P3-7 — a session opening a SOCKS5 listener on the device it runs on,
   // its flows exiting through `resource`: to whatever destination the
   // tunnel policies allow there. Nothing implies it.

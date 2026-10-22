@@ -1628,6 +1628,39 @@ pub enum ClientMsg {
         ttl_secs: u32,
     },
 
+    /// FR-90 P3-9-1 — a PERSON on this device asks for one field of a secret,
+    /// for an endpoint the device serves them (`roomler connect`): always in
+    /// `proxy` mode, toward `audience`, the upstream the endpoint signs in to.
+    /// One frame per field, as a session's `vault_connect` asks its leases.
+    /// Decided by Cedar's `secret:connect` for the device's OWNER, and
+    /// answered as a lease is, with [`ServerMsg::VaultLeased`] or
+    /// [`ServerMsg::VaultRefused`], naming `req_id`.
+    ///
+    /// ⚠️ It names no session and no person: the principal is the device's
+    /// owner as its ROW holds it, never as a frame says, so a device can ask
+    /// for what its owner may and for nobody else. It is a frame of its own,
+    /// never [`ClientMsg::VaultLease`] with the session left out, whose every
+    /// field is believed against a session's record.
+    #[serde(rename = "rc:vault.connect")]
+    VaultConnect {
+        req_id: String,
+        /// The secret, by its path or its RRN (`rrn:{org}:secret:{path}`).
+        secret: String,
+        /// The field; empty or absent = `value`, a static secret's one field.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        field: String,
+        /// The upstream the endpoint presents the value to, exactly as the
+        /// secret's `audiences` names it: a policy's `context.audience`.
+        /// Absent reads as empty, which the vault refuses `bad_request`: a
+        /// frame the server cannot decode is never answered, and the device
+        /// would wait on it.
+        #[serde(default)]
+        audience: String,
+        /// How long the person wants it, in seconds. The vault clamps it to a
+        /// lease's bounds ([`crate::vault::lease_limits`]).
+        ttl_secs: u32,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2564,6 +2597,7 @@ impl ClientMsg {
             ClientMsg::VaultActivity { .. } => "rc:vault.activity",
             ClientMsg::VaultNet { .. } => "rc:vault.net",
             ClientMsg::VaultSsh { .. } => "rc:vault.ssh",
+            ClientMsg::VaultConnect { .. } => "rc:vault.connect",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2690,7 +2724,8 @@ impl ClientMsg {
             | ClientMsg::VaultDescribe { .. }
             | ClientMsg::VaultActivity { .. }
             | ClientMsg::VaultNet { .. }
-            | ClientMsg::VaultSsh { .. } => Owner::Vault,
+            | ClientMsg::VaultSsh { .. }
+            | ClientMsg::VaultConnect { .. } => Owner::Vault,
         }
     }
 }
@@ -2742,6 +2777,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.activity", Owner::Vault),
     ("rc:vault.net", Owner::Vault),
     ("rc:vault.ssh", Owner::Vault),
+    ("rc:vault.connect", Owner::Vault),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -5724,6 +5760,67 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<ServerMsg>(v).unwrap(),
             ServerMsg::VaultSshGranted { ref account, .. } if account == "console_user"
+        ));
+    }
+
+    /// FR-90 P3-9-1 — a person's ask for one field, as it crosses the wire: no
+    /// session and no person in it, a `value` field left out, and the ask the
+    /// vault's. A lease's frame with its session left out is no such ask: it
+    /// does not decode at all, so a request with no session never reaches the
+    /// path that believes one.
+    #[test]
+    fn vault_connect_wire_shape_is_locked() {
+        let ask = ClientMsg::VaultConnect {
+            req_id: "c1".into(),
+            secret: "db/orders".into(),
+            field: "password".into(),
+            audience: "db.internal:5432".into(),
+            ttl_secs: 600,
+        };
+        let v = serde_json::to_value(&ask).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "t": "rc:vault.connect", "req_id": "c1", "secret": "db/orders",
+                "field": "password", "audience": "db.internal:5432",
+                "ttl_secs": 600,
+            })
+        );
+        let back: ClientMsg = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::VaultConnect { ref field, ttl_secs: 600, .. } if field == "password"
+        ));
+        assert_eq!(back.namespace(), Owner::Vault);
+
+        let value = ClientMsg::VaultConnect {
+            req_id: "c2".into(),
+            secret: "api/billing".into(),
+            field: String::new(),
+            audience: "api.internal:443".into(),
+            ttl_secs: 60,
+        };
+        let v = serde_json::to_value(&value).unwrap();
+        assert!(v.get("field").is_none(), "{v}");
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(v).unwrap(),
+            ClientMsg::VaultConnect { ref field, .. } if field.is_empty()
+        ));
+
+        let sessionless = serde_json::json!({
+            "t": "rc:vault.lease", "req_id": "c3", "fence": 1, "secret": "db/orders",
+            "mode": "proxy", "audience": "db.internal:5432", "ttl_secs": 60,
+        });
+        assert!(serde_json::from_value::<ClientMsg>(sessionless).is_err());
+
+        // An ask that names no upstream still decodes, so the vault can answer
+        // it (`bad_request`) rather than leave the device waiting.
+        let nowhere = serde_json::json!({
+            "t": "rc:vault.connect", "req_id": "c4", "secret": "db/orders", "ttl_secs": 60,
+        });
+        assert!(matches!(
+            serde_json::from_value::<ClientMsg>(nowhere).unwrap(),
+            ClientMsg::VaultConnect { ref audience, .. } if audience.is_empty()
         ));
     }
 

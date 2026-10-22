@@ -11,7 +11,12 @@
 //! | the secret was disabled, or deleted | the change | at once on the device's pod, else at that pod's sweep |
 //! | the device's vault key changed (its daemon restarted) | its next hello | at that hello |
 //! | the device is being removed | `agent_removed`, before its row and socket go | at once |
-//! | the organization is no longer served | the device's pod, at its sweep or hello | at that sweep |
+//! | the organization is no longer served, or (P3-9-1) a person's lease and the vault no longer lends to its people | the device's pod, at its sweep or hello | at that sweep |
+//! | P3-9-1 — a person's lease, and the device's row names another owner, or its owner is no longer a member | the device's pod, at its sweep or hello | at that sweep |
+//!
+//! A person's lease (`roomler connect`, [`crate::connect`]) names no
+//! session: it stands on its owner instead, and on everything else a
+//! session's lease stands on.
 //!
 //! Each pod looks after the devices CONNECTED TO IT: it holds their
 //! connections (the lease socket's lifecycle) and sweeps those holding live
@@ -196,13 +201,28 @@ pub struct SecretStanding {
     pub changed: bool,
 }
 
+/// P3-9-1 — the owner a person's lease stands on, as the device's row and
+/// the organization's members hold them now.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerStanding {
+    /// The owner the device's row names.
+    pub id: ObjectId,
+    /// Whether they are a member of the organization.
+    pub member: bool,
+}
+
 /// What a lease is checked against, read by the caller; `None` = gone.
 #[derive(Debug, Clone, Copy)]
 pub struct Standing<'a> {
+    /// The vault serves the organization, and (P3-9-1) for a person's lease
+    /// lends to its people.
     pub served: bool,
     /// The device row's vault key.
     pub device_key: Option<&'a str>,
+    /// A session's lease: its session.
     pub session: Option<SessionStanding>,
+    /// P3-9-1 — a person's lease: its owner.
+    pub owner: Option<OwnerStanding>,
     pub secret: Option<SecretStanding>,
 }
 
@@ -212,6 +232,7 @@ impl<'a> Standing<'a> {
         served: bool,
         device: Option<&'a Agent>,
         session: Option<&AgentSession>,
+        owner: Option<OwnerStanding>,
         secret: Option<&VaultSecret>,
     ) -> Self {
         Self {
@@ -222,6 +243,7 @@ impl<'a> Standing<'a> {
                 fence: s.fence,
                 device: s.location.device_id,
             }),
+            owner,
             secret: secret.map(|s| SecretStanding {
                 deleted: s.deleted_at.is_some(),
                 disabled: s.disabled,
@@ -255,11 +277,22 @@ pub fn verdict(lease: &VaultLease, s: &Standing<'_>) -> Option<RevokeReason> {
     if key != lease.sealed_to {
         return Some(RevokeReason::KeyChanged);
     }
-    let Some(session) = s.session.filter(|x| leasable(x.status)) else {
-        return Some(RevokeReason::SessionEnded);
-    };
-    if session.fence != lease.fence || session.device != lease.device_id {
-        return Some(RevokeReason::SessionMoved);
+    if lease.session_id.is_some() {
+        let Some(session) = s.session.filter(|x| leasable(x.status)) else {
+            return Some(RevokeReason::SessionEnded);
+        };
+        if session.fence != lease.fence || session.device != lease.device_id {
+            return Some(RevokeReason::SessionMoved);
+        }
+    } else {
+        // P3-9-1 — a person's lease: decided for the owner the device's row
+        // named, who must still be the one it names, and still a member.
+        let Some(owner) = s.owner.filter(|o| o.id == lease.owner_id) else {
+            return Some(RevokeReason::OwnerChanged);
+        };
+        if !owner.member {
+            return Some(RevokeReason::OwnerNotMember);
+        }
     }
     let Some(secret) = s.secret.filter(|x| !x.deleted) else {
         return Some(RevokeReason::SecretDeleted);
@@ -282,7 +315,13 @@ async fn record(state: &VaultState, lease: &VaultLease, why: RevokeReason) {
         tenant_id: lease.tenant_id,
         principal: "vault".into(),
         user_id: lease.owner_id,
-        action: policy::ACTION_USE.into(),
+        // P3-9-1 — the action the lease was decided under: a lease with no
+        // session is a person's.
+        action: match lease.session_id {
+            Some(_) => policy::ACTION_USE,
+            None => policy::ACTION_CONNECT,
+        }
+        .into(),
         op: "revoke".into(),
         decision: "revoke".into(),
         reason: why.wire().into(),
@@ -291,7 +330,7 @@ async fn record(state: &VaultState, lease: &VaultLease, why: RevokeReason) {
         field: Some(lease.field.clone()),
         n: Some(lease.n),
         target: Some(format!("lease:{}", id.to_hex())),
-        session_id: Some(lease.session_id),
+        session_id: lease.session_id,
         device_id: Some(lease.device_id),
         request: None,
         at: DateTime::now(),
@@ -342,31 +381,57 @@ pub async fn check_device(state: &VaultState, device: ObjectId) -> Result<bool, 
         .is_some_and(|a| a.capabilities.has_rpc(RpcCap::Vault) && !a.vault_key.is_empty());
     state.revoker.set_capable(device, capable);
     let served = state.scope.serves(tenant);
+    // P3-9-1 — and a person's lease, only while the vault lends to the
+    // organization's people.
+    let people_served = served && state.people.serves(tenant);
     let mut sessions: HashMap<ObjectId, Option<AgentSession>> = HashMap::new();
     let mut secrets: HashMap<ObjectId, Option<VaultSecret>> = HashMap::new();
+    // P3-9-1 — the owner a person's lease stands on, read once per check and
+    // only when one is live.
+    let mut owner: Option<Option<OwnerStanding>> = None;
     let mut live = false;
     for lease in leases.iter_mut().filter(|l| l.revoked_at.is_none()) {
-        if let Entry::Vacant(slot) = sessions.entry(lease.session_id) {
-            slot.insert(
-                match state
-                    .sessions
-                    .find_in_tenant(tenant, lease.session_id)
-                    .await
-                {
-                    Ok(s) => Some(s),
-                    Err(DaoError::NotFound) => None,
-                    Err(e) => return Err(e),
-                },
-            );
-        }
+        let session = match lease.session_id {
+            Some(sid) => {
+                if let Entry::Vacant(slot) = sessions.entry(sid) {
+                    slot.insert(match state.sessions.find_in_tenant(tenant, sid).await {
+                        Ok(s) => Some(s),
+                        Err(DaoError::NotFound) => None,
+                        Err(e) => return Err(e),
+                    });
+                }
+                sessions[&sid].as_ref()
+            }
+            None => None,
+        };
+        let standing_owner = match (lease.session_id, owner) {
+            (Some(_), _) => None,
+            (None, Some(known)) => known,
+            (None, None) => {
+                let known = match row.as_ref() {
+                    Some(a) => Some(OwnerStanding {
+                        id: a.owner_user_id,
+                        member: state.tenants.is_member(tenant, a.owner_user_id).await?,
+                    }),
+                    None => None,
+                };
+                owner = Some(known);
+                known
+            }
+        };
         if let Entry::Vacant(slot) = secrets.entry(lease.secret_id) {
             slot.insert(state.secrets.find_any(tenant, lease.secret_id).await?);
         }
         let standing = Standing::of(
             lease,
-            served,
+            if lease.session_id.is_some() {
+                served
+            } else {
+                people_served
+            },
             row.as_ref(),
-            sessions[&lease.session_id].as_ref(),
+            session,
+            standing_owner,
             secrets[&lease.secret_id].as_ref(),
         );
         let why = verdict(lease, &standing);
@@ -544,7 +609,7 @@ mod tests {
             field: "value".into(),
             n: 3,
             bundle: None,
-            session_id: ObjectId::new(),
+            session_id: Some(ObjectId::new()),
             fence: 2,
             device_id: ObjectId::new(),
             owner_id: ObjectId::new(),
@@ -567,6 +632,7 @@ mod tests {
                 fence: l.fence,
                 device: l.device_id,
             }),
+            owner: None,
             secret: Some(SecretStanding {
                 deleted: false,
                 disabled: false,
@@ -695,6 +761,88 @@ mod tests {
             let want = (!stands).then_some(RevokeReason::SessionEnded);
             assert_eq!(verdict(&l, &s), want, "{status:?}");
         }
+    }
+
+    /// P3-9-1 — a person's lease names no session and stands on its owner:
+    /// the one the device's row names, still a member. No session is read
+    /// for it, and a session's lease never reads an owner.
+    #[test]
+    fn a_persons_lease_stands_on_its_owner() {
+        let l = VaultLease {
+            session_id: None,
+            fence: 0,
+            mode: "proxy".into(),
+            ..lease()
+        };
+        let owner = OwnerStanding {
+            id: l.owner_id,
+            member: true,
+        };
+        let ok = Standing {
+            session: None,
+            owner: Some(owner),
+            ..standing(&l)
+        };
+        assert_eq!(verdict(&l, &ok), None);
+        for (s, want) in [
+            (
+                Standing {
+                    owner: Some(OwnerStanding {
+                        id: ObjectId::new(),
+                        ..owner
+                    }),
+                    ..ok
+                },
+                RevokeReason::OwnerChanged,
+            ),
+            (Standing { owner: None, ..ok }, RevokeReason::OwnerChanged),
+            (
+                Standing {
+                    owner: Some(OwnerStanding {
+                        member: false,
+                        ..owner
+                    }),
+                    ..ok
+                },
+                RevokeReason::OwnerNotMember,
+            ),
+            (
+                Standing {
+                    served: false,
+                    ..ok
+                },
+                RevokeReason::NotServed,
+            ),
+            (
+                Standing {
+                    device_key: Some("ANOTHER"),
+                    ..ok
+                },
+                RevokeReason::KeyChanged,
+            ),
+            (
+                Standing {
+                    secret: Some(SecretStanding {
+                        changed: true,
+                        ..ok.secret.unwrap()
+                    }),
+                    ..ok
+                },
+                RevokeReason::ValueChanged,
+            ),
+        ] {
+            assert_eq!(verdict(&l, &s), Some(want), "{s:?}");
+        }
+        // A session's lease is a session's whatever an owner reads.
+        let session_lease = lease();
+        let moved_owner = Standing {
+            owner: Some(OwnerStanding {
+                id: ObjectId::new(),
+                member: false,
+            }),
+            ..standing(&session_lease)
+        };
+        assert_eq!(verdict(&session_lease, &moved_owner), None);
     }
 
     /// A device's connection is forgotten only by itself: the close of a
