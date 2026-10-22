@@ -241,6 +241,8 @@ fn a_runs_placeholders_are_its_own_and_go_with_it() {
             lease_id: format!("L-{token}"),
             host: host.into(),
             port,
+            secret: "s".into(),
+            field: "f".into(),
         });
     };
     put(s, "t1", "api.github.com", 443);
@@ -286,6 +288,8 @@ fn a_binding_goes_with_its_lease_and_its_placeholders_others_stay() {
             lease_id: lease.into(),
             host: host.into(),
             port: 443,
+            secret: "s".into(),
+            field: "f".into(),
         });
     }
     forget((s, 1), "t", Some("L1"));

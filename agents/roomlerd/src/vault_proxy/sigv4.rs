@@ -2,9 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P3b-4-1 — AWS's Signature Version 4, as the daemon computes it: the
 //! canonical request, the string to sign, the signing key and the signature.
-//! No caller before P3b-4-2, where the session's egress proxy checks a
-//! signature made with a placeholder pair and signs the request again with
-//! the value (the FR-90 spec, §3e "P3b-4, AWS, as designed").
+//! Its caller is the session's egress proxy (P3b-4-2,
+//! `hive::egress::swap::aws`), which checks a signature made with a
+//! placeholder pair and signs the request again with the value (the FR-90
+//! spec, §3e "P3b-4, AWS, as designed").
 //!
 //! | Step | Rule |
 //! |---|---|

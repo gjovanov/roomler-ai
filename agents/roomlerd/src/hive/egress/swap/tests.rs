@@ -34,11 +34,14 @@ const H1: &[&[u8]] = &[b"h2", b"http/1.1"];
 /// One request, as the audience was sent it.
 #[derive(Debug, Clone)]
 struct Seen {
+    method: Method,
     target: String,
     host: String,
     authorization: Vec<String>,
     api_key: Option<String>,
     agent: Option<String>,
+    /// Every header, as AWS would read them (P3b-4-2).
+    headers: HeaderMap,
     body: String,
 }
 
@@ -138,6 +141,7 @@ async fn answered(
             .map(str::to_string)
     };
     lock(seen).push(Seen {
+        method: parts.method.clone(),
         target: parts.uri.to_string(),
         host: named("host").unwrap_or_default(),
         authorization: parts
@@ -149,6 +153,7 @@ async fn answered(
             .collect(),
         api_key: named("x-api-key"),
         agent: named("user-agent"),
+        headers: parts.headers.clone(),
         body: String::from_utf8_lossy(&body).into_owned(),
     });
     let mut resp = Response::new(Full::new(Bytes::from_static(b"from the audience")));
@@ -232,6 +237,13 @@ impl Rig {
         lock(&self.leases.0).insert(format!("test-lease-{token}"), value.to_vec());
         token
     }
+
+    /// [`Self::hold`], for `secret`'s `field` (P3b-4-2).
+    fn hold_as(&self, host: &str, secret: &str, field: &str, value: &[u8]) -> String {
+        let token = placeholder::bind_as_for_test(self.run.0, self.run.1, host, 443, secret, field);
+        lock(&self.leases.0).insert(format!("test-lease-{token}"), value.to_vec());
+        token
+    }
 }
 
 impl Drop for Rig {
@@ -242,7 +254,7 @@ impl Drop for Rig {
 }
 
 /// The status line of an answer, read to its blank line.
-async fn status_line(tcp: &mut TcpStream) -> String {
+async fn status_line<S: AsyncRead + Unpin>(tcp: &mut S) -> String {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
@@ -440,7 +452,8 @@ async fn a_placeholder_anywhere_but_authorization_goes_out_as_itself() {
 }
 
 /// Another audience's placeholder goes out as itself on this one's
-/// connection, and an AWS signature goes out as it is: P3b-4 signs again.
+/// connection, in an AWS signature too: one naming none of this audience's
+/// goes out as it is (one naming one is signed again: [`aws`]'s tests).
 #[tokio::test]
 async fn another_audiences_placeholder_goes_out_as_itself() {
     let audience = Audience::start(false).await;
@@ -457,13 +470,13 @@ async fn another_audiences_placeholder_goes_out_as_itself() {
     )
     .await;
     let aws = format!(
-        "AWS4-HMAC-SHA256 Credential={mine}/20261022/us-east-1/s3/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={theirs}/20261022/us-east-1/s3/aws4_request, \
          SignedHeaders=host, Signature=00"
     );
     ask(&mut send, get("/b", HOST, Some(&aws))).await;
     let seen = audience.seen();
     assert_eq!(seen[0].authorization, [format!("x mine {theirs}")]);
-    assert_eq!(seen[1].authorization, [aws], "P3b-4's");
+    assert_eq!(seen[1].authorization, [aws], "as it is");
 }
 
 /// A host the run holds no placeholder for is carried as it comes: the
@@ -724,6 +737,8 @@ fn basic_credentials_are_decoded_swapped_and_encoded_again() {
         lease_id: "l1".into(),
         host: HOST.into(),
         port: 443,
+        secret: "s".into(),
+        field: "f".into(),
     }];
     let held = |lease: &str| (lease == "l1").then(|| Zeroizing::new(b"v@lue".to_vec()));
     let header = |s: String| HeaderValue::from_str(&s).unwrap();
@@ -868,3 +883,6 @@ async fn a_hello_is_read_whole_and_kept_as_it_came() {
     assert_eq!(read.bytes, plain);
     assert_eq!(read.asks, None);
 }
+
+/// FR-90 P3b-4-2 — AWS's signature signed again, on this rig.
+mod aws;
