@@ -466,6 +466,10 @@ pub mod providers {
         /// the issuer's fields to it, and they stay in daemon memory, as a
         /// `proxy` value does.
         Device,
+        /// FR-90 P3-6e-1 — nowhere in this build: a provider declared ahead
+        /// of its minter. Its secrets are written and checked as any
+        /// provider's, and its leases are refused until a minter serves it.
+        Nowhere,
     }
 
     /// One provider: its name, its issuer's fields, its credential's.
@@ -530,8 +534,32 @@ pub mod providers {
         mints_on: MintsOn::Device,
     };
 
+    /// FR-90 P3-6e-1 — an AWS role's credentials, minted for the lease by
+    /// `AssumeRole` with the issuer's key: an IAM user's, which may assume
+    /// `role_arn` (`external_id` where its trust policy asks for one). Its
+    /// one audience is the region's STS endpoint. Minted nowhere yet: where
+    /// is decision 21's, and P3-6e-2's minter.
+    pub const AWS_STS: Provider = Provider {
+        name: "aws_sts",
+        issuer: &[
+            "access_key_id",
+            "secret_access_key",
+            "role_arn",
+            "region",
+            "external_id",
+        ],
+        required: &["access_key_id", "secret_access_key", "role_arn", "region"],
+        minted: &[
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "region",
+        ],
+        mints_on: MintsOn::Nowhere,
+    };
+
     /// Every provider this build knows.
-    pub const ALL: &[Provider] = &[POSTGRES, MYSQL, KUBERNETES];
+    pub const ALL: &[Provider] = &[POSTGRES, MYSQL, KUBERNETES, AWS_STS];
 
     /// The provider a secret names. `None` for a name this build cannot
     /// name, which nothing mints for.
@@ -765,7 +793,7 @@ mod tests {
     fn a_providers_names_are_locked() {
         use providers::*;
         let names: Vec<&str> = ALL.iter().map(|p| p.name).collect();
-        assert_eq!(names, ["postgres", "mysql", "kubernetes"]);
+        assert_eq!(names, ["postgres", "mysql", "kubernetes", "aws_sts"]);
         for p in [POSTGRES, MYSQL] {
             assert_eq!(
                 (p.issuer, p.required, p.minted),
@@ -797,12 +825,37 @@ mod tests {
             )
         );
         assert_eq!(KUBERNETES.mints_on, MintsOn::Device);
+        // P3-6e-1 — the names P3-6e gives AWS's fields, which a session's
+        // placeholder pair is found by too (decision 33); minted nowhere yet.
+        assert_eq!(
+            (AWS_STS.issuer, AWS_STS.required, AWS_STS.minted),
+            (
+                &[
+                    "access_key_id",
+                    "secret_access_key",
+                    "role_arn",
+                    "region",
+                    "external_id"
+                ][..],
+                &["access_key_id", "secret_access_key", "role_arn", "region"][..],
+                &[
+                    "access_key_id",
+                    "secret_access_key",
+                    "session_token",
+                    "region"
+                ][..],
+            )
+        );
+        assert_eq!(AWS_STS.mints_on, MintsOn::Nowhere);
         assert_eq!(named("postgres"), Some(&POSTGRES));
         assert_eq!(named("mysql"), Some(&MYSQL));
         assert_eq!(named("kubernetes"), Some(&KUBERNETES));
+        assert_eq!(named("aws_sts"), Some(&AWS_STS));
         assert_eq!(named("Postgres"), None, "one spelling");
         assert_eq!(named("k8s"), None, "one spelling");
         assert_eq!(named("MySQL"), None, "one spelling");
+        assert_eq!(named("sts"), None, "one spelling");
+        assert_eq!(named("aws-sts"), None, "one spelling");
         assert_eq!(
             named("mssql"),
             None,

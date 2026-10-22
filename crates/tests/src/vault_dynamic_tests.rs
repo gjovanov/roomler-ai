@@ -359,3 +359,87 @@ async fn a_dynamic_secret_is_declared_with_its_provider_and_one_audience() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400, "it keeps one audience");
 }
+
+/// FR-90 P3-6e-1 — an `aws_sts` issuer is declared with its region's STS
+/// endpoint as its one audience, holds its issuer's fields alone, keeps an
+/// STS endpoint on every change, and is refused at every lease, recorded
+/// with why: nothing in this build mints it (decision 21 says where).
+#[tokio::test]
+async fn an_aws_sts_issuer_is_declared_and_held_and_leased_by_no_minter_yet() {
+    let app = lease_app().await;
+    let t = app.seed_tenant("vaultsts").await;
+    seed_vault(&app, &t).await;
+    for (audience, why) in [
+        ("https://sts.amazonaws.com", "the global endpoint"),
+        ("https://sts.eu-central-1.amazonaws.com:443", "a port"),
+        ("https://sts.cn-north-1.amazonaws.com", "another partition"),
+        ("sts.eu-central-1.amazonaws.com", "a bare host"),
+    ] {
+        let (code, answer) = post(
+            &app,
+            &t,
+            "/vault/secret",
+            json!({ "path": "aws/bad", "kind": "dynamic", "provider": "aws_sts",
+                    "audiences": [audience] }),
+        )
+        .await;
+        assert_eq!(code, 400, "{why}: {answer}");
+    }
+    let (code, body) = post(
+        &app,
+        &t,
+        "/vault/secret",
+        json!({ "path": "db/dyn", "kind": "dynamic", "provider": "aws_sts",
+                "audiences": ["https://sts.eu-central-1.amazonaws.com"] }),
+    )
+    .await;
+    assert_eq!(code, 201, "{body}");
+    assert_eq!(body["provider"], "aws_sts", "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    // The issuer's fields, made here: none is a key AWS ever saw.
+    let made = |what: &str| format!("{what}-{}", bson::oid::ObjectId::new().to_hex());
+    for (field, value) in [
+        ("access_key_id", made("id")),
+        ("secret_access_key", made("key")),
+        (
+            "role_arn",
+            "arn:aws:iam::000000000000:role/roomler-test".to_string(),
+        ),
+        ("region", "eu-central-1".to_string()),
+        ("external_id", made("ext")),
+    ] {
+        assert_eq!(put(&app, &t, &id, field, &value).await, 200, "{field}");
+    }
+    // The minted credential's own field is not the issuer's to hold.
+    assert_eq!(put(&app, &t, &id, "session_token", "x").await, 400);
+    let patch = |audience: &'static str| {
+        app.client
+            .patch(app.url(&format!("/api/tenant/{}/vault/secret/{id}", t.tenant_id)))
+            .header("Authorization", format!("Bearer {}", t.admin.access_token))
+            .json(&json!({ "audiences": [audience] }))
+            .send()
+    };
+    let status = |r: reqwest::Response| r.status().as_u16();
+    assert_eq!(status(patch("https://evil.example").await.unwrap()), 400);
+    assert_eq!(
+        status(patch("https://sts.us-east-1.amazonaws.com").await.unwrap()),
+        200,
+        "another region's STS endpoint"
+    );
+    let mut dev = device(&app, &t, "sts-dev", "linux", TAKES_LEASES, true).await;
+    let (sid, fence) = start(&app, &t, &mut dev, "/srv/sts", Some("dev")).await;
+    assert_eq!(
+        refused(&ask(&mut dev, "s-1", short_lived(&sid, fence)).await),
+        "not_served"
+    );
+    let reasons: Vec<String> = rows(&app, "vault_audit", doc! { "decision": "deny" })
+        .await
+        .iter()
+        .map(|r| r.get_str("reason").unwrap().to_string())
+        .collect();
+    assert_eq!(reasons, ["provider_has_no_minter"]);
+    assert!(
+        rows(&app, "vault_leases", doc! {}).await.is_empty(),
+        "nothing released"
+    );
+}

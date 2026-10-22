@@ -88,13 +88,47 @@ pub fn check_issuer_field(p: &Provider, field: &str) -> Result<(), String> {
     }
 }
 
-/// A dynamic secret names exactly one audience: where its provider mints.
-pub fn check_audiences(audiences: &[String]) -> Result<(), String> {
-    if audiences.len() == 1 {
-        Ok(())
-    } else {
-        Err("a dynamic secret names exactly one audience, where its provider mints".into())
+/// A dynamic secret names exactly one audience: where its provider mints;
+/// (P3-6e-1) for `aws_sts`, its region's STS endpoint and nothing else. A
+/// provider this build cannot name is held to the one audience alone.
+pub fn check_audiences(p: Option<&Provider>, audiences: &[String]) -> Result<(), String> {
+    let [audience] = audiences else {
+        return Err("a dynamic secret names exactly one audience, where its provider mints".into());
+    };
+    if p.is_some_and(|p| p.name == providers::AWS_STS.name) && sts_region(audience).is_none() {
+        return Err(format!(
+            "an aws_sts secret's audience is its region's STS endpoint, \
+             https://sts.<region>.amazonaws.com, in the aws partition: not {audience}"
+        ));
     }
+    Ok(())
+}
+
+/// P3-6e-1 — the region an STS endpoint names: `https://sts.<region>.amazonaws.com`,
+/// exactly, its region in the `aws` partition. `None` for anything else: a
+/// port, a path, another case, the global endpoint, another partition.
+pub fn sts_region(audience: &str) -> Option<&str> {
+    let region = audience
+        .strip_prefix("https://sts.")?
+        .strip_suffix(".amazonaws.com")?;
+    region_ok(region).then_some(region)
+}
+
+/// An AWS region's name in the `aws` partition, as `eu-central-1`: two
+/// letters, a word, a number. China's (`cn-`) and GovCloud's (`us-gov-`)
+/// are other partitions, which P3-6e does not serve.
+fn region_ok(region: &str) -> bool {
+    let parts: Vec<&str> = region.split('-').collect();
+    let [area, place, n] = parts[..] else {
+        return false;
+    };
+    let lower = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase());
+    area.len() == 2
+        && lower(area)
+        && area != "cn"
+        && lower(place)
+        && (1..=2).contains(&n.len())
+        && n.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The issuer's fields that hold a value, each at its current version: what
@@ -210,9 +244,52 @@ mod tests {
 
     #[test]
     fn a_dynamic_secret_names_one_audience() {
-        assert!(check_audiences(&[]).is_err());
-        assert_eq!(check_audiences(&["db.internal:5432".into()]), Ok(()));
-        assert!(check_audiences(&["a:5432".into(), "b:5432".into()]).is_err());
+        for p in [Some(&POSTGRES), None] {
+            assert!(check_audiences(p, &[]).is_err());
+            assert_eq!(check_audiences(p, &["db.internal:5432".into()]), Ok(()));
+            assert!(check_audiences(p, &["a:5432".into(), "b:5432".into()]).is_err());
+        }
+    }
+
+    /// P3-6e-1 — an `aws_sts` secret's one audience is its region's STS
+    /// endpoint, exactly, in the `aws` partition; any other provider's is
+    /// not held to that shape.
+    #[test]
+    fn an_aws_sts_secrets_audience_is_its_regions_sts_endpoint() {
+        use providers::AWS_STS;
+        for (audience, region) in [
+            ("https://sts.eu-central-1.amazonaws.com", "eu-central-1"),
+            ("https://sts.us-east-1.amazonaws.com", "us-east-1"),
+            ("https://sts.ap-southeast-2.amazonaws.com", "ap-southeast-2"),
+            ("https://sts.me-central-1.amazonaws.com", "me-central-1"),
+        ] {
+            assert_eq!(sts_region(audience), Some(region));
+            assert_eq!(check_audiences(Some(&AWS_STS), &[audience.into()]), Ok(()));
+        }
+        for audience in [
+            "https://sts.amazonaws.com",
+            "https://sts.eu-central-1.amazonaws.com:443",
+            "https://sts.eu-central-1.amazonaws.com/",
+            "https://STS.eu-central-1.amazonaws.com",
+            "https://sts.EU-central-1.amazonaws.com",
+            "http://sts.eu-central-1.amazonaws.com",
+            "sts.eu-central-1.amazonaws.com",
+            "https://sts.cn-north-1.amazonaws.com",
+            "https://sts.us-gov-west-1.amazonaws.com",
+            "https://sts.eu-central-1.amazonaws.com.evil.example",
+            "https://sts.eu-central.amazonaws.com",
+            "https://sts.eu-central-123.amazonaws.com",
+            "https://iam.amazonaws.com",
+        ] {
+            assert_eq!(sts_region(audience), None, "{audience}");
+            let refused = check_audiences(Some(&AWS_STS), &[audience.into()]).unwrap_err();
+            assert!(refused.contains("STS endpoint"), "{audience}: {refused}");
+        }
+        assert_eq!(
+            check_audiences(Some(&POSTGRES), &["https://sts.amazonaws.com".into()]),
+            Ok(()),
+            "another provider's audience is not held to it"
+        );
     }
 
     #[test]

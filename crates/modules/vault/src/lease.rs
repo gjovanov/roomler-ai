@@ -58,7 +58,10 @@ use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
 use roomler_ai_remote_control::{
     models::{Agent, OsKind, RpcCap},
     signaling::{ClientMsg, ServerMsg},
-    vault::{LeaseRefusal, VaultActivityKind, lease_limits, program_name_ok, providers::Provider},
+    vault::{
+        LeaseRefusal, VaultActivityKind, lease_limits, program_name_ok,
+        providers::{MintsOn, Provider},
+    },
 };
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
@@ -1218,8 +1221,8 @@ enum Leasing<'a> {
 
 /// P3-6b — a dynamic secret's lease, before any policy reads it: the secret
 /// as a whole, since a field named is no session's to have; a provider this
-/// build knows and the vault serves; the one audience it mints toward; and
-/// every field no mint can do without.
+/// build knows, the vault serves and (P3-6e-1) a minter serves; the one
+/// audience it mints toward; and every field no mint can do without.
 async fn bundle_for<'a>(
     state: &VaultState,
     rec: &Record<'_>,
@@ -1237,6 +1240,13 @@ async fn bundle_for<'a>(
     if !state.providers.serves(provider) {
         return Err(rec
             .refuse(LeaseRefusal::NotServed, "provider_not_served")
+            .await);
+    }
+    // P3-6e-1 — a provider declared ahead of its minter: nothing in this
+    // build mints for it, so nothing is released.
+    if provider.mints_on == MintsOn::Nowhere {
+        return Err(rec
+            .refuse(LeaseRefusal::NotServed, "provider_has_no_minter")
             .await);
     }
     let [audience] = secret.audiences.as_slice() else {
