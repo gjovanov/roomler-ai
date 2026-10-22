@@ -14,9 +14,9 @@
 //! | the answer | `env`: each name's placeholder; the audience; `ttl_s`, what its shortest lease has left; and a note |
 //! | the run's placeholders | each with its lease and its audience's host and port: what the proxy swaps. One goes when its lease is let go (its expiry, `rc:vault.revoke`, the run's end), all when the run ends. At most [`MAX_PER_RUN`] at once |
 //!
-//! ⚠️ No caller yet: P3b-3c offers the tool, once the proxy swaps a
-//! placeholder in. Until then no session holds one, which would go out as
-//! itself.
+//! ⚠️ No caller yet: P3b-3c-2 offers the tool. The proxy swaps a
+//! placeholder in from P3b-3c-1 (`egress::swap`); until the tool, no session
+//! holds one.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -128,8 +128,8 @@ pub fn drop_run(session: ObjectId, fence: u64) -> bool {
 }
 
 /// A placeholder bound to the run with no lease behind it: for a test of
-/// what ends the run's (the supervisor's, which are Unix's).
-#[cfg(all(test, unix))]
+/// what ends the run's, and of the proxy's swap.
+#[cfg(test)]
 pub(crate) fn bind_for_test(session: ObjectId, fence: u64, host: &str, port: u16) -> String {
     let token = mint().unwrap();
     runs().entry((session, fence)).or_default().push(Bound {
@@ -289,7 +289,7 @@ pub(crate) fn parse(args: &Value) -> Result<PlaceholderRequest, String> {
 /// placeholder bound to the run and the audience, and the assignments to set.
 /// Every lease the call asked for itself is let go on any refusal.
 ///
-/// Called by no tool until P3b-3c offers it: only the tests call it, so the
+/// Called by no tool until P3b-3c-2 offers it: only the tests call it, so the
 /// build without them keeps it, and what it calls, all the same.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn call(

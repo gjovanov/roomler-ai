@@ -44,7 +44,7 @@ use zeroize::Zeroizing;
 
 use super::tls;
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type Body = BoxBody<Bytes, BoxError>;
 
 /// How long the upstream may take to accept a connection and finish TLS.
@@ -386,7 +386,7 @@ fn inbound(resp: Response<Incoming>, up: &Upstream) -> Response<Body> {
 /// Drop the hop-by-hop headers, and those `Connection` names: they are one
 /// leg's, never the next one's (RFC 9110 §7.6.1). `Proxy-Authorization`
 /// among them, so a client's never leaves.
-fn hop_by_hop(headers: &mut HeaderMap) {
+pub(crate) fn hop_by_hop(headers: &mut HeaderMap) {
     let named: Vec<HeaderName> = headers
         .get_all(header::CONNECTION)
         .iter()
@@ -441,7 +441,7 @@ fn point_back(location: &HeaderValue, up: &Upstream) -> Option<HeaderValue> {
 }
 
 /// The endpoint's own answer: `status`, and why, as plain text.
-fn answer(status: StatusCode, why: &str) -> Response<Body> {
+pub(crate) fn answer(status: StatusCode, why: &str) -> Response<Body> {
     let body = Full::new(Bytes::from(format!("{why}\n")))
         .map_err(|never| match never {})
         .boxed();
