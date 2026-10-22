@@ -874,7 +874,7 @@ again on one already there.
   unknown, and another session's directory stays closed, its own DACL granting only
   its account. The unit test runs as a restricted Medium copy of its own token, and
   fails on the old DACL
-  ([`supervisor.rs:12305`](../agents/roomlerd/src/hive/supervisor.rs#L12305)).
+  ([`supervisor.rs:12316`](../agents/roomlerd/src/hive/supervisor.rs#L12316)).
 
 ### macOS: the `/var` link
 

@@ -8039,8 +8039,19 @@ done
         );
         let bundle_file = run.join(super::super::egress::ca::BUNDLE_FILE);
         match super::super::egress::ca::bundle(&ca.pem()) {
-            Some(bundle) => {
-                assert_eq!(std::fs::read_to_string(&bundle_file).unwrap(), bundle);
+            Some(_) => {
+                // The system's roots, in whatever order the system gives them
+                // (a Mac's keychain gives another at each read), then the CA.
+                use tokio_rustls::rustls::pki_types::CertificateDer;
+                use tokio_rustls::rustls::pki_types::pem::PemObject;
+                let written = std::fs::read_to_string(&bundle_file).unwrap();
+                let certs: Vec<CertificateDer<'static>> =
+                    CertificateDer::pem_slice_iter(written.as_bytes())
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                let roots = rustls_native_certs::load_native_certs().certs;
+                assert_eq!(certs.len(), roots.len() + 1);
+                assert_eq!(certs.last(), Some(&ca.der()), "the CA, last");
                 assert_eq!(
                     settings["env"]["SSL_CERT_FILE"],
                     serde_json::json!(bundle_file.to_string_lossy())

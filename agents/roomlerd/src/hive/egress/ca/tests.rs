@@ -159,8 +159,21 @@ fn the_bundle_is_the_systems_roots_then_the_ca() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(certs.len(), roots.len() + 1);
-    assert_eq!(certs[..roots.len()], roots[..], "the system's, as read");
+    // The system's, in whatever order it gives them: a Mac's keychain gives
+    // them in another at each read.
+    assert_eq!(
+        sorted(&certs[..roots.len()]),
+        sorted(&roots),
+        "the system's"
+    );
     assert_eq!(certs.last(), Some(&ca.der()), "the CA, last");
+}
+
+/// `certs` in the order of their bytes.
+fn sorted(certs: &[CertificateDer<'static>]) -> Vec<CertificateDer<'static>> {
+    let mut out = certs.to_vec();
+    out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    out
 }
 
 /// A PEM block is its label's lines around base64 in lines of 64, and
