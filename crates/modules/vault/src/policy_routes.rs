@@ -35,9 +35,9 @@ use crate::VaultState;
 use crate::dao::{MAX_POLICIES, MAX_ROLES, is_name_taken};
 use crate::model::{VaultPolicy, VaultRole};
 use crate::policy::{
-    self, ACTION_ASSUME, ACTION_CONNECT, ACTION_LIST, ACTION_NET_FORWARD, ACTION_NET_SOCKS,
-    ACTION_SSH_RUN, ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS, MODES, NodeFacts,
-    OSES, OrgNames, SecretFacts, SessionFacts, Verdict,
+    self, ACTION_ASSUME, ACTION_CONNECT, ACTION_LIST, ACTION_NET_EGRESS, ACTION_NET_FORWARD,
+    ACTION_NET_SOCKS, ACTION_SSH_RUN, ACTION_USE, ACTIONS, Ask as Request, DeviceFacts, GUARDRAILS,
+    MODES, NodeFacts, OSES, OrgNames, SecretFacts, SessionFacts, Verdict,
 };
 use crate::routes::{
     Ask, check_description, decide, live_secret, member_tenant, org_slug, record_allow, rfc3339,
@@ -647,7 +647,8 @@ pub struct Simulate {
     pub ttl_s: Option<i64>,
     #[serde(default)]
     pub approver_id: Option<String>,
-    /// P3-7 — `net:forward`: the destination, through the node.
+    /// P3-7 — `net:forward`: the destination, through the node. P3b-1a —
+    /// `net:egress`: the host and port a command dials.
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -890,6 +891,44 @@ pub async fn simulate(
                     port,
                     device,
                 }
+            }
+        }
+        // P3b-1a — whether a session in a role, on that device, reaches
+        // `host:port` through its egress proxy: the host taken in its one
+        // spelling, as the vault decides a session's request.
+        ACTION_NET_EGRESS => {
+            let Some(raw) = &body.principal.owner_id else {
+                return Err(ApiError::BadRequest(
+                    "principal.owner_id is required".into(),
+                ));
+            };
+            let session_owner = parse_user(raw, "principal.owner_id")?;
+            let role = match &body.principal.role {
+                Some(r) => Some(known_role(r)?),
+                None => None,
+            };
+            let (Some(host), Some(port)) = (&body.host, body.port) else {
+                return Err(ApiError::BadRequest(
+                    "net:egress needs host and port".into(),
+                ));
+            };
+            let Some(host) = canonical_net_host(host).filter(|_| port != 0) else {
+                return Err(ApiError::BadRequest(
+                    "net:egress needs a host a command can dial (a DNS name or an address, \
+                     no port) and a port other than 0"
+                        .into(),
+                ));
+            };
+            Request::NetEgress {
+                session: SessionFacts {
+                    id: "simulated".into(),
+                    owner: session_owner,
+                    role,
+                    playbook: body.principal.playbook.clone(),
+                },
+                host,
+                port,
+                device,
             }
         }
         // P3-9-1 — whether a person, the device's owner, may use that secret
