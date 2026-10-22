@@ -6358,6 +6358,22 @@ async fn handle_server_msg(
                 debug!(%ticket_id, "rc:vault.ssh.granted ignored — this build asks for none");
             }
         }
+        // FR-90 P3b-1b-1 — the vault's allow for a session's egress proxy,
+        // the answer to this daemon's `rc:vault.egress`: the primary's only,
+        // as a lease is. No credential in it.
+        ServerMsg::VaultEgressAllowed { req_id, host, port } => {
+            #[cfg(feature = "vault")]
+            if ctx.is_primary {
+                crate::vault::on_egress_allowed(&req_id, &host, port);
+            } else {
+                debug!(%req_id, "rc:vault.egress.allowed on a secondary org's connection — dropped");
+            }
+            #[cfg(not(feature = "vault"))]
+            {
+                let _ = (host, port);
+                debug!(%req_id, "rc:vault.egress.allowed ignored — this build asks for none");
+            }
+        }
         // FR-52 P3c — an outsider's login, relayed by the server. Answered in
         // a task, not inline: the live config read waits on the config lock,
         // which `rc password set` holds across an Argon2 derivation, and the
