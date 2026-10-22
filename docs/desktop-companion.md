@@ -69,7 +69,7 @@ on one connection) and closes. Five things poll it at once in a running companio
 |---|---|---|---|
 | service status | `src/front/app.js:166` | 10 s | 0 (reads config, runs `roomlerd service status`) |
 | device view (`Status` + `Peers`) | `src/front/app.js:168` → `cmd_device_view`, `src/commands.rs:323` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:1818` | 2 s, visible only | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:1877` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:148` | 1.5 s | 1 |
 | consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
 
@@ -124,7 +124,7 @@ A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in
 under the config write lock and restarts its flow; an invalid replacement is refused and the
 old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
-service predates route editing"* (`src/commands.rs:1869`), never as a blank page.
+service predates route editing"* (`src/commands.rs:1928`), never as a blank page.
 
 ⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
@@ -379,7 +379,7 @@ sequenceDiagram
   ago (`RESTART_MIN_INTERVAL`, persisted next to the config, so it also bounds a loop across
   processes), and on the macOS supervisor a worker younger than 30 s.
 - **"Back" means a new process.** The companion waits for a different pid **and** start time
-  (`cmd_restart_wait`, `src/commands.rs:1456`) — the leaving process keeps answering for a
+  (`cmd_restart_wait`, `src/commands.rs:1515`) — the leaving process keeps answering for a
   moment, and Windows can hand the relaunched daemon the old pid.
 - ⚠️ **This is local only.** Remote configuration never restarts a daemon: a server push is
   persisted and reported as *applied-pending-restart*, and there is no server message that
@@ -761,7 +761,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1125`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1139`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -815,7 +815,7 @@ flowchart TD
 
 ## 14. Opening links: View screen and Open Roomler (#2713)
 
-**View screen** on the Devices page (`cmd_open_remote`, `src/commands.rs:1107`), **Open Roomler**
+**View screen** on the Devices page (`cmd_open_remote`, `src/commands.rs:1166`), **Open Roomler**
 on the Overview page and the tray all open a link through one function, `open_web_or_browser`
 (`src/commands.rs:976`):
 
@@ -823,7 +823,7 @@ on the Overview page and the tray all open a link through one function, `open_we
 |---|---|---|
 | Windows | the in-app WebView2 window (Chromium: the full viewer works), else the default browser | the browser fallback's error |
 | macOS | the default browser (`open`) | the shell's error |
-| Linux | **the app registered for the link's scheme**, through GIO (`open_in_browser`, `src/commands.rs:1022`) | a dialog and the button's error: *No web browser is set up on this computer…* |
+| Linux | **the app registered for the link's scheme**, through GIO, with an activation token that brings a running browser forward (`open_in_browser`, `src/commands.rs:1026`; §14.2) | a dialog and the button's error as its tooltip: *No web browser is set up on this computer…*, until the next success puts the button's own back (`src/front/devices.js:261`, #2729) |
 
 ⚠️ **Linux never uses `xdg-open` for this.** When no app claims a link's scheme, xdg-open (GNOME:
 `gio open`) falls back to the link's **content** type: it fetches the page, sees `text/html` and
@@ -837,7 +837,7 @@ flowchart TD
     S -->|none| E1[error: not a link]
     S -->|https| D{GIO: the default app<br/>for x-scheme-handler/https}
     D -->|none| E2[dialog + red button:<br/>no web browser is set up]
-    D -->|a browser| L[launch THAT app with the link]
+    D -->|a browser| L[launch THAT app with the link<br/>and an activation token, §14.2]
     X[xdg-open / gio open] -. would have .-> T[sniffed text/html:<br/>the text editor]
 ```
 
@@ -855,7 +855,7 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not: FR-27's consent launch, FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
-first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:711`). For a
+first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:724`). For a
 root daemon that is a transient **system** unit, which inherits nothing of the desktop; its
 environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`,
 `WAYLAND_DISPLAY`) and nothing else.
@@ -863,8 +863,8 @@ environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DI
 Since #2713 a root daemon reads the session user's systemd manager environment, the store the
 desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
 privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
-`companion.rs:791`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:739`;
-parsing in `session_env_pairs`, `companion.rs:765`):
+`companion.rs:804`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:752`;
+parsing in `session_env_pairs`, `companion.rs:778`):
 
 - ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
   runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
@@ -879,3 +879,82 @@ parsing in `session_env_pairs`, `companion.rs:765`):
   `XDG_CURRENT_DESKTOP`, and its `/proc/<pid>/cgroup` for which manager started it: a
   `system.slice/run-…service` is the daemon's launch, an `app-…` scope or service under
   `user@<uid>.service` is the desktop's.
+
+### 14.2 A browser that is already running comes forward (#2729)
+
+With the browser already open behind the companion, a launch without a token opened the tab and
+left the window where it was. GNOME's focus-stealing prevention does not raise a window for a
+request that names no user action, so to the person View screen did nothing. The companion now
+asks GDK for an **activation token** tied to the click and hands it to the browser
+(`launch_default_handler`, `src/commands.rs:1058`; the token, `activation_token`,
+`src/commands.rs:1077`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as the person
+    participant C as companion (GTK main thread)
+    participant M as compositor
+    participant N as new browser process
+    participant B as the running browser
+    P->>C: clicks View screen
+    C->>M: xdg_activation_v1: a token for this click
+    M-->>C: the token
+    C->>N: launch the https handler with the link,<br/>XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID set
+    N->>B: the link and the token (its single-instance hand-off)
+    B->>M: activate my window, with the token
+    M-->>P: the browser comes forward on the new tab
+```
+
+- ⚠️ **The token goes in the environment explicitly**, in a plain GIO launch context. GLib asks a
+  launch context for a token only when the app's desktop file says `StartupNotify=true`, and
+  Fedora's Chromium's has no such key. Measured 2026-10-22 on the lab's Fedora Asahi GNOME box
+  (GTK 3.24.52, GLib 2.84, mutter 48, Chromium 148), three launches from a GTK 3 window with the
+  browser open behind it:
+
+  | Launch | New tab | Window raised |
+  |---|---|---|
+  | no launch context (the companion before #2729) | yes | **no** |
+  | GDK's own launch context | yes | **no**: GLib asked it for no token |
+  | GDK's token, set explicitly in a plain GIO context | yes | **yes** |
+
+- ⚠️ **GTK main thread only.** The token comes from GDK, while View screen and Open Roomler are
+  async commands on Tauri's runtime, so the launch hops to the main thread and waits for the
+  answer (`on_main_thread`, `src/commands.rs:1091`). The tray's Open Roomler is already there,
+  and Tauri runs a main-thread task in place for a caller on the main thread, so the wait cannot
+  deadlock.
+- Best-effort: with no GDK display, or off its thread, there is no token and the link opens as
+  it did before.
+
+### 14.3 A browser the companion opened outlives the companion (#2729)
+
+A browser that View screen or Open Roomler **started**, because none was running, is the
+companion's child, so it lands in the companion's cgroup. A companion the desktop autostarted
+sits in an `app-…` scope, and a scope does not stop when one process in it exits. One the
+**daemon** started (§14.1) is the main process of a transient `systemd-run` **service**: systemd
+stops a `Type=simple` service when its main process exits, and under the default
+`KillMode=control-group` kills everything left in its cgroup. Quitting the companion, a crash,
+and FR-117's restart after **every** update (`restart_replaced` sends the old companion SIGTERM,
+`agents/roomlerd/src/companion/package_sync.rs:418`) each closed that browser with all its
+windows.
+
+Since #2729 the daemon starts the companion with `--property=KillMode=process`
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:889`), in a root daemon's system
+unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
+Its own helpers end with it regardless, since WebKit's web and network processes exit when their
+UI process's connection closes.
+
+Measured 2026-10-22 on the same box, with a replica of the daemon's unit whose main process starts
+a child and exits after 4 s:
+
+| Unit | The child at 2 s | The child at 8 s |
+|---|---|---|
+| `systemd-run --quiet --collect --uid=<uid>` (before #2729) | alive, in `system.slice/run-…service` | **killed** |
+| the same with `--property=KillMode=process` | alive | alive |
+
+- ⚠️ A unit keeps the mode it started with. On the update that brings this change, FR-117's
+  restart of the OLD companion still takes a browser that companion opened with it, once; every
+  companion the new daemon starts is `KillMode=process`.
+- 🔑 **Check it on a host:** `systemctl show <unit> -p KillMode`, with the unit read from the
+  companion's `/proc/<pid>/cgroup`. A browser the companion started names the same unit in its
+  own `cgroup` file, and survives `kill -TERM <companion pid>`.

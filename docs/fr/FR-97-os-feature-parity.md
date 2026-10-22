@@ -951,7 +951,7 @@ model on Windows, so the three agree on what the mode means.
 (`exec.rs:807`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
-  `user` (`companion::seat0_user`, `companion.rs:1053`). It is not `graphical_session`, which takes the first
+  `user` (`companion::seat0_user`, `companion.rs:1067`). It is not `graphical_session`, which takes the first
   active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
   read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
   `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:616`),

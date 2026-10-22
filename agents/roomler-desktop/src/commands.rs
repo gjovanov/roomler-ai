@@ -1018,18 +1018,14 @@ fn open_in_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) -> R
 /// per-user Flatpak browser is exported). A companion the daemon started
 /// had neither until the daemon began passing the session's environment on
 /// (`roomlerd`'s `systemd_run_command`, same issue).
+///
+/// ⚠️ #2729 — the launch runs on the GTK main thread, because the activation
+/// token that brings the browser forward comes from GDK
+/// ([`launch_default_handler`]).
 #[cfg(target_os = "linux")]
 fn open_in_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) -> Result<(), String> {
-    use gio::prelude::*;
-    let result = match url_scheme(url) {
-        None => Err(format!("not a link that can be opened: {url}")),
-        Some(scheme) => match gio::AppInfo::default_for_uri_scheme(scheme) {
-            None => Err(no_handler_message(scheme)),
-            Some(handler) => handler
-                .launch_uris(&[url], None::<&gio::AppLaunchContext>)
-                .map_err(|e| format!("{} could not open the link: {e}", handler.name())),
-        },
-    };
+    let link = url.to_string();
+    let result = on_main_thread(app, move || launch_default_handler(&link)).and_then(|r| r);
     if let Err(e) = &result {
         tracing::warn!(%e, "opening a link failed");
         use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
@@ -1040,6 +1036,69 @@ fn open_in_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) -> R
             .show(|_| {});
     }
     result
+}
+
+/// The app registered for the link's scheme, launched with an activation
+/// token. ⚠️ GTK main thread only: the token comes from GDK.
+///
+/// ⚠️ #2729 — without a token, a browser that is ALREADY running opens the
+/// tab and stays behind the companion: GNOME's focus-stealing prevention
+/// will not raise a window for a request that names no user action, so to
+/// the person View screen did nothing. The token (Wayland's
+/// `xdg_activation_v1`, X11's startup id) ties the request to the click that
+/// made it; the launched browser hands it to its running instance, which may
+/// then come forward. It goes in the environment EXPLICITLY, in a plain GIO
+/// context: GLib asks a launch context for one only when the app's desktop
+/// file says `StartupNotify=true`, and Fedora's Chromium's does not.
+/// Measured 2026-10-22 on the lab's Fedora Asahi GNOME box (GTK 3.24.52,
+/// GLib 2.84, mutter 48, Chromium 148, the browser behind another window):
+/// no context and GDK's own context both left it behind; the explicit
+/// token brought it forward.
+#[cfg(target_os = "linux")]
+fn launch_default_handler(url: &str) -> Result<(), String> {
+    use gio::prelude::*;
+    let scheme = url_scheme(url).ok_or_else(|| format!("not a link that can be opened: {url}"))?;
+    let handler =
+        gio::AppInfo::default_for_uri_scheme(scheme).ok_or_else(|| no_handler_message(scheme))?;
+    let context = gio::AppLaunchContext::new();
+    if let Some(token) = activation_token(&handler) {
+        context.setenv("XDG_ACTIVATION_TOKEN", token.as_str());
+        context.setenv("DESKTOP_STARTUP_ID", token.as_str());
+    }
+    handler
+        .launch_uris(&[url], Some(&context))
+        .map_err(|e| format!("{} could not open the link: {e}", handler.name()))
+}
+
+/// A token from the display server for launching `handler`, or `None` where
+/// there is none to ask (no GDK display, or not on its thread). Best-effort:
+/// the link opens either way.
+#[cfg(target_os = "linux")]
+fn activation_token(handler: &gio::AppInfo) -> Option<gio::glib::GString> {
+    use gio::prelude::*;
+    if !gtk::is_initialized_main_thread() {
+        return None;
+    }
+    gtk::gdk::Display::default()?
+        .app_launch_context()?
+        .startup_notify_id(handler, &[])
+}
+
+/// Run `f` on the app's main thread and return its answer. Tauri runs the
+/// task in place when the caller IS the main thread (the tray's Open
+/// Roomler) and queues it otherwise (a command), so the wait cannot deadlock.
+#[cfg(target_os = "linux")]
+fn on_main_thread<R: tauri::Runtime, T: Send + 'static>(
+    app: &tauri::AppHandle<R>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(f());
+    })
+    .map_err(|e| format!("could not reach the app's main thread: {e}"))?;
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| "the app's main thread did not answer within 10 s".to_string())
 }
 
 /// A link's scheme (`https` of `https://…`), when it has a valid one: per

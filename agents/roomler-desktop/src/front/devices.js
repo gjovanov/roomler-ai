@@ -55,6 +55,8 @@
   const SEARCH_DEBOUNCE_MS = 300;
   const PRIMARY = 'primary';
   const PREF_PAGE_SIZE = 'roomler-desktop:devices-per-page';
+  // The View screen button's own tooltip, put back after a success (#2729).
+  const VIEW_SCREEN_TITLE = 'Open the remote-control viewer in your browser (sign-in required)';
   // The two causes that mean "this cannot work until something is updated":
   // fall back to the peers table and name what to update.
   const LEGACY = { unsupported_daemon: 'device service', unsupported_server: 'server' };
@@ -248,12 +250,15 @@
         const s = { agentId: null };
         const btn = el('button', 'sm', 'View screen');
         btn.type = 'button';
-        btn.title = 'Open the remote-control viewer in your browser (sign-in required)';
+        btn.title = VIEW_SCREEN_TITLE;
         btn.addEventListener('click', async () => {
           if (!s.agentId) return;
           btn.disabled = true;
           try {
             await invoke('cmd_open_remote', { agentId: s.agentId, org: orgArg() });
+            // #2729 — the error was the tooltip; a success takes it back, or
+            // "No web browser is set up…" outlives every later open.
+            btn.title = VIEW_SCREEN_TITLE;
             btn.classList.remove('is-error');
           } catch (err) {
             btn.title = String(err);
@@ -1057,4 +1062,7 @@
       else scheduleMesh();
     });
   });
+
+  // For the jsdom tests (ui/src/__tests__/companion/devices.spec.ts).
+  window.RoomlerDevices = { COLUMNS };
 })();

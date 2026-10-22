@@ -707,6 +707,19 @@ pub(crate) fn linux_companion_path() -> Option<std::path::PathBuf> {
 /// 2026-10-22 on a Fedora Asahi GNOME box, where that companion is what the
 /// person clicked View screen in. A per-user daemon's `--user` unit inherits
 /// the manager's environment already.
+///
+/// ⚠️ #2729 — and either unit is `KillMode=process`. The companion is the
+/// unit's main process, and what it launches lands in the unit's cgroup: the
+/// person's web browser, when View screen or Open Roomler started it. Under
+/// the default `KillMode=control-group`, a `Type=simple` unit whose main
+/// process exits is stopped and everything left in it killed, so quitting the
+/// companion, a crash, or FR-117's restart after every update (a SIGTERM to
+/// the old companion) closed that browser with every window it had. Measured
+/// 2026-10-22 on the same box: Chromium in the companion's
+/// `system.slice/run-…service`, and in a replica of this unit a child killed
+/// when the main process exited, alive under `KillMode=process`. The
+/// companion's own helpers need no killing: WebKit's web and network
+/// processes exit when their UI process's connection closes.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn systemd_run_command(
     sess: &GraphicalSession,
@@ -872,7 +885,8 @@ fn systemd_run_command_with(
     if user_manager {
         cmd.arg("--user");
     }
-    cmd.args(["--quiet", "--collect"]);
+    // #2729 — a browser the companion opened outlives the companion.
+    cmd.args(["--quiet", "--collect", "--property=KillMode=process"]);
     if !user_manager {
         cmd.arg(format!("--uid={}", sess.uid));
     }
@@ -1765,6 +1779,7 @@ mod tests {
         assert!(!root.contains(&"--user".to_string()), "{root:?}");
         for want in [
             "--collect",
+            "--property=KillMode=process",
             "--setenv=XDG_RUNTIME_DIR=/run/user/1000",
             "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
             "--setenv=DISPLAY=:0",
@@ -1781,6 +1796,12 @@ mod tests {
         assert_eq!(user[0], "--user");
         assert!(!user.iter().any(|a| a.starts_with("--uid=")), "{user:?}");
         assert!(user.contains(&"--setenv=DISPLAY=:0".to_string()));
+        // #2729 — under either manager, a browser the companion opened is not
+        // killed with it.
+        assert!(
+            user.contains(&"--property=KillMode=process".to_string()),
+            "{user:?}"
+        );
     }
 
     /// #2713 — REAL `systemctl --user show-environment` output, captured on
