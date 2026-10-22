@@ -34,8 +34,8 @@ reports a companion (`agents.companion_version`, read on mars, 18:20Z):
 `agents/roomlerd/src/updater.rs:2320`). Measured 2026-10-20: `roomler 0.4.147` on Windows, on the MacBook and on the
 Asahi tarball install.
 
-**Root cause.** `companion::refresh_if_stale` (`agents/roomlerd/src/companion.rs:1046`) is Windows-only "by design".
-Its premise (`companion.rs:1053-1064`) is that on Linux "the companion is its own `roomler-desktop` .deb that apt
+**Root cause.** `companion::refresh_if_stale` (`agents/roomlerd/src/companion.rs:1060`) is Windows-only "by design".
+Its premise (`companion.rs:1067-1078`) is that on Linux "the companion is its own `roomler-desktop` .deb that apt
 upgrades". That is false: there is no apt or dnf repository. `install.sh` installs the companion once, from a release
 asset (`desktop_install`, `scripts/install.sh:804`), and the daemon's updater picks only the daemon's own asset
 (`is_daemon_asset`, `updater.rs:978`, on purpose: FR-27's companion-as-daemon freeze). So the companion package moves
