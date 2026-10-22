@@ -76,17 +76,28 @@ time rather than caching an answer at startup.
 | Session | Capture | Input |
 |---|---|---|
 | **X11** | Direct capture | Direct injection |
-| **Wayland (wlroots, and compositors exposing the right protocols)** | Supported | Supported |
-| **Wayland (GNOME / KDE)** | Via the desktop portal, or a lower-level path where available | Supported |
+| **Wayland, GNOME, per-user install** | GNOME's own screen sharing, automatic; nobody at the screen is asked | Automatic |
+| **Wayland, KDE Plasma, per-user install** | The desktop portal, automatic: the person at the screen is asked once, then remembered | Through the portal's remote control |
+| **Wayland, GNOME or KDE, system install** | Automatic for the person's session on screen, read only while it is on screen and unlocked | Automatic, under the same conditions |
+| **Wayland, wlroots compositors (sway and others)** | Through the desktop portal; less tested | Not available: the wlroots portal has no remote control |
 | **Headless** | Virtual display mode | Supported |
+
+A **system install** (a root service) switches its Wayland capture on by
+itself only for a person's own session, and only where that person can be told:
+the desktop companion shows a banner saying who is viewing, with Disconnect, or
+a desktop notification says it. While that session is locked or not on screen,
+or when only the login screen is showing, nothing is read and the viewer says
+why. Where a Wayland desktop cannot be captured at all, the viewer names what is
+missing instead of showing a black screen.
 
 Two things regularly cause trouble:
 
 :::warning The portal must actually be running
-On GNOME the desktop portal is started on demand, and if nothing has ever
-triggered it, the agent finds no capture source at all. Starting it is not
-always enough on its own — the portal front-end caches its backend choice at
-startup, so it may need restarting after the backend becomes available.
+On KDE Plasma and other desktops that capture through the desktop portal, the
+portal is started on demand, and if nothing has ever triggered it, the agent
+finds no capture source at all. Starting it is not always enough on its own:
+the portal front-end caches its backend choice at startup, so it may need
+restarting after the backend becomes available.
 
 The practical symptom: a machine with every package installed that still reports
 no capture source.
@@ -98,9 +109,8 @@ is not on the detected layout **types nothing and reports success**, which looks
 like input working for some characters and not others.
 :::
 
-A machine running as a **root system service** has no logged-in session to
-capture. Either use the per-user unit on a desktop, or enable virtual-display
-mode on a headless box.
+A machine with no session on screen at all, such as a headless server, has
+nothing to capture: enable virtual-display mode there.
 :::
 
 ## Quick diagnosis
