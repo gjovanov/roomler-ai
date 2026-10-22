@@ -76,9 +76,29 @@ fn run_key() -> RunKey {
     (ObjectId::new(), 1)
 }
 
+/// No lease holds a value.
+struct NoValues;
+
+impl Values for NoValues {
+    fn value(&self, _lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
+        None
+    }
+}
+
+/// A run's seams where `vault` decides and `dial` dials: no placeholder,
+/// so nothing is terminated.
+fn seams(vault: Arc<FakeVault>, dial: impl Dial) -> Seams {
+    Seams {
+        decide: vault,
+        dial: Arc::new(dial),
+        values: Arc::new(NoValues),
+        roots: Roots::System,
+    }
+}
+
 async fn serve(vault: Arc<FakeVault>) -> (RunKey, Fronts) {
     let run = run_key();
-    let fronts = start_admitting(run, admit_all(), vault, Arc::new(ToEcho(echo().await))).unwrap();
+    let fronts = start_admitting(run, admit_all(), seams(vault, ToEcho(echo().await))).unwrap();
     (run, fronts)
 }
 
@@ -363,7 +383,7 @@ async fn what_cannot_be_decided_is_never_asked() {
     let refusing: Admit = Arc::new(|_: &TcpStream, _: SocketAddr| Err("uid 4242".into()));
     let run = run_key();
     let fronts =
-        start_admitting(run, refusing, vault.clone(), Arc::new(ToEcho(echo().await))).unwrap();
+        start_admitting(run, refusing, seams(vault.clone(), ToEcho(echo().await))).unwrap();
     let mut tcp = TcpStream::connect(fronts.http).await.unwrap();
     let _ = tcp
         .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\n\r\n")
@@ -412,6 +432,7 @@ async fn a_run_asks_about_at_most_so_many_hosts() {
         decisions: Mutex::default(),
         open: Arc::new(Semaphore::new(1)),
         ca: Arc::new(ca::SessionCa::new(run.0).unwrap()),
+        upstream: OnceCell::new(),
     };
     for i in 0..MAX_HOSTS {
         let _ = decided(&state, run, &format!("h{i}.example"), 443, &vault).await;

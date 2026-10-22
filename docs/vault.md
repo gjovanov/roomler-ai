@@ -2502,7 +2502,7 @@ sequenceDiagram
 | the host | in its one spelling. A name it cannot spell (`010.0.0.5`) is refused 400, unasked |
 | the decision | asked once per host, port and run, however many connections wait on it, and kept for the run: an allow, or any refusal the vault made. `busy`, `unavailable` and `undecided`, no answer, or an answer for something else is not kept: the connection is refused and the next one asks again. At most 1024 hosts a run |
 | the dial | the OS's resolver, which MagicDNS steers, then the first address that answers. Never an address of this host's loopback, a link-local, an unspecified, a multicast or a broadcast one, `0.0.0.0/8` (which Linux connects to this host), or AWS's IPv6 metadata service (`fd00:ec2::254`); an IPv4 address written as IPv6 is judged as itself. From this device, never through a tunnel exit |
-| the bytes | relayed both ways as they are, what the client sent behind its `CONNECT` included. No TLS is terminated (P3b-3) |
+| the bytes | relayed both ways as they are, what the client sent behind its `CONNECT` included, and never decrypted, but to a host the run holds a placeholder for, whose TLS is terminated (P3b-3c-1, "The swap", below) |
 | its end | the run's: both fronts close, and every connection on them ends. At most 256 connections open at once |
 
 | Refused because | HTTP | SOCKS5 |
@@ -2531,7 +2531,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:234`](../agents/roomlerd/src/hive/egress.rs#L234)), `drop_run` ([`:305`](../agents/roomlerd/src/hive/egress.rs#L305)), a connection ([`carry`, `:361`](../agents/roomlerd/src/hive/egress.rs#L361)), the decision kept per run ([`decided`, `:454`](../agents/roomlerd/src/hive/egress.rs#L454)), `dialable` ([`:644`](../agents/roomlerd/src/hive/egress.rs#L644)), what is kept ([`decision_of`, `:723`](../agents/roomlerd/src/hive/egress.rs#L723)) |
+| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:310`](../agents/roomlerd/src/hive/egress.rs#L310)), `drop_run` ([`:384`](../agents/roomlerd/src/hive/egress.rs#L384)), a connection ([`carry`, `:432`](../agents/roomlerd/src/hive/egress.rs#L432)), the decision kept per run ([`decided`, `:527`](../agents/roomlerd/src/hive/egress.rs#L527)), `dialable` ([`:717`](../agents/roomlerd/src/hive/egress.rs#L717)), what is kept ([`decision_of`, `:805`](../agents/roomlerd/src/hive/egress.rs#L805)) |
 | the ask | the lease client's `egress` ([`vault.rs:909`](../agents/roomlerd/src/vault.rs#L909)) and `on_egress_allowed` ([`:1107`](../agents/roomlerd/src/vault.rs#L1107)), which refuses an allow for anything but what was asked |
 | the run's | P3b-1b-2, below: started before the harness, so its ports are in the settings, and stopped with the run |
 
@@ -2595,8 +2595,8 @@ A session holds a secret as a placeholder: an opaque token in its
 environment, which its tools send as they would send the value. The value
 stays in the daemon's lease, and the egress proxy swaps it in on the way to
 the secret's audience, and nowhere else. P3b-3a builds the placeholder.
-⚠️ **No tool offers it yet**: P3b-3c does, once the proxy swaps a value in,
-so no session holds a placeholder that would go out as itself.
+⚠️ **No tool offers it yet**: P3b-3c-2 does. The proxy swaps a value in from
+P3b-3c-1 ("The swap", below), and until the tool no session holds a placeholder.
 
 ```mermaid
 sequenceDiagram
@@ -2634,10 +2634,10 @@ sequenceDiagram
 
 ### The session's CA and its trust (P3b-3b)
 
-The egress proxy will terminate TLS for an audience host of a placeholder
-the session holds (P3b-3c), and only for one. It does so under a CA of the
-session's own, which the session's tools are told to trust. P3b-3b builds
-the CA and the trust. Nothing is terminated yet.
+The egress proxy terminates TLS for an audience host of a placeholder the
+session holds, and only for one (P3b-3c-1, "The swap", below). It does so
+under a CA of the session's own, which the session's tools are told to
+trust. P3b-3b builds the CA and the trust.
 
 ```mermaid
 sequenceDiagram
@@ -2648,7 +2648,7 @@ sequenceDiagram
     P->>P: a CA of the run's own, ECDSA P-256, its key in memory only
     D->>S: ca.pem and ca-bundle.pem beside the session's settings
     D->>S: settings env naming them
-    Note over P,S: P3b-3c: a leaf per audience host, presented to the session's tools
+    Note over P,S: P3b-3c-1: a leaf per audience host, presented to the session's tools
 ```
 
 | Piece | What holds |
@@ -2666,7 +2666,7 @@ sequenceDiagram
 >   would make every tool that reads one refuse every other host, so then
 >   only `NODE_EXTRA_CA_CERTS`, which adds, is set.
 > - **The CA signs a leaf for whatever host it is asked.** What decides
->   that a host is terminated at all is the proxy (P3b-3c), and only for an
+>   that a host is terminated at all is the proxy (P3b-3c-1), and only for an
 >   audience of a placeholder the session holds.
 
 | Piece | Where |
@@ -2674,6 +2674,82 @@ sequenceDiagram
 | the CA, its leaves, the bundle | [`hive/egress/ca.rs`](../agents/roomlerd/src/hive/egress/ca.rs) |
 | the run's CA, made and dropped with its proxy | `start_admitting`, `ca_of` in [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs) |
 | the files and the variables | `write_trust` in [`hive/supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs); `Trust`, `CA_VAR`, `BUNDLE_VARS` in [`launch.rs`](../crates/hive-node/src/launch.rs) |
+
+### The swap (P3b-3c-1)
+
+The egress proxy terminates TLS for an audience host of a placeholder the
+session holds, under the run's CA, and swaps each placeholder of that
+audience in the request's `Authorization` for its value. Every other
+connection is carried as it comes, never decrypted. No tool offers a
+placeholder before P3b-3c-2, so no session holds one yet.
+
+```mermaid
+sequenceDiagram
+    participant S as the session's command (in the sandbox)
+    participant P as the run's egress proxy
+    participant L as the daemon's leases
+    participant A as the audience (api.github.com)
+    S->>P: CONNECT api.github.com:443
+    P->>P: the vault's decision, kept for the run, and a placeholder held for the host
+    P->>A: TCP, then TLS verified as api.github.com, offering HTTP/1.1
+    alt the audience does not verify
+        P-->>S: 502, and nothing decrypted
+    else verified
+        P-->>S: 200 Connection established
+        S->>P: its hello, read and not answered
+        alt it names another host, offers no HTTP/1.1, or is no TLS
+            P->>A: the hello as it came, on a new dial, then the bytes both ways
+        else the host, and HTTP/1.1
+            P-->>S: TLS under the run's CA, its leaf for the host
+            S->>P: GET /user, Host api.github.com, Authorization token rph_…
+            P->>L: the placeholder's lease, its value now
+            P->>A: the request, Authorization carrying the value
+            A-->>S: the response, as it came
+        end
+    end
+```
+
+| Piece | What holds |
+|---|---|
+| which connections | one to a host and port the run holds a placeholder for, as it starts. Every other is carried as it comes, never decrypted |
+| the audience | TLS first, before the client is told it is through: verified against this device's roots, read once a run as `proxy` mode reads them (§19, "The HTTP engine"), as the host the client named, offering HTTP/1.1 alone. One that does not verify is refused, `502` on the HTTP front and a general failure on SOCKS5, with why. Nothing is decrypted, and nothing is swapped toward a host nobody proved |
+| the client's hello | read with rustls, and not answered. One that names another host (SNI), offers protocols without HTTP/1.1 (ALPN), or is no TLS hello is carried as it came, on a new dial, never decrypted |
+| the client's TLS | under the run's CA, its leaf for the host, offering HTTP/1.1 alone |
+| a request | its `Host` names the connection's host and port (443 where it names none), as does an absolute form's authority, else `421 Misdirected Request`. A second `Host` is `400`; an upgrade, `501`. Sent on in origin form, less the hop-by-hop headers and `Expect` |
+| the swap | in `Authorization` alone (decision 32): each placeholder of this audience the run holds, as written (`token …`, `Bearer …`), and inside `Basic`'s credentials, decoded and encoded again (git). A placeholder anywhere else (the URL, another header, the body) goes out as itself, as does one in AWS's signature, which P3b-4 signs again. A value no header can carry (a line break, a control character) refuses the request, `502`, and it is never sent |
+| the value | read from its lease as each request goes: a placeholder whose lease was let go goes out as itself |
+| the response | streamed back as it came, less the hop-by-hop headers |
+| the log | the session, the host, and the lease of each placeholder swapped, at `debug`; never a value |
+| its end | the client's, or the run's. An audience that closes its connection is dialed again for the next request, through the same decision and verification |
+
+> [!WARNING]
+> - **The names must agree**: the CONNECT's host, the hello's, each
+>   request's `Host`, and the one the audience proved. Without the `Host`
+>   check, a CDN that serves many names on one address would route a
+>   request, the value in it, to whichever name the session wrote.
+> - **Nowhere but `Authorization`** (decision 32, pending the operator's
+>   word). An audience that keeps what it is sent and gives it back (an
+>   issue, a gist, a comment, a log) would turn a swap anywhere else into a
+>   way for the session to read the value.
+> - **The audience is trusted with the value.** It is the secret's own,
+>   matched exactly, as for `proxy` mode. One that gives back what it was
+>   sent in `Authorization` hands the value to the session.
+> - **Never the URL**, which lands in logs, histories and `Referer`
+>   headers.
+> - **HTTP/1.1 alone.** A client that offers HTTP/2 alone is carried as it
+>   came, and one that asks to upgrade is refused: neither has a
+>   placeholder swapped.
+
+| Piece | Where |
+|---|---|
+| which connections: a host the run holds a placeholder for | `carry` in [`hive/egress.rs:483`](../agents/roomlerd/src/hive/egress.rs#L483) |
+| the run's TLS to its audiences, made once | `RunState::upstream_tls` ([`egress.rs:272`](../agents/roomlerd/src/hive/egress.rs#L272)) |
+| a placeholder's value | `Values` ([`egress.rs:116`](../agents/roomlerd/src/hive/egress.rs#L116)), `LeaseValues` ([`:794`](../agents/roomlerd/src/hive/egress.rs#L794)) |
+| the order: the audience verified, the client told, its hello read, its TLS | `carry` in [`hive/egress/swap.rs:135`](../agents/roomlerd/src/hive/egress/swap.rs#L135) |
+| the hello, read and judged | `read_hello` ([`:294`](../agents/roomlerd/src/hive/egress/swap.rs#L294)), `judge` ([`:342`](../agents/roomlerd/src/hive/egress/swap.rs#L342)) |
+| a request's names | `outbound` ([`:530`](../agents/roomlerd/src/hive/egress/swap.rs#L530)), `names` ([`:599`](../agents/roomlerd/src/hive/egress/swap.rs#L599)) |
+| the swap | `swap` ([`:636`](../agents/roomlerd/src/hive/egress/swap.rs#L636)), `swap_authorization` ([`:671`](../agents/roomlerd/src/hive/egress/swap.rs#L671)) |
+| the tests | [`hive/egress/swap/tests.rs`](../agents/roomlerd/src/hive/egress/swap/tests.rs): 17, against a test audience under a CA of its own |
 
 ## 25. Audit
 
@@ -2770,5 +2846,5 @@ its lease (§15).
 | Step | Builds |
 |---|---|
 | P3-6c to P3-9 | GitHub App tokens, where decision 18 says; SQL Server and Redis users, as decision 19 says; AWS STS, a role's credential per lease, ended at the lease's end by a session policy AWS enforces and minted where decision 21 says (its design: the FR-90 spec, §3e "P3-6e, AWS STS, as designed"); a Kubernetes `TokenRequest`, a service account's token per lease bound to a Secret made for the lease, so deleting the Secret ends it, minted on the device (its design: §3e "P3-6f, a Kubernetes `TokenRequest`, as designed"); the rest of a session's own egress (the tunnel policies a session's flows match, P3-7-2b); the rest of `ssh_run`, one command on another device over Roomler SSH under a ticket of the session's own, whose vault half is built (§22): the network module's half built (P3-8-1b-1, refusing every session at gate 3) and gate 3 as decision 22 says (P3-8-1b-2), the target serving a session one command and nothing else built (P3-8-2a), the device's client built (P3-8-2b-1), and its tool built (P3-8-2b-2) (its design: §3e "P3-8, `ssh_run`, as designed"); `fleet_exec` as decision 5 says; for `roomler connect`, built (§23: the vault's half, P3-9-1; the daemon's ask and its renewing endpoint, P3-9-2a; the LocalAPI verb and the foreground command, P3-9-2b), the operator's word on decision 26, who may run it on Windows (its design: §3e "P3-9, `roomler connect`, as designed") |
-| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy and the session's sandbox around it are built too (P3b-1b-1 and P3b-1b-2, §24). The device's half of a placeholder (P3b-3), AWS (P3b-4) and Windows (P3b-5) are left |
+| P3b | `placeholder` mode: a session holds a secret as an opaque placeholder, and the daemon's egress proxy swaps the value in on the way out, only toward the secret's audiences, under TLS it terminates for those hosts alone with a per-session CA. It needs the session's egress proxy first, which Claude Code's sandbox sends every command through (its design: the FR-90 spec, §3e "P3b, `placeholder` egress, as designed"; decisions 27 to 30, decided on the recommendations). The vault's halves are built: the egress allowlist, Cedar's `net:egress` (P3b-1a, §24), and the placeholder lease (P3b-2: `vault.placeholder` §5, the lease §10, its guardrail §7). The daemon's egress proxy and the session's sandbox around it are built too (P3b-1b-1 and P3b-1b-2, §24). Of the device's half of a placeholder (P3b-3, §24), the placeholder (P3b-3a), the session's CA (P3b-3b) and the swap (P3b-3c-1, in `Authorization` alone as decision 32 recommends, pending the operator's word) are built. The tool (P3b-3c-2), AWS (P3b-4) and Windows (P3b-5) are left |
 | P3k | the field run in the test organization |
