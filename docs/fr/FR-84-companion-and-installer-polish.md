@@ -69,7 +69,7 @@ it. Do not shift these anchors with code that moved later.*
 | Surface | Where | What it does today |
 |---|---|---|
 | Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:166-168` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
-| swallowed errors | `agents/roomler-desktop/src/commands.rs:1077-1081`, `:1122-1127` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
+| swallowed errors | `agents/roomler-desktop/src/commands.rs:1136-1140`, `:1181-1186` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
 | pipe server | `crates/localapi/src/lib.rs:1796-1871` | ONE listening instance; the next is created only after `connect()` returns |
 | pipe client | `crates/localapi/src/lib.rs:2133-2153` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
@@ -78,7 +78,7 @@ it. Do not shift these anchors with code that moved later.*
 | restart | — | nothing in the desktop or on the LocalAPI can restart the daemon |
 | encoder caps | `agents/roomlerd/src/encode/caps.rs:37, 548-559` | a process OnceLock filled at the first `rc:agent.hello`; never on the LocalAPI |
 | drop folder | `agents/roomlerd/src/files.rs:1966-2030` | SystemContext → the active user's Downloads; else the process owner's; Windows fallback `%PROGRAMDATA%\roomler\<segment>\uploads`; not configurable |
-| devices | `agents/roomler-desktop/src/front/devices.js:58, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
+| devices | `agents/roomler-desktop/src/front/devices.js:60, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
 | agent-token routes | `crates/modules/fleet/src/lib.rs:331-340` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
 | launch after install | `scripts/install.ps1:283-305`; `agents/roomler-setup/src/orchestrator_agent.rs:501-610`; `agents/roomlerd/wix*/main.wxs` | copy the EXE, launch nothing, register nothing |
 | first launch | `agents/roomler-desktop/src/main.rs:57-75`; `tauri.conf.json:26` | `--view=` handled only in the single-instance callback; the window starts hidden |
