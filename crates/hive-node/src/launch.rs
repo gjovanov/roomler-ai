@@ -431,7 +431,36 @@ pub struct SandboxProxy {
     /// The session's own cache directory ([`cache_dir_in`]): the one place
     /// outside its working directory and temp a sandboxed command writes.
     pub cache: PathBuf,
+    /// FR-90 P3b-3b — the files that tell the session's tools to trust its
+    /// own CA, which the proxy terminates TLS under (P3b-3c). None writes no
+    /// trust variable.
+    pub trust: Option<Trust>,
 }
+
+/// FR-90 P3b-3b — where a sandboxed session's trust lies, as files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trust {
+    /// The session's CA alone: [`CA_VAR`] adds it to Node's roots.
+    pub ca: PathBuf,
+    /// The system's roots and the CA, for [`BUNDLE_VARS`], which replace a
+    /// tool's roots. None where no system root could be read: a bundle of
+    /// the CA alone would refuse every other host.
+    pub bundle: Option<PathBuf>,
+}
+
+/// FR-90 P3b-3b — the variable that ADDS the session's CA to Node's roots.
+pub const CA_VAR: &str = "NODE_EXTRA_CA_CERTS";
+
+/// FR-90 P3b-3b — the variables that REPLACE a tool's roots with the bundle:
+/// what Claude Code's own TLS termination sets (OpenSSL's, Python's, curl's),
+/// and AWS's and git's, which it does not.
+pub const BUNDLE_VARS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "AWS_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+];
 
 /// FR-90 P3b-1b-2 — the session's cache directory, beside its
 /// `CLAUDE_CONFIG_DIR` ([`config_dir_in`]) and gone with it (decision 31).
@@ -544,10 +573,20 @@ impl SettingsSpec {
                 "allowWrite": [p.cache.to_string_lossy()],
                 "denyWrite": HOME_DENY_WRITE,
             });
-            let env: serde_json::Map<String, Value> = CACHE_VARS
+            let mut env: serde_json::Map<String, Value> = CACHE_VARS
                 .iter()
                 .map(|(var, sub)| (var.to_string(), json!(p.cache.join(sub).to_string_lossy())))
                 .collect();
+            // P3b-3b — the session's CA, added to Node's roots; the bundle in
+            // place of every other tool's, where there is one.
+            if let Some(t) = &p.trust {
+                env.insert(CA_VAR.into(), json!(t.ca.to_string_lossy()));
+                if let Some(bundle) = &t.bundle {
+                    for var in BUNDLE_VARS {
+                        env.insert((*var).into(), json!(bundle.to_string_lossy()));
+                    }
+                }
+            }
             doc["env"] = Value::Object(env);
         }
         doc
@@ -824,6 +863,56 @@ mod tests {
         assert_eq!(attributed_prompt(Some("Bo"), "one\ntwo"), "[Bo] one\ntwo");
     }
 
+    /// FR-90 P3b-3b — with no system root read, the session's CA is still
+    /// added to Node's roots, and no tool's own roots are replaced: a bundle
+    /// of the CA alone would refuse every other host.
+    #[test]
+    fn with_no_system_root_the_ca_is_added_and_no_tool_loses_its_roots() {
+        let ca = root().join("run").join("ca.pem");
+        let doc = SettingsSpec {
+            api_key_helper: None,
+            auto_memory_directory: None,
+            sandbox_proxy: Some(SandboxProxy {
+                http_port: 47001,
+                socks_port: 47002,
+                cache: cache_dir_in(&root().join("state")),
+                trust: Some(Trust {
+                    ca: ca.clone(),
+                    bundle: None,
+                }),
+            }),
+            extra_read_denies: vec![],
+            session_start_hook: None,
+            allow_tools: vec![],
+            ask_tools: vec![],
+        }
+        .to_json();
+        let env = doc["env"].as_object().unwrap();
+        assert_eq!(env[CA_VAR], json!(ca.to_string_lossy()));
+        for var in BUNDLE_VARS {
+            assert!(!env.contains_key(*var), "{var} keeps the tool's own roots");
+        }
+        // And with no trust at all, no trust variable.
+        let none = SettingsSpec {
+            api_key_helper: None,
+            auto_memory_directory: None,
+            sandbox_proxy: Some(SandboxProxy {
+                http_port: 47001,
+                socks_port: 47002,
+                cache: cache_dir_in(&root().join("state")),
+                trust: None,
+            }),
+            extra_read_denies: vec![],
+            session_start_hook: None,
+            allow_tools: vec![],
+            ask_tools: vec![],
+        }
+        .to_json();
+        let env = none["env"].as_object().unwrap();
+        assert!(!env.contains_key(CA_VAR));
+        assert_eq!(env.len(), CACHE_VARS.len(), "the caches alone");
+    }
+
     #[test]
     fn settings_deny_proc_and_carry_the_helper_memory_dir_and_sandbox() {
         let doc = SettingsSpec {
@@ -833,6 +922,10 @@ mod tests {
                 http_port: 47001,
                 socks_port: 47002,
                 cache: cache_dir_in(&root().join("state")),
+                trust: Some(Trust {
+                    ca: root().join("run").join("ca.pem"),
+                    bundle: Some(root().join("run").join("ca-bundle.pem")),
+                }),
             }),
             extra_read_denies: vec!["Read(//var/lib/roomler/hive/secrets/**)".into()],
             session_start_hook: Some("'/usr/bin/roomlerd' hive-resume-note '/run/n'".into()),
@@ -900,7 +993,7 @@ mod tests {
             assert!(denied.iter().any(|d| d == path), "{path}");
         }
         let env = doc["env"].as_object().unwrap();
-        assert_eq!(env.len(), CACHE_VARS.len());
+        assert_eq!(env.len(), CACHE_VARS.len() + 1 + BUNDLE_VARS.len());
         for (var, sub) in CACHE_VARS {
             let at = PathBuf::from(env[*var].as_str().unwrap());
             assert!(at.starts_with(&cache), "{var} is under the cache");
@@ -916,6 +1009,24 @@ mod tests {
             "GOCACHE",
         ] {
             assert!(env.contains_key(var), "{var} points under the cache");
+        }
+        // P3b-3b — the session's CA added to Node's roots, and the bundle in
+        // place of every other tool's, each variable by its name.
+        let ca = root().join("run").join("ca.pem");
+        let bundle = root().join("run").join("ca-bundle.pem");
+        assert_eq!(
+            env["NODE_EXTRA_CA_CERTS"],
+            json!(ca.to_string_lossy()),
+            "{env:?}"
+        );
+        for var in [
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "AWS_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ] {
+            assert_eq!(env[var], json!(bundle.to_string_lossy()), "{var}");
         }
         // No sandbox where we set none (P1; native Windows) — and should one
         // come on anyway, a sandboxed command still asks a person.

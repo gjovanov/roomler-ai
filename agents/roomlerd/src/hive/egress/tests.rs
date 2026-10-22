@@ -406,12 +406,13 @@ async fn the_run_ending_ends_its_fronts_and_its_connections() {
 #[tokio::test]
 async fn a_run_asks_about_at_most_so_many_hosts() {
     let vault = FakeVault::default();
+    let run = run_key();
     let state = RunState {
         stop: CancellationToken::new(),
         decisions: Mutex::default(),
         open: Arc::new(Semaphore::new(1)),
+        ca: Arc::new(ca::SessionCa::new(run.0).unwrap()),
     };
-    let run = run_key();
     for i in 0..MAX_HOSTS {
         let _ = decided(&state, run, &format!("h{i}.example"), 443, &vault).await;
     }
@@ -426,4 +427,19 @@ async fn a_run_asks_about_at_most_so_many_hosts() {
         "kept"
     );
     assert_eq!(lock(&vault.asks).len(), MAX_HOSTS);
+}
+
+/// FR-90 P3b-3b — each run has a CA of its own from its start, and the CA
+/// goes with its run.
+#[tokio::test]
+async fn a_run_has_its_own_ca_while_it_is_served() {
+    let vault = Arc::new(FakeVault::default());
+    let (a, _) = serve(vault.clone()).await;
+    let (b, _) = serve(vault).await;
+    let (ca_a, ca_b) = (ca_of(a.0, a.1).unwrap(), ca_of(b.0, b.1).unwrap());
+    assert_ne!(ca_a.der(), ca_b.der(), "each run its own");
+    assert!(drop_run(a.0, a.1));
+    assert!(ca_of(a.0, a.1).is_none(), "gone with its run");
+    assert!(ca_of(b.0, b.1).is_some(), "the other's stays");
+    assert!(drop_run(b.0, b.1));
 }
