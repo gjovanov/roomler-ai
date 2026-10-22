@@ -18,8 +18,8 @@ that is greyed out always carries the device's own reason.
 - **⛔ Ruled out** icon:danger — the OS itself prevents it. The reason is below.
 :::
 
-These tables describe agent 0.4.148; a row that names 0.4.149 is coming in the
-next release. The engineering record behind them, with
+These tables describe agent 0.4.153; a row that names a later version is coming
+in the next release. The engineering record behind them, with
 the code each verdict comes from, is
 [`docs/platform-support.md`](https://github.com/gjovanov/roomler-ai/blob/master/docs/platform-support.md).
 
@@ -125,7 +125,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 | Checks a download is the version it was offered as | ✅ | ✅ | ✅ |
 | One-command uninstall | ✅ | ✅ | ✅ |
 | An ephemeral device removes itself when it stops | ✅ | ✅ | ✅ |
-| The tunnel client (`roomler self-update`) updates itself | ✅ | ✅ from the next tunnel release | ✅ from the next tunnel release |
+| The tunnel client (`roomler self-update`) updates itself | ✅ | ✅ from tunnel 0.4.149 | ✅ from tunnel 0.4.149 |
 | Processors the agent runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |
 | Hardware video encoding on Linux ARM | — | ❌ | — |
 | The tunnel client and the wizard on Linux ARM | — | ✅ from 0.4.149: the wizard with the agent release, the tunnel client with the first tunnel release from then on | — |
