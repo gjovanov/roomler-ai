@@ -161,6 +161,36 @@ fn region_stats_urls(spec: &roomler_ai_remote_control::turn_creds::RelayRegionSp
         .collect()
 }
 
+/// FR-115 P4a-2 — does this `/stats` body come from a derp-relay that takes
+/// the allowance push? Only one that reports the set it holds (`allowance`,
+/// an object, since P4a-2) does. A central worker's host exporter, or a PoP
+/// from before P4a-2, has nothing to verify a set with and answers the
+/// `POST` 405, so it is never sent one.
+fn takes_allowance_push(body: &serde_json::Value) -> bool {
+    body.get("allowance")
+        .is_some_and(serde_json::Value::is_object)
+}
+
+/// The push targets: each region's endpoints that took the push on their
+/// last answered `GET`. A region left with none is dropped.
+fn allowance_push_targets(
+    targets: &[(String, Vec<String>)],
+    takers: &std::collections::HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    targets
+        .iter()
+        .map(|(region, urls)| {
+            let urls: Vec<String> = urls
+                .iter()
+                .filter(|u| takers.contains(*u))
+                .cloned()
+                .collect();
+            (region.clone(), urls)
+        })
+        .filter(|(_, urls)| !urls.is_empty())
+        .collect()
+}
+
 /// FR-115 P4a-2 — the push of the over-allowance set to the PoPs, on the
 /// poll the API already makes (`POST` to the same `/stats`; the `GET` is
 /// unchanged). The set is the one the throttle's job publishes in Redis
@@ -170,9 +200,14 @@ fn region_stats_urls(spec: &roomler_ai_remote_control::turn_creds::RelayRegionSp
 ///
 /// Every way this can fail leaves the PoPs throttling NOTHING: a PoP keeps a
 /// set three polls after it arrives and then lets it lapse, so a stopped
-/// push, an unreachable PoP and an older PoP (which answers the `POST` 405
-/// and has no throttle) all fail open. An empty or absent set is pushed too:
-/// that is how the API's kill switch reaches a PoP within one poll.
+/// push and an unreachable PoP both fail open. An empty or absent set is
+/// pushed too: that is how the API's kill switch reaches a PoP within one poll.
+///
+/// It goes only to endpoints whose last `GET /stats` reported an
+/// `allowance` ([`takes_allowance_push`]). A region's `stats_urls` may name
+/// what is not a derp-relay at all (the central coturn workers' host
+/// exporters), and those, like a PoP from before P4a-2, answer the `POST`
+/// 405 on every poll.
 pub struct AllowancePush {
     redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
     key: String,
@@ -302,15 +337,13 @@ pub fn spawn_poller(
         // The PoP counters never reset except on restart, so what we bill is
         // the diff between successive samples.
         let mut prev_net: HashMap<(String, String), u64> = HashMap::new();
+        // FR-115 P4a-2 — the endpoints whose last answered `GET` reported an
+        // `allowance`: the only ones the set is pushed to.
+        let mut takers: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut tick = tokio::time::interval(Duration::from_secs(poll_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            // FR-115 P4a-2 — a PoP keeps the set three polls after it arrives.
-            if let Some(push) = &allowance_push {
-                push.push(&client, &targets, poll_secs.saturating_mul(3))
-                    .await;
-            }
             for (region, urls) in &targets {
                 // Multi-worker region: poll every endpoint and aggregate
                 // pessimistically (see `Agg`). One unreachable worker of
@@ -338,6 +371,13 @@ pub fn spawn_poller(
                             continue;
                         }
                     };
+                    // Only an answered GET changes what an endpoint is; one
+                    // that did not answer keeps its last known state.
+                    if takes_allowance_push(&body) {
+                        takers.insert(url.clone());
+                    } else {
+                        takers.remove(url);
+                    }
                     agg.add(
                         &body,
                         started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
@@ -448,6 +488,15 @@ pub fn spawn_poller(
                             }
                         }
                     }
+                }
+            }
+            // FR-115 P4a-2 — a PoP keeps the set three polls after it arrives.
+            // After the GETs, so even the first poll pushes only to the
+            // endpoints that take it.
+            if let Some(push) = &allowance_push {
+                let to = allowance_push_targets(&targets, &takers);
+                if !to.is_empty() {
+                    push.push(&client, &to, poll_secs.saturating_mul(3)).await;
                 }
             }
         }
@@ -566,6 +615,53 @@ mod tests {
         );
         // Neither ⇒ unpolled ("not monitored", never "down").
         assert!(region_stats_urls(&spec(None, vec![])).is_empty());
+    }
+
+    #[test]
+    fn only_a_body_reporting_its_allowance_takes_the_push() {
+        // A derp-relay since P4a-2: it reports the set it holds.
+        assert!(takes_allowance_push(&serde_json::json!({
+            "region": "us-east",
+            "allowance": { "networks": 0, "age_s": null, "shaped_total": 0 }
+        })));
+        // A central worker's host exporter, and a PoP from before P4a-2: no
+        // `allowance` at all. Both answered every push 405.
+        assert!(!takes_allowance_push(
+            &serde_json::json!({ "cpus": 2, "load1": 0.1 })
+        ));
+        // Present but not an object is not a derp-relay's report either.
+        assert!(!takes_allowance_push(
+            &serde_json::json!({ "allowance": null })
+        ));
+        assert!(!takes_allowance_push(
+            &serde_json::json!({ "allowance": 3 })
+        ));
+    }
+
+    #[test]
+    fn push_targets_keep_only_the_endpoints_that_take_it() {
+        let targets = vec![
+            (
+                "eu-central".to_string(),
+                vec!["http://w1/stats".to_string(), "http://w2/stats".to_string()],
+            ),
+            (
+                "us-east".to_string(),
+                vec!["https://derp-us-east/stats".to_string()],
+            ),
+        ];
+        let takers: std::collections::HashSet<String> =
+            std::iter::once("https://derp-us-east/stats".to_string()).collect();
+        assert_eq!(
+            allowance_push_targets(&targets, &takers),
+            vec![(
+                "us-east".to_string(),
+                vec!["https://derp-us-east/stats".to_string()]
+            )],
+            "a region left with no taker is dropped, not pushed to"
+        );
+        // Before any GET has answered, nobody is pushed to.
+        assert!(allowance_push_targets(&targets, &Default::default()).is_empty());
     }
 
     #[test]
