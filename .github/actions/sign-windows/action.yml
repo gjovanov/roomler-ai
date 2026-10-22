@@ -319,6 +319,38 @@ runs:
         tenant-id:       ${{ inputs.azure-tenant-id }}
         subscription-id: ${{ inputs.azure-subscription-id }}
 
+    # The signing action restores its PowerShell module (and the SDK build
+    # tools) from the Actions cache, and on a miss installs the module with
+    # `Install-Module -Repository PSGallery`. On 2026-10-22 a master dispatch
+    # missed every one of those caches (evicted since the morning's tag run
+    # hit them), and in BOTH Windows jobs, on two runner images, that
+    # `Install-Module`, the job's first PowerShellGet call, answered "Unable to
+    # find repository 'PSGallery'": nothing was signed (run 39866474834). A
+    # tag run that misses the same caches fails the release. With this step
+    # first, a `Get-PSRepository` lookup that found the gallery, the next run's
+    # cache-miss job on the same image installed the module and signed (run
+    # 39869295413). One run cannot say whether the lookup is what makes
+    # PowerShellGet register its default gallery on a fresh profile, or the
+    # first miss was a transient; the step costs nothing either way, registers
+    # the gallery if the lookup finds none, and logs which it saw. It never
+    # fails the job itself: a cache HIT signs without the gallery, so a refusal
+    # here is a warning.
+    - name: Make sure the PowerShell Gallery is registered
+      if: steps.resolve.outputs.mode == 'azure'
+      shell: pwsh
+      run: |
+        try {
+          if (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue) {
+            Write-Host "PSGallery: registered"
+          } else {
+            Register-PSRepository -Default -ErrorAction Stop
+            Get-PSRepository -Name PSGallery | Format-List Name, SourceLocation, InstallationPolicy
+            Write-Host "PSGallery: missing on this image, registered now"
+          }
+        } catch {
+          Write-Host "::warning::could not register PSGallery ($($_.Exception.Message)); signing still works on a module cache hit"
+        }
+
     - name: Sign with Azure Artifact Signing
       if: steps.resolve.outputs.mode == 'azure'
       uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
