@@ -14,6 +14,7 @@
 //! | the decision | the vault's, asked once per host, port and run (`rc:vault.egress`) and kept for the run, an allow or a denial. A request that got no decision (no answer, busy, unavailable) is refused, and the next connection asks again |
 //! | the dial | from this device, never through a tunnel exit: the name resolved by the OS's resolver, which MagicDNS steers, and never to an address of this host's loopback, a link-local, an unspecified, a multicast or a broadcast one, nor a cloud's metadata service, whatever the vault allowed |
 //! | the bytes | relayed as they are: no TLS is terminated here (P3b-3 adds it, for an audience host of a placeholder) |
+//! | its CA | made with the run (P3b-3b, [`ca`]): what P3b-3c terminates TLS under, and what the session's tools are told to trust ([`ca_of`]) |
 //! | its end | the run's ([`drop_run`]): both listeners close, and every connection on them ends |
 //!
 //! ⚠️ A front admits the session's account and nobody else. On Linux the
@@ -42,6 +43,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tunnel_core::flow_listener::Admit;
 use tunnel_core::socks5;
+
+/// FR-90 P3b-3b — the run's own CA, and the trust the session is told of.
+pub mod ca;
 
 /// A session's run, by its session and fence.
 pub type RunKey = (ObjectId, u64);
@@ -198,12 +202,14 @@ type HostPort = (String, u16);
 /// when it did not, so the next connection asks again.
 type Kept = Arc<OnceCell<Decision>>;
 
-/// One run's proxy: its end, its decisions, its open connections.
+/// One run's proxy: its end, its decisions, its open connections, its CA.
 struct RunState {
     stop: CancellationToken,
     /// Each host and port asked about.
     decisions: Mutex<HashMap<HostPort, Kept>>,
     open: Arc<Semaphore>,
+    /// FR-90 P3b-3b — made with the run, gone with it.
+    ca: Arc<ca::SessionCa>,
 }
 
 /// Every run's proxy: ended with the run ([`drop_run`]).
@@ -264,6 +270,7 @@ fn start_admitting(
         stop: CancellationToken::new(),
         decisions: Mutex::default(),
         open: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+        ca: Arc::new(ca::SessionCa::new(run.0)?),
     });
     if let Some(old) = runs().insert(run, state.clone()) {
         old.stop.cancel();
@@ -284,6 +291,13 @@ fn start_admitting(
         "hive: the session's egress proxy is serving"
     );
     Ok(fronts)
+}
+
+/// FR-90 P3b-3b — the CA of `run`'s proxy, while it is served.
+pub fn ca_of(session: ObjectId, fence: u64) -> Option<Arc<ca::SessionCa>> {
+    runs()
+        .get(&(session, fence))
+        .map(|state| Arc::clone(&state.ca))
 }
 
 /// Stop serving `run`: both fronts close and every connection on them ends.

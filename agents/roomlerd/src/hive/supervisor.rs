@@ -4362,15 +4362,35 @@ impl Supervisor {
             )
             .map_err(|e| (HiveRefusal::SandboxUnavailable, e))?;
             let served = EgressServed::of(order.session_id, order.fence);
+            // P3b-3b — the run's CA, which the proxy made with it, and the
+            // files that tell the session's tools to trust it: written beside
+            // its settings below, before the harness runs. With no system
+            // root to read, no bundle, so no tool loses its own roots.
+            let ca = super::egress::ca_of(order.session_id, order.fence).ok_or((
+                HiveRefusal::SandboxUnavailable,
+                "the session's egress proxy stopped as it started".to_string(),
+            ))?;
+            let ca_pem = ca.pem();
+            let bundle_pem = super::egress::ca::bundle(&ca_pem);
+            let dir = self.runtime.join(&sid);
+            let trust = roomler_hive_node::launch::Trust {
+                ca: dir.join(super::egress::ca::CA_FILE),
+                bundle: bundle_pem
+                    .as_ref()
+                    .map(|_| dir.join(super::egress::ca::BUNDLE_FILE)),
+            };
             let sandbox = SandboxProxy {
                 http_port: fronts.http.port(),
                 socks_port: fronts.socks.port(),
                 cache: roomler_hive_node::launch::cache_dir_in(&session_state_dir(&home, &sid)),
+                trust: Some(trust),
             };
-            (Some(sandbox), served)
+            (Some(sandbox), (served, Some((ca_pem, bundle_pem))))
         } else {
-            (None, EgressServed::none())
+            (None, (EgressServed::none(), None))
         };
+        #[cfg(feature = "vault")]
+        let (egress, trust_pems) = egress;
         #[cfg(not(feature = "vault"))]
         let sandbox: Option<SandboxProxy> = None;
         let settings = write_settings(
@@ -4407,6 +4427,17 @@ impl Supervisor {
             ));
         }
         let dir = self.runtime.join(&sid);
+        // FR-90 P3b-3b — the session's trust, beside its settings: the CA
+        // alone, and the bundle where there is one.
+        #[cfg(feature = "vault")]
+        if let Some((ca_pem, bundle_pem)) = &trust_pems {
+            write_trust(&dir, ca_pem, bundle_pem.as_deref()).map_err(|e| {
+                (
+                    HiveRefusal::LaunchFailed,
+                    format!("writing the session's trust: {e}"),
+                )
+            })?;
+        }
         let run = toolbelt::Run {
             session: order.session_id,
             fence: order.fence,
@@ -5197,6 +5228,25 @@ fn harness_path(home: &Path) -> String {
         "{home}/.local/bin:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
         home = home.display()
     )
+}
+
+/// FR-90 P3b-3b — the session's CA, and its bundle where there is one, as
+/// the files its settings name, in the run's own directory. Neither is a
+/// secret, so both are readable by the session's account whatever the
+/// daemon's umask.
+#[cfg(all(unix, feature = "vault"))]
+fn write_trust(dir: &Path, ca: &str, bundle: Option<&str>) -> Result<(), String> {
+    let write = |name: &str, text: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    };
+    write(super::egress::ca::CA_FILE, ca)?;
+    if let Some(bundle) = bundle {
+        write(super::egress::ca::BUNDLE_FILE, bundle)?;
+    }
+    Ok(())
 }
 
 /// FR-90 P3b-1b-2 — [`harness_path`]'s directories: where the sandbox gate
@@ -7972,6 +8022,46 @@ done
                 .is_some_and(|c| Path::new(c).starts_with(&cache)),
             "the caches point under it: {settings}"
         );
+        // P3b-3b — the run's own CA beside its settings, named for Node; the
+        // bundle (the system's roots, then the CA) for every other tool.
+        let ca = super::super::egress::ca_of(sid, 1).expect("the run's CA");
+        let ca_file = run.join(super::super::egress::ca::CA_FILE);
+        assert_eq!(std::fs::read_to_string(&ca_file).unwrap(), ca.pem());
+        // Readable by the session's account, which is not the daemon: this
+        // test reads it as the daemon, so it reads the mode instead.
+        assert_eq!(
+            std::fs::metadata(&ca_file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            settings["env"]["NODE_EXTRA_CA_CERTS"],
+            serde_json::json!(ca_file.to_string_lossy())
+        );
+        let bundle_file = run.join(super::super::egress::ca::BUNDLE_FILE);
+        match super::super::egress::ca::bundle(&ca.pem()) {
+            Some(_) => {
+                // The system's roots, in whatever order the system gives them
+                // (a Mac's keychain gives another at each read), then the CA.
+                use tokio_rustls::rustls::pki_types::CertificateDer;
+                use tokio_rustls::rustls::pki_types::pem::PemObject;
+                let written = std::fs::read_to_string(&bundle_file).unwrap();
+                let certs: Vec<CertificateDer<'static>> =
+                    CertificateDer::pem_slice_iter(written.as_bytes())
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                let roots = rustls_native_certs::load_native_certs().certs;
+                assert_eq!(certs.len(), roots.len() + 1);
+                assert_eq!(certs.last(), Some(&ca.der()), "the CA, last");
+                assert_eq!(
+                    settings["env"]["SSL_CERT_FILE"],
+                    serde_json::json!(bundle_file.to_string_lossy())
+                );
+            }
+            None => {
+                assert!(!bundle_file.exists(), "no system root, no bundle");
+                assert!(settings["env"].get("SSL_CERT_FILE").is_none());
+            }
+        }
 
         r.sup.stop(sid, 1, "owner".into());
         assert_eq!(
@@ -8007,6 +8097,10 @@ done
         assert!(settings["sandbox"].get("enabled").is_none(), "{settings}");
         assert!(settings.get("env").is_none(), "{settings}");
         assert!(!super::super::egress::drop_run(sid, 1), "no proxy");
+        assert!(
+            !run.join(super::super::egress::ca::CA_FILE).exists(),
+            "no CA either"
+        );
         plain.sup.stop(sid, 1, "owner".into());
         until_ended(&mut plain, sid).await;
     }
