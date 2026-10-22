@@ -30,7 +30,7 @@ Two properties, stated as the acceptance bar rather than as slogans:
 
 There is no `ROOMLER__OVERLAY__*` key in the prod configmap
 (`k8s/base/configmap-roomler2-config.yaml` in the deploy repo), so the shipped default
-`blocks_enabled: false` applies (`crates/config/src/settings.rs:132`, `:810`). Every
+`blocks_enabled: false` applies (`crates/config/src/settings.rs:144`, `:822`). Every
 organization created today lands on the shared `100.64.0.0/10` with its cursor seeded at 1.
 
 The two legacy rows above are therefore **not merely un-migrated — they overlap right now**.
@@ -136,7 +136,7 @@ is not an assumption: `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fire
 The trap that *does* need a forward-compat pre-roll is a new variant of a **nested** enum
 inside a frame the old agent already parses — the `RelayStrategyWire` case, where an unknown
 tag fails the *whole enclosing `ServerMsg`* and the agent silently drops entire netmaps
-(`signaling.rs:5103-5119`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
+(`signaling.rs:5139-5155`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
 
 ### 3c. Multi-block per org (P5) — the growth mechanism
 

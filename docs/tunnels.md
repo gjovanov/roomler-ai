@@ -924,7 +924,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:1894`](../crates/remote_control/src/signaling.rs#L1894)), `net_grant_id` on `rc:tunnel.opened` ([`:3629`](../crates/remote_control/src/signaling.rs#L3629)) |
+| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:1927`](../crates/remote_control/src/signaling.rs#L1927)), `net_grant_id` on `rc:tunnel.opened` ([`:3665`](../crates/remote_control/src/signaling.rs#L3665)) |
 | the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
 | each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
 | the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
@@ -974,7 +974,7 @@ sequenceDiagram
 | asking | `vault::net` ([`vault.rs:776`](../agents/roomlerd/src/vault.rs#L776)) and its answer `on_net_granted` ([`:924`](../agents/roomlerd/src/vault.rs#L924)), held to what was asked by `net_granted` ([`:363`](../agents/roomlerd/src/vault.rs#L363)); the answer's own arm in the daemon's signalling ([`signaling.rs:6302`](../agents/roomlerd/src/signaling.rs#L6302)) |
 | presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
 | the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1737`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1737)) |
-| the code | `NET_GRANT_REFUSED` ([`vault.rs:524`](../crates/remote_control/src/vault.rs#L524)), shared by the server and the device |
+| the code | `NET_GRANT_REFUSED` ([`vault.rs:547`](../crates/remote_control/src/vault.rs#L547)), shared by the server and the device |
 | tests | `driver::tests` (4), `tunnel::client_mgr::tests::a_refused_or_unbound_grant_ends_the_flow`, `vault::tests::client` (2): 7, and 13 negative controls |
 
 #### The device's listeners (P3-7-3b)

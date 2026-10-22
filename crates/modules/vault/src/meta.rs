@@ -92,7 +92,7 @@ async fn facts(
     };
     Ok((
         SessionFacts {
-            id: rec.session_id.to_hex(),
+            id: rec.session_id.map(|s| s.to_hex()).unwrap_or_default(),
             owner: session.owner_id,
             role: Some(role),
             playbook: None,

@@ -906,6 +906,10 @@ async fn roles_and_policies_are_checked_before_they_are_kept() {
             "guardrail:proxy-only-named-audiences",
             "guardrail:dynamic-only-short-lived",
             "guardrail:short-lived-only-dynamic",
+            // P3-9-1 — a person's own three, for `secret:connect`.
+            "guardrail:connect-only-named-audiences",
+            "guardrail:connect-never-dynamic",
+            "guardrail:connect-never-prod",
             pid.as_str()
         ],
         "{list}"

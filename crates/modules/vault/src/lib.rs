@@ -22,6 +22,10 @@
 //! network module checks without calling the vault. So is a session's command
 //! on another device over Roomler SSH (P3-8-1a, [`ssh`]): a ticket, likewise
 //! under its own audience, never naming the device the session runs on.
+//! And from P3-9-1 a PERSON's use, through an endpoint their device serves
+//! them (`roomler connect`, [`connect`]): decided by Cedar's own
+//! `secret:connect` for the device's owner as its row names them, and lent
+//! only to the organizations `vault.people` lists.
 //!
 //! The module's switch defaults OFF (`[modules] vault`), and a
 //! `vault.tenants` list both switches it on and limits it to the
@@ -40,6 +44,7 @@ use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique, index_uni
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Module, TenantCtx};
 
 pub mod approval;
+pub mod connect;
 pub mod crypto;
 pub mod dao;
 pub mod dynamic;
@@ -85,6 +90,11 @@ pub struct VaultState {
     pub approvals: Arc<dao::VaultApprovalDao>,
     /// The organizations the vault serves (`vault.tenants`).
     pub scope: Arc<scope::TenantScope>,
+    /// P3-9-1 — the organizations whose people it lends to (`vault.people`,
+    /// opt-in: empty is none).
+    pub people: Arc<scope::TenantScope>,
+    /// P3-9-1 — each device's requests per minute for its owner.
+    pub person_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
     /// P3-6b — the providers a dynamic secret is leased for
     /// (`vault.providers`).
     pub providers: Arc<dynamic::ProviderScope>,
@@ -121,6 +131,8 @@ impl Module for VaultState {
         let db = &core.db;
         let scope = scope::TenantScope::parse(&settings.vault.tenants);
         scope.log();
+        let people = scope::TenantScope::parse_opt_in(&settings.vault.people);
+        people.log_people();
         let providers = dynamic::ProviderScope::parse(&settings.vault.providers);
         providers.log();
         // Never a boot refusal: a missing or unusable KEK leaves the
@@ -142,6 +154,8 @@ impl Module for VaultState {
             activity_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             approvals: Arc::new(dao::VaultApprovalDao::new(db)),
             scope: Arc::new(scope),
+            people: Arc::new(people),
+            person_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             providers: Arc::new(providers),
             kek,
             core,
