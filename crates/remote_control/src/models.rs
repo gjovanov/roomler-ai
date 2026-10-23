@@ -9275,6 +9275,10 @@ mod tests {
             // 38): a server that could set it could make every device read,
             // and describe to the map, whatever folder it named.
             "knowhow_scan_roots",
+            // FR-90 P4-3b-3 — whether a scan reports the ports a device
+            // listens on (decision 47): the owner's word about what the
+            // machine runs, never the server's.
+            "knowhow_scan_listeners",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

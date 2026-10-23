@@ -39,9 +39,9 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | piece | where | note |
 |---|---|---|
 | primary key mint | `agents/roomlerd/src/main.rs:3436-3443` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
-| secondary-org mint | `crates/agent-core/src/enrollment.rs:624-625` | at enroll-append; never copied from the primary (cross-org correlation) |
-| storage | `crates/agent-core/src/config.rs:1874` (primary), `:2004` (`OrgEntry`), `for_org` at `:2138-2166` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
-| atomic save | `config.rs:3499` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
+| secondary-org mint | `crates/agent-core/src/enrollment.rs:626-627` | at enroll-append; never copied from the primary (cross-org correlation) |
+| storage | `crates/agent-core/src/config.rs:1882` (primary), `:2012` (`OrgEntry`), `for_org` at `:2146-2174` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
+| atomic save | `config.rs:3508` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
 | how a session gets its key | `agents/roomlerd/src/signaling.rs:444-449`, `:899-901`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
 | runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:430-438` | a changed secret already fails re-attach and rebuilds the runtime |
 | existing per-org cycle | `main.rs:2891-2912` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |

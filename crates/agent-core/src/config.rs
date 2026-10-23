@@ -622,6 +622,14 @@ pub struct AgentConfig {
     /// call, not the server's.
     #[serde(default)]
     pub knowhow_scan_roots: Vec<String>,
+    /// FR-90 P4-3b-3 — whether this device's knowhow scans report the TCP
+    /// ports it listens on (decision 47): each port, its bound address and
+    /// the process holding it, read by the daemon from the system's own
+    /// table. Default **off**: a listener is under no root, and its process
+    /// names software a person runs. Read from this file again at each scan,
+    /// and never pushable.
+    #[serde(default)]
+    pub knowhow_scan_listeners: bool,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2800,6 +2808,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_ssh: false,
         hive_egress: false,
         knowhow_scan_roots: Vec::new(),
+        knowhow_scan_listeners: false,
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

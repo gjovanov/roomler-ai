@@ -19,6 +19,7 @@
 //! | a checkout, read as text | [`checkout`] |
 //! | the services its manifests name (P4-3b-2) | [`manifests`] |
 //! | a listed kubeconfig's contexts (P4-3b-2, decision 46) | [`kubeconfig`] |
+//! | the device's TCP listeners, behind their own key (P4-3b-3, decision 47) | [`listeners`] |
 //! | the one YAML reader both use, bounded | [`yaml`] |
 //! | the answer | [`assemble`] |
 //!
@@ -29,6 +30,7 @@
 
 mod checkout;
 mod kubeconfig;
+mod listeners;
 mod manifests;
 mod owner;
 mod walk;
@@ -290,6 +292,10 @@ pub struct Scanner {
     config: PathBuf,
     lock: crate::config::WriteLock,
     run: Runner,
+    /// The daemon's own process, whose ports the listeners leave out (P4-3b-3).
+    /// None in an integration test, where the test process is the device and
+    /// the listener it opens is the one to find.
+    own_pid: Option<u32>,
     state: Mutex<State>,
 }
 
@@ -310,28 +316,36 @@ struct Unread {
 }
 
 impl Scanner {
-    fn new(config: PathBuf, lock: crate::config::WriteLock, run: Runner) -> Self {
+    fn new(
+        config: PathBuf,
+        lock: crate::config::WriteLock,
+        run: Runner,
+        own_pid: Option<u32>,
+    ) -> Self {
         Self {
             config,
             lock,
             run,
+            own_pid,
             state: Mutex::new(State::default()),
         }
     }
 
     /// The daemon's: roots read from `config` under `lock` (the LocalAPI's
     /// own, so a scan never reads a half-written file), each by a child as
-    /// its owner.
+    /// its owner; its own ports never among the listeners.
     pub fn subprocess(config: PathBuf, lock: crate::config::WriteLock) -> Arc<Self> {
-        Arc::new(Self::new(config, lock, Runner::Subprocess))
+        let own = Some(std::process::id());
+        Arc::new(Self::new(config, lock, Runner::Subprocess, own))
     }
 
     /// An integration test's device, whose binary is a test's and knows no
-    /// `knowhow-scan`: each root is read in this process, as it.
+    /// `knowhow-scan`: each root is read in this process, as it, and no
+    /// listener is the daemon's own.
     #[cfg(feature = "hive-test-launcher")]
     pub fn in_process(config: PathBuf, lock: crate::config::WriteLock) -> Arc<Self> {
         let ceiling = std::env::temp_dir();
-        Arc::new(Self::new(config, lock, Runner::InProcess { ceiling }))
+        Arc::new(Self::new(config, lock, Runner::InProcess { ceiling }, None))
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -412,8 +426,9 @@ impl Scanner {
             }
         };
         let roots = &cfg.knowhow_scan_roots;
-        if roots.is_empty() {
-            info!(%scan_id, "knowhow: no roots listed, answered no_roots");
+        // Nothing listed at all: neither a root nor the listeners (P4-3b-3).
+        if roots.is_empty() && !cfg.knowhow_scan_listeners {
+            info!(%scan_id, "knowhow: nothing listed, answered no_roots");
             return ClientMsg::KnowhowScanned {
                 scan_id,
                 outcome: ScanOutcome::NoRoots,
@@ -450,8 +465,42 @@ impl Scanner {
                 }
             }
         }
+        // P4-3b-3: the machine's listeners, read by the daemon from the
+        // system's table when the owner turned them on, first among what the
+        // roots found. A table that cannot be read is one more source
+        // unread, so the answer is cut and retires nothing.
+        let mut listed = roots.len();
+        if cfg.knowhow_scan_listeners {
+            listed += 1;
+            let own = self.own_pid;
+            let read = tokio::task::spawn_blocking(move || listeners::listeners(own))
+                .await
+                .map_err(|e| format!("the read's task: {e}"))
+                .and_then(|read| read);
+            match read {
+                Ok(found_listeners) => found.insert(
+                    0,
+                    Found {
+                        v: REQUEST_V,
+                        findings: found_listeners
+                            .into_iter()
+                            .map(|l| Finding::Listener(l).to_value())
+                            .collect(),
+                        cut: false,
+                        entries: 0,
+                    },
+                ),
+                Err(why) => {
+                    info!(%scan_id, %why, "knowhow: the listeners not read");
+                    unread.push(Unread {
+                        root: "the TCP listener table".into(),
+                        why,
+                    });
+                }
+            }
+        }
         let routes = declared_routes(&cfg.tunnel_routes);
-        let answer = assemble(scan_id, roots.len(), found, routes, &unread);
+        let answer = assemble(scan_id, listed, found, routes, &unread);
         if let ClientMsg::KnowhowScanned {
             outcome,
             truncated,
@@ -665,6 +714,9 @@ fn assemble(
         let key = match Finding::read(&value) {
             Ok(Some(Finding::Checkout(c))) => format!("checkout {}", c.path),
             Ok(Some(Finding::TunnelRoute(r))) => format!("tunnel_route {}", r.id),
+            Ok(Some(Finding::Listener(l))) => {
+                format!("listener {}:{}/{}", l.address, l.port, l.protocol)
+            }
             Ok(Some(_)) => value.to_string(),
             // A kind this build cannot read, or one the server would refuse.
             Ok(None) | Err(_) => {
@@ -909,12 +961,17 @@ mod tests {
         let run = Runner::InProcess {
             ceiling: tmp.path().to_path_buf(),
         };
-        (Arc::new(Scanner::new(config, lock, run)), tmp)
+        (Arc::new(Scanner::new(config, lock, run, None)), tmp)
     }
 
     fn write_roots(config: &Path, roots: &[&Path]) {
+        write_config(config, roots, false);
+    }
+
+    fn write_config(config: &Path, roots: &[&Path], listeners: bool) {
         let mut cfg = crate::config::test_fixture();
         cfg.knowhow_scan_roots = roots.iter().map(|p| p.display().to_string()).collect();
+        cfg.knowhow_scan_listeners = listeners;
         crate::config::save(&config.to_path_buf(), &cfg).unwrap();
     }
 
@@ -1037,7 +1094,7 @@ mod tests {
             let config = tmp.path().join("config.toml");
             write_roots(&config, &[root.path()]);
             let lock: crate::config::WriteLock = Arc::new(tokio::sync::Mutex::new(()));
-            let s = Arc::new(Scanner::new(config, lock, run));
+            let s = Arc::new(Scanner::new(config, lock, run, None));
             let msg = s.scan(ObjectId::new()).await;
             let (outcome, detail, _, _) = parts(&msg);
             // SAFETY: reads the caller's own credentials; it cannot fail.
@@ -1145,5 +1202,32 @@ mod tests {
             serde_json::json!([{ "name": "web", "image": "nginx:1.27", "file": "compose.yaml" }])
         );
         assert_eq!(findings[1]["server"], "https://k8s.example.com:6443");
+    }
+
+    /// P4-3b-3: with the listeners on, a scan reports the machine's TCP
+    /// listeners first, even with no root listed; with nothing listed at all
+    /// it answers `no_roots`.
+    #[tokio::test]
+    async fn the_listeners_are_reported_when_the_owner_turns_them_on() {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let (s, tmp) = scanner(&[]);
+        let (tx, mut rx) = mpsc::channel(4);
+
+        handle_scan(Some(&s), ObjectId::new(), true, tx.clone());
+        assert_eq!(parts(&answer(&mut rx).await).0, ScanOutcome::NoRoots);
+
+        write_config(&tmp.path().join("config.toml"), &[], true);
+        handle_scan(Some(&s), ObjectId::new(), true, tx);
+        let (outcome, detail, truncated, findings) = parts(&answer(&mut rx).await);
+        assert_eq!(outcome, ScanOutcome::Done, "{detail:?}");
+        assert!(!truncated, "{detail:?}");
+        assert!(
+            findings.iter().any(|f| f["kind"] == "listener"
+                && f["port"] == port
+                && f["address"] == "127.0.0.1"),
+            "this test's own socket: {findings:?}"
+        );
+        drop(socket);
     }
 }
