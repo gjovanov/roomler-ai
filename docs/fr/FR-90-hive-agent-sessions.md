@@ -1437,7 +1437,7 @@ which ran in no lane before. Nothing calls them yet. The supervisor is wired to 
 | the mapping | `hive_win.rs:564` `names_console_user` and `:577` `check_mapping`: `name`, `DOMAIN\name` or `.\name`, case-insensitively. Anything else is `no_account`, naming who is at the console | a table of 15, including `CORP\dev` ≠ `WS-1\dev`, and `.` against a domain account |
 | the harness | `hive_win.rs:604` `harness_candidates`, `:620` `resolve_harness` | `hive_harness` alone when set; else `claude.exe`, then npm's `claude.cmd`; a directory of that name is no harness |
 | its command line | `hive_win.rs:690` `harness_command_line`: an `.exe` quoted for the C runtime; a `.cmd` through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`, an argument holding one of cmd's metacharacters (`:676`, `:680`) refused, never escaped | every argument reads back exactly through `CommandLineToArgvW`; eleven metacharacters are refused |
-| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1139` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
+| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1141` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
 
 Three decisions differ from the table above:
 

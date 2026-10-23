@@ -33,7 +33,7 @@ updates, and not one recorded an outcome.
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
 (`post_install.rs:225`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:997-1022`).
+(`post_install.rs:1023-1048`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
