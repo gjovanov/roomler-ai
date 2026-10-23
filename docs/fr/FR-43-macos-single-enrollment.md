@@ -329,7 +329,7 @@ explicit allowlist, `WORKER_ENV_FORWARD`
 (`agents/roomlerd/src/macos_supervisor.rs:275`): each through
 `tunnel_core::env::node_env` (environment, then config fallback), and only when
 the root has one, as `sudo -u '#uid' /usr/bin/env ROOMLERD_K=v … run
---supervised` (`macos_supervisor.rs:389`). In the worker an environment variable
+--supervised` (`macos_supervisor.rs:392`). In the worker an environment variable
 beats its own config, so the session does what the hello promised. `env` execs
 into the agent, so the chain the supervisor reaps and the signals it relays are
 unchanged.

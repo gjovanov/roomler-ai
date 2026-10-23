@@ -29,7 +29,7 @@ Nothing to install on the controlling side stays true: Pointer Lock is a web API
 | The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:6247`](../../ui/src/composables/useRemoteControl.ts#L6247), the gap's key at `:2391` |
 | The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9443` |
 | No Pointer Lock anywhere in the viewer | `git grep requestPointerLock ui/src`: nothing |
-| `AgentCaps.input` today: `arbiter`, `exclusive`, `ghost-cursor` | [`caps.rs:1663`](../../agents/roomlerd/src/encode/caps.rs#L1663) |
+| `AgentCaps.input` today: `arbiter`, `exclusive`, `ghost-cursor` | [`caps.rs:1750`](../../agents/roomlerd/src/encode/caps.rs#L1750) |
 
 ## 3. Design
 
