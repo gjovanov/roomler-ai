@@ -318,7 +318,7 @@ flowchart LR
     L --> MTD["month-to-date per org<br/>(60 s flush)"]
     MTD -->|over allowance| F{{"over-allowance set"}}
     F --> TB["DERP token bucket<br/>for flagged networks only"]
-    F --> TC["TURN: credentials on a<br/>rate-capped realm"]
+    F --> TC["P4c, proposed: overlay pairs<br/>leave TURN for the DERP floor"]
     DIR["direct P2P"] -. never counted .-> X(( ))
     OR["org relay (FR-19)"] -. never counted .-> X
 ```
@@ -391,9 +391,9 @@ up, not the policy.
 analytics page shows relayed bytes against the allowance in units, never money (FR-20), and
 says when the throttle is on.
 
-**Not in P4a:** TURN (P4b attributes coturn bytes per org with `--redis-statsdb`, P4c moves an
-over-allowance org's credentials to a rate-capped realm), and exit nodes on Free (P4d, after
-the throttle exists).
+**Not in P4a:** TURN (P4b attributes coturn bytes per org with `--redis-statsdb`, and P4c brings
+TURN under the allowance, *P4c, as proposed*), and exit nodes on Free (P4d, after the throttle
+exists).
 
 ### P4b, as proposed: per-org TURN bytes from coturn's statistics DB (AC8, approved 2026-10-20)
 
@@ -543,6 +543,65 @@ sequenceDiagram
   view reports `turn_bytes` monitored whenever `relay_allowance.turn_attribution` is on, and
   `monitored: false` with a null total when it is off (`crates/api/src/routes/cost.rs:59`).
 
+### P4c, as proposed: the relay allowance reaches TURN (O8–O10 open, 2026-10-23)
+
+The first sketch had over-allowance credentials land on a rate-capped coturn realm (the
+diagram in *The relay allowance*). Checked against the code and coturn's own help text, that
+mechanism does not exist, so this section replaces it.
+
+**What is true today.**
+
+- **The allowance counts DERP bytes only.** The month-to-date sum filters on `derp_bytes`
+  (`crates/services/src/dao/stats.rs:220`), though the plan table sells "Relay (DERP + TURN)".
+  An org that relays only through TURN can never enter the over-allowance set.
+- **The set is keyed by overlay network**, held on each pod
+  (`crates/modules/network/src/relay_allowance.rs:53`) and read by `rate_of(network)` in one
+  atomic load (`:66`).
+- **TURN credentials are minted in ten places.** Only the overlay's pair grant
+  (`crates/modules/network/src/overlay.rs:1038`) and warm grant (`:201`) can ask `rate_of`
+  cheaply. The remote-desktop hub, the credentials route, conference and hive cannot: they do
+  not depend on the network module, and the hub's mints are synchronous.
+- **coturn has nothing to throttle with.** It runs one realm, one shared secret, no user
+  database and no `max-bps`. coturn picks a realm by ORIGIN or its default, never by the
+  credential, so a credential cannot move an org onto a capped realm. `max-bps` caps a whole
+  session's bytes with no regard for packet type, so it would also hold WireGuard handshakes,
+  which P4a was built never to do.
+- **The overlay already has the right lever.** A pair with no TURN grant stays on its DERP
+  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2010`), and P4a already holds DERP's
+  bulk frames to the plan's rate while letting every handshake through. The server can also
+  stamp a pair's relay tier itself (`server_relay_verdict`,
+  `crates/modules/network/src/overlay.rs:2236`), flipping both ends at once.
+
+**Proposal, in two steps.**
+
+| Step | What | Kill switch |
+|---|---|---|
+| **P4c-0** (O8) | `turn_bytes` count toward the month's relay, as the plan table says. An org over its allowance by DERP + TURN gets its DERP throttled, as today | `relay_allowance.count_turn = false` |
+| **P4c-1** (O9) | An over-allowance org's **overlay** pairs leave TURN for the DERP floor: the server's verdict stamps them DERP, and the pair grant and warm grant withhold TURN from older agents that compute their own tier. Never refused: the floor always connects, and a direct path is untouched | `relay_allowance.turn = false` (the row's existing name) |
+
+**Deliberately not throttled (O10): remote-desktop, conference, hive and tunnel TURN.**
+
+- A browser's WebRTC relays only through TURN, so withholding it would refuse the session,
+  which D4 forbids, and a coturn-level cap would hold its handshakes too. Those sessions are
+  bounded instead by the plan's own fences: Free's one concurrent remote session (P3), and
+  its 10-person, 60-minute meetings (P5).
+- A tunnel's TURN leg cannot be steered from the server: `quic-derp-v1` is negotiated only
+  when the client asked for it and sent its DERP identity
+  (`crates/modules/network/src/tunnel.rs:878`).
+
+Their bytes still count toward the allowance (P4c-0), so an org that relays heavily through
+them has its mesh throttled. The alternative to O10 is a second coturn listener per site with
+`max-bps`: a change to the cluster's role and to every PoP, a port a corporate firewall may
+block, and handshakes held with the bulk.
+
+**Before P4c-0 ships**, the private annex gets how many orgs would cross the allowance with
+TURN counted. O3's rates (1 Mbit/s Free, 4 Mbit/s paid) stay as P4a shipped them.
+
+**Field tests, when built.** P4c-0: a throwaway org pushed over its allowance by TURN bytes
+alone enters the set. P4c-1: one pair of that org runs on DERP at the plan's rate and takes
+TURN again once the org is back under, and a handshake storm on the throttled pair shows no
+handshake held.
+
 ### Meetings
 
 Free meetings end at 60 minutes with a warning at 55; the participant caps become
@@ -622,7 +681,7 @@ room is piped across workers. That is O4.
 | P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | ✅ **live and field-verified 2026-10-21**: #2637 (`726654b35` since the 2026-10-21 history rewrite), session slots in the cluster directory (*P3b, as proposed*), with O6 + O7 as the operator decided them on 2026-10-20. The integration lane ran all 11 `org_session_cap` tests, two pods among them. Promoted with `hosted-20261021-adbdadc`, then `rc.session_slots` switched on (deploy `596782e`), on the operator's go. In the field, both halves of AC6 hold: same-org with the slot doing the refusing (red, then green), and cross-org through FR-52's external path (field log) |
 | P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 **live 2026-10-21**, switched on in the deploy repo (`f5940b7`) on the operator's go. At that moment 0 orgs were over their allowance, so it held nobody. On prod all three of AC7's clauses hold (field log): the throttle and the direct path since 2026-10-21, and the org relay since 2026-10-22. Each was measured as a pair against a DERP arm on the same org and ledger. Still owed: O3's usability items. The design was approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `d6235e5ee`) is on the API pods; P4a-3 (#2629, `b2c66f102`) is the analytics surface; P4a-2 (#2633, `11f18c33a`) merged 2026-10-20: the PoPs throttle by the set the API signs and pushes on its `/stats` poll, and a PoP that holds no set throttles nothing. All four PoPs have run it since 2026-10-21 06:11Z, and the API's push has reached every one since the 12:46Z promote (field log) |
 | P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | ✅ **live on every coturn**: the cluster's since 2026-10-22, the PoPs' since 2026-10-23. Designed 2026-10-20 (#2619). P4b-1 (#2622, `54a3709ff`) makes TURN usernames name the paying org (`:org-`) and adds the collector. coturn-worker-1..3 are pinned to the 4.18.0 they ran, and they have published to Redis since 22:14–22:21Z (k8s-cluster-multi `e352c63`, one worker at a time; *As built* above). `relay_allowance.turn_attribution` has been on since 22:25:55Z (deploy `b656323`). AC8 is field-verified (field log). **P4b-2** (the PoPs' coturn, *P4b-2, as built*) merged in #2767 (`023ac05a1`). Its PoP half has been live on all four PoPs since 2026-10-23 09:41Z, each PoP keeping coturn's totals for the API to pull with a signed request (field log). The API's pull went live with the promote of `hosted-20261023-5b3eb0a` (18:02Z), and the PoPs' totals were booked once in the field (field log). The cost view reports TURN monitored behind the switch (#2782). Found while designing it: #2763, PoP-relayed DERP bytes would be booked once per API pod (latent), fixed by #2773 and live on both halves |
-| P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
+| P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | 🟡 **proposed 2026-10-23**: the rate-capped realm cannot work, so P4c-0 counts TURN toward the allowance and P4c-1 moves over-allowance overlay pairs to the DERP floor (*P4c, as proposed*). O8–O10 are the operator's |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
 | P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ✅ merged #2583 (`8ed9ccb34`); AC9 field-verified on prod 2026-10-20 in real time (warned at 55:00, ended at 60:00); the SFU measurement found nothing to measure (O4) |
 | P6 | Announcement email to real users, once P1 + P2 are live | — | ✅ sent 2026-10-20 13:55Z to every real user, after #2603's promote and an all-green AC5 re-check; the send log is in the private annex |
@@ -654,6 +713,9 @@ room is piped across workers. That is O4.
 | O5 | AC10's "no per-org view counts them". Admin stats, plan compliance and weekly active orgs exclude the 62 tombstoned orphans. FR-102's growth **Orgs** list shows them with an *archived* chip, and a cohort view asked for more than its default 26 weeks would count them in their February cohorts. Hiding archived orgs outright would also hide an owner's own archive, which is the churn signal that list is for | **Decided 2026-10-20: remove them completely, and done.** Every document of the 62 is deleted (the field log), so no view lists or counts them |
 | O6 | Whose plan pays for an external (FR-52) session (*P3b, as proposed*)? | **Decided 2026-10-20 (operator): it uses the quota of the org it is for, at that org's tier.** The outsider picks the org on `/connect`, from all of their orgs, and the session takes one of that org's concurrent-session slots. An account in no org uses Free's quota (one session), counted against the account; the operator confirmed this case on 2026-10-21 |
 | O7 | Do accounts in no paid org get no external sessions? | **Decided 2026-10-20 (operator): no, no paid org is needed.** FR-52's helping-a-friend case keeps working without membership |
+| O8 | P4c-0: do TURN bytes count toward the relay allowance, as the plan table says (*P4c, as proposed*)? | no: the allowance counts DERP bytes only |
+| O9 | P4c-1: do an over-allowance org's overlay pairs leave TURN for the DERP floor? | no: TURN is not throttled |
+| O10 | Do remote-desktop, conference, hive and tunnel TURN stay unthrottled, bounded by the session and meeting caps, rather than a second coturn listener per site with `max-bps`? | unthrottled |
 
 ## Out of scope
 
