@@ -1191,7 +1191,10 @@ pub(crate) async fn fail(
             fence,
         );
     }
-    let why = failure.why(&was);
+    // FR-116 AC4 — a person reads the reason (the room's note, the route's
+    // answer): both devices named as the device list names them.
+    let shown = room::promotion_for_people(&state.fleet.agents, before.tenant_id, &was).await;
+    let why = failure.why(&shown);
     info!(
         session = %session_id, to = %was.to, state = was.state.as_str(),
         reason = failure.reason(), "hive: promotion failed — nothing moved"
@@ -1210,8 +1213,8 @@ pub(crate) async fn fail(
         let note = match Kind::of(&was) {
             // P2f-3c — the session never moved: it is the fork that did not
             // happen.
-            Kind::Fork => room::fork_failed_note(&was, &why),
-            Kind::Promote | Kind::Teleport => room::move_failed_note(&was, &why),
+            Kind::Fork => room::fork_failed_note(&shown, &why),
+            Kind::Promote | Kind::Teleport => room::move_failed_note(&shown, &why),
         };
         room::note(state, &before, note).await;
     }
@@ -1384,7 +1387,8 @@ async fn drain_primary(
     }
     info!(session = %session_id, to = %p.to, "hive: the member is ready — the primary drains");
     let by = display_name(state, p.by).await;
-    room::note(state, s, room::moving_note(p, &by)).await;
+    let shown = room::promotion_for_people(&state.fleet.agents, s.tenant_id, p).await;
+    room::note(state, s, room::moving_note(&shown, &by)).await;
     true
 }
 
@@ -1433,9 +1437,10 @@ async fn begin_joining(state: &HiveState, s: &AgentSession, p: &Promotion) {
     crate::replica::push_join(state, &s, s.location.device_id, HiveReplicaRole::Primary);
     info!(session = %sid, to = %p.to, action = Kind::of(p).action(), "hive: the teleport's target is ready — it takes a copy first");
     let by = display_name(state, p.by).await;
+    let shown = room::promotion_for_people(&state.fleet.agents, s.tenant_id, p).await;
     let note = match Kind::of(p) {
-        Kind::Fork => room::fork_joining_note(p, &by),
-        Kind::Promote | Kind::Teleport => room::teleporting_note(p, &by),
+        Kind::Fork => room::fork_joining_note(&shown, &by),
+        Kind::Promote | Kind::Teleport => room::teleporting_note(&shown, &by),
     };
     room::note(state, &s, note).await;
     state.prepare_acks.deliver(p.id, p.to, PrepareAnswer::Ready);
@@ -1672,7 +1677,8 @@ async fn move_from_unreachable(
         "hive: the member is ready and the primary unreachable — the lease moves to the member's copy"
     );
     let by = display_name(state, p.by).await;
-    room::note(state, &now, room::moving_unreachable_note(&syncing, &by)).await;
+    let shown = room::promotion_for_people(&state.fleet.agents, now.tenant_id, &syncing).await;
+    room::note(state, &now, room::moving_unreachable_note(&shown, &by)).await;
     move_lease(state, &now, &syncing).await;
     // After the move: a move that failed answered the route itself.
     state
@@ -2081,7 +2087,9 @@ pub(crate) async fn on_launched(
         .write(state)
         .await;
     let by = display_name(state, p.by).await;
-    room::note(state, &s, room::moved_note(&s, &p, &by)).await;
+    let shown = room::for_people(&state.fleet.agents, &s).await;
+    let shown_p = room::promotion_for_people(&state.fleet.agents, s.tenant_id, &p).await;
+    room::note(state, &s, room::moved_note(&shown, &shown_p, &by)).await;
     true
 }
 
@@ -2138,8 +2146,9 @@ pub(crate) async fn on_start_refused(
     crate::view::end_grants_of_session(state, session_id, "moved").await;
     crate::stream::end_for_session(state, session_id, "moved");
     let detail = crate::agent_socket::clamp_words(detail, hive_limits::MAX_DETAIL_LEN);
-    let why = Failure::PrepareRefused { word, detail }.why(&p);
-    room::note(state, &s, room::move_failed_note(&p, &why)).await;
+    let shown = room::promotion_for_people(&state.fleet.agents, s.tenant_id, &p).await;
+    let why = Failure::PrepareRefused { word, detail }.why(&shown);
+    room::note(state, &s, room::move_failed_note(&shown, &why)).await;
     send_member_joins(state, &s);
     // P2e-6b — from the device itself, back as it left it; or, for one that
     // never answered the start it was moved, from where that start came.

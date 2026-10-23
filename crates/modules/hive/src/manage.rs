@@ -333,7 +333,8 @@ pub async fn manage(
         .find(sid)
         .await?
         .ok_or_else(|| ApiError::Internal("the session record vanished".into()))?;
-    room::note(&state, &s, room::managing_note(&s, &user.display_name)).await;
+    let shown = room::for_people(&state.fleet.agents, &s).await;
+    room::note(&state, &s, room::managing_note(&shown, &user.display_name)).await;
     if s.replicaset.is_some() {
         Audit {
             tenant_id: tid,
@@ -451,10 +452,11 @@ pub(crate) async fn restore(
     }
     info!(session = %sid, word, "hive: the terminal session is the adopted one it was again");
     if let Ok(Some(now)) = state.sessions.find(sid).await {
+        let shown = room::for_people(&state.fleet.agents, &now).await;
         room::note(
             state,
             &now,
-            room::manage_refused_note(&now, word, detail.as_deref()),
+            room::manage_refused_note(&shown, word, detail.as_deref()),
         )
         .await;
     }
