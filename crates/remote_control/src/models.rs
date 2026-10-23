@@ -1240,6 +1240,14 @@ pub enum RpcCap {
     /// advertising this. No other verb starts with `peer`, and matching stays
     /// equality regardless.
     PeerAuth,
+    /// FR-90 P4-3 — this build answers `rc:knowhow.scan`: it reads the roots
+    /// its owner lists in `knowhow_scan_roots` (decision 38) and answers
+    /// `rc:knowhow.scanned`. The server asks no device that does not
+    /// advertise it, since one that cannot scan would never answer.
+    ///
+    /// A BUILD property: a device whose owner lists no root still advertises
+    /// it, and answers `no_roots`.
+    KnowhowScan,
 }
 
 impl RpcCap {
@@ -1289,11 +1297,12 @@ impl RpcCap {
             Self::ExternalAccess => "external-access",
             Self::ExternalSession => "external-session",
             Self::PeerAuth => "peer-auth",
+            Self::KnowhowScan => "knowhow-scan",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 38] = [
+    pub const ALL: [RpcCap; 39] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1332,6 +1341,7 @@ impl RpcCap {
         Self::ExternalAccess,
         Self::ExternalSession,
         Self::PeerAuth,
+        Self::KnowhowScan,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -7566,6 +7576,7 @@ mod tests {
         assert_eq!(RpcCap::ExternalAccess.wire(), "external-access");
         assert_eq!(RpcCap::ExternalSession.wire(), "external-session");
         assert_eq!(RpcCap::PeerAuth.wire(), "peer-auth");
+        assert_eq!(RpcCap::KnowhowScan.wire(), "knowhow-scan");
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`

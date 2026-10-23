@@ -166,6 +166,11 @@ mod key_rotation_tests;
 /// an evicted node's facts gone with it; a machine's room kept for the sync.
 #[cfg(test)]
 mod knowhow_network_sync_tests;
+/// FR-90 P4-3a-1 — a scan asked, delivered on the device's own connection
+/// and answered once; the refusals; no doubling; a hello's delivery and its
+/// repeat; a forged answer dropped; the sweep; expiry.
+#[cfg(test)]
+mod knowhow_scan_tests;
 /// FR-90 P4-2a — the fleet's devices mirrored onto the map: a hello's
 /// machine, the fleet's changes, the fleet's facts kept the fleet's, a
 /// removal's archive, and the reconcile that retires what is gone.

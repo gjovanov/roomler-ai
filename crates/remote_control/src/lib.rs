@@ -40,6 +40,9 @@ pub mod derp_frame;
 pub mod derp_ticket;
 pub mod error;
 pub mod hive;
+/// FR-90 P4-3 — knowhow's scan vocabulary: a scan's findings, their bounds,
+/// and the credential shapes both ends refuse.
+pub mod knowhow;
 pub mod models;
 pub mod permissions;
 pub mod serde_helpers;

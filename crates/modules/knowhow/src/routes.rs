@@ -87,7 +87,7 @@ pub(crate) async fn member_tenant(
 
 /// A reader's organization: `KNOWHOW_VIEW`, or `KNOWHOW_EDIT`, which
 /// includes it.
-async fn reader(
+pub(crate) async fn reader(
     state: &KnowhowState,
     tenant_id: &str,
     auth: &AuthUser,
@@ -108,7 +108,7 @@ async fn reader(
 }
 
 /// A writer's organization: `KNOWHOW_EDIT`.
-async fn writer(
+pub(crate) async fn writer(
     state: &KnowhowState,
     tenant_id: &str,
     auth: &AuthUser,
@@ -125,7 +125,7 @@ async fn writer(
     Ok(tid)
 }
 
-fn parse_id(raw: &str, what: &str) -> Result<ObjectId, ApiError> {
+pub(crate) fn parse_id(raw: &str, what: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(raw).map_err(|_| ApiError::BadRequest(format!("Invalid {what}")))
 }
 
@@ -133,7 +133,7 @@ fn bad(why: String) -> ApiError {
     ApiError::BadRequest(why)
 }
 
-fn limit_of(raw: Option<i64>) -> Result<i64, ApiError> {
+pub(crate) fn limit_of(raw: Option<i64>) -> Result<i64, ApiError> {
     match raw {
         None => Ok(DEFAULT_LIMIT),
         Some(n) if (1..=MAX_LIMIT).contains(&n) => Ok(n),
