@@ -492,6 +492,10 @@ objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString",
     "NSThread",
 ] }
+# FR-97 P2d-2a — the CoreFoundation types Text Input Sources speaks (the
+# keyboard layout, `input::layout_mac`), called on the main loop above. Already
+# in the lockfile (0.10.1, through core-graphics), so no new supply chain.
+core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Effort 2 (Windows Service deployment mode). Optional opt-in alternative
@@ -664,7 +668,7 @@ viewer-indicator-x11 = ["dep:x11rb"]
 # ⚠️ Requires the daemon's tokio runtime to be OFF the main thread: AppKit
 # delivers events on the main run loop, and `#[tokio::main]` parks it forever.
 # `main.rs` does that swap under this same feature.
-viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:core-foundation"]
 # System / desktop audio → WebRTC Opus track (opt-in per session via
 # `ServerMsg::Request.audio_enabled`). Pulls in the Opus encoder
 # (audiopus, bundled libopus from C source) and the cpal capture backend

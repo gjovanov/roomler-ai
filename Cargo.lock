@@ -9507,6 +9507,7 @@ dependencies = [
  "chrono",
  "clap",
  "clipboard-win",
+ "core-foundation 0.10.1",
  "cpal",
  "crypto_box",
  "dashmap",

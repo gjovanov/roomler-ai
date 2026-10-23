@@ -83,6 +83,44 @@ fn shared() -> &'static Mutex<Shared> {
 /// caller fall back to the companion.
 static PUMPING: AtomicBool = AtomicBool::new(false);
 
+/// FR-97 P2d-2a — work that must run on the MAIN thread, handed to [`pump`]
+/// the way a prompt is: queued here, run on its next pass, its answer sent
+/// back. Text Input Sources (the keyboard layout) needs it: recent macOS
+/// asserts those calls are made on the main thread, which is AppKit's.
+type MainJob = Box<dyn FnOnce(MainThreadMarker) + Send>;
+
+fn main_jobs() -> &'static Mutex<Vec<MainJob>> {
+    static JOBS: OnceLock<Mutex<Vec<MainJob>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whether [`on_main`] has a main thread to run on: [`run_main_loop`] is
+/// pumping in this process (not in a CLI call, nor in a test).
+pub fn main_loop_running() -> bool {
+    PUMPING.load(Ordering::SeqCst)
+}
+
+/// Run `f` on the main thread and wait up to `timeout` for its answer, which
+/// comes on the pump's next pass (it blocks at most 120 ms between passes).
+/// `None` without a pumping main loop, when the answer is late, and when
+/// called FROM the main thread, where it would wait for itself.
+pub fn on_main<R: Send + 'static>(
+    timeout: std::time::Duration,
+    f: impl FnOnce(MainThreadMarker) -> R + Send + 'static,
+) -> Option<R> {
+    if !main_loop_running() || MainThreadMarker::new().is_some() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    main_jobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Box::new(move |mtm| {
+            let _ = tx.send(f(mtm));
+        }));
+    rx.recv_timeout(timeout).ok()
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Inner;
 
@@ -173,6 +211,15 @@ pub fn run_main_loop() -> ! {
 
 /// One AppKit-side step. MAIN THREAD ONLY (the `MainThreadMarker` proves it).
 fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
+    // FR-97 P2d-2a — queued main-thread work ([`on_main`]) first. A job that
+    // panics is contained: this thread is AppKit's for the daemon's whole life.
+    let jobs = std::mem::take(&mut *main_jobs().lock().unwrap_or_else(|e| e.into_inner()));
+    for job in jobs {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(mtm))).is_err() {
+            tracing::warn!("indicator: a main-thread job panicked");
+        }
+    }
+
     let (view, dirty) = {
         let mut s = shared().lock().unwrap();
         let d = std::mem::take(&mut s.dirty);

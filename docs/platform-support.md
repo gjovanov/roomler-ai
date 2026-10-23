@@ -1,8 +1,8 @@
 # Platform support — what each OS serves, and why where it does not
 
 > **FR-97** ([#2082](https://github.com/gjovanov/roomler-ai/issues/2082),
-> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.153** (2026-10-22); a row that says
-> "from 0.4.154" or "since 0.4.154" is on master for the next release. The spec's §2 is the register this page was built from: each
+> [spec](fr/FR-97-os-feature-parity.md)). This is agent **0.4.154** (2026-10-23); a row that says
+> "from 0.4.155" or "since 0.4.155" is on master for the next release. The spec's §2 is the register this page was built from: each
 > gap's evidence, its phase and its field run. This page says what is true now. A change that
 > moves a row moves it here, in the same PR.
 >
@@ -25,7 +25,7 @@ other two, or the device says why it cannot, in its hello and on screen.
 A capability word in the hello promises that this device serves the feature, on this OS, now.
 What a host cannot keep, the daemon takes out and explains in `AgentCaps.unavailable`, a map
 of feature → `{code, reason}` (`crates/remote_control/src/models.rs:534`, its keys at `:557`).
-One seam decides it, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:820`), over
+One seam decides it, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:831`), over
 plain facts about the host, so the decision runs and is tested on every OS. Features with a
 channel of their own say no there: capture as `rc:media-unavailable` (FR-80), input as
 `rc:input-reach` (FR-93), Remote Apps in its `unavailable` reply (FR-56), and privacy mode as
@@ -97,17 +97,17 @@ flowchart LR
 | The lock and sign-in screens, nobody signed in | ✅ SystemContext | 🟡 only with `drm_capture = true`, set by the operator | ⛔ | §8 |
 | The computer's sound in a session | ✅ WASAPI loopback | ✅ the default output's monitor, through Pulse's client library, per-user and system installs (FR-97 P3c) | ❌ no capture backend, so no audio track, and the reason `no-backend` | `agents/roomlerd/src/audio/pulse.rs:3-9`; macOS: `agents/roomlerd/src/audio/mod.rs:99` |
 | Recording with sound | ✅ the computer and the microphone | ✅ | 🟡 picture only | cpal, the capture crate, is not built for macOS (`agents/roomlerd/Cargo.toml:400-404`) |
-| Ctrl+Alt+Del | ✅ the real sequence from a SystemContext install where the policy lets services; elsewhere three ordinary keys, and it says so | ⛔ keys only | ⛔ hidden | `agents/roomlerd/src/input/sas.rs:3-25`; the words at `agents/roomlerd/src/encode/caps.rs:887-899`; §8 |
+| Ctrl+Alt+Del | ✅ the real sequence from a SystemContext install where the policy lets services; elsewhere three ordinary keys, and it says so | ⛔ keys only | ⛔ hidden | `agents/roomlerd/src/input/sas.rs:3-25`; the words at `agents/roomlerd/src/encode/caps.rs:898-910`; §8 |
 | The consent panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the companion asks | ✅ from 0.4.153: the native panel (FR-97 P2b), drawn by the root half too on a supervised Mac; the companion stays the fallback | `viewer-indicator-macos` joined the macOS release build (`.github/workflows/release-agent.yml:2581`) after the real-Mac procedure (FR-97 D3): on a tart Mac and on the operator's MacBook the panel came up, and Approve and Deny each answered |
 | "Host is locked" hint, in a session and before consent | ✅ | 🟡 in a session: advisory, from logind's `LockedHint`; a Linux lock screen is captured and takes input like any other. Not yet while a request waits for consent | ✅ both since 0.4.150, advisory, from the session dictionary (FR-97 P2d-1); whether the lock screen takes typed input is not measured, so the viewer's chip claims neither way | `agents/roomlerd/src/lock_state.rs:335-349`; macOS: `agents/roomlerd/src/lock_state.rs:301-320`, `:352-366`; `docs/remote-control.md` §5.1d |
 | The host's cursor shape, drawn by the viewer | ✅ | ✅ X11, read from XFixes (FR-97 P3a, from 0.4.147), and the DRM arm's hardware cursor (FR-93 P3c) · a per-user Wayland compositor draws it into the picture instead | ❌ WindowServer draws the pointer into the picture | `agents/roomlerd/src/capture/cursor.rs:128-165`, `agents/roomlerd/src/capture/x11_cursor.rs`; `docs/linux-capture.md` §2.1, `docs/wayland.md` §2 |
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: the windows Xwayland owns | ❌ | `Unavailable::Platform` (`agents/roomlerd/src/apps/mod.rs:207`); `docs/remote-apps.md` |
-| Keyboard layout report and switch | ✅ | ✅ an X11 desktop with a per-user install (FR-97 P3e, from 0.4.148); 🟡 GNOME on Xorg reports its layout and is not switched, because GNOME Shell puts its own input source back · ❌ under Wayland, where the compositor owns the layout and shares no way to read or set it, and on a system install, which has no X connection | ❌ | `agents/roomlerd/src/input/layout_x11.rs:62`, `:79`, `agents/roomlerd/src/encode/caps.rs:860`; `docs/remote-control.md` §18.3.2 |
+| Keyboard layout report and switch | ✅ | ✅ an X11 desktop with a per-user install (FR-97 P3e, from 0.4.148); 🟡 GNOME on Xorg reports its layout and is not switched, because GNOME Shell puts its own input source back · ❌ under Wayland, where the compositor owns the layout and shares no way to read or set it, and on a system install, which has no X connection | ✅ from 0.4.155 (FR-97 P2d-2a): Text Input Sources, called on AppKit's main thread | `agents/roomlerd/src/input/layout_x11.rs:62`, `:79`, `agents/roomlerd/src/encode/caps.rs:871`; a Mac's `agents/roomlerd/src/input/layout_mac.rs:54`; `docs/remote-control.md` §18.3.2, §18.3.3 |
 | Typing text on a non-US layout | ✅ | ✅ through uinput, the host's own XKB keymap (FR-97 P3f, from 0.4.147); without libxkbcommon, a US table, and other layouts refuse rather than mistype | ✅ | `agents/roomlerd/src/input/keylayout/xkb.rs:82`, `agents/roomlerd/src/input/keylayout.rs:23-26`; `docs/linux-capture.md` §3 |
 | Match the remote display to the viewer | ✅ | ✅ a person's own X11 display with one active output, a per-user install (FR-97 P3e-2, from 0.4.148), and the daemon's own virtual desktop on Xorg's dummy driver · ❌ Wayland, a system install, several active outputs | ❌ | `agents/roomlerd/src/display_match.rs:739-744`, `:262`; `docs/display-match.md` |
-| Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:796-814`; FR-93 P7 |
+| Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:807-825`; FR-93 P7 |
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ✅ from 0.4.154, through the pasteboard's change count (FR-97 P2e-1); before it, on request only | image watching rides Windows' clipboard sequence number, on X11 the change gate (`agents/roomlerd/src/clipboard.rs:643`, `:1148`), on a Mac the change count (`agents/roomlerd/src/clipboard.rs:756`); `docs/remote-control.md`, the watcher on X11 and on a Mac |
-| Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:1660-1664` |
+| Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:1671-1675` |
 | An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:541`); `docs/wayland.md` |
 | The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:625`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
@@ -186,8 +186,8 @@ Release feature sets per OS, which decide what ships: Linux x86_64
 
 | Feature | OS | Why |
 |---|---|---|
-| Ctrl+Alt+Del | Linux | The desktop owns the chord, and GNOME and KDE bind it to log out, so the button types keys and says so (`agents/roomlerd/src/encode/caps.rs:893-896`). Hiding it would take away a key that does something |
-| Ctrl+Alt+Del | macOS | The chord has no system meaning on a Mac, so the viewer hides the button (`not-applicable`, `agents/roomlerd/src/encode/caps.rs:897-900`) |
+| Ctrl+Alt+Del | Linux | The desktop owns the chord, and GNOME and KDE bind it to log out, so the button types keys and says so (`agents/roomlerd/src/encode/caps.rs:904-907`). Hiding it would take away a key that does something |
+| Ctrl+Alt+Del | macOS | The chord has no system meaning on a Mac, so the viewer hides the button (`not-applicable`, `agents/roomlerd/src/encode/caps.rs:908-911`) |
 | The consent panel on a Wayland desktop | Linux | GNOME and KDE give an ordinary client no `wlr-layer-shell`, so nothing can draw a panel over their desktop. The companion asks instead, over the LocalAPI, by design (FR-27) |
 | The lock and sign-in screens | macOS | A capture needs a GUI login session. Reaching the login window takes an agent in the LoginWindow session and an MDM privacy profile: a different product posture, out of scope until a customer asks (FR-97 §7) |
 | Privacy mode | macOS | Since macOS 15 no public API keeps a window out of capture: ScreenCaptureKit ignores `NSWindow.sharingType = .none` (`docs/privacy-mode.md`, Platforms) |
