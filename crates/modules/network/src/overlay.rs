@@ -204,6 +204,13 @@ async fn handle_overlay_warm_relay_request(state: &NetworkState, ident: NodeIden
         return;
     };
     let Some(self_id) = self_node.id else { return };
+    // FR-115 P4c-1 — no standing TURN allocation for an org over its relay
+    // allowance: its pairs ride the DERP floor. Warm creds are a latency
+    // optimisation, never reach, so withholding them refuses nothing.
+    if turn_withheld(state, &self_node) && self_node.supports_derp {
+        debug!(node = %self_id, "overlay relay: org over its relay allowance — no warm creds (P4c-1)");
+        return;
+    }
     let warm_key = self_id.to_hex();
     // C4 stage 1.5 — long-lived creds: the cred timestamp bounds the
     // allocation's TOTAL life (refreshes re-authenticate with the same
@@ -921,6 +928,40 @@ async fn handle_overlay_relay_request(
     // one keeps exactly the path it has today.
     crate::org_relay::maybe_mint(state, &self_node, &peer).await;
 
+    // FR-115 P4c-1 — an org over its relay allowance keeps this pair on the
+    // DERP floor: no TURN grant, the verdict stamped DERP on both ends now,
+    // and a pin for ends too old to read the verdict. The org relay offer
+    // above still stands, because an org relay is never metered.
+    if keeps_pair_on_derp(
+        turn_withheld(state, &self_node),
+        self_node.supports_derp,
+        peer.supports_derp,
+        evidence.derp_mux_failed,
+    ) {
+        if forced_derp_enabled() {
+            for (to, other_id) in [(&self_node, peer_node_id), (&peer, self_id)] {
+                if to.supports_forced_derp && !to.supports_server_relay_strategy {
+                    send_to_node(
+                        state,
+                        to,
+                        ServerMsg::OverlayForceDerp {
+                            peer_node_id: other_id,
+                            ttl_ms: FORCED_DERP_TTL.as_millis() as u64,
+                            derp_url: None,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        fan_pair_verdicts(state, &self_node, &peer).await;
+        debug!(
+            %self_id, peer = %peer_node_id,
+            "overlay relay: org over its relay allowance — the pair stays on DERP, no TURN grant (P4c-1)"
+        );
+        return;
+    }
+
     let pair_key = pair_key(self_id, peer_node_id);
 
     // P7 — forced-DERP escalation: a request that lands shortly after a prior
@@ -1280,6 +1321,41 @@ async fn repush_forced_pairs_on_join(state: &NetworkState, node: &OverlayNode) {
 /// when something OUT of band changes the node's wire shape (Phase 1: an admin
 /// approving/revoking its subnet `routes`), so peers pick it up immediately
 /// instead of waiting for the next join. Best-effort.
+/// FR-115 P4c-1 — re-stamp every pair of these networks, whose org just
+/// entered or left the over-allowance set: each live node is re-fanned, and
+/// a fan re-stamps its edges both ways, so each edge's verdict follows the
+/// allowance now. A node on another pod is skipped by [`send_to_node`], as in
+/// every fan; that pod re-stamps its own when its refresh sees the change.
+pub async fn refan_networks(state: &NetworkState, networks: &[ObjectId]) {
+    for network_id in networks {
+        let tenant_id = match state.overlay_networks.base.find_by_id(*network_id).await {
+            Ok(n) => n.tenant_id,
+            Err(e) => {
+                debug!(%network_id, %e, "overlay: allowance refan — network not found");
+                continue;
+            }
+        };
+        let nodes = match state
+            .overlay_nodes
+            .list_active_in_network(tenant_id, *network_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(%network_id, %e, "overlay: allowance refan — node list failed");
+                continue;
+            }
+        };
+        for node in &nodes {
+            refan_node(state, node).await;
+        }
+        tracing::info!(
+            %network_id, nodes = nodes.len(),
+            "overlay: relay allowance changed — the network's pairs re-stamped (P4c-1)"
+        );
+    }
+}
+
 pub async fn refan_node(state: &NetworkState, node: &OverlayNode) {
     // P9 — an out-of-band refan (admin route approval) can target a node
     // that is currently offline; carry its real presence, not a blanket true.
@@ -2239,14 +2315,17 @@ fn server_relay_verdict(
     peer: &OverlayNode,
 ) -> Option<RelayStrategyWire> {
     // Force-DERP pin wins first (the server owns it), gated on both ends'
-    // DERP support exactly as the client's pin check is.
+    // DERP support exactly as the client's pin check is. FR-115 P4c-1 pins
+    // the same way while the org is over its relay allowance.
     let pinned = recipient.supports_derp
         && peer.supports_derp
-        && matches!((recipient.id, peer.id), (Some(a), Some(b))
-            if state
-                .relay_pair_churn
-                .get(&pair_key(a, b))
-                .is_some_and(|pc| forced_active(&pc, Instant::now())));
+        && (turn_withheld(state, recipient)
+            || turn_withheld(state, peer)
+            || matches!((recipient.id, peer.id), (Some(a), Some(b))
+                if state
+                    .relay_pair_churn
+                    .get(&pair_key(a, b))
+                    .is_some_and(|pc| forced_active(&pc, Instant::now()))));
     // FR-19 — an ACTIVE org-relay session for this pair outranks every rule
     // below: the mint already applied the gates, and the client cascade picks
     // Org over Turn/Derp when a session exists (§6). Gated on BOTH ends'
@@ -2262,6 +2341,29 @@ fn server_relay_verdict(
         return Some(RelayStrategyWire::OrgRelay);
     }
     verdict_from_nodes(recipient, peer, pinned)
+}
+
+/// FR-115 P4c-1 — whether this node's org is over its relay allowance with
+/// the switch on (`relay_allowance.turn`): its overlay pairs then leave TURN
+/// for the DERP floor, where the throttle (P4a) holds bulk to the plan's rate
+/// and never a handshake. One relaxed load while no network is over.
+fn turn_withheld(state: &NetworkState, node: &OverlayNode) -> bool {
+    state.settings.relay_allowance.turn
+        && crate::relay_allowance::rate_of(&node.network_id).is_some()
+}
+
+/// FR-115 P4c-1 — keep a relay request's pair on the DERP floor instead of
+/// granting it TURN? Only while the org is over its allowance (`withheld`),
+/// both ends can ride DERP, and the requester's `/derp` is up. Any other
+/// pair is granted TURN as before: withholding it there would refuse the
+/// pair, which the allowance never does.
+fn keeps_pair_on_derp(
+    withheld: bool,
+    requester_derp: bool,
+    peer_derp: bool,
+    derp_mux_failed: bool,
+) -> bool {
+    withheld && requester_derp && peer_derp && !derp_mux_failed
 }
 
 /// U2 — the node-level verdict (the pin resolved to a bool by the caller so
@@ -3078,6 +3180,31 @@ mod tests {
         assert!(effective_udp_ok(true, Some(true), None));
         // srflx gates everything, flags or not.
         assert!(!effective_udp_ok(false, Some(true), Some(true)));
+    }
+
+    /// FR-115 P4c-1 — TURN is withheld only from a pair that has a working
+    /// DERP floor at both ends; every other pair keeps its grant, because
+    /// the allowance throttles and never refuses.
+    #[test]
+    fn only_a_pair_with_a_derp_floor_is_kept_off_turn() {
+        // (withheld, requester DERP, peer DERP, requester's /derp failed)
+        assert!(keeps_pair_on_derp(true, true, true, false));
+        assert!(
+            !keeps_pair_on_derp(false, true, true, false),
+            "an org inside its allowance keeps TURN"
+        );
+        assert!(
+            !keeps_pair_on_derp(true, false, true, false),
+            "a requester that cannot ride DERP keeps TURN"
+        );
+        assert!(
+            !keeps_pair_on_derp(true, true, false, false),
+            "a peer that cannot ride DERP keeps TURN"
+        );
+        assert!(
+            !keeps_pair_on_derp(true, true, true, true),
+            "a requester whose /derp failed keeps TURN, or the pair would go dark"
+        );
     }
 
     /// U2 — the PARITY LOCK: the server's pure verdict core must reproduce the

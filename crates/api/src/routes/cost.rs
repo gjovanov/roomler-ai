@@ -522,8 +522,9 @@ pub async fn tenant_resources(
 
 /// FR-115 P4a — the org's relay allowance this month, as the throttle reads
 /// it (`roomler_ai_services::relay_allowance`, the same functions): the bytes
-/// relayed through DERP since the first of the month (UTC) against the
-/// plan's allowance for its seats. In units, never money (FR-20).
+/// relayed through DERP (and TURN, with P4c-0's `count_turn`) since the first
+/// of the month (UTC) against the plan's allowance for its seats. In units,
+/// never money (FR-20).
 ///
 /// `null` where plans are not sold (self-hosting has no allowance) and on
 /// any error: the panel that polls this degrades, it never fails over it.
@@ -532,9 +533,13 @@ async fn relay_quota(state: &Core, tid: ObjectId) -> serde_json::Value {
         return serde_json::Value::Null;
     }
     let now = bson::DateTime::now();
+    let s = &state.settings.relay_allowance;
     let (tenant, used) = match (
         state.tenants.base.find_by_id(tid).await,
-        state.stats.relay_month_to_date(Some(tid), now).await,
+        state
+            .stats
+            .relay_month_to_date(Some(tid), now, s.count_turn)
+            .await,
     ) {
         (Ok(t), Ok(used)) => (t, used.get(&tid).copied().unwrap_or(0)),
         (Err(e), _) | (_, Err(e)) => {
@@ -542,7 +547,6 @@ async fn relay_quota(state: &Core, tid: ObjectId) -> serde_json::Value {
             return serde_json::Value::Null;
         }
     };
-    let s = &state.settings.relay_allowance;
     let seats = tenant.billed_seats();
     let allowance = relay_allowance::allowance_bytes(&tenant.plan, seats);
     let over = relay_allowance::rate_for(&tenant.plan, seats, used, s).is_some();
@@ -562,6 +566,9 @@ async fn relay_quota(state: &Core, tid: ObjectId) -> serde_json::Value {
             // Recomputed here; the throttle's own job runs every five
             // minutes, so the two agree within one job period.
             "throttled": s.enabled && over,
+            // FR-115 P4c-0 — whether TURN bytes count toward `used_bytes`
+            // (remote desktop and meetings included), or DERP alone.
+            "counts_turn": s.count_turn,
         }
     })
 }

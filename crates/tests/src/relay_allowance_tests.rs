@@ -6,15 +6,19 @@
 //! month, with the kill switch off, or on a server that sells no plans,
 //! nothing is.
 //!
-//! The process-wide map `forward_frame` reads is the unit tests'
-//! (`relay_allowance::tests`): these tests read what the job COMPUTES and
-//! PUBLISHES, which is scoped to each test's own database.
+//! Most of these read what the job COMPUTES and PUBLISHES, which is scoped to
+//! each test's own database. The pod's map that `forward_frame` and P4c-1
+//! read is process-wide, but each entry is tagged with its database and an
+//! app's refresh replaces only its own, so the P4c-1 test can drive it
+//! through `refresh` while other apps' refreshes run beside it.
 
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use roomler_ai_mod_network::{NetworkState, relay_allowance};
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
 
+use crate::agent_presence_tests::{connect_agent, enroll};
 use crate::fixtures::test_app::TestApp;
+use crate::knowhow_scan_tests::recv_t;
 
 const GB: i64 = 1_000_000_000;
 
@@ -38,6 +42,11 @@ fn enable(s: &mut roomler_ai_config::Settings) {
 /// the hourly tier for a completed hour when the month has one, the rest in
 /// the raw tier's open hour.
 async fn relayed_this_month(app: &TestApp, tenant: ObjectId, bytes: i64) {
+    relayed_this_month_as(app, tenant, "derp_bytes", bytes).await;
+}
+
+/// [`relayed_this_month`] for any relay meter (`derp_bytes`, `turn_bytes`).
+async fn relayed_this_month_as(app: &TestApp, tenant: ObjectId, meter: &str, bytes: i64) {
     let now = DateTime::now();
     let start = relay_allowance::month_start(now);
     let hour = DateTime::from_millis(now.timestamp_millis() / 3_600_000 * 3_600_000);
@@ -47,18 +56,25 @@ async fn relayed_this_month(app: &TestApp, tenant: ObjectId, bytes: i64) {
         (0, bytes)
     };
     if hourly > 0 {
-        usage_row(app, "stats_usage_1h", tenant, start, hourly).await;
+        usage_row(app, "stats_usage_1h", tenant, meter, start, hourly).await;
     }
-    usage_row(app, "stats_usage", tenant, now, raw).await;
+    usage_row(app, "stats_usage", tenant, meter, now, raw).await;
 }
 
-async fn usage_row(app: &TestApp, coll: &str, tenant: ObjectId, ts: DateTime, value: i64) {
+async fn usage_row(
+    app: &TestApp,
+    coll: &str,
+    tenant: ObjectId,
+    meter: &str,
+    ts: DateTime,
+    value: i64,
+) {
     app.db
         .collection::<Document>(coll)
         .insert_one(doc! {
-            "_id": format!("{}:derp_bytes:{}:{}", tenant.to_hex(), ts.timestamp_millis() / 1000, ObjectId::new().to_hex()),
+            "_id": format!("{}:{meter}:{}:{}", tenant.to_hex(), ts.timestamp_millis() / 1000, ObjectId::new().to_hex()),
             "tenant_id": tenant,
-            "meter": "derp_bytes",
+            "meter": meter,
             "ts": ts,
             "value": value,
         })
@@ -160,7 +176,15 @@ async fn last_months_relay_does_not_count() {
     network_of(&app, tid).await;
     let start = relay_allowance::month_start(DateTime::now());
     let last_month = DateTime::from_millis(start.timestamp_millis() - 86_400_000);
-    usage_row(&app, "stats_usage_1h", tid, last_month, 50 * GB).await;
+    usage_row(
+        &app,
+        "stats_usage_1h",
+        tid,
+        "derp_bytes",
+        last_month,
+        50 * GB,
+    )
+    .await;
 
     let set = relay_allowance::compute(net(&app), DateTime::now())
         .await
@@ -426,5 +450,224 @@ async fn the_poller_pushes_the_signed_set_to_the_pops() {
         exporter_posts.load(Ordering::Relaxed),
         0,
         "an endpoint whose GET reports no allowance is never pushed to"
+    );
+}
+
+/// FR-115 P4c-0 — with `count_turn`, an org pushed past its allowance by
+/// TURN bytes alone enters the set at its plan's rate, and its page reads the
+/// same total. Without it (the default), TURN does not count: the red half.
+#[tokio::test]
+async fn turn_bytes_count_toward_the_allowance_only_with_count_turn() {
+    for count_turn in [false, true] {
+        let app = TestApp::spawn_with_settings(move |s| {
+            enable(s);
+            s.relay_allowance.count_turn = count_turn;
+        })
+        .await;
+        let t = app
+            .seed_tenant(if count_turn {
+                "fr115p4c0on"
+            } else {
+                "fr115p4c0off"
+            })
+            .await;
+        let tid = oid(&t.tenant_id);
+        let network = network_of(&app, tid).await;
+        relayed_this_month_as(&app, tid, "turn_bytes", 11 * GB).await;
+
+        let set = relay_allowance::compute(net(&app), DateTime::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            set.get(&network).copied(),
+            count_turn.then_some(125_000),
+            "count_turn={count_turn}: a Free org past 10 GB by TURN alone"
+        );
+        let used = app
+            .state
+            .stats
+            .relay_month_to_date(Some(tid), DateTime::now(), count_turn)
+            .await
+            .unwrap();
+        assert_eq!(
+            used.get(&tid).copied().unwrap_or(0),
+            if count_turn { 11 * GB as u64 } else { 0 },
+            "what the page reads is what the throttle reads"
+        );
+    }
+}
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Join the overlay as a node that rides DERP, with a server-reflexive
+/// address (so its capability verdict is single-relay, not DERP).
+/// `verdicts` = it reads the server's relay verdict; else it is an older
+/// node that honours only a forced-DERP pin.
+async fn join_derp(ws: &mut Ws, seed: u8, verdicts: bool) {
+    use base64::Engine as _;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let join = serde_json::json!({
+        "t": "rc:overlay.join",
+        "wg_public_key": base64::engine::general_purpose::STANDARD.encode([seed; 32]),
+        "mtu": 1280,
+        "endpoints": [format!("203.0.113.{seed}:41641")],
+        "supports_derp": true,
+        "supports_forced_derp": true,
+        "supports_relay_single": true,
+        "supports_server_relay_strategy": verdicts,
+    });
+    ws.send(Message::Text(join.to_string().into()))
+        .await
+        .expect("send join");
+    recv_t(ws, "rc:overlay.netmap", std::time::Duration::from_secs(5))
+        .await
+        .expect("a netmap answers the join");
+    let srflx = serde_json::json!({
+        "t": "rc:overlay.srflx",
+        "candidates": [format!("198.51.100.{seed}:41641")],
+    });
+    ws.send(Message::Text(srflx.to_string().into()))
+        .await
+        .expect("send srflx");
+}
+
+async fn relay_request(ws: &mut Ws, peer: ObjectId) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let req = serde_json::json!({ "t": "rc:overlay.relay_request", "peer_node_id": peer.to_hex() });
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send relay_request");
+}
+
+/// The relay verdict the next netmap delta carrying `peer`'s row stamps on
+/// it (`"none"` when the row carries no verdict), or `None` after `wait`.
+async fn verdict_for(ws: &mut Ws, peer: ObjectId, wait: std::time::Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let delta = recv_t(ws, "rc:overlay.netmap_delta", left).await?;
+        let row = delta["upserts"]
+            .as_array()
+            .and_then(|u| u.iter().find(|r| r["node_id"] == peer.to_hex()).cloned());
+        if let Some(row) = row {
+            return Some(row["relay_strategy"].as_str().unwrap_or("none").to_string());
+        }
+    }
+}
+
+async fn live_node(
+    app: &TestApp,
+    tid: ObjectId,
+    machine: &str,
+) -> roomler_ai_remote_control::models::OverlayNode {
+    app.state
+        .network()
+        .overlay_nodes
+        .find_live_by_tenant_and_machine(tid, machine)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no live node for {machine}"))
+}
+
+/// FR-115 P4c-1 — an over-allowance org's overlay pairs leave TURN for the
+/// DERP floor: the verdict flips to DERP the moment the pod reads the set,
+/// a relay request gets no TURN grant, an older node is pinned instead, and
+/// once the org is back under, the pair regrades and TURN is granted again.
+/// Inside the allowance the same pair is granted TURN: the red half.
+#[tokio::test]
+async fn an_over_allowance_orgs_pairs_leave_turn_for_the_derp_floor() {
+    use std::time::Duration;
+    let app = TestApp::spawn_with_settings(|s| {
+        enable(s);
+        s.relay_allowance.turn = true;
+    })
+    .await;
+    let Some(redis) = app.state.redis_pubsub.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let seeded = app.seed_tenant("fr115p4c1").await;
+    let tid = oid(&seeded.tenant_id);
+    let mut ws: Vec<Ws> = Vec::new();
+    for m in ["p4c1-a", "p4c1-b", "p4c1-c"] {
+        let (_, token) = enroll(&app, &seeded, m).await;
+        ws.push(connect_agent(&app, &token).await);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let [a, b, c] = &mut ws[..] else {
+        unreachable!()
+    };
+    join_derp(a, 1, true).await;
+    join_derp(b, 2, true).await;
+    join_derp(c, 3, false).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a_node = live_node(&app, tid, "p4c1-a").await;
+    let (a_id, b_id) = (
+        a_node.id.unwrap(),
+        live_node(&app, tid, "p4c1-b").await.id.unwrap(),
+    );
+    let network = a_node.network_id;
+
+    // Inside the allowance: a TURN grant, as before P4c.
+    relay_request(a, b_id).await;
+    assert!(
+        recv_t(a, "rc:overlay.relay_grant", Duration::from_secs(5))
+            .await
+            .is_some(),
+        "inside the allowance, the pair is granted TURN"
+    );
+
+    // Drop what the joins and srflx updates queued, so the next delta read
+    // is the re-stamp's, not a stale row with the old verdict.
+    let drain = Duration::from_millis(500);
+    recv_t(a, "drain", drain).await;
+
+    // The org goes over: the job's set, read by this pod's refresh, which
+    // re-stamps the network's pairs at once.
+    let key = relay_allowance::set_key(app.db.name());
+    let set = serde_json::json!({ network.to_hex(): 125_000 }).to_string();
+    redis.kv_set_ex(&key, &set, 900).await.unwrap();
+    relay_allowance::refresh(net(&app)).await;
+    assert_eq!(
+        verdict_for(a, b_id, Duration::from_secs(5))
+            .await
+            .as_deref(),
+        Some("derp"),
+        "over the allowance, the pair's verdict is DERP"
+    );
+    relay_request(a, b_id).await;
+    assert!(
+        recv_t(a, "rc:overlay.relay_grant", Duration::from_secs(2))
+            .await
+            .is_none(),
+        "over the allowance, no TURN grant"
+    );
+    // A node too old for verdicts is pinned to DERP instead.
+    relay_request(c, a_id).await;
+    assert!(
+        recv_t(c, "rc:overlay.force_derp", Duration::from_secs(5))
+            .await
+            .is_some(),
+        "an older node is pinned to DERP"
+    );
+
+    // Back under: the set lapses, the pair regrades, TURN is granted again.
+    recv_t(a, "drain", drain).await;
+    redis.kv_del(&key).await.unwrap();
+    relay_allowance::refresh(net(&app)).await;
+    let back = verdict_for(a, b_id, Duration::from_secs(5)).await;
+    assert!(
+        matches!(back.as_deref(), Some(v) if v.starts_with("single-relay")),
+        "back inside the allowance, the capability verdict returns: {back:?}"
+    );
+    relay_request(a, b_id).await;
+    assert!(
+        recv_t(a, "rc:overlay.relay_grant", Duration::from_secs(5))
+            .await
+            .is_some(),
+        "back inside the allowance, TURN is granted again"
     );
 }
