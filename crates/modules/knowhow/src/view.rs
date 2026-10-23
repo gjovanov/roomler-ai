@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::dao::EntityNode;
-use crate::model::{Fact, KnowhowEdge, KnowhowEntity, KnowhowHistory};
+use crate::model::{Fact, KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, ScanCounts};
 
 pub(crate) fn rfc3339(t: DateTime) -> String {
     t.try_to_rfc3339_string().unwrap_or_default()
@@ -227,6 +227,42 @@ impl HistoryView {
             by: h.by.map(|u| u.to_hex()),
             at: rfc3339(h.at),
             set: json(&h.set),
+        }
+    }
+}
+
+/// P4-3a — one scan asked of a device: where it is, and what its answer held.
+#[derive(Serialize, Debug)]
+pub struct ScanView {
+    pub id: String,
+    pub device_id: String,
+    pub requested_by: String,
+    pub requested_at: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    pub counts: ScanCounts,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ScanView {
+    pub fn of(s: &KnowhowScan) -> Self {
+        Self {
+            id: hex(s.id),
+            device_id: s.device_id.to_hex(),
+            requested_by: s.requested_by.to_hex(),
+            requested_at: rfc3339(s.requested_at),
+            state: s.state.clone(),
+            delivered_at: s.delivered_at.map(rfc3339),
+            answered_at: s.answered_at.map(rfc3339),
+            counts: s.counts,
+            truncated: s.truncated,
+            detail: s.detail.clone(),
         }
     }
 }

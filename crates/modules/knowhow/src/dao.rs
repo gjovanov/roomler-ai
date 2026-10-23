@@ -19,7 +19,10 @@ use mongodb::{Collection, Database, options::ReturnDocument};
 use roomler_ai_services::dao::base::{BaseDao, DaoResult, escape_regex};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{KnowhowEdge, KnowhowEntity, KnowhowHistory, STATUS_ARCHIVED};
+use crate::model::{
+    KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, SCAN_DELIVERED, SCAN_EXPIRED,
+    SCAN_REQUESTED, STATUS_ARCHIVED,
+};
 
 /// The most live entities an organization's map holds.
 pub const MAX_ENTITIES: u64 = 10_000;
@@ -346,6 +349,144 @@ impl HistoryDao {
             .collection()
             .find(filter)
             .sort(doc! { "at": -1, "_id": -1 })
+            .limit(limit)
+            .await?;
+        Ok(cursor.try_collect().await?)
+    }
+}
+
+/// How long a scan waits for its answer before it is `expired`, in seconds.
+pub const SCAN_ANSWER_SECS: i64 = 24 * 60 * 60;
+/// How long a scan's record is kept, in seconds: 90 days.
+pub const SCAN_KEEP_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// P4-3a — the scans asked of devices. Each step is a compare-and-set on the
+/// row's state, so a device whose connection moved between pods is told once
+/// and answered once.
+pub struct ScanDao {
+    pub base: BaseDao<KnowhowScan>,
+}
+
+impl ScanDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, KnowhowScan::COLLECTION),
+        }
+    }
+
+    /// A new scan. `DuplicateKey` when the device already has one pending.
+    pub async fn create(&self, scan: &KnowhowScan) -> DaoResult<ObjectId> {
+        self.base.insert_one(scan).await
+    }
+
+    /// The device's pending scan, requested or delivered.
+    pub async fn pending_for(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Option<KnowhowScan>> {
+        self.base
+            .find_one(doc! { "tenant_id": tenant_id, "device_id": device_id, "pending": true })
+            .await
+    }
+
+    /// The scans asked of these devices and not yet delivered.
+    pub async fn requested_for(&self, devices: &[ObjectId]) -> DaoResult<Vec<KnowhowScan>> {
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.base
+            .find_many(
+                doc! { "device_id": { "$in": devices.to_vec() }, "state": SCAN_REQUESTED },
+                Some(doc! { "requested_at": 1 }),
+            )
+            .await
+    }
+
+    /// Requested → delivered: `true` for the one caller that moved it, who
+    /// then sends it.
+    pub async fn deliver(&self, id: ObjectId, now: DateTime) -> DaoResult<bool> {
+        let r = self
+            .base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "state": SCAN_REQUESTED },
+                doc! { "$set": { "state": SCAN_DELIVERED, "delivered_at": now } },
+            )
+            .await?;
+        Ok(r.modified_count == 1)
+    }
+
+    /// Delivered → requested, for a scan that could not go out: the next
+    /// sweep sends it.
+    pub async fn undeliver(&self, id: ObjectId) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "state": SCAN_DELIVERED },
+                doc! { "$set": { "state": SCAN_REQUESTED }, "$unset": { "delivered_at": "" } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A delivered scan sent again (a hello, the connection it went to gone).
+    pub async fn redelivered(&self, id: ObjectId, now: DateTime) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "state": SCAN_DELIVERED },
+                doc! { "$set": { "delivered_at": now } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The device's answer, once: `None` when the scan is not this device's,
+    /// not pending, or answered already.
+    pub async fn answer(
+        &self,
+        id: ObjectId,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+        set: Document,
+    ) -> DaoResult<Option<KnowhowScan>> {
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": id, "tenant_id": tenant_id, "device_id": device_id, "pending": true },
+                doc! { "$set": set, "$unset": { "pending": "" } },
+            )
+            .return_document(ReturnDocument::After)
+            .await?)
+    }
+
+    /// Every pending scan asked before `cutoff`: expired.
+    pub async fn expire_before(&self, cutoff: DateTime) -> DaoResult<u64> {
+        let r = self
+            .base
+            .collection()
+            .update_many(
+                doc! { "pending": true, "requested_at": { "$lt": cutoff } },
+                doc! { "$set": { "state": SCAN_EXPIRED }, "$unset": { "pending": "" } },
+            )
+            .await?;
+        Ok(r.modified_count)
+    }
+
+    /// A device's scans, newest first, at most `limit`.
+    pub async fn list_for(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+        limit: i64,
+    ) -> DaoResult<Vec<KnowhowScan>> {
+        let cursor = self
+            .base
+            .collection()
+            .find(doc! { "tenant_id": tenant_id, "device_id": device_id })
+            .sort(doc! { "requested_at": -1, "_id": -1 })
             .limit(limit)
             .await?;
         Ok(cursor.try_collect().await?)

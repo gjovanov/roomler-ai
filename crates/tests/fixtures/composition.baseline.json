@@ -681,6 +681,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/knowhow/scan",
+      "methods": "GET,HEAD,POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/knowhow/search",
       "methods": "GET,HEAD"
     },
@@ -1989,6 +1993,40 @@
               "at": -1,
               "_id": -1
             }
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_scans",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "pending": true
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "device_id": 1,
+              "state": 1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -4273,6 +4311,40 @@
         ]
       },
       {
+        "collection": "knowhow_scans",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "pending": true
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "device_id": 1,
+              "state": 1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "messages",
         "indexes": [
           {
@@ -5717,6 +5789,7 @@
     "rc:vault.ssh",
     "rc:vault.connect",
     "rc:vault.egress",
+    "rc:knowhow.scanned",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5841,6 +5914,7 @@
     "rc:vault.net.granted",
     "rc:vault.ssh.granted",
     "rc:vault.egress.allowed",
+    "rc:knowhow.scan",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -5879,6 +5953,7 @@
     "rc:hive.view.grant_ack": "hive",
     "rc:hive.view.ice": "hive",
     "rc:ice": "remote",
+    "rc:knowhow.scanned": "knowhow",
     "rc:overlay.endpoints": "network",
     "rc:overlay.join": "network",
     "rc:overlay.leave": "network",

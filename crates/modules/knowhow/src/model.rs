@@ -236,6 +236,68 @@ pub const OP_CREATE: &str = "create";
 pub const OP_UPDATE: &str = "update";
 pub const OP_ARCHIVE: &str = "archive";
 
+/// P4-3a — one scan asked of a device (the FR-90 spec, §3e "P4-3, scans, as
+/// designed"): who asked and when, where it is, and how it ended. The row is
+/// the bus: the pod holding the device's connection delivers it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KnowhowScan {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub device_id: ObjectId,
+    pub requested_by: ObjectId,
+    pub requested_at: DateTime,
+    /// [`SCAN_REQUESTED`] → [`SCAN_DELIVERED`] → [`SCAN_DONE`],
+    /// [`SCAN_NO_ROOTS`] or [`SCAN_FAILED`]; or [`SCAN_EXPIRED`].
+    pub state: String,
+    /// `true` while requested or delivered, and absent once it ended: a
+    /// device's one pending scan, held unique by a partial index on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
+    #[serde(default)]
+    pub delivered_at: Option<DateTime>,
+    #[serde(default)]
+    pub answered_at: Option<DateTime>,
+    /// What its answer held, by kind.
+    #[serde(default)]
+    pub counts: ScanCounts,
+    /// The device stopped short of all it found.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl KnowhowScan {
+    pub const COLLECTION: &'static str = "knowhow_scans";
+}
+
+/// A scan's answer, counted by kind.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCounts {
+    #[serde(default)]
+    pub checkouts: u32,
+    #[serde(default)]
+    pub contexts: u32,
+    #[serde(default)]
+    pub listeners: u32,
+    #[serde(default)]
+    pub tunnel_routes: u32,
+    /// Of a kind this build does not know.
+    #[serde(default)]
+    pub unknown: u32,
+    /// Refused: malformed, past a bound, or holding a credential's shape.
+    #[serde(default)]
+    pub refused: u32,
+}
+
+pub const SCAN_REQUESTED: &str = "requested";
+pub const SCAN_DELIVERED: &str = "delivered";
+pub const SCAN_DONE: &str = "done";
+pub const SCAN_NO_ROOTS: &str = "no_roots";
+pub const SCAN_FAILED: &str = "failed";
+pub const SCAN_EXPIRED: &str = "expired";
+
 // ─── the rules a write is held to ───────────────────────────────────────────
 
 /// A kind a write may name.

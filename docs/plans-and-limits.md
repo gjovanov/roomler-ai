@@ -110,7 +110,7 @@ another pod — are where the design is unusual:
 An org past its month's `relay_bytes_per_month` (§1) is never disconnected. Its mesh keeps
 the DERP floor, the path that always connects, and only that floor's **bulk** frames slow
 down: to 1 Mbit/s on Free and 4 Mbit/s on a paid plan (`relay_allowance.free_rate_kbps` and
-`paid_rate_kbps`, `crates/config/src/settings.rs:383`). A WireGuard handshake and disco are
+`paid_rate_kbps`, `crates/config/src/settings.rs:389`). A WireGuard handshake and disco are
 never held. A throttle that delayed a handshake past its retry window would turn "slow" into
 "down" for exactly the hosts that have no other path.
 

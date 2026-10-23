@@ -1690,6 +1690,37 @@ pub enum ClientMsg {
         port: u16,
     },
 
+    /// FR-90 P4-3 — the device's answer to a [`ServerMsg::KnowhowScan`]: how
+    /// the scan ended, and what it found under the roots its owner lists
+    /// (decision 38). Recorded only when this connection's device is the one
+    /// the scan was sent to, and only once.
+    ///
+    /// ⚠️ Metadata only. The findings travel as raw JSON and are read one at
+    /// a time ([`crate::knowhow::Finding::read`]): a kind this build does
+    /// not know is skipped, a known kind with a field it does not know is
+    /// refused, and so is a finding holding a credential's shape.
+    #[serde(rename = "rc:knowhow.scanned")]
+    KnowhowScanned {
+        #[serde(with = "oid_hex")]
+        scan_id: ObjectId,
+        /// An unknown word, or none, is `failed`, never `done`.
+        #[serde(
+            default = "crate::knowhow::failed",
+            deserialize_with = "crate::knowhow::outcome_lenient"
+        )]
+        outcome: crate::knowhow::ScanOutcome,
+        /// Why a scan failed, in a few words. Capped by the device,
+        /// re-clamped on receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// The device stopped at [`crate::knowhow::MAX_FINDINGS`] or
+        /// [`crate::knowhow::MAX_SCAN_BYTES`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        findings: Vec<serde_json::Value>,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2564,6 +2595,8 @@ pub enum Owner {
     Hive,
     /// FR-90 P3-3b — the vault: a session's lease requests.
     Vault,
+    /// FR-90 P4-3 — knowhow: a device's answer to a scan.
+    Knowhow,
 }
 
 impl Owner {
@@ -2575,6 +2608,7 @@ impl Owner {
             Owner::Network => "network",
             Owner::Hive => "hive",
             Owner::Vault => "vault",
+            Owner::Knowhow => "knowhow",
         }
     }
 }
@@ -2628,6 +2662,7 @@ impl ClientMsg {
             ClientMsg::VaultSsh { .. } => "rc:vault.ssh",
             ClientMsg::VaultConnect { .. } => "rc:vault.connect",
             ClientMsg::VaultEgress { .. } => "rc:vault.egress",
+            ClientMsg::KnowhowScanned { .. } => "rc:knowhow.scanned",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2757,6 +2792,7 @@ impl ClientMsg {
             | ClientMsg::VaultSsh { .. }
             | ClientMsg::VaultConnect { .. }
             | ClientMsg::VaultEgress { .. } => Owner::Vault,
+            ClientMsg::KnowhowScanned { .. } => Owner::Knowhow,
         }
     }
 }
@@ -2810,6 +2846,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.ssh", Owner::Vault),
     ("rc:vault.connect", Owner::Vault),
     ("rc:vault.egress", Owner::Vault),
+    ("rc:knowhow.scanned", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -4855,6 +4892,18 @@ pub enum ServerMsg {
         host: String,
         port: u16,
     },
+
+    /// FR-90 P4-3 — a scan, asked of a device whose last hello advertised
+    /// [`crate::models::RpcCap::KnowhowScan`]: read the roots its owner lists
+    /// (decision 38) and answer [`ClientMsg::KnowhowScanned`] naming
+    /// `scan_id`. It names no root: the device's own list decides, so the
+    /// server cannot widen a scan. Sent again at a hello while unanswered,
+    /// so a device runs a scan id once.
+    #[serde(rename = "rc:knowhow.scan")]
+    KnowhowScan {
+        #[serde(with = "oid_hex")]
+        scan_id: ObjectId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -6863,6 +6912,52 @@ mod tests {
             serde_json::from_value::<ServerMsg>(v).unwrap(),
             ServerMsg::HiveMove { earlier, .. } if earlier.len() == 1
         ));
+    }
+
+    /// FR-90 P4-3 — a scan and its answer: the scan names its id and nothing
+    /// else (no root: the device's own list decides); the answer's outcome is
+    /// `failed` for a word this build does not know, or none; its findings
+    /// travel as raw JSON, read one at a time by `crate::knowhow`.
+    #[test]
+    fn knowhow_scan_frames_wire_shape_is_locked() {
+        use crate::knowhow::ScanOutcome;
+
+        let scan = ObjectId::new();
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowScan { scan_id: scan }).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.scan", "scan_id": scan.to_hex()})
+        );
+        let answer = ClientMsg::KnowhowScanned {
+            scan_id: scan,
+            outcome: ScanOutcome::NoRoots,
+            detail: None,
+            truncated: false,
+            findings: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.scanned", "scan_id": scan.to_hex(),
+                               "outcome": "no_roots"}),
+            "an empty answer carries its id and its outcome alone"
+        );
+        assert_eq!(answer.namespace(), Owner::Knowhow);
+        assert_eq!(answer.wire_tag(), "rc:knowhow.scanned");
+        for newer in [
+            serde_json::json!({"t": "rc:knowhow.scanned", "scan_id": scan.to_hex(),
+                               "outcome": "partial", "truncated": true,
+                               "findings": [{"kind": "bucket", "name": "logs"}]}),
+            serde_json::json!({"t": "rc:knowhow.scanned", "scan_id": scan.to_hex()}),
+        ] {
+            match serde_json::from_value::<ClientMsg>(newer.clone()).unwrap() {
+                ClientMsg::KnowhowScanned {
+                    scan_id, outcome, ..
+                } => {
+                    assert_eq!(scan_id, scan);
+                    assert_eq!(outcome, ScanOutcome::Failed, "{newer}");
+                }
+                other => panic!("not an answer: {other:?}"),
+            }
+        }
     }
 
     /// FR-90 P2g — the purge and its acknowledgement: ids and words only, the
