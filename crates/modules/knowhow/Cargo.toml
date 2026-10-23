@@ -32,6 +32,8 @@ futures.workspace = true
 mongodb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# P4-3a-2 — a checkout's key: its path's SHA-256, since a path is not a key.
+sha2.workspace = true
 # P4-2a — a hello's sync off the socket's path, and the reconcile's interval.
 tokio.workspace = true
 tracing.workspace = true

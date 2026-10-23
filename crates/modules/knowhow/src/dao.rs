@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, SCAN_DELIVERED, SCAN_EXPIRED,
-    SCAN_REQUESTED, STATUS_ARCHIVED,
+    SCAN_REQUESTED, SOURCE_SCAN, STATUS_ARCHIVED, ScanWritten,
 };
 
 /// The most live entities an organization's map holds.
@@ -173,6 +173,25 @@ impl EntityDao {
         Ok(cursor.try_collect().await?)
     }
 
+    /// P4-3a-2 — the live entities a device's scans own (source `scan`, this
+    /// device): what its next complete scan compares with what it found.
+    /// Bounded by the map's own cap.
+    pub async fn live_of_device(
+        &self,
+        tenant_id: ObjectId,
+        device: ObjectId,
+    ) -> DaoResult<Vec<KnowhowEntity>> {
+        let cursor = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": tenant_id, "device": device, "source": SOURCE_SCAN, "deleted_at": null,
+            })
+            .limit(MAX_ENTITIES as i64)
+            .await?;
+        Ok(cursor.try_collect().await?)
+    }
+
     /// P4-2a — the organizations whose map holds a live entity of `kind`.
     pub async fn tenants_with(&self, kind: &str) -> DaoResult<Vec<ObjectId>> {
         Ok(self
@@ -284,6 +303,39 @@ impl EdgeDao {
             )
             .return_document(ReturnDocument::After)
             .await?)
+    }
+
+    /// P4-3a-2 — the live link `from` `kind` `to`, if there is one.
+    pub async fn find_live(
+        &self,
+        tenant_id: ObjectId,
+        from: ObjectId,
+        kind: &str,
+        to: ObjectId,
+    ) -> DaoResult<Option<KnowhowEdge>> {
+        self.base
+            .find_one(doc! {
+                "tenant_id": tenant_id, "from": from, "kind": kind, "to": to, "deleted_at": null,
+            })
+            .await
+    }
+
+    /// P4-3a-2 — the live links a device's scans own, as
+    /// [`EntityDao::live_of_device`].
+    pub async fn live_of_device(
+        &self,
+        tenant_id: ObjectId,
+        device: ObjectId,
+    ) -> DaoResult<Vec<KnowhowEdge>> {
+        let cursor = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": tenant_id, "device": device, "source": SOURCE_SCAN, "deleted_at": null,
+            })
+            .limit(MAX_EDGES as i64)
+            .await?;
+        Ok(cursor.try_collect().await?)
     }
 
     /// Archive a live edge whatever its rev: an entity's archive takes its
@@ -460,6 +512,18 @@ impl ScanDao {
             )
             .return_document(ReturnDocument::After)
             .await?)
+    }
+
+    /// P4-3a-2 — what an answered scan wrote onto the map.
+    pub async fn written(&self, id: ObjectId, written: &ScanWritten) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id },
+                doc! { "$set": { "written": bson::to_bson(written)? } },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Every pending scan asked before `cutoff`: expired.

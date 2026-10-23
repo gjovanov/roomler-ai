@@ -1947,6 +1947,13 @@
               "to": 1,
               "deleted_at": 1
             }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device": 1,
+              "deleted_at": 1
+            }
           }
         ]
       },
@@ -1972,6 +1979,13 @@
               "deleted_at": 1,
               "kind": 1,
               "key": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device": 1,
+              "deleted_at": 1
             }
           }
         ]
@@ -4261,6 +4275,13 @@
               "to": 1,
               "deleted_at": 1
             }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device": 1,
+              "deleted_at": 1
+            }
           }
         ]
       },
@@ -4286,6 +4307,13 @@
               "deleted_at": 1,
               "kind": 1,
               "key": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device": 1,
+              "deleted_at": 1
             }
           }
         ]

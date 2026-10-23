@@ -378,7 +378,9 @@ async fn a_known_nodes_word_comes_with_a_hello_and_goes_with_an_eviction() {
 /// its room; and the network's word still fits on a full machine.
 #[tokio::test]
 async fn a_machine_keeps_room_for_the_syncs_facts() {
-    use roomler_ai_mod_knowhow::{model::MAX_FACTS, sync::SYNCED_FACTS};
+    use roomler_ai_mod_knowhow::{
+        intake::SCANNED_MACHINE_FACTS, model::MAX_FACTS, sync::SYNCED_FACTS,
+    };
 
     let app = knowhow_app().await;
     let t = app.seed_tenant("knownetroom").await;
@@ -393,7 +395,8 @@ async fn a_machine_keeps_room_for_the_syncs_facts() {
             .as_i64()
             .unwrap()
     };
-    let room = MAX_FACTS - SYNCED_FACTS.len();
+    // P4-3a-2 — and its scans' (`tunnel.declared`).
+    let room = MAX_FACTS - SYNCED_FACTS.len() - SCANNED_MACHINE_FACTS.len();
 
     let mine: Map<String, Value> = (0..room).map(|i| (format!("note{i}"), json!(i))).collect();
     let body = json!({ "rev": rev().await, "facts": mine });
