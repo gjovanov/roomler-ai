@@ -659,7 +659,9 @@ pub(crate) struct HostFacts {
     pub(crate) clipboard_reachable: bool,
     /// The keyboard layout is this process's to read and switch: on Windows
     /// always; on Linux in an X11 session (FR-97 P3e,
-    /// `input::layout_x11::offered`); on macOS not before P2d.
+    /// `input::layout_x11::offered`); on macOS (P2d-2a) wherever its kill
+    /// switch is on and the build runs AppKit's main loop
+    /// (`input::layout_mac::offered`).
     pub(crate) layout_reachable: bool,
     /// A layout switch stays switched: not under GNOME, which puts its own
     /// back (FR-97 P3e, `input::layout_x11::switchable`). There the chip
@@ -702,7 +704,11 @@ fn layout_switchable() -> bool {
     {
         crate::input::layout_x11::switchable()
     }
-    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+    {
+        crate::input::layout_mac::switchable()
+    }
+    #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "enigo-input")))]
     {
         cfg!(target_os = "windows")
     }
@@ -710,12 +716,17 @@ fn layout_switchable() -> bool {
 
 /// FR-97 P3e — see [`HostFacts::layout_reachable`]. Under Wayland the layout
 /// is the compositor's, and a system install has no X connection at all.
+/// P2d-2a — a Mac's needs AppKit's main loop.
 fn layout_reachable() -> bool {
     #[cfg(all(target_os = "linux", feature = "enigo-input"))]
     {
         crate::input::layout_x11::offered()
     }
-    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+    {
+        crate::input::layout_mac::offered()
+    }
+    #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "enigo-input")))]
     {
         cfg!(target_os = "windows")
     }
@@ -1669,11 +1680,17 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
 
     // Keyboard-layout integration (rc.227) — status reporting +
     // manual set ride the control DC: Windows code in `input::layout`
-    // behind enigo-input, and (FR-97 P3e) X11's in `input::layout_x11`,
-    // which `with_honest_words` takes out where there is no X11 session.
-    // The browser gates its layout chip + picker on these.
+    // behind enigo-input, (FR-97 P3e) X11's in `input::layout_x11`,
+    // which `with_honest_words` takes out where there is no X11 session,
+    // and (P2d-2a) a Mac's in `input::layout_mac`, out where the build
+    // runs no AppKit main loop. The browser gates its layout chip + picker
+    // on these.
     let layout: Vec<String> = if cfg!(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos"
+        ),
         feature = "enigo-input"
     )) {
         vec!["report".into(), "set".into()]
@@ -3029,7 +3046,11 @@ mod tests {
             assert!(f.layout_reachable && f.layout_switchable);
             assert!(f.display_switchable);
         } else if cfg!(target_os = "macos") {
-            assert!(!f.layout_reachable, "macOS until FR-97 P2d");
+            // FR-97 P2d-2a — wherever the Mac module offers it.
+            #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+            assert_eq!(f.layout_reachable, crate::input::layout_mac::offered());
+            #[cfg(all(target_os = "macos", not(feature = "enigo-input")))]
+            assert!(!f.layout_reachable);
             assert!(!f.display_switchable);
         }
     }

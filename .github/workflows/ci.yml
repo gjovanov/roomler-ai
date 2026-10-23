@@ -1195,8 +1195,12 @@ jobs:
       # is a separate crate root, to move tokio off the main thread so AppKit
       # can pump. A `--lib` check would compile the panel and miss the swap
       # entirely — the exact escape rc.454 hit, one feature over.
+      # FR-97 P2d-2a: with `enigo-input` too, because the keyboard layout's Text
+      # Input Sources calls (`input::layout_mac::tis`) need BOTH features, and
+      # `full` below has `enigo-input` without this one: nothing else would
+      # compile them before a release build does.
       - name: cargo check agent (viewer-indicator-macos — the AppKit panel + the main-thread swap)
-        run: cargo check -p roomlerd --lib --bins --features viewer-indicator-macos
+        run: cargo check -p roomlerd --lib --bins --features viewer-indicator-macos,enigo-input
 
       # `--bins`, because `--lib` alone was not enough. main.rs is a SEPARATE
       # crate root: a `#[cfg(target_os = "macos")]` block there referring to a
@@ -1222,12 +1226,14 @@ jobs:
       # FR-97 P2e-1: so does the clipboard's change gate against the real
       # pasteboard. Its write replaces whatever was copied, so the test skips
       # unless `ROOMLERD_TEST_MAC_PASTEBOARD=1`; a runner has nobody's copy to lose.
+      # FR-97 P2d-2a: and the Mac keyboard layout's pure parts (the tag table,
+      # the token, the snapshot), which build only with `enigo-input`.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault,clipboard -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests
+          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the

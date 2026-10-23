@@ -1262,7 +1262,7 @@ impl AgentPeer {
                         // no channel, and goes out again only when the layout
                         // changes.
                         #[cfg(all(
-                            any(target_os = "windows", target_os = "linux"),
+                            any(target_os = "windows", target_os = "linux", target_os = "macos"),
                             feature = "enigo-input"
                         ))]
                         if crate::input::layout::offered()
@@ -1545,7 +1545,7 @@ impl AgentPeer {
         // a host that offers no layout (Wayland, a system install) starts
         // no emitter.
         #[cfg(all(
-            any(target_os = "windows", target_os = "linux"),
+            any(target_os = "windows", target_os = "linux", target_os = "macos"),
             feature = "enigo-input"
         ))]
         if crate::input::layout::offered() {
@@ -10031,7 +10031,7 @@ async fn emit_display_match(
 /// returns `true` (keep waiting for it to open; its `control` arm then
 /// sends the current snapshot, FR-97 P3e).
 #[cfg(all(
-    any(target_os = "windows", target_os = "linux"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos"),
     feature = "enigo-input"
 ))]
 async fn emit_layout(
@@ -10057,7 +10057,7 @@ async fn emit_layout(
 /// rc.227 — one snapshot as its `rc:layout` envelope. `json!`, not
 /// `format!`: the tags are dynamic strings.
 #[cfg(all(
-    any(target_os = "windows", target_os = "linux"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos"),
     feature = "enigo-input"
 ))]
 fn layout_json(snap: &crate::input::layout::LayoutSnapshot) -> String {
@@ -10599,7 +10599,7 @@ fn attach_control_handler(
                     }
                 }
                 #[cfg(all(
-                    any(target_os = "windows", target_os = "linux"),
+                    any(target_os = "windows", target_os = "linux", target_os = "macos"),
                     feature = "enigo-input"
                 ))]
                 "rc:layout.set" => {
@@ -13869,7 +13869,7 @@ mod tests {
     /// `installed` as `{hkl, tag}` objects. One builder serves the emitter and
     /// the control arm's first send, on Windows and on X11.
     #[cfg(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(target_os = "windows", target_os = "linux", target_os = "macos"),
         feature = "enigo-input"
     ))]
     #[test]

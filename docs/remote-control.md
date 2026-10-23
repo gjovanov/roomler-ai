@@ -384,7 +384,7 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:820`](../agents/roomlerd/src/encode/caps.rs#L820)), applied in
+([`caps.rs:831`](../agents/roomlerd/src/encode/caps.rs#L831)), applied in
 `detect()` ([`caps.rs:624`](../agents/roomlerd/src/encode/caps.rs#L624))
 after the config lists, over plain `HostFacts`
 ([`caps.rs:636`](../agents/roomlerd/src/encode/caps.rs#L636)), so it runs and
@@ -394,7 +394,7 @@ is tested on every OS.
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3308`](../agents/roomlerd/src/signaling.rs#L3308)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:801`](../agents/roomlerd/src/encode/caps.rs#L801)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:812`](../agents/roomlerd/src/encode/caps.rs#L812)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -437,7 +437,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:759`](../agents/roomlerd/src/encode/caps.rs#L759)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:770`](../agents/roomlerd/src/encode/caps.rs#L770)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | nothing yet (ScreenCaptureKit audio is FR-97 P2a) | the hello offers no track (`no-backend`, §5.1b) |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -2621,7 +2621,7 @@ to-activate, so the browser never sees a bait-and-switch.
   because an X server buffers what a client does not read. Our own writes
   change the owner too, and the content hashes swallow them as before.
   `AgentCaps.unavailable["clipboard-image-events"]` goes away where the
-  gate opens (`agents/roomlerd/src/encode/caps.rs:727`). ⚠️ Not under
+  gate opens (`agents/roomlerd/src/encode/caps.rs:738`). ⚠️ Not under
   Wayland: the clipboard is the compositor's there, and Xwayland's copy
   of it is unmeasured. A broken gate connection drops back to text
   polling with images unwatched. Kill switch
@@ -2637,7 +2637,7 @@ to-activate, so the browser never sees a bait-and-switch.
   the gate skips cannot ask. The count is read inside an autorelease pool of
   its own (`clipboard.rs:797`), because the clipboard worker is not the main
   thread. `unavailable["clipboard-image-events"]` goes away wherever the
-  switch is on (`agents/roomlerd/src/encode/caps.rs:734`), without asking this
+  switch is on (`agents/roomlerd/src/encode/caps.rs:745`), without asking this
   process's own pasteboard (`clipboard.rs:807`): on a supervised Mac the root
   daemon says the hello, while a delegated session's clipboard runs in the GUI
   worker. A root daemon outside the console session cannot reach the
@@ -2822,8 +2822,64 @@ the compositor's, and no protocol the desktops share reads or sets it.
 Xwayland's XKB group is a copy of what the compositor sends, and locking it
 does not reach the compositor. A system install reaches the screen through DRM
 and has no X connection (FR-113). Both leave `layout` out of the hello
-(`agents/roomlerd/src/encode/caps.rs:860`), with no reason in `unavailable`:
+(`agents/roomlerd/src/encode/caps.rs:871`), with no reason in `unavailable`:
 there is no control to grey, so the chip does not appear, as before P3e.
+
+### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)
+
+The same chip and picker again. On macOS `input::layout` *is*
+`input::layout_mac` (`agents/roomlerd/src/input/mod.rs:104`), behind the same
+peer emitter and `rc:layout.set` arm, now built for all three platforms.
+
+The constraint that shapes it is the thread. Text Input Sources (Carbon's
+HIToolbox) is called on the main thread only; recent macOS asserts it. A daemon
+built with `viewer-indicator-macos` gives its main thread to AppKit for its
+whole life (`main.rs`'s swap, FR-27), so every read and switch is queued for it:
+`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:107`) parks a
+closure that the pump runs on its next pass (`mac.rs:214`), at most 120 ms
+later, and sends the answer back.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as Viewer
+    participant P as Agent: control DC
+    participant A as Input arbiter
+    participant R as Layout reader thread
+    participant M as Main thread (AppKit pump)
+    participant T as Text Input Sources
+    P->>R: subscribe(), as the session starts
+    loop every 500 ms, only while a session watches
+        R->>M: on_main(read)
+        M->>T: TISCreateInputSourceList (enabled, selectable), TISCopyCurrentKeyboardInputSource
+        M-->>R: the sources and the one in use
+        R-->>P: a snapshot, when it changed
+    end
+    P-->>V: rc:layout {active_hkl, active, installed}
+    V->>P: rc:layout.set {hkl}
+    P->>A: layout_set(session, token)
+    Note over A: may this session type?<br/>exclusive mode: the floor holder only
+    A->>M: on_main(select)
+    M->>T: TISSelectInputSource, then read the one in use back
+    R-->>V: the next snapshot is the answer: a refused switch snaps the picker back
+```
+
+| | macOS (FR-97 P2d-2a) |
+|---|---|
+| A layout is | an enabled keyboard input source the person can select, as the input menu lists it: a layout (`com.apple.keylayout.German`) or an input method's mode |
+| The list, the one in use | `TISCreateInputSourceList` filtered to selectable keyboard sources; `TISCopyCurrentKeyboardInputSource` (`agents/roomlerd/src/input/layout_mac.rs:426`) |
+| The token (`hkl`) | the source ID's FNV-1a hash, 8 hex (`layout_mac.rs:233`): a click on a source disabled since is refused |
+| The tag (`active`) | BCP-47 for a layout the table knows (`German` → `de-DE`, `layout_mac.rs:253`); otherwise the system's localized name, never a guess (`ABC` stays `ABC`) |
+| Read | polled every 500 ms on a thread of its own, only while a session watches (`layout_mac.rs:137`), each read a hop to the main thread |
+| Switch | `TISSelectInputSource` on the main thread, then the one in use read back (`layout_mac.rs:332`) |
+| Offered | wherever the switch is on and the build runs AppKit's main loop (`layout_mac.rs:54`); never asked of the process's own session, because on a supervised Mac the root daemon says the hello and the session runs in the GUI worker |
+| Kill switch | `ROOMLERD_MAC_LAYOUT=0`: no `layout` in the hello, so no chip |
+
+⚠️ **`on_main` refuses to run from the main thread**, where it would wait for
+itself, and answers `None` without a pumping main loop (a CLI call, a test). So
+`cargo test` cannot call Text Input Sources at all: its threads are not the
+main thread. The pure parts (the tag table, the token, the snapshot) are unit
+tests; the calls themselves are proven on a Mac (FR-97 §8).
 
 ### 18.4 Input fix — Windows VK path (0.1.34)
 

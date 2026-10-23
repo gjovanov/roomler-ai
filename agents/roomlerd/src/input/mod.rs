@@ -96,6 +96,13 @@ pub mod layout_x11;
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
 pub use layout_x11 as layout;
 
+/// FR-97 P2d-2a — a Mac's keyboard layout through Text Input Sources, on the
+/// main thread AppKit owns: the same snapshot, watch and switch again.
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+pub mod layout_mac;
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+pub use layout_mac as layout;
+
 #[cfg(all(
     feature = "system-context",
     target_os = "windows",

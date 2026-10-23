@@ -1317,7 +1317,7 @@ session's grant backs it.
 |---|---|
 | the grant's field | `Grant::one_command` ([`ssh.rs:2834`](../agents/roomlerd/src/ssh.rs#L2834)), recorded by `record_grant` ([`:2910`](../agents/roomlerd/src/ssh.rs#L2910)), resolved into the session's policy ([`:826`](../agents/roomlerd/src/ssh.rs#L826)) |
 | the rules | one channel ([`ssh.rs:1680`](../agents/roomlerd/src/ssh.rs#L1680)), no forward ([`:1746`](../agents/roomlerd/src/ssh.rs#L1746)), one `exec` ([`:1841`](../agents/roomlerd/src/ssh.rs#L1841)), no shell ([`:1949`](../agents/roomlerd/src/ssh.rs#L1949)), no terminal ([`:1988`](../agents/roomlerd/src/ssh.rs#L1988)), no subsystem ([`:2091`](../agents/roomlerd/src/ssh.rs#L2091)) |
-| the device's word | `ssh-one-command` in the hello ([`caps.rs:1938`](../agents/roomlerd/src/encode/caps.rs#L1938)) |
+| the device's word | `ssh-one-command` in the hello ([`caps.rs:1955`](../agents/roomlerd/src/encode/caps.rs#L1955)) |
 | the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
 | the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2663`](../crates/remote_control/src/models.rs#L2663)) |
 

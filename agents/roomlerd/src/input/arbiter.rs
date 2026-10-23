@@ -632,7 +632,7 @@ enum Cmd {
     /// Before P3e the control arm switched for any session, a view-only one's
     /// included.
     #[cfg(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(target_os = "windows", target_os = "linux", target_os = "macos"),
         feature = "enigo-input"
     ))]
     LayoutSet {
@@ -788,7 +788,7 @@ impl Arbiter {
 
     /// FR-97 P3e — a controller's `rc:layout.set` ([`Cmd::LayoutSet`]).
     #[cfg(all(
-        any(target_os = "windows", target_os = "linux"),
+        any(target_os = "windows", target_os = "linux", target_os = "macos"),
         feature = "enigo-input"
     ))]
     pub fn layout_set(&self, session: ObjectId, token: String) {
@@ -803,7 +803,7 @@ impl Arbiter {
 #[cfg(any(
     test,
     all(
-        any(target_os = "windows", target_os = "linux"),
+        any(target_os = "windows", target_os = "linux", target_os = "macos"),
         feature = "enigo-input"
     )
 ))]
@@ -954,7 +954,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 }
             }
             #[cfg(all(
-                any(target_os = "windows", target_os = "linux"),
+                any(target_os = "windows", target_os = "linux", target_os = "macos"),
                 feature = "enigo-input"
             ))]
             Cmd::LayoutSet { session, token } => layout_set_if_allowed(
