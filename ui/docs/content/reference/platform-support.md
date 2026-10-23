@@ -67,7 +67,7 @@ organization chooses it with `roomler org overlay <org> netstack`
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ❌ |
 | Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148; on GNOME the layout is shown, and you switch it with GNOME's own shortcut (Super+Space) · ❌ Wayland desktops and system installs | ✅ from agent 0.4.156 |
 | Typing text on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
-| Match the remote display to your window | ✅ | ✅ X11 desktops with one screen and a per-user install, from agent 0.4.148, and the agent's own virtual desktop · ❌ Wayland desktops, system installs, several screens | ❌ |
+| Match the remote display to your window | ✅ | ✅ X11 desktops with one screen and a per-user install, from agent 0.4.148, and the agent's own virtual desktop · ❌ Wayland desktops, system installs, several screens | ✅ from agent 0.4.157, with one screen |
 | Clipboard: text, formatted text and images | ✅ | ✅ per-user · ❌ a system install | ✅ |
 | A copied image arrives by itself | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148 · ❌ Wayland desktops and system installs: on request | ✅ from agent 0.4.154 · before it, on request |
 | An idle desktop costs little CPU | ✅ | ✅ | ❌ |

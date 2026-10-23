@@ -33,10 +33,20 @@
 //! steady across the read's own jitter ([`steady`]). It samples only where
 //! display match can switch a real X11 display (`display_match::x11_offered`);
 //! everywhere else the answer stays `Attended`, as before.
+//!
+//! **A Mac (FR-97 P2d-2b).** The same tracker again, fed by the HID idle clock
+//! (`CGEventSourceSecondsSinceLastEventType` over the HID system state) and the
+//! session's lock as keep busy's Mac host reads it. Measured on a tart Mac: the
+//! controller's injected events move that clock as a person's input does, so
+//! the tracker explains them as it does on Windows; and a smaller display mode,
+//! which clamps the pointer to its edge, moves the session's COMBINED clock but
+//! not the HID one, so a Mac needs no X11-style "our own switch" exception. It
+//! samples only where display match can switch (`display_match::mac_offered`).
 
 #[cfg(any(
     target_os = "windows",
-    all(target_os = "linux", feature = "enigo-input")
+    all(target_os = "linux", feature = "enigo-input"),
+    all(target_os = "macos", feature = "enigo-input")
 ))]
 use std::sync::Mutex;
 use std::time::Duration;
@@ -152,7 +162,8 @@ impl Tracker {
 
 #[cfg(any(
     target_os = "windows",
-    all(target_os = "linux", feature = "enigo-input")
+    all(target_os = "linux", feature = "enigo-input"),
+    all(target_os = "macos", feature = "enigo-input")
 ))]
 static TRACKER: Mutex<Tracker> = Mutex::new(Tracker {
     last_input: None,
@@ -162,23 +173,23 @@ static TRACKER: Mutex<Tracker> = Mutex::new(Tracker {
 });
 
 /// The OS input clock: Windows' `GetTickCount`, the clock `GetLastInputInfo`
-/// reports in. Linux (FR-97 P3e-2): this process's monotonic clock in
-/// milliseconds, plus one so a tick is never the `0` keep busy reads as "none
-/// yet"; the X idle clock is turned into ticks of it. Elsewhere `0`, which
-/// nothing here reads.
+/// reports in. Linux (FR-97 P3e-2) and a Mac (P2d-2b): this process's
+/// monotonic clock in milliseconds, plus one so a tick is never the `0` keep
+/// busy reads as "none yet"; the X idle clock, or the Mac's HID one, is turned
+/// into ticks of it. Elsewhere `0`, which nothing here reads.
 pub fn os_tick() -> u32 {
     #[cfg(target_os = "windows")]
     {
         // SAFETY: no arguments, no failure mode.
         unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         static BASE: std::sync::LazyLock<std::time::Instant> =
             std::sync::LazyLock::new(std::time::Instant::now);
         (BASE.elapsed().as_millis() as u32).wrapping_add(1)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         0
     }
@@ -259,6 +270,62 @@ mod x11_idle {
     }
 }
 
+/// FR-97 P2d-2b — a Mac: the HID idle clock, read from the session the process
+/// runs in (the GUI worker's), turned into a tick of [`os_tick`]'s clock and
+/// held steady across the read's own jitter, as X11's is.
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+mod mac_idle {
+    use std::sync::Mutex;
+
+    /// `kCGEventSourceStateHIDSystemState`: input only, never the pointer
+    /// clamp a display-mode switch makes (measured, FR-97 §8).
+    const HID_SYSTEM_STATE: i32 = 1;
+    /// `kCGAnyInputEventType`.
+    const ANY_INPUT_EVENT: u32 = !0;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+    }
+
+    static LAST: Mutex<Option<u32>> = Mutex::new(None);
+
+    /// The tick of the last input at `now`, `None` when the clock gives no
+    /// answer a tick can be made of.
+    pub fn last_input_tick(now: u32) -> Option<u32> {
+        // SAFETY: a plain getter over constants; no preconditions.
+        let secs =
+            unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
+        if !secs.is_finite() || secs < 0.0 {
+            return None;
+        }
+        let ago_ms = (secs * 1000.0).min(f64::from(u32::MAX)) as u32;
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let tick = super::steady(*last, now.wrapping_sub(ago_ms));
+        *last = Some(tick);
+        Some(tick)
+    }
+}
+
+/// FR-97 P2d-2b — the Mac reading: the HID idle clock, and the session's lock
+/// as keep busy's Mac host reads it (`None` outside a GUI session reads as
+/// unlocked; a switch there fails on its own, as the root half has no display
+/// to switch).
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+fn sample() -> bool {
+    let locked = crate::keep_busy::mac_screen_locked().unwrap_or(false);
+    let machine = [
+        crate::keep_busy::last_remote_input_tick(),
+        crate::keep_busy::last_own_move_tick(),
+    ];
+    let mut t = TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(input) = mac_idle::last_input_tick(os_tick()) {
+        t.observe(input, &machine);
+    }
+    t.observe_lock(locked, os_tick());
+    locked
+}
+
 #[cfg(target_os = "windows")]
 fn last_input_tick() -> Option<u32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
@@ -334,8 +401,10 @@ fn sample() -> bool {
     locked
 }
 
-/// The sampler runs on this host: Windows, and (FR-97 P3e-2) a Linux X11
-/// session whose real display display match can switch.
+/// The sampler runs on this host: Windows, (FR-97 P3e-2) a Linux X11 session
+/// whose real display display match can switch, and (P2d-2b) a Mac process
+/// inside a GUI session where it can. Not a supervised Mac's root half, which
+/// has no session of its own: its sessions run in the worker.
 fn samples() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -345,9 +414,14 @@ fn samples() -> bool {
     {
         crate::display_match::x11_offered()
     }
+    #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+    {
+        crate::display_match::mac_offered() && crate::keep_busy::mac_screen_locked().is_some()
+    }
     #[cfg(not(any(
         target_os = "windows",
-        all(target_os = "linux", feature = "enigo-input")
+        all(target_os = "linux", feature = "enigo-input"),
+        all(target_os = "macos", feature = "enigo-input")
     )))]
     {
         false
@@ -360,7 +434,8 @@ fn samples() -> bool {
 pub fn start() {
     #[cfg(any(
         target_os = "windows",
-        all(target_os = "linux", feature = "enigo-input")
+        all(target_os = "linux", feature = "enigo-input"),
+        all(target_os = "macos", feature = "enigo-input")
     ))]
     {
         if !samples() {
@@ -392,7 +467,8 @@ pub fn now() -> Presence {
     }
     #[cfg(any(
         target_os = "windows",
-        all(target_os = "linux", feature = "enigo-input")
+        all(target_os = "linux", feature = "enigo-input"),
+        all(target_os = "macos", feature = "enigo-input")
     ))]
     {
         start();
@@ -405,7 +481,8 @@ pub fn now() -> Presence {
     }
     #[cfg(not(any(
         target_os = "windows",
-        all(target_os = "linux", feature = "enigo-input")
+        all(target_os = "linux", feature = "enigo-input"),
+        all(target_os = "macos", feature = "enigo-input")
     )))]
     {
         Presence::Attended

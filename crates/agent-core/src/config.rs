@@ -2682,6 +2682,43 @@ impl<'de> Deserialize<'de> for DisplayMatchPolicy {
     }
 }
 
+impl DisplayMatchPolicy {
+    /// FR-97 P2d-2b — the word the config file writes for this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// FR-97 P2d-2b — a word read as the config file reads it: one this build
+    /// does not know is [`Self::Never`].
+    pub fn from_word(word: &str) -> Self {
+        match word.trim() {
+            "auto" => Self::Auto,
+            "always" => Self::Always,
+            _ => Self::Never,
+        }
+    }
+
+    /// FR-97 P2d-2b — the stricter of two policies: `never`, then `auto`, then
+    /// `always`. A supervised Mac's worker takes the stricter of its own and
+    /// the root's, so neither half can loosen the other's.
+    pub fn strictest(self, other: Self) -> Self {
+        let rank = |p: Self| match p {
+            Self::Always => 0,
+            Self::Auto => 1,
+            Self::Never => 2,
+        };
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
 /// FR-100 P1c — whether this device checks the browser that offers it a
 /// session (see `AgentConfig::peer_auth`).
 ///
@@ -3276,6 +3313,15 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     if let Some(v) = &cfg.encoder_cells_deny {
         fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
     }
+    // FR-97 P2d-2b — the display-match policy, as a string too, and only when
+    // it is not the default: a supervised Mac's root hands it to its worker
+    // (FR-43's forward), which takes the stricter of it and its own.
+    if cfg.display_match != DisplayMatchPolicy::Auto {
+        fallbacks.insert(
+            "DISPLAY_MATCH".to_string(),
+            cfg.display_match.as_str().to_string(),
+        );
+    }
     // FR-119 P2b — the frame-rate denylist, read by the pump once per session.
     if let Some(v) = &cfg.fps_deny {
         fallbacks.insert("FPS_DENY".to_string(), v.clone());
@@ -3649,6 +3695,50 @@ mod tests {
             Some("41641"),
             "the operator's port, not the derived one"
         );
+    }
+
+    /// FR-97 P2d-2b — the display-match policy reaches the map only when it is
+    /// not the default, so a supervised Mac's root forwards an owner's choice
+    /// and never imposes `auto` on its worker.
+    #[test]
+    fn display_match_rides_the_map_only_when_chosen() {
+        let mut cfg = test_fixture();
+        assert_eq!(
+            env_fallbacks(&cfg).get("DISPLAY_MATCH"),
+            None,
+            "auto, the default"
+        );
+        cfg.display_match = DisplayMatchPolicy::Never;
+        assert_eq!(
+            env_fallbacks(&cfg).get("DISPLAY_MATCH").map(String::as_str),
+            Some("never")
+        );
+        cfg.display_match = DisplayMatchPolicy::Always;
+        assert_eq!(
+            env_fallbacks(&cfg).get("DISPLAY_MATCH").map(String::as_str),
+            Some("always")
+        );
+    }
+
+    /// FR-97 P2d-2b — `never` beats `auto` beats `always`, whichever side holds
+    /// it, and a word this build does not know reads as `never`.
+    #[test]
+    fn the_stricter_display_match_policy_wins() {
+        use DisplayMatchPolicy::{Always, Auto, Never};
+        for (a, b, want) in [
+            (Always, Auto, Auto),
+            (Auto, Always, Auto),
+            (Auto, Never, Never),
+            (Never, Always, Never),
+            (Always, Always, Always),
+        ] {
+            assert_eq!(a.strictest(b), want, "{a:?} with {b:?}");
+        }
+        for p in [Always, Auto, Never] {
+            assert_eq!(DisplayMatchPolicy::from_word(p.as_str()), p);
+        }
+        assert_eq!(DisplayMatchPolicy::from_word("sometimes"), Never);
+        assert_eq!(DisplayMatchPolicy::from_word(" auto "), Auto);
     }
 
     /// Smallest document `try_load` accepts — enough to exercise save/load.
