@@ -291,37 +291,70 @@ async fn the_org_page_says_when_the_throttle_is_on() {
 
 /// FR-115 P4a-2 — the API half of the push to the PoPs. On its `/stats`
 /// poll, the pod signs the over-allowance set the job published and POSTs it
-/// to every endpoint; a fake PoP records what arrives. What it receives must
-/// verify with the ticket key's PUBLIC half (all a PoP holds) and carry the
-/// published set, with a lifetime of three polls; an absent set is pushed
-/// as an empty one, which is how the kill switch reaches a PoP.
+/// to every endpoint whose last answered `GET` reported an `allowance`, which a
+/// PoP does and a plain stats exporter does not. A fake PoP and a fake exporter
+/// in one region record what arrives. What the PoP receives must verify with
+/// the ticket key's PUBLIC half (all a PoP holds) and carry the published set,
+/// with a lifetime of three polls; an absent set is pushed as an empty one,
+/// which is how the kill switch reaches a PoP. The exporter, polled all along,
+/// receives nothing.
 #[tokio::test]
 async fn the_poller_pushes_the_signed_set_to_the_pops() {
     use base64::Engine as _;
     use roomler_ai_remote_control::derp_ticket::{self, DerpTicketSigner};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    // A fake PoP: the GET answers a minimal snapshot, the POST is recorded.
+    // A fake PoP: the GET answers a minimal snapshot with the `allowance` a
+    // PoP reports (no set held), and the POST is recorded.
     let pushed: Arc<Mutex<Vec<String>>> = Arc::default();
     let pop = {
         let pushed = pushed.clone();
         axum::Router::new().route(
             "/stats",
-            axum::routing::get(|| async { axum::Json(serde_json::json!({ "cpus": 1 })) }).post(
-                move |body: String| {
-                    let pushed = pushed.clone();
-                    async move {
-                        pushed.lock().unwrap().push(body);
-                        axum::http::StatusCode::NO_CONTENT
-                    }
-                },
-            ),
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "cpus": 1,
+                    "allowance": { "networks": 0, "age_s": null, "shaped_total": 0 },
+                }))
+            })
+            .post(move |body: String| {
+                let pushed = pushed.clone();
+                async move {
+                    pushed.lock().unwrap().push(body);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
         )
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let pop_addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, pop).await.unwrap() });
+
+    // Beside it, a stats endpoint that is not a PoP (a coturn worker's
+    // exporter): its GET reports no `allowance`, and it answers a POST 405.
+    // Its GETs are counted, so "never pushed to" cannot pass by its not
+    // having been polled at all.
+    let exporter_gets = Arc::new(AtomicUsize::new(0));
+    let exporter_posts = Arc::new(AtomicUsize::new(0));
+    let exporter = {
+        let (gets, posts) = (exporter_gets.clone(), exporter_posts.clone());
+        axum::Router::new().route(
+            "/stats",
+            axum::routing::get(move || {
+                gets.fetch_add(1, Ordering::Relaxed);
+                async { axum::Json(serde_json::json!({ "cpus": 1 })) }
+            })
+            .post(move || {
+                posts.fetch_add(1, Ordering::Relaxed);
+                async { axum::http::StatusCode::METHOD_NOT_ALLOWED }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exporter_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, exporter).await.unwrap() });
 
     let pkcs8 =
         ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
@@ -332,7 +365,7 @@ async fn the_poller_pushes_the_signed_set_to_the_pops() {
         s.turn.shared_secret = Some(ObjectId::new().to_hex());
         s.relay.regions_enabled = true;
         s.relay.regions = Some(format!(
-            r#"[{{"id":"pop-test","turn_url":"turn:coturn-pop.example:3478","stats_urls":["http://{pop_addr}/stats"]}}]"#
+            r#"[{{"id":"pop-test","turn_url":"turn:coturn-pop.example:3478","stats_urls":["http://{pop_addr}/stats","http://{exporter_addr}/stats"]}}]"#
         ));
         s.relay.stats_poll_secs = 1;
         s.relay.derp_ticket_private_key = Some(configured);
@@ -385,4 +418,13 @@ async fn the_poller_pushes_the_signed_set_to_the_pops() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
     assert!(empty.set.is_empty(), "{empty:?}");
+
+    // The exporter was polled through both pushes, and pushed neither.
+    let gets = exporter_gets.load(Ordering::Relaxed);
+    assert!(gets >= 2, "the exporter was polled only {gets} times");
+    assert_eq!(
+        exporter_posts.load(Ordering::Relaxed),
+        0,
+        "an endpoint whose GET reports no allowance is never pushed to"
+    );
 }
