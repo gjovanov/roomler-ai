@@ -210,7 +210,9 @@ software. The GPU's work is the capture.
   was a kept vmtest Ubuntu cell, GNOME on Xorg, master against master plus the change, alternated A B A B at a
   60 fps target. At 3840×2160, H.264/RTP went from 32.6 and 33.8 fps to 46.1 and 46.5 (+39 %). VP9-444 stayed at
   16–18 fps either way, bound by its 30 ms CPU resample. At 1280×800 (a ~1 ms grab) it went from 55.5 to 57.6 fps.
-  An idle desktop cost the same.
+  An idle desktop cost the same. **macOS followed in [FR-119](FR-119-high-refresh-streaming.md)'s P2b-5**
+  (2026-10-23), once the MacBook's heartbeats measured the same loss on the CoreGraphics stream: 54 fps at a 60
+  target and 97 at 120. Windows still times from the arrival.
 - **The VP9-444 path's encode budget.** On a fast link the rate control rises to ~17.5 Mbps at QP 6, and
   libvpx (8 threads, row-mt, 4 tile columns, `cpu-used` 6) is then the slowest stage. It stayed under the
   frame period after P3 (27.9 fps), but trading quality for frame rate under motion is rate control's

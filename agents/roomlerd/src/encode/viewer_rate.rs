@@ -145,7 +145,16 @@ impl ViewerRateController {
     /// call so a mid-session capture-rate change (e.g. the SW auto-cap) re-seeds
     /// the ceiling.
     pub fn observe(&mut self, reported_fps: u32, struggling: bool, capture_fps: u32) -> u32 {
-        self.capture_fps = capture_fps.max(1);
+        let capture_fps = capture_fps.max(1);
+        // FR-119 — a cap at the capture rate is NO cap, and it stays no cap when
+        // the rate moves (the grant's 60 → 120 swap). Left at the old rate it
+        // clamped the new one for the whole recovery climb: every other frame
+        // dropped, and the rate trial measured nothing. A cap that was clamping
+        // keeps the viewer's number.
+        if self.cap_fps >= self.capture_fps {
+            self.cap_fps = capture_fps;
+        }
+        self.capture_fps = capture_fps;
         self.min_fps = self.min_fps.min(self.capture_fps);
         // Keep the cap within the (possibly changed) bounds before deciding.
         self.cap_fps = self.cap_fps.clamp(self.min_fps, self.capture_fps);
@@ -932,6 +941,39 @@ mod tests {
         assert_eq!(c.divisor(), 2);
         assert_eq!(div, 2);
         assert!(c.cap_fps() <= 30);
+    }
+
+    /// FR-119 — a frame-rate move up (the grant's 60 → 120 swap adopted) must
+    /// not turn a cap that was not clamping into one that is. Left at the old
+    /// capture rate, "no cap" became a clamp at 60: divisor 2 for the whole
+    /// recovery climb, every other frame dropped, and the rate trial measured
+    /// nothing, because each drop ends its stretch. Field 2026-10-23, the
+    /// MacBook on 0.4.155: `cap_fps=60 skip_divisor=2` in the first window
+    /// after `to_fps=120`, divisor 1 only 3–5 s later.
+    #[test]
+    fn mid_session_capture_fps_rise_keeps_an_unclamped_cap_unclamped() {
+        for mut c in [ctrl(60), ctrl_ss(60)] {
+            assert_eq!(c.observe(60, false, 60), 1);
+            // The first window at 120 reports what the viewer was SENT in the
+            // window before (~60): a clean window, not a limit.
+            assert_eq!(c.observe(60, false, 120), 1);
+            assert_eq!(c.cap_fps(), 120);
+        }
+    }
+
+    /// The other half: a cap that WAS clamping stays where the viewer put it
+    /// when the capture rate rises. What the viewer managed has not changed
+    /// because the host can now capture faster.
+    #[test]
+    fn mid_session_capture_fps_rise_keeps_a_clamped_cap_clamped() {
+        let mut c = ctrl(60);
+        c.observe(35, true, 60); // cap 25 at 60 fps capture
+        assert_eq!(c.cap_fps(), 25);
+        let div = c.observe(25, false, 120);
+        assert_eq!(c.cap_fps(), 25);
+        // ceil(120/25) = 5 → 24 fps, still at or under the cap.
+        assert_eq!(div, 5);
+        assert!(120 / div <= c.cap_fps());
     }
 
     // ── FR-15 — age packing + loop ──────────────────────────────────────
