@@ -569,7 +569,8 @@ impl ScreenCapture for ScrapCapture {
     /// (the worker asks the capturer when the pump asks), and its
     /// whole-millisecond period runs a little fast at 120 and 144, so it does
     /// not lock to a phase (`gate::legacy_period`). The macOS stream itself is
-    /// unthrottled, so a 120 Hz panel already delivers what this asks for.
+    /// unthrottled, so a 120 Hz panel delivers what this asks for, once the
+    /// period runs from the ask (P2b-5, in `next_frame`).
     fn set_target_fps(&mut self, fps: u32) {
         self.target_frame_period = super::gate::legacy_period(fps);
     }
@@ -624,13 +625,15 @@ impl ScreenCapture for ScrapCapture {
         let reply = res_rx
             .await
             .map_err(|_| anyhow!("capture worker dropped reply"))?;
-        // FR-107's P2b, for X11: the frame period runs from when this frame
-        // was ASKED for. Timed from its arrival, every period also paid for
-        // the XShm grab, so a 30 fps target ran at 1000 / (33.3 + grab), as the
-        // DRM backend did until P2b. Linux only: on Windows and macOS this
-        // backend is the fallback, and its waits there (DXGI's and the CG
-        // stream's) were never measured against the change.
-        self.last_frame_at = Some(if cfg!(target_os = "linux") {
+        // FR-107's P2b, for X11, and FR-119's P2b-5, for macOS: the frame
+        // period runs from when this frame was ASKED for. Timed from its
+        // arrival, every period also paid for the grab (XShm's, or the CG
+        // stream's wait and copy), so a 30 fps target ran at
+        // 1000 / (33.3 + grab), as the DRM backend did until P2b. Measured on
+        // the MacBook (a 120 Hz panel, 3024×1964): 54 fps at 60 and 97 at 120.
+        // Windows keeps the arrival: there this backend is the fallback, and
+        // DXGI's wait was never measured against the change.
+        self.last_frame_at = Some(if cfg!(any(target_os = "linux", target_os = "macos")) {
             asked_at
         } else {
             Instant::now()
