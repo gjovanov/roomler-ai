@@ -313,6 +313,40 @@ next session gets the black screen P2b just fixed. Reconcile, do not toggle:
 compute effective caps from current state and send when they differ, the same
 shape as [`crate::power::PowerKeeper`].
 
+### The worker inherits the root's session knobs (FR-97 / FR-119, 2026-10-23)
+
+The same `env_reset` that dropped P1's environment marker drops every
+`ROOMLERD_*` variable, and the worker reads the person's `config.toml`, not
+`/etc/roomler/config.toml`. So a session-side knob the root had, set in its
+plist or written into its config by `roomler config set` or a remote-config
+push, changed the hello the root sent and nothing the worker did. Found by
+FR-119's field run: `fps_high` set as root made the picker show, the asks were
+ignored, and `rc:video-info` carried no fps fields. FR-97's Mac kill switches had
+the same split.
+
+`spawn_worker` now hands the worker the root's **effective** value of an
+explicit allowlist, `WORKER_ENV_FORWARD`
+(`agents/roomlerd/src/macos_supervisor.rs:275`): each through
+`tunnel_core::env::node_env` (environment, then config fallback), and only when
+the root has one, as `sudo -u '#uid' /usr/bin/env ROOMLERD_K=v … run
+--supervised` (`macos_supervisor.rs:381`). In the worker an environment variable
+beats its own config, so the session does what the hello promised. `env` execs
+into the agent, so the chain the supervisor reaps and the signals it relays are
+unchanged.
+
+| Forwarded | Owner |
+|---|---|
+| `LOCK_HINT`, `CLIPBOARD_MAC_WATCH`, `MAC_LAYOUT` | FR-97's Mac kill switches (P2d-1, P2e-1, P2d-2a) |
+| `FPS_HIGH`, `FPS_DENY` | FR-119's high-refresh picker and its per-cell ceilings |
+| `ENCODER_CELLS_DENY` | the encoder-cells kill switch: a gate applies at every entry point, and the worker is where a session's encoders open |
+
+⚠️ **An allowlist, never `config_fallbacks_for_child()`.** That helper exports
+every registered config knob, which suits the caps-probe child, but the worker is
+a full agent: a root-only knob (a relay server, the overlay, the updater) would
+start a second one in the person's session. A session-side knob joins the list
+when it is added; a test keeps the root-only ones out
+(`no_root_only_knob_is_forwarded_to_the_worker`).
+
 ### Components
 
 | where | change |
