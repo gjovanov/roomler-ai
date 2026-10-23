@@ -1585,6 +1585,17 @@ async fn connect_once(
         hello_caps.apps = apps;
     }
     let mut last_announced_apps: Vec<String> = hello_caps.apps.clone();
+    // FR-97 P2a — and its audio offer: the worker captures a delegated
+    // session's sound through ScreenCaptureKit in the person's session, while
+    // this root daemon says `no-session`. Ours is kept for when no worker is
+    // attached.
+    let own_audio = crate::encode::caps::AudioWords::of(&hello_caps);
+    if ctx.is_primary
+        && let Some(audio) = delegation.host().and_then(|d| d.effective_audio())
+    {
+        audio.apply(&mut hello_caps);
+    }
+    let mut last_announced_audio = crate::encode::caps::AudioWords::of(&hello_caps);
     // FR-85 P3b — what the hello told the server about remote recording, so
     // the heartbeat re-announces the moment the owner's gate changes it.
     let mut last_announced_record: Vec<String> = hello_caps.record.clone();
@@ -2208,6 +2219,12 @@ async fn connect_once(
                     .then(|| delegate.as_ref().and_then(|d| d.effective_apps()))
                     .flatten()
                     .unwrap_or_else(|| own_apps.clone());
+                // FR-97 P2a — and its audio offer, the same way.
+                let audio_now = ctx
+                    .is_primary
+                    .then(|| delegate.as_ref().and_then(|d| d.effective_audio()))
+                    .flatten()
+                    .unwrap_or_else(|| own_audio.clone());
                 let keep_busy_now = crate::keep_busy::advertised();
                 let sas_now = sas_advertised();
                 let desktop_now = crate::desktop_brief::current();
@@ -2226,6 +2243,7 @@ async fn connect_once(
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && apps_now == last_announced_apps
+                    && audio_now == last_announced_audio
                     && keep_busy_now == last_announced_keep_busy
                     && sas_now == last_announced_sas
                     && desktop_now == last_announced_desktop
@@ -2239,6 +2257,7 @@ async fn connect_once(
                     last_announced_permissions = caps_now.clone();
                     last_announced_record = record_now.clone();
                     last_announced_apps = apps_now.clone();
+                    last_announced_audio = audio_now.clone();
                     last_announced_keep_busy = keep_busy_now;
                     last_announced_sas = sas_now;
                     last_announced_desktop = desktop_now;
@@ -2264,6 +2283,7 @@ async fn connect_once(
                     crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
                     c.record = record_now;
                     c.apps = apps_now;
+                    audio_now.apply(&mut c);
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
                         c.has_input_permission = has_input;
@@ -2272,6 +2292,7 @@ async fn connect_once(
                         permissions = ?c.permissions,
                         record = ?c.record,
                         apps = ?c.apps,
+                        audio = ?c.audio,
                         desktop = ?c.desktop,
                         "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                     );
@@ -3395,8 +3416,20 @@ async fn handle_server_msg(
             // its grant carries AUDIO. A ceiling the org or this device set has
             // to bound everything that leaves the host, and system audio does;
             // an ordinary session keeps the historical opt-in unchanged.
+            //
+            // FR-97 P2a — on a supervised Mac, the GUI worker's offer: it
+            // captures a delegated session's sound (primary org only, like the
+            // delegation that sends it the session), while this root daemon,
+            // in no window-server session, offers none.
+            let audio_offered = match delegate
+                .filter(|_| ctx.is_primary)
+                .and_then(|d| d.effective_audio())
+            {
+                Some(worker) => !worker.audio.is_empty(),
+                None => !our_caps.audio.is_empty(),
+            };
             let audio_negotiated = audio_enabled
-                && !our_caps.audio.is_empty()
+                && audio_offered
                 && (external_consent.is_none()
                     || permissions
                         .contains(roomler_ai_remote_control::permissions::Permissions::AUDIO));

@@ -644,11 +644,18 @@ pub(crate) struct HostFacts {
     ///   default output's monitor through Pulse's client library (FR-97
     ///   P3c-2), or a capture device the owner named. Never the default input,
     ///   which is a microphone (P3c-1).
-    /// - macOS: never, until FR-97 P2a.
+    /// - macOS (FR-97 P2a): ScreenCaptureKit, in a process with a
+    ///   window-server session, unless its kill switch is off
+    ///   ([`mac_audio_refusal`]).
     pub(crate) audio_backend: bool,
     /// Linux: why there is no way to the computer's sound, by the route's own
     /// code ([`linux_audio_refusal`]). `None` elsewhere, and where there is one.
     pub(crate) linux_audio_refusal: Option<crate::audio_source::AudioUnavailableCode>,
+    /// macOS (FR-97 P2a): why this process cannot capture the computer's
+    /// sound: `NoSession` (no window-server session, a supervised Mac's root
+    /// half) or `SwitchedOff` (`ROOMLERD_SCK_AUDIO=0`). `None` elsewhere, and
+    /// where it can.
+    pub(crate) mac_audio_refusal: Option<crate::audio_source::AudioUnavailableCode>,
     /// The clipboard watcher reports copied images: Windows, (FR-97 P3e-3a)
     /// a Linux X11 session whose server takes the change gate
     /// (`clipboard::x11_gate`), and (P2e-1) a Mac, behind its change count
@@ -677,6 +684,7 @@ impl HostFacts {
     pub(crate) fn here() -> Self {
         use roomler_ai_remote_control::models::OsKind;
         let linux_audio_refusal = linux_audio_refusal();
+        let mac_audio_refusal = mac_audio_refusal();
         Self {
             os: if cfg!(target_os = "windows") {
                 OsKind::Windows
@@ -687,8 +695,10 @@ impl HostFacts {
             },
             audio_built: cfg!(feature = "audio"),
             audio_backend: cfg!(target_os = "windows")
-                || (cfg!(target_os = "linux") && linux_audio_refusal.is_none()),
+                || (cfg!(target_os = "linux") && linux_audio_refusal.is_none())
+                || (cfg!(target_os = "macos") && mac_audio_refusal.is_none()),
             linux_audio_refusal,
+            mac_audio_refusal,
             watches_clipboard_images: watches_clipboard_images(),
             clipboard_reachable: clipboard_reachable(),
             layout_reachable: layout_reachable(),
@@ -809,6 +819,82 @@ fn linux_audio_word(
     }
 }
 
+/// FR-97 P2a — a hello's audio offer: the `audio` words and the
+/// `unavailable["audio"]` reason, which travel together. A supervised Mac's
+/// root daemon says its GUI worker's (`DelegateHost::effective_audio`): the
+/// worker captures a delegated session's sound, and the root, in no
+/// window-server session, could capture none of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioWords {
+    pub audio: Vec<String>,
+    pub why: Option<roomler_ai_remote_control::models::Unavailable>,
+}
+
+impl AudioWords {
+    /// The offer `caps` makes.
+    pub fn of(caps: &AgentCaps) -> Self {
+        Self {
+            audio: caps.audio.clone(),
+            why: caps.unavailable.get("audio").cloned(),
+        }
+    }
+
+    /// Make `caps` make this offer: the words, and the reason or none.
+    pub fn apply(self, caps: &mut AgentCaps) {
+        caps.audio = self.audio;
+        match self.why {
+            Some(why) => {
+                caps.unavailable.insert("audio".into(), why);
+            }
+            None => {
+                caps.unavailable.remove("audio");
+            }
+        }
+    }
+}
+
+/// FR-97 P2a — a Mac's reason for sending no sound, by the refusal's code.
+/// `None` reads as no window-server session: the only way a Mac with the
+/// backend built has none and is not switched off.
+fn mac_audio_word(
+    why: Option<crate::audio_source::AudioUnavailableCode>,
+) -> roomler_ai_remote_control::models::Unavailable {
+    use crate::audio_source::AudioUnavailableCode as Why;
+    use roomler_ai_remote_control::models::Unavailable;
+    match why {
+        Some(Why::SwitchedOff) => Unavailable::new(
+            "switched-off",
+            "This Mac sends no sound: system audio is switched off on it (ROOMLERD_SCK_AUDIO=0)",
+        ),
+        _ => Unavailable::new(
+            "no-session",
+            "This process has no window-server session (a Mac's root daemon), so it captures no sound; \
+             the GUI worker in the person's login session does, and while it is attached this device \
+             says what that worker can",
+        ),
+    }
+}
+
+/// FR-97 P2a — see [`HostFacts::mac_audio_refusal`]: the kill switch first,
+/// then whether this process is in a window-server session at all.
+fn mac_audio_refusal() -> Option<crate::audio_source::AudioUnavailableCode> {
+    #[cfg(all(target_os = "macos", feature = "audio"))]
+    {
+        use crate::audio_source::AudioUnavailableCode as Why;
+        if !crate::audio::mac_audio_enabled() {
+            return Some(Why::SwitchedOff);
+        }
+        if !crate::tcc::has_gui_session() {
+            return Some(Why::NoSession);
+        }
+        None
+    }
+    #[cfg(not(all(target_os = "macos", feature = "audio")))]
+    {
+        None
+    }
+}
+
 /// A root Linux daemon (a system install) runs outside every desktop session:
 /// with neither display variable it has no clipboard to reach, the same test
 /// capture makes before it reports `no_display`. A per-user daemon, and every
@@ -840,7 +926,8 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
         caps.audio.clear();
         let why = match facts.os {
             OsKind::Linux => linux_audio_word(facts.linux_audio_refusal),
-            OsKind::Windows | OsKind::Macos => Unavailable::new(
+            OsKind::Macos => mac_audio_word(facts.mac_audio_refusal),
+            OsKind::Windows => Unavailable::new(
                 "no-backend",
                 "System-audio capture is not implemented on this OS yet, so this host sends no sound",
             ),
@@ -2804,6 +2891,7 @@ mod tests {
             audio_built: true,
             audio_backend: true,
             linux_audio_refusal: None,
+            mac_audio_refusal: None,
             watches_clipboard_images: true,
             clipboard_reachable: true,
             layout_reachable: true,
@@ -2826,19 +2914,42 @@ mod tests {
     #[test]
     fn a_host_without_an_audio_backend_offers_no_track_and_says_why() {
         use roomler_ai_remote_control::models::OsKind;
-        let mac = with_honest_words(
+        // A Windows build without its backend says so plainly.
+        let windows = with_honest_words(
             p0c_caps(),
             &HostFacts {
                 audio_backend: false,
-                ..p0c_facts(OsKind::Macos)
+                ..p0c_facts(OsKind::Windows)
             },
         );
         assert!(
-            mac.audio.is_empty(),
+            windows.audio.is_empty(),
             "no backend, no opus (R1): {:?}",
-            mac.audio
+            windows.audio
         );
-        assert_eq!(mac.unavailable["audio"].code, "no-backend");
+        assert_eq!(windows.unavailable["audio"].code, "no-backend");
+        // FR-97 P2a — a Mac with ScreenCaptureKit offers the track; one that
+        // cannot capture says which of its two reasons holds.
+        let mac = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Macos));
+        assert_eq!(mac.audio, vec!["opus".to_string()]);
+        assert!(!mac.unavailable.contains_key("audio"));
+        use crate::audio_source::AudioUnavailableCode as MacWhy;
+        for (why, code, names) in [
+            (MacWhy::NoSession, "no-session", "GUI worker"),
+            (MacWhy::SwitchedOff, "switched-off", "ROOMLERD_SCK_AUDIO=0"),
+        ] {
+            let c = with_honest_words(
+                p0c_caps(),
+                &HostFacts {
+                    audio_backend: false,
+                    mac_audio_refusal: Some(why),
+                    ..p0c_facts(OsKind::Macos)
+                },
+            );
+            assert!(c.audio.is_empty(), "{why:?}: {:?}", c.audio);
+            assert_eq!(c.unavailable["audio"].code, code, "{why:?}");
+            assert!(c.unavailable["audio"].reason.contains(names), "{why:?}");
+        }
         // A Linux host with a way to the computer's sound.
         let linux = with_honest_words(p0c_caps(), &p0c_facts(OsKind::Linux));
         assert_eq!(linux.audio, vec!["opus".to_string()]);
@@ -3002,6 +3113,7 @@ mod tests {
                         audio_built: true,
                         audio_backend: false,
                         linux_audio_refusal: None,
+                        mac_audio_refusal: None,
                         watches_clipboard_images: false,
                         clipboard_reachable: reachable,
                         layout_reachable: reachable,
@@ -3036,7 +3148,13 @@ mod tests {
                 f.linux_audio_refusal
             );
         } else {
-            assert!(!f.audio_backend, "macOS until FR-97 P2a");
+            // FR-97 P2a — ScreenCaptureKit, and a reason exactly when not.
+            assert_eq!(
+                f.audio_backend,
+                f.mac_audio_refusal.is_none(),
+                "{:?}",
+                f.mac_audio_refusal
+            );
         }
         // FR-97 P3e-3a — on Linux, wherever the X11 change gate opens.
         #[cfg(all(target_os = "linux", feature = "clipboard"))]

@@ -496,6 +496,32 @@ objc2-foundation = { version = "0.3", optional = true, features = [
 # keyboard layout, `input::layout_mac`), called on the main loop above. Already
 # in the lockfile (0.10.1, through core-graphics), so no new supply chain.
 core-foundation = { version = "0.10", optional = true }
+# FR-97 P2a — a Mac's system audio through ScreenCaptureKit (`audio::sck`), in
+# the `audio` feature. The same objc2 project as the crates above (0.3 on objc2
+# 0.6); new to the lockfile are only its ScreenCaptureKit, CoreMedia and
+# CoreAudioTypes bindings. `block2` and `dispatch2` are already there.
+objc2-screen-capture-kit = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+    "SCShareableContent",
+    "SCStream",
+] }
+objc2-core-media = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMTime",
+    "objc2-core-audio-types",
+] }
+objc2-core-audio-types = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
+] }
+block2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Effort 2 (Windows Service deployment mode). Optional opt-in alternative
@@ -672,10 +698,20 @@ viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundatio
 # System / desktop audio → WebRTC Opus track (opt-in per session via
 # `ServerMsg::Request.audio_enabled`). Pulls in the Opus encoder
 # (audiopus, bundled libopus from C source) and the cpal capture backend
-# (PulseAudio monitor on Linux, WASAPI loopback on Windows; macOS falls
-# back to a silent Noop capture). Independent of `ffmpeg-encoder`. See
-# `src/audio/`.
-audio = ["dep:audiopus", "dep:cpal"]
+# (PulseAudio monitor on Linux, WASAPI loopback on Windows; macOS, since FR-97
+# P2a, ScreenCaptureKit, whose bindings are macOS-only dependencies and so are
+# nothing elsewhere). Independent of `ffmpeg-encoder`. See `src/audio/`.
+audio = [
+    "dep:audiopus",
+    "dep:cpal",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-screen-capture-kit",
+    "dep:objc2-core-media",
+    "dep:objc2-core-audio-types",
+    "dep:block2",
+    "dep:dispatch2",
+]
 # FR-85 — HQ screen recording: the `roomlerd record` child (own capturer, CFR
 # pacer, recording encoder profile, fragmented MP4 + remux on stop), the local
 # verbs, and the device's half of remote recording. `symphonia` decodes an

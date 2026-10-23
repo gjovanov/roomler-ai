@@ -287,6 +287,9 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // false`, published as `0`, which the worker that serves `rc:apps.*` holds
     // as a floor under its own config.
     "APPS",
+    // FR-97 P2a — system audio through ScreenCaptureKit: the worker is the
+    // half that captures a session's (and a recording's) sound.
+    "SCK_AUDIO",
     // FR-119 — the high-refresh picker and its per-cell ceilings.
     "FPS_HIGH",
     "FPS_DENY",
