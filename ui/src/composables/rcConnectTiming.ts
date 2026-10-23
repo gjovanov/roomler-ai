@@ -246,6 +246,11 @@ const HUMAN_PACED: ReadonlySet<RcConnectMark> = new Set<RcConnectMark>(['ready']
  *  ignore the message, which is worse than not showing it. */
 export const CONNECT_SLOW_MS = 7000
 
+/** #2787 — a human-paced wait shorter than this was a machine's: an `auto`
+ *  grant settles consent in tens of milliseconds, and "0.0 s of it waiting
+ *  for approval" on such a connect would be noise. */
+const APPROVAL_MENTION_MS = 1000
+
 /** Minimum gap between two stall warnings. A flapping path abandons
  *  an attempt every few seconds; without this the operator gets a
  *  snackbar queue instead of a message. Long enough that repeats are
@@ -292,16 +297,21 @@ export function describeConnectTiming(t: RcConnectTiming): RcConnectVerdict {
     }
   }
 
-  // Find the dominant wait, ignoring human-paced ones.
+  // Find the dominant wait, ignoring human-paced ones, and add those up:
+  // they come off the total before it is judged slow (#2787, below).
   let worst: RcConnectMark | null = null
   let worstMs = 0
+  let humanMs = 0
   let prev = 0
   for (const name of MARK_ORDER) {
     const at = t.marks[name]
     if (at === undefined) continue
     const step = at - prev
     prev = at
-    if (HUMAN_PACED.has(name)) continue
+    if (HUMAN_PACED.has(name)) {
+      humanMs += step
+      continue
+    }
     if (step > worstMs) {
       worstMs = step
       worst = name
@@ -331,20 +341,31 @@ export function describeConnectTiming(t: RcConnectTiming): RcConnectVerdict {
     }
   }
 
-  if (total <= CONNECT_SLOW_MS) {
-    return { text: `Connected in ${secs(total)}.`, color: 'info', notable: false }
+  // ⚠️ #2787 — judge the MACHINE's share. `total` includes however long a
+  // person took over the consent prompt, and judging it whole made every
+  // attended connect "slower than usual", pinned on whichever machine step
+  // was largest: measured, 35.6 s in total, 33.6 s of it the owner
+  // approving, blamed on a 1.5 s network path. The approval is still SAID,
+  // so the number on screen adds up.
+  const machineMs = total - humanMs
+  const approval = humanMs >= APPROVAL_MENTION_MS
+    ? `, ${secs(humanMs)} of it waiting for approval`
+    : ''
+
+  if (machineMs <= CONNECT_SLOW_MS) {
+    return { text: `Connected in ${secs(total)}${approval}.`, color: 'info', notable: false }
   }
 
   if (!worst) {
     return {
-      text: `Connected in ${secs(total)} - slower than usual.`,
+      text: `Connected in ${secs(total)}${approval} - slower than usual.`,
       color: 'warning',
       notable: true,
     }
   }
 
   return {
-    text: `Connected in ${secs(total)} - slower than usual. Most of the wait `
+    text: `Connected in ${secs(total)}${approval} - slower than usual. Most of the wait `
       + `was ${WAIT_LABEL[worst]} (${secs(worstMs)}).`,
     color: 'warning',
     notable: true,
