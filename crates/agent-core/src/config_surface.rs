@@ -546,7 +546,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: true,
         kind: "list",
-        description: "FR-90 - comma-separated absolute folders this device's knowhow scans read: each is walked for its git checkouts (their remotes, branch and first commit), as the account that owns the folder - never SYSTEM/root, and never a folder root owns. Metadata only, never file contents. Read again at each scan. Never settable by the server. Empty = nothing is read.",
+        description: "FR-90 - comma-separated absolute paths this device's knowhow scans read, each as the account that owns it - never SYSTEM/root, and never a path root owns: a folder is walked for its git checkouts (their remotes, branch, first commit and the services their compose and Kubernetes manifests name), a file is read as a kubeconfig (its contexts, servers and CA fingerprints - never its users). Metadata only, never file contents. Read again at each scan. Never settable by the server. Empty = nothing is read.",
     },
     KeyMeta {
         key: "ssh_enabled",

@@ -14,11 +14,12 @@ sessions read it too, through their toolbelt.
 > the fleet's devices mirrored as machines, with what the fleet and the
 > network say of each (§10); P4-3a, a scan asked of a device, delivered,
 > answered and written as the device's own part of the map (§11); and
-> P4-3b-1, the device's own half on Linux and macOS, each root read as the
-> account that owns it (§11.2).** People, the sync and scans fill the map. A
-> checkout's manifests and kube contexts (P4-3b-2), listeners (P4-3b-3),
-> Windows (P4-3b-4), a session's reads and proposals (P4-4), probes (P4-5)
-> and `roomler_connect` (P4-6) come with the steps that build them (§12).
+> P4-3b-1 and P4-3b-2, the device's own half on Linux and macOS: its
+> checkouts with the services their manifests name, and a listed kubeconfig's
+> contexts, each root read as the account that owns it (§11.2).** People, the
+> sync and scans fill the map. Listeners (P4-3b-3), Windows (P4-3b-4), a
+> session's reads and proposals (P4-4), probes (P4-5) and `roomler_connect`
+> (P4-6) come with the steps that build them (§12).
 
 ## 1. A map, not a gate
 
@@ -434,7 +435,7 @@ to scan, and the device reads only the roots its owner lists, each as the accoun
 delivery and the answer's record; P4-3a-2 writes what a scan found onto the map (§11.1,
 decision 42). The device's half (the roots, the scanners) is P4-3b's, designed with
 decisions 45–47 in the FR-90 spec's §3e "P4-3b, a device's scan, as designed", and built on
-Linux and macOS by P4-3b-1 (§11.2). The server's half, with decisions 41–44, is its §3e
+Linux and macOS by P4-3b-1 and P4-3b-2 (§11.2). The server's half, with decisions 41–44, is its §3e
 "P4-3, scans, as designed".
 
 ```mermaid
@@ -587,13 +588,14 @@ entities with its machine.
 > person's own stop at 49; a scan entity keeps room for its scans' 9, so a person's own stop at
 > 55.
 
-### 11.2 A device's scan (P4-3b-1)
+### 11.2 A device's scan (P4-3b-1, P4-3b-2)
 
 The device's half of decision 38: the daemon reads the roots its owner lists, each through a
 child running as the account that owns it, and answers with what it found, checked as the
 server will check it ([`hive/knowhow`](../agents/roomlerd/src/hive/knowhow/mod.rs)). Linux and
-macOS, on every build carrying `hive`. A checkout's manifests and a listed kubeconfig are
-P4-3b-2's, listeners P4-3b-3's, Windows P4-3b-4's.
+macOS, on every build carrying `hive`. Since P4-3b-2 a checkout's manifests are read, and a file
+listed as a root is read as a kubeconfig (decision 46). Listeners are P4-3b-3's, Windows
+P4-3b-4's.
 
 ```mermaid
 flowchart TD
@@ -605,8 +607,10 @@ flowchart TD
     R -- "owned by root, or reached through another account's link" --> U["unread, and why"]
     R --> K["roomlerd knowhow-scan, as that account"]
     K -- "cannot list it, or no longer its own" --> U
-    K --> W["the walk: its checkouts, each read as text"]
+    K -- "a folder" --> W["the walk: its checkouts, each read as text, with its manifests' services"]
+    K -- "a file" --> KC["a kubeconfig: its contexts, its users never read"]
     W --> A["the answer: checked, bounded"]
+    KC --> A
     U --> A
     A --> S["rc:knowhow.scanned"]
 ```
@@ -615,28 +619,29 @@ flowchart TD
 
 | | |
 |---|---|
-| the key | `knowhow_scan_roots`: comma-separated absolute folders, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L544)) |
+| the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L544)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
-| live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L411)): an edit takes the next scan, with no restart |
+| live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L474)): an edit takes the next scan, with no restart |
 | whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9193)) |
 
-**Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L58)).
+**Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
 
 | The root | Read as |
 |---|---|
-| owned by an account, the daemon root | that account: `roomlerd knowhow-scan` started as it, through the drop an agent session takes ([`run_child`](../agents/roomlerd/src/hive/knowhow/mod.rs#L448)) |
+| owned by an account, the daemon root | that account: `roomlerd knowhow-scan` started as it, through the drop an agent session takes ([`run_child`](../agents/roomlerd/src/hive/knowhow/mod.rs#L511)) |
 | owned by the account the daemon runs as (a per-user install) | the daemon itself |
 | owned by another account, the daemon not root | unread: it reads only its own |
-| owned by root | unread: the owner lists the folders below it |
-| reached through a symbolic link that belongs to neither root nor the root's owner | unread ([`resolve`](../agents/roomlerd/src/hive/knowhow/owner.rs#L106)) |
-| not a folder (a kubeconfig is P4-3b-2's) | unread |
+| owned by root | unread: the owner lists the folders below it. A file root owns, a cluster's `admin.conf` among them, is never read |
+| reached through a symbolic link that belongs to neither root nor the root's owner | unread ([`resolve`](../agents/roomlerd/src/hive/knowhow/owner.rs#L132)) |
+| a file | read as a kubeconfig, by the account that owns it, as a folder would be |
+| neither a folder nor a file | unread |
 
 The child is started as hive's own children are: fed its request on stdin, its environment
 emptied but for its account's, in a process group of its own, at low priority. It refuses to run
 as root at all, and resolves its root again: a root it cannot list, or one no longer its
-account's, is refused ([`produce`](../agents/roomlerd/src/hive/knowhow/mod.rs#L167)).
+account's, is refused ([`produce`](../agents/roomlerd/src/hive/knowhow/mod.rs#L193)).
 
-**The walk** ([`walk`](../agents/roomlerd/src/hive/knowhow/walk.rs#L70)).
+**The walk** ([`walk`](../agents/roomlerd/src/hive/knowhow/walk.rs#L71)).
 
 | Bound | Value | When it is reached |
 |---|---|---|
@@ -652,21 +657,46 @@ A folder holding `.git` (a folder, or a file naming one: a worktree) is a checko
 goes no deeper into it. A folder under the root the account cannot list is passed by: the same at
 every scan, so not a cut.
 
-**A checkout** ([`read`](../agents/roomlerd/src/hive/knowhow/checkout.rs#L47)).
+**A checkout** ([`read`](../agents/roomlerd/src/hive/knowhow/checkout.rs#L48)).
 
 | Fact | Read from |
 |---|---|
 | `path` | where it is, resolved |
-| `remotes` | each remote's first `url` in its config (the shared one, for a worktree), its user and password, query and fragment taken out ([`clean_url`](../agents/roomlerd/src/hive/knowhow/checkout.rs#L188)), and one still holding a credential's shape dropped |
+| `remotes` | each remote's first `url` in its config (the shared one, for a worktree), its user and password, query and fragment taken out ([`clean_url`](../agents/roomlerd/src/hive/knowhow/checkout.rs#L189)), and one still holding a credential's shape dropped |
 | `branch` | `HEAD`; none when it is detached |
-| `root_commit` | `git rev-list --max-parents=0 HEAD`, as the account: hooks and fsmonitor off, no prompt, no fetch, neither the system's git config nor the account's, 5 s; only a real git ([`find_git`](../agents/roomlerd/src/hive/knowhow/checkout.rs#L32)), and never in a shallow clone, whose oldest commit is where it was cut |
+| `root_commit` | `git rev-list --max-parents=0 HEAD`, as the account: hooks and fsmonitor off, no prompt, no fetch, neither the system's git config nor the account's, 5 s; only a real git ([`find_git`](../agents/roomlerd/src/hive/knowhow/checkout.rs#L33)), and never in a shallow clone, whose oldest commit is where it was cut |
+| `services` | P4-3b-2: its manifests' services ([`services`](../agents/roomlerd/src/hive/knowhow/manifests.rs#L91)). A compose file's services, and a Kubernetes workload's containers (a Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob or Pod), each a name and an image: the workload's name for one container, `<workload>/<container>` for several. From YAML files three levels down at most: 200 a checkout, 256 KiB each, 64 services. A Helm template is not YAML until it is rendered, and is skipped |
+
+**A kubeconfig** ([`contexts`](../agents/roomlerd/src/hive/knowhow/kubeconfig.rs#L28)), P4-3b-2,
+decision 46: a file listed as a root, read by the account that owns it.
+
+| Fact | Read from |
+|---|---|
+| `name` | the context's |
+| `server` | its cluster's `server`, its user and password taken out; a context naming no cluster is passed by |
+| `namespace` | the context's, when it names one |
+| `ca_sha256` | the SHA-256 of its cluster's CA certificate (the DER of the first one), from `certificate-authority-data` or from the file `certificate-authority` names: the fingerprint `openssl x509 -noout -fingerprint -sha256` prints, so a person can check it by hand. None when the cluster skips verification |
+
+> [!WARNING]
+> **A kubeconfig's `users` is never read.** The reader passes the key by at the top of the file
+> without keeping a byte of its value
+> ([`documents`](../agents/roomlerd/src/hive/knowhow/yaml.rs#L64)'s `skip`): the credentials a
+> context uses stay where they are, and nothing a scan sends could carry one. A file that holds
+> no `contexts` or no `clusters` is refused as no kubeconfig, never read as an empty one.
+
+> [!NOTE]
+> **One YAML reader, bounded.** Manifests and kubeconfigs are read through `yaml-rust2`'s event
+> parser, never its loader, which copies an anchor's whole subtree at every alias, so a file of a
+> few lines can grow without bound. Here an alias counts as its anchor's size against
+> 100,000 nodes a document ([`MAX_NODES`](../agents/roomlerd/src/hive/knowhow/yaml.rs#L18)):
+> a document past it is refused, and its file passed by.
 
 > [!WARNING]
 > **macOS's `/usr/bin/git` is never run.** Without the developer tools it is a stub that offers
 > the person at the console an install dialog. The scanner runs Homebrew's git or the tools' own,
 > and names no first commit without one.
 
-**The answer** ([`assemble`](../agents/roomlerd/src/hive/knowhow/mod.rs#L583)).
+**The answer** ([`assemble`](../agents/roomlerd/src/hive/knowhow/mod.rs#L646)).
 
 | Outcome | When | The server then (§11.1) |
 |---|---|---|
@@ -676,7 +706,7 @@ every scan, so not a cut.
 | `failed` | no root read | writes nothing, archives nothing |
 
 The primary's declared tunnel routes go first
-([`declared_routes`](../agents/roomlerd/src/hive/knowhow/mod.rs#L558)): a secondary's names
+([`declared_routes`](../agents/roomlerd/src/hive/knowhow/mod.rs#L621)): a secondary's names
 another organization's node. Then each root's checkouts, each checked as the server will check it
 and dropped when it would be refused, and a checkout two roots share sent once. `detail` names
 each root not read and why, and counts what was dropped.
@@ -690,7 +720,7 @@ each root not read and why, and counts what was dropped.
 
 > [!NOTE]
 > **Once per scan id, on the primary's connection, off the loop**
-> ([`handle_scan`](../agents/roomlerd/src/hive/knowhow/mod.rs#L505)). A frame on a secondary
+> ([`handle_scan`](../agents/roomlerd/src/hive/knowhow/mod.rs#L568)). A frame on a secondary
 > enrollment's connection is answered `failed` (decision 43), though the server never sends one.
 > A scan runs off the signaling loop, one at a time, and the last 16 answers are kept, so a scan
 > delivered again after a lost connection is answered from what it found, never run twice. The
@@ -702,7 +732,6 @@ each root not read and why, and counts what was dropped.
 
 | Step | Builds |
 |---|---|
-| P4-3b-2 | the services a checkout's manifests name, and kube contexts from a kubeconfig the owner lists (decision 46), its users never read |
 | P4-3b-3 | the device's TCP listeners, behind its own `knowhow_scan_listeners` (decision 47) |
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |

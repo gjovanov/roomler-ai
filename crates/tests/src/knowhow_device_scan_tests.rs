@@ -8,8 +8,10 @@
 //! What these lock, that the unit tests cannot: the frame reaches the
 //! scanner on the primary's context; the roots come from the config FILE at
 //! each scan; a checkout is keyed as the intake keys it, its remote without
-//! its password; only a scan that read everything it lists retires anything;
-//! and an emptied list answers `no_roots`, which archives the device's part.
+//! its password and (P4-3b-2) its compose file's service beside it; a listed
+//! kubeconfig's context reaches its cluster; only a scan that read everything
+//! it lists retires anything; and an emptied list answers `no_roots`, which
+//! archives the device's part.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -152,6 +154,15 @@ fn checkout(at: &Path, remote: &str) -> String {
     git(at, &["rev-list", "--max-parents=0", "HEAD"])
 }
 
+/// Whether a cluster's card holds a `reachable_via` link.
+fn reachable(card: &Value) -> bool {
+    card["links"].as_array().is_some_and(|links| {
+        links
+            .iter()
+            .any(|l| l["edge"]["kind"] == json!("reachable_via"))
+    })
+}
+
 fn set_roots(config: &Path, roots: &[&Path]) {
     let path = config.to_path_buf();
     let mut cfg = roomlerd::config::load(&path).unwrap();
@@ -183,8 +194,23 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
             ["p", "w"].concat()
         ),
     );
+    // P4-3b-2: a compose file in the checkout, and a kubeconfig listed as a
+    // root (decision 46).
+    std::fs::write(
+        api.join("compose.yaml"),
+        "services:\n  web:\n    image: nginx:1.27\n",
+    )
+    .unwrap();
+    let kube = base.join("kube").join("config");
+    std::fs::create_dir_all(kube.parent().unwrap()).unwrap();
+    std::fs::write(
+        &kube,
+        "clusters:\n- name: prod\n  cluster:\n    server: https://k8s.example.com:6443\n\
+         contexts:\n- name: prod-admin\n  context:\n    cluster: prod\n    namespace: payments\n",
+    )
+    .unwrap();
     let config = base.join("config.toml");
-    cfg.knowhow_scan_roots = vec![root.display().to_string()];
+    cfg.knowhow_scan_roots = vec![root.display().to_string(), kube.display().to_string()];
     roomlerd::config::save(&config, &cfg).unwrap();
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -208,11 +234,23 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
     );
     assert_eq!(fact(&c, "branch")["value"], json!("main"));
     assert_eq!(fact(&c, "root_commit")["value"], json!(first));
+    assert_eq!(
+        fact(&c, "services")["value"],
+        json!([{ "name": "web", "image": "nginx:1.27", "file": "compose.yaml" }]),
+        "its compose file's service: {c}"
+    );
     assert!(
         card(&app, &t, "repo", "github.com/acme/api")
             .await
             .is_some()
     );
+    // The listed kubeconfig's context: its cluster, reachable via the device.
+    assert_eq!(s["counts"]["contexts"], json!(1), "{s}");
+    assert_eq!(s["written"]["clusters"], json!(1), "{s}");
+    let cluster = card(&app, &t, "cluster", "k8s.example.com:6443")
+        .await
+        .expect("the context's cluster");
+    assert!(reachable(&cluster), "{cluster}");
 
     // 2. A root unread: done but truncated, and nothing retired, though the
     // checkout is gone from the folder that was read.
@@ -230,8 +268,13 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
         card(&app, &t, "checkout", &key).await.is_some(),
         "a truncated scan retires nothing"
     );
+    let cluster = card(&app, &t, "cluster", "k8s.example.com:6443")
+        .await
+        .unwrap();
+    assert!(reachable(&cluster), "nor the unlisted kubeconfig's link");
 
-    // 3. Every root read again: the checkout it no longer finds is retired.
+    // 3. Every root read again: the checkout it no longer finds is retired,
+    // and so is the link of the kubeconfig no longer listed.
     set_roots(&config, &[&root]);
     let s = scan_once(&app, &t, &device, "done").await;
     assert!(s.get("truncated").is_none(), "{s}");
@@ -245,6 +288,10 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
             .is_some(),
         "never a shared entity"
     );
+    let cluster = card(&app, &t, "cluster", "k8s.example.com:6443")
+        .await
+        .expect("a shared cluster stays");
+    assert!(!reachable(&cluster), "its device's link retired: {cluster}");
 
     // 4. No root listed: `no_roots`, read from the file with no restart.
     set_roots(&config, &[]);

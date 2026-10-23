@@ -54,8 +54,9 @@ pub(super) struct Walked {
     pub entries: usize,
 }
 
-/// Whether the walk passes `name` by.
-fn skipped(name: &OsStr) -> bool {
+/// Whether the walk passes `name` by: the manifests' walk too
+/// ([`super::manifests`]).
+pub(super) fn skipped(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     name.starts_with('.') || SKIP.contains(&name.as_ref())
 }
