@@ -249,7 +249,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10105-10108`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 picture only | No SCK audio; cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:332-333`) | P2a, P2f |
-| R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:228`) | D2 |
+| R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:231`) | D2 |
 | R14 | "Being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | CGDisplayStream ignores `NSWindowSharingNone` (`desktop-companion.md:514-517`) | D2 |
 | R15 | Greeter, nobody signed in | ✅ SystemContext | 🟡 DRM, opt-in | ⛔ | macOS loginwindow: §7 | FR-93 / FR-95 |
 | R16 | Ctrl+Alt+Del | ❌ | ⛔ | ⛔ | §2.7 item 3 | P0c, P4a |
