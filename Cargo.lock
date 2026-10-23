@@ -8996,16 +8996,19 @@ name = "roomler-ai-mod-knowhow"
 version = "0.4.154"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bson",
  "futures",
  "mongodb",
  "roomler-ai-config",
  "roomler-ai-db",
+ "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-core",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
@@ -9206,6 +9209,7 @@ dependencies = [
  "roomler-ai-mod-conference",
  "roomler-ai-mod-fleet",
  "roomler-ai-mod-hive",
+ "roomler-ai-mod-knowhow",
  "roomler-ai-mod-network",
  "roomler-ai-mod-remote",
  "roomler-ai-mod-saas",

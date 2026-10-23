@@ -56,8 +56,8 @@ hive = ["dep:roomler-ai-mod-hive", "fleet", "chat"]
 # or a `vault.tenants` list.
 vault = ["dep:roomler-ai-mod-vault", "hive"]
 # FR-90 P4-1 — knowhow, the organization's map: on core alone for now (its
-# edges to `fleet`, `network` and `hive` come with P4-2 and P4-4, and the
-# feature will imply what they need then). In `profile-full` only, and its
+# edges to `fleet`, `network` and `hive` come with P4-3a, P4-2b and P4-4, and
+# the feature will imply what they need then). In `profile-full` only, and its
 # runtime switch defaults OFF like the vault's: `[modules] knowhow = true`,
 # or a `knowhow.tenants` list.
 knowhow = ["dep:roomler-ai-mod-knowhow"]

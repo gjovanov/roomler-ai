@@ -36,13 +36,15 @@ use axum::{
 };
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_unique_partial};
-use roomler_core::{Capabilities, Core, Module, TenantCtx};
+use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Job, Module, TenantCtx};
 
 pub mod dao;
 pub mod model;
 pub mod routes;
 pub mod scope;
+pub mod sync;
 pub mod view;
+mod write;
 
 /// The module's state: the core, and the map's three collections.
 #[derive(Clone)]
@@ -51,6 +53,9 @@ pub struct KnowhowState {
     pub entities: Arc<dao::EntityDao>,
     pub edges: Arc<dao::EdgeDao>,
     pub history: Arc<dao::HistoryDao>,
+    /// P4-2a — the fleet's devices, read to mirror them (the shared
+    /// stateless DAO, as the vault reads them: no module edge).
+    pub agents: Arc<roomler_ai_services::dao::agent::AgentDao>,
     /// The organizations whose map it keeps (`knowhow.tenants`).
     pub scope: Arc<scope::TenantScope>,
 }
@@ -73,22 +78,42 @@ impl FromRef<KnowhowState> for Core {
 impl Module for KnowhowState {
     const ID: &'static str = "knowhow";
 
-    /// No module state: P4-1 is the store, on core alone. Its edges come
-    /// with the steps that use them — `fleet` and `network` (P4-2's sync)
-    /// and `hive` (P4-4's session reads).
+    /// No module state, and no module edge yet. P4-2a reads the fleet's
+    /// devices through the shared `AgentDao` and hears of them through
+    /// core's hooks and agent socket, so it calls no module. `knowhow →
+    /// fleet` comes with the first use of fleet's Hub (P4-3a, asking a device
+    /// to scan), `knowhow → network` with P4-2b, and `knowhow → hive` with
+    /// P4-4's session reads.
     type Deps = ();
 
     async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
         let scope = scope::TenantScope::parse(&settings.knowhow.tenants);
         scope.log();
-        Ok(Self {
+        let state = Self {
             entities: Arc::new(dao::EntityDao::new(db)),
             edges: Arc::new(dao::EdgeDao::new(db)),
             history: Arc::new(dao::HistoryDao::new(db)),
+            agents: Arc::new(roomler_ai_services::dao::agent::AgentDao::new(db)),
             scope: Arc::new(scope),
             core,
-        })
+        };
+        // P4-2a — a device's hello mirrors it (an enrolment's first, every
+        // reconnect); the agent socket is fleet's, the registry core's.
+        state.core.agent_socket.register(
+            Self::ID,
+            AgentSocketHooks {
+                handler: None,
+                lifecycle: Some(sync::hello(&state)),
+            },
+        );
+        // And every pod reconciles, for what no hook carries.
+        let secs = match settings.knowhow.sync_secs {
+            0 => sync::DEFAULT_SYNC_SECS,
+            secs => secs,
+        };
+        sync::spawn_reconciler(state.clone(), secs);
+        Ok(state)
     }
 
     /// The module switch, or a `knowhow.tenants` list.
@@ -124,6 +149,27 @@ impl Module for KnowhowState {
             .nest("/tenant/{tenant_id}/knowhow/entity", entity)
             .nest("/tenant/{tenant_id}/knowhow/edge", edge)
             .with_state(self.clone())
+    }
+
+    /// P4-2a — fleet's events reach the map: a rename, an update, a removal.
+    /// Last in `HOOK_ORDER`, and never the cascade's refusal.
+    fn hooks(&self) -> Hooks {
+        Hooks {
+            fleet: Some(std::sync::Arc::new(sync::FleetSync {
+                state: self.clone(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// P4-2a — at boot, every served organization's machines mirrored, on
+    /// the pod that holds the startup lease.
+    fn jobs(&self) -> Vec<Job> {
+        let state = self.clone();
+        vec![Job::at_startup("knowhow.sync", true, move || {
+            let state = state.clone();
+            async move { sync::at_boot(&state).await }
+        })]
     }
 
     fn indexes(&self) -> Vec<IndexSet> {

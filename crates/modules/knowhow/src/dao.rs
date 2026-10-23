@@ -153,6 +153,35 @@ impl EntityDao {
             .await
     }
 
+    /// P4-2a — every live entity of one kind in an organization, as a
+    /// listing shows it: the machines a sync compares with the fleet's
+    /// devices. Bounded by the map's own cap.
+    pub async fn live_of_kind(
+        &self,
+        tenant_id: ObjectId,
+        kind: &str,
+    ) -> DaoResult<Vec<EntityNode>> {
+        let cursor = self
+            .nodes
+            .find(doc! { "tenant_id": tenant_id, "deleted_at": null, "kind": kind })
+            .projection(node_projection())
+            .limit(MAX_ENTITIES as i64)
+            .await?;
+        Ok(cursor.try_collect().await?)
+    }
+
+    /// P4-2a — the organizations whose map holds a live entity of `kind`.
+    pub async fn tenants_with(&self, kind: &str) -> DaoResult<Vec<ObjectId>> {
+        Ok(self
+            .base
+            .collection()
+            .distinct("tenant_id", doc! { "deleted_at": null, "kind": kind })
+            .await?
+            .into_iter()
+            .filter_map(|b| b.as_object_id())
+            .collect())
+    }
+
     /// Set fields on a live entity, at the rev its writer read, and bump it.
     /// `None` when it changed since, or is not live.
     pub async fn update_at(
@@ -255,12 +284,13 @@ impl EdgeDao {
     }
 
     /// Archive a live edge whatever its rev: an entity's archive takes its
-    /// links with it. `None` when it was not live.
+    /// links with it. `None` when it was not live. `by` is the person, or
+    /// none for the sync.
     pub async fn archive_live(
         &self,
         tenant_id: ObjectId,
         id: ObjectId,
-        by: ObjectId,
+        by: Option<ObjectId>,
         now: DateTime,
     ) -> DaoResult<Option<KnowhowEdge>> {
         Ok(self

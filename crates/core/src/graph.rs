@@ -34,10 +34,10 @@ pub const MODULES: &[&str] = &[
 /// own DAO. `vault → fleet` (the Hub, to push a revocation) comes with P3-3c.
 /// Hive never calls the vault: it asks through core's `SessionGate` hook.
 ///
-/// FR-90 P4 — `knowhow` has no edge yet: P4-1 is the store, on core alone.
-/// Its three come with the steps that use them — `knowhow → fleet` and
-/// `knowhow → network` with P4-2's sync, `knowhow → hive` (a session's
-/// question believed from its record) with P4-4 — and nothing calls it.
+/// FR-90 P4 — `knowhow` has no edge yet: P4-2a hears of devices from core.
+/// Its three come with the steps that call a module — `knowhow → fleet` (the
+/// Hub) with P4-3a, `knowhow → network` with P4-2b, `knowhow → hive` (a
+/// session's question believed from its record) with P4-4 — and none calls it.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),
