@@ -65,7 +65,7 @@ Three properties of the wire are load-bearing:
   handing it to `wmctrl -i -a` so a crafted id cannot become a flag
   (`agents/roomlerd/src/apps/linux.rs:337`).
 - 🔑 **Launch takes a key, never a command.** `resolve_app`
-  (`agents/roomlerd/src/apps/mod.rs:536`) is the security gate: the key must be
+  (`agents/roomlerd/src/apps/mod.rs:618`) is the security gate: the key must be
   in the device's own allowlist and the entry's `command` is run as argv with
   no shell, so a compromised viewer can start only what the device's owner
   wrote into its config, and there is no injection surface to reason about.
@@ -229,7 +229,7 @@ that is the truth: a short list looks exactly like a quiet desktop. This is the
 `Some([])`-vs-`None` distinction on its fourth surface in this codebase
 (overlay ACL ingress rules, `ssh_activity`, FR-49's dark org): an empty list and
 an unenumerable source are different facts, and only the reply can tell them
-apart. `Coverage` (`agents/roomlerd/src/apps/mod.rs:127`) is a **trait method**,
+apart. `Coverage` (`agents/roomlerd/src/apps/mod.rs:139`) is a **trait method**,
 not a field set at construction, so the compiler forces every backend to answer
 — it caught the test fake the day it was added.
 
@@ -254,14 +254,14 @@ not a field set at construction, so the compiler forces every backend to answer
   `pre_exec` hook long after the environment was copied, so the target user's
   login `PATH` never enters into it (`linux.rs:209`). Asking any other way
   answers about an environment the child never gets.
-- **`coverage` rides the error arm too** (`mod.rs:433`). A failed listing is
+- **`coverage` rides the error arm too** (`mod.rs:548`). A failed listing is
   exactly where an empty list is most likely to be read as calm.
 
 ### 4.2 `unavailable` — why there is no listing at all (P6)
 
 Every reply that says `supported: false`, and every focus/launch refused for
 want of a backend, carries `unavailable: {code, reason}` (`Unavailable`,
-`agents/roomlerd/src/apps/mod.rs:176`). The sentence is composed on the agent,
+`agents/roomlerd/src/apps/mod.rs:189`). The sentence is composed on the agent,
 not in the viewer, because only the agent knows which arm it took — the same
 rule FR-80 applied to the capture reason. The `code` is a **closed set**, and a
 compatibility surface like every other `rc:*` string: a test locks that the
@@ -281,7 +281,7 @@ into `starts_with`).
 
 The legacy `error` string on a focus/launch refusal keeps its shape and
 *contains* the reason, so a viewer that reads nothing else still shows it
-(`mod.rs:521`).
+(`mod.rs:603`).
 
 ### 4.3 The hello is a boot-time snapshot; the reply is live
 
@@ -297,14 +297,14 @@ restart changes it. That is why P6 added a fourth value:
 - **`status`** — *this build has a Remote Apps backend and answers
   `rc:apps.list` honestly*: with the list when there is a desktop, with
   `unavailable` when there is not. Advertised whenever the platform has a
-  backend (`apps::has_backend`, `mod.rs:357`), independent of what the host
+  backend (`apps::has_backend`, `mod.rs:434`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
   (`ui/src/views/remote/RemoteControl.vue:4589` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
   or the reason (`useRemoteControl.ts:9601`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
-- 🔑 **`availability_for()` is the single source for both** (`mod.rs:321`): the
+- 🔑 **`availability_for()` is the single source for both** (`mod.rs:396`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
   can disagree only by *time*, never by logic — **and never by which process
   asked.** ⚠️ The review of #1667 found that claim false on a caps-cache
@@ -344,7 +344,7 @@ server outlives both), it is `ssh`-attachable from a real login
 
 - 🔑 **Our own windows carry a known title**, so a window maps back to its
   session or allowlist key without pid/`xprop` correlation
-  (`classify_title`, `mod.rs:650`). Anything else is an unmanaged window and is
+  (`classify_title`, `mod.rs:732`). Anything else is an unmanaged window and is
   reported with its real title.
 - ⚠️ **A re-attach target is validated as a plain session token**
   (`is_safe_session`, `linux.rs:447`) — defence in depth against a crafted
@@ -467,7 +467,7 @@ must never write the device's config as a side effect of being run.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage` `:127`, `MissingTool` `:151`, `Unavailable` `:176` with `code` `:209` and `reason` `:221`), the `WindowManager` trait (`:259`), `availability` (`:314`) and `availability_for` (`:321`), `has_backend` (`:357`), `backend` (`:367`), `handle_control_message` (`:390`) and the pure `dispatch` seam (`:410`), the three reply builders (`:433`, `:471`, `:489`), `unavailable_reply` (`:521`), `resolve_app` (`:536`), the `wmctrl`/tmux parsers and `classify_title` (`:650`) |
+| `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage` `:139`, `MissingTool` `:164`, `Unavailable` `:189` with `code` `:229` and `reason` `:242`), the `WindowManager` trait (`:288`), the env floor (`APPS_ENV` `:338`, `permitted` `:355`), `availability` (`:389`) and `availability_for` (`:396`), `has_backend` (`:434`), `backend` (`:448`), `handle_control_message` (`:475`) and the pure `dispatch` seam (`:492`), the three reply builders (`:515`, `:553`, `:571`), `unavailable_reply` (`:603`), `resolve_app` (`:618`), the `wmctrl`/tmux parsers and `classify_title` (`:732`), the macOS listing (`QuartzWindow` `:764`, `quartz_listing` `:800`) and the Terminal script (`terminal_script` `:865`) |
 | `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:228`), `coverage` (`:254`), `list` (`:274`), `focus` (`:337`), `launch` (`:368`), `discover` (`:480`) and its test seam `discover_with` (`:497`), `refused` (`:579`), `Probe` (`:589`) and `probe` (`:605`), `find_xauthority` (`:648`) |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/apps/macos.rs` | FR-97 P2c: the window server's list (`quartz_windows`), the AX focus (`ax_window`, `MacWm::focus`), the launcher (`run_launcher`) and the Terminal script (`write_script`, `person_temp_dir`), `availability` (a window-server session or `no_session`). Its pure halves are in `mod.rs`: `QuartzWindow`, `quartz_listing`, `quartz_title`, `parse_quartz_window_id`, `terminal_script`, `terminal_script_name`, and the env floor (`APPS_ENV`, `apps_switched_off`, `permitted`) |
