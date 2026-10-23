@@ -548,8 +548,15 @@ async fn relay_quota(state: &Core, tid: ObjectId) -> serde_json::Value {
         }
     };
     let seats = tenant.billed_seats();
-    let allowance = relay_allowance::allowance_bytes(&tenant.plan, seats);
-    let over = relay_allowance::rate_for(&tenant.plan, seats, used, s).is_some();
+    // An exempt org (the operator's own) has no allowance on its page, as it
+    // has none in the throttle.
+    let exempt = relay_allowance::is_exempt(s, &tid);
+    let allowance = if exempt {
+        None
+    } else {
+        relay_allowance::allowance_bytes(&tenant.plan, seats)
+    };
+    let over = !exempt && relay_allowance::rate_for(&tenant.plan, seats, used, s).is_some();
     let iso = |d: bson::DateTime| d.try_to_rfc3339_string().unwrap_or_default();
     serde_json::json!({
         "relay": {
@@ -569,6 +576,8 @@ async fn relay_quota(state: &Core, tid: ObjectId) -> serde_json::Value {
             // FR-115 P4c-0 — whether TURN bytes count toward `used_bytes`
             // (remote desktop and meetings included), or DERP alone.
             "counts_turn": s.count_turn,
+            // FR-115 — the operator's own org: no allowance applies.
+            "exempt": exempt,
         }
     })
 }
