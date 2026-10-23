@@ -301,6 +301,58 @@ impl RedisPubSub {
             .await
     }
 
+    /// #2763 — advance a cumulative counter's baseline that every pod
+    /// shares, and say how much of it is NEW: the bytes this caller, and no
+    /// other, should book. The baseline is `boot|value`, `boot` naming the
+    /// counter's process. Only a higher value from the same process books
+    /// anything (the difference). An equal or lower one (another pod's
+    /// newer sample already advanced it) books nothing. A sample from
+    /// another process, or with no baseline yet, starts one and books
+    /// nothing: the bytes since a restart are lost, never counted twice, and
+    /// a late sample from an old process cannot be read as a new one's.
+    pub async fn advance_baseline(
+        &self,
+        key: &str,
+        boot: &str,
+        value: u64,
+        ttl_secs: u64,
+    ) -> Result<u64, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let n: i64 = redis::Script::new(Self::ADVANCE_BASELINE)
+            .key(key)
+            .arg(boot)
+            .arg(value)
+            .arg(ttl_secs.max(1))
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// `KEYS[1]` the baseline, `ARGV` boot, value, ttl. Returns the bytes to
+    /// book. Lua numbers are doubles, exact to 2^53 bytes (9 PB). A stored
+    /// value that does not parse starts a new baseline, like another boot.
+    const ADVANCE_BASELINE: &'static str = r#"
+local cur = redis.call('GET', KEYS[1])
+local new = ARGV[1] .. '|' .. ARGV[2]
+local now = tonumber(ARGV[2])
+if cur then
+  local sep = string.find(cur, '|', 1, true)
+  if sep and string.sub(cur, 1, sep - 1) == ARGV[1] then
+    local was = tonumber(string.sub(cur, sep + 1))
+    if was then
+      if now > was then
+        redis.call('SET', KEYS[1], new, 'EX', ARGV[3])
+        return now - was
+      end
+      redis.call('EXPIRE', KEYS[1], ARGV[3])
+      return 0
+    end
+  end
+end
+redis.call('SET', KEYS[1], new, 'EX', ARGV[3])
+return 0
+"#;
+
     /// Batched presence read for the agent listing: one MGET over all
     /// ids, `Some(owner_token)` per present (⇒ fresh, TTL-enforced) key.
     pub async fn agent_presence_get_many(

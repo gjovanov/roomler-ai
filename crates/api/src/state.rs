@@ -220,18 +220,27 @@ impl AppState {
             relay_load.clone(),
             &settings.relay,
             settings.stats.enabled.then(|| stats.clone()),
-            // FR-20 B — the network → tenant resolver. Gated on the same flag:
-            // stats off ⇒ no metering, and the load poller is unaffected.
+            // FR-20 B — a PoP's relayed bytes, booked to the network's tenant
+            // once across pods by a baseline in Redis (#2763). Gated on the
+            // same flag: stats off ⇒ no metering, and the load poller is
+            // unaffected. Without Redis they are not booked at all, rather
+            // than once per pod.
             //
             // A plain DAO rather than the configured `overlay_networks` below:
             // that one is constructed later in this function AND carries the
             // block-prefix allocator config, which only the ALLOCATION paths
             // need. The poller does exactly one read — `_id` → `tenant_id` —
             // so a read-only instance is both sufficient and honest about it.
-            settings
-                .stats
-                .enabled
-                .then(|| Arc::new(OverlayNetworkDao::new(&db))),
+            redis_pubsub
+                .clone()
+                .filter(|_| settings.stats.enabled)
+                .map(|redis| {
+                    crate::relay_load::PopNetworkBytes::new(
+                        Arc::new(OverlayNetworkDao::new(&db)),
+                        redis,
+                        db.name(),
+                    )
+                }),
             // FR-115 P4a-2 — the over-allowance set, pushed to the PoPs on
             // the same poll. Not gated on stats (it is a throttle, not
             // metering); without Redis or a ticket key, no push, and no PoP

@@ -130,7 +130,7 @@ landed yet is computed at one seat, the floor, so a missing number can only unde
 Every org is created on `free` (`crates/services/src/dao/tenant.rs:284`), on every server.
 On the hosted service that is a plan; on a self-hosted server it is only the absence of
 one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the hosted
-`saas` module is compiled in and switched on (`crates/api/src/state.rs:314`). The published
+`saas` module is compiled in and switched on (`crates/api/src/state.rs:323`). The published
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
@@ -351,7 +351,7 @@ the throttle shapes **bulk only**:
 ```mermaid
 flowchart LR
     FL["usage flush, every pod<br/>(derp.rs:178)"] --> L[("stats_usage")]
-    PP["PoP /stats poll<br/>(relay_load.rs:521)"] --> L
+    PP["PoP /stats poll<br/>(relay_load.rs:633)"] --> L
     L --> J["allowance job, one pod, every 5 min:<br/>month-to-date per org vs<br/>relay_bytes_per_month × seats"]
     J -->|plans_sold only| S[("over-allowance set<br/>(Redis, networks of flagged orgs)")]
     S --> A["each API pod: refresh every 60 s<br/>→ DashSet lookup in forward_frame"]
@@ -463,7 +463,7 @@ cluster *before any edit* found it behind on two counts:
 - It pinned coturn **4.17.0**, a pin that had never been applied. The workers ran **4.18.0**
   through `:latest`, so re-running the role would have downgraded TURN on all three at once.
 - Its template lacked the `prometheus` line, which the DERP sidecar's `/stats` scrapes
-  (`crates/derp-relay/src/main.rs:627`).
+  (`crates/derp-relay/src/main.rs:641`).
 
 The role was first brought level with what ran. Then it gained `redis-statsdb` with three
 choices:
@@ -521,10 +521,10 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The parser, one for both readers | `crates/remote_control/src/turn_stats.rs:42` (`parse`), moved from the cluster's collector |
-| The PoP's store and its collector | `crates/derp-relay/src/main.rs:256` (`TurnUsage`), `:372` (the subscription to `TURN_STATS_REDIS`) |
-| The PoP's endpoint | `crates/derp-relay/src/main.rs:484` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
+| The PoP's store and its collector | `crates/derp-relay/src/main.rs:256` (`TurnUsage`), `:382` (the subscription to `TURN_STATS_REDIS`) |
+| The PoP's endpoint | `crates/derp-relay/src/main.rs:494` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
 | The signed request | `crates/remote_control/src/derp_ticket.rs:220` (sign), `:239` (verify): audience `derp-turn-usage`, a `region` claim, 60 s |
-| The pull | `crates/core/src/relay_load.rs:327` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:199`) |
+| The pull | `crates/core/src/relay_load.rs:314` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:186`) |
 | The booking, one for both readers | `crates/core/src/turn_bytes.rs:86` (`record`). The cluster's claim key is P4b-1's, unchanged (`:71`) |
 | The PoP deploy | `scripts/relay-pop/`: a `redis` service, `TURN_STATS` in `pop.env`, `TURN_STATS_REDIS` for derp-relay, coturn pinned |
 

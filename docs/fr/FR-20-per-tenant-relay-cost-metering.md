@@ -381,3 +381,15 @@ re-homing.
 | 2026-09-01 | Billing invariant pinned in `ws::derp::tests` | 7 new tests: relayed frames bill **exactly** the enqueued bytes (32 + payload, not the inbound length) and accumulate; **zero** on unregistered dst / cross-network / ACL-denied / full queue / malformed; warn-mode delivers **and therefore bills** |
 | 2026-09-01 | ⚠️ Verified falsifiable | hoisting `add_network_bytes` above the enqueue fails **4** of them. The ACL test's precondition also earned itself: `DerpAllowTable::default()` is WARN mode and permits, so a first draft would have billed `0` for the wrong reason |
 | 2026-09-01 | P3 resolved as a **decision**, not a blockage | measured on the fleet that coturn 4.17.2's label set is `{realm}`/`{type}` only; deferred deliberately because per-tenant TURN attribution buys nothing until a tenant relays material TURN volume |
+
+## Correction: PoP bytes were booked once PER POD (#2763, 2026-10-23)
+
+"The poller must diff successive samples" (§B) held for each pod, but every API pod
+polls every PoP. Each pod diffed the PoP's cumulative counter against its own last
+sample and booked the same growth, so a PoP's bytes were booked **twice on the two-pod
+deployment**. The bug was latent: measured on 2026-10-23, all four PoPs report
+`per_network: {}` with 0 DERP registrations, because no agent is homed to one. The diff
+is now against a baseline both pods share in Redis, keyed by the PoP process's `boot`,
+and only the pod whose sample advances it books the difference. The mechanics and the
+outcome table are in
+[`relay-cost-metering.md` §B](../relay-cost-metering.md#b--pop-derp--shipped).
