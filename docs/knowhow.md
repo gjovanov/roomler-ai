@@ -775,7 +775,7 @@ sequenceDiagram
     K-->>D: rc:knowhow.card {req_id, card}, or rc:knowhow.refused {req_id, reason}
 ```
 
-**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L189)). At each hello the
+**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L181)). At each hello the
 pod's knowhow sends `rc:knowhow.served {tools}` to a device whose hello
 advertised `knowhow-tools`, on its primary enrollment's connection, when
 knowhow serves its organization. `tools` names what this server answers
@@ -785,7 +785,7 @@ agent would log a frame it cannot read. A device offers its sessions the
 tools only on this word, so where knowhow is switched off no session is shown
 a tool that no module would answer.
 
-**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L311)). A question names a session and
+**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L303)). A question names a session and
 its fence; the organization and the device come from the socket. Every
 question is checked, in this order:
 
@@ -795,14 +795,14 @@ question is checked, in this order:
 | the session's record, read through hive's own DAO, is this organization's and runs on this device | `not_located` |
 | at the frame's fence | `stale_fence` |
 | live: starting, idle, running or awaiting approval | `ended` |
-| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L358), decision 48) | `denied` |
+| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L350), decision 48) | `denied` |
 | 120 questions a minute for the session on its device | `busy` |
 
 Then the question itself: `bad_request` for one past its bounds, `not_found`
 for a name no live entity holds, `unavailable` when a read failed. Each
 connection's questions wait in one queue of 16, answered in order by one task,
 so a slow read never holds the socket and a flood is answered `busy` instead
-of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L125)).
+of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L88)).
 
 > [!IMPORTANT]
 > **A session reads what its starter may, now.** The vault holds a session's
@@ -816,7 +816,7 @@ of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L125)).
 | Question | Answer | Bounds |
 |---|---|---|
 | `rc:knowhow.search {q?, kind?, env?, limit?}` | `rc:knowhow.found {entities, truncated}`: the people's search (§6), each entity as a listing shows one, no attributes and no facts | at most 50, 20 by default; `q` at most 200 characters |
-| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use | at most 50 links, cut from the end until the card fits 64 KiB ([`bounded`](../crates/modules/knowhow/src/session.rs#L464)); the entity itself is never cut, its own bounds hold it |
+| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use | at most 50 links, cut from the end until the card fits 64 KiB ([`bounded`](../crates/modules/knowhow/src/session.rs#L456)); the entity itself is never cut, its own bounds hold it |
 
 Every entity, fact and link comes with its status and source, so a session
 sees what a person said, what the sync and scans said, and (with P4-4-2) what
