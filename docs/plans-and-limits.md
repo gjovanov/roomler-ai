@@ -4,9 +4,11 @@
 billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b since
 2026-10-21), and the meeting cap (P5). The relay allowance on DERP (P4a) has been on since
 2026-10-21. Per-org TURN bytes (P4b) have been counted on the cluster's coturn since
-2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). Bringing TURN under the
-allowance (P4c) is built and ships switched off. Claims were checked against the code at
-`8ab970586`, and the relay allowance section at `d4eb310a9` plus this change.
+2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). TURN has counted toward the
+allowance, and an over-allowance org's mesh has left TURN for the DERP floor (P4c), since
+2026-10-23, with the operator's own orgs exempt. Exit nodes are on every plan (P4d). Claims
+were checked against the code at `8ab970586`, and the relay allowance section at `d4eb310a9`
+plus this change.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
 This page is the engineering view: where the numbers live, the one place they are compared,
@@ -119,7 +121,8 @@ down: to 1 Mbit/s on Free and 4 Mbit/s on a paid plan (`relay_allowance.free_rat
 never held. A throttle that delayed a handshake past its retry window would turn "slow" into
 "down" for exactly the hosts that have no other path.
 
-P4c extends it to TURN, behind two switches that ship **off**. With `count_turn` (P4c-0),
+P4c extends it to TURN, behind two switches that ship **off** and have been on in production
+since 2026-10-23. With `count_turn` (P4c-0),
 `turn_bytes` count toward the allowance beside `derp_bytes`. With `turn` (P4c-1), the org's
 overlay pairs leave TURN for that same DERP floor, and so meet the same throttle. Remote
 desktop, meetings, hive and tunnels keep TURN: a browser's WebRTC has no DERP path, and a
@@ -157,10 +160,11 @@ flowchart LR
 | What the org sees | `crates/api/src/routes/cost.rs:531` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced`, `throttled`, and `counts_turn` (P4c-0) |
 | TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. With `count_turn` they count toward the allowance (P4c-0) |
 
-⚠️ **Until `count_turn` is switched on, the allowance counts DERP bytes only.** TURN bytes have
-been attributed per org on every coturn since 2026-10-23 (the cluster's since 2026-10-22), but
-only P4c-0 makes the allowance read them. A username that names no org (the session-less
-pre-fetch) is logged as unattributed, never guessed.
+⚠️ **Without `count_turn`, the allowance counts DERP bytes only**, so a deployment that has
+not switched it on throttles nobody for TURN. Production has counted both since 2026-10-23.
+TURN bytes have been attributed per org on every coturn since 2026-10-23 (the cluster's since
+2026-10-22), but only P4c-0 makes the allowance read them. A username that names no org (the
+session-less pre-fetch) is logged as unattributed, never guessed.
 
 ⚠️ **The pod's over-allowance map is process-wide, with each entry tagged by its database**
 (`crates/modules/network/src/relay_allowance.rs:170`). In production a process serves one
@@ -237,7 +241,7 @@ Each fence now has an integration test on a server without `saas`.
 
 ## 8. Not built yet
 
-- **The relay allowance on TURN (P4c) is built, but not yet switched on.** P4c-0 counts
-  TURN toward the allowance, and P4c-1 moves an over-allowance org's overlay pairs to the DERP
-  floor (§4). Both switches ship off and are turned on in the deploy repo per deployment.
-- **Exit nodes on Free (P4d):** after the throttle exists.
+- **What one meeting room carries is published, not measured** (FR-115 O4). Pro's 50 and
+  Business's 100 people stand until a synthetic-participant load test measures what one
+  mediasoup worker's room holds. Then either a room spans workers, or the published numbers
+  come down to the measured one.
