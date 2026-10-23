@@ -755,7 +755,7 @@ each root not read and why, and counts what was dropped.
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
+| P4-4 | a session's reads and proposals, designed in the FR-90 spec's §3e "P4-4, a session's reads and proposals, as designed" (decisions 48–52): the toolbelt's `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`) and held to its starter's `KNOWHOW_VIEW` (P4-4-1); `knowhow_propose` (P4-4-2); a person's word on a proposal (P4-4-3) |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
