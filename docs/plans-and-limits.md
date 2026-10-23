@@ -3,8 +3,9 @@
 **Status:** shipped in [FR-115](fr/FR-115-pricing-reshape.md) (#2557): the ladder and per-seat
 billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b since
 2026-10-21), and the meeting cap (P5). The relay allowance on DERP (P4a) has been on since
-2026-10-21, and per-org TURN bytes (P4b) have been counted on the cluster's coturn since
-2026-10-22. Throttling TURN (P4c) is not built. Claims were checked against the code at
+2026-10-21. Per-org TURN bytes (P4b) have been counted on the cluster's coturn since
+2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). Throttling TURN (P4c) is not
+built. Claims were checked against the code at
 `8ab970586`, and the relay allowance section at `d13831d31`.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
@@ -139,7 +140,7 @@ flowchart LR
 | The refresh | `crates/modules/network/src/relay_allowance.rs:253`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
 | The bucket on the API pods | `crates/modules/network/src/derp.rs:620` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:82`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
 | The bucket on the PoPs | `crates/derp-relay/src/main.rs:148`, the set arriving on `POST /stats` (`:529`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:219`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:156`). A PoP that holds no set throttles nothing |
-| What the org sees | `crates/api/src/routes/cost.rs:501` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced` and `throttled` |
+| What the org sees | `crates/api/src/routes/cost.rs:530` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced` and `throttled` |
 | TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. Counted, never held: holding them is P4c |
 
 ⚠️ **The allowance counts DERP bytes only.** TURN bytes have been attributed per org since

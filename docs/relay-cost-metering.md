@@ -29,6 +29,7 @@ flowchart LR
     subgraph measured["Server-measured — enters the ledger"]
         D1["API-pod DERP<br/>forward_frame"]
         D2["PoP DERP<br/>/stats per_network"]
+        C1["coturn totals<br/>cluster + PoPs"]
         S1["SFU participant-seconds"]
     end
     subgraph claimed["Endpoint-reported — analytics only"]
@@ -45,7 +46,7 @@ flowchart LR
 | Meter | What it counts |
 |---|---|
 | `derp_bytes` | relay bytes forwarded on this tenant's behalf |
-| `turn_bytes` | coturn-relayed bytes — **not collected today**, see [Point C](#c--coturn-turn--decided-not-built) |
+| `turn_bytes` | coturn-relayed bytes per org, from every coturn (the cluster's and each PoP's), **only behind `relay_allowance.turn_attribution`**; see [Point C](#c--coturn-turn--shipped-fr-115-p4b) |
 | `sfu_participant_seconds` | the SFU's real marginal cost |
 | `storage_bytes` | gauge |
 
@@ -162,27 +163,45 @@ sequenceDiagram
 > five regions measured ≈0 traffic while the ledger moved 1.77 GB. A PoP-vs-ledger
 > reconciliation would compare two things that barely overlap.
 
-### C · coturn TURN — decided, not built
+### C · coturn TURN — shipped (FR-115 P4b)
 
-Per-tenant TURN attribution is **deliberately not implemented**, and this is a decision
-rather than a blockage.
+coturn publishes each allocation's totals when it ends, through its statistics database
+(`--redis-statsdb`), under the username the server issued. A credential issued for an org
+names it (`<expiry>:<principal>:org-<hex>`, `crates/remote_control/src/turn_creds.rs:388`),
+so its bytes go to that org's `turn_bytes`, counted as what coturn **sent**: toward the
+client plus toward the peer.
 
-The original design resolved *username → tenant* through a TTL'd grant map. Measured on
-the live fleet against coturn **4.17.2**, the entire label set it emits is
-`{realm}` and `{type}` — `grep -c 'user=|username='` over the whole payload returns **0**.
-Every `turn_traffic_*` series is a realm-level aggregate, so the grant map would have been
-a lookup that matches nothing.
+```mermaid
+flowchart LR
+    subgraph cluster["The cluster's coturn"]
+        CT["coturn<br/>redis-statsdb"] --> CR[("cluster Redis")]
+    end
+    subgraph pop["Each regional PoP"]
+        PT["coturn"] --> PR[("PoP Redis")] --> DR["derp-relay<br/>keeps totals 1 h"]
+    end
+    CR -->|every pod subscribes| REC["turn_bytes::record<br/>once per leg"]
+    DR -->|every pod pulls, signed| REC
+    REC -->|names an org| L[("stats_usage<br/>turn_bytes")]
+    REC -.->|names none| U["unattributed,<br/>never guessed"]
+```
 
-Two mechanisms exist in 4.17.2, and choosing between them is an operational decision:
-
-| Option | Cost |
+| Path | Where |
 |---|---|
-| `--prometheus-username-labels` | Minimal code. ⚠️ But usernames are `{expiry}:{id}`, unique per issuance and never reused, so **every credential mints a new time series** — an unbounded label set, and the timestamp cannot be dropped because it is HMAC input. |
-| `-O, --redis-statsdb` | Per-session records with username and byte counts; no cardinality growth, and Redis is already deployed. Needs a new integration and its schema verified. |
+| The cluster's coturn (P4b-1) | every pod subscribes, `crates/modules/network/src/turn_usage.rs:81` |
+| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:256`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`) |
+| The booking | `crates/core/src/turn_bytes.rs:86`: the first pod to claim a leg books it, and a username naming no org is counted as unattributed |
 
-**Prefer `redis-statsdb` if this is ever taken up.** Per-tenant TURN attribution buys
-nothing until a tenant relays material TURN volume, and the fleet-total TURN cost is
-already visible through each region's `rx_mbps`/`tx_mbps`.
+> ⚠️ **`turn_bytes` is monitored only behind `relay_allowance.turn_attribution`**, which
+> is off by default and on in production since 2026-10-22. With it off, the cost surfaces
+> report the meter `monitored: false` with a null total, never a zero nobody measured
+> (`crates/api/src/routes/cost.rs:59`). Turn it on only where every coturn publishes: the
+> cluster's with `redis-statsdb`, each PoP's with `TURN_STATS_REDIS`. A range reaching back
+> before the switch is a partial total.
+
+Why `redis-statsdb`: coturn's Prometheus labels carry no user (4.17.2 emits `{realm}` and
+`{type}` only), and `--prometheus-username-labels` would mint a time series per credential,
+because the expiry in every username is HMAC input. The gates, the allowance and the kill
+switch are in [`plans-and-limits.md` §4](plans-and-limits.md#4-the-gates).
 
 ## The cost model
 
