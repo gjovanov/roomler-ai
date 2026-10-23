@@ -15,24 +15,38 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// The most links one root may pass through: the kernel's own limit.
 const MAX_LINKS: usize = 40;
 
-/// A root, ready to read: where it resolves, and as whom. `None` reads it as
-/// the daemon itself, which is then the account that owns it.
+/// What a root is, and so how it is read (decision 46): a folder is walked
+/// for its checkouts, a file is read as a kubeconfig.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RootKind {
+    #[default]
+    Folder,
+    Kubeconfig,
+}
+
+/// A root, ready to read: where it resolves, what it is, and as whom. `None`
+/// reads it as the daemon itself, which is then the account that owns it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Root {
     pub path: PathBuf,
+    pub kind: RootKind,
     pub account: Option<String>,
 }
 
-/// What resolving a listed root met: where it led, who owns that, and the
-/// owner of every link on the way.
+/// What resolving a listed root met: where it led, what that is, who owns
+/// it, and the owner of every link on the way.
 #[derive(Debug)]
 pub(super) struct Resolved {
     pub path: PathBuf,
     pub owner: u32,
     pub is_dir: bool,
+    pub is_file: bool,
     pub links: Vec<(PathBuf, u32)>,
 }
 
@@ -46,8 +60,14 @@ pub(super) fn prepare(listed: &Path, daemon_uid: u32) -> Result<Root, String> {
         None => None,
         Some(uid) => Some(crate::exec::account_name(uid)?),
     };
+    let kind = if resolved.is_dir {
+        RootKind::Folder
+    } else {
+        RootKind::Kubeconfig
+    };
     Ok(Root {
         path: resolved.path,
+        kind,
         account,
     })
 }
@@ -56,13 +76,19 @@ pub(super) fn prepare(listed: &Path, daemon_uid: u32) -> Result<Root, String> {
 /// `Some(uid)`: a root daemon drops to that account; `None`: the daemon reads
 /// it as itself.
 pub(super) fn whose(r: &Resolved, daemon_uid: u32) -> Result<Option<u32>, String> {
-    if !r.is_dir {
-        return Err("not a folder".into());
+    if !r.is_dir && !r.is_file {
+        return Err("neither a folder nor a file".into());
     }
     // Never as root: not because root could not read it, but because a scan
-    // sees what one account sees, and root sees everything.
+    // sees what one account sees, and root sees everything (a cluster's
+    // `admin.conf` among it).
     if r.owner == 0 {
-        return Err("owned by root, so never read: list the folders below it".into());
+        return Err(if r.is_dir {
+            "owned by root, so never read: list the folders below it"
+        } else {
+            "owned by root, so never read"
+        }
+        .into());
     }
     if let Some((link, _)) = r.links.iter().find(|(_, uid)| *uid != 0 && *uid != r.owner) {
         return Err(format!(
@@ -143,6 +169,7 @@ pub(super) fn resolve(listed: &Path) -> Result<Resolved, String> {
         path: at,
         owner: meta.uid(),
         is_dir: meta.is_dir(),
+        is_file: meta.is_file(),
         links,
     })
 }
@@ -156,6 +183,7 @@ mod tests {
             path: PathBuf::from("/home/dev/src"),
             owner,
             is_dir: true,
+            is_file: false,
             links: links
                 .iter()
                 .enumerate()
@@ -174,14 +202,34 @@ mod tests {
         assert!(why.contains("reads only its own"), "{why}");
     }
 
-    /// Never as root, and never a file.
+    /// Never as root, folder or file, and never what is neither.
     #[test]
     fn a_root_root_owns_is_never_read() {
         let why = whose(&resolved(0, &[]), 0).unwrap_err();
         assert!(why.contains("owned by root"), "{why}");
-        let mut file = resolved(1000, &[]);
-        file.is_dir = false;
-        assert!(whose(&file, 0).is_err());
+        let mut file = resolved(0, &[]);
+        (file.is_dir, file.is_file) = (false, true);
+        assert!(whose(&file, 0).unwrap_err().contains("owned by root"));
+        let mut other = resolved(1000, &[]);
+        other.is_dir = false;
+        assert!(whose(&other, 0).is_err(), "a socket, a device");
+    }
+
+    /// Decision 46: a file listed as a root is read as a kubeconfig, by the
+    /// account that owns it; a folder is walked.
+    #[test]
+    fn a_file_root_is_a_kubeconfig_and_a_folder_is_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config");
+        std::fs::write(&file, "kind: Config\n").unwrap();
+        let me = std::fs::metadata(&file).unwrap().uid();
+        if me == 0 {
+            // Every temp file is root's here, and never read.
+            return;
+        }
+        let root = prepare(&file, me).unwrap();
+        assert_eq!((root.kind, root.account), (RootKind::Kubeconfig, None));
+        assert_eq!(prepare(tmp.path(), me).unwrap().kind, RootKind::Folder);
     }
 
     /// A link on the way belongs to root or to the root's owner, or the root

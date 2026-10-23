@@ -9575,6 +9575,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "x11rb",
  "x509-parser",
+ "yaml-rust2",
  "zbus",
  "zeroize",
  "zip",

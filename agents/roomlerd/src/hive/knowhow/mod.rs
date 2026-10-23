@@ -17,6 +17,9 @@
 //! | the child, `roomlerd knowhow-scan`, as that account | [`scan_main`] |
 //! | the walk and its bounds | [`walk`] |
 //! | a checkout, read as text | [`checkout`] |
+//! | the services its manifests name (P4-3b-2) | [`manifests`] |
+//! | a listed kubeconfig's contexts (P4-3b-2, decision 46) | [`kubeconfig`] |
+//! | the one YAML reader both use, bounded | [`yaml`] |
 //! | the answer | [`assemble`] |
 //!
 //! ⚠️ Only a scan that read everything it lists retires anything. A root
@@ -25,8 +28,11 @@
 //! unplugged disk, or a typo, must never archive what earlier scans found.
 
 mod checkout;
+mod kubeconfig;
+mod manifests;
 mod owner;
 mod walk;
+mod yaml;
 
 use std::collections::{HashSet, VecDeque};
 use std::os::unix::fs::MetadataExt;
@@ -45,6 +51,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::checkpointer::Runner;
+use owner::RootKind;
 
 /// The hidden subcommand: `roomlerd knowhow-scan`, its request on stdin.
 pub const SCAN_SUBCOMMAND: &str = "knowhow-scan";
@@ -77,6 +84,10 @@ const ANSWERS_KEPT: usize = 16;
 pub(crate) struct Request {
     pub v: u32,
     pub root: PathBuf,
+    /// A folder or a kubeconfig (P4-3b-2). Absent from a P4-3b-1 daemon's
+    /// request, which only ever named folders.
+    #[serde(default)]
+    pub kind: RootKind,
     pub deadline_ms: u64,
     pub max_depth: usize,
     pub max_entries: usize,
@@ -85,10 +96,11 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    fn new(root: PathBuf, deadline: Duration) -> Self {
+    fn new(root: PathBuf, kind: RootKind, deadline: Duration) -> Self {
         Self {
             v: REQUEST_V,
             root,
+            kind,
             deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             max_depth: MAX_DEPTH,
             max_entries: MAX_ENTRIES,
@@ -161,9 +173,23 @@ pub fn scan_main() -> i32 {
     }
 }
 
+impl Found {
+    /// Add `value`, or mark the answer cut: past the request's bounds.
+    fn add(&mut self, value: Value, bytes: &mut usize, req: &Request) -> bool {
+        let size = value.to_string().len() + 1;
+        if self.findings.len() >= req.max_findings || *bytes + size > req.max_bytes {
+            self.cut = true;
+            return false;
+        }
+        *bytes += size;
+        self.findings.push(value);
+        true
+    }
+}
+
 /// Read `req.root` as this process's own account: the child's work, and the
-/// in-process runner's in tests. The root must still be a folder this
-/// account owns: the daemon resolved it, and it may have changed since.
+/// in-process runner's in tests. The root must still be what the daemon
+/// resolved, owned by this account: it may have changed since.
 pub(crate) fn produce(req: &Request) -> Result<Found, String> {
     let deadline = Instant::now() + Duration::from_millis(req.deadline_ms);
     let root =
@@ -171,6 +197,48 @@ pub(crate) fn produce(req: &Request) -> Result<Found, String> {
     let meta = std::fs::metadata(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     // SAFETY: reads the caller's own credentials; it cannot fail.
     let me = unsafe { libc::geteuid() };
+    match req.kind {
+        RootKind::Folder => read_folder(req, &root, &meta, me, deadline),
+        RootKind::Kubeconfig => read_kubeconfig(req, &root, &meta, me),
+    }
+}
+
+/// Decision 46: a file, read as a kubeconfig: its contexts.
+fn read_kubeconfig(
+    req: &Request,
+    root: &Path,
+    meta: &std::fs::Metadata,
+    me: u32,
+) -> Result<Found, String> {
+    if !meta.is_file() || meta.uid() != me {
+        return Err(format!(
+            "{} is no longer a file this account owns",
+            root.display()
+        ));
+    }
+    let mut found = Found {
+        v: REQUEST_V,
+        findings: Vec::new(),
+        cut: false,
+        entries: 0,
+    };
+    let mut bytes = 0;
+    for context in kubeconfig::contexts(root)? {
+        if !found.add(Finding::Context(context).to_value(), &mut bytes, req) {
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// A folder: its checkouts.
+fn read_folder(
+    req: &Request,
+    root: &Path,
+    meta: &std::fs::Metadata,
+    me: u32,
+    deadline: Instant,
+) -> Result<Found, String> {
     if !meta.is_dir() || meta.uid() != me {
         return Err(format!(
             "{} is no longer a folder this account owns",
@@ -181,9 +249,9 @@ pub(crate) fn produce(req: &Request) -> Result<Found, String> {
     // mode, or macOS's privacy protections without Full Disk Access, would
     // otherwise make a whole scan of nothing, and the server would archive
     // everything it held.
-    std::fs::read_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    std::fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let walked = walk::walk(
-        &root,
+        root,
         &walk::Bounds {
             max_depth: req.max_depth,
             max_entries: req.max_entries,
@@ -206,14 +274,9 @@ pub(crate) fn produce(req: &Request) -> Result<Found, String> {
         let Some(c) = checkout::read(dir, git.as_deref(), deadline) else {
             continue;
         };
-        let value = Finding::Checkout(c).to_value();
-        let size = value.to_string().len() + 1;
-        if found.findings.len() >= req.max_findings || bytes + size > req.max_bytes {
-            found.cut = true;
+        if !found.add(Finding::Checkout(c).to_value(), &mut bytes, req) {
             break;
         }
-        bytes += size;
-        found.findings.push(value);
     }
     Ok(found)
 }
@@ -421,7 +484,7 @@ impl Scanner {
     /// One root, read through the runner: a child as its owner on a device,
     /// in this process in tests.
     async fn read_root(&self, root: &owner::Root, deadline: Duration) -> Result<Found, String> {
-        let req = Request::new(root.path.clone(), deadline);
+        let req = Request::new(root.path.clone(), root.kind, deadline);
         match &self.run {
             Runner::Subprocess => {
                 run_child(&req, root.account.as_deref(), deadline + CHILD_GRACE).await
@@ -992,7 +1055,11 @@ mod tests {
     fn the_child_reads_its_root_as_its_own_account() {
         let root = tempfile::tempdir().unwrap();
         checkout_at(&root.path().join("api"));
-        let req = Request::new(root.path().to_path_buf(), Duration::from_secs(30));
+        let req = Request::new(
+            root.path().to_path_buf(),
+            RootKind::Folder,
+            Duration::from_secs(30),
+        );
         // SAFETY: reads the caller's own credentials; it cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -1000,7 +1067,11 @@ mod tests {
         let found = produce(&req).unwrap();
         assert_eq!(found.findings.len(), 1);
         assert!(!found.cut);
-        let not_mine = Request::new(PathBuf::from("/"), Duration::from_secs(30));
+        let not_mine = Request::new(
+            PathBuf::from("/"),
+            RootKind::Folder,
+            Duration::from_secs(30),
+        );
         assert!(
             produce(&not_mine)
                 .unwrap_err()
@@ -1023,10 +1094,56 @@ mod tests {
         // Searchable, not listable: as macOS's privacy protections leave a
         // folder for a process without Full Disk Access.
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
-        let req = Request::new(root.path().to_path_buf(), Duration::from_secs(30));
+        let req = Request::new(
+            root.path().to_path_buf(),
+            RootKind::Folder,
+            Duration::from_secs(30),
+        );
         let read = produce(&req);
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let why = read.unwrap_err();
         assert!(why.contains("ermission denied"), "{why}");
+    }
+
+    /// P4-3b-2: a checkout's manifests ride on its finding, and a file listed
+    /// as a root answers its kube contexts (decision 46).
+    #[tokio::test]
+    async fn a_checkouts_manifests_and_a_listed_kubeconfig_are_read() {
+        let root = tempfile::tempdir().unwrap();
+        checkout_at(&root.path().join("api"));
+        std::fs::write(
+            root.path().join("api").join("compose.yaml"),
+            "services:\n  web:\n    image: nginx:1.27\n",
+        )
+        .unwrap();
+        let kube = root.path().join("kubeconfig");
+        std::fs::write(
+            &kube,
+            "clusters:\n- name: prod\n  cluster:\n    server: https://k8s.example.com:6443\n\
+             contexts:\n- name: prod\n  context:\n    cluster: prod\n",
+        )
+        .unwrap();
+        // SAFETY: reads the caller's own credentials; it cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let folder = root.path().join("api");
+        let (s, _tmp) = scanner(&[&folder, &kube]);
+        let (tx, mut rx) = mpsc::channel(4);
+
+        handle_scan(Some(&s), ObjectId::new(), true, tx);
+        let (outcome, detail, truncated, findings) = parts(&answer(&mut rx).await);
+        assert_eq!(outcome, ScanOutcome::Done, "{detail:?}");
+        assert!(!truncated, "{detail:?}");
+        let kinds: Vec<&str> = findings
+            .iter()
+            .map(|f| f["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["checkout", "context"]);
+        assert_eq!(
+            findings[0]["services"],
+            serde_json::json!([{ "name": "web", "image": "nginx:1.27", "file": "compose.yaml" }])
+        );
+        assert_eq!(findings[1]["server"], "https://k8s.example.com:6443");
     }
 }

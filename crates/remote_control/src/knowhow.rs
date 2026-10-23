@@ -118,7 +118,7 @@ pub struct ManifestService {
 }
 
 /// A kube context the device's account holds. Its server and CA, never its
-/// token: that is offered to the vault on the device.
+/// user: the device never reads one (P4-3b-0 withdrew the vault offer).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KubeContext {

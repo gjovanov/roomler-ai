@@ -62,6 +62,11 @@ zeroize = { workspace = true, optional = true }
 hyper = { version = "1", features = ["server", "client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
+# FR-90 P4-3b-2 — a knowhow scan's one YAML reader (compose and Kubernetes
+# manifests, kubeconfigs), through its EVENT parser only: its loader copies an
+# anchor's subtree at every alias. Already in the tree through `config`; no
+# default features, so no encoding detection is linked.
+yaml-rust2 = { version = "0.8", default-features = false, optional = true }
 
 # Async + networking
 tokio = { workspace = true }
@@ -730,7 +735,7 @@ uinput-input = []
 # ⚠️ Deliberately NOT in `full`: no release build compiles it until the P0
 # field cell has run, and even compiled, every gate is closed by default
 # (`hive_enabled = false`, an empty account map, empty roots = nowhere).
-hive = ["dep:roomler-hive-node", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+hive = ["dep:roomler-hive-node", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:yaml-rust2"]
 # FR-90 P0f — TESTS ONLY: `hive::init_as_daemon`, a supervisor that launches
 # sessions as the daemon's OWN account, for the integration test that cannot
 # switch users (`crates/tests/tests/hive_canary.rs`).
