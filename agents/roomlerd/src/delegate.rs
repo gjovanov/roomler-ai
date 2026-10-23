@@ -817,6 +817,20 @@ impl DelegateHost {
         held.as_ref().map(|c| c.apps.clone())
     }
 
+    /// FR-97 P2a — the audio offer this DEVICE should make, given who is
+    /// attached: the worker's words and its reason. The worker captures a
+    /// delegated session's sound through ScreenCaptureKit, in the person's
+    /// window-server session; this root daemon is in none.
+    ///
+    /// `None` = no worker, or one that has not sent its caps: the caller keeps
+    /// its own (no `opus`, and `no-session`). A worker older than P2a sends no
+    /// `opus` and its own "no backend" reason, so the device offers no track it
+    /// cannot fill.
+    pub fn effective_audio(&self) -> Option<crate::encode::caps::AudioWords> {
+        let held = self.inner.worker_caps.lock().expect("worker caps mutex");
+        held.as_ref().map(crate::encode::caps::AudioWords::of)
+    }
+
     /// The `permissions` this DEVICE should advertise, given who is attached.
     ///
     /// `None` = "nothing to override" — no worker, or one that has not sent its

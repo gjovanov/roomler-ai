@@ -214,7 +214,7 @@ installing peers — a fleet-wide outage delivered by the server, visible only a
 Four requirements, all in P0:
 
 1. A **`supports_org_relay` hello bit** (`#[serde(default)] bool`, the shape of
-   `supports_server_relay_strategy`, `signaling.rs:2291`), gated at the existing both-ends
+   `supports_server_relay_strategy`, `signaling.rs:2312`), gated at the existing both-ends
    gate in `server_relay_verdict` (`crates/api/src/ws/overlay.rs:1877`). The gate is
    **permanent**, not "until everyone upgrades".
 2. `#[serde(other)] Unknown` (or a `deserialize_with` mapping unknown → `None`), making the
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:5408` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:5441` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -701,7 +701,7 @@ the counter was added without a reader"*. Still true: `stale_drops()`
 | server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
 
 ⚠️ An empty `relay_via` is not evidence of "no relay available" — it may mean the node never
-measured (`signaling.rs:1959`).
+measured (`signaling.rs:1970`).
 ⚠️ `relay_via` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.

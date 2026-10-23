@@ -19,8 +19,11 @@
 //!   * **Windows** — WASAPI loopback: cpal opens the default OUTPUT
 //!     device with `build_input_stream` (cpal 0.15 special-cases an
 //!     output device driven as an input into a loopback capture).
-//!   * **macOS / everything else** — none (ScreenCaptureKit system audio
-//!     is FR-97 P2a). The hello offers no track there, so no session asks.
+//!   * **macOS** — ScreenCaptureKit's mix of every app ([`sck`], FR-97
+//!     P2a), in a process with a window-server session: a per-user agent, or
+//!     a supervised Mac's GUI worker. Kill switch `ROOMLERD_SCK_AUDIO=0`.
+//!   * **everything else** — none. The hello offers no track there, so no
+//!     session asks.
 //!
 //! A capture that cannot open says why: the pump sends the reason to the
 //! controller as `rc:audio-unavailable` (`peer.rs`) instead of a silent
@@ -37,6 +40,40 @@ pub mod cpal_backend;
 pub mod opus_encode;
 #[cfg(target_os = "linux")]
 pub mod pulse;
+#[cfg(target_os = "macos")]
+pub mod sck;
+
+/// FR-97 P2a — the kill switch for a Mac's system audio:
+/// `ROOMLERD_SCK_AUDIO=0` stops the hello offering a track and the capture
+/// opening one. A supervised Mac's root forwards it to the GUI worker that
+/// captures (`macos_supervisor::WORKER_ENV_FORWARD`).
+pub fn mac_audio_enabled() -> bool {
+    tunnel_core::env::flag("SCK_AUDIO", true)
+}
+
+/// One float sample as 16-bit PCM: clamped, so a sample past full scale
+/// saturates instead of wrapping.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn f32_to_i16(x: f32) -> i16 {
+    let x = if x.is_nan() { 0.0 } else { x.clamp(-1.0, 1.0) };
+    (x * i16::MAX as f32).round() as i16
+}
+
+/// Planar float channels (one slice per channel, as ScreenCaptureKit hands
+/// them) as one interleaved 16-bit buffer: `[L0, R0, L1, R1, …]`. Channels of
+/// unequal length are cut to the shortest, so the result is always a whole
+/// number of frames.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn planar_f32_to_i16(planes: &[&[f32]]) -> Vec<i16> {
+    let frames = planes.iter().map(|p| p.len()).min().unwrap_or(0);
+    let mut out = Vec::with_capacity(frames * planes.len());
+    for i in 0..frames {
+        for p in planes {
+            out.push(f32_to_i16(p[i]));
+        }
+    }
+    out
+}
 
 /// One buffer of interleaved PCM samples straight off the capture
 /// backend, BEFORE resample / upmix. `channels` and `sample_rate`
@@ -96,13 +133,32 @@ pub fn open_default() -> Result<Box<dyn AudioCapture>, crate::audio_source::Audi
     {
         open_cpal()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        open_mac_system_audio()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Err(crate::audio_source::AudioUnavailable::new(
             crate::audio_source::AudioUnavailableCode::NotSupported,
-            "no system-audio capture backend on this OS (macOS ScreenCaptureKit audio is FR-97 P2a)",
+            "no system-audio capture backend on this OS",
         ))
     }
+}
+
+/// FR-97 P2a — a Mac's system audio, for a live session and for the recorder:
+/// ScreenCaptureKit's mix of every app, this process excluded; never a
+/// microphone. Refused, with the reason, under the kill switch.
+#[cfg(target_os = "macos")]
+pub fn open_mac_system_audio()
+-> Result<Box<dyn AudioCapture>, crate::audio_source::AudioUnavailable> {
+    if !mac_audio_enabled() {
+        return Err(crate::audio_source::AudioUnavailable::new(
+            crate::audio_source::AudioUnavailableCode::SwitchedOff,
+            "system audio is switched off on this Mac (ROOMLERD_SCK_AUDIO=0)",
+        ));
+    }
+    sck::SckAudioCapture::open().map(|c| Box::new(c) as Box<dyn AudioCapture>)
 }
 
 /// The loopback (Windows) or the named device (Linux), through cpal.
@@ -145,5 +201,50 @@ pub fn open_linux_system_audio()
             crate::audio_source::AudioUnavailableCode::NoSession,
             "this build has no session helper",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-97 P2a — ScreenCaptureKit's floats as 16-bit PCM: full scale maps to
+    /// the ends, past it saturates, and NaN is silence rather than a click.
+    #[test]
+    fn floats_become_16_bit_and_saturate() {
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.0), i16::MAX);
+        assert_eq!(f32_to_i16(-1.0), -i16::MAX);
+        assert_eq!(f32_to_i16(3.5), i16::MAX, "past full scale saturates");
+        assert_eq!(f32_to_i16(-7.0), -i16::MAX);
+        assert_eq!(f32_to_i16(f32::NAN), 0);
+        assert_eq!(f32_to_i16(0.5), 16384);
+    }
+
+    /// The measured layout: two planar channels of 960 frames become one
+    /// interleaved buffer of 1920 samples, left first.
+    #[test]
+    fn planar_channels_interleave_left_first() {
+        let left: Vec<f32> = (0..960).map(|i| i as f32 / 960.0).collect();
+        let right: Vec<f32> = (0..960).map(|i| -(i as f32) / 960.0).collect();
+        let out = planar_f32_to_i16(&[&left, &right]);
+        assert_eq!(out.len(), 1920);
+        assert_eq!((out[0], out[1]), (0, 0));
+        assert_eq!(out[2], f32_to_i16(1.0 / 960.0));
+        assert_eq!(out[3], f32_to_i16(-1.0 / 960.0));
+        assert_eq!(out[1918], f32_to_i16(959.0 / 960.0));
+        assert_eq!(out[1919], f32_to_i16(-959.0 / 960.0));
+        let short = planar_f32_to_i16(&[&[0.1, 0.2, 0.3], &[0.4]]);
+        assert_eq!(
+            short.len(),
+            2,
+            "cut to the shortest channel: whole frames only"
+        );
+        assert!(planar_f32_to_i16(&[]).is_empty());
+        assert_eq!(
+            planar_f32_to_i16(&[&[0.5, -0.5]]),
+            vec![16384, -16384],
+            "mono stays mono"
+        );
     }
 }

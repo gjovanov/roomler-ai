@@ -138,7 +138,17 @@ fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
         )?;
         Ok(Box::new(cap))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    // FR-97 P2a — a Mac: ScreenCaptureKit's mix, in the person's session the
+    // recorder runs in; never a microphone.
+    #[cfg(target_os = "macos")]
+    {
+        const _: () = assert!(
+            super::system_audio_supported(),
+            "ScreenCaptureKit opens here, so `system_audio_supported` must say so"
+        );
+        crate::audio::open_mac_system_audio().map_err(anyhow::Error::new)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         const _: () = assert!(
             !super::system_audio_supported(),

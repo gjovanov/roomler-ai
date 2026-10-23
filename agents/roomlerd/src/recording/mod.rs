@@ -12,8 +12,9 @@
 //! The folder rules live in [`folder`], the facts about a finished recording
 //! in [`sidecar`].
 //!
-//! Not here yet (later FR-85 phases): the microphone and computer audio on
-//! macOS (P1c-mac), and re-attaching after a dropped session (P3b-3). AAC
+//! Not here yet (later phases): the microphone on macOS (FR-97 P2f; computer
+//! audio is there since FR-97 P2a), and re-attaching after a dropped session
+//! (P3b-3). AAC
 //! ([`audio_codec`]) and FFmpeg's H.264 decoder for hardware-encoded
 //! recordings ([`decode`]) are built (P4) and wait only for the vendored
 //! FFmpeg that carries them.
@@ -36,10 +37,19 @@
 /// have, the start passed every gate, and it failed inside the recorder as a
 /// bare `start_failed`. A gate that is not the capability is a courtesy:
 /// keep this the only place the platform rule is spelled out.
+///
+/// FR-97 P2a — macOS joins: ScreenCaptureKit records what the computer
+/// plays, in the person's session where the recorder runs. A start that meets
+/// the kill switch (`ROOMLERD_SCK_AUDIO=0`) is refused by the open itself,
+/// with that reason.
 pub const fn system_audio_supported() -> bool {
     cfg!(all(
         feature = "audio",
-        any(target_os = "linux", target_os = "windows")
+        any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        )
     ))
 }
 
@@ -49,8 +59,6 @@ pub const fn system_audio_supported() -> bool {
 /// child's own refusal, so every surface says the same thing.
 pub const SYSTEM_AUDIO_UNSUPPORTED: &str = if !cfg!(feature = "audio") {
     "this device service was built without audio capture"
-} else if cfg!(target_os = "macos") {
-    "macOS can't capture what the computer plays yet"
 } else {
     "this device can't capture what the computer plays"
 };

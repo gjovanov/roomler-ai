@@ -97,6 +97,9 @@ pub enum AudioUnavailableCode {
     /// FR-97 P3c-2 — a root daemon with nobody signed in at the screen: there
     /// is no session, so no session sound.
     NoSession,
+    /// FR-97 P2a — the host's owner switched system audio off
+    /// (`ROOMLERD_SCK_AUDIO=0` on a Mac).
+    SwitchedOff,
 }
 
 impl AudioUnavailableCode {
@@ -111,6 +114,7 @@ impl AudioUnavailableCode {
             Self::NotSupported => "not_supported",
             Self::NoSoundServer => "no_sound_server",
             Self::NoSession => "no_session",
+            Self::SwitchedOff => "switched_off",
         }
     }
 
@@ -145,6 +149,10 @@ impl AudioUnavailableCode {
             Self::NoSession => {
                 "This host sends no sound: nobody is signed in at its screen, so there is no session \
                  sound to capture."
+            }
+            Self::SwitchedOff => {
+                "This host sends no sound: its owner switched system audio off on it \
+                 (ROOMLERD_SCK_AUDIO=0 on a Mac)."
             }
         }
     }
@@ -430,6 +438,7 @@ mod tests {
             NotSupported,
             NoSoundServer,
             NoSession,
+            SwitchedOff,
         ];
         let mut wires: Vec<&str> = all.iter().map(|c| c.wire()).collect();
         wires.sort_unstable();

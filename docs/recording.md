@@ -700,20 +700,22 @@ to the default INPUT device. The recorder opens
 `cpal_backend::Source::SystemOnly`, which refuses instead
 (`system_audio_unavailable`).
 
-⚠️ **Not yet on macOS.** Computer audio there needs ScreenCaptureKit (macOS 13+;
-the bundle targets 12). The microphone needs cpal on macOS, plus
-`NSMicrophoneUsageDescription` and the `audio-input` entitlement in the
-bundle. Both are refused by name until then — and computer audio is **never
+⚠️ **On macOS, computer audio since FR-97 P2a; the microphone not yet.**
+Computer audio comes from ScreenCaptureKit (`crate::audio::open_mac_system_audio`,
+the live session's own capture), in the person's session the recorder runs
+in. The microphone needs cpal on macOS, plus `NSMicrophoneUsageDescription`
+and the `audio-input` entitlement in the bundle (FR-97 P2f). It is refused by
+name until then. Before P2a computer audio was refused there too — and it is **never
 offered** where it cannot be recorded (#1760):
 
-| Computer audio | Windows | Linux | macOS · a build without `audio` |
-|---|---|---|---|
-| `system_audio_supported()` (`agents/roomlerd/src/recording/mod.rs`): the `audio` feature on Windows or Linux — the ONE answer every row below reads | yes | yes | **no** |
-| the recorder child (`child.rs` `open_system_audio`) | WASAPI loopback | the PulseAudio / PipeWire monitor | refuses `system_audio_unavailable` with the same words (`SYSTEM_AUDIO_UNSUPPORTED`); each `cfg` arm asserts at compile time that it agrees with the fn |
-| the device's caps (`remote.rs` `advertise`) | `remote-audio` while the owner allows it | same | never `remote-audio`, whatever the owner set |
-| a remote start asking for audio (`remote.rs` `precheck`) | `audio_not_allowed` until the owner allows it | same | `audio_unsupported`, ahead of the owner's gate, the words in `detail` |
-| every `rc:record.state` (`audio_unavailable`) | absent, or `audio_not_allowed` | same | `audio_unsupported`: the viewer's box is greyed out, unticked, with the sentence beside it |
-| the LocalAPI state (`RecordingState.system_audio_unavailable_reason`) | absent | absent | the words: the companion's **Computer audio** box and the owner's **Include computer audio** toggle are greyed out, unticked, with them |
+| Computer audio | Windows | Linux | macOS (FR-97 P2a) | a build without `audio` |
+|---|---|---|---|---|
+| `system_audio_supported()` (`agents/roomlerd/src/recording/mod.rs`): the `audio` feature on Windows, Linux or macOS — the ONE answer every row below reads | yes | yes | yes | **no** |
+| the recorder child (`child.rs` `open_system_audio`) | WASAPI loopback | the PulseAudio / PipeWire monitor | ScreenCaptureKit (`audio::open_mac_system_audio`); refused, with the reason, under `ROOMLERD_SCK_AUDIO=0` | refuses `system_audio_unavailable` with the same words (`SYSTEM_AUDIO_UNSUPPORTED`); each `cfg` arm asserts at compile time that it agrees with the fn |
+| the device's caps (`remote.rs` `advertise`) | `remote-audio` while the owner allows it | same | same | never `remote-audio`, whatever the owner set |
+| a remote start asking for audio (`remote.rs` `precheck`) | `audio_not_allowed` until the owner allows it | same | same | `audio_unsupported`, ahead of the owner's gate, the words in `detail` |
+| every `rc:record.state` (`audio_unavailable`) | absent, or `audio_not_allowed` | same | same | `audio_unsupported`: the viewer's box is greyed out, unticked, with the sentence beside it |
+| the LocalAPI state (`RecordingState.system_audio_unavailable_reason`) | absent | absent | absent | the words: the companion's **Computer audio** box and the owner's **Include computer audio** toggle are greyed out, unticked, with them |
 
 ⚠️ **The gate is the capability, or it is a courtesy.** Before #1760 the
 remote gates read the `audio` FEATURE, which the macOS build has (it is in
@@ -1047,9 +1049,9 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2550` (sent AFTER the consent mode is resolved), `signaling.rs:1860` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1094`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:88` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1675` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
-| An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:364` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
+| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2571` (sent AFTER the consent mode is resolved), `signaling.rs:1871` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1094`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:88` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1686` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:365` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:554` (noted where the grant crosses), `delegate.rs:794` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:195`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
@@ -1072,7 +1074,7 @@ sequenceDiagram
   for the new console user and stops the old worker's process group, recorder
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
-  `child.rs:370`); a recording never follows a user switch.
+  `child.rs:380`); a recording never follows a user switch.
 - ⚠️ **Not built on macOS yet:** the microphone and computer audio (P1c-mac:
   cpal, `NSMicrophoneUsageDescription`, the `audio-input` entitlement,
   ScreenCaptureKit on 13+). They are refused by name, and computer audio is
