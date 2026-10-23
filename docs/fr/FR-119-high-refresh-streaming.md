@@ -148,7 +148,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. P2 is built; its field proof is P3 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. P2 is built; its field proof is P3 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155) |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -455,6 +455,24 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
   - for `fps_high`: the bridge entry misnamed (2 failed, 253 passed: its own test and the bridge's parity check);
   - for the trial's numbers, each alone: the summary not kept, and the rate counted in the wrong unit (its test failed
     both times).
+
+### 4.6 P2b-4 — the viewer-rate cap follows a rate move up, as built (2026-10-23)
+
+Found on P3's first direct run (§8, 2026-10-23). The swap from 60 to 120 was adopted, and the first viewer window
+after it read `cap_fps=60 skip_divisor=2`. Divisor 1 came only 3–5 s later.
+
+- **The cause.** The viewer-rate controller (rc.188) starts every session with its cap at the capture rate, which
+  means no cap. When the capture rate rose, the cap stayed at the old rate, so "no cap" became a clamp at 60. It then
+  climbed back like any clamp the viewer had caused: three clean windows, then probes. For those 3–5 s every other
+  frame was dropped, and the trial measured nothing, because each drop ends its stretch (§4.4).
+- **The fix** (`encode/viewer_rate.rs:147-157`). A cap at the capture rate follows the rate when it moves. A cap below
+  it is the viewer's own number and stays where it is: what the viewer managed does not change because the host can
+  now capture faster. A move down is unchanged.
+- **The base rate moving up with the transport** (30 on a relay, 60 direct) follows the same rule, and now gets the
+  higher rate from the next window instead of climbing back to it.
+- **Tests** (`viewer_rate.rs:954`, `:968`). An unclamped cap follows a move from 60 to 120, on both the plain and the
+  slow-start controller. A clamped cap stays clamped: 25 at 60 is still 25 at 120, which is divisor 5. The first is
+  red on the code before the fix. The second passes on both, and guards the half that must not change.
 
 ## 5. Acceptance criteria
 
