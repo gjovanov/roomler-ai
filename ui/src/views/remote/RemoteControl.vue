@@ -12,7 +12,12 @@
          Low-Latency, clipboard send/get, file upload) moved to
          Row 2 below; on `<md` Row 2 collapses into the bottom-sheet.
          ============================================================ -->
-    <v-toolbar density="compact" color="surface" class="px-2 rc-toolbar-primary">
+    <v-toolbar
+      density="compact"
+      color="surface"
+      class="px-2 rc-toolbar-primary"
+      :class="{ 'rc-tb-split': sessionToolsOnStrip }"
+    >
       <v-btn
         icon="mdi-arrow-left"
         variant="text"
@@ -21,7 +26,7 @@
         :aria-label="isExternal ? 'Back to Connect' : 'Back to Agents'"
       />
       <v-toolbar-title class="d-flex align-center text-truncate">
-        <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0">
+        <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0 rc-tb-dot">
           mdi-circle
         </v-icon>
         <!-- FR-26 — the admin-set display name wins, as it does on /devices
@@ -44,6 +49,13 @@
         </span>
       </v-toolbar-title>
       <v-spacer />
+      <!-- FR-116 P5c — while a session runs, its state and every tool ride
+           their own row under the toolbar (#rc-tb-strip), at every width, so
+           this row keeps the device's name, Disconnect and Fullscreen. In one
+           row the tools overflowed it: the name was squeezed to 96 px on a
+           phone ("FR-…" at 360 px) and to 0 px on a 1300 px desktop, and the
+           state chips went past the edge or shrank to stubs. -->
+      <Teleport defer to="#rc-tb-strip" :disabled="!sessionToolsOnStrip">
       <v-chip
         v-if="rc.phase.value !== 'idle'"
         size="small"
@@ -825,6 +837,7 @@
       >
         Unmute
       </v-btn>
+      </Teleport>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         data-tour="viewer-connect"
@@ -868,6 +881,9 @@
         <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
       </v-btn>
     </v-toolbar>
+    <!-- FR-116 P5c — a running session's row: state chips first, then the
+         tools, scrolling sideways. Empty and hidden otherwise. -->
+    <div v-show="sessionToolsOnStrip" id="rc-tb-strip" class="rc-tb-strip" data-testid="rc-tb-strip" />
 
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
@@ -2425,6 +2441,13 @@ const { showSuccess, showError, showSnackbar } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
 const { mobile, xs, width: displayWidth } = useDisplay()
+// FR-116 P5c — while a session runs, its state chips and tools move to their
+// own row (#rc-tb-strip), at every width: in the toolbar's one row they
+// overflowed it, which pinned the device's name at its 96 px minimum on a
+// phone ("FR-…" at 360 px) and at 0 px on a 1300 px desktop with the drawer
+// open, and squeezed the state chips and the stats to stubs. Connect's phases
+// (idle, closed, error) keep the one row.
+const sessionToolsOnStrip = computed(() => !['idle', 'closed', 'error'].includes(rc.phase.value))
 // rc.199 — the single grouped Settings panel (gear button opens it at every
 // viewport, replacing the desktop inline Row 2 + the mobile bottom-sheet).
 const settingsOpen = ref(false)
@@ -5277,10 +5300,61 @@ onBeforeUnmount(() => {
   .remote-control-wrapper :deep(.rc-toolbar-primary .v-chip) {
     flex-shrink: 0;
   }
+  /* FR-116 P5c — while the session's tools ride #rc-tb-strip, this row holds
+     only Back, the name, Disconnect and Fullscreen: the actions go right. */
+  .remote-control-wrapper :deep(.rc-toolbar-primary.rc-tb-split .v-spacer) {
+    order: 1;
+  }
+}
+@media (max-width: 599.98px) {
+  /* FR-116 P5c — on a phone the name gets the room: Vuetify's 20 px title
+     inset, the online dot (a running session's phase chip, on the strip,
+     says more) and Disconnect's 64 px minimum (its word is hidden here) go. */
+  .remote-control-wrapper :deep(.rc-toolbar-primary.rc-tb-split .v-toolbar-title) {
+    margin-inline-start: 8px;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary.rc-tb-split .rc-tb-dot) {
+    display: none;
+  }
+  .remote-control-wrapper :deep(.rc-toolbar-primary.rc-tb-split .rc-tb-session) {
+    min-width: 48px;
+    padding: 0 12px;
+  }
 }
 .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar-title) {
   flex-shrink: 1;
   min-width: 0;
+}
+/* FR-116 P5c — a running session's own row (`sessionToolsOnStrip`): the
+   state chips first, then every tool, scrolling sideways. */
+.rc-tb-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-height: 44px;
+  padding: 0 8px;
+  background: rgb(var(--v-theme-surface));
+  border-top: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.rc-tb-strip > :deep(*) {
+  flex-shrink: 0;
+}
+/* From 960 px the stats readout rides the strip too, after the tools and in
+   the room they leave: whole pills only (one that does not fit wraps to a
+   second line, clipped), so a long codec label never pushes a tool out of
+   view, which at 1300 px it did. */
+.rc-tb-strip > .stats-readout {
+  order: 1;
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  row-gap: 8px;
+  max-height: 22px;
+  overflow: hidden;
+}
+.rc-tb-strip > .stats-readout .stats-pill {
+  white-space: nowrap;
 }
 /* The card wrapping `.remote-stage` provides Material elevation +
    rounded corners + theme-aware border. `overflow: hidden` clips
