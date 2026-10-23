@@ -3140,10 +3140,18 @@ table), on a host whose adapters and routes churn.
 - The arm is staged step by step: `heartbeat.flows`, `heartbeat.sys`,
   `heartbeat.caps`, `heartbeat.send`, `heartbeat.stats`
   (`agents/roomlerd/src/signaling.rs:2124` onwards).
-- ⚠️ `heartbeat.caps` can still block. When the advertised caps change
-  and the encoder-caps cache misses (it lives a week, keyed on the GPU
-  and driver), the capability probe runs synchronously: two children of
-  up to 60 s each.
+- The encoder capability probe never runs in the heartbeat.
+  `caps::detect()` is memoized per process, so only its first call
+  probes.
+  - ⚠️ That first call used to be the hello's, inside `connect_once`
+    with the pump already counting. On a probe-cache miss (no cache
+    yet, a week's age, a driver change), the probe's two children can
+    take up to 60 s each, which is past the watchdog. The kill left the
+    cache unwritten, so the restarted worker probed again: a crash loop
+    with the device offline.
+  - It is now warmed at the top of `run`, before any connect, while the
+    pump is gated off and on a blocking thread
+    (`agents/roomlerd/src/signaling.rs:803`).
 
 **Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
