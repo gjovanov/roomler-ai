@@ -40,9 +40,9 @@ DXGI Desktop Duplication, which returns `WouldBlock` when the desktop is
 unchanged. Two consequences in
 [`capture/scrap_backend.rs`](../../agents/roomlerd/src/capture/scrap_backend.rs):
 
-- `scrap_backend.rs:387` — the `WouldBlock` arm is the "no new frame" path.
+- `scrap_backend.rs:390` — the `WouldBlock` arm is the "no new frame" path.
   **On Linux it is unreachable**: XShm always yields a full buffer.
-- `scrap_backend.rs:378` — every delivered frame is stamped
+- `scrap_backend.rs:381` — every delivered frame is stamped
   `damage: Damage::Unknown`, so the encoder must treat all pixels as dirty and
   `peer.rs:2480`'s `set_roi_hints` receives an empty rect list.
 

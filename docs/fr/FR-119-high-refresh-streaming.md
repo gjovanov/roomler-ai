@@ -113,10 +113,11 @@ and as with encoder cells, the probe proves an open and only a session proves th
   `agents/roomlerd/src/encode/mod.rs`).
 - **The capture gate:** above 60, WGC runs the slot-first gate (FR-98 C1) regardless of `ROOMLERD_CAPTURE_GATE`.
   Its legacy rule sleeps out the rest of a period before it looks at the slot, so a frame that landed during the
-  encode waits, and at 120 fps that wait comes out of an 8.3 ms budget. scrap keeps its legacy gate, because it
-  has no slot to look at first, and DRM's period is in microseconds already. (The first draft gave a phase-lock as
-  the reason. At 120 and 144 the whole-millisecond period is 8 and 6 ms, a little faster than the frames, so as at
-  30 and 60 it drifts out of the wait instead.)
+  encode waits, and at 120 fps that wait comes out of an 8.3 ms budget. scrap has no slot to look at first, so
+  above 60 the same bucket paces its asks (P2b-6, §4.8): its whole-millisecond period, meant to run a little fast,
+  fell short of the target by each sleep's overshoot. DRM's period is in microseconds already. (The first draft
+  gave a phase-lock as the reason. At 120 and 144 the whole-millisecond period is 8 and 6 ms, a little faster than
+  the frames, so as at 30 and 60 it drifts out of the wait instead.)
 - **The cursor channel:** its poll interval follows the frame period above 60 (FR-98's `poll_interval` knob,
   `capture/cursor.rs:44`).
 
@@ -148,7 +149,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. P2 is built; its field proof is P3 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. P2 is built; its field proof is P3 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155). **Run 2, 2026-10-23** (§8): #2758 verified on 0.4.155. AC4 attempt 2, direct from Edge at the Mac's native size, was granted 120 and then taken back by the pipe; it found P2b-4 and P2b-5 |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -484,13 +485,31 @@ below the target whatever the viewer did.
   3024×1964). At 120 that is 8 + 2.3 ms a frame, or 97 fps. FR-107's P2b found the same on X11 and fixed it there
   alone (#2421), because the CG stream's wait had not been measured against the change. These heartbeats are that
   measurement.
-- **The fix** (`capture/scrap_backend.rs:628-640`). On macOS too, the period runs from when the frame was asked for.
+- **The fix** (`capture/scrap_backend.rs:652-664`). On macOS too, the period runs from when the frame was asked for.
   The stream is unthrottled, so a 120 Hz panel can now deliver the 120 asked for. At 60 the whole-millisecond
   period (16 ms) runs a little fast, as on X11, up to 62.5 fps when the screen changes faster than 60. Windows
   keeps the arrival: there this backend is the fallback, and DXGI's wait is unmeasured.
 - **No unit test**, as with #2421: the period is the worker's real wait, and a test would check a model of it, not
-  the code. The proof is a before/after on the MacBook. The before is in §8 (2026-10-23). The after is owed on the
-  release that carries this.
+  the code. The proof is a before/after on the MacBook. The before is in §8 (2026-10-23). The first after, on
+  0.4.157, is in §8 too, and it led to P2b-6 (§4.8).
+
+### 4.8 P2b-6 — above 60 the scrap backend paces its asks with the bucket, as built (2026-10-23)
+
+P2b-5's first after-measurement, on the MacBook (0.4.157): a relayed session at a 30 target captured 29.05 fps
+(28.9–29.2 per window), up from 28.09 on 0.4.155. The wait and the copy are gone from the period. What is left is
+each sleep overshooting its period by about 1.4 ms (tokio's 1 ms timer, and macOS's timer coalescing). The legacy
+period was meant to run a little fast at 120, 8 ms against 8.33, but 0.33 ms of margin cannot absorb 1.4 ms: 8 + 1.4
+ms is 106 fps, under the 108 AC4 asks for.
+
+- **The fix** (`capture/gate.rs:85-94`, `capture/scrap_backend.rs:626-644`). Above 60 the scrap backend paces its
+  asks with the slot-first bucket at the microsecond period, debited at each ask. What a sleep overshoots by is
+  credit the next ask already holds, so the long-run rate is the target. With no slot to look at first, the bucket
+  here paces asks rather than frames; the CoreGraphics stream delivers at most one new frame per refresh, so the panel
+  still caps it. At 60 and below the legacy rule stays, as it does for WGC.
+- **Windows' scrap fallback** (used only when WGC is unavailable) takes the same bucket above 60.
+- **Tests** (`gate.rs:210`, `:223`). Above 60 a pull backend gets the bucket. On a synthetic timeline where every
+  sleep overshoots by 1.4 ms, the bucket holds 120 asks a second and the legacy rule falls to about 106. A negative
+  control, `pull_gate` returning `None` (master's behaviour), fails exactly those two tests and no other.
 
 ## 5. Acceptance criteria
 
@@ -548,6 +567,7 @@ below the target whatever the viewer did.
 | 2026-10-23 | — | AC4 from the same viewer | **Not run: this viewer relays every session.** Both ends were on one LAN, and the overlay between them read direct at 5 ms. Yet ICE nominated the agent's host candidate against the browser's TURN relay candidate. An `RTCPeerConnection` with no ICE servers gathered zero candidates in that Chrome profile: its WebRTC IP-handling policy forbids non-proxied UDP. AC4 needs a viewer browser that allows direct UDP |
 | 2026-10-23 | agent 0.4.155, `fps_high = true` in the root's config only | **The two-half fix in the field** (FR-43's #2758). The worker's own config has no `fps_high` | **The worker takes the root's knob.** When the root spawned the worker it logged `macOS supervisor: the worker inherits the root's session knobs keys=["ROOMLERD_FPS_HIGH"]`, and the worker honoured the viewer's ask: `FR-119: frame rate decided … want=120` on a direct session, `refused=Some((120, Constrained))` on a relayed one. On 0.4.154 the same state ignored the ask |
 | 2026-10-23 | agent 0.4.155 | **AC4, attempt 2.** The MacBook, direct (host to host on one LAN), to Edge on neo16, whose panel is 2560×1600 at 240 Hz. At the Mac's native 3024×1964, with a 120 fps video moving on it | **Granted, then taken back by the pipe, as designed. Not an AC4 run.** `asked=Some(120) base_fps=60 want=120`, and the swap was adopted in 20 ms with no freeze. Three things stopped it. (1) The viewer-rate cap held the old 60 for 5 s (`cap_fps=60 skip_divisor=2`), so the trial measured nothing: **P2b-4**. (2) The capture delivered 97 fps at 120 and 54 at 60, because the macOS period ran from each frame's arrival: **P2b-5**. (3) When the full rate reached Edge, one send blocked for 44 ms. That one window gave a capacity of 10.1 Mbit/s against a ceiling of 104 Mbit/s at 120 for 5.9 Mpixel, so the grant went back to 60 on `pipe` (a capacity holds for 60 s). The session before it, at the same geometry, ended in an SCTP error and Edge reconnected; the panel is driven by a Radeon 610M, and which GPU Edge decoded on was not read. AC4's D1 is up to 1440p, so the next run picks 1080p. The log printed `refused=None` beside `want=60` because a refusal is named only once the stream runs below the ask, and the line is written before the swap down |
+| 2026-10-23 | agent 0.4.157 (P2b-4, P2b-5) | **P2b-5's first after.** The MacBook, a relayed session at a 30 target, against the same kind of session on 0.4.155 earlier that day; the same 120 fps video moving | **Better, not yet the target.** The capture rate went from 28.09 fps (mean of 3,794 heartbeat windows) to 29.05 (937 windows, each 28.9–29.2): the wait and the copy are out of the period. What remains is each sleep overshooting by about 1.4 ms, and at 120 that would be 8 + 1.4 ms a frame, 106 fps, under AC4's 108: **P2b-6** |
 
 ## 9. Related
 

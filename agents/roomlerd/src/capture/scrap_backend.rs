@@ -59,6 +59,9 @@ pub struct ScrapCapture {
     monitor: u8,
     target_frame_period: Duration,
     last_frame_at: Option<Instant>,
+    /// FR-119 P2b-6 — `Some` above 60: the bucket paces the asks
+    /// (`gate::pull_gate`); `None` keeps the legacy period above.
+    slot_first: Option<super::gate::SlotFirst>,
     /// Phase B — the encode box the pump wants, published to the capture
     /// worker. An atomic rather than a new command variant deliberately: the
     /// command channel is the per-frame hot path and a cap change is rare, so
@@ -448,6 +451,7 @@ impl ScrapCapture {
             monitor: 0,
             target_frame_period: super::gate::legacy_period(target_fps),
             last_frame_at: None,
+            slot_first: super::gate::pull_gate(target_fps),
             desired,
             unchanged,
             origin,
@@ -574,15 +578,16 @@ impl ScreenCapture for ScrapCapture {
         self.unchanged.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// FR-119 P2b — the pace is this side's sleep, so it moves in place. The
-    /// legacy gate is kept above 60: this backend has no slot to look at first
-    /// (the worker asks the capturer when the pump asks), and its
-    /// whole-millisecond period runs a little fast at 120 and 144, so it does
-    /// not lock to a phase (`gate::legacy_period`). The macOS stream itself is
-    /// unthrottled, so a 120 Hz panel delivers what this asks for, once the
-    /// period runs from the ask (P2b-5, in `next_frame`).
+    /// FR-119 P2b — the pace is this side's sleep, so it moves in place. This
+    /// backend has no slot to look at first (the worker grabs when the pump
+    /// asks), so above 60 the bucket paces the ASKS instead (P2b-6,
+    /// `gate::pull_gate`): the legacy whole-millisecond period was meant to run
+    /// a little fast at 120, but each sleep overshoots by more than its margin.
+    /// The macOS stream itself is unthrottled, so a 120 Hz panel delivers what
+    /// this asks for.
     fn set_target_fps(&mut self, fps: u32) {
         self.target_frame_period = super::gate::legacy_period(fps);
+        self.slot_first = super::gate::pull_gate(fps);
     }
 
     fn backend(&self) -> &'static str {
@@ -619,8 +624,14 @@ impl ScreenCapture for ScrapCapture {
     }
 
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
-        // FPS gate.
-        if let Some(last) = self.last_frame_at {
+        // FPS gate. Above 60 the bucket (P2b-6): what a sleep overshoots by is
+        // credit the next ask already holds, so the long-run rate is the target.
+        if let Some(gate) = self.slot_first.as_ref() {
+            let wait = gate.wait(Instant::now());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        } else if let Some(last) = self.last_frame_at {
             let elapsed = last.elapsed();
             if elapsed < self.target_frame_period {
                 tokio::time::sleep(self.target_frame_period - elapsed).await;
@@ -628,6 +639,9 @@ impl ScreenCapture for ScrapCapture {
         }
 
         let asked_at = Instant::now();
+        if let Some(gate) = self.slot_first.as_mut() {
+            gate.took(asked_at);
+        }
         let (res_tx, res_rx) = oneshot::channel();
         self.cmd_tx
             .send(res_tx)
