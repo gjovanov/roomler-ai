@@ -38,12 +38,7 @@ clicking Google OAuth button redirects to Google
 #  conference-list:76 — stale post-S4 selector, re-scoped to the dashboard
 #  card (#248); mention:66 — v-if→v-show stable tippy anchor in MentionList
 #  (#250, v20260729-135328). Kept here as a marker in case either regresses.)
-# 2026-10-21 — channels.spec.ts:90, #2647. FR-116 P2 (ae5e725c8) gave the app
-# bar's Search icon button its missing accessible name, so the spec's
-# `getByLabel('Search', { exact: true })` matched that button AND the explore
-# page's field: a strict-mode violation. The UI is right; the spec now asks for
-# the textbox by role. The nightly runs each image's OWN specs (#2645), so the
-# corrected spec reaches it only with the first promote that carries it.
-# ⚠️ DELETE this entry once a nightly on such an image passes the test, or the
-# entry will hide a real regression of it.
-explore page loads with search
+# (channels.spec.ts:90, #2647 — a stale locator after FR-116 P2 named the app
+#  bar's Search button — is FIXED and removed: #2649's role locator passed on
+#  the 2026-10-23 nightly, on hosted-20261022-ea2d75e with the specs at that
+#  image's own commit. Kept here as a marker in case it regresses.)
