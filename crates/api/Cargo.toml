@@ -55,12 +55,12 @@ hive = ["dep:roomler-ai-mod-hive", "fleet", "chat"]
 # and its runtime switch defaults OFF like hive's: `[modules] vault = true`,
 # or a `vault.tenants` list.
 vault = ["dep:roomler-ai-mod-vault", "hive"]
-# FR-90 P4-1 — knowhow, the organization's map: on core alone for now (its
-# edges to `fleet`, `network` and `hive` come with P4-3a, P4-2b and P4-4, and
-# the feature will imply what they need then). In `profile-full` only, and its
-# runtime switch defaults OFF like the vault's: `[modules] knowhow = true`,
-# or a `knowhow.tenants` list.
-knowhow = ["dep:roomler-ai-mod-knowhow"]
+# FR-90 P4-1 — knowhow, the organization's map. Built ON `hive` from P4-4-1
+# (a session's question is believed from its record — the graph's
+# `knowhow → hive` edge), so the feature implies it, as the vault's does. In
+# `profile-full` only, and its runtime switch defaults OFF like the vault's:
+# `[modules] knowhow = true`, or a `knowhow.tenants` list.
+knowhow = ["dep:roomler-ai-mod-knowhow", "hive"]
 
 
 [dependencies]

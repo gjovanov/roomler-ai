@@ -17,10 +17,13 @@ sessions read it too, through their toolbelt.
 > P4-3b-1 to P4-3b-3, the device's own half on Linux and macOS: its
 > checkouts with the services their manifests name, a listed kubeconfig's
 > contexts, each root read as the account that owns it, and, when its owner
-> says so, the ports it listens on (§11.2).** People, the sync and scans fill
-> the map. Windows (P4-3b-4), a session's reads and proposals (P4-4), probes
-> (P4-5) and `roomler_connect` (P4-6) come with the steps that build them
-> (§12).
+> says so, the ports it listens on (§11.2); and P4-4-1a, the server's half of
+> a session's questions: the word that the map is there, a session's search
+> and card, believed from its record and held to its starter's
+> `KNOWHOW_VIEW` (§12).** People, the sync and scans fill the map. Windows
+> (P4-3b-4), the toolbelt's knowhow tools (P4-4-1b), a session's proposals
+> (P4-4-2), probes (P4-5) and `roomler_connect` (P4-6) come with the steps
+> that build them (§13).
 
 ## 1. A map, not a gate
 
@@ -125,7 +128,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Four collections, per organization
-([`lib.rs:211`](../crates/modules/knowhow/src/lib.rs#L211)):
+([`lib.rs:233`](../crates/modules/knowhow/src/lib.rs#L233)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -242,7 +245,7 @@ All under `/api/tenant/{tenant_id}/knowhow`
 ## 7. A neighbourhood
 
 The map route walks the links both ways, one step at a time
-([`routes.rs:460`](../crates/modules/knowhow/src/routes.rs#L460)). Each step
+([`routes.rs:462`](../crates/modules/knowhow/src/routes.rs#L462)). Each step
 is one indexed read of the live links from or to the step's entities, at most
 500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L265)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
@@ -370,7 +373,7 @@ the device row as the fleet keeps it.
 | `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
 | `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
 | `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L222)) | while the organization has a MagicDNS domain |
-| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6565)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6576)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
 | `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
 | `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
 | `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
@@ -625,7 +628,7 @@ flowchart TD
 | the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L544)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
 | live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L523)): an edit takes the next scan, with no restart |
-| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9193)) |
+| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9219)) |
 | the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L554)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
 
 **Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
@@ -750,12 +753,102 @@ each root not read and why, and counts what was dropped.
 > ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L1991)), whatever its roots say: an empty
 > list is an answer.
 
-## 12. What comes next
+## 12. A session's questions (P4-4-1)
+
+A session asks the map through its toolbelt, and its device carries each
+question on its primary connection, as it carries a session's lease requests
+([`session.rs`](../crates/modules/knowhow/src/session.rs)). P4-4-1a builds the
+server's half: the word that the map is there, the two reads, and who is
+believed. The device's half (its client, the toolbelt's tools, the session's
+settings) is P4-4-1b's. The design, with decisions 48–52, is the FR-90 spec's
+§3e "P4-4, a session's reads and proposals, as designed".
+
+```mermaid
+sequenceDiagram
+    participant D as the device (the primary's connection)
+    participant K as knowhow, the pod holding it
+    participant H as agent_sessions (hive's record)
+    K-->>D: rc:knowhow.served {tools}, at its hello (decision 49)
+    D->>K: rc:knowhow.get {req_id, session_id, fence, kind, key}
+    K->>H: this organization's? on this device? at this fence? live?
+    K->>K: the starter's KNOWHOW_VIEW, read now (decision 48), then the rate
+    K-->>D: rc:knowhow.card {req_id, card}, or rc:knowhow.refused {req_id, reason}
+```
+
+**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L189)). At each hello the
+pod's knowhow sends `rc:knowhow.served {tools}` to a device whose hello
+advertised `knowhow-tools`, on its primary enrollment's connection, when
+knowhow serves its organization. `tools` names what this server answers
+(`knowhow_search`, `knowhow_get`), so a newer agent offers a session no tool an
+older server would leave unanswered. No other device is sent it: an older
+agent would log a frame it cannot read. A device offers its sessions the
+tools only on this word, so where knowhow is switched off no session is shown
+a tool that no module would answer.
+
+**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L311)). A question names a session and
+its fence; the organization and the device come from the socket. Every
+question is checked, in this order:
+
+| Check | Refused |
+|---|---|
+| knowhow serves the organization (`knowhow.tenants`) | `not_served` |
+| the session's record, read through hive's own DAO, is this organization's and runs on this device | `not_located` |
+| at the frame's fence | `stale_fence` |
+| live: starting, idle, running or awaiting approval | `ended` |
+| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L358), decision 48) | `denied` |
+| 120 questions a minute for the session on its device | `busy` |
+
+Then the question itself: `bad_request` for one past its bounds, `not_found`
+for a name no live entity holds, `unavailable` when a read failed. Each
+connection's questions wait in one queue of 16, answered in order by one task,
+so a slow read never holds the socket and a flood is answered `busy` instead
+of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L125)).
+
+> [!IMPORTANT]
+> **A session reads what its starter may, now.** The vault holds a session's
+> requests to its role, chosen at its start; knowhow reads the starter's roles
+> again at every question, as a person's route reads them. A starter whose
+> role loses `KNOWHOW_VIEW` stops their sessions' reads at the next question,
+> and one who leaves the organization ends their sessions.
+
+**The reads.** What a person's routes answer, bounded for a model:
+
+| Question | Answer | Bounds |
+|---|---|---|
+| `rc:knowhow.search {q?, kind?, env?, limit?}` | `rc:knowhow.found {entities, truncated}`: the people's search (§6), each entity as a listing shows one, no attributes and no facts | at most 50, 20 by default; `q` at most 200 characters |
+| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use | at most 50 links, cut from the end until the card fits 64 KiB ([`bounded`](../crates/modules/knowhow/src/session.rs#L464)); the entity itself is never cut, its own bounds hold it |
+
+Every entity, fact and link comes with its status and source, so a session
+sees what a person said, what the sync and scans said, and (with P4-4-2) what
+a session proposed, each for what it is.
+
+| Refusal | Means | Asking again |
+|---|---|---|
+| `not_served` | knowhow does not keep this organization's map | will not help |
+| `bad_request` | the question is malformed or past a bound | not as it is |
+| `not_located` | no session of this organization runs on this device by that id | will not help |
+| `stale_fence` | the session runs at a newer fence: this run no longer holds it | will not help |
+| `ended` | the session is over | will not help |
+| `denied` | its starter may not read the map | once their role holds `KNOWHOW_VIEW` |
+| `not_found` | no live entity by that kind and key | once one is on the map |
+| `busy` | too many questions are waiting, or this minute's are spent | later |
+| `unavailable` | a read failed | later |
+
+> [!NOTE]
+> **`knowhow → hive`, a stateless DAO.** A session's record is read through
+> hive's own DAO, as the vault reads it for a lease (the module graph's edge,
+> [`graph.rs`](../crates/core/src/graph.rs)). There is no module state to wait
+> on, so a knowhow mounted without hive finds no session and refuses every
+> question `not_located`; the `knowhow` build feature implies `hive`.
+
+## 13. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-4 | a session's reads and proposals, designed in the FR-90 spec's §3e "P4-4, a session's reads and proposals, as designed" (decisions 48–52): the toolbelt's `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`) and held to its starter's `KNOWHOW_VIEW` (P4-4-1); `knowhow_propose` (P4-4-2); a person's word on a proposal (P4-4-3) |
+| P4-4-1b | the toolbelt's `knowhow_search` and `knowhow_get`: the device's client on the primary's connection, the tools offered on the server's word (§12), allowed in the session's settings |
+| P4-4-2 | `knowhow_propose`: an entity, a fact or a link written `proposed`, naming its session, within a ceiling (decisions 39, 50, 51) |
+| P4-4-3 | a person's word on a proposal: confirmed with who and when, or rejected as the routes already archive (decision 52) |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
