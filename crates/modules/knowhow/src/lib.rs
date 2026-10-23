@@ -35,12 +35,13 @@ use axum::{
     routing::{get, patch, post},
 };
 use roomler_ai_config::Settings;
-use roomler_ai_db::indexes::{IndexSet, index, index_unique_partial};
+use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique_partial};
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Job, Module, TenantCtx};
 
 pub mod dao;
 pub mod model;
 pub mod routes;
+pub mod scan;
 pub mod scope;
 pub mod sync;
 pub mod view;
@@ -60,6 +61,10 @@ pub struct KnowhowState {
     /// and the organization's network, read through the same shared DAOs.
     pub overlay_nodes: Arc<roomler_ai_services::dao::overlay_node::OverlayNodeDao>,
     pub overlay_networks: Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>,
+    /// P4-3a — the scans asked of devices, and this pod's connections of the
+    /// devices that can scan, each told what was asked of it.
+    pub scans: Arc<dao::ScanDao>,
+    pub links: Arc<scan::Links>,
     /// The organizations whose map it keeps (`knowhow.tenants`).
     pub scope: Arc<scope::TenantScope>,
 }
@@ -107,16 +112,24 @@ impl Module for KnowhowState {
             overlay_networks: Arc::new(
                 roomler_ai_services::dao::overlay_network::OverlayNetworkDao::new(db),
             ),
+            scans: Arc::new(dao::ScanDao::new(db)),
+            links: Arc::new(scan::Links::default()),
             scope: Arc::new(scope),
             core,
         };
         // P4-2a — a device's hello mirrors it (an enrolment's first, every
         // reconnect); the agent socket is fleet's, the registry core's.
+        // P4-3a — and links its connection for scans, whose answers
+        // (`rc:knowhow.scanned`) `ClientMsg::namespace()` dispatches here.
         state.core.agent_socket.register(
             Self::ID,
             AgentSocketHooks {
-                handler: None,
-                lifecycle: Some(sync::hello(&state)),
+                handler: Some(Arc::new(scan::ScanAnswers {
+                    state: state.clone(),
+                })),
+                lifecycle: Some(Arc::new(scan::SocketHooks {
+                    state: state.clone(),
+                })),
             },
         );
         // And every pod reconciles, for what no hook carries.
@@ -125,6 +138,12 @@ impl Module for KnowhowState {
             secs => secs,
         };
         sync::spawn_reconciler(state.clone(), secs);
+        // P4-3a — and sweeps for the scans asked of its devices.
+        let sweep = match settings.knowhow.scan_sweep_secs {
+            0 => scan::DEFAULT_SCAN_SWEEP_SECS,
+            secs => secs,
+        };
+        scan::spawn_sweeper(state.clone(), sweep);
         Ok(state)
     }
 
@@ -157,6 +176,10 @@ impl Module for KnowhowState {
             .route(
                 "/tenant/{tenant_id}/knowhow/map/{entity_id}",
                 get(routes::map),
+            )
+            .route(
+                "/tenant/{tenant_id}/knowhow/scan",
+                get(scan::list).post(scan::request),
             )
             .nest("/tenant/{tenant_id}/knowhow/entity", entity)
             .nest("/tenant/{tenant_id}/knowhow/edge", edge)
@@ -226,6 +249,24 @@ impl Module for KnowhowState {
                     // included (`entity_ids` holds an edge's two ends).
                     index(bson::doc! { "tenant_id": 1, "at": -1, "_id": -1 }),
                     index(bson::doc! { "tenant_id": 1, "entity_ids": 1, "at": -1, "_id": -1 }),
+                ],
+            },
+            // P4-3a — the scans asked of devices.
+            IndexSet {
+                collection: model::KnowhowScan::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    // A device's one pending scan: a second request finds it.
+                    index_unique_partial(
+                        bson::doc! { "tenant_id": 1, "device_id": 1 },
+                        bson::doc! { "pending": true },
+                    ),
+                    // A device's scans, newest first.
+                    index(bson::doc! { "tenant_id": 1, "device_id": 1, "requested_at": -1 }),
+                    // A sweep: what was asked of the devices connected here.
+                    index(bson::doc! { "device_id": 1, "state": 1 }),
+                    // Kept 90 days.
+                    index_ttl(bson::doc! { "requested_at": 1 }, dao::SCAN_KEEP_SECS),
                 ],
             },
         ]

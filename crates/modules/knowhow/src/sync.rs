@@ -40,16 +40,13 @@
 //! with the mesh's own latency, the wrong way round for a map.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bson::{Bson, Document, doc, oid::ObjectId};
 use roomler_ai_remote_control::models::{Agent, DEFAULT_ROUTE_V4, NodeRef, OverlayNode, RpcCap};
 use roomler_ai_services::dao::base::{DaoError, DaoResult};
-use roomler_core::{
-    AgentCtx, AgentSocketLifecycle, FleetLifecycle, ReleasedLease, RenamePropagation,
-};
+use roomler_core::{FleetLifecycle, ReleasedLease, RenamePropagation};
 use tracing::{debug, info, warn};
 
 use crate::KnowhowState;
@@ -612,26 +609,6 @@ pub async fn at_boot(state: &KnowhowState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A device's hello: its machine mirrored, off the socket's path.
-pub(crate) struct HelloSync {
-    pub state: KnowhowState,
-}
-
-#[async_trait]
-impl AgentSocketLifecycle for HelloSync {
-    async fn hello(&self, ctx: &AgentCtx) {
-        let (state, tid, aid) = (self.state.clone(), ctx.tenant_id, ctx.agent_id);
-        if !state.scope.serves(tid) {
-            return;
-        }
-        tokio::spawn(async move {
-            if let Err(e) = device(&state, tid, aid).await {
-                warn!(tenant = %tid, device = %aid, %e, "knowhow: a device's hello did not reach its machine");
-            }
-        });
-    }
-}
-
 /// Fleet's events: a rename, an update, a removal. ⚠️ Each answers `Ok`
 /// whatever the map met (the module's own doc says why).
 pub(crate) struct FleetSync {
@@ -673,13 +650,6 @@ impl FleetLifecycle for FleetSync {
         }
         Ok(())
     }
-}
-
-/// The hooks a [`KnowhowState`] registers.
-pub(crate) fn hello(state: &KnowhowState) -> Arc<HelloSync> {
-    Arc::new(HelloSync {
-        state: state.clone(),
-    })
 }
 
 #[cfg(test)]

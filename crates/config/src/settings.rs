@@ -178,6 +178,12 @@ pub struct KnowhowSettings {
     /// (a display name) waits to reach the map. 0 or absent: 600.
     #[serde(default)]
     pub sync_secs: u64,
+    /// P4-3a — how often each pod looks for scans asked of the devices
+    /// connected to it, in seconds (`ROOMLER__KNOWHOW__SCAN_SWEEP_SECS`):
+    /// the longest a scan asked on another pod waits to be delivered. 0 or
+    /// absent: 5.
+    #[serde(default)]
+    pub scan_sweep_secs: u64,
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.

@@ -467,6 +467,8 @@ includes reading. Every id resolves within the organization, every write is a co
 | POST | `…/knowhow/edge` | `{from, to, kind, attrs?}` — **201**; **409** when already linked by that kind; **404** for an end that is not a live entity of the organization |
 | PATCH | `…/knowhow/edge/{id}` | `{rev, attrs}` — its attributes, replaced |
 | DELETE | `…/knowhow/edge/{id}?rev=…` | Archive the link: `{archived}` |
+| POST | `…/knowhow/scan` | P4-3a-1 — `{device}`: ask a device to scan, `KNOWHOW_EDIT` → **202** with the scan, or the device's pending one (never doubled); **409** for a device whose last hello did not advertise `knowhow-scan`, or a secondary enrollment; **404** for one that is not the organization's |
+| GET | `…/knowhow/scan?device=…` | A device's scans, newest first → `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts{checkouts, contexts, listeners, tunnel_routes, unknown, refused}, truncated?, detail?}]}`; `state` is `requested` · `delivered` · `done` · `no_roots` · `failed` · `expired` |
 
 ### Observability
 

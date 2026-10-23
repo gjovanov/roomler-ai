@@ -10,11 +10,13 @@ sessions read it too, through their toolbelt.
 > Spec, steps and the field log: [`fr/FR-90-hive-agent-sessions.md`](fr/FR-90-hive-agent-sessions.md)
 > §3e "P4, knowhow, as designed" (#1827). The design is
 > [`roomler-hive-design.md`](roomler-hive-design.md) §9. **This page describes
-> what is built: P4-1, the module, its store and the people's routes; and
-> P4-2, the fleet's devices mirrored as machines, with what the fleet and the
-> network say of each (§10).** People and the sync fill the map so far. Device
-> scans (P4-3), a session's reads and proposals (P4-4), probes (P4-5) and
-> `roomler_connect` (P4-6) come with the steps that build them (§11).
+> what is built: P4-1, the module, its store and the people's routes; P4-2,
+> the fleet's devices mirrored as machines, with what the fleet and the
+> network say of each (§10); and P4-3a-1, a scan asked of a device,
+> delivered and answered (§11).** People and the sync fill the map so far. A
+> scan's findings on the map (P4-3a-2), the device's scanners (P4-3b), a
+> session's reads and proposals (P4-4), probes (P4-5) and `roomler_connect`
+> (P4-6) come with the steps that build them (§12).
 
 ## 1. A map, not a gate
 
@@ -91,7 +93,7 @@ A **fact** is a path, a value and where the value came from
 
 > [!IMPORTANT]
 > **A person's change to one fact never restamps another**
-> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L433)). An
+> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L495)). An
 > update names facts by path: a value sets that fact, as the caller's; null
 > removes it; a fact it does not name keeps who said it, from where and when,
 > and so does one set to the value it already holds while active. Restamping
@@ -117,8 +119,8 @@ that is no device is an `endpoint`.
 
 ## 3. The store
 
-Three collections, per organization
-([`lib.rs:187`](../crates/modules/knowhow/src/lib.rs#L187)):
+Four collections, per organization
+([`lib.rs:210`](../crates/modules/knowhow/src/lib.rs#L210)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -126,13 +128,14 @@ Three collections, per organization
 - **`knowhow_edges`**, unique on `(tenant_id, from, kind, to)` among the live,
   so a kind of link between two entities exists once.
 - **`knowhow_history`**, every write appended.
+- **`knowhow_scans`**, the scans asked of devices (§11).
 
 An organization's map holds at most 10,000 live entities and 50,000 live links
-([`dao.rs:25`](../crates/modules/knowhow/src/dao.rs#L25)); a write past
+([`dao.rs:28`](../crates/modules/knowhow/src/dao.rs#L28)); a write past
 either is **409**.
 
 **A write is a compare-and-set on `rev`**
-([`dao.rs:185`](../crates/modules/knowhow/src/dao.rs#L185)): its filter
+([`dao.rs:188`](../crates/modules/knowhow/src/dao.rs#L188)): its filter
 names the rev the writer read, its update `$inc`s it, and the row after is
 returned. A writer that lost the race matches nothing and is told so, rather
 than overwriting what it never saw.
@@ -171,7 +174,7 @@ because a card and a neighbourhood show only the links whose other end is live.
 | Switch | Effect |
 |---|---|
 | `[modules] knowhow` (`ROOMLER__MODULES__KNOWHOW`) | **default OFF**, like `hive` and `vault`: no route is mounted |
-| `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`) | the organizations whose map it keeps ([`KnowhowSettings`](../crates/config/src/settings.rs#L163)). A list alone mounts the module ([`knowhow_on`](../crates/config/src/settings.rs#L1597)), the form a hosted server uses, because no older image reads it. Clearing it is the kill switch |
+| `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`) | the organizations whose map it keeps ([`KnowhowSettings`](../crates/config/src/settings.rs#L163)). A list alone mounts the module ([`knowhow_on`](../crates/config/src/settings.rs#L1603)), the form a hosted server uses, because no older image reads it. Clearing it is the kill switch |
 
 `knowhow.tenants` reads like `vault.tenants`: empty or `*` is every
 organization, and an entry that is not an organization id matches nothing
@@ -228,13 +231,15 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | POST | `/edge` | `{from, to, kind, attrs?}`: two live entities of the organization → **201**. **409** when they are already linked by that kind; **400** for a link to itself | `KNOWHOW_EDIT` |
 | PATCH | `/edge/{id}` | `{rev, attrs}`: its attributes, replaced. Its ends and kind never change: a different link is archived and made again | `KNOWHOW_EDIT` |
 | DELETE | `/edge/{id}?rev=…` | archive the link | `KNOWHOW_EDIT` |
+| POST | `/scan` | `{device}`: ask a device to scan (§11) → **202** with the scan, or the device's pending one. **409** for a device that cannot scan or is a secondary enrollment; **404** for one that is not the organization's | `KNOWHOW_EDIT` |
+| GET | `/scan?device=…` | a device's scans, newest first: `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts, truncated?, detail?}]}`; `?limit=` 1–200 | `KNOWHOW_VIEW` |
 
 ## 7. A neighbourhood
 
 The map route walks the links both ways, one step at a time
 ([`routes.rs:431`](../crates/modules/knowhow/src/routes.rs#L431)). Each step
 is one indexed read of the live links from or to the step's entities, at most
-500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L243)), each way on
+500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L246)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
 The entities they lead to are read live, and filtered by `kind` and `env`; the
 centre is always shown. A filtered entity is not walked through. A link is
@@ -275,6 +280,7 @@ years after it was written, so it has no TTL.
 | `knowhow_entities` | entity: kind, key, name, env, owner, attributes, facts, status, source, rev | unique `(tenant_id, kind, key)` over live rows (partial on `deleted_at: {$type: "null"}`); `(tenant_id, deleted_at, kind, key)` | tombstoned, kept |
 | `knowhow_edges` | link: from, to, kind, attributes, status, source, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)` | tombstoned, kept |
 | `knowhow_history` | write | `(tenant_id, at desc, _id desc)`, `(tenant_id, entity_ids, at desc, _id desc)` | kept, no TTL |
+| `knowhow_scans` | scan asked of a device: who asked and when, its state, when delivered and answered, its counts and detail (§11) | unique `(tenant_id, device_id)` over pending rows (partial on `pending: true`); `(tenant_id, device_id, requested_at desc)`; `(device_id, state)` | 90 days (TTL on `requested_at`) |
 
 ## 10. Machines, from the fleet and the network (P4-2)
 
@@ -289,7 +295,7 @@ the server's own record, not anybody's claim.
 | `name` | the label the device list shows: its display name, else its own name. A label the map cannot keep falls back to the machine's name, then to its id, never to nothing |
 | `owner_id` | the device's owner |
 | `source` | `sync`; its history rows too, with no person behind them |
-| facts, the sync's | what the fleet says (§10.1) and what the network says (§10.2), fourteen paths in all ([`SYNCED_FACTS`](../crates/modules/knowhow/src/sync.rs#L68)), each sourced `sync`, with no `by` |
+| facts, the sync's | what the fleet says (§10.1) and what the network says (§10.2), fourteen paths in all ([`SYNCED_FACTS`](../crates/modules/knowhow/src/sync.rs#L65)), each sourced `sync`, with no `by` |
 
 ```mermaid
 sequenceDiagram
@@ -357,8 +363,8 @@ the device row as the fleet keeps it.
 |---|---|---|
 | `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
 | `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
-| `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L225)) | while the organization has a MagicDNS domain |
-| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6555)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L222)) | while the organization has a MagicDNS domain |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6565)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
 | `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
 | `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
 | `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
@@ -382,9 +388,9 @@ flowchart LR
     style S fill:#f3e8fd
 ```
 
-A hello reads the device's own node ([`device`](../crates/modules/knowhow/src/sync.rs#L356));
+A hello reads the device's own node ([`device`](../crates/modules/knowhow/src/sync.rs#L353));
 the reconcile reads the organization's live nodes once, by device
-([`device_nodes`](../crates/modules/knowhow/src/sync.rs#L318)). An overlay fact
+([`device_nodes`](../crates/modules/knowhow/src/sync.rs#L315)). An overlay fact
 exists while the device holds a live node and leaves the machine with it: an evicted node's
 facts go at the next sync, and the rest of the machine stays, because an eviction forces a new
 lease and is no removal.
@@ -409,18 +415,107 @@ lease and is no removal.
 
 ⚠️ **A MagicDNS read that fails fails the sync.** Read as "no domain", it would take every
 machine's MagicDNS name off the map until a later sync put it back
-([`magic_domain`](../crates/modules/knowhow/src/sync.rs#L308)).
+([`magic_domain`](../crates/modules/knowhow/src/sync.rs#L305)).
 
 **Declared tunnel routes** (`[[tunnel_routes]]`) are not among the facts: the server never
 holds them. They live in the device's own config, outside its remote configuration surface,
 and the tunnel hub knows only the flows live on its pod. They come with the device's own scan
 (P4-3b).
 
-## 11. What comes next
+## 11. Scans (P4-3a)
+
+A scan is the server's request and the device's answer (decision 38): a person asks a device
+to scan, and the device reads only the roots its owner lists, each as the account that owns it
+([`scan.rs`](../crates/modules/knowhow/src/scan.rs)). P4-3a-1 builds the request, its
+delivery and the answer's record. Writing what a scan found onto the map is P4-3a-2's
+(decision 42), and the device's half (the roots, the scanners) is P4-3b's. The design, with
+decisions 41–44, is the FR-90 spec's §3e "P4-3, scans, as designed".
+
+```mermaid
+sequenceDiagram
+    participant P as a person (KNOWHOW_EDIT)
+    participant K as knowhow, any pod
+    participant M as knowhow_scans
+    participant H as knowhow, the pod holding the device
+    participant D as the device
+    P->>K: POST knowhow/scan {device}
+    K->>M: a scan, requested (409 if the device cannot scan or is secondary)
+    K-->>P: 202 {scan}
+    H->>M: requested to delivered, a compare-and-set (at once, a sweep, a hello)
+    H->>D: rc:knowhow.scan {scan_id}
+    D->>H: rc:knowhow.scanned {scan_id, outcome, findings}
+    H->>H: each finding read and checked, counted by kind
+    H->>M: answered, once, by the device it was sent to
+```
+
+**Who asks, and which devices** ([`request`](../crates/modules/knowhow/src/scan.rs#L443)).
+A person with `KNOWHOW_EDIT` (decision 41) asks for a live device of the organization: **202**
+with the scan, or with the device's pending scan when it has one, since a scan is never doubled
+(a partial unique index on `pending`). A device is refused **409** up front
+([`refusal`](../crates/modules/knowhow/src/scan.rs#L145)) when its last hello did not
+advertise `knowhow-scan`, since an agent that cannot scan would never answer, and when it is a
+secondary enrollment (its caps' `update_mode` is `primary_org`), since its roots are one
+device-owned list, scanned for its primary organization alone (decision 43). That is how fleet
+refuses an update push a device would ignore (FR-67).
+
+**The delivery: the row is the bus** ([`deliver`](../crates/modules/knowhow/src/scan.rs#L163)).
+The pod holding the device's connection tells it, the vault's way, so knowhow needs no edge to
+fleet's Hub, which is pod-local:
+
+| When | Who sends |
+|---|---|
+| the request lands on the pod holding the device | that pod, at once |
+| it landed on another pod | the holding pod's next sweep, every `knowhow.scan_sweep_secs` (5 s) |
+| the device was offline | the pod its next hello reaches ([`hello`](../crates/modules/knowhow/src/scan.rs#L204)) |
+| it was sent to a connection that died unanswered | the next hello's pod, again |
+
+Each first send is a compare-and-set from `requested` to `delivered`, so one connection is told
+once; a send that cannot go out within 2 s is put back to `requested` for the next sweep. A
+connection is linked at its hello when the device can scan, and unlinked when it closes.
+
+> [!NOTE]
+> **Sent again, run once.** A scan delivered to a connection that dies before its answer is sent
+> again at the device's next hello. The device runs a scan id once, and the server keeps the
+> first answer, so a repeat costs a frame, never a second scan.
+
+**The record.** `knowhow_scans`, one row per request, kept 90 days:
+
+| State | Means | Its fix |
+|---|---|---|
+| `requested` | asked, not yet sent | the device comes online, or this pod's sweep runs |
+| `delivered` | sent, not yet answered | the device answers, or is sent it again at its next hello |
+| `done` | answered with what it found, counted by kind | — |
+| `no_roots` | its owner lists no root (decision 38) | the owner lists roots on the device |
+| `failed` | the device could not scan; why is `detail` | the detail's |
+| `expired` | 24 h without an answer | ask again |
+
+**The answer** ([`read_answer`](../crates/modules/knowhow/src/scan.rs#L280)).
+Recorded once, and only from the device the scan was sent to: an answer for another device's scan,
+one already answered, or a made-up id is dropped and logged. Only a `done` answer's findings are
+read, each on its own by the wire's rules
+([`Finding::read`](../crates/remote_control/src/knowhow.rs#L224)), and counted:
+`checkouts`, `contexts`, `listeners`, `tunnel_routes`, `unknown` (a kind this build does not
+know: skipped, so a newer device's answer is never lost whole) and `refused`. An answer past
+2,000 findings or 1 MiB is recorded `failed`. A `detail` is clamped to 200 characters.
+
+> [!WARNING]
+> **A finding is closed, and never holds a credential.** A known kind with a field this build
+> does not know is refused, since an open shape is where a token would ride along unseen. Every
+> string is checked for a credential's shape
+> ([`holds_credential`](../crates/remote_control/src/knowhow.rs#L334)): a URL's
+> password, a token by a prefix it knows, an AWS access key, a PEM block, a JWT. A finding that
+> holds one is refused whole, and a `detail` that holds one is withheld. Nothing of a finding is
+> stored in P4-3a-1, only its count.
+
+| Setting | Effect |
+|---|---|
+| `knowhow.scan_sweep_secs` (`ROOMLER__KNOWHOW__SCAN_SWEEP_SECS`) | how often each pod looks for scans asked of the devices connected to it, in seconds; 0 or absent: 5 |
+
+## 12. What comes next
 
 | Step | Builds |
 |---|---|
-| P4-3a, P4-3b | device scans, the server's half and the device's, as the FR-90 spec designs them (§3e "P4-3, scans, as designed", decisions 41–44): a person asks a device, and the device reads only the roots its owner lists in `knowhow_scan_roots` (decision 38), each as the account that owns it, for metadata only. Its checkouts, listeners and declared tunnel routes become its own part of the map, and the repositories and clusters they reach are made bare |
+| P4-3a-2, P4-3b | the rest of device scans (§11 built the request, its delivery and the answer's record): what a scan writes as its device's (decision 42), so its checkouts, listeners and declared tunnel routes become its own part of the map and the repositories and clusters they reach are made bare; and the device's half, the roots its owner lists in `knowhow_scan_roots` (decision 38), each read as the account that owns it, for metadata only |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
