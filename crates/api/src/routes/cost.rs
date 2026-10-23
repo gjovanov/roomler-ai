@@ -12,10 +12,11 @@
 //!    `null`, which the UI renders as *not priced*. A defaulted 0.00 would
 //!    read as "this org is free to serve" and imply 100 % margin.
 //! 2. **A zero for an uncollected meter.** `turn_bytes` is written only by
-//!    FR-115 P4b's collector (`relay_allowance.turn_attribution`, off by
-//!    default), and only for the cluster's coturn until P4b-2 brings the PoPs
-//!    in, so it reports `monitored: false` until both are. *No traffic* and
-//!    *not measured* are different facts and must never share a cell.
+//!    FR-115 P4b's collectors, the cluster's coturn (P4b-1) and every
+//!    regional PoP's (P4b-2), which run only behind
+//!    `relay_allowance.turn_attribution` (off by default). With it off the
+//!    meter reports `monitored: false` ([`monitored`]). *No traffic* and *not
+//!    measured* are different facts and must never share a cell.
 //! 3. **A relayed fraction with no reporters.** An empty denominator yields
 //!    `null`, not `0`, which would otherwise read as a flawless mesh.
 //!
@@ -45,12 +46,28 @@ use roomler_ai_config::RelayCosts;
 use roomler_ai_db::models::tenant::Plan;
 use roomler_ai_services::relay_allowance;
 
-/// Meters this deployment actually collects. A meter absent from this list is
+/// Meters every deployment with stats on collects.
+const ALWAYS_MONITORED: &[&str] = &["derp_bytes", "sfu_participant_seconds"];
+
+/// The meters this deployment actually collects. A meter outside it is
 /// reported `monitored: false` rather than `0` — see the module docs.
 ///
-/// `turn_bytes` is deliberately NOT here: until FR-115 P4b's collector covers
-/// every coturn (the cluster's and the PoPs'), a total would be partial.
-const MONITORED: &[&str] = &["derp_bytes", "sfu_participant_seconds"];
+/// `turn_bytes` joins only behind FR-115 P4b's switch
+/// (`relay_allowance.turn_attribution`): it turns on the collectors for
+/// every coturn, the cluster's and each regional PoP's. Off, nobody counts
+/// it, and a total would claim a measurement.
+fn monitored(s: &roomler_ai_config::Settings) -> Vec<&'static str> {
+    let mut m = ALWAYS_MONITORED.to_vec();
+    if s.relay_allowance.turn_attribution {
+        m.push("turn_bytes");
+    }
+    m
+}
+
+/// Whether any monitored meter carries a price.
+fn any_priced(monitored: &[&str], c: &RelayCosts) -> bool {
+    monitored.iter().any(|m| cost_of(m, 0.0, c).is_some())
+}
 
 /// Cost of `total` units of `meter`, or `None` when that meter has no price
 /// configured. The conversion to a billable unit lives here so the ledger can
@@ -128,13 +145,17 @@ async fn usage_per_org(
     Ok((per_org, fleet))
 }
 
-/// One org's priced cost over the window: the sum over the MONITORED
+/// One org's priced cost over the window: the sum over the `monitored`
 /// meters that carry a price, `None` when none of them does (never a 0.00
 /// that would read as "free to serve").
-fn org_cost(mine: Option<&HashMap<String, f64>>, costs: &RelayCosts) -> Option<f64> {
+fn org_cost(
+    mine: Option<&HashMap<String, f64>>,
+    costs: &RelayCosts,
+    monitored: &[&str],
+) -> Option<f64> {
     let mut total = 0.0;
     let mut any_priced = false;
-    for m in MONITORED {
+    for m in monitored {
         let used = mine.and_then(|h| h.get(*m)).copied().unwrap_or(0.0);
         if let Some(c) = cost_of(m, used, costs) {
             total += c;
@@ -168,13 +189,14 @@ impl OrgCosts {
 pub(crate) async fn org_costs(state: &Core, range: &str) -> Result<OrgCosts, ApiError> {
     let (window, tier) = range_spec(Some(range))?;
     let costs = &state.settings.relay_costs;
+    let monitored = monitored(&state.settings);
     let (per_org, _) = usage_per_org(state, window, tier).await?;
     Ok(OrgCosts {
         currency: costs.currency.clone(),
-        priced: costs.derp_gb.is_some() || costs.sfu_participant_hour.is_some(),
+        priced: any_priced(&monitored, costs),
         per_org: per_org
             .iter()
-            .filter_map(|(t, mine)| Some((t.clone(), org_cost(Some(mine), costs)?)))
+            .filter_map(|(t, mine)| Some((t.clone(), org_cost(Some(mine), costs, &monitored)?)))
             .collect(),
     })
 }
@@ -192,6 +214,7 @@ pub async fn admin_cost(
     }
     let (window, tier) = range_spec(q.range.as_deref())?;
     let costs = &state.settings.relay_costs;
+    let monitored = monitored(&state.settings);
 
     // ── the ledger, summed per (tenant, meter) over the range ──────────────
     let (per_org, fleet) = usage_per_org(&state, window, tier).await?;
@@ -232,10 +255,10 @@ pub async fn admin_cost(
         let id = str_of(t, "id");
         let mine = per_org.get(&id);
         // An org with no ledger rows is included with explicit zeros: for a
-        // MONITORED meter, zero is a measurement ("relayed nothing"), which is
+        // monitored meter, zero is a measurement ("relayed nothing"), which is
         // exactly the fact an operator wants to see.
         let mut meters = serde_json::Map::new();
-        for m in MONITORED {
+        for m in &monitored {
             let total = mine.and_then(|h| h.get(*m)).copied().unwrap_or(0.0);
             meters.insert(
                 (*m).to_string(),
@@ -262,7 +285,7 @@ pub async fn admin_cost(
             "mrr_cents": mrr_cents,
             "meters": meters,
             // `null`, not 0, when nothing this org used carries a price.
-            "cost": org_cost(mine, costs),
+            "cost": org_cost(mine, costs, &monitored),
         }));
     }
 
@@ -311,7 +334,7 @@ pub async fn admin_cost(
         })
     });
 
-    let fleet_meters: serde_json::Map<String, serde_json::Value> = MONITORED
+    let fleet_meters: serde_json::Map<String, serde_json::Value> = monitored
         .iter()
         .map(|m| {
             let total = fleet.get(*m).copied().unwrap_or(0.0);
@@ -326,16 +349,18 @@ pub async fn admin_cost(
         })
         // Everything the ledger CAN carry but this deployment does not
         // collect, reported honestly rather than omitted or zeroed.
-        .chain(std::iter::once((
-            "turn_bytes".to_string(),
-            serde_json::json!({
-                "total": serde_json::Value::Null,
-                "cost": serde_json::Value::Null,
-                "monitored": false,
-                "why": "coturn 4.17.2 emits no user label, so relayed bytes \
-                        cannot be attributed to a tenant (FR-20 P3)",
-            }),
-        )))
+        .chain((!monitored.contains(&"turn_bytes")).then(|| {
+            (
+                "turn_bytes".to_string(),
+                serde_json::json!({
+                    "total": serde_json::Value::Null,
+                    "cost": serde_json::Value::Null,
+                    "monitored": false,
+                    "why": "TURN attribution is off (relay_allowance.turn_attribution), \
+                            so no coturn's totals are collected (FR-115 P4b)",
+                }),
+            )
+        }))
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -343,7 +368,7 @@ pub async fn admin_cost(
         "range": q.range.unwrap_or_else(|| "24h".into()),
         "window_secs": window,
         "currency": costs.currency,
-        "priced": costs.derp_gb.is_some() || costs.sfu_participant_hour.is_some(),
+        "priced": any_priced(&monitored, costs),
         "unit_costs": {
             "derp_gb": costs.derp_gb,
             "turn_gb": costs.turn_gb,
@@ -409,24 +434,28 @@ pub async fn tenant_resources(
     for u in &usage {
         totals.insert(str_of(u, "meter"), f64_of(u, "total"));
     }
-    let meters: serde_json::Map<String, serde_json::Value> = MONITORED
+    let monitored = monitored(&state.settings);
+    let meters: serde_json::Map<String, serde_json::Value> = monitored
         .iter()
         .map(|m| {
             (
                 (*m).to_string(),
                 // A monitored meter with no rows is a real measurement — this
                 // org relayed nothing — so zero is the honest value here, in
-                // contrast to `turn_bytes` below which nobody counted.
+                // contrast to an unmonitored `turn_bytes` below, which nobody
+                // counted.
                 serde_json::json!({
                     "total": totals.get(*m).copied().unwrap_or(0.0),
                     "monitored": true,
                 }),
             )
         })
-        .chain(std::iter::once((
-            "turn_bytes".to_string(),
-            serde_json::json!({ "total": serde_json::Value::Null, "monitored": false }),
-        )))
+        .chain((!monitored.contains(&"turn_bytes")).then(|| {
+            (
+                "turn_bytes".to_string(),
+                serde_json::json!({ "total": serde_json::Value::Null, "monitored": false }),
+            )
+        }))
         .collect();
 
     // Storage is a live sum of what the org is holding right now, not a
@@ -575,14 +604,32 @@ mod tests {
         assert!((c - 0.008).abs() < 1e-9, "{c}");
     }
 
-    /// `turn_bytes` must never appear as monitored: it has a price and an enum
-    /// variant but no writer, and reporting `0` would assert that coturn
-    /// relayed nothing when the truth is that nobody counted.
+    /// `turn_bytes` is monitored only behind its switch. Off, nothing writes
+    /// it, and reporting `0` would assert that coturn relayed nothing when the
+    /// truth is that nobody counted. On, every coturn is collected (the
+    /// cluster's and each PoP's), so a zero is a measurement.
     #[test]
-    fn turn_bytes_is_not_a_monitored_meter() {
-        assert!(!MONITORED.contains(&"turn_bytes"));
-        assert!(MONITORED.contains(&"derp_bytes"));
-        assert!(MONITORED.contains(&"sfu_participant_seconds"));
+    fn turn_bytes_is_monitored_only_behind_its_switch() {
+        let mut s = roomler_ai_config::Settings::default();
+        assert!(!s.relay_allowance.turn_attribution, "off by default");
+        let off = monitored(&s);
+        assert!(!off.contains(&"turn_bytes"));
+        assert!(off.contains(&"derp_bytes"));
+        assert!(off.contains(&"sfu_participant_seconds"));
+
+        s.relay_allowance.turn_attribution = true;
+        let on = monitored(&s);
+        assert!(on.contains(&"turn_bytes"));
+        assert!(on.contains(&"derp_bytes"));
+        assert!(on.contains(&"sfu_participant_seconds"));
+
+        // A TURN price alone prices nothing while the meter is unmonitored.
+        let turn_only = RelayCosts {
+            turn_gb: Some(0.010),
+            ..RelayCosts::default()
+        };
+        assert!(!any_priced(&off, &turn_only));
+        assert!(any_priced(&on, &turn_only));
     }
 
     /// An unknown meter is unpriced rather than silently free — if a meter is
@@ -600,13 +647,18 @@ mod tests {
         let used: HashMap<String, f64> = HashMap::from([
             ("derp_bytes".to_string(), 5e9),
             ("sfu_participant_seconds".to_string(), 7200.0),
-            // Not monitored: never priced into the org's cost.
             ("turn_bytes".to_string(), 9e12),
         ]);
-        assert_eq!(org_cost(Some(&used), &RelayCosts::default()), None);
-        let c = org_cost(Some(&used), &priced()).unwrap();
+        let off = ALWAYS_MONITORED;
+        assert_eq!(org_cost(Some(&used), &RelayCosts::default(), off), None);
+        // Unmonitored, the 9 TB of TURN is never priced into the org's cost.
+        let c = org_cost(Some(&used), &priced(), off).unwrap();
         assert!((c - 0.058).abs() < 1e-9, "{c}");
-        assert_eq!(org_cost(None, &priced()), Some(0.0));
+        assert_eq!(org_cost(None, &priced(), off), Some(0.0));
+        // Monitored, it is: 9,000 GB at 0.010/GB = 90.
+        let on = [ALWAYS_MONITORED, &["turn_bytes"]].concat();
+        let c = org_cost(Some(&used), &priced(), &on).unwrap();
+        assert!((c - 90.058).abs() < 1e-9, "{c}");
 
         let costs = OrgCosts {
             currency: Some("EUR".into()),

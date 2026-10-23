@@ -1488,7 +1488,7 @@ addresses plus one that bounces, sent twice — and the per-issue table marks it
 Billed revenue — paying orgs, billed MRR, its new / expansion / contraction / churned
 movements per month, trial → paid, `paid_since`, all of it by the owner's acquisition
 channel — read from **what Stripe billed**, never from the price list (§3g). The list-price
-figure (`Plan::price_monthly_cents` × seats, [`mrr_estimate_cents`, cost.rs:68](../crates/api/src/routes/cost.rs))
+figure (`Plan::price_monthly_cents` × seats, [`mrr_estimate_cents`, cost.rs:85](../crates/api/src/routes/cost.rs))
 stays beside it, labelled an ESTIMATE: for an org with no invoice yet it is the only figure
 there is. Rows carry the org's id and Stripe's ids and amounts — never a card, an address or a
 name — and go with the org.
@@ -1593,7 +1593,7 @@ the tenant, so they go with the org.
 
 The cost to serve is FR-20's ledger priced by [`routes/cost.rs`](../crates/api/src/routes/cost.rs)
 — the same prices and the same meters as the Cost & usage tab, through one helper
-([`org_costs`, cost.rs:159](../crates/api/src/routes/cost.rs)). Margin per org = billed MRR −
+([`org_costs`, cost.rs:189](../crates/api/src/routes/cost.rs)). Margin per org = billed MRR −
 the last 30 days' cost, **only** where both exist in the same currency
 ([`margin_cents`, revenue.rs:386](../crates/api/src/growth/revenue.rs)); an unpriced meter is
 "not priced", never 0.00 (which would read as free to serve).

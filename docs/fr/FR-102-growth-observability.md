@@ -52,7 +52,7 @@ This FR:
 2. **Carry, don't store** (FR-88 §3a): nothing about attribution is written to a visitor's device.
 3. **Derive before you collect.** Whatever the server can compute from records it already keeps to
    operate, it computes. A new collection point names the question it answers.
-4. **Measured, not measured, and zero are three cells** (the cost view's rule, `crates/api/src/routes/cost.rs:9-21`).
+4. **Measured, not measured, and zero are three cells** (the cost view's rule, `crates/api/src/routes/cost.rs:9-22`).
    A source that is down, unset or unbuilt renders `null` with a reason, never `0`.
 5. **Every rate carries its n.** Below n = 30 the UI shows counts and hides the percentage.
 6. **Self-hosted never phones home** (`docs/business-model.md` §6 rule 1, `LICENSING.md:20-23`). Nothing
@@ -97,7 +97,7 @@ purestat's `roomler.ai` site (`site_id` from the site's ObjectId), production `h
 | The wizard reports nothing | steps `welcome → server → token → install → done` (`agents/roomler-setup/src/front/app.js:32`); progress goes to an in-process channel and logs to stderr (`agents/roomler-setup/src/main.rs:47-54`) | a stalled or cancelled install is invisible |
 | No product-event history | org creation leaves a `tracing::info!` (`crates/services/src/dao/tenant.rs:185`); invite acceptance only bumps `use_count` (`crates/api/src/routes/invite.rs:233`) | — |
 | Audit-shaped sources expire at 90 days | `tunnel_audit` (`crates/modules/network/src/lib.rs:719-725`), `ssh_audit`, `exec_audit`, `remote_audit`; `remote_sessions` has **no** TTL (`crates/modules/remote/src/lib.rs:159-161`), `call_sessions` 730 d (`crates/modules/conference/src/lib.rs:208-216`), `stats_events` 730 d (`crates/db/src/indexes.rs:371-375`) | a cohort chart longer than 90 days cannot see tunnel or SSH use. `docs/data-model.md:46, 96, 131-132` state other TTLs and are stale |
-| Revenue is a list-price estimate | `crates/api/src/routes/cost.rs:22-30`; `BillingInfo` keeps ids and a status (`crates/db/src/models/tenant.rs:243-232`); `invoice.paid` falls into "Unhandled Stripe webhook event" (`crates/services/src/stripe.rs:621`) | no billed amount, no plan history, no "paying since" |
+| Revenue is a list-price estimate | `crates/api/src/routes/cost.rs:23-31`; `BillingInfo` keeps ids and a status (`crates/db/src/models/tenant.rs:243-232`); `invoice.paid` falls into "Unhandled Stripe webhook event" (`crates/services/src/stripe.rs:621`) | no billed amount, no plan history, no "paying since" |
 | Quota collisions are log lines | `services::quota` `tracing::warn!` (`crates/modules/saas/src/plan_compliance.rs:17-19`) | the business model's "best upgrade-intent signal" (`docs/business-model.md` §5) is not counted |
 | Newsletter `sent` means "accepted by SendGrid" | `crates/db/src/models/newsletter_send.rs:16-47`; the footer promises "No tracking pixels — the only per-recipient thing in this email is your unsubscribe link" (`crates/services/src/newsletter.rs:178`) | delivery and bounces are unknown, and §3h must keep that promise |
 | Nothing asks a user how it went | no rating or feedback surface; `remote_sessions.stats` keeps bytes, fps and RTT, not the carrier (`crates/remote_control/src/models.rs:5540-5555`); time to first frame lives 7 days in `agent_logs` (FR-22) | satisfaction is not measured at all |
@@ -606,7 +606,7 @@ computes the day, stores it, and emails it to the platform admins.
 | Blog | each post viewed that day: visitors, pageviews, reads (≥ 30 s), median read time, top sources | purestat's v1 query | after PS1 (read time exact after PS0a) |
 | Campaigns | per `utm_source` / `utm_medium` / `utm_campaign`: visitors and goal conversions from purestat, sign-ups from roomler | purestat + `users` | after PS1 |
 | Newsletter | new, confirmed and unsubscribed subscribers; each issue sent that day, accepted (delivered and bounced from P5) | `subscribers`, `newsletter_sends` | P1d |
-| Revenue | orgs by plan and subscription status; the list-price MRR, labelled an estimate (`crates/api/src/routes/cost.rs:22-30`) | `tenants` | P1d; billed from P4 |
+| Revenue | orgs by plan and subscription status; the list-price MRR, labelled an estimate (`crates/api/src/routes/cost.rs:23-31`) | `tenants` | P1d; billed from P4 |
 | Quality | sessions requested → reached Active / never, by `end_reason` (and the ended ones by class); duration, peak frame rate and RTT as p50/p90 with n; FR-22's time to first frame p50/p90 (the day exact, 7d/28d estimated from the frozen histograms); agent crashes by version and per 100 device-days; the day by agent version | `remote_sessions`, `agent_crashes`, `stats_machine_1d`, `growth_quality_daily` | P1d; TTFF, the rates and the versions P9a; the rating P9b |
 | Install | fetches by client class; tokens issued → redeemed | §3e | P3 |
 | Social reach | each platform's own numbers per post | the pipeline's push | P8 |
