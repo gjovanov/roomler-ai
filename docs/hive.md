@@ -825,7 +825,7 @@ Empty or `*` means every organization, which is what a self-hosted server wants.
 
 ⚠️ **The list is the switch.** A non-empty `hive.tenants` mounts the module by itself,
 with no `[modules] hive`, and `/api/capabilities` says so
-([`settings.rs:1605`](../crates/config/src/settings.rs#L1605) `Settings::hive_on`). A
+([`settings.rs:1612`](../crates/config/src/settings.rs#L1612) `Settings::hive_on`). A
 hosted server sets only the list, because that form fails safe. An image from before
 P1g never reads the list, so with `ROOMLER__MODULES__HIVE=true` beside it, promoting
 such an image (a rollback, or another session's older tag) would open the pillar to

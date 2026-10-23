@@ -615,6 +615,12 @@ impl Plan {
                 per_seat: true,
             },
         };
+        // FR-115 — Enterprise's relay is "custom" on the ladder: it has no
+        // allowance, so it is never throttled. A contract that wants one names
+        // it; it does not inherit Business's 100 GB per seat.
+        if matches!(self, Plan::Enterprise) {
+            limits.relay_bytes_per_month = u64::MAX;
+        }
         if limits.per_seat {
             let seats = seats.max(1);
             if limits.max_concurrent_sessions != u32::MAX {
@@ -737,6 +743,28 @@ mod plan_tests {
         // Free has no seats: a seat count changes nothing.
         assert_eq!(Plan::Free.limits_for(7).max_concurrent_sessions, 1);
         assert_eq!(Plan::Free.limits_for(7).storage_bytes, GIB);
+    }
+
+    /// FR-115 — Enterprise's relay is "custom": no allowance at any seat
+    /// count, while every other Enterprise limit is still Business's.
+    #[test]
+    fn enterprise_has_no_relay_allowance() {
+        for seats in [1, 7, 500] {
+            assert_eq!(
+                Plan::Enterprise.limits_for(seats).relay_bytes_per_month,
+                u64::MAX,
+                "{seats} seats"
+            );
+        }
+        assert_eq!(
+            Plan::Business.limits_for(2).relay_bytes_per_month,
+            200 * GB,
+            "Business keeps 100 GB per seat"
+        );
+        let (ent, biz) = (Plan::Enterprise.limits_for(3), Plan::Business.limits_for(3));
+        assert_eq!(ent.storage_bytes, biz.storage_bytes);
+        assert_eq!(ent.max_devices, biz.max_devices);
+        assert_eq!(ent.video_max_participants, biz.video_max_participants);
     }
 
     /// Zero and absurd seat counts are clamped and saturate — never a wrap.

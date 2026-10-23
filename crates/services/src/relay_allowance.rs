@@ -36,6 +36,17 @@ pub fn rate_kbps(plan: &Plan, s: &RelayAllowanceSettings) -> u32 {
     }
 }
 
+/// Whether the allowance never applies to `tenant` (`exempt_tenants`: the
+/// operator's own orgs). The throttle's job and the org's page both ask, so
+/// an exempt org is shown no allowance and is throttled by none.
+pub fn is_exempt(s: &RelayAllowanceSettings, tenant: &bson::oid::ObjectId) -> bool {
+    s.exempt_tenants.as_deref().is_some_and(|list| {
+        list.split(',')
+            .filter_map(|id| bson::oid::ObjectId::parse_str(id.trim()).ok())
+            .any(|id| id == *tenant)
+    })
+}
+
 /// The throttled rate (bytes/s) for an org on `plan` with `seats` that has
 /// relayed `used` bytes this month; `None` while it is inside its allowance.
 pub fn rate_for(plan: &Plan, seats: u32, used: u64, s: &RelayAllowanceSettings) -> Option<u64> {
@@ -99,6 +110,11 @@ mod tests {
         assert_eq!(allowance_bytes(&Plan::Free, 7), Some(10 * GB));
         assert_eq!(allowance_bytes(&Plan::Pro, 3), Some(75 * GB));
         assert_eq!(allowance_bytes(&Plan::Business, 2), Some(200 * GB));
+        assert_eq!(
+            allowance_bytes(&Plan::Enterprise, 3),
+            None,
+            "Enterprise is custom"
+        );
         let s = RelayAllowanceSettings::default();
         assert_eq!(rate_kbps(&Plan::Free, &s), s.free_rate_kbps);
         assert_eq!(rate_kbps(&Plan::Pro, &s), s.paid_rate_kbps);
@@ -124,5 +140,32 @@ mod tests {
             next_month_start(at(2026, 11, 1, 0, 0)),
             at(2026, 12, 1, 0, 0)
         );
+    }
+
+    /// The exempt list: ids separated by commas, spaces tolerated, and an
+    /// entry that is not an id ignored rather than exempting anything.
+    #[test]
+    fn the_exempt_list_names_tenants_by_id() {
+        let (a, b, c) = (
+            bson::oid::ObjectId::new(),
+            bson::oid::ObjectId::new(),
+            bson::oid::ObjectId::new(),
+        );
+        let s = RelayAllowanceSettings {
+            exempt_tenants: Some(format!(" {} ,not-an-id,{}", a.to_hex(), b.to_hex())),
+            ..RelayAllowanceSettings::default()
+        };
+        assert!(is_exempt(&s, &a));
+        assert!(is_exempt(&s, &b));
+        assert!(!is_exempt(&s, &c));
+        assert!(
+            !is_exempt(&RelayAllowanceSettings::default(), &a),
+            "unset: none"
+        );
+        let empty = RelayAllowanceSettings {
+            exempt_tenants: Some(String::new()),
+            ..RelayAllowanceSettings::default()
+        };
+        assert!(!is_exempt(&empty, &a), "empty: none");
     }
 }

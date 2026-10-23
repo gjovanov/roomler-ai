@@ -408,6 +408,12 @@ pub struct RelayAllowanceSettings {
     /// withheld. Default **off**. Env: `ROOMLER__RELAY_ALLOWANCE__TURN`.
     #[serde(default)]
     pub turn: bool,
+    /// FR-115 — orgs the allowance never applies to, as comma-separated
+    /// tenant ids: the operator's own orgs, whose test traffic must not
+    /// throttle the operator's fleet. Unset or empty: none. An entry that is
+    /// not an id is ignored. Env: `ROOMLER__RELAY_ALLOWANCE__EXEMPT_TENANTS`.
+    #[serde(default)]
+    pub exempt_tenants: Option<String>,
 }
 
 fn relay_allowance_free_rate_kbps() -> u32 {
@@ -427,6 +433,7 @@ impl Default for RelayAllowanceSettings {
             turn_attribution: false,
             count_turn: false,
             turn: false,
+            exempt_tenants: None,
         }
     }
 }
