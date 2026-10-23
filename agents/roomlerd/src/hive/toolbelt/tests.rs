@@ -3768,9 +3768,13 @@ async fn git_goes_through_an_http_endpoint_by_its_env() {
     for (k, v) in answer["env"].as_object().unwrap() {
         git.env(k, v.as_str().unwrap());
     }
-    let out = tokio::time::timeout(WAIT, tokio::task::spawn_blocking(move || git.output()))
+    // A real git, which cannot prompt (the answer's `GIT_TERMINAL_PROMPT`),
+    // given longer than `WAIT`: on a loaded Windows runner, starting git and
+    // its `git-remote-http` helper alone took past 10 s (CI, 2026-10-23).
+    const GIT_WAIT: Duration = Duration::from_secs(30);
+    let out = tokio::time::timeout(GIT_WAIT, tokio::task::spawn_blocking(move || git.output()))
         .await
-        .expect("git within 10 s")
+        .expect("git within 30 s")
         .unwrap()
         .expect("git runs");
     let stdout = String::from_utf8_lossy(&out.stdout);
