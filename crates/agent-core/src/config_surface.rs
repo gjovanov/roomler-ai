@@ -548,6 +548,16 @@ const KEYS: &[KeyMeta] = &[
         kind: "list",
         description: "FR-90 - comma-separated absolute paths this device's knowhow scans read, each as the account that owns it - never SYSTEM/root, and never a path root owns: a folder is walked for its git checkouts (their remotes, branch, first commit and the services their compose and Kubernetes manifests name), a file is read as a kubeconfig (its contexts, servers and CA fingerprints - never its users). Metadata only, never file contents. Read again at each scan. Never settable by the server. Empty = nothing is read.",
     },
+    // FR-90 P4-3b-3 — whether a knowhow scan reports the ports this device
+    // listens on (decision 47): the device's, and absent from `DesiredConfig`.
+    KeyMeta {
+        key: "knowhow_scan_listeners",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: true,
+        kind: "bool",
+        description: "FR-90 - let this device's knowhow scans report the TCP ports it listens on: each port, its bound address and the process holding it, read by the daemon from the system's own table (this daemon's own ports left out). A listener is under no root, so it has its own switch. Read again at each scan. Never settable by the server. Default: OFF.",
+    },
     KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
@@ -1990,6 +2000,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_ssh" => Some(fmt_bool(cfg.hive_ssh)),
         "hive_egress" => Some(fmt_bool(cfg.hive_egress)),
         "knowhow_scan_roots" => Some(cfg.knowhow_scan_roots.join(",")),
+        "knowhow_scan_listeners" => Some(fmt_bool(cfg.knowhow_scan_listeners)),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2351,6 +2362,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "knowhow_scan_roots" => {
             cfg.knowhow_scan_roots = parse_absolute_list("knowhow_scan_roots", value)?
         }
+        // Clearing turns it off, like every reporting switch.
+        "knowhow_scan_listeners" => cfg.knowhow_scan_listeners = parse_bool_or(value, false)?,
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -3261,8 +3274,9 @@ mod tests {
             "external_consent_mode",
             "external_max_permissions",
             // FR-90 P4-3b-1 — read at use: from the config FILE at every
-            // knowhow scan, so nothing re-seeds it.
+            // knowhow scan, so nothing re-seeds them.
             "knowhow_scan_roots",
+            "knowhow_scan_listeners",
         ]
         .into_iter()
         .map(String::from)
@@ -4618,6 +4632,24 @@ mod tests {
             cfg.knowhow_scan_roots.is_empty(),
             "cleared: nothing is read"
         );
+    }
+
+    /// FR-90 P4-3b-3 — a scan reports the device's listeners only when the
+    /// owner says so: off by default and again when cleared, live, and the
+    /// wire default agrees with the serde default of an absent key.
+    #[test]
+    fn knowhow_scan_listeners_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.knowhow_scan_listeners);
+        let e = entry_for(&cfg, "knowhow_scan_listeners").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        assert!(!e.restart_required, "read at every scan");
+        apply(&mut cfg, "knowhow_scan_listeners", Some("true")).unwrap();
+        assert!(cfg.knowhow_scan_listeners);
+        apply(&mut cfg, "knowhow_scan_listeners", None).unwrap();
+        assert!(!cfg.knowhow_scan_listeners, "cleared: off");
+        assert!(apply(&mut cfg, "knowhow_scan_listeners", Some("sometimes")).is_err());
     }
 
     /// FR-90 P1e — core memory is shown to a session only when the device's

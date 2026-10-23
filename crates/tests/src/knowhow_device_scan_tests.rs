@@ -9,9 +9,10 @@
 //! scanner on the primary's context; the roots come from the config FILE at
 //! each scan; a checkout is keyed as the intake keys it, its remote without
 //! its password and (P4-3b-2) its compose file's service beside it; a listed
-//! kubeconfig's context reaches its cluster; only a scan that read everything
-//! it lists retires anything; and an emptied list answers `no_roots`, which
-//! archives the device's part.
+//! kubeconfig's context reaches its cluster; (P4-3b-3) a port listening here
+//! becomes an endpoint, retired once it stops; only a scan that read
+//! everything it lists retires anything; and nothing listed answers
+//! `no_roots`, which archives the device's part.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -170,6 +171,13 @@ fn set_roots(config: &Path, roots: &[&Path]) {
     roomlerd::config::save(&path, &cfg).unwrap();
 }
 
+fn set_listeners(config: &Path, on: bool) {
+    let path = config.to_path_buf();
+    let mut cfg = roomlerd::config::load(&path).unwrap();
+    cfg.knowhow_scan_listeners = on;
+    roomlerd::config::save(&path, &cfg).unwrap();
+}
+
 /// A device scans the roots its config file lists, and the map holds its
 /// checkout and the repository it belongs to; a root gone unread retires
 /// nothing; a whole scan retires what it no longer finds; an emptied list
@@ -211,6 +219,11 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
     .unwrap();
     let config = base.join("config.toml");
     cfg.knowhow_scan_roots = vec![root.display().to_string(), kube.display().to_string()];
+    // P4-3b-3: the listeners on, and one listening here (the in-process
+    // device leaves no pid out, since this process is the device).
+    cfg.knowhow_scan_listeners = true;
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("{device}:{}/tcp", socket.local_addr().unwrap().port());
     roomlerd::config::save(&config, &cfg).unwrap();
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -251,6 +264,12 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
         .await
         .expect("the context's cluster");
     assert!(reachable(&cluster), "{cluster}");
+    // The port listening here: an endpoint of the device's, with its process.
+    let ep = card(&app, &t, "endpoint", &endpoint)
+        .await
+        .expect("the listener's endpoint");
+    assert_eq!(fact(&ep, "address")["value"], json!("127.0.0.1"), "{ep}");
+    assert!(fact(&ep, "process")["value"].is_string(), "{ep}");
 
     // 2. A root unread: done but truncated, and nothing retired, though the
     // checkout is gone from the folder that was read.
@@ -272,9 +291,12 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
         .await
         .unwrap();
     assert!(reachable(&cluster), "nor the unlisted kubeconfig's link");
+    assert!(card(&app, &t, "endpoint", &endpoint).await.is_some());
 
     // 3. Every root read again: the checkout it no longer finds is retired,
-    // and so is the link of the kubeconfig no longer listed.
+    // and so are the link of the kubeconfig no longer listed and the port no
+    // longer listening.
+    drop(socket);
     set_roots(&config, &[&root]);
     let s = scan_once(&app, &t, &device, "done").await;
     assert!(s.get("truncated").is_none(), "{s}");
@@ -292,9 +314,15 @@ async fn a_device_scans_the_roots_its_config_lists_onto_the_map() {
         .await
         .expect("a shared cluster stays");
     assert!(!reachable(&cluster), "its device's link retired: {cluster}");
+    assert!(
+        card(&app, &t, "endpoint", &endpoint).await.is_none(),
+        "a port no longer listening is retired"
+    );
 
-    // 4. No root listed: `no_roots`, read from the file with no restart.
+    // 4. Nothing listed, neither a root nor the listeners: `no_roots`, read
+    // from the file with no restart.
     set_roots(&config, &[]);
+    set_listeners(&config, false);
     let s = scan_once(&app, &t, &device, "no_roots").await;
     assert!(s.get("detail").is_none(), "{s}");
 

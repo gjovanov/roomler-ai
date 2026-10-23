@@ -14,12 +14,13 @@ sessions read it too, through their toolbelt.
 > the fleet's devices mirrored as machines, with what the fleet and the
 > network say of each (§10); P4-3a, a scan asked of a device, delivered,
 > answered and written as the device's own part of the map (§11); and
-> P4-3b-1 and P4-3b-2, the device's own half on Linux and macOS: its
-> checkouts with the services their manifests name, and a listed kubeconfig's
-> contexts, each root read as the account that owns it (§11.2).** People, the
-> sync and scans fill the map. Listeners (P4-3b-3), Windows (P4-3b-4), a
-> session's reads and proposals (P4-4), probes (P4-5) and `roomler_connect`
-> (P4-6) come with the steps that build them (§12).
+> P4-3b-1 to P4-3b-3, the device's own half on Linux and macOS: its
+> checkouts with the services their manifests name, a listed kubeconfig's
+> contexts, each root read as the account that owns it, and, when its owner
+> says so, the ports it listens on (§11.2).** People, the sync and scans fill
+> the map. Windows (P4-3b-4), a session's reads and proposals (P4-4), probes
+> (P4-5) and `roomler_connect` (P4-6) come with the steps that build them
+> (§12).
 
 ## 1. A map, not a gate
 
@@ -588,21 +589,22 @@ entities with its machine.
 > person's own stop at 49; a scan entity keeps room for its scans' 9, so a person's own stop at
 > 55.
 
-### 11.2 A device's scan (P4-3b-1, P4-3b-2)
+### 11.2 A device's scan (P4-3b-1 to P4-3b-3)
 
 The device's half of decision 38: the daemon reads the roots its owner lists, each through a
 child running as the account that owns it, and answers with what it found, checked as the
 server will check it ([`hive/knowhow`](../agents/roomlerd/src/hive/knowhow/mod.rs)). Linux and
 macOS, on every build carrying `hive`. Since P4-3b-2 a checkout's manifests are read, and a file
-listed as a root is read as a kubeconfig (decision 46). Listeners are P4-3b-3's, Windows
-P4-3b-4's.
+listed as a root is read as a kubeconfig (decision 46). Since P4-3b-3 the TCP ports the machine
+listens on are reported too, when its owner turns that on (decision 47). Windows is P4-3b-4's.
 
 ```mermaid
 flowchart TD
     F["rc:knowhow.scan, on the primary's connection"] --> O{"this scan id run before?"}
     O -- "yes" --> AGAIN["answered from what it found"]
     O -- "no" --> C["knowhow_scan_roots, read from the config file now"]
-    C -- "none listed" --> NR["no_roots"]
+    C -- "nothing listed: no root, no listeners" --> NR["no_roots"]
+    C -- "knowhow_scan_listeners on" --> L["the machine's TCP listeners, read by the daemon"]
     C --> R["each root resolved, and its owner found"]
     R -- "owned by root, or reached through another account's link" --> U["unread, and why"]
     R --> K["roomlerd knowhow-scan, as that account"]
@@ -611,6 +613,7 @@ flowchart TD
     K -- "a file" --> KC["a kubeconfig: its contexts, its users never read"]
     W --> A["the answer: checked, bounded"]
     KC --> A
+    L --> A
     U --> A
     A --> S["rc:knowhow.scanned"]
 ```
@@ -621,14 +624,15 @@ flowchart TD
 |---|---|
 | the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L544)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
-| live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L474)): an edit takes the next scan, with no restart |
+| live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L523)): an edit takes the next scan, with no restart |
 | whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9193)) |
+| the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L554)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
 
 **Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
 
 | The root | Read as |
 |---|---|
-| owned by an account, the daemon root | that account: `roomlerd knowhow-scan` started as it, through the drop an agent session takes ([`run_child`](../agents/roomlerd/src/hive/knowhow/mod.rs#L511)) |
+| owned by an account, the daemon root | that account: `roomlerd knowhow-scan` started as it, through the drop an agent session takes ([`run_child`](../agents/roomlerd/src/hive/knowhow/mod.rs#L560)) |
 | owned by the account the daemon runs as (a per-user install) | the daemon itself |
 | owned by another account, the daemon not root | unread: it reads only its own |
 | owned by root | unread: the owner lists the folders below it. A file root owns, a cluster's `admin.conf` among them, is never read |
@@ -639,7 +643,7 @@ flowchart TD
 The child is started as hive's own children are: fed its request on stdin, its environment
 emptied but for its account's, in a process group of its own, at low priority. It refuses to run
 as root at all, and resolves its root again: a root it cannot list, or one no longer its
-account's, is refused ([`produce`](../agents/roomlerd/src/hive/knowhow/mod.rs#L193)).
+account's, is refused ([`produce`](../agents/roomlerd/src/hive/knowhow/mod.rs#L195)).
 
 **The walk** ([`walk`](../agents/roomlerd/src/hive/knowhow/walk.rs#L71)).
 
@@ -691,22 +695,40 @@ decision 46: a file listed as a root, read by the account that owns it.
 > 100,000 nodes a document ([`MAX_NODES`](../agents/roomlerd/src/hive/knowhow/yaml.rs#L18)):
 > a document past it is refused, and its file passed by.
 
+**The listeners** ([`listeners`](../agents/roomlerd/src/hive/knowhow/listeners.rs#L32)), P4-3b-3,
+decision 47: the machine's TCP listeners, read by the daemon from the system's own table when
+`knowhow_scan_listeners` is on. No account's file is opened, so no account's eyes are needed.
+
+| OS | Table | Its process |
+|---|---|---|
+| Linux | `/proc/net/tcp` and `tcp6`, the rows in state `0A` | the socket's inode found under `/proc/<pid>/fd`, then `/proc/<pid>/comm` |
+| macOS | `lsof -nP -iTCP -sTCP:LISTEN -F pctn`, within 10 s | its own lines; `*` is the family's any-address |
+
+Each is a `listener` finding: its port, `tcp`, the address it is bound to, and its process when
+the table can say. Each bound address and port is reported once.
+
+> [!NOTE]
+> **The daemon's own ports are left out**: its loopback forwards are its declared routes, which
+> the scan reports as such. A daemon that is not root sees only its own account's processes, so
+> another account's listener comes without its process. A table that cannot be read is one more
+> source unread: the answer is `truncated`, and nothing is retired.
+
 > [!WARNING]
 > **macOS's `/usr/bin/git` is never run.** Without the developer tools it is a stub that offers
 > the person at the console an install dialog. The scanner runs Homebrew's git or the tools' own,
 > and names no first commit without one.
 
-**The answer** ([`assemble`](../agents/roomlerd/src/hive/knowhow/mod.rs#L646)).
+**The answer** ([`assemble`](../agents/roomlerd/src/hive/knowhow/mod.rs#L695)).
 
 | Outcome | When | The server then (§11.1) |
 |---|---|---|
-| `no_roots` | nothing listed | archives the device's whole scan part |
-| `done` | every root read whole | writes what it found, archives what it no longer reports |
-| `done`, `truncated` | a root unread, cut or ended, or the answer past 2,000 findings or 1 MiB | writes what it found, archives nothing |
-| `failed` | no root read | writes nothing, archives nothing |
+| `no_roots` | nothing listed: no root, and the listeners off | archives the device's whole scan part |
+| `done` | every root, and the listener table when on, read whole | writes what it found, archives what it no longer reports |
+| `done`, `truncated` | a root or the listener table unread, a root cut or ended, or the answer past 2,000 findings or 1 MiB | writes what it found, archives nothing |
+| `failed` | nothing it lists read | writes nothing, archives nothing |
 
 The primary's declared tunnel routes go first
-([`declared_routes`](../agents/roomlerd/src/hive/knowhow/mod.rs#L621)): a secondary's names
+([`declared_routes`](../agents/roomlerd/src/hive/knowhow/mod.rs#L670)): a secondary's names
 another organization's node. Then each root's checkouts, each checked as the server will check it
 and dropped when it would be refused, and a checkout two roots share sent once. `detail` names
 each root not read and why, and counts what was dropped.
@@ -720,7 +742,7 @@ each root not read and why, and counts what was dropped.
 
 > [!NOTE]
 > **Once per scan id, on the primary's connection, off the loop**
-> ([`handle_scan`](../agents/roomlerd/src/hive/knowhow/mod.rs#L568)). A frame on a secondary
+> ([`handle_scan`](../agents/roomlerd/src/hive/knowhow/mod.rs#L617)). A frame on a secondary
 > enrollment's connection is answered `failed` (decision 43), though the server never sends one.
 > A scan runs off the signaling loop, one at a time, and the last 16 answers are kept, so a scan
 > delivered again after a lost connection is answered from what it found, never run twice. The
@@ -732,7 +754,6 @@ each root not read and why, and counts what was dropped.
 
 | Step | Builds |
 |---|---|
-| P4-3b-3 | the device's TCP listeners, behind its own `knowhow_scan_listeners` (decision 47) |
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
