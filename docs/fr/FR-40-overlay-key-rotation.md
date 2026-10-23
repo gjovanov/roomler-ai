@@ -38,18 +38,18 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 
 | piece | where | note |
 |---|---|---|
-| primary key mint | `agents/roomlerd/src/main.rs:3428-3435` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
-| secondary-org mint | `crates/agent-core/src/enrollment.rs:622-623` | at enroll-append; never copied from the primary (cross-org correlation) |
-| storage | `crates/agent-core/src/config.rs:1865` (primary), `:1995` (`OrgEntry`), `for_org` at `:2129-2157` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
-| atomic save | `config.rs:3489` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
-| how a session gets its key | `agents/roomlerd/src/signaling.rs:444-449`, `:881-883`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
+| primary key mint | `agents/roomlerd/src/main.rs:3436-3443` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
+| secondary-org mint | `crates/agent-core/src/enrollment.rs:624-625` | at enroll-append; never copied from the primary (cross-org correlation) |
+| storage | `crates/agent-core/src/config.rs:1874` (primary), `:2004` (`OrgEntry`), `for_org` at `:2138-2166` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
+| atomic save | `config.rs:3499` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
+| how a session gets its key | `agents/roomlerd/src/signaling.rs:444-449`, `:899-901`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
 | runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:430-438` | a changed secret already fails re-attach and rebuilds the runtime |
-| existing per-org cycle | `main.rs:2883-2904` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |
+| existing per-org cycle | `main.rs:2891-2912` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |
 | server join | `crates/api/src/ws/overlay.rs:232`, `:279-297` (`wg_key_taken_by_other`, machine-scoped ⇒ a same-machine rotation is allowed), `:299-390` (`rehydrate` stores `wg_public_key` + `key_epoch`) | `key_epoch` is stored and **read by nothing** (`models.rs:2914`; the agent always sends 0, `runtime.rs:1951`) |
 | peer fan-out | `overlay.rs:531-561` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:3966`) | an upsert IS the update; the re-join already carries the new key to every peer |
 | peer reinstall | `crates/tunnel-core/src/overlay/runtime/establish.rs:1147-1180` | "peer's WG public key changed — reinstalling its carrier" (`PeerRoute::Keep`) |
 | DERP | `crates/api/src/ws/derp.rs:339-362` (pubkey must equal the row's), `derp_acl.rs:99-140` rebuilt on every join (`overlay.rs:481-490`) | the row must carry the new key BEFORE the node re-registers — the join does exactly that |
-| the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2767-2789` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
+| the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2785-2807` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
 | the report-back precedent | `ClientMsg::ConfigStatus` (`signaling.rs:505`), `record_config_report` (`ws/remote_control.rs:940-985`), `config_audit` (`models.rs:5155-5173`) | the shape to copy: revision-bumped request, device reports the revision, server resolves ONE state |
 | capability verbs | `crates/remote_control/src/models.rs:271-384` | `RpcCap` — no rotation verb exists |
 | UI | `ui/src/components/admin/AgentsSection.vue:1918-1906`, `ui/src/stores/agents.ts:749-704` | "Update now"; **no view shows the overlay public key anywhere** |

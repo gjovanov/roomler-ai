@@ -13,7 +13,7 @@ to `Off` at enrolment with no way to change it short of hand-editing
 
 ## Root cause, with anchors
 
-`crates/agent-core/src/enrollment.rs:341` — every appended org, unconditionally:
+`crates/agent-core/src/enrollment.rs:343` — every appended org, unconditionally:
 
 ```rust
 let mut entry = crate::config::OrgEntry {
@@ -44,8 +44,8 @@ device is genuinely, silently absent from the second org's mesh, and:
 
 | Surface | What it shows | What it omits |
 |---|---|---|
-| `roomlerd enroll` output (`main.rs:1766`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
-| `roomlerd org ls` (`main.rs:1945`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
+| `roomlerd enroll` output (`main.rs:1774`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
+| `roomlerd org ls` (`main.rs:1953`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
 | `roomler status` (`localapi::OrgStatus`) | label · agent id · enabled · connected · stopped · update-ignored | **no overlay field** — the org's WS *is* connected, so it reads healthy |
 | `roomler peers` (`localclient.rs:1398`) | one `── org: <label> ──` section per org **that has peers** | an overlay-off org produces **no section at all** — identical to an org whose peers are simply offline |
 | the dashboard | the device row, online | it is the server's view; the server was never told |

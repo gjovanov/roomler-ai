@@ -90,6 +90,11 @@ pub mod framing;
 pub mod gates;
 mod hosted;
 mod importer;
+/// FR-90 P4-3b-1 — a device's knowhow scan: the roots its owner lists, each
+/// read by `roomlerd knowhow-scan` as the account that owns it. Linux and
+/// macOS; Windows is P4-3b-4's.
+#[cfg(unix)]
+pub mod knowhow;
 mod lines;
 mod materializer;
 /// FR-90 P3-7-3c — `net_socks` and `net_forward`: a session's own egress, on

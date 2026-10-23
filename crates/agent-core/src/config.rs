@@ -613,6 +613,15 @@ pub struct AgentConfig {
     /// the vault decides is the owner's call.
     #[serde(default)]
     pub hive_egress: bool,
+    /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):
+    /// absolute paths, a folder walked for its git checkouts, each read as
+    /// the account that owns it and never as the daemon, for metadata alone.
+    /// **Empty means nothing is read** (the scan answers `no_roots`), never
+    /// everything. Read from this file again at each scan, so an edit takes
+    /// the next one, and never pushable: what a device reads is its owner's
+    /// call, not the server's.
+    #[serde(default)]
+    pub knowhow_scan_roots: Vec<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2790,6 +2799,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_net: false,
         hive_ssh: false,
         hive_egress: false,
+        knowhow_scan_roots: Vec::new(),
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

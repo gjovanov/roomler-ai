@@ -25,7 +25,7 @@ use roomler_ai_mod_knowhow::intake::checkout_key;
 
 /// The live entity of `kind` and `key`, as its card: `None` while there is
 /// none.
-async fn card(app: &TestApp, t: &SeededTenant, kind: &str, key: &str) -> Option<Value> {
+pub(crate) async fn card(app: &TestApp, t: &SeededTenant, kind: &str, key: &str) -> Option<Value> {
     let (code, card) = call(app.auth_get(
         &kpath(&t.tenant_id, &format!("/entity?kind={kind}&key={key}")),
         &t.admin.access_token,
