@@ -280,7 +280,7 @@ and the consent chain's fallbacks.
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:902`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
-| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:238-262`, `:595-601`) | P6e |
+| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:238-262`, `:652-658`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1180-1189` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3130`, `session_end.rs:220`) | P4d |
@@ -680,6 +680,11 @@ test of the SIGKILL property itself.
   - A root daemon outside the console session cannot reach the pasteboard server: its lookup fails with "No such
     process". So the hello does not ask the process's own pasteboard (`clipboard.rs:807`): on a supervised Mac the
     root daemon says the hello, and a delegated session's clipboard runs in the GUI worker, inside the session.
+  *The Mac kill switches on a supervised Mac (found 2026-10-23, by FR-119's field run):* the hello is the root's and
+  the session the worker's, and `sudo`'s `env_reset` gave the worker none of the root's `ROOMLERD_*`. So
+  `ROOMLERD_LOCK_HINT` (P2d-1), `ROOMLERD_CLIPBOARD_MAC_WATCH` (P2e-1) and `ROOMLERD_MAC_LAYOUT` (P2d-2a), set on the
+  root, changed the hello and not the session. From 0.4.155 the supervisor hands the worker the root's effective
+  value of each (FR-43's `WORKER_ENV_FORWARD`, #2758); a per-user half's own LaunchAgent environment is unchanged.
 - **P2f, a microphone for recordings.** cpal on macOS, `NSMicrophoneUsageDescription` in the bundle (a missing key
   ends the process at first access), and the audio-input entitlement.
 - **P2g, the companion's Devices page on a two-half Mac (D2).** Reported by the operator on 2026-10-21: the Mac's
@@ -1104,7 +1109,7 @@ model on Windows, so the three agree on what the mode means.
       session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:238-262`). Exit code 9 is a restart someone
       asked for, and signal 9 is a kill. Only the wait status tells them apart, and a test holds that.
     - *Where it goes.* `WriterContext::Supervisor`, which off Windows is the writing process's own dir: the root
-      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:595-601`).
+      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:652-658`).
     - *Its tail* is the daemon's own log, as on Windows. The worker's stderr is the daemon's `StandardErrorPath`,
       which a signal death writes nothing to. Its rolling log is in the person's home, which a root daemon does not
       read, and nothing ties the two halves to one org.
@@ -1270,8 +1275,10 @@ one depends on it.
   on the candidate the native panel came up, Approve connected the viewer and Deny declined it. Then on the
   operator's MacBook, a supervised Mac, where the root half asked and its own panel answered, 2026-10-22.)*
   *(The last clause, copied images (P2e-1), on a tart Mac, §8: red on 0.4.153 (`not-watched`, no image), green on its
-  candidate (the image unasked within a second), and red again under the kill switch. The operator's MacBook follows
-  on the release that carries it: a candidate reports the released number, so it never goes on a kept Mac.)*
+  candidate (the image unasked within a second), and red again under the kill switch. Released in 0.4.154: on the
+  operator's MacBook, both halves on 0.4.154, neither half's hello says `not-watched` any more,
+  read from the server, 2026-10-23 (§8). An image copy there was not tried, because that pasteboard is the person's
+  own.)*
 - [x] **AC9 (P3a–P3f):** on the Linux lab, the cursor shape follows; the locked hint arrives; a session holds sleep
   off; session audio is never a microphone; received files land as the seat user; layout, display-match and image
   sync work on X11; uinput types a German and a French string.
@@ -1595,3 +1602,5 @@ one depends on it.
 | 2026-10-22 | `agent-v0.4.153` (tag run 39771313078 on `ea2d75eff`, the bump #2721; it differs from the rehearsed `3a26e1de7` only in its 28 version lines) | the release and the served manifest; one host per OS; then the operator's org | 🟢 **0.4.153 ships P2b.** Published 11:51:18Z: 37 assets, each of the 12 packages with its `.asc` and `.sha256`; "Resolved MSI ProductVersion: 0.4.153"; `/api/agent/latest-release` serves it first, daemon assets before companions. `self-update --check-only` says "Update available" from 0.4.152 on Windows (signer G ROX LTD) and from 0.4.151 on Linux and on the operator's MacBook (the pinned `.asc`), each package naming itself 0.4.153. An UpdateNow to the org's 13 online devices: all 13 on 0.4.153 and back online within 5 minutes, both halves of the MacBook included |
 | 2026-10-22 | promote `hosted-20261022-ea2d75e` (pods up 12:09Z) | prod, read-only: the served docs; the fleet | 🟢 **AC16.** Before the roll the served `/docs/troubleshooting/black-screen/` still had its old step ("A root system service has no logged-in session"). After it, the page says a system install (a root service) captures the person's session on GNOME and KDE Wayland by itself, and `/docs/remote-desktop/per-os-permissions/` carries the system-install Wayland row: #2533 is live. Also checked: both pods on the image, `/health` 0.4.153, 25 agents online as before, and the mesh (an overlay SSH session) and a SOCKS5 tunnel through a 0.4.153 Windows host both answered |
 | 2026-10-22 | released 0.4.153, then P2e-1's candidate (the `.pkg` from release-lane rehearsal 39776321684 on `5cc8766d8`, `6e8ca4dc…`), with and without `ROOMLERD_CLIPBOARD_MAC_WATCH=0` in its LaunchAgent | throwaway tart Macs (macOS 15.7.7) with only the per-user half, sessions auto-granted; a Playwright viewer from mars tapping the clipboard channel, subscribed to text and image events; a 64×48 PNG, then a line of text, copied as the console user | 🟢 **P2e-1: AC8's copied images, on a tart Mac.** 🔴 0.4.153: the hello says `clipboard-image-events: not-watched`, and the image copy brought nothing (0 binary frames); the text arrived 1.7 s after its copy. 🟢 The candidate: no such word, and the image arrived unasked within a second of the copy (`clipboard:img-begin` 64×48, a 1010-byte PNG in one binary frame), then the text. The kill switch: `not-watched` again and no image, while the text still synced |
+| 2026-10-23 | released 0.4.154 (`agent-v0.4.154`, published 00:18Z; it carries P2e-1) | the operator's MacBook, both halves; the server's rows, read-only | 🟢 **P2e-1 released.** Both of the MacBook's rows are on 0.4.154 and online, and neither hello carries `clipboard-image-events` any more. On 0.4.153 every Mac's said `not-watched` (the tart red above). The org's 15 online devices were all on 0.4.154 by 06:44Z. An image copy on the MacBook was not tried, because that pasteboard is the person's own |
+| 2026-10-23 | released 0.4.154, then #2758's candidate (the `.pkg` from release-lane rehearsal 39912891967 on `351610deb`, `9ea527d4…`) | throwaway tart Macs (macOS 15.7.7) with both halves, the root's supervisor starting the worker. `ROOMLERD_CLIPBOARD_MAC_WATCH=0` and `ROOMLERD_LOCK_HINT=0`, plus the root-only `ROOMLERD_AUTO_UPDATE=0`, in the ROOT's plist only. The viewer on the root's row, so the session was the worker's by delegation; an image, then text, copied as the console user | 🟢 **A Mac kill switch reaches a supervised session (#2758, FR-43).** 🔴 0.4.154: the root's hello said `not-watched`, but the worker had no `ROOMLERD_*` and pushed the image unasked 0.9 s after the copy. 🟢 The candidate: the root logged that the worker inherits `ROOMLERD_LOCK_HINT` and `ROOMLERD_CLIPBOARD_MAC_WATCH` (not `AUTO_UPDATE`), and both rows said `not-watched`. No image arrived, and the text still did. Control, the candidate with no switch: the image arrived unasked again. Detail in FR-43's field log |

@@ -261,6 +261,43 @@ pub fn crash_summary(end: WorkerEnd, uid: u32, ran: Duration) -> Option<String> 
     ))
 }
 
+/// FR-97 / FR-119 — the session-side knobs whose ROOT value must bind the
+/// supervised worker, by suffix (`ROOMLERD_<suffix>`). The root daemon says the
+/// hello from its own environment and config; the worker serves the session,
+/// and `sudo`'s `env_reset` hands it neither (measured, see `spawn_worker`).
+/// So the root's effective value of each — its environment, else its
+/// `config.toml` fallback — reaches the worker as a real variable, which beats
+/// the worker's own config: what the hello promised is what the session does.
+///
+/// ⚠️ Session-side knobs ONLY. The worker is a full agent, so a knob it must
+/// not act on (the overlay, a relay server, the updater) never belongs here: it
+/// would start a second one of them in the person's session.
+pub const WORKER_ENV_FORWARD: &[&str] = &[
+    // FR-97 P2d-1 — the lock hint, in a session and at a prompt.
+    "LOCK_HINT",
+    // FR-97 P2e-1 — copied images, gated on the pasteboard's change count.
+    "CLIPBOARD_MAC_WATCH",
+    // FR-97 P2d-2a — the keyboard layout through Text Input Sources.
+    "MAC_LAYOUT",
+    // FR-119 — the high-refresh picker and its per-cell ceilings.
+    "FPS_HIGH",
+    "FPS_DENY",
+    // The encoder-cells kill switch: a gate applies at every entry point, and
+    // the worker is where a session's encoders open.
+    "ENCODER_CELLS_DENY",
+];
+
+/// The worker's `ROOMLERD_<suffix>=<value>` assignments: every
+/// [`WORKER_ENV_FORWARD`] suffix `lookup` has a value for, in that order.
+/// `lookup` is `tunnel_core::env::node_env` in the daemon (environment, then
+/// config). No shell sees them, so a value like `*:144` stays literal.
+pub fn worker_env_args(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    WORKER_ENV_FORWARD
+        .iter()
+        .filter_map(|suffix| lookup(suffix).map(|v| format!("ROOMLERD_{suffix}={v}")))
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 pub use imp::run;
 
@@ -342,12 +379,32 @@ mod imp {
     /// would have used. P1 changes who launches the worker, nothing about its
     /// identity.
     fn spawn_worker(uid: u32, exe: &std::path::Path, secret: &str) -> std::io::Result<Child> {
-        let mut child = Command::new("launchctl")
-            .arg("asuser")
+        let mut cmd = Command::new("launchctl");
+        cmd.arg("asuser")
             .arg(uid.to_string())
             .arg("sudo")
             .arg("-u")
-            .arg(format!("#{uid}"))
+            .arg(format!("#{uid}"));
+        // FR-97 / FR-119 — the same `env_reset` (below) is why the worker never
+        // saw the root's kill switches or its config-only session knobs: the
+        // hello the root sent promised one thing and the session did another.
+        // The root's effective values go on as real variables
+        // ([`WORKER_ENV_FORWARD`]); `env` execs into the agent, so the chain
+        // the supervisor reaps, and the signals it relays, are unchanged. Not
+        // secrets: settings, safe in a world-readable argv.
+        let forward = worker_env_args(tunnel_core::env::node_env);
+        if !forward.is_empty() {
+            let keys: Vec<&str> = forward
+                .iter()
+                .map(|a| a.split_once('=').map_or(a.as_str(), |(k, _)| k))
+                .collect();
+            tracing::info!(
+                ?keys,
+                "macOS supervisor: the worker inherits the root's session knobs"
+            );
+            cmd.arg("/usr/bin/env").args(&forward);
+        }
+        let mut child = cmd
             .arg(exe)
             .arg("run")
             // FR-43 P2a — tell the worker it is ours, and that its
@@ -747,6 +804,51 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-97 / FR-119 — the worker gets the root's value of each forwarded
+    /// knob the root has, as a real variable, in the allowlist's order and
+    /// verbatim, and nothing for a knob the root lacks or one not on the list.
+    #[test]
+    fn the_worker_inherits_the_roots_session_knobs_and_nothing_else() {
+        let root = |suffix: &str| match suffix {
+            "FPS_DENY" => Some("*:144".to_string()),
+            "CLIPBOARD_MAC_WATCH" => Some("0".to_string()),
+            "ENCODER_CELLS_DENY" => Some("hevc_videotoolbox:yuv444".to_string()),
+            // Set on the root, but root-only: never forwarded.
+            "RELAY_SERVER_ENABLED" => Some("true".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            worker_env_args(root),
+            vec![
+                "ROOMLERD_CLIPBOARD_MAC_WATCH=0",
+                "ROOMLERD_FPS_DENY=*:144",
+                "ROOMLERD_ENCODER_CELLS_DENY=hevc_videotoolbox:yuv444",
+            ]
+        );
+        assert!(
+            worker_env_args(|_| None).is_empty(),
+            "no knob set, no `env` at all"
+        );
+    }
+
+    /// The worker is a full agent: a knob only the root may act on must never
+    /// join the list, or the person's session would start a second one.
+    #[test]
+    fn no_root_only_knob_is_forwarded_to_the_worker() {
+        for root_only in [
+            "RELAY_SERVER_ENABLED",
+            "OVERLAY_NETSTACK_SOCKS",
+            "AUTO_UPDATE",
+            "UPDATE_URL",
+            "PERSON_SOCKET",
+        ] {
+            assert!(
+                !WORKER_ENV_FORWARD.contains(&root_only),
+                "{root_only} is the root's alone"
+            );
+        }
+    }
 
     fn base() -> Inputs {
         Inputs {
