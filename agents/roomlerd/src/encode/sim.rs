@@ -1068,6 +1068,9 @@ impl RateLaw for GovernorLaw {
             prev_state: self.prev_state.replace(state),
             // The sim has no pump passes and one carrier per scenario.
             agent_stalled: false,
+            // Nor a transport opening: its scenarios are measured from a
+            // transport already past its ramp.
+            opening: false,
             carrier_changed: false,
         });
         let hold = self.stall_gate && rejected.is_some();

@@ -211,6 +211,14 @@ Fail-first: `a_link_report_in_the_shadow_of_a_transit_stall_does_not_arm_the_cla
 queue in an over-budget window) arms the clamp on T2 and does not on T2b; the same
 test then shows the clamp reading a growing report again two windows later.
 
+⚠️ **The classifier's sender inputs were one pass long until FR-119 P2b-8
+(2026-10-23).** The pump hands `WindowSenderStats` over on every pass, as deltas
+since the previous pass, and the governor kept only the last one. So in the field
+`frames_sent` and `gate_skips` read 0–2 where a window held 30–120, and a gate skip
+outside a window's final pass never made it `overproduced`. The governor now sums
+the passes ([FR-119](FR-119-high-refresh-streaming.md) §4.10). The tests here always
+fed whole windows, so they describe the classifier the field runs from then on.
+
 ## Phases
 
 | Phase | What | Kill switch | Status |

@@ -327,8 +327,16 @@ pub struct RateGovernor {
 }
 
 /// FR-71 T1a — what the pump measured about its own send side over one
-/// viewer window, handed to [`RateGovernor::note_window_sender`] just before
-/// the tick. Every field is a delta or a level for THAT window.
+/// viewer window. The pump reports every PASS ([`RateGovernor::note_window_sender`]),
+/// and the governor folds the passes into the window it reads at the
+/// boundary ([`Self::absorb`]).
+///
+/// ⚠️ FR-119 P2b-8 — until then the governor KEPT ONLY THE LAST PASS: the
+/// pump hands its facts over on every iteration, as deltas since the previous
+/// one, and each call overwrote the one before. So the "window" the classifier
+/// and the gate read was one pass long: a stalled pass anywhere but in the
+/// window's last iteration never reached FR-79's `AgentStalled`, and
+/// `frames_sent` / `gate_skips` read 0–2 where the window held 30–120.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowSenderStats {
     /// Bytes still held for this session (the FR-59 P2 ledger) and the
@@ -340,6 +348,10 @@ pub struct WindowSenderStats {
     /// window measured is evidence about the pipe. A pump that keeps no
     /// send-side figures reports `0` and the gate's other conditions stand.
     pub stalled_passes: u32,
+    /// FR-119 P2b-8 — the transport is still in its opening (FR-35's opener
+    /// window, kept for every session): what a blocked send measured here is
+    /// the transport ramping, so the gate drops the window ([`super::evidence::Reason::Opening`]).
+    pub opening: bool,
     /// Frames the byte-budget gate skipped this window.
     pub gate_skips: u32,
     /// The longest a frame waited in the send queue this window, ms, and
@@ -348,6 +360,30 @@ pub struct WindowSenderStats {
     pub send_wait_avg_ms: Option<f64>,
     /// Frames the send task wrote this window.
     pub frames_sent: u32,
+}
+
+impl WindowSenderStats {
+    /// FR-119 P2b-8 — fold one more pass into this window. Counts add, the
+    /// wait's maximum is the larger, its average is weighted by the frames each
+    /// pass sent (the send task records a wait for every frame it writes, so
+    /// the weights are exact), `opening` is true if any pass was in the
+    /// opening, and the levels (`inflight_bytes`, `budget_bytes`) are the
+    /// latest pass's.
+    pub fn absorb(&mut self, next: WindowSenderStats) {
+        let (n0, n1) = (f64::from(self.frames_sent), f64::from(next.frames_sent));
+        self.send_wait_avg_ms = match (self.send_wait_avg_ms, next.send_wait_avg_ms) {
+            (Some(a), Some(b)) if n0 + n1 > 0.0 => Some((a * n0 + b * n1) / (n0 + n1)),
+            (Some(a), _) => Some(a),
+            (None, b) => b,
+        };
+        self.inflight_bytes = next.inflight_bytes;
+        self.budget_bytes = next.budget_bytes;
+        self.stalled_passes = self.stalled_passes.saturating_add(next.stalled_passes);
+        self.opening |= next.opening;
+        self.gate_skips = self.gate_skips.saturating_add(next.gate_skips);
+        self.send_wait_max_ms = self.send_wait_max_ms.max(next.send_wait_max_ms);
+        self.frames_sent = self.frames_sent.saturating_add(next.frames_sent);
+    }
 }
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
 const VIEWER_WINDOW: Duration = Duration::from_secs(1);
@@ -1023,8 +1059,17 @@ impl RateGovernor {
         // shadow the moment the gate was built on it, so `transit_classify`
         // went with them. `samples` is this window's blocked sends; the
         // sender's other figures arrive from the pump via `note_window_sender`.
-        let rejection = if constrained {
-            let sender = self.window_sender.take();
+        //
+        // FR-119 P2b-8 — the GATE runs on every window, direct ones included;
+        // only the classifier is constrained-only. A direct window used to be
+        // evidence by definition, and the capacity it folded is what FR-119's
+        // grant reads: a session's opening window, blocked by its own first
+        // keyframe, took a granted 120 fps back for 60 s. On a direct window
+        // the state is `Unknown` and there is no predecessor (a stale
+        // constrained verdict from before a transport flip must not cast a
+        // shadow here), so only the agent's own stall and the opening apply.
+        let sender = self.window_sender.take();
+        let (state, prev_state) = if constrained {
             let split = match (report, self.last_viewer_arrival) {
                 (Some((avg, _, _)), Some(arrival)) => {
                     let s = viewer_rate::split_age(
@@ -1051,27 +1096,25 @@ impl RateGovernor {
                 frames_sent: sender.map_or(0, |s| s.frames_sent),
                 struggling,
             };
-            let state = self.pipe.classify(&signals);
-            let rejected = super::evidence::rejected(super::evidence::WindowFacts {
-                state,
-                prev_state,
-                // The pump counts its own stalled passes; a pump that keeps no
-                // send-side figures (VP9-444) reports none and the remaining
-                // conditions still stand.
-                agent_stalled: sender.is_some_and(|s| s.stalled_passes > 0),
-                // V2 wires the carrier; until then a change cannot be seen
-                // here and the memory keying is where it will be read.
-                carrier_changed: false,
-            });
-            if let Some(r) = rejected {
-                self.evidence.note(r);
-            }
-            rejected
+            (self.pipe.classify(&signals), prev_state)
         } else {
-            // A direct transport has the measured-ceiling clamp for this job and
-            // no classifier verdict to gate on.
-            None
+            (super::pipe_state::PipeState::Unknown, None)
         };
+        let rejection = super::evidence::rejected(super::evidence::WindowFacts {
+            state,
+            prev_state,
+            // The pump counts its own stalled passes; a pump that keeps no
+            // send-side figures (VP9-444) reports none and the remaining
+            // conditions still stand.
+            agent_stalled: sender.is_some_and(|s| s.stalled_passes > 0),
+            opening: sender.is_some_and(|s| s.opening),
+            // V2 wires the carrier; until then a change cannot be seen
+            // here and the memory keying is where it will be read.
+            carrier_changed: false,
+        });
+        if let Some(r) = rejection {
+            self.evidence.note(r);
+        }
         let valid = rejection.is_none();
         // FR-79 V5 — the gate says whether this window MEASURES the pipe. It
         // was also being read as whether the window says anything at all, and
@@ -1377,12 +1420,17 @@ impl RateGovernor {
         Some(viewer_rate::split_age(age, arrival, sender_ms))
     }
 
-    /// FR-71 T1a — the pump hands in what it measured about its own send
-    /// side since the last viewer window, just before the tick. The tick
-    /// consumes it; a pump that never calls this (the VP9-444 pump) classifies
-    /// from the split and the viewer's report alone.
+    /// FR-71 T1a — the pump hands in what it measured about its own send side
+    /// on THIS PASS, as deltas since its previous call, before every tick. The
+    /// governor folds the passes into the window ([`WindowSenderStats::absorb`])
+    /// and the tick that closes the window consumes the sum; a pump that never
+    /// calls this (the VP9-444 pump) classifies from the split and the
+    /// viewer's report alone.
     pub fn note_window_sender(&mut self, stats: WindowSenderStats) {
-        self.window_sender = Some(stats);
+        match self.window_sender.as_mut() {
+            Some(window) => window.absorb(stats),
+            None => self.window_sender = Some(stats),
+        }
     }
 
     /// FR-71 T1a — the last window's verdict on which plane is the limiter,
@@ -1406,8 +1454,9 @@ impl RateGovernor {
     }
 
     /// FR-79 — windows the validity gate rejected, as
-    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed]`.
-    pub fn evidence_rejected(&self) -> [u32; 4] {
+    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening]`
+    /// (FR-119 P2b-8 appended the fifth, so the first four keep their places).
+    pub fn evidence_rejected(&self) -> [u32; 5] {
         self.evidence.counts()
     }
 
@@ -1570,6 +1619,7 @@ mod tests {
             send_wait_avg_ms: Some(0.5),
             frames_sent,
             stalled_passes: 0,
+            opening: false,
         };
         // Three clean windows learn the floors (40 ms transit, 1 ms viewer).
         for _ in 0..3 {
@@ -1624,7 +1674,7 @@ mod tests {
         // Four rejections, every one a transit stall — no agent stall, no
         // shadow (each window's predecessor stalled too, and the stall itself
         // is the more specific answer), no carrier change.
-        assert_eq!(g.evidence_rejected(), [0, 4, 0, 0]);
+        assert_eq!(g.evidence_rejected(), [0, 4, 0, 0, 0]);
     }
     /// FR-70 P1 — a remembered-slow pair, constrained, as the field ran it.
     fn remembered(seed_bps: u32, flags: GovernorFlags, now: Instant) -> RateGovernor {
@@ -2825,6 +2875,7 @@ mod tests {
             send_wait_avg_ms: Some(0.5),
             frames_sent,
             stalled_passes: 0,
+            opening: false,
         };
         // Three clean windows learn the floors, then the session's ONE
         // measurement folds on the fourth: 1500 bytes per 12 ms = 1.0 Mbps.
@@ -2891,7 +2942,7 @@ mod tests {
         );
         assert_eq!(
             g.evidence_rejected(),
-            [0, 2, 0, 0],
+            [0, 2, 0, 0, 0],
             "both rejections were transit stalls"
         );
     }
@@ -3406,6 +3457,7 @@ mod tests {
             send_wait_avg_ms: Some(0.05),
             frames_sent,
             stalled_passes: 0,
+            opening: false,
         }
     }
 
@@ -3523,7 +3575,7 @@ mod tests {
         );
         assert_eq!(
             g.evidence_rejected(),
-            [0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
             "every window was evidence"
         );
         assert!(
@@ -3599,6 +3651,7 @@ mod tests {
             send_wait_avg_ms: Some(19.9),
             frames_sent: 12,
             stalled_passes: 0,
+            opening: false,
         });
         g.tick_viewer_window(
             t,
@@ -3665,5 +3718,122 @@ mod tests {
         assert_eq!(g.paced_fps(), None, "the hardware pace is untouched");
         let mut g = gov(Instant::now());
         assert_eq!(g.pace_software(45.0, 60), Some(30), "22 fps: held at 30");
+    }
+
+    /// FR-119 P2b-8 — the pump reports every PASS; the window the gate and the
+    /// classifier read is their sum. Counts add, the longest wait wins, the
+    /// average weighs each pass by the frames it sent, any pass in the opening
+    /// makes it an opening window, and the levels are the latest pass's.
+    #[test]
+    fn a_window_is_the_sum_of_its_passes() {
+        let mut w = WindowSenderStats {
+            inflight_bytes: 1_000,
+            budget_bytes: 128_000,
+            stalled_passes: 1,
+            opening: true,
+            gate_skips: 2,
+            send_wait_max_ms: 40.0,
+            send_wait_avg_ms: Some(10.0),
+            frames_sent: 1,
+        };
+        w.absorb(WindowSenderStats {
+            inflight_bytes: 3_000,
+            budget_bytes: 96_000,
+            stalled_passes: 0,
+            opening: false,
+            gate_skips: 3,
+            send_wait_max_ms: 5.0,
+            send_wait_avg_ms: Some(2.0),
+            frames_sent: 3,
+        });
+        assert_eq!(w.stalled_passes, 1);
+        assert!(
+            w.opening,
+            "a pass in the opening makes it an opening window"
+        );
+        assert_eq!(w.gate_skips, 5);
+        assert_eq!(w.frames_sent, 4);
+        assert_eq!(w.send_wait_max_ms, 40.0);
+        assert_eq!(w.send_wait_avg_ms, Some(4.0), "(10 × 1 + 2 × 3) / 4");
+        assert_eq!(
+            (w.inflight_bytes, w.budget_bytes),
+            (3_000, 96_000),
+            "the levels are the latest pass's"
+        );
+    }
+
+    /// FR-119 P2b-8 — the defect the sum fixes. A pump pass that stalled at the
+    /// START of a window was overwritten by the clean passes after it: the
+    /// window reached the gate as if the loop had been free all along.
+    #[test]
+    fn a_stalled_pass_early_in_the_window_still_rejects_it() {
+        let start = Instant::now();
+        let mut g = t2_governor(start);
+        let mut t = start;
+        for _ in 0..4 {
+            t += Duration::from_millis(1100);
+            t2_clean_window(&mut g, t);
+        }
+        g.note_window_sender(WindowSenderStats {
+            stalled_passes: 1,
+            ..t2_sender(1)
+        });
+        for _ in 0..29 {
+            g.note_window_sender(t2_sender(1));
+        }
+        t += Duration::from_millis(1100);
+        g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        assert_eq!(
+            g.evidence_rejected()[0],
+            1,
+            "the window held a stalled pass, wherever in it"
+        );
+    }
+
+    /// FR-119 P2b-8 — a DIRECT window inside the transport's opening is not a
+    /// capacity measurement. A direct window used to be evidence by
+    /// definition: on the MacBook a session's opening keyframe blocked its
+    /// sends for 43–82 ms, folded as 14–22 Mbps of capacity, and FR-119's
+    /// grant took a freshly granted 120 fps back for the claim's 60 s.
+    #[test]
+    fn a_direct_window_in_the_opening_folds_no_capacity() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        // The opening: 40 × 30 KB sends, each blocked 24 ms (a 10 Mbps drain).
+        for _ in 0..40 {
+            sink.record(30_000, Duration::from_millis(24));
+        }
+        g.note_window_sender(WindowSenderStats {
+            opening: true,
+            ..t2_sender(40)
+        });
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, false, |o| o, 0)
+            .expect("window due");
+        assert_eq!(
+            g.belief_bps(t1).2,
+            None,
+            "no capacity claim from the opening"
+        );
+        assert_eq!(
+            g.blocked_send_bps(t1),
+            None,
+            "and no estimate for the measured-ceiling clamp"
+        );
+        assert_eq!(g.evidence_rejected()[4], 1, "rejected for the opening");
+
+        // The control: the same window once the opening has ended folds as it
+        // always did. A direct pipe pushing back is still evidence.
+        for _ in 0..40 {
+            sink.record(30_000, Duration::from_millis(24));
+        }
+        g.note_window_sender(t2_sender(40));
+        let t2 = t1 + Duration::from_millis(1100);
+        g.tick_viewer_window(t2, 30, || 0, || 0, || 0, false, |o| o, 0)
+            .expect("window due");
+        assert_eq!(g.blocked_send_bps(t2), Some(10_000_000));
+        assert!(g.belief_bps(t2).2.is_some(), "the capacity claim folds");
     }
 }

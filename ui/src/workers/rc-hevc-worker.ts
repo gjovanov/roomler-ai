@@ -45,7 +45,9 @@ import {
   normalizeCtxMode,
   normalizeIntKnob,
   round1,
-  DEFAULT_MAX_DECODE_QUEUE,
+  DEFAULT_MAX_BACKLOG_MS,
+  DecodeBacklog,
+  backlogShouldDrop,
   type CtxMode,
 } from './rc-hop-stats'
 import {
@@ -87,10 +89,11 @@ type InitCanvasMessage = {
    *  (localStorage `roomler-rc-per-frame-msg`). Default OFF — see the
    *  vp9-444 worker's comment. */
   perFrameMsg?: boolean
-  /** P6 — backlog-drop threshold override (localStorage
-   *  `roomler-rc-max-queue`). Sticks across the idempotent visible-canvas
-   *  re-init (which omits it), like `ctxMode`. */
-  maxQueue?: number
+  /** FR-119 P2b-7 — the backlog-drop threshold in ms (localStorage
+   *  `roomler-rc-max-backlog-ms`; was P6's frame-count `maxQueue`). Sticks
+   *  across the idempotent visible-canvas re-init (which omits it), like
+   *  `ctxMode`. */
+  maxBacklogMs?: number
   /** P7 — FSR sharpening mode (localStorage `roomler-rc-sharpen`).
    *  Sticks across the idempotent visible-canvas re-init, like `ctxMode`. */
   sharpen?: string
@@ -187,9 +190,12 @@ let framesSkippedAwaitingKey = 0
 // WITHOUT the destructive drop+IDR-storm that used to freeze the screen. The
 // composable's `struggling` rule trips at a lower queue depth, so the cap
 // reacts before we ever reach this drop threshold.
-// P6 — init-canvas-configurable (localStorage `roomler-rc-max-queue`) for the
-// flow-control field-tuning round; default unchanged.
-let maxDecodeQueue = DEFAULT_MAX_DECODE_QUEUE
+// P6 — init-canvas-configurable for the flow-control field-tuning round.
+// FR-119 P2b-7 — the threshold is the decode BACKLOG in ms, not a frame count:
+// 4 frames were 67 ms at 60 and only 33 ms at 120, where one slow keyframe
+// tripped the drop and the drop's IDR tripped it again (`DecodeBacklog`).
+let maxBacklogMs = DEFAULT_MAX_BACKLOG_MS
+const backlog = new DecodeBacklog()
 let framesDroppedBacklog = 0
 let lastKeyframeReqMs = 0
 
@@ -285,7 +291,6 @@ const ageStats = new HopStats()
 const queueDrift = new QueueDrift()
 let clockOffsetUs: number | null = null
 let outGapMaxMs = 0
-const pendingDecodeAt = new Map<number, number>()
 // FR-70 M0 — the age SPLIT. `ageStats` fuses sender, transit and viewer
 // latency into one number, which is how a 4903 ms relay stall on 2026-09-04
 // arrived looking like a pump problem. `arrivalStats` is the age of the
@@ -293,7 +298,7 @@ const pendingDecodeAt = new Map<number, number>()
 // like `ageStats`), and `viewerStats` is the purely local time from that
 // arrival to the paint (decode queue + decode + paint) — no probe needed.
 // The agent subtracts: viewer = age − arrival, transit = arrival − its own
-// send-queue wait. Keyed by the wire timestamp, like `pendingDecodeAt`.
+// send-queue wait. Keyed by the wire timestamp, like the decode `backlog`.
 const arrivalStats = new HopStats()
 const viewerStats = new HopStats()
 const pendingArrivalUs = new Map<number, number>()
@@ -327,6 +332,9 @@ function maybeEmitStats(): void {
   const elapsedSec = elapsed / 1000
   const bitrateBps = Math.round((statsBytesInWindow * 8) / elapsedSec)
   const fps = Math.round(statsFramesInWindow / elapsedSec)
+  // FR-119 P2b-7 — the window's decode backlog: the mean is what the
+  // composable's struggling rule reads, the max is for the HUD.
+  const backlogWindow = backlog.takeWindow()
   workerScope.postMessage({
     type: 'stats',
     bitrateBps,
@@ -336,6 +344,8 @@ function maybeEmitStats(): void {
     framesDecodedTotal: framesDecoded,
     bytesReceivedTotal: statsBytesTotal,
     decodeQueueSize: decoder?.decodeQueueSize ?? 0,
+    backlogMs: round1(backlogWindow.meanMs),
+    backlogMaxMs: round1(backlogWindow.maxMs),
     framesDroppedBacklog,
     // FR-17 - the framing counters, surfaced rather than left
     // internal: a rising `chunkStragglers` with steady fps is the
@@ -406,8 +416,8 @@ workerScope.onmessage = (e) => {
     // P1 — ctx mode sticks across the idempotent visible-canvas re-init.
     if (msg.ctxMode !== undefined) ctxMode = normalizeCtxMode(msg.ctxMode)
     if (typeof msg.perFrameMsg === 'boolean') perFrameMsg = msg.perFrameMsg
-    if (msg.maxQueue !== undefined) {
-      maxDecodeQueue = normalizeIntKnob(msg.maxQueue, DEFAULT_MAX_DECODE_QUEUE, 1, 60)
+    if (msg.maxBacklogMs !== undefined) {
+      maxBacklogMs = normalizeIntKnob(msg.maxBacklogMs, DEFAULT_MAX_BACKLOG_MS, 10, 2000)
     }
     // P7 — FSR knobs stick across the idempotent visible re-init like ctxMode.
     if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
@@ -476,12 +486,10 @@ function initDecoder() {
       framesDecoded++
       statsFramesInWindow++
       noteOutputForStallCheck()
-      // P1 — submit→output latency (queue + decoder time).
-      const submittedAt = pendingDecodeAt.get(frame.timestamp)
-      if (submittedAt !== undefined) {
-        decodeStats.add(performance.now() - submittedAt)
-        pendingDecodeAt.delete(frame.timestamp)
-      }
+      // P1 — submit→output latency (queue + decoder time); FR-119 P2b-7 —
+      // the same bookkeeping is the decode backlog the shed rule reads.
+      const decodeMs = backlog.output(frame.timestamp, performance.now())
+      if (decodeMs !== undefined) decodeStats.add(decodeMs)
       // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
       // geometry for our hevc_nvenc stream (field DEVBOX, RTX 5090):
       // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
@@ -731,8 +739,11 @@ function emitFrame(): void {
   // rc.130 — backlog shed. If the decoder has fallen behind, drop this delta
   // and re-arm the keyframe gate so we keep dropping deltas (which would
   // otherwise decode-error against the missing reference and tear the path
-  // down to <video>) until the resync IDR lands.
-  if (!isKey && decoder.decodeQueueSize > maxDecodeQueue) {
+  // down to <video>) until the resync IDR lands. FR-119 P2b-7 — "behind" is
+  // the backlog in ms, sampled here once per arriving frame (the struggling
+  // rule reads the window's mean of these samples).
+  const backlogMs = backlog.sample(performance.now())
+  if (!isKey && backlogShouldDrop(backlogMs, maxBacklogMs)) {
     framesDroppedBacklog++
     sawKeyframe = false
     requestKeyframeResync()
@@ -741,6 +752,7 @@ function emitFrame(): void {
         type: 'backlog-drop',
         dropped: framesDroppedBacklog,
         queue: decoder.decodeQueueSize,
+        backlogMs: Math.round(backlogMs),
       })
     }
     return
@@ -752,10 +764,9 @@ function emitFrame(): void {
       timestamp: ts,
       data: payload,
     })
-    // P1 — record the submission time for the submit→output hop (bounded;
-    // see the vp9-444 worker's mirror).
-    if (pendingDecodeAt.size > 240) pendingDecodeAt.clear()
-    pendingDecodeAt.set(ts, performance.now())
+    // P1 — record the submission time for the submit→output hop; FR-119
+    // P2b-7 — and for the decode backlog (bounded inside `DecodeBacklog`).
+    backlog.submitted(ts, performance.now())
     // FR-70 M0 — and the frame's arrival (its last chunk is in hand here).
     if (pendingArrivalUs.size > 240) pendingArrivalUs.clear()
     pendingArrivalUs.set(ts, epochNowUs())
@@ -849,7 +860,7 @@ function teardown(): void {
   framesSkippedAwaitingKey = 0
   framesDroppedBacklog = 0
   // P1 — drop the hop-instrumentation state with the session.
-  pendingDecodeAt.clear()
+  backlog.clear()
   paintStats.snapshotAndReset()
   fwdStats.snapshotAndReset()
   decodeStats.snapshotAndReset()

@@ -164,7 +164,7 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | finding | where | fix |
 |---|---|---|
 | once a session starts, the toolbar's title gets 0 px (no device name), chips lose their text, and **Disconnect** and Fullscreen are off-screen | `RemoteControl.vue:15-883`, `:50` | on `xs`: name, status and Disconnect on row 1, tools on an extension row; the rarer tools in an overflow menu |
-| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:908-970`, `:5185-5192` | the alerts as an overlay on the stage |
+| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:908-970`, `:5186-5193` | the alerts as an overlay on the stage |
 | the **Unverified** device-identity badge is hidden below 600 px | `RemoteControl.vue:81-92` | always shown when it warns (icon-only on `xs`) |
 | the Settings **Session** tab is off-screen on a phone | `RemoteControl.vue:1522-1527` | `show-arrows` |
 | the Metrics tab's live values never render (`hide-details` with `messages`) | `RemoteControl.vue:1707-1755` | `hide-details="auto"` |
