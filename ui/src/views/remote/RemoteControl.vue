@@ -3859,7 +3859,8 @@ const diagLabel = computed(() => {
   const rtt = d.probeRttMs !== null ? ` · rtt ${Math.round(d.probeRttMs)}` : ''
   return (
     `paint ${hop(d.paint)} · fwd ${hop(d.fwd)} · dec ${hop(d.decode)}${age}${rtt}`
-    + ` · gap ${d.outGapMaxMs} · q ${d.queue} · drop ${d.droppedTotal}`
+    + ` · gap ${d.outGapMaxMs} · q ${d.queue} · backlog ${d.backlogMs}/${d.backlogMaxMs}`
+    + ` · drop ${d.droppedTotal}`
     + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}${render}`
   )
 })

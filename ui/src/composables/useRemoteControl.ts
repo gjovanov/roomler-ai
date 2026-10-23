@@ -39,9 +39,11 @@ import {
   normalizeCtxMode,
   normalizeIntKnob,
   StruggleWindow,
-  DEFAULT_MAX_DECODE_QUEUE,
-  DEFAULT_STRUGGLE_QUEUE,
+  DEFAULT_MAX_BACKLOG_MS,
+  DEFAULT_STRUGGLE_BACKLOG_MS,
   DEFAULT_STRUGGLE_WINDOWS,
+  LEGACY_KNOB_FRAME_MS,
+  isBadDecodeWindow,
   type ClockSample,
   type CtxMode,
   type HopWindow,
@@ -2409,40 +2411,66 @@ export function storedPerFrameMsg(): boolean {
 // P6 (Parsec-class plan) Ã¢ÂÂ flow-control knobs for the field-tuning round.
 // All localStorage, all default to today's baked values; proven values get
 // baked as the new defaults in a follow-up (one constant per field round):
-//  - roomler-rc-max-queue: worker decode-queue depth above which deltas are
-//    dropped + an IDR resync is requested (default 4, clamp 1..60).
-//  - roomler-rc-struggle-queue: queue depth that makes a 1 s stats window
-//    "bad" for the struggling rule (default 2, clamp 0..59).
+//  - roomler-rc-max-backlog-ms: worker decode backlog (ms) above which deltas
+//    are dropped + an IDR resync is requested (default 67, clamp 10..2000).
+//  - roomler-rc-struggle-backlog-ms: the window's MEAN backlog (ms) that
+//    makes a 1 s stats window "bad" for the struggling rule (default 33,
+//    clamp 1..2000).
+//    FR-119 P2b-7 — both were frame counts (`roomler-rc-max-queue`, 4, and
+//    `roomler-rc-struggle-queue`, 2), which meant half the time at 120 fps
+//    that they meant at 60. A viewer still carrying one has it read as the
+//    ms it meant at 60 fps, the rate it was tuned at.
 //  - roomler-rc-struggle-windows: consecutive bad windows before the
 //    struggling bit is sent to the agent (default 2; 1 = the legacy
 //    instantaneous rule, clamp 1..10).
-const MAX_QUEUE_STORAGE_KEY = 'roomler-rc-max-queue'
-const STRUGGLE_QUEUE_STORAGE_KEY = 'roomler-rc-struggle-queue'
+const MAX_BACKLOG_STORAGE_KEY = 'roomler-rc-max-backlog-ms'
+const STRUGGLE_BACKLOG_STORAGE_KEY = 'roomler-rc-struggle-backlog-ms'
+const LEGACY_MAX_QUEUE_STORAGE_KEY = 'roomler-rc-max-queue'
+const LEGACY_STRUGGLE_QUEUE_STORAGE_KEY = 'roomler-rc-struggle-queue'
 const STRUGGLE_WINDOWS_STORAGE_KEY = 'roomler-rc-struggle-windows'
 
 export interface RcFlowParams {
-  maxQueue: number
-  struggleQueue: number
+  /** FR-119 P2b-7 — the workers' backlog-drop threshold, ms. */
+  maxBacklogMs: number
+  /** FR-119 P2b-7 — the struggling rule's mean-backlog threshold, ms. */
+  struggleBacklogMs: number
   struggleWindows: number
+}
+
+/** FR-119 P2b-7 — a retired P6 frame-count knob, as the ms it meant at the
+ *  60 fps it was tuned at; `null` when absent or not a number. */
+function legacyFramesToMs(raw: string | null): number | null {
+  if (raw === null) return null
+  const frames = Number.parseInt(raw, 10)
+  return Number.isFinite(frames) ? Math.round(frames * LEGACY_KNOB_FRAME_MS) : null
 }
 
 /** Read the P6 flow-control knobs (pure + exported so the defaults and
  *  clamps are locked by unit tests). Read once per composable Ã¢ÂÂ a knob
  *  change needs a page refresh, like every other `roomler-rc-*` knob. */
 export function storedFlowParams(): RcFlowParams {
+  let mb: string | null = null
+  let sb: string | null = null
   let mq: string | null = null
   let sq: string | null = null
   let sw: string | null = null
   try {
-    mq = globalThis.localStorage?.getItem(MAX_QUEUE_STORAGE_KEY) ?? null
-    sq = globalThis.localStorage?.getItem(STRUGGLE_QUEUE_STORAGE_KEY) ?? null
+    mb = globalThis.localStorage?.getItem(MAX_BACKLOG_STORAGE_KEY) ?? null
+    sb = globalThis.localStorage?.getItem(STRUGGLE_BACKLOG_STORAGE_KEY) ?? null
+    mq = globalThis.localStorage?.getItem(LEGACY_MAX_QUEUE_STORAGE_KEY) ?? null
+    sq = globalThis.localStorage?.getItem(LEGACY_STRUGGLE_QUEUE_STORAGE_KEY) ?? null
     sw = globalThis.localStorage?.getItem(STRUGGLE_WINDOWS_STORAGE_KEY) ?? null
   } catch {
     /* privacy mode Ã¢ÂÂ defaults */
   }
   return {
-    maxQueue: normalizeIntKnob(mq, DEFAULT_MAX_DECODE_QUEUE, 1, 60),
-    struggleQueue: normalizeIntKnob(sq, DEFAULT_STRUGGLE_QUEUE, 0, 59),
+    maxBacklogMs: normalizeIntKnob(mb ?? legacyFramesToMs(mq), DEFAULT_MAX_BACKLOG_MS, 10, 2000),
+    struggleBacklogMs: normalizeIntKnob(
+      sb ?? legacyFramesToMs(sq),
+      DEFAULT_STRUGGLE_BACKLOG_MS,
+      1,
+      2000,
+    ),
     struggleWindows: normalizeIntKnob(sw, DEFAULT_STRUGGLE_WINDOWS, 1, 10),
   }
 }
@@ -2656,6 +2684,10 @@ export type RcDecodeDiag = {
   probeRttMs: number | null
   outGapMaxMs: number
   queue: number
+  /** FR-119 P2b-7 — the window's decode backlog, mean and max, ms: what the
+   *  shed and struggling rules read (`queue` is kept as the raw count). */
+  backlogMs: number
+  backlogMaxMs: number
   droppedTotal: number
   ctxMode: string
   longTasksPerSec: number
@@ -6845,6 +6877,8 @@ export function useRemoteControl(
     fps?: number
     framesDroppedBacklog?: number
     decodeQueueSize?: number
+    /** FR-119 P2b-7 — the window's mean decode backlog, ms. */
+    backlogMs?: number
     age?: HopWindow | null
     /** FR-70 M0 — the window's age at arrival (null until the probe locks). */
     arrival?: HopWindow | null
@@ -6857,15 +6891,18 @@ export function useRemoteControl(
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
     lastBacklogDrops = drops
-    const queue = typeof m.decodeQueueSize === 'number' ? m.decodeQueueSize : 0
-    // A window is "bad" when we dropped frames to a backlog, OR the queue is
-    // deep enough that we're about to (the worker drops at queue > maxQueue).
+    // FR-119 P2b-7 — the window's mean decode backlog in ms (the workers
+    // sample it once per arriving frame); was the instantaneous frame count of
+    // `decodeQueueSize`, which halved its meaning at every doubling of the rate.
+    const backlogMs = typeof m.backlogMs === 'number' ? m.backlogMs : 0
+    // A window is "bad" when we dropped frames to a backlog, OR the backlog is
+    // sustained deep enough that we're about to (`isBadDecodeWindow`).
     // P6 Ã¢ÂÂ the struggling bit needs a SUSTAINED run of bad windows (default
     // 2 consecutive; `roomler-rc-struggle-windows=1` restores the legacy
     // instantaneous rule). P1's field read showed a healthy viewer parks at
     // queue 0, so a single-window blip (a big IDR landing, a GPU hiccup) was
     // a false positive that cost ~20 s of lazily-recovered reduced fps.
-    const bad = delta > 0 || queue > flowParams.struggleQueue
+    const bad = isBadDecodeWindow(delta, backlogMs, flowParams.struggleBacklogMs)
     // FR-15 — ride the window's paint age along. Present only once the
     // clock probe has locked and frames actually painted (n > 0); the
     // agent treats its absence as "no signal", not as a 0 ms age.
@@ -7478,6 +7515,8 @@ export function useRemoteControl(
     viewer?: HopWindow | null
     outGapMaxMs?: number
     decodeQueueSize?: number
+    backlogMs?: number
+    backlogMaxMs?: number
     framesDroppedBacklog?: number
     ctxMode?: string
   }) {
@@ -7492,6 +7531,8 @@ export function useRemoteControl(
       probeRttMs: clockBest?.rttMs ?? null,
       outGapMaxMs: typeof m.outGapMaxMs === 'number' ? m.outGapMaxMs : 0,
       queue: typeof m.decodeQueueSize === 'number' ? m.decodeQueueSize : 0,
+      backlogMs: typeof m.backlogMs === 'number' ? m.backlogMs : 0,
+      backlogMaxMs: typeof m.backlogMaxMs === 'number' ? m.backlogMaxMs : 0,
       droppedTotal: typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0,
       ctxMode: typeof m.ctxMode === 'string' ? m.ctxMode : 'legacy',
       longTasksPerSec: lt.perSec,
@@ -7613,6 +7654,8 @@ export function useRemoteControl(
           bytesReceivedTotal?: number
           framesDroppedBacklog?: number
           decodeQueueSize?: number
+          backlogMs?: number
+          backlogMaxMs?: number
           framesDecodedTotal?: number
           paint?: HopWindow
           fwd?: HopWindow
@@ -7678,7 +7721,7 @@ export function useRemoteControl(
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
-          maxQueue: flowParams.maxQueue,
+          maxBacklogMs: flowParams.maxBacklogMs,
           // FR-17 — negotiated per session; see `sessionChunkFraming`.
           chunkFraming: sessionChunkFraming,
           // FR-16 L4 — resolved per session; see `sessionBench`.
@@ -7889,6 +7932,8 @@ export function useRemoteControl(
           bytesReceivedTotal?: number
           framesDroppedBacklog?: number
           decodeQueueSize?: number
+          backlogMs?: number
+          backlogMaxMs?: number
           framesDecodedTotal?: number
           paint?: HopWindow
           fwd?: HopWindow
@@ -7934,7 +7979,7 @@ export function useRemoteControl(
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
-          maxQueue: flowParams.maxQueue,
+          maxBacklogMs: flowParams.maxBacklogMs,
           // FR-17 — negotiated per session; see `sessionChunkFraming`.
           chunkFraming: sessionChunkFraming,
           // FR-16 L4 — resolved per session; see `sessionBench`.

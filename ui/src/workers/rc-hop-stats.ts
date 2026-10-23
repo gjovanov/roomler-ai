@@ -247,16 +247,118 @@ export function ctxOptionsFor(
 // its send-fps, and the lazy recovery took ~20 s to climb back. Both knobs are
 // now configurable (init-canvas / localStorage), and the struggling bit needs
 // a SUSTAINED run of bad windows before it fires.
+//
+// ── FR-119 P2b-7 — decode health in TIME, not in frames ─────────────────────
+// P6's two thresholds counted frames: drop deltas (and ask for an IDR) once the
+// decoder's queue held more than 4, call a window "bad" once it held more than
+// 2. A frame count is a different amount of time at every rate — 4 frames are
+// 67 ms at 60, 33 ms at 120 and 133 ms at 30 — so at 120 fps one slow keyframe
+// decode tripped the drop, the drop's IDR tripped it again, and about every
+// 30 s a viewer decoding 113 fps told the agent it was struggling (FR-119 §8,
+// the MacBook to neo16 on 2026-10-23: four 4–8 s dips a session). The count
+// also missed the frames already inside the codec: `decodeQueueSize` holds
+// only the requests not yet handed to it.
+//
+// So both rules read the decode BACKLOG: how long the oldest frame still
+// waiting for its output has waited since it was submitted (`DecodeBacklog`).
+// The thresholds are what P6's counts meant at 60 fps, the rate they were tuned
+// at, and they now mean the same at every rate.
 
-/** Worker decode-queue depth above which non-key frames are dropped and an
- *  IDR resync is requested. */
-export const DEFAULT_MAX_DECODE_QUEUE = 4
-/** Queue depth that makes a 1 s stats window count as "bad" for the
- *  struggling rule (strictly-greater compare). */
-export const DEFAULT_STRUGGLE_QUEUE = 2
+/** Backlog age above which an arriving delta is dropped and an IDR resync is
+ *  requested: P6's 4 frames at 60 fps. */
+export const DEFAULT_MAX_BACKLOG_MS = 67
+/** Mean backlog over a 1 s stats window above which the window counts as
+ *  "bad" for the struggling rule: P6's 2 frames at 60 fps. A window MEAN, not
+ *  a sample: one slow keyframe lifts a few frames' ages for tens of ms and the
+ *  mean barely moves, while a decoder that cannot keep up lifts every one. */
+export const DEFAULT_STRUGGLE_BACKLOG_MS = 33
+/** The frame period P6's frame-count knobs were tuned at. A viewer that still
+ *  carries one of them has it converted at this rate (`storedFlowParams`). */
+export const LEGACY_KNOB_FRAME_MS = 1000 / 60
 /** Consecutive bad windows before the struggling bit is reported to the
  *  agent. 1 = the legacy instantaneous rule. */
 export const DEFAULT_STRUGGLE_WINDOWS = 2
+
+/** FR-119 P2b-7 — one decode worker's backlog: when each frame went to
+ *  `decode()`, until its output arrives. Pure over the instants it is given,
+ *  so the tests drive it with a synthetic timeline. */
+export class DecodeBacklog {
+  /** Bounds the map if outputs ever stop arriving (a wedged decoder): the
+   *  stall detector reports that case, and this only keeps memory flat. */
+  static readonly MAX_PENDING = 240
+  /** Wire timestamp → submit time (ms), in submission order. */
+  private readonly pending = new Map<number, number>()
+  private sumMs = 0
+  private samples = 0
+  private maxMs = 0
+
+  /** A frame went to `decode()` at `now`. */
+  submitted(timestamp: number, now: number): void {
+    if (this.pending.size >= DecodeBacklog.MAX_PENDING) this.pending.clear()
+    this.pending.delete(timestamp)
+    this.pending.set(timestamp, now)
+  }
+
+  /** A frame came out at `now`: its submit→output time, or `undefined` for a
+   *  frame this tracker never saw submitted. Output follows submission order
+   *  (the agent's encoders send no B-frames), so frames submitted before it
+   *  and still pending were skipped by the decoder: they are forgotten here,
+   *  not left to age for ever and fake a backlog. */
+  output(timestamp: number, now: number): number | undefined {
+    const at = this.pending.get(timestamp)
+    if (at === undefined) return undefined
+    for (const ts of this.pending.keys()) {
+      this.pending.delete(ts)
+      if (ts === timestamp) break
+    }
+    return Math.max(0, now - at)
+  }
+
+  /** How long the oldest frame still waiting for its output has waited. */
+  ageMs(now: number): number {
+    for (const at of this.pending.values()) return Math.max(0, now - at)
+    return 0
+  }
+
+  /** The backlog at `now`, also folded into the current stats window. */
+  sample(now: number): number {
+    const age = this.ageMs(now)
+    this.sumMs += age
+    this.samples++
+    if (age > this.maxMs) this.maxMs = age
+    return age
+  }
+
+  /** The window's mean and largest backlog; starts the next window. */
+  takeWindow(): { meanMs: number; maxMs: number } {
+    const w = { meanMs: this.samples > 0 ? this.sumMs / this.samples : 0, maxMs: this.maxMs }
+    this.sumMs = 0
+    this.samples = 0
+    this.maxMs = 0
+    return w
+  }
+
+  clear(): void {
+    this.pending.clear()
+    this.takeWindow()
+  }
+}
+
+/** FR-119 P2b-7 — is the decoder so far behind that an arriving delta must be
+ *  dropped (and an IDR requested)? */
+export function backlogShouldDrop(backlogMs: number, maxBacklogMs: number): boolean {
+  return backlogMs > maxBacklogMs
+}
+
+/** FR-119 P2b-7 — is this 1 s stats window "bad" for the struggling rule? A
+ *  backlog drop inside it, or a mean backlog over the threshold. */
+export function isBadDecodeWindow(
+  backlogDrops: number,
+  backlogMeanMs: number,
+  struggleBacklogMs: number,
+): boolean {
+  return backlogDrops > 0 || backlogMeanMs > struggleBacklogMs
+}
 
 /** Parse an integer knob (localStorage string or init-canvas number) with a
  *  clamp. Anything non-numeric (null, '', 'banana') → the default; fractions
