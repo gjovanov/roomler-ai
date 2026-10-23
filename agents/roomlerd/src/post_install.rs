@@ -983,6 +983,32 @@ pub(crate) fn version_matches(version_output: &str, expected_tag: &str) -> bool 
     version_output.contains(&needle)
 }
 
+/// #2724 — what `roomlerd self-update` does about a daemon running BESIDE it,
+/// once its own install has completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BesideDaemon {
+    /// The installed binary answers as the release it was installed as: ask
+    /// the daemon to restart onto it.
+    Restart,
+    /// Leave the daemon on the image it runs, for this reason.
+    Leave(String),
+}
+
+/// #2724 — decide [`BesideDaemon`] from the installed binary's `--version`
+/// answer (`None`: it did not answer). Only a binary that answers as the
+/// release just installed is restarted onto, P2b's rule for the same question
+/// (`replaced_binary.rs`): a file that cannot run would take the daemon down
+/// with it.
+pub fn beside_daemon_after_install(version_answer: Option<&str>, latest: &str) -> BesideDaemon {
+    match version_answer.map(str::trim) {
+        Some(answer) if version_matches(answer, latest) => BesideDaemon::Restart,
+        Some(answer) => BesideDaemon::Leave(format!(
+            "the installed binary answers {answer:?}, not {latest}"
+        )),
+        None => BesideDaemon::Leave("the installed binary did not answer --version".to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum WaitOutcome {
     Exited(i32),
@@ -1237,6 +1263,30 @@ mod tests {
         // RETIRED-NAME-ANCHOR(2): a ROLLBACK re-runs the previous binary, which
         // still prints the pre-FR-21 name. Prefix tolerance is the contract.
         assert!(version_matches("roomler-agent 0.1.50", "agent-v0.1.50"));
+    }
+
+    /// #2724 — `self-update` restarts the daemon beside it only onto a
+    /// binary that answers as the release it just installed.
+    #[test]
+    fn a_daemon_beside_self_update_is_restarted_only_onto_the_proven_release() {
+        assert_eq!(
+            beside_daemon_after_install(Some("roomlerd 0.4.156\n"), "0.4.156"),
+            BesideDaemon::Restart
+        );
+        assert_eq!(
+            beside_daemon_after_install(Some("roomlerd 0.4.156"), "agent-v0.4.156"),
+            BesideDaemon::Restart
+        );
+        // The old binary still in place (the CLI ran from somewhere else).
+        assert!(matches!(
+            beside_daemon_after_install(Some("roomlerd 0.4.155"), "0.4.156"),
+            BesideDaemon::Leave(why) if why.contains("0.4.155") && why.contains("0.4.156")
+        ));
+        // A file that does not run is never restarted onto.
+        assert!(matches!(
+            beside_daemon_after_install(None, "0.4.156"),
+            BesideDaemon::Leave(why) if why.contains("did not answer")
+        ));
     }
 
     #[test]
