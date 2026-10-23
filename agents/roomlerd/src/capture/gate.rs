@@ -82,6 +82,17 @@ pub fn legacy_period(fps: u32) -> Duration {
     Duration::from_millis(1000 / u64::from(fps.max(1)))
 }
 
+/// FR-119 P2b-6 — the bucket a PULL-based backend (scrap: its worker grabs
+/// when the pump asks, so there is no slot to look at first) paces its asks
+/// with above [`SLOT_FIRST_ABOVE_FPS`], debited at each ask. It holds the
+/// long-run ask rate at the target to the microsecond, whatever each sleep
+/// overshoots by. The legacy rule's "a little fast" period does not: on the
+/// MacBook each sleep overshot by ~1.4 ms (29.05 fps at a 30 target), and
+/// 8 + 1.4 ms is 106 fps at 120. `None` at 60 and below: the legacy rule stays.
+pub fn pull_gate(fps: u32) -> Option<SlotFirst> {
+    (GateMode::at_fps(GateMode::Legacy, fps) == GateMode::SlotFirst).then(|| SlotFirst::new(fps))
+}
+
 /// The slot-first bucket. Pure over the instants it is given, so the tests
 /// drive it with a synthetic timeline.
 #[derive(Debug, Clone)]
@@ -191,6 +202,52 @@ mod tests {
         assert_eq!(SlotFirst::new(144).period(), Duration::from_micros(6_944));
         assert_eq!(SlotFirst::new(60).period(), Duration::from_micros(16_666));
         assert_eq!(SlotFirst::new(0).period(), Duration::from_secs(1));
+    }
+
+    /// FR-119 P2b-6 — above 60 a pull-based backend paces its asks with the
+    /// bucket; at 60 and below it keeps the legacy rule.
+    #[test]
+    fn above_sixty_a_pull_backend_paces_with_the_bucket() {
+        let gate = pull_gate(120).expect("above 60 a pull backend runs the bucket");
+        assert_eq!(gate.period(), Duration::from_micros(8_333));
+        assert!(pull_gate(144).is_some());
+        assert!(pull_gate(60).is_none());
+        assert!(pull_gate(30).is_none());
+    }
+
+    /// FR-119 P2b-6 — the reason, on a synthetic timeline: a caller whose every
+    /// sleep overshoots by 1.4 ms (as measured on the MacBook) asks 120 times a
+    /// second through the bucket, and ~106 through the legacy rule, under the
+    /// 108 that AC4 asks for.
+    #[test]
+    fn a_pull_caller_that_oversleeps_still_averages_the_target_through_the_bucket() {
+        const ASKS: u32 = 1_200;
+        let over = Duration::from_micros(1_400);
+        let t0 = Instant::now();
+        let rate = |end: Instant| f64::from(ASKS) / end.duration_since(t0).as_secs_f64();
+
+        let mut gate = pull_gate(120).expect("the bucket");
+        let mut now = t0;
+        for _ in 0..ASKS {
+            let wait = gate.wait(now);
+            if !wait.is_zero() {
+                now += wait + over;
+            }
+            gate.took(now);
+        }
+        assert!(rate(now) >= 119.0, "bucket: {}", rate(now));
+
+        let (mut now, mut last) = (t0, None::<Instant>);
+        for _ in 0..ASKS {
+            if let Some(last) = last {
+                let elapsed = now.duration_since(last);
+                if elapsed < legacy_period(120) {
+                    now += legacy_period(120) - elapsed + over;
+                }
+            }
+            last = Some(now);
+        }
+        assert!(rate(now) < 108.0, "legacy: {}", rate(now));
     }
 
     /// The legacy rule as each backend applies it: sleep out the rest of a
