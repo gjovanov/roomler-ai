@@ -149,7 +149,7 @@ sequenceDiagram
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
 | P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. P2 is built; its field proof is P3 |
-| P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | — |
+| P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155) |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
 
@@ -413,6 +413,10 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
   (Video encoding, Advanced) bridges to `ROOMLERD_FPS_HIGH`. It is read at start with the hello's capabilities,
   so a change needs a restart, and it stays device-local: it is not pushable, because it widens what a session
   may do. Default off.
+  ⚠️ On a supervised (two-half) Mac, the hello comes from the root half while the session runs in the GUI
+  worker, which resolves its own config. Set as root, the key changed only the hello: the picker showed and the
+  pump ignored the ask (§8, 2026-10-23). Since #2758 (0.4.155), FR-43 forwards `FPS_HIGH` and `FPS_DENY` to the
+  worker: [the worker inherits the root's session knobs](FR-43-macos-single-enrollment.md).
 - **`fps_deny` in config.** The denylist is now a config key on `encoder_cells_deny`'s terms.
   `roomler config set fps_deny` validates it: a plain FFmpeg name or `*`, and a rate above 60, because an entry
   that could only deny nothing would read as in force. It rides `desired_config` with `MANAGE_AGENTS` alone,
@@ -459,9 +463,12 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
 - [ ] **AC2 — the wire is additive.** An agent without `fps-high` never receives `rc:fps`; a viewer without the
   picker never sends it; an unknown value is dropped. Tests on both sides. An old viewer with a new agent and a
   new viewer with an old agent both stream at today's rate.
-- [ ] **AC3 — constrained paths stay where they are.** A constrained session never exceeds its current cap,
+- [x] **AC3 — constrained paths stay where they are.** A constrained session never exceeds its current cap,
   whatever the viewer asks. Unit-tested on the grant, and seen on one relay cell in the field answering at its
-  current cap (30 on a relayed FFmpeg DC session today) with `reason:"constrained"`.
+  current cap (30 on a relayed FFmpeg DC session today) with `reason:"constrained"`. **Verified** 2026-10-23 on
+  agent 0.4.154 (§8). The MacBook, on a relayed session, was asked for 120 and answered at 30 with
+  `refused=Some((120, Constrained))`; the viewer read "120 fps not granted: the connection is relayed, and a
+  relay stays at its current rate". The grant's unit tests are P2b-1's (§4.3).
 - [ ] **AC4 — D1 in the field.** One direct pair delivers ≥ 0.9 × 120 fps for 60 s, with p99 inter-frame time
   under 16.7 ms, on a 120 Hz-or-faster viewer. The red run is the same pair on today's build, at ≤ 60.
 - [ ] **AC5 — the rate law.** At 60 fps the ceiling is byte-identical to today's at every geometry (a table
@@ -482,6 +489,10 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
    webrtc-rs 0.20 is a separate FR and the operator's decision.
 4. **144 Hz without a 144 Hz panel.** Only a virtual display can produce frames faster than the panel. That rides
    on the virtual-display decision (FR-108 P3 / the IddCx note in the program).
+5. **An ask of 60 (raised by P3's first run).** The viewer sends the rate it shows, 60 included. A relayed session
+   now reads "60 fps not granted: the connection is relayed", which is accurate, since the stream runs at 30,
+   below the ask. But before FR-119 a relay's 30 was silent (§8, 2026-10-23). Recommended: the viewer shows a
+   refusal only for an ask above 60.
 
 ## 7. Out of scope
 
@@ -496,6 +507,9 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
 | 2026-10-21 | fleet, agents 0.4.135–0.4.148 | every FFmpeg DC session for 7 days (FR-118 §2.2) | **The red record for the encode stage.** Only `hevc_videotoolbox` (6.3 ms at 3024×1964) fits a 120 fps period on today's CPU path; QSV and NVENC need 9.9–16.4 ms per 1080p–1600p frame. No session ran above 60, because nothing lets one |
 | 2026-10-21 | dev build, release profile, neo16 (a Ryzen 9 7945HX laptop, Windows 11) | P0(c): the data channel alone, in process over loopback UDP (`agents/roomlerd/tests/dc_throughput.rs`): 16 KiB messages awaited back to back, as the production send task sends them; 5 s × 3 rounds per mode | **The transport is not D1's limiter.** Ordered: 375.9 / 278.8 / 275.7 Mbit/s. Unordered: 281.0 / 287.1 / 271.6. Every byte was delivered. That is ~2.7× D2's ~100 Mbit/s on this CPU. Still owed before open decision 3 closes: a weaker host's CPU and a real round trip, because this is an upper bound for a LAN path |
 | 2026-10-21 | ffmpeg (a winget build) with NVENC on neo16 (RTX 5090), offline | P0(d): α. The same content at 60, 120 and 144 fps: code-like text scrolling at a fixed **px/s** (each frame's y is `40 − t·speed`). HEVC at `cq 28`, AV1 at `cq 34`, `-b:v 0`; preset p4, tune ll, no B-frames, no periodic keyframes. 10 s per clip, bits counted after the first IDR | **α ≈ 0 to 0.8 by codec and content.** HEVC on text moving a whole number of pixels per frame (720 px/s: 12 / 6 / 5 px): 471 / 805 / 950 kbit/s, so α = 0.77 (120 vs 60) and 0.80 (144 vs 60). HEVC at 200 px/s: 0.73. HEVC at 800 px/s: −0.12. HEVC static: 0.23. AV1: 0.02–0.32. **Wrong turn:** every 144 fps clip with fractional per-frame motion came out 31–34 Mbit/s, about 20× its neighbours. `drawtext` renders each frame at a different sub-pixel glyph phase (18 at 200 px/s), which defeats motion compensation. Whole-pixel steps behave. That is a caveat for real smooth-scrolled text too, for P3. P2a uses 0.8, the upper envelope. Posted on #2670 |
+| 2026-10-23 | agent 0.4.154, `fps_high` unset (the default) | **P3 run 1, the red.** The MacBook host: a two-half Mac (root daemon plus a GUI worker in the person's session), 3024×1964, `hevc_videotoolbox`. The viewer is the MCP-driven Chrome on neo16, on the same LAN. Motion: a 120 fps test pattern (1512×982, looping) in a Safari tab | **No picker, 30 fps.** The Video settings offer no frame-rate control (no `fps-high` in the hello). The heartbeat read `target_fps=30 constrained=true`, about 28 fps delivered, `avg_encode_ms` 5.8–5.9. The capture read the panel as `refresh_hz=Some(120)` through CoreGraphics |
+| 2026-10-23 | agent 0.4.154, `fps_high = true` in both halves | **AC3**: the same cell, with the viewer asking 120 | **A relay answers at its cap, with `constrained`.** The agent logged `rc:fps asked … fps=120`, then `FR-119: frame rate decided … asked=Some(120) base_fps=30 want=30 refused=Some((120, Constrained))`. `rc:video-info` carried `"fps":30,"fps_asked":120`. The viewer read "30 fps (120 fps not granted: the connection is relayed, and a relay stays at its current rate)". The heartbeat stayed `target_fps=30 constrained=true`. **Wrong turn:** `fps_high` was first set as root, which reached only the root half. The hello advertised `fps-high`, so the picker showed, but the worker that runs the pump resolves its own config: the ask was logged and ignored, and `rc:video-info` carried no frame-rate fields. Set as the console user (`roomler config` as that user talks to the worker), with the worker restarted (7.5 s), it worked. The fix is FR-43's #2758, in 0.4.155. Also: picking 60 on this relay now reads "60 fps not granted" (open decision 5) |
+| 2026-10-23 | — | AC4 from the same viewer | **Not run: this viewer relays every session.** Both ends were on one LAN, and the overlay between them read direct at 5 ms. Yet ICE nominated the agent's host candidate against the browser's TURN relay candidate. An `RTCPeerConnection` with no ICE servers gathered zero candidates in that Chrome profile: its WebRTC IP-handling policy forbids non-proxied UDP. AC4 needs a viewer browser that allows direct UDP |
 
 ## 9. Related
 
