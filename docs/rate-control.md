@@ -249,7 +249,7 @@ Each DC video pump runs these, owned by `encode::governor::RateGovernor`
 | **Encode pressure + auto tier** (`encode::encode_pressure`) | avg encode ms | maxrate factor; long-edge cap when encode-bound | 2 s heartbeat |
 | **Goodput estimate** (`encode::goodput`, rc.453) | blocked-send goodput from the send task, folded **only when the validity gate accepts the window** (§ above) | the measured-ceiling clamp (stage 1), FR-59 P1/P6 and V5's `stall_is_ours` via `pipe_bps`, the pair memory's write-back | folded on the viewer window |
 
-Two rules keep them from stepping on each other:
+Three rules keep them from stepping on each other:
 
 - **Rebuild-bound bitrate applies are motion-deferred** (rc.445). NVENC
   reconfigures maxrate in place; QSV/AMF must rebuild the encoder — a
@@ -261,6 +261,12 @@ Two rules keep them from stepping on each other:
 - **A rebuild bumps the send epoch** (rc.445): the send task discards
   queued frames from the previous encoder, so the fresh IDR ships
   immediately instead of behind up to 450 ms of obsolete motion.
+- **A rate move is not a viewer limit** (FR-119 P2b-4). The viewer-rate cap
+  starts at the capture rate, which means no cap, and it follows the capture
+  rate when that moves: FR-119's 60 → 120 swap, or a relayed session going
+  direct. Before, it stayed at the old rate and read as a clamp, so every
+  other frame was dropped for the 3–5 s of the recovery climb. A cap below the
+  capture rate is the viewer's own number and stays where it is.
 
 Rebuilds also reuse the session's **proven encoder name** first instead of
 re-walking the vendor cascade (a failed tiered open of an absent vendor's
