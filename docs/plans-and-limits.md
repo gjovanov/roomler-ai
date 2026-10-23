@@ -138,9 +138,9 @@ flowchart LR
 | The job | `crates/modules/network/src/relay_allowance.rs:114` (`compute`), every 5 min (`:42`) | one pod (a Redis claim), only where plans are sold, publishes the networks of every org past its allowance, each with its rate, for 15 min (`:45`) |
 | The refresh | `crates/modules/network/src/relay_allowance.rs:253`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
 | The bucket on the API pods | `crates/modules/network/src/derp.rs:620` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:82`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
-| The bucket on the PoPs | `crates/derp-relay/src/main.rs:148`, the set arriving on `POST /stats` (`:519`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:232`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:169`). A PoP that holds no set throttles nothing |
+| The bucket on the PoPs | `crates/derp-relay/src/main.rs:148`, the set arriving on `POST /stats` (`:529`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:219`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:156`). A PoP that holds no set throttles nothing |
 | What the org sees | `crates/api/src/routes/cost.rs:501` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced` and `throttled` |
-| TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:327`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. Counted, never held: holding them is P4c |
+| TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. Counted, never held: holding them is P4c |
 
 ⚠️ **The allowance counts DERP bytes only.** TURN bytes have been attributed per org since
 2026-10-22 on the cluster's coturn, and P4b-2 brings in the PoPs' coturn, one PoP at a time.
@@ -189,7 +189,7 @@ subscription's item instead of starting a second one (`crates/services/src/strip
 Every org is created on `free`, on every server (`crates/services/src/dao/tenant.rs:284`).
 On the hosted service that is a plan; on a self-hosted server it only means nobody sold the
 org anything. `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the
-hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:314`); the
+hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:323`); the
 published self-host image and the compose build both leave it out. With it false,
 `roomler_core::quota` refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and
 the session cap (`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
