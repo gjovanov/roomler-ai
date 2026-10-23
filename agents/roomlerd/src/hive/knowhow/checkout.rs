@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P4-3b-1 — what a checkout says of itself, read as text, in the
-//! child, as the root's account: its remotes, its branch, its first commit.
+//! child, as the root's account: its remotes, its branch, its first commit,
+//! and (P4-3b-2) the services its manifests name ([`super::manifests`]).
 //!
 //! Never through git's porcelain, which reads a repository's config and may
 //! run what it names. Only the first commit asks git, and only a real git
@@ -66,7 +67,7 @@ pub(super) fn read(dir: &Path, git: Option<&Path>, deadline: Instant) -> Option<
         remotes,
         root_commit,
         branch,
-        services: Vec::new(),
+        services: super::manifests::services(dir, deadline),
     })
 }
 
