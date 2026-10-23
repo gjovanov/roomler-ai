@@ -584,10 +584,12 @@ enum Command {
         action: ServiceAction,
     },
     /// Check GitHub Releases for a newer version and — if found —
-    /// download + spawn the installer. The agent exits on successful
-    /// spawn so the installer can overwrite the binary; your service
-    /// hook re-launches it. Safe to run interactively. Pass
-    /// `--check-only` to print the verdict without touching disk.
+    /// download + spawn the installer, then exit so the installer can
+    /// overwrite the binary. On Linux the install completes before this
+    /// command exits, and a roomlerd service running beside it is asked to
+    /// restart onto the new binary, as `roomler restart` does (#2724).
+    /// Safe to run interactively. Pass `--check-only` to print the verdict
+    /// without touching disk.
     SelfUpdate {
         /// Don't download or spawn anything; just report whether an
         /// update is available.
@@ -5510,6 +5512,10 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
             ))),
         };
     }
+    // #2724 — the file this command runs, read BEFORE an install replaces it:
+    // afterwards `/proc/self/exe` names the replaced image (`… (deleted)`).
+    #[cfg(target_os = "linux")]
+    let exe_before_install = std::env::current_exe().ok();
     let outcome = updater::check_once().await;
     match outcome {
         updater::CheckOutcome::UpToDate { current, latest } => {
@@ -5557,6 +5563,15 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
                     "self-update: a running daemon owns the overlay's routes and DNS steer — leaving them to it"
                 );
             }
+            // #2724 — this process is not the service, so its exit relaunches
+            // nothing: a daemon running beside it kept its old image while the
+            // verdict read SucceededVerified. On Linux the install has
+            // COMPLETED by here (both paths are synchronous, see
+            // `post_install::should_wait_for_installer`), so ask it to restart.
+            #[cfg(target_os = "linux")]
+            if daemon_running {
+                restart_daemon_beside_self_update(exe_before_install.as_deref(), &latest).await;
+            }
             std::process::exit(0);
         }
         updater::CheckOutcome::Skipped(reason) => {
@@ -5566,6 +5581,41 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
         updater::CheckOutcome::Unreachable(reason) => {
             println!("Update check could not reach the release server: {reason}");
             Ok(())
+        }
+    }
+}
+
+/// #2724 — after `self-update` installed `latest`, restart the daemon running
+/// beside it onto the new binary, the way `roomler restart` does: through its
+/// supervisor, under the daemon's own refusals (`local_restart_enabled`, a
+/// recording, a restart in the last 30 s), then waiting for the new process to
+/// answer. Only once the installed file answers `--version` as `latest`
+/// ([`roomlerd::post_install::beside_daemon_after_install`]). Every other
+/// outcome says plainly what still runs and what applies the update.
+#[cfg(target_os = "linux")]
+async fn restart_daemon_beside_self_update(exe: Option<&std::path::Path>, latest: &str) {
+    use roomlerd::post_install::{BesideDaemon, beside_daemon_after_install};
+    let answer = exe
+        .and_then(|p| std::process::Command::new(p).arg("--version").output().ok())
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    let apply = "restart it through its service manager: `sudo systemctl restart roomlerd` (a \
+                 per-user install: `systemctl --user restart roomler`), or `roomler restart`";
+    match beside_daemon_after_install(answer.as_deref(), latest) {
+        BesideDaemon::Leave(why) => println!(
+            "The roomlerd service beside this command keeps the build it runs ({why}). To run \
+             {latest}, {apply}."
+        ),
+        BesideDaemon::Restart => {
+            println!(
+                "Installed {latest}. The roomlerd service beside this command still runs the \
+                 build it started with; asking it to restart onto {latest}. That ends the \
+                 sessions it serves, a `roomler ssh` session this command runs in among them."
+            );
+            let reason = format!("roomlerd self-update installed {latest}");
+            if let Err(e) = roomler_cli::localclient::restart(&reason, false, None).await {
+                println!("It still runs its previous build: {e:#}. To run {latest}, {apply}.");
+            }
         }
     }
 }

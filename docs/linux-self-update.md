@@ -118,6 +118,61 @@ The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
 Integrity is unchanged: the updater already verifies GitHub's `sha256:` `digest`
 per asset before install (`verify_sha256`), and that covers the tarball too.
 
+## `roomlerd self-update` beside a running service (#2724)
+
+Step 6 holds for the process that IS the service: the daemon's own updater exits,
+and systemd starts the new binary. An operator's `sudo roomlerd self-update` is
+another process, so its exit relaunches nothing. The service kept the image it
+started with while the verdict read `SucceededVerified`. Measured 2026-10-22 on
+the lab's Fedora Asahi box: still 0.4.151 after installing 0.4.153, and FR-117's
+companion sync had not run either. A root daemon has no P2b watch
+([below](#the-per-user-daemon-onto-the-new-binary-p2b)), so nothing noticed until
+its own updater's next check installed the release a second time.
+
+Since #2724, on Linux, the command restarts the daemon running beside it once its
+install has completed, the way `roomler restart` does
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/main.rs:5596`, called
+at `main.rs:5573`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as operator
+    participant C as roomlerd self-update
+    participant D as the roomlerd service (old image)
+    participant S as systemd
+    O->>C: sudo roomlerd self-update
+    C->>C: install the release (synchronous: the tarball, or the .deb/.rpm waited on)
+    C->>C: does the file it started as answer --version as that release?
+    C->>D: RestartDaemon, on root's own LocalAPI socket
+    D-->>C: DaemonRestarting (the supervisor, the exit code)
+    D->>S: graceful exit
+    S->>D: starts the new binary
+    C->>D: Status, until a different pid answers
+    C-->>O: back: pid N after X s
+```
+
+- **Only onto a proven binary.** The file the command was started as, read before
+  the install replaces it, must answer `--version` as the release just installed
+  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1002`).
+  Otherwise the service keeps its image: P2b's rule for the same question.
+- **The daemon's refusals stand** (FR-84 D3, `roomler restart`'s client,
+  `agents/roomler-cli/src/localclient.rs:1592`): `local_restart_enabled = false`,
+  a recording, a restart in the last 30 s, no supervisor it can prove. A refusal,
+  a daemon older than the verb, or a binary that did not answer each end in one
+  line: what still runs, and `sudo systemctl restart roomlerd` (a per-user install:
+  `systemctl --user restart roomler`).
+- ⚠️ **It ends what the daemon serves**, as every update's restart does:
+  remote-control sessions, tunnel flows, a `roomler ssh` session the command may
+  be running in. The command says so before it asks. Through Fleet RPC
+  (`roomler exec … -- roomlerd self-update`) the daemon relaying the command is
+  the one restarting, so the caller sees "no answer" although it ran.
+- **Not changed:** an admin's `apt upgrade` or `dnf upgrade` on a system install
+  still leaves the root daemon on its old image until something restarts it or
+  its own updater next fires. Taking P2b to root daemons is FR-96's separate
+  decision. Windows (the MSI stops and starts the service) and macOS (the pkg's
+  postinstall bootstraps the daemon again) never had the gap.
+
 ## `scripts/install.sh`
 
 First install currently only handles x86_64 + `.deb`. Teach it the same two
