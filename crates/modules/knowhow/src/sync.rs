@@ -408,6 +408,7 @@ async fn put(
                     facts,
                     status: STATUS_ACTIVE.into(),
                     source: SOURCE_SYNC.into(),
+                    device: None,
                     rev: 1,
                     created_by: None,
                     created_at: stamp.at,
@@ -626,6 +627,13 @@ impl FleetLifecycle for FleetSync {
     ) -> anyhow::Result<Option<ReleasedLease>> {
         if let Err(e) = removed(&self.state, tenant_id, agent_id).await {
             warn!(device = %agent_id, %e, "knowhow: a removed device's machine stays until the next reconcile");
+        }
+        // P4-3a-2 — and its scan part: its checkouts and listeners, with
+        // their links.
+        if self.state.scope.serves(tenant_id)
+            && let Err(e) = crate::intake::removed(&self.state, tenant_id, agent_id).await
+        {
+            warn!(device = %agent_id, %e, "knowhow: a removed device's scan part stays on the map");
         }
         Ok(None)
     }

@@ -24,11 +24,11 @@ use crate::fixtures::test_app::TestApp;
 use crate::knowhow_tests::{call, kpath};
 use crate::vault_lease_tests::enroll;
 
-type Ws =
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Knowhow on, and a sweep every second, so a test waits on it in seconds.
-async fn scan_app() -> TestApp {
+pub(crate) async fn scan_app() -> TestApp {
     TestApp::spawn_with_settings(|s| {
         s.modules.knowhow = true;
         s.knowhow.scan_sweep_secs = 1;
@@ -46,7 +46,7 @@ fn urlencode(s: &str) -> String {
 
 /// An agent socket's hello, advertising `rpc` and, when given, the
 /// `update_mode` a secondary enrollment says (`primary_org`).
-async fn hello(app: &TestApp, token: &str, rpc: &[&str], update_mode: &str) -> Ws {
+pub(crate) async fn hello(app: &TestApp, token: &str, rpc: &[&str], update_mode: &str) -> Ws {
     let url = format!("ws://{}/ws?token={}&role=agent", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("ws connect");
     let hello = json!({
@@ -70,7 +70,7 @@ async fn hello(app: &TestApp, token: &str, rpc: &[&str], update_mode: &str) -> W
 }
 
 /// The next message of type `want`, or `None` after `wait`.
-async fn recv_t(ws: &mut Ws, want: &str, wait: Duration) -> Option<Value> {
+pub(crate) async fn recv_t(ws: &mut Ws, want: &str, wait: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -92,7 +92,7 @@ async fn recv_t(ws: &mut Ws, want: &str, wait: Duration) -> Option<Value> {
 }
 
 /// The scan the device is sent next: its id.
-async fn scan_sent(ws: &mut Ws) -> String {
+pub(crate) async fn scan_sent(ws: &mut Ws) -> String {
     let frame = recv_t(ws, "rc:knowhow.scan", Duration::from_secs(10))
         .await
         .expect("the device is sent its scan");
@@ -104,7 +104,7 @@ async fn scan_sent(ws: &mut Ws) -> String {
     frame["scan_id"].as_str().unwrap().to_string()
 }
 
-async fn answer(ws: &mut Ws, body: Value) {
+pub(crate) async fn answer(ws: &mut Ws, body: Value) {
     let mut frame = body;
     frame["t"] = json!("rc:knowhow.scanned");
     ws.send(Message::Text(frame.to_string().into()))
@@ -113,7 +113,12 @@ async fn answer(ws: &mut Ws, body: Value) {
 }
 
 /// Ask `device` to scan, as `token`.
-async fn ask(app: &TestApp, t: &SeededTenant, token: &str, device: &str) -> (u16, Value) {
+pub(crate) async fn ask(
+    app: &TestApp,
+    t: &SeededTenant,
+    token: &str,
+    device: &str,
+) -> (u16, Value) {
     call(
         app.auth_post(&kpath(&t.tenant_id, "/scan"), token)
             .json(&json!({ "device": device })),
@@ -122,7 +127,7 @@ async fn ask(app: &TestApp, t: &SeededTenant, token: &str, device: &str) -> (u16
 }
 
 /// A device's scans, newest first.
-async fn scans(app: &TestApp, t: &SeededTenant, device: &str) -> Vec<Value> {
+pub(crate) async fn scans(app: &TestApp, t: &SeededTenant, device: &str) -> Vec<Value> {
     let (code, body) = call(app.auth_get(
         &kpath(&t.tenant_id, &format!("/scan?device={device}")),
         &t.admin.access_token,
@@ -133,7 +138,7 @@ async fn scans(app: &TestApp, t: &SeededTenant, device: &str) -> Vec<Value> {
 }
 
 /// Wait until the device's newest scan satisfies `ready`.
-async fn wait_scan(
+pub(crate) async fn wait_scan(
     app: &TestApp,
     t: &SeededTenant,
     device: &str,

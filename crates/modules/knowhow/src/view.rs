@@ -9,7 +9,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::dao::EntityNode;
-use crate::model::{Fact, KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, ScanCounts};
+use crate::model::{
+    Fact, KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, ScanCounts, ScanWritten,
+};
 
 pub(crate) fn rfc3339(t: DateTime) -> String {
     t.try_to_rfc3339_string().unwrap_or_default()
@@ -38,6 +40,8 @@ pub struct EntityView {
     pub facts: Vec<FactView>,
     pub status: String,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     pub rev: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
@@ -60,6 +64,7 @@ impl EntityView {
             facts: e.facts.iter().map(FactView::of).collect(),
             status: e.status.clone(),
             source: e.source.clone(),
+            device: e.device.map(|d| d.to_hex()),
             rev: e.rev,
             created_by: e.created_by.map(|u| u.to_hex()),
             created_at: rfc3339(e.created_at),
@@ -77,6 +82,8 @@ pub struct FactView {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     pub observed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,
@@ -90,6 +97,7 @@ impl FactView {
             value: f.value.clone().into_relaxed_extjson(),
             source: f.source.clone(),
             by: f.by.map(|u| u.to_hex()),
+            device: f.device.map(|d| d.to_hex()),
             observed_at: rfc3339(f.observed_at),
             verified_at: f.verified_at.map(rfc3339),
             status: f.status.clone(),
@@ -152,6 +160,8 @@ pub struct EdgeView {
     pub attrs: Value,
     pub status: String,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     pub rev: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
@@ -171,6 +181,7 @@ impl EdgeView {
             attrs: json(&e.attrs),
             status: e.status.clone(),
             source: e.source.clone(),
+            device: e.device.map(|d| d.to_hex()),
             rev: e.rev,
             created_by: e.created_by.map(|u| u.to_hex()),
             created_at: rfc3339(e.created_at),
@@ -210,6 +221,8 @@ pub struct HistoryView {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     pub at: String,
     pub set: Value,
 }
@@ -225,6 +238,7 @@ impl HistoryView {
             op: h.op.clone(),
             source: h.source.clone(),
             by: h.by.map(|u| u.to_hex()),
+            device: h.device.map(|d| d.to_hex()),
             at: rfc3339(h.at),
             set: json(&h.set),
         }
@@ -248,6 +262,9 @@ pub struct ScanView {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// P4-3a-2 — what its answer wrote onto the map, once written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written: Option<ScanWritten>,
 }
 
 impl ScanView {
@@ -263,6 +280,7 @@ impl ScanView {
             counts: s.counts,
             truncated: s.truncated,
             detail: s.detail.clone(),
+            written: s.written,
         }
     }
 }

@@ -12,11 +12,11 @@ sessions read it too, through their toolbelt.
 > [`roomler-hive-design.md`](roomler-hive-design.md) §9. **This page describes
 > what is built: P4-1, the module, its store and the people's routes; P4-2,
 > the fleet's devices mirrored as machines, with what the fleet and the
-> network say of each (§10); and P4-3a-1, a scan asked of a device,
-> delivered and answered (§11).** People and the sync fill the map so far. A
-> scan's findings on the map (P4-3a-2), the device's scanners (P4-3b), a
-> session's reads and proposals (P4-4), probes (P4-5) and `roomler_connect`
-> (P4-6) come with the steps that build them (§12).
+> network say of each (§10); and P4-3a, a scan asked of a device,
+> delivered, answered and written as the device's own part of the map
+> (§11).** People, the sync and scans fill the map. The device's scanners
+> (P4-3b), a session's reads and proposals (P4-4), probes (P4-5) and
+> `roomler_connect` (P4-6) come with the steps that build them (§12).
 
 ## 1. A map, not a gate
 
@@ -57,15 +57,16 @@ An **entity** is one thing the organization has
 | `env` | an environment, one lowercase word (`prod`, `staging`), or none |
 | `owner_id` | the member who answers for it, or none. A member of the organization, checked on every write |
 | `attrs` | a JSON object, up to 16 KiB stored: what describes it |
-| `facts` | what is known of it, each with its provenance (below), up to 64. A machine keeps 14 of them for the sync (§10) |
+| `facts` | what is known of it, each with its provenance (below), up to 64. A machine keeps 15 of them for the sync and its scans, a scan's own entity 9 for its scans (§10, §11.1) |
 | `status` | `active`; `archived` once tombstoned. `proposed` and `stale` come with P4-4 and P4-5 |
-| `source` | where it came from: `person` in P4-1; `sync`, `scan` and `session` later |
+| `source` | where it came from: `person`, `sync` (§10) or `scan` (§11.1); `session` later |
+| `device` | for a scan's own entity, the device whose scans made it, keep it and retire it (§11.1); absent otherwise |
 | `rev` | bumped by every write. A write names the rev it read (§3) |
 
 Kinds: `machine`, `repo`, `checkout`, `database`, `cluster`, `namespace`,
 `service`, `endpoint`, `bucket`, `cloud_account`, `domain`, `environment`,
 `team`, `doc`. An **edge** relates two entities, `from` `kind` `to`
-([`model.rs:174`](../crates/modules/knowhow/src/model.rs#L174)), its
+([`model.rs:181`](../crates/modules/knowhow/src/model.rs#L181)), its
 kind one of `runs_on`, `checked_out_at`, `deployed_to`, `depends_on`, `reads`,
 `writes`, `part_of`, `owned_by`, `documented_in`, `authenticates_with`,
 `reachable_via`, with attributes of its own (up to 4 KiB). No rule pairs an
@@ -81,19 +82,19 @@ flowchart LR
 ```
 
 A **fact** is a path, a value and where the value came from
-([`model.rs:155`](../crates/modules/knowhow/src/model.rs#L155)):
+([`model.rs:159`](../crates/modules/knowhow/src/model.rs#L159)):
 
 | Field | Meaning |
 |---|---|
 | `path` | `[a-z0-9]` then `[a-z0-9._-]`: `port`, `tls.fingerprint`. Stored beside the value, never as a key in the document, so a `.` is safe |
 | `value` | any JSON but null, up to 2 KiB |
-| `source`, `by` | `person` and who, in P4-1 |
+| `source`, `by`, `device` | `person` and who; `sync`, with nobody; or `scan` and its device (§11.1) |
 | `observed_at`, `verified_at` | when it was said; when a probe last confirmed it (P4-5) |
 | `status` | `active` for a person's. A session's will be `proposed` until a probe or a person confirms it (decision 39) |
 
 > [!IMPORTANT]
 > **A person's change to one fact never restamps another**
-> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L495)). An
+> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L536)). An
 > update names facts by path: a value sets that fact, as the caller's; null
 > removes it; a fact it does not name keeps who said it, from where and when,
 > and so does one set to the value it already holds while active. Restamping
@@ -120,7 +121,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Four collections, per organization
-([`lib.rs:210`](../crates/modules/knowhow/src/lib.rs#L210)):
+([`lib.rs:211`](../crates/modules/knowhow/src/lib.rs#L211)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -135,7 +136,7 @@ An organization's map holds at most 10,000 live entities and 50,000 live links
 either is **409**.
 
 **A write is a compare-and-set on `rev`**
-([`dao.rs:188`](../crates/modules/knowhow/src/dao.rs#L188)): its filter
+([`dao.rs:207`](../crates/modules/knowhow/src/dao.rs#L207)): its filter
 names the rev the writer read, its update `$inc`s it, and the row after is
 returned. A writer that lost the race matches nothing and is told so, rather
 than overwriting what it never saw.
@@ -155,7 +156,7 @@ sequenceDiagram
 ```
 
 ⚠️ **The history is appended after the write it records, never before**
-([`write.rs:87`](../crates/modules/knowhow/src/write.rs#L87)).
+([`write.rs:113`](../crates/modules/knowhow/src/write.rs#L113)).
 Without a transaction, a row written first could name a write that then lost
 its compare-and-set. A row appended after can only go missing: the write
 stands, the failure is logged, and the entity still names who changed it last
@@ -164,7 +165,7 @@ stands, the failure is logged, and the entity still names who changed it last
 **Archiving an entity** tombstones it at the rev it was read, which frees its
 key, and archives every live link to it, each in the history with the cause
 `entity_archived`
-([`archive_links`](../crates/modules/knowhow/src/write.rs#L123)).
+([`archive_links`](../crates/modules/knowhow/src/write.rs#L149)).
 Nothing links to an archived entity: a link's ends are resolved live, within
 the organization, before it is made. A link the archive raced is invisible,
 because a card and a neighbourhood show only the links whose other end is live.
@@ -179,7 +180,7 @@ because a card and a neighbourhood show only the links whose other end is live.
 `knowhow.tenants` reads like `vault.tenants`: empty or `*` is every
 organization, and an entry that is not an organization id matches nothing
 ([`scope.rs`](../crates/modules/knowhow/src/scope.rs)). Every route checks, in
-this order ([`routes.rs:73`](../crates/modules/knowhow/src/routes.rs#L73)):
+this order ([`routes.rs:75`](../crates/modules/knowhow/src/routes.rs#L75)):
 
 1. **membership**: someone outside the organization is told `403 not_a_member`,
    and so learns nothing about whether its map is kept;
@@ -226,8 +227,8 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | GET | `/map/{id}` | its neighbourhood (§7): `?depth=` 1 (default) or 2, `?kind=`, `?env=` → `{center, entities, edges, truncated}` | `KNOWHOW_VIEW` |
 | GET | `/history` | the writes, newest first; `?entity=` one entity's, its links' included, archived or not; `?limit=` 1–200 | `KNOWHOW_VIEW` |
 | POST | `/entity` | `{kind, key, name, env?, owner_id?, attrs?, facts?: {path: value}}` → **201**. **409** when a live entity holds the kind and key; **400** for `machine`, a kind or a spelling outside the rules, a null fact, an owner who is no member; **422** for an unknown field | `KNOWHOW_EDIT` |
-| PATCH | `/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?: {path: value or null}}`: `""` clears `env` and `owner_id`; `attrs` is replaced whole; `facts` is merged by path (§2). **409** at a rev already gone; a change that changes nothing writes nothing and answers the entity as it is. `kind` and `key` are unknown fields (**422**). A machine's name, owner and synced facts are the fleet's (**400**, §10), and a person's own facts on a machine stop at 50 (**400**, §10) | `KNOWHOW_EDIT` |
-| DELETE | `/entity/{id}?rev=…` | archive it and its links: `{archived, links_archived}`. **409** at a rev already gone, **404** once archived; **400** for a machine, which leaves when its device does (§10) | `KNOWHOW_EDIT` |
+| PATCH | `/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?: {path: value or null}}`: `""` clears `env` and `owner_id`; `attrs` is replaced whole; `facts` is merged by path (§2). **409** at a rev already gone; a change that changes nothing writes nothing and answers the entity as it is. `kind` and `key` are unknown fields (**422**). A machine's name, owner and synced facts are the fleet's (**400**, §10), a scan entity's name, owner and scanned facts and any fact a scan said are its device's (**400**, §11.1), and a person's own facts stop at 49 on a machine and 55 on a scan entity (**400**) | `KNOWHOW_EDIT` |
+| DELETE | `/entity/{id}?rev=…` | archive it and its links: `{archived, links_archived}`. **409** at a rev already gone, **404** once archived; **400** for a machine, which leaves when its device does (§10), and for a scan entity, which leaves when its device's scans no longer report it (§11.1) | `KNOWHOW_EDIT` |
 | POST | `/edge` | `{from, to, kind, attrs?}`: two live entities of the organization → **201**. **409** when they are already linked by that kind; **400** for a link to itself | `KNOWHOW_EDIT` |
 | PATCH | `/edge/{id}` | `{rev, attrs}`: its attributes, replaced. Its ends and kind never change: a different link is archived and made again | `KNOWHOW_EDIT` |
 | DELETE | `/edge/{id}?rev=…` | archive the link | `KNOWHOW_EDIT` |
@@ -237,9 +238,9 @@ All under `/api/tenant/{tenant_id}/knowhow`
 ## 7. A neighbourhood
 
 The map route walks the links both ways, one step at a time
-([`routes.rs:431`](../crates/modules/knowhow/src/routes.rs#L431)). Each step
+([`routes.rs:460`](../crates/modules/knowhow/src/routes.rs#L460)). Each step
 is one indexed read of the live links from or to the step's entities, at most
-500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L246)), each way on
+500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L265)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
 The entities they lead to are read live, and filtered by `kind` and `env`; the
 centre is always shown. A filtered entity is not walked through. A link is
@@ -260,7 +261,7 @@ stops there.
 
 ## 8. History
 
-One row per write ([`model.rs:204`](../crates/modules/knowhow/src/model.rs#L204)):
+One row per write ([`model.rs:214`](../crates/modules/knowhow/src/model.rs#L214)):
 
 | Field | Meaning |
 |---|---|
@@ -277,8 +278,8 @@ years after it was written, so it has no TTL.
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
-| `knowhow_entities` | entity: kind, key, name, env, owner, attributes, facts, status, source, rev | unique `(tenant_id, kind, key)` over live rows (partial on `deleted_at: {$type: "null"}`); `(tenant_id, deleted_at, kind, key)` | tombstoned, kept |
-| `knowhow_edges` | link: from, to, kind, attributes, status, source, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)` | tombstoned, kept |
+| `knowhow_entities` | entity: kind, key, name, env, owner, attributes, facts, status, source, device, rev | unique `(tenant_id, kind, key)` over live rows (partial on `deleted_at: {$type: "null"}`); `(tenant_id, deleted_at, kind, key)`; `(tenant_id, device, deleted_at)`, a device's scan part | tombstoned, kept |
+| `knowhow_edges` | link: from, to, kind, attributes, status, source, device, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`; `(tenant_id, device, deleted_at)` | tombstoned, kept |
 | `knowhow_history` | write | `(tenant_id, at desc, _id desc)`, `(tenant_id, entity_ids, at desc, _id desc)` | kept, no TTL |
 | `knowhow_scans` | scan asked of a device: who asked and when, its state, when delivered and answered, its counts and detail (§11) | unique `(tenant_id, device_id)` over pending rows (partial on `pending: true`); `(tenant_id, device_id, requested_at desc)`; `(device_id, state)` | 90 days (TTL on `requested_at`) |
 
@@ -339,12 +340,13 @@ edge (FR-69's rule 5).
 > its owner or a synced fact is refused **400**, because the next sync would undo it. So is
 > archiving a machine, which leaves the map when its device is removed. A person may give a
 > machine an environment, attributes and facts of their own, and every sync leaves those as
-> they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L182)).
+> they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L184)).
 
 > [!NOTE]
 > **A machine keeps room for the sync's facts.** An entity holds at most 64 facts, and the
-> sync owns 14 of a machine's paths, so a person's own facts on a machine stop at 50
-> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L214)), and no sync
+> sync owns 14 of a machine's paths and its scans one more (§11.1), so a person's own facts on
+> a machine stop at 49
+> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L247)), and no sync
 > takes a machine past 64. An edit that adds none of a person's still passes, so a machine
 > that a newly synced path left past its room can still be tidied.
 
@@ -427,8 +429,8 @@ and the tunnel hub knows only the flows live on its pod. They come with the devi
 A scan is the server's request and the device's answer (decision 38): a person asks a device
 to scan, and the device reads only the roots its owner lists, each as the account that owns it
 ([`scan.rs`](../crates/modules/knowhow/src/scan.rs)). P4-3a-1 builds the request, its
-delivery and the answer's record. Writing what a scan found onto the map is P4-3a-2's
-(decision 42), and the device's half (the roots, the scanners) is P4-3b's. The design, with
+delivery and the answer's record; P4-3a-2 writes what a scan found onto the map (§11.1,
+decision 42). The device's half (the roots, the scanners) is P4-3b's. The design, with
 decisions 41–44, is the FR-90 spec's §3e "P4-3, scans, as designed".
 
 ```mermaid
@@ -448,7 +450,7 @@ sequenceDiagram
     H->>M: answered, once, by the device it was sent to
 ```
 
-**Who asks, and which devices** ([`request`](../crates/modules/knowhow/src/scan.rs#L443)).
+**Who asks, and which devices** ([`request`](../crates/modules/knowhow/src/scan.rs#L483)).
 A person with `KNOWHOW_EDIT` (decision 41) asks for a live device of the organization: **202**
 with the scan, or with the device's pending scan when it has one, since a scan is never doubled
 (a partial unique index on `pending`). A device is refused **409** up front
@@ -504,18 +506,88 @@ know: skipped, so a newer device's answer is never lost whole) and `refused`. An
 > string is checked for a credential's shape
 > ([`holds_credential`](../crates/remote_control/src/knowhow.rs#L334)): a URL's
 > password, a token by a prefix it knows, an AWS access key, a PEM block, a JWT. A finding that
-> holds one is refused whole, and a `detail` that holds one is withheld. Nothing of a finding is
-> stored in P4-3a-1, only its count.
+> holds one is refused whole, and a `detail` that holds one is withheld. Only the findings
+> read are written (§11.1); what was refused is counted, never stored.
 
 | Setting | Effect |
 |---|---|
 | `knowhow.scan_sweep_secs` (`ROOMLER__KNOWHOW__SCAN_SWEEP_SECS`) | how often each pod looks for scans asked of the devices connected to it, in seconds; 0 or absent: 5 |
 
+### 11.1 What a scan writes (P4-3a-2)
+
+Decision 42: what lives on its device, and nothing else
+([`intake.rs`](../crates/modules/knowhow/src/intake.rs)). Its findings are written once its
+answer has taken, so a scan is written once, and what it wrote is stamped on its record
+(`written`: checkouts, endpoints, repos and clusters made, links made, what it retired, and
+whether the map was full).
+
+```mermaid
+flowchart LR
+    subgraph own["the device's own: source scan, its device named"]
+        C["checkout (node id)/(16 hex of the path)"]
+        E["endpoint (node id):port/protocol"]
+        F["its machine's tunnel.declared"]
+    end
+    subgraph shared["shared: made bare, never changed, no device's"]
+        R["repo github.com/acme/api"]
+        K["cluster k8s.example.com:6443"]
+    end
+    M["machine (the sync's)"]
+    C -->|checked_out_at| M
+    C -->|"part_of (the remote's name)"| R
+    E -->|runs_on| M
+    K -->|"reachable_via (its contexts)"| M
+    style own fill:#f3e8fd
+```
+
+| A finding | Writes | Keyed |
+|---|---|---|
+| a checkout | a `checkout` named `<last segment> on <machine>`, owned by the device's owner: `path`, `remotes`, `root_commit`, `branch`, `services`; `checked_out_at` its machine; `part_of` the repository of each remote, the remote's name as the link's attribute | `<node id>/<16 hex of the path's SHA-256>` ([`checkout_key`](../crates/modules/knowhow/src/intake.rs#L81)), since a path is not a key (case, spaces, separators) |
+| a listener | an `endpoint`: `port`, `protocol`, `address`, `process`; `runs_on` its machine | `<node id>:<port>/<protocol>` |
+| a kube context | the `cluster` its server names, made bare; `reachable_via` its machine, the device's contexts for it (name, namespace, CA) as the link's attributes | its server's `host:port` ([`cluster_key`](../crates/modules/knowhow/src/intake.rs#L125)), the scheme's port when it names none |
+| a declared tunnel route | its machine's `tunnel.declared`, a list | — |
+| a remote | the `repo` it names, made bare | its host and path, lowercase, with no scheme, user, port or `.git` ([`repo_key`](../crates/modules/knowhow/src/intake.rs#L95)). A local path names none |
+
+Every fact and link a scan writes says so: source `scan`, and the device (`device`), with no
+person (`by`), as do its history rows. A shared repository or cluster is a scan's (source
+`scan`, its history naming the device that made it), but no device's: `device` is empty.
+
+> [!IMPORTANT]
+> **A scan is its device's claim about itself.** It writes only entities keyed by its own node
+> id and its own machine's scan fact. It makes a repository or a cluster only bare and never
+> changes one another source made, including another device's scan. A key a person already
+> holds is left as it is. So the worst a lying device does is describe itself falsely, and name
+> a repository or a cluster that does not exist.
+
+**A later scan replaces its device's part**
+([`retire`](../crates/modules/knowhow/src/intake.rs#L650)):
+
+| The answer | Archives |
+|---|---|
+| `done`, complete | what the device's earlier scans wrote and this one no longer reports: its own entities with their links, then its own links. No routes declared clears `tunnel.declared` |
+| `done`, truncated | nothing: what it left out is unknown, not gone |
+| `no_roots` | all of the device's part |
+| `failed` | nothing |
+
+Never a shared entity: no device owns one. A device removed from the fleet takes its own
+entities with its machine.
+
+> [!NOTE]
+> **What a scan says is the device's.** A person's change to a scan entity's name, owner or one
+> of its scan's facts, to a machine's `tunnel.declared`, or to any fact a scan said, is refused
+> **400** (`its device's scan says this of a checkout: path — change the device instead`), and
+> so is archiving a scan entity: it leaves when its device's scans no longer report it. A person
+> may give it an environment, attributes and facts of their own, and every scan leaves those as
+> they are. A shared repository or cluster is a person's to describe; no scan changes it again.
+> A machine now keeps room for 15 facts (the sync's 14 and its scans' `tunnel.declared`), so a
+> person's own stop at 49; a scan entity keeps room for its scans' 9, so a person's own stop at
+> 55.
+
 ## 12. What comes next
 
 | Step | Builds |
 |---|---|
-| P4-3a-2, P4-3b | the rest of device scans (§11 built the request, its delivery and the answer's record): what a scan writes as its device's (decision 42), so its checkouts, listeners and declared tunnel routes become its own part of the map and the repositories and clusters they reach are made bare; and the device's half, the roots its owner lists in `knowhow_scan_roots` (decision 38), each read as the account that owns it, for metadata only |
+| P4-3b | the device's half of scans (§11 built the server's): the roots its owner lists in `knowhow_scan_roots` (decision 38), each read as the account that owns it, for metadata only; the `knowhow-scan` verb advertised, and a kube context's token offered to the vault on the device, never sent |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |

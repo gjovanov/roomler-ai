@@ -39,6 +39,7 @@ use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique_partial};
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Job, Module, TenantCtx};
 
 pub mod dao;
+pub mod intake;
 pub mod model;
 pub mod routes;
 pub mod scan;
@@ -222,6 +223,9 @@ impl Module for KnowhowState {
                     ),
                     // A search and a count: the live, by kind and key.
                     index(bson::doc! { "tenant_id": 1, "deleted_at": 1, "kind": 1, "key": 1 }),
+                    // P4-3a-2 — a device's scan part: what its next complete
+                    // scan compares with what it found.
+                    index(bson::doc! { "tenant_id": 1, "device": 1, "deleted_at": 1 }),
                 ],
             },
             IndexSet {
@@ -237,6 +241,8 @@ impl Module for KnowhowState {
                     // entity, and the links to it.
                     index(bson::doc! { "tenant_id": 1, "from": 1, "deleted_at": 1 }),
                     index(bson::doc! { "tenant_id": 1, "to": 1, "deleted_at": 1 }),
+                    // P4-3a-2 — a device's scan links, as its entities.
+                    index(bson::doc! { "tenant_id": 1, "device": 1, "deleted_at": 1 }),
                 ],
             },
             // Every write, kept as long as the map: a fact's provenance may

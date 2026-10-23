@@ -277,11 +277,7 @@ pub fn spawn_sweeper(state: KnowhowState, secs: u64) {
 /// and its detail clamped. Only a `done` answer's findings are read, and an
 /// answer past its bounds is recorded as failed. Pure, so a test reads it
 /// without a socket.
-pub fn read_answer(
-    outcome: ScanOutcome,
-    detail: Option<String>,
-    findings: &[Value],
-) -> (ScanCounts, ScanOutcome, Option<String>) {
+pub fn read_answer(outcome: ScanOutcome, detail: Option<String>, findings: &[Value]) -> Answer {
     let detail = detail.map(|d| {
         if holds_credential(&d) {
             "(withheld: it held a credential's shape)".to_string()
@@ -292,31 +288,51 @@ pub fn read_answer(
                 .collect()
         }
     });
+    let mut answer = Answer {
+        counts: ScanCounts::default(),
+        outcome,
+        detail,
+        findings: Vec::new(),
+    };
     if outcome != ScanOutcome::Done {
-        return (ScanCounts::default(), outcome, detail);
+        return answer;
     }
     let bytes = serde_json::to_vec(findings).map_or(usize::MAX, |v| v.len());
     if findings.len() > MAX_FINDINGS || bytes > MAX_SCAN_BYTES {
-        return (
-            ScanCounts::default(),
-            ScanOutcome::Failed,
-            Some(format!(
-                "the answer held more than {MAX_FINDINGS} findings or {MAX_SCAN_BYTES} bytes"
-            )),
-        );
+        answer.outcome = ScanOutcome::Failed;
+        answer.detail = Some(format!(
+            "the answer held more than {MAX_FINDINGS} findings or {MAX_SCAN_BYTES} bytes"
+        ));
+        return answer;
     }
-    let mut counts = ScanCounts::default();
     for f in findings {
+        let counts = &mut answer.counts;
         match Finding::read(f) {
-            Ok(Some(Finding::Checkout(_))) => counts.checkouts += 1,
-            Ok(Some(Finding::Context(_))) => counts.contexts += 1,
-            Ok(Some(Finding::Listener(_))) => counts.listeners += 1,
-            Ok(Some(Finding::TunnelRoute(_))) => counts.tunnel_routes += 1,
+            Ok(Some(finding)) => {
+                match &finding {
+                    Finding::Checkout(_) => counts.checkouts += 1,
+                    Finding::Context(_) => counts.contexts += 1,
+                    Finding::Listener(_) => counts.listeners += 1,
+                    Finding::TunnelRoute(_) => counts.tunnel_routes += 1,
+                }
+                answer.findings.push(finding);
+            }
             Ok(None) => counts.unknown += 1,
             Err(_) => counts.refused += 1,
         }
     }
-    (counts, outcome, detail)
+    answer
+}
+
+/// An answer, read ([`read_answer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub counts: ScanCounts,
+    pub outcome: ScanOutcome,
+    pub detail: Option<String>,
+    /// What a `done` answer found, each finding read and checked: what the
+    /// intake writes (P4-3a-2).
+    pub findings: Vec<Finding>,
 }
 
 /// Record a device's answer: once, and only for a scan this device was sent.
@@ -329,13 +345,13 @@ async fn answered(
     truncated: bool,
     findings: Vec<Value>,
 ) {
-    let (counts, outcome, detail) = read_answer(outcome, detail, &findings);
-    let word = match outcome {
+    let answer = read_answer(outcome, detail, &findings);
+    let word = match answer.outcome {
         ScanOutcome::Done => SCAN_DONE,
         ScanOutcome::NoRoots => SCAN_NO_ROOTS,
         ScanOutcome::Failed => SCAN_FAILED,
     };
-    let counts_bson = match bson::to_bson(&counts) {
+    let counts_bson = match bson::to_bson(&answer.counts) {
         Ok(b) => b,
         Err(e) => {
             warn!(scan = %scan_id, %e, "knowhow: an answer's counts were not written");
@@ -348,8 +364,8 @@ async fn answered(
         "counts": counts_bson,
         "truncated": truncated,
     };
-    if let Some(d) = detail {
-        set.insert("detail", d);
+    if let Some(d) = &answer.detail {
+        set.insert("detail", d.as_str());
     }
     match state
         .scans
@@ -357,15 +373,39 @@ async fn answered(
         .await
     {
         Ok(Some(_)) => info!(
-            scan = %scan_id, device = %ctx.agent_id, outcome = word, ?counts,
+            scan = %scan_id, device = %ctx.agent_id, outcome = word, counts = ?answer.counts,
             "knowhow: a scan was answered"
         ),
-        Ok(None) => warn!(
-            scan = %scan_id, device = %ctx.agent_id,
-            "knowhow: an answer for a scan this device was not sent, or one answered already, dropped"
-        ),
+        Ok(None) => {
+            warn!(
+                scan = %scan_id, device = %ctx.agent_id,
+                "knowhow: an answer for a scan this device was not sent, or one answered already, dropped"
+            );
+            return;
+        }
         Err(e) => {
-            warn!(scan = %scan_id, %e, "knowhow: an answer was not recorded; the scan expires unanswered")
+            warn!(scan = %scan_id, %e, "knowhow: an answer was not recorded; the scan expires unanswered");
+            return;
+        }
+    }
+    // P4-3a-2 — the map, once the answer took: one intake per scan. A
+    // device that lists no root has no part of the map; a failed scan
+    // changes nothing, and a truncated one archives nothing.
+    let found: &[Finding] = match answer.outcome {
+        ScanOutcome::Done => &answer.findings,
+        ScanOutcome::NoRoots => &[],
+        ScanOutcome::Failed => return,
+    };
+    let complete = !truncated || answer.outcome == ScanOutcome::NoRoots;
+    match crate::intake::write(state, ctx.tenant_id, ctx.agent_id, found, complete).await {
+        Ok(written) => {
+            info!(scan = %scan_id, device = %ctx.agent_id, ?written, "knowhow: a scan's findings were written");
+            if let Err(e) = state.scans.written(scan_id, &written).await {
+                warn!(scan = %scan_id, %e, "knowhow: what a scan wrote was not recorded on it");
+            }
+        }
+        Err(e) => {
+            warn!(scan = %scan_id, %e, "knowhow: a scan's findings were not written; the next scan tries again")
         }
     }
 }
@@ -469,6 +509,7 @@ pub async fn request(
         counts: ScanCounts::default(),
         truncated: false,
         detail: None,
+        written: None,
     };
     let id = match state.scans.create(&scan).await {
         Ok(id) => id,
@@ -539,11 +580,11 @@ mod tests {
             json!({"kind": "bucket", "name": "logs"}),
             json!("not a finding"),
         ];
-        let (c, outcome, detail) = read_answer(ScanOutcome::Done, None, &findings);
-        assert_eq!(outcome, ScanOutcome::Done);
-        assert_eq!(detail, None);
+        let a = read_answer(ScanOutcome::Done, None, &findings);
+        assert_eq!(a.outcome, ScanOutcome::Done);
+        assert_eq!(a.detail, None);
         assert_eq!(
-            c,
+            a.counts,
             ScanCounts {
                 checkouts: 2,
                 contexts: 1,
@@ -553,6 +594,12 @@ mod tests {
                 refused: 2,
             }
         );
+        let kinds: Vec<&str> = a.findings.iter().map(Finding::kind).collect();
+        assert_eq!(
+            kinds,
+            ["checkout", "checkout", "context", "listener"],
+            "what the intake writes: the findings read, in order"
+        );
     }
 
     /// Only a done answer's findings are read: a device that lists no root,
@@ -560,8 +607,9 @@ mod tests {
     #[test]
     fn only_a_done_answers_findings_are_read() {
         for outcome in [ScanOutcome::NoRoots, ScanOutcome::Failed] {
-            let (c, o, _) = read_answer(outcome, None, &[checkout("/src/a")]);
-            assert_eq!((c, o), (ScanCounts::default(), outcome));
+            let a = read_answer(outcome, None, &[checkout("/src/a")]);
+            assert_eq!((a.counts, a.outcome), (ScanCounts::default(), outcome));
+            assert!(a.findings.is_empty());
         }
     }
 
@@ -569,12 +617,16 @@ mod tests {
     #[test]
     fn an_answer_past_its_bounds_failed() {
         let many = vec![checkout("/src/a"); MAX_FINDINGS + 1];
-        let (c, o, detail) = read_answer(ScanOutcome::Done, None, &many);
-        assert_eq!((c, o), (ScanCounts::default(), ScanOutcome::Failed));
-        assert!(detail.unwrap().contains("findings"));
+        let a = read_answer(ScanOutcome::Done, None, &many);
+        assert_eq!(
+            (a.counts, a.outcome),
+            (ScanCounts::default(), ScanOutcome::Failed)
+        );
+        assert!(a.findings.is_empty());
+        assert!(a.detail.unwrap().contains("findings"));
         let big = vec![checkout(&"/".repeat(4_000)); 300];
         assert_eq!(
-            read_answer(ScanOutcome::Done, None, &big).1,
+            read_answer(ScanOutcome::Done, None, &big).outcome,
             ScanOutcome::Failed,
             "past {MAX_SCAN_BYTES} bytes"
         );
@@ -585,12 +637,13 @@ mod tests {
     #[test]
     fn a_detail_is_clamped_and_never_a_credential() {
         let long = format!("git said\u{7} {}", "x".repeat(MAX_DETAIL * 2));
-        let (_, _, d) = read_answer(ScanOutcome::Failed, Some(long), &[]);
-        let d = d.unwrap();
+        let d = read_answer(ScanOutcome::Failed, Some(long), &[])
+            .detail
+            .unwrap();
         assert_eq!(d.chars().count(), MAX_DETAIL);
         assert!(!d.contains('\u{7}'));
         let leak = format!("fetch https://dev:{}@git.example.com failed", "hunter2");
-        let (_, _, d) = read_answer(ScanOutcome::Failed, Some(leak), &[]);
+        let d = read_answer(ScanOutcome::Failed, Some(leak), &[]).detail;
         assert_eq!(d.unwrap(), "(withheld: it held a credential's shape)");
     }
 }
