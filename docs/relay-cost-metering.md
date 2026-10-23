@@ -111,10 +111,52 @@ ticket's public key and no Mongo at all. It counts bytes per `network` in an in-
 map and exposes a `per_network` object in the `/stats` payload that `relay_load.rs`
 already polls every 30 s; the poller resolves network → tenant and writes the buckets.
 
-> ⚠️ These are **cumulative counters, so the poller diffs successive samples** — the same
-> shape `machine_series_pipeline` already uses for agent counters. A PoP restart resets
-> mid-bucket, so that bucket **under-reports rather than going negative**, the identical
-> trade the host-total `net_*_bytes` columns already make. Do not invent a different one.
+> ⚠️ These are **cumulative counters**, and **every API pod polls every PoP**. Until #2763
+> each pod diffed a counter against its *own* last sample, so every byte a PoP relayed was
+> booked **once per pod**: twice on the two-pod deployment. The diff is now against a
+> baseline **both pods share** in Redis, one per (region, endpoint, network), and one Lua
+> compare-and-advance decides which pod books the growth (`book_network_bytes`,
+> `crates/core/src/relay_load.rs:495`; `RedisPubSub::advance_baseline`,
+> `crates/core/src/ws/redis_pubsub.rs:313`).
+
+| The sample, against the shared baseline | Books | The baseline |
+|---|---|---|
+| same `boot`, higher | the difference | advances to it |
+| same `boot`, equal or lower: another pod's sample got there first | nothing | kept, its TTL refreshed |
+| another `boot`: the PoP restarted, or a late sample from the old process | nothing | restarts at this sample |
+| none: the first sample, or the PoP was unreachable for 7 days | nothing | starts at this sample |
+
+`boot` names the PoP process in `/stats` (`crates/derp-relay/src/main.rs:283`, the same id
+`turn_usage.boot` carries), and it is what tells a restart from a stale sample. Every row
+but the first **under-reports and never double-counts**, the same trade the host-total
+`net_*_bytes` columns make: a missing byte is recoverable, an invented one is a refund.
+
+```mermaid
+sequenceDiagram
+    participant A as API pod A
+    participant B as API pod B
+    participant P as PoP /stats
+    participant R as Redis baseline
+    A->>P: GET
+    P-->>A: boot b1, network n at 60,000
+    A->>R: advance to b1 at 60,000
+    R-->>A: 50,000 (the baseline was b1 at 10,000)
+    Note over A: books 50,000 to n's tenant
+    B->>P: GET
+    P-->>B: boot b1, network n at 60,000
+    B->>R: advance to b1 at 60,000
+    R-->>B: 0 (already there)
+    Note over B: books nothing
+```
+
+> ⚠️ **A stats URL must name ONE process.** Behind a load balancer the boots alternate,
+> every sample starts a new baseline, and nothing is ever booked.
+>
+> ⚠️ **Nothing is booked without Redis, or from a `derp-relay` that reports no `boot`**
+> (one from before #2763, warned once per endpoint). Roll the PoPs before the API.
+> Proof: `a_pops_network_bytes_are_booked_once_across_pods`
+> (`crates/tests/src/usage_ledger_tests.rs:183`): two pods and one fake PoP book 50,000
+> once, where each pod used to book it.
 
 > ⚠️ On the fleet as it stands, **DERP rides the API pods, not the regional PoPs** — all
 > five regions measured ≈0 traffic while the ledger moved 1.77 GB. A PoP-vs-ledger

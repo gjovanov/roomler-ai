@@ -94,12 +94,6 @@ struct Agg {
     coturn_sessions: f64,
     derp_registrations: f64,
     uptime_s: f64,
-    /// FR-20 B — the PoP's CUMULATIVE relayed bytes per overlay network.
-    /// Volume, so summed across a region's endpoints like the `net_*` pair.
-    /// Absent from the payload ⇒ this PoP predates the field and the region is
-    /// simply **not monitored** — which is why it stays an empty map rather
-    /// than a zero: a zero would be indistinguishable from "relayed nothing".
-    per_network: std::collections::HashMap<String, u64>,
 }
 
 impl Agg {
@@ -135,13 +129,6 @@ impl Agg {
         self.allocations += body["coturn"]["allocations"].as_f64().unwrap_or(0.0);
         self.coturn_sessions += body["coturn"]["sessions"].as_f64().unwrap_or(0.0);
         self.derp_registrations += f("derp_registrations");
-        if let Some(map) = body["per_network"].as_object() {
-            for (network, v) in map {
-                if let Some(n) = v.as_u64() {
-                    *self.per_network.entry(network.clone()).or_insert(0) += n;
-                }
-            }
-        }
     }
 }
 
@@ -442,6 +429,134 @@ impl TurnUsagePull {
     }
 }
 
+/// How long a PoP's per-network baseline outlives its last sample: long, so a
+/// PoP the API cannot reach for days still books everything it relayed
+/// meanwhile, by its unchanged process's counter.
+const NETWORK_BASELINE_TTL_SECS: u64 = 7 * 86_400;
+
+/// FR-20 B, exact (#2763) — what books a PoP's relayed bytes to the network's
+/// tenant, once across pods. Every pod polls every PoP, and a cumulative
+/// counter that each pod diffs against its own last sample is booked once PER
+/// POD. So the baseline lives in Redis, one per (region, endpoint, network),
+/// and only the pod whose sample advances it books the difference
+/// (`RedisPubSub::advance_baseline`).
+///
+/// ⚠ A stats URL must name ONE process. Behind a load balancer the boots
+/// alternate, every sample starts a new baseline, and nothing is booked.
+pub struct PopNetworkBytes {
+    /// Resolves an overlay network id to its tenant.
+    networks: Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>,
+    redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
+    db_name: String,
+    /// Endpoints already warned about for reporting bytes with no `boot`.
+    warned: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl PopNetworkBytes {
+    pub fn new(
+        networks: Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>,
+        redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
+        db_name: &str,
+    ) -> Self {
+        Self {
+            networks,
+            redis,
+            db_name: db_name.to_string(),
+            warned: Default::default(),
+        }
+    }
+
+    fn key(&self, region: &str, url: &str, network: &str) -> String {
+        format!(
+            "roomler:pop_net_baseline:{}:{region}:{url}:{network}",
+            self.db_name
+        )
+    }
+}
+
+/// One endpoint's per-network byte counters, with the process (`boot`) they
+/// belong to. `None` when it reports none (a PoP from before FR-20 B is not
+/// monitored, which is not the same as "relayed nothing"), or reports them
+/// without a `boot`, which would leave a restart indistinguishable from a
+/// stale sample.
+fn network_counters(body: &serde_json::Value) -> Option<(&str, Vec<(&str, u64)>)> {
+    let map = body["per_network"].as_object()?;
+    let boot = body["boot"].as_str().filter(|b| !b.is_empty())?;
+    let counters = map
+        .iter()
+        .filter_map(|(network, v)| Some((network.as_str(), v.as_u64()?)))
+        .collect();
+    Some((boot, counters))
+}
+
+/// FR-20 B, exact (#2763) — book one endpoint's relayed bytes per network,
+/// once across pods: each counter advances the shared baseline, and only
+/// what it advanced by is booked, to the network's tenant.
+async fn book_network_bytes(
+    stats: &StatsDao,
+    pop: &PopNetworkBytes,
+    region: &str,
+    url: &str,
+    body: &serde_json::Value,
+) {
+    let Some((boot, counters)) = network_counters(body) else {
+        // A derp-relay from before #2763: its bytes go unbooked until it is
+        // updated. Said once per endpoint, so the gap is not silent.
+        if body["per_network"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty())
+            && pop
+                .warned
+                .lock()
+                .is_ok_and(|mut w| w.insert(url.to_string()))
+        {
+            warn!(%region, %url, "fr-20: PoP reports bytes without a boot; not booked until it is updated (#2763)");
+        }
+        return;
+    };
+    for (network, cumulative) in counters {
+        let key = pop.key(region, url, network);
+        let delta = match pop
+            .redis
+            .advance_baseline(&key, boot, cumulative, NETWORK_BASELINE_TTL_SECS)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(%region, %e, "fr-20: baseline unavailable; not booked (under-reports)");
+                continue;
+            }
+        };
+        if delta == 0 {
+            continue;
+        }
+        let Ok(nid) = bson::oid::ObjectId::parse_str(network) else {
+            continue;
+        };
+        match pop.networks.base.find_by_id(nid).await {
+            Ok(n) => {
+                if let Err(e) = stats
+                    .add_usage(
+                        n.tenant_id,
+                        roomler_ai_services::dao::stats::Meter::DerpBytes,
+                        unix_now(),
+                        delta as i64,
+                    )
+                    .await
+                {
+                    debug!(%region, %e, "fr-20: PoP usage bucket write failed");
+                }
+            }
+            // Unresolvable ⇒ logged and dropped. An unattributed byte must
+            // never become a wrongly attributed one.
+            Err(_) => debug!(
+                %region, %network,
+                "fr-20: PoP bytes for an unknown network — unattributed"
+            ),
+        }
+    }
+}
+
 /// Spawn the poller. No-op (never spawns) when regions are disabled or none
 /// exposes a `/stats` endpoint, or when `relay.stats_poll_secs` is 0.
 pub fn spawn_poller(
@@ -449,10 +564,11 @@ pub fn spawn_poller(
     load: RelayLoadMap,
     settings: &roomler_ai_config::RelaySettings,
     stats: Option<Arc<StatsDao>>,
-    // FR-20 B — resolves an overlay network id to its tenant so PoP-relayed
-    // bytes can be attributed. `None` ⇒ metering off; the load poller itself
-    // is unaffected.
-    networks: Option<Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>>,
+    // FR-20 B — books PoP-relayed bytes to the network's tenant, once across
+    // pods (#2763). `None` ⇒ not booked: metering is off, or there is no
+    // Redis to share the baselines, which would otherwise book them once per
+    // pod. The load poller itself is unaffected.
+    pop_bytes: Option<PopNetworkBytes>,
     // FR-115 P4a-2 — `None` ⇒ no push, and so no PoP throttles (fail open).
     allowance_push: Option<AllowancePush>,
     // FR-115 P4b-2 — `None` ⇒ the PoPs' TURN bytes are not attributed.
@@ -494,10 +610,6 @@ pub fn spawn_poller(
         // across samples.
         let mut prev_tx: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut prev_rx: HashMap<String, (u64, Instant)> = HashMap::new();
-        // FR-20 B — (region, network) → the last CUMULATIVE byte total seen.
-        // The PoP counters never reset except on restart, so what we bill is
-        // the diff between successive samples.
-        let mut prev_net: HashMap<(String, String), u64> = HashMap::new();
         // FR-115 P4a-2 — the endpoints whose last answered `GET` reported an
         // `allowance`: the only ones the set is pushed to.
         let mut takers: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -547,6 +659,10 @@ pub fn spawn_poller(
                         turn_keepers.insert(url.clone());
                     } else {
                         turn_keepers.remove(url);
+                    }
+                    // FR-20 B, booked per endpoint and once across pods (#2763).
+                    if let (Some(st), Some(pop)) = (&stats, &pop_bytes) {
+                        book_network_bytes(st, pop, region, url, &body).await;
                     }
                     agg.add(
                         &body,
@@ -610,53 +726,6 @@ pub fn spawn_poller(
                     };
                     if let Err(e) = st.upsert_relay_sample(&sample).await {
                         debug!(%region, %e, "relay load: sample persist failed");
-                    }
-
-                    // FR-20 B — attribute this PoP's relayed bytes.
-                    //
-                    // ⚠ The PoP counters are CUMULATIVE, so what we bill is the
-                    // DIFF against the previous sample. A PoP restart resets
-                    // them, making the diff negative — that interval is dropped
-                    // and the new total becomes the baseline, so the bucket
-                    // UNDER-reports rather than going negative or inventing a
-                    // carry-over. Same trade the `net_*_bytes` rate above makes.
-                    if let Some(nets) = &networks {
-                        for (network, cumulative) in &agg.per_network {
-                            let key = (region.clone(), network.clone());
-                            let prev = prev_net.insert(key, *cumulative);
-                            let Some(delta) = prev.and_then(|p| cumulative.checked_sub(p)) else {
-                                // First sample for this pair, or a restart.
-                                continue;
-                            };
-                            if delta == 0 {
-                                continue;
-                            }
-                            let Ok(nid) = bson::oid::ObjectId::parse_str(network) else {
-                                continue;
-                            };
-                            match nets.base.find_by_id(nid).await {
-                                Ok(n) => {
-                                    if let Err(e) = st
-                                        .add_usage(
-                                            n.tenant_id,
-                                            roomler_ai_services::dao::stats::Meter::DerpBytes,
-                                            unix_now(),
-                                            delta as i64,
-                                        )
-                                        .await
-                                    {
-                                        debug!(%region, %e, "fr-20: PoP usage bucket write failed");
-                                    }
-                                }
-                                // Unresolvable ⇒ logged and dropped. An
-                                // unattributed byte must never become a
-                                // wrongly-attributed one.
-                                Err(_) => debug!(
-                                    %region, %network,
-                                    "fr-20: PoP bytes for an unknown network — unattributed"
-                                ),
-                            }
-                        }
                     }
                 }
             }
@@ -903,32 +972,37 @@ mod tests {
 
 #[cfg(test)]
 mod fr20_tests {
-    /// The PoP counters are cumulative, so what gets billed is the DIFF. This
-    /// pins the three cases, because two of them are ways to bill wrongly.
-    ///
-    /// `checked_sub` is the whole mechanism: it yields `None` on a counter
-    /// reset, which the poller treats as "re-baseline, bill nothing", so the
-    /// interval under-reports instead of going negative or inventing a
-    /// carry-over. An invented byte on a cost ledger is worse than a missing
-    /// one — the missing one is recoverable, the invented one is a refund.
+    use super::network_counters;
+
+    /// The PoP counters are cumulative, so what gets billed is the DIFF, and
+    /// since #2763 the diff is against a baseline both pods share
+    /// (`RedisPubSub::advance_baseline`, pinned by `usage_ledger_tests`
+    /// against a real Redis). A counter is read only with the process it
+    /// belongs to: without `boot`, a restart could not be told from another
+    /// pod's stale sample, so it is not booked at all.
     #[test]
-    fn cumulative_counters_are_billed_as_diffs() {
-        // Normal: bill the increment, not the total.
-        assert_eq!(5_000u64.checked_sub(3_000), Some(2_000));
-        // Idle interval: nothing to bill.
-        assert_eq!(3_000u64.checked_sub(3_000), Some(0));
-        // PoP restart (counter reset): no diff exists, so bill NOTHING and
-        // let the new total become the baseline.
-        assert_eq!(100u64.checked_sub(3_000), None);
+    fn counters_are_read_only_with_their_process() {
+        let both = serde_json::json!({
+            "boot": "18e11ef727b2f264-1",
+            "per_network": { "6a54bf440b4fd609a7356f97": 5_000, "bad": "x" }
+        });
+        let (boot, counters) = network_counters(&both).unwrap();
+        assert_eq!(boot, "18e11ef727b2f264-1");
+        assert_eq!(counters, vec![("6a54bf440b4fd609a7356f97", 5_000)]);
+
+        let no_boot = serde_json::json!({ "per_network": { "n": 5_000 } });
+        assert!(network_counters(&no_boot).is_none(), "no boot, not booked");
+        let empty_boot = serde_json::json!({ "boot": "", "per_network": { "n": 1 } });
+        assert!(network_counters(&empty_boot).is_none());
     }
 
     /// A region with no `per_network` in its payload is a PoP that predates
     /// the field: "not monitored", which must not be confused with "relayed
-    /// zero bytes". An empty map produces no buckets at all; a zero would
-    /// produce a row asserting the tenant used nothing.
+    /// zero bytes". It produces no buckets at all; a zero would produce a row
+    /// asserting the tenant used nothing.
     #[test]
     fn a_missing_per_network_object_yields_no_buckets() {
-        let body = serde_json::json!({ "region": "eu", "net_rx_bytes": 1 });
-        assert!(body["per_network"].as_object().is_none());
+        let body = serde_json::json!({ "region": "eu", "boot": "b", "net_rx_bytes": 1 });
+        assert!(network_counters(&body).is_none());
     }
 }

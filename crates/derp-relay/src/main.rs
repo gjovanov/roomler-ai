@@ -277,14 +277,24 @@ struct TurnTotal {
     p: String,
 }
 
-impl TurnUsage {
-    fn new() -> Self {
+/// This process's id: when it started, and its pid. `per_network` and the
+/// `turn_usage` totals start from zero with it: the API tells a restart from
+/// a stale sample by it (#2763), and a `turn_usage` cursor names it.
+fn boot() -> &'static str {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        format!("{nanos:x}-{:x}", std::process::id())
+    })
+}
+
+impl TurnUsage {
+    fn new() -> Self {
         Self {
-            boot: format!("{nanos:x}-{:x}", std::process::id()),
+            boot: boot().to_string(),
             inner: Mutex::default(),
         }
     }
@@ -593,6 +603,9 @@ async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value>
 
     axum::Json(serde_json::json!({
         "region": &*state.region,
+        // #2763 — which process `per_network` belongs to: it restarts from
+        // zero with the process (the host's `net_*_bytes` do not).
+        "boot": boot(),
         "cpus": cpus,
         "load1": load1,
         "load5": load5,
@@ -603,15 +616,16 @@ async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value>
         "uptime_s": uptime_s,
         "derp_registrations": state.registry.len(),
         // FR-20 B — cumulative relayed bytes per overlay network, since this
-        // process started. The API poller diffs successive samples and resolves
-        // network → tenant; this binary never learns which tenant is which.
+        // process started (entries are only ever added to). The API books the
+        // growth against a baseline every pod shares, keyed by `boot` (#2763),
+        // and resolves network → tenant; this binary never learns which tenant
+        // is which.
         //
-        // ⚠ A restart resets these to zero, so the poller's diff for that
-        // interval goes NEGATIVE and is discarded — the bucket under-reports
-        // rather than going wrong, the identical trade the host `net_*_bytes`
-        // counters above already make. Do not "fix" it with a fabricated
-        // carry-over; an invented byte on a cost ledger is worse than a
-        // missing one.
+        // ⚠ A restart resets these to zero under a new `boot`, which the API
+        // takes as a new baseline and books nothing for — the bucket
+        // under-reports the interval rather than going wrong. Do not "fix" it
+        // with a fabricated carry-over; an invented byte on a cost ledger is
+        // worse than a missing one.
         "per_network": state
             .network_bytes
             .iter()
@@ -931,6 +945,12 @@ mod tests {
         assert!(v["derp_registrations"].is_u64());
         // No coturn exporter in the test env → explicit null, not an error.
         assert!(v["coturn"].is_null());
+        // #2763 — the process the counters belong to, the same on every read.
+        let b = v["boot"].as_str().expect("boot");
+        assert!(!b.is_empty());
+        let again: serde_json::Value =
+            serde_json::from_str(&reqwest_lite(addr, "/stats").await).unwrap();
+        assert_eq!(again["boot"], b);
     }
 
     /// Tiny HTTP/1.0 GET so the test needs no client dependency.
@@ -1291,6 +1311,10 @@ mod tests {
             serde_json::from_str(&reqwest_lite(addr, "/stats").await).unwrap();
         assert_eq!(v["turn_usage"]["kept"], 1, "{v}");
         assert_eq!(v["region"], "us-east");
+        assert_eq!(
+            v["boot"], v["turn_usage"]["boot"],
+            "one process, one boot id: the counters and the totals restart together"
+        );
 
         let (_, plain_key) = test_signer();
         let (plain, _) = serve(plain_key).await;
