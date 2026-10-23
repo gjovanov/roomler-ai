@@ -930,9 +930,15 @@ sequenceDiagram
   deadlock.
 - Best-effort: with no GDK display, or off its thread, there is no token and the link opens as
   it did before.
-- Not covered: a browser that GIO starts over D-Bus (`DBusActivatable=true`, GNOME Web for one)
-  takes no environment from the companion, and GLib hands such an app a token only from a context
-  it asked itself. It opens the tab and may stay behind. Not measured.
+- **GNOME Web is covered**, although it runs as one instance. Fedora's package (48.5) has no
+  `DBusActivatable`, so GIO starts `epiphany <link>`, and that process hands the link, with the
+  token from its environment, to the running GNOME Web over D-Bus. Measured 2026-10-23 on the same
+  box, with the companion on 0.4.158: GNOME Web was minimized, and View screen restored it and
+  brought it forward on the new tab.
+- Not covered: a browser whose desktop file says `DBusActivatable=true`. GIO starts it over D-Bus
+  itself, so it takes no environment from the companion, and GLib puts a token into the activation
+  only from a context that answers for one, which a plain context never does. It would open the tab
+  and may stay behind. None measured.
 
 ### 14.3 A browser the companion opened outlives the companion (#2729)
 
