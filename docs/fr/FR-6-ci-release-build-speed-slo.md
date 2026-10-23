@@ -105,6 +105,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 23d | 10-19 | The crypto crates (Argon2, OPAQUE, the curve and AEAD crates) build at `opt-level = 3` in the dev and test profiles: the integration suite's test time −34% | #2544 |
 | 24 | 10-20 | **The integration suite runs as three shards**, each on its own runner with its own mongod at 2 threads. Each shard lists the same binaries, sorts the (test, binary) pairs and runs every third with `--exact`; each must report every test it was handed. Only the first shard publishes the cargo cache | #2596 |
 | 25 | 10-20 | **A merge burst queues one run, not one per commit**: `ci.yml`, `integration-tests.yml` and `installer-smoke.yml` group master's runs by branch, so GitHub keeps one running (never cancelled) and one waiting, and a newer push cancels the waiting one. PR pushes cancel their superseded run; a dispatch gets a group of its own | #2624 |
+| 26 | 10-23 | **The setup wizard's release lane gets seeds**: `release-setup.yml`'s four build jobs restore from the `seed-cache` release (`seed-setup-<platform>`) instead of Swatinem, rehearsals publish, and a `reseed` job dispatches a master rehearsal after every published release. The macOS job builds both triples in one cargo invocation | #2778 |
 
 ## Acceptance criteria
 
@@ -640,3 +641,18 @@ itself on the affected run's page. Baseline when the program started: releases t
     20 concurrent slots. A session cancelled its own superseded runs by hand, and #2596's
     own CI took 58 min, most of it waiting for slots. Wave 25 groups master's runs by
     branch, so a burst queues one run while the running one finishes.
+- 2026-10-23: **the setup wizard's release lane built cold for nine days** (wave 26).
+  Asked: "too long for mac but also win" (run 39943332027, setup-v0.4.156: macOS 21.8 min,
+  Windows 15.8, Linux 8.7 and 8.1).
+  - Every step that mattered was a compile: macOS x86_64 11.2 + aarch64 9.0 min back to
+    back, Windows 14.7, Linux 8.0. Signing took under a minute.
+  - Each build job logged `No cache found`. Its Swatinem cache saved only on non-tag runs,
+    and release-agent.yml's lockstep job dispatches this file on the TAG ref. The one
+    master run (10-14 06:10Z) seeded it, and setup-v0.4.135 two hours later was the last
+    warm release (full match in all three jobs: macOS 10.3 min, Windows 8.4, Linux 3.9).
+    From 0.4.140 to 0.4.156 every sampled job (0.4.140, .145, .150, .155, .156) found no
+    cache, and the pool held no `setup-*` entry. 22 wizard releases ran in those nine
+    days, at 16–41 min each.
+  - The warm floor is not the seed's to remove: the wizard links `roomlerd`, `roomler-cli`
+    and `remote_control`, and those workspace crates rebuild at release opt-level on every
+    run (4.3–4.4 min per macOS triple, 6.7 on Windows, on 0.4.135).
