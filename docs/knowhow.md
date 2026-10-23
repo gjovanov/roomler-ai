@@ -420,7 +420,7 @@ and the tunnel hub knows only the flows live on its pod. They come with the devi
 
 | Step | Builds |
 |---|---|
-| P4-3a, P4-3b | device scans, the server's half and the device's: `knowhow_scan_roots`, a device-owned list as decision 38 says; repositories and checkouts, kube contexts, manifests, listening services and the device's declared tunnel routes, metadata only |
+| P4-3a, P4-3b | device scans, the server's half and the device's, as the FR-90 spec designs them (§3e "P4-3, scans, as designed", decisions 41–44): a person asks a device, and the device reads only the roots its owner lists in `knowhow_scan_roots` (decision 38), each as the account that owns it, for metadata only. Its checkouts, listeners and declared tunnel routes become its own part of the map, and the repositories and clusters they reach are made bare |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
