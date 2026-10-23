@@ -3100,7 +3100,10 @@ sequenceDiagram
 | P4-3b-2 | what a checkout's manifests and a listed kubeconfig say: the services compose and Kubernetes manifests name, and kube contexts as decision 46 says, through one bounded YAML reader | the same | — |
 | P4-3b-3 | the device's listeners, as decision 47 says | device `knowhow_scan_listeners` off | — |
 | P4-3b-4 | Windows, as decision 45 says | device `knowhow_scan_roots` empty | — |
-| P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, over `rc:knowhow.*`, believed from the session's record; and `knowhow_propose` as decision 39 says | `[modules] knowhow` | — |
+| P4-4-0 | a session's reads and proposals, as designed (§3e "P4-4, a session's reads and proposals, as designed"), and decisions 48–52 | docs only | — |
+| P4-4-1 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, over `rc:knowhow.*`: believed from the session's record (`knowhow → hive`), held to its starter's `KNOWHOW_VIEW` at every question (decision 48), and offered where the server says the map is there (`rc:knowhow.served`, the `knowhow-tools` verb; decision 49) | `[modules] knowhow` | — |
+| P4-4-2 | `knowhow_propose`, as decisions 39, 50 and 51 say: an entity, a fact or a link written `proposed`, naming its session, within a ceiling | the same | — |
+| P4-4-3 | a person's word on a proposal (decision 52): confirmed, with who and when, or rejected as the routes already archive | the same | — |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says | the same | — |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving | the same; the vault's own gates | AC15 ("through the mesh") |
 | P4-7 | the map in the web app | the SPA | — |
@@ -3237,6 +3240,69 @@ sequenceDiagram
   Linux and macOS (P4k): no CI runner is root beside other accounts' folders.
 - **Not in P4-3b:** submodules and bare repositories; UDP listeners; `$KUBECONFIG` (the owner
   lists each file); a local preview of what a scan would say; a cadence (decision 44).
+
+**P4-4, a session's reads and proposals, as designed (P4-4-0).** A session reads the map through
+its toolbelt, and says what it learned as a proposal. The device carries each question on its
+primary connection, as it carries the vault's, and the server believes the session from its
+record, never from the frame: the record must be this organization's, on this device, at this
+fence, and live. A session reads what its starter may (decision 37), held again at every question
+(decision 48). A proposal is written `proposed`: shown as a proposal, never as a fact, until a
+person confirms it (P4-4-3) or a probe does (P4-5).
+
+```mermaid
+sequenceDiagram
+    participant S as the session (its toolbelt)
+    participant D as roomlerd (the primary's connection)
+    participant K as knowhow, the pod holding the device
+    participant H as agent_sessions (hive's record)
+    K-->>D: rc:knowhow.served, at the hello (decision 49)
+    S->>D: knowhow_get {kind, key}
+    D->>K: rc:knowhow.get {req_id, session_id, fence, kind, key}
+    K->>H: this organization's? on this device? at this fence? live?
+    K->>K: the starter's KNOWHOW_VIEW, read now (decision 48), and the rate
+    K-->>D: rc:knowhow.card {req_id, card}, or rc:knowhow.refused {req_id, reason}
+    D-->>S: the card, as text
+    S->>D: knowhow_propose {fact, why}
+    D->>K: rc:knowhow.propose {req_id, session_id, fence, proposal, why}
+    K->>K: believed as above, then its shape (decision 50) and the ceiling (decision 51)
+    K-->>D: rc:knowhow.proposed {req_id, …}
+```
+
+| Piece | Design |
+|---|---|
+| the frames | from the device: `rc:knowhow.search {req_id, session_id, fence, q?, kind?, env?, limit?}`, `rc:knowhow.get {req_id, session_id, fence, kind, key}` and (P4-4-2) `rc:knowhow.propose {req_id, session_id, fence, proposal, why}`. To it: `rc:knowhow.found {req_id, entities, truncated}`, `rc:knowhow.card {req_id, card}`, `rc:knowhow.proposed {req_id, …}`, and `rc:knowhow.refused {req_id, reason}`, one refusal frame for every question, as `rc:vault.refused` is. The vault's shape (`VaultList`, `crates/remote_control/src/signaling.rs`): the device picks `req_id`; the session and its fence travel in the frame, while the organization and the device come from the authenticated socket. Owned by `knowhow` (`Owner::Knowhow`). The agent socket keeps one handler a module (`crates/core/src/agent_socket.rs:135`), so knowhow's one handler (`crates/modules/knowhow/src/lib.rs:125`) answers these and the scans' answers alike |
+| who is asking | knowhow's own `identify`, as the vault's (`crates/modules/vault/src/lease.rs:867`). The organization is one knowhow serves (`not_served`). The session's record, read through hive's own DAO (`crates/modules/hive/src/dao.rs:118`), is this organization's and runs on this device (`not_located`), at the frame's fence (`stale_fence`), and is live: starting, idle, running or awaiting approval, as a lease's must be (`crates/modules/vault/src/lease.rs:641`; `ended`). Then the rate: 120 a minute for a session on a device, the vault's (`crates/remote_control/src/vault.rs:70`; `busy`). That is the `knowhow → hive` edge, a stateless DAO as the vault's is (`crates/core/src/graph.rs:47`): no module state, so a knowhow mounted without hive finds no session, and refuses every question |
+| what it may read | decision 48: what the session's starter may, now. The starter is the record's `owner_id` (`crates/modules/hive/src/model.rs:115`). Their `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization is read at every question, as a person's route reads it (`crates/modules/knowhow/src/routes.rs:92`; `denied`). A starter whose role loses the bit stops their sessions' reads at the next question; one who leaves the organization ends their sessions (hive's `member_removed`) |
+| the reads | `knowhow_search {q?, kind?, env?, limit?}`: the people's search (`crates/modules/knowhow/src/routes.rs:325`), at most 50 (20 by default). `knowhow_get {kind, key}`: the people's card (`:396`), by the name a chip and a session use, with at most 50 links and 64 KiB in all, cut from the end with `truncated`, so one answer stays within what a tool hands a model. Every entity, fact and link comes with its status and source: a session sees `proposed` and `stale` for what they are |
+| how a device knows | decision 49: at each hello of a device advertising `knowhow-tools` (an `RpcCap`, matched whole), the pod's knowhow sends `rc:knowhow.served` when it serves the device's organization. The device forgets the word at every primary connection and keeps it from that frame on. A session's toolbelt offers the knowhow tools only when the device held it at the session's launch, as the vault's tools follow `takes_leases` (`agents/roomlerd/src/vault.rs:1350`). So where knowhow is switched off, as on prod today, no session is shown a tool no module would answer. Sent to a device that asks for it: an older one logs an `rc:` frame it cannot read as a warning (`agents/roomlerd/src/signaling.rs:2825`) |
+| the device | a small client on the primary's connection, as the vault's lease client is (`agents/roomlerd/src/vault.rs:601`): a `req_id` a question, each answer matched to its question, 15 s each (`:131`). Compiled wherever agent sessions are (`cfg(hive_host)`: Linux, macOS and Windows), apart from the scanner. The toolbelt names the tools `mcp__roomler__knowhow_*`, lists them beside the vault's (`agents/roomlerd/src/hive/toolbelt.rs:1451`), and calls them on a branch of their own: the vault's chain ends in `vault_describe` for any name it does not know (`:1267`). The session's settings allow all three (`agents/roomlerd/src/hive/supervisor.rs:4927`), since decision 39 asks no person a call |
+| a proposal (P4-4-2) | decision 50: a new entity, a fact at a path no fact holds, or a link between two live entities, each end named by its kind and key. Written with status `proposed` and source `session` (`crates/modules/knowhow/src/model.rs:67`, `:80`), the session named on the row, on each fact and on its history row, as a scan names its device. Its `why`, up to 500 characters, rides the history row. A proposal never changes what is there: no fact replaced, nothing archived. It is checked as a person's write is (kinds, keys, attributes, the map's 10,000 entities and 50,000 links), and refused whole when any of its text holds a credential's shape (`crates/remote_control/src/knowhow.rs:334`; `refused`) |
+| the ceiling (P4-4-2) | decision 51: 50 proposals a session, over its whole life and every fence, counted from the history (`ceiling`) |
+| a person's word (P4-4-3) | decision 52: a person with `KNOWHOW_EDIT` confirms a proposed entity, link or fact. It turns `active`, with who confirmed it and when beside the session that proposed it (`confirmed_by`, `confirmed_at`), in the history as `confirm`. Rejecting is what the routes already do: archive a proposed entity or link, remove a proposed fact |
+| the kill switches | `knowhow.tenants`; `[modules] knowhow`; the starter's `KNOWHOW_VIEW` |
+
+- ⚠️ **The frame names a session; the record decides.** A session id sent from another device
+  than the one its record names is `not_located`, and an older fence, as a promoted session's
+  previous device would send, is `stale_fence`. The daemon attaches the session and the fence
+  itself (`toolbelt::Run`), never the model.
+- ⚠️ **Still a map, not a gate.** A read tells a session where things are, and a proposal changes
+  nothing a session relies on. The vault, the network and each device decide every reach as
+  before.
+- ⚠️ **A session never proposes into a device's part of the map.** A `machine`, a key a device's
+  scans keep (`<node id>/…` for a checkout, `<node id>:…` for an endpoint,
+  `crates/modules/knowhow/src/intake.rs:81`), and a path the sync or a scan keeps on an entity
+  (`crates/modules/knowhow/src/routes.rs:184`) are refused. A proposal parked at such a key would
+  hold it against the device's next scan, which leaves a key another source holds as it is.
+- **Tests.** The server's half as integration tests over a raw agent socket and a real session,
+  as the vault's are (`crates/tests/src/vault_lease_tests.rs`): each read answered, and each
+  refusal (`not_located` from another device, `stale_fence`, `ended`, `denied` once the starter's
+  role loses the bit, `not_served`). The device's half as unit tests: the client matching each
+  answer to its question, the tools offered only on the server's word and allowed in the
+  settings, and the toolbelt over its socket with a fake knowhow, as with the vault's `FakeVault`
+  (`agents/roomlerd/src/hive/toolbelt/tests.rs`).
+- **Not in P4-4:** `knowhow_neighbors` (the map route's neighbourhood: a card already holds its
+  links); probes (P4-5); a person proposing through the routes (P4-7's map); a proposal's own
+  expiry; a proposal replacing a fact (P5's contradiction cards).
 
 ### 3f. The brain
 
@@ -4595,6 +4661,65 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: listing a folder would report what the machine runs, which no root names.
     - *Or: nothing until P4-6 asks for them.*
       - What it costs: `roomler_connect` would find no listener to connect to.
+48. **Whose permission a session's read is held to** (P4-4), for the operator to confirm (posted in
+    step 236).
+    - *Recommended: its starter's `KNOWHOW_VIEW`, read again at every question*, as a person's
+      route reads it. A starter whose role loses the bit stops their sessions' reads at the next
+      question.
+      - What it costs: one read of the starter's roles a question, which a person's route pays
+        too.
+    - *Or: at the session's start, as `HIVE_RUN` is.*
+      - What it costs: a starter whose bit is taken away keeps reading through every session
+        already running, until it ends.
+    - *Or: nothing of its own: whoever may run a session reads the map.*
+      - What it costs: a role that runs sessions without `KNOWHOW_VIEW` would read the topology
+        through them.
+49. **How a session learns the map is there** (P4-4), for the operator to confirm (posted in step
+    236).
+    - *Recommended: the server's word at each hello*: knowhow sends `rc:knowhow.served` to a device
+      advertising `knowhow-tools` when it serves the device's organization, and a session's
+      toolbelt offers the knowhow tools only then. Nothing to set on the device: a read takes
+      nothing from it, and brings it only what the starter may see.
+      - What it costs: a frame at each hello, and a session launched in the moment between a
+        reconnect and that frame offers no knowhow tools.
+    - *Or: in every session, refused by the server.*
+      - What it costs: where knowhow is switched off (prod today) no module answers, so each call
+        waits out its 15 s, and the model is shown tools that never work.
+    - *Or: a device-owned key, as `vault_enabled` is.*
+      - What it costs: an owner's switch over what reads nothing of the device, and a map offered
+        to no session until each owner sets it.
+50. **What a session may propose** (P4-4), for the operator to confirm (posted in step 236): the
+    shape of decision 39's `knowhow_propose`.
+    - *Recommended: something new, never a change*: an entity (never a `machine`, nor a key a
+      device's scans keep), a fact at a path no fact holds and neither the sync nor a scan keeps,
+      or a link between two live entities. Each `proposed`, naming its session, with its `why`.
+      - What it costs: a session that finds a fact wrong can only say so in its transcript, until
+        P5's contradiction cards.
+    - *Or: a fact's new value too, kept beside the one there as a proposal.*
+      - What it costs: two values a path in the model, the card and every reader of either.
+    - *Or: entities only.*
+      - What it costs: what a session learns about an entity already there (a port, what reads a
+        database) is lost.
+51. **A session's ceiling** (P4-4), for the operator to confirm (posted in step 236).
+    - *Recommended: 50 proposals over the session's whole life*, every fence counted, from the
+      history; and reads at 120 a minute, the vault's rate.
+      - What it costs: a long session that learns a lot stops proposing at 50, and is told so.
+    - *Or: 50 a day.*
+      - What it costs: a session left running fills the review queue again every day.
+    - *Or: no ceiling but the map's own (10,000 entities, 50,000 links).*
+      - What it costs: one session can fill the review queue, and the map, on its own.
+52. **Who confirms a proposal** (P4-4), for the operator to confirm (posted in step 236).
+    - *Recommended: a person with `KNOWHOW_EDIT`*, decision 36's writer. Confirming turns it
+      `active` and records who and when beside the session that proposed it; rejecting archives a
+      proposed entity or link, or removes a proposed fact, as the routes do now. P4-5's probes
+      confirm too.
+      - What it costs: proposals wait in an administrator's queue.
+    - *Or: any member who reads the map.*
+      - What it costs: decision 36's line (members propose, administrators write) moves, and a
+        member could confirm their own session's proposals.
+    - *Or: the session's starter, for their own sessions' proposals.*
+      - What it costs: a model's claim becomes a fact on one person's word, the person whose
+        session made it.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
