@@ -420,8 +420,8 @@ fn check_word(word: &str, max: usize, more: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A person's change to an entity's facts: each path set to a value, or
-/// (`None`) removed.
+/// A change to an entity's facts, said by `source` (and `by`, a person):
+/// each path set to a value, or (`None`) removed.
 ///
 /// ⚠️ The facts it does not name keep their provenance — who said them, from
 /// where, when — and so does one it sets to the value it already holds while
@@ -433,7 +433,8 @@ fn check_word(word: &str, max: usize, more: &[u8]) -> Result<(), &'static str> {
 pub fn merge_facts(
     current: &[Fact],
     changes: &[(String, Option<Bson>)],
-    by: ObjectId,
+    source: &str,
+    by: Option<ObjectId>,
     now: DateTime,
 ) -> (Vec<Fact>, Vec<Document>) {
     let mut facts = current.to_vec();
@@ -451,8 +452,8 @@ pub fn merge_facts(
                 let fact = Fact {
                     path: path.clone(),
                     value: v.clone(),
-                    source: SOURCE_PERSON.into(),
-                    by: Some(by),
+                    source: source.into(),
+                    by,
                     observed_at: now,
                     verified_at: None,
                     status: STATUS_ACTIVE.into(),
@@ -636,7 +637,8 @@ mod tests {
                 ("port".into(), Some(Bson::Int64(5432))),
                 ("gone".into(), None),
             ],
-            me,
+            SOURCE_PERSON,
+            Some(me),
             now,
         );
         assert_eq!(changed, vec![doc! { "path": "version", "value": "16" }]);
@@ -665,7 +667,8 @@ mod tests {
                 ("port".into(), Some(Bson::Int64(6432))),
                 ("os".into(), None),
             ],
-            me,
+            SOURCE_PERSON,
+            Some(me),
             now,
         );
         assert_eq!(
@@ -687,12 +690,28 @@ mod tests {
             SOURCE_SESSION,
             STATUS_PROPOSED,
         )];
-        let (facts, changed) =
-            merge_facts(&proposed, &[("port".into(), Some(Bson::Int64(1)))], me, now);
+        let (facts, changed) = merge_facts(
+            &proposed,
+            &[("port".into(), Some(Bson::Int64(1)))],
+            SOURCE_PERSON,
+            Some(me),
+            now,
+        );
         assert_eq!(changed.len(), 1);
         assert_eq!(
             (facts[0].source.as_str(), facts[0].status.as_str()),
             (SOURCE_PERSON, STATUS_ACTIVE)
         );
+
+        // P4-2a — the sync says its facts with no person behind them.
+        let (facts, _) = merge_facts(
+            &facts,
+            &[("os".into(), Some(Bson::String("linux".into())))],
+            SOURCE_SYNC,
+            None,
+            now,
+        );
+        let os = facts.iter().find(|f| f.path == "os").unwrap();
+        assert_eq!((os.source.as_str(), os.by), (SOURCE_SYNC, None));
     }
 }

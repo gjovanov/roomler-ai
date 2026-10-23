@@ -228,8 +228,8 @@ impl Modules {
         }
         #[cfg(feature = "knowhow")]
         {
-            // On core alone in P4-1: the map's own store and the people's
-            // routes. Its switch defaults off, like the vault's.
+            // On core alone: the map's store, the people's routes, and (P4-2a)
+            // the fleet's devices heard through core. Defaults off, like the vault.
             modules.knowhow =
                 init_one::<roomler_ai_mod_knowhow::KnowhowState>(core.clone(), settings, ())
                     .await?;

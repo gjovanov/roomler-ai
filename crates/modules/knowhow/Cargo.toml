@@ -10,20 +10,28 @@ description = "FR-90 module: knowhow — the organization's map, the server side
 name = "roomler_ai_mod_knowhow"
 path = "src/lib.rs"
 
-# P4-1 depends on core alone. Its three edges come with the steps that use
-# them: `knowhow → fleet` and `knowhow → network` with P4-2's sync,
-# `knowhow → hive` (a session's question believed from its record) with P4-4.
+# On core alone, and no module edge yet. P4-2a reads the fleet's devices
+# through the shared AgentDao (their model is `roomler-ai-remote-control`'s)
+# and hears of them through core's hooks. The edges come with the steps that
+# call a module: `knowhow → fleet` (its Hub) with P4-3a, `knowhow → network`
+# with P4-2b, `knowhow → hive` (a session's question believed from its
+# record) with P4-4.
 [dependencies]
 roomler-core = { path = "../../core" }
 roomler-ai-config = { path = "../../config" }
 roomler-ai-db = { path = "../../db" }
 roomler-ai-services = { path = "../../services" }
+roomler-ai-remote-control = { path = "../../remote_control" }
 
 anyhow.workspace = true
+# P4-2a — the hooks fleet's events reach the map through.
+async-trait.workspace = true
 axum.workspace = true
 bson.workspace = true
 futures.workspace = true
 mongodb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# P4-2a — a hello's sync off the socket's path, and the reconcile's interval.
+tokio.workspace = true
 tracing.workspace = true
