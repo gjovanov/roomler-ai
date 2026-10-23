@@ -18,7 +18,7 @@ that is greyed out always carries the device's own reason.
 - **⛔ Ruled out** icon:danger — the OS itself prevents it. The reason is below.
 :::
 
-These tables describe agent 0.4.154; a row that names a later version is coming
+These tables describe agent 0.4.155; a row that names a later version is coming
 in the next release. The engineering record behind them, with
 the code each verdict comes from, is
 [`docs/platform-support.md`](https://github.com/gjovanov/roomler-ai/blob/master/docs/platform-support.md).
@@ -65,7 +65,7 @@ organization chooses it with `roomler org overlay <org> netstack`
 | "The host is locked" while you are connected | ✅ | ✅ | ✅ from agent 0.4.150 |
 | The host's cursor, drawn by your browser | ✅ | ✅ system installs, and X11 desktops from agent 0.4.147; a per-user Wayland desktop draws it into the picture | ❌ the cursor is part of the picture |
 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows | ❌ |
-| Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148; on GNOME the layout is shown, and you switch it with GNOME's own shortcut (Super+Space) · ❌ Wayland desktops and system installs | ✅ from agent 0.4.155 |
+| Show and switch the keyboard layout | ✅ | ✅ X11 desktops with a per-user install, from agent 0.4.148; on GNOME the layout is shown, and you switch it with GNOME's own shortcut (Super+Space) · ❌ Wayland desktops and system installs | ✅ from agent 0.4.156 |
 | Typing text on a non-US layout | ✅ | ✅ on any layout from agent 0.4.147; before it, a system install types only on a US layout, and refuses rather than mistype | ✅ |
 | Match the remote display to your window | ✅ | ✅ X11 desktops with one screen and a per-user install, from agent 0.4.148, and the agent's own virtual desktop · ❌ Wayland desktops, system installs, several screens | ❌ |
 | Clipboard: text, formatted text and images | ✅ | ✅ per-user · ❌ a system install | ✅ |
