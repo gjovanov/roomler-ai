@@ -1205,8 +1205,26 @@ fn policy_byte(p: DisplayMatchPolicy) -> u8 {
     }
 }
 
+/// FR-97 P2d-2b — the policy a process keeps: its own, held to the floor a
+/// supervised Mac's root handed it (`ROOMLERD_DISPLAY_MATCH`, FR-43's forward)
+/// where there is one, whichever is stricter. Pure.
+fn with_root_floor(own: DisplayMatchPolicy, floor: Option<&str>) -> DisplayMatchPolicy {
+    floor.map_or(own, |word| {
+        own.strictest(DisplayMatchPolicy::from_word(word))
+    })
+}
+
+/// The forwarded floor, from the environment alone: the config fallback is
+/// this process's own value as it started, which a live change replaces.
+fn root_floor() -> Option<String> {
+    tunnel_core::env::PREFIXES
+        .iter()
+        .find_map(|prefix| std::env::var(format!("{prefix}DISPLAY_MATCH")).ok())
+}
+
 /// The owner set `display_match` (at start, and on every local change).
 pub fn set_device_policy(p: DisplayMatchPolicy) {
+    let p = with_root_floor(p, root_floor().as_deref());
     let was = DEVICE_POLICY.swap(policy_byte(p), std::sync::atomic::Ordering::Relaxed);
     if was != policy_byte(p) {
         tracing::info!(policy = ?p, "display-match: the owner's policy");
@@ -1927,6 +1945,31 @@ mod tests {
         );
         // Smaller than every HiDPI mode: nothing fits, and the display is left alone.
         assert_eq!(pick_mac_mode(&modes, &start, 1000, 700), None);
+    }
+
+    /// FR-97 P2d-2b — a supervised Mac's worker keeps the stricter of its own
+    /// policy and the root's; with no floor handed down, its own.
+    #[test]
+    fn a_worker_keeps_the_stricter_of_its_policy_and_the_roots() {
+        use super::with_root_floor;
+        use crate::config::DisplayMatchPolicy::{Always, Auto, Never};
+        assert_eq!(with_root_floor(Always, None), Always);
+        assert_eq!(
+            with_root_floor(Always, Some("never")),
+            Never,
+            "the machine's never holds"
+        );
+        assert_eq!(
+            with_root_floor(Never, Some("always")),
+            Never,
+            "and the person's too"
+        );
+        assert_eq!(with_root_floor(Auto, Some("always")), Auto);
+        assert_eq!(
+            with_root_floor(Always, Some("bogus")),
+            Never,
+            "an unknown word is never"
+        );
     }
 
     /// A person who chose a 1x desktop keeps 1x, and an unusable mode is never picked.
