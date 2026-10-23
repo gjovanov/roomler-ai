@@ -28,7 +28,7 @@ path = "src/main.rs"
 # boot smoke asserts the image does not mount it — enforced where the image is
 # made, not by a default a recipe would have to remember.
 default = ["profile-full", "saas"]
-profile-full = ["chat", "conference", "fleet", "remote", "network", "hive", "vault"]
+profile-full = ["chat", "conference", "fleet", "remote", "network", "hive", "vault", "knowhow"]
 profile-collab = ["chat", "conference"]
 profile-remote = ["fleet", "remote"]
 profile-mesh = ["fleet", "network"]
@@ -55,6 +55,12 @@ hive = ["dep:roomler-ai-mod-hive", "fleet", "chat"]
 # and its runtime switch defaults OFF like hive's: `[modules] vault = true`,
 # or a `vault.tenants` list.
 vault = ["dep:roomler-ai-mod-vault", "hive"]
+# FR-90 P4-1 — knowhow, the organization's map: on core alone for now (its
+# edges to `fleet`, `network` and `hive` come with P4-2 and P4-4, and the
+# feature will imply what they need then). In `profile-full` only, and its
+# runtime switch defaults OFF like the vault's: `[modules] knowhow = true`,
+# or a `knowhow.tenants` list.
+knowhow = ["dep:roomler-ai-mod-knowhow"]
 
 
 [dependencies]
@@ -81,6 +87,7 @@ roomler-ai-mod-fleet = { path = "../modules/fleet", optional = true }
 roomler-ai-mod-network = { path = "../modules/network", optional = true }
 roomler-ai-mod-hive = { path = "../modules/hive", optional = true }
 roomler-ai-mod-vault = { path = "../modules/vault", optional = true }
+roomler-ai-mod-knowhow = { path = "../modules/knowhow", optional = true }
 
 axum.workspace = true
 tokio.workspace = true

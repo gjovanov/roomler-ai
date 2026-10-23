@@ -653,6 +653,38 @@
       "methods": "GET,HEAD,PUT"
     },
     {
+      "path": "/api/tenant/{tenant_id}/knowhow",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/edge",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/edge/{edge_id}",
+      "methods": "DELETE,PATCH"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/entity",
+      "methods": "GET,HEAD,POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/entity/{entity_id}",
+      "methods": "DELETE,GET,HEAD,PATCH"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/history",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/map/{entity_id}",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/search",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/magic-dns",
       "methods": "GET,HEAD,PUT"
     },
@@ -1878,6 +1910,85 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_edges",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "from": 1,
+              "kind": 1,
+              "to": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "from": 1,
+              "deleted_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "to": 1,
+              "deleted_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_entities",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "kind": 1,
+              "key": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1,
+              "kind": 1,
+              "key": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_history",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1,
+              "_id": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "entity_ids": 1,
+              "at": -1,
+              "_id": -1
+            }
           }
         ]
       },
@@ -4079,6 +4190,85 @@
               "at": 1
             },
             "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_edges",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "from": 1,
+              "kind": 1,
+              "to": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "from": 1,
+              "deleted_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "to": 1,
+              "deleted_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_entities",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "kind": 1,
+              "key": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
+              }
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1,
+              "kind": 1,
+              "key": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_history",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1,
+              "_id": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "entity_ids": 1,
+              "at": -1,
+              "_id": -1
+            }
           }
         ]
       },

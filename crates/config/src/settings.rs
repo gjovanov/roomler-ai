@@ -58,6 +58,10 @@ pub struct Settings {
     /// organization, and no KEK.
     #[serde(default)]
     pub vault: VaultSettings,
+    /// FR-90 P4-1 — knowhow, the organization's map: which organizations it
+    /// keeps one for once `[modules] knowhow` is on. Absent ⇒ every one.
+    #[serde(default)]
+    pub knowhow: KnowhowSettings,
     /// #1731 — the stall watchdog. Absent ⇒ on, with its defaults.
     #[serde(default)]
     pub diag: DiagSettings,
@@ -152,6 +156,22 @@ impl std::fmt::Debug for VaultSettings {
             .field("placeholder", &self.placeholder)
             .finish()
     }
+}
+
+/// FR-90 P4-1 — `[knowhow]`, env `ROOMLER__KNOWHOW__*`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct KnowhowSettings {
+    /// The organizations whose map knowhow keeps, as comma-separated ids
+    /// (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`), with `hive.tenants`'s rules:
+    /// empty or `*` is every organization, a list is only those, and an
+    /// entry that is no id matches nothing.
+    ///
+    /// ⚠️ A list switches the module ON by itself ([`Settings::knowhow_on`]),
+    /// as `vault.tenants` does: the form a hosted server uses, because it
+    /// fails safe — no older image reads it. Clearing the list is the kill
+    /// switch.
+    #[serde(default)]
+    pub tenants: String,
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.
@@ -421,6 +441,12 @@ pub struct ModulesSettings {
     /// [`Self::DEFAULT_OFF`].
     #[serde(default)]
     pub vault: bool,
+    /// FR-90 P4-1 — knowhow, the organization's map. **Default OFF**, as
+    /// `hive` and `vault` are: `ROOMLER__MODULES__KNOWHOW=true`, or a
+    /// `knowhow.tenants` list — read [`Settings::knowhow_on`], never this
+    /// field alone. Listed in [`Self::DEFAULT_OFF`].
+    #[serde(default)]
+    pub knowhow: bool,
 }
 
 fn modules_default_on() -> bool {
@@ -438,6 +464,7 @@ impl Default for ModulesSettings {
             saas: true,
             hive: false,
             vault: false,
+            knowhow: false,
         }
     }
 }
@@ -446,15 +473,15 @@ impl ModulesSettings {
     /// Modules whose switch is OFF unless an operator turns it on. Their
     /// absence from a build that does not link them is the default, not a
     /// configuration worth a boot warning.
-    pub const DEFAULT_OFF: &'static [&'static str] = &["hive", "vault"];
+    pub const DEFAULT_OFF: &'static [&'static str] = &["hive", "vault", "knowhow"];
 
     /// The module ids an operator has switched off, in the composition order
     /// of `roomler_core::graph::MODULES` — including a default-off module
     /// nobody switched on, so `modules = compiled − switched_off` holds.
     ///
-    /// ⚠️ It cannot see a `hive.tenants` or `vault.tenants` list, which also
-    /// switches its module on; the boot log and `/api/capabilities` read
-    /// [`Settings::switched_off`].
+    /// ⚠️ It cannot see a `hive.tenants`, `vault.tenants` or
+    /// `knowhow.tenants` list, which also switches its module on; the boot
+    /// log and `/api/capabilities` read [`Settings::switched_off`].
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = Vec::new();
         if !self.saas {
@@ -480,6 +507,9 @@ impl ModulesSettings {
         }
         if !self.vault {
             off.push("vault");
+        }
+        if !self.knowhow {
+            off.push("knowhow");
         }
         off
     }
@@ -1556,10 +1586,17 @@ impl Settings {
         self.modules.vault || !self.vault.tenants.trim().is_empty()
     }
 
-    /// [`ModulesSettings::switched_off`], with `hive` and `vault` on wherever
-    /// [`Self::hive_on`] and [`Self::vault_on`] say they are — what boot
-    /// logs and `GET /api/capabilities` report, so
-    /// `modules = compiled − switched_off` still holds.
+    /// FR-90 P4-1 — whether knowhow is on: `[modules] knowhow`, or a
+    /// `knowhow.tenants` list ([`KnowhowSettings::tenants`]).
+    pub fn knowhow_on(&self) -> bool {
+        self.modules.knowhow || !self.knowhow.tenants.trim().is_empty()
+    }
+
+    /// [`ModulesSettings::switched_off`], with `hive`, `vault` and `knowhow`
+    /// on wherever [`Self::hive_on`], [`Self::vault_on`] and
+    /// [`Self::knowhow_on`] say they are — what boot logs and
+    /// `GET /api/capabilities` report, so `modules = compiled − switched_off`
+    /// still holds.
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = self.modules.switched_off();
         if self.hive_on() {
@@ -1567,6 +1604,9 @@ impl Settings {
         }
         if self.vault_on() {
             off.retain(|m| *m != "vault");
+        }
+        if self.knowhow_on() {
+            off.retain(|m| *m != "knowhow");
         }
         off
     }
@@ -1879,6 +1919,25 @@ mod vault_settings_tests {
         assert!(shown.contains("<redacted>"), "{shown}");
         assert!(shown.contains("65f0000000000000000000a1"), "{shown}");
         assert!(format!("{:?}", VaultSettings::default()).contains("<unset>"));
+    }
+}
+
+#[cfg(test)]
+mod knowhow_settings_tests {
+    use super::{KnowhowSettings, ModulesSettings};
+
+    /// FR-90 P4-1 — knowhow ships OFF and listed as such, and a file that
+    /// leaves every key out keeps a map for every organization once it is on.
+    #[test]
+    fn knowhow_is_off_until_turned_on() {
+        let m = ModulesSettings::default();
+        assert!(!m.knowhow);
+        assert!(ModulesSettings::DEFAULT_OFF.contains(&"knowhow"));
+        assert!(m.switched_off().contains(&"knowhow"));
+        let absent: KnowhowSettings = toml::from_str("").expect("every key defaults");
+        assert!(absent.tenants.is_empty());
+        let on: ModulesSettings = toml::from_str("knowhow = true").unwrap();
+        assert!(on.knowhow && !on.switched_off().contains(&"knowhow"));
     }
 }
 

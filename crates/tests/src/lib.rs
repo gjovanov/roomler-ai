@@ -161,6 +161,12 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-1 — knowhow, the organization's map: off until turned on, read
+/// from `member` up and changed by `admin`, each entity named once, every
+/// change at the rev it was read, links that go with what they link, and
+/// another organization's id answered as a bogus one.
+#[cfg(test)]
+mod knowhow_tests;
 /// FR-115 P5 — the meeting-length cap: warned at 55, ended at 60, once.
 #[cfg(test)]
 mod meeting_cap_tests;

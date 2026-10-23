@@ -45,9 +45,9 @@ rather than to the org.
 | role | mask | carries | notes |
 |---|---|---|---|
 | `owner` | `permissions::ALL` | everything, incl. `ADMINISTRATOR` | the tenant creator |
-| `admin` | `DEFAULT_ADMIN` | channels, roles, members, fleet management, all three audit views | ⚠️ **not** `MANAGE_TENANT` |
+| `admin` | `DEFAULT_ADMIN` | channels, roles, members, fleet management, all three audit views, changing the map (`KNOWHOW_EDIT`) | ⚠️ **not** `MANAGE_TENANT` |
 | `moderator` | member + moderation + `REMOTE_CONTROL` | | |
-| `member` | `DEFAULT_MEMBER` | read/write in channels, join calls | `is_default` — the invite path resolves it **by name** |
+| `member` | `DEFAULT_MEMBER` | read/write in channels, join calls, reading the map (`KNOWHOW_VIEW`) | `is_default` — the invite path resolves it **by name** |
 | `guest` | `VIEW_CHANNELS \| READ_HISTORY` | | |
 
 ⚠️ **`EXEC_DEVICE` and `SSH_DEVICE` are in no row below the `ADMINISTRATOR`
@@ -82,6 +82,18 @@ rule so much as outside it: the row carries `ADMINISTRATOR`, so `has()` already
 answers true for every bit, and the two bits confer nothing there. The test
 skips any row with the bypass for exactly that reason — a check that fails on
 `owner` is failing for a reason that says nothing about the risk.
+
+⚠️ **`KNOWHOW_VIEW` (bit 33) and `KNOWHOW_EDIT` (bit 34, FR-90 P4) are the
+opposite case: they ARE in the managed rows, on purpose.** Knowhow, the
+organization's map, grants nothing: the vault, the network and the device still
+decide every reach. So reading where things are is a member's, and changing it is
+an administrator's (decisions 37 and 36). `KNOWHOW_VIEW` is in `DEFAULT_MEMBER`, so
+`member`, `moderator` and `admin` hold it and `guest` does not; `KNOWHOW_EDIT` is in
+`DEFAULT_ADMIN`, and the routes read it as including the view. The reconcile in §3
+hands both to every existing organization at the first boot that carries them;
+with `[modules] knowhow` off they open nothing.
+`the_map_is_read_from_member_up_and_changed_by_admins` pins the rows, and
+[knowhow.md](knowhow.md) §5 has the rest.
 
 ⚠️ **`MANAGE_TENANT` is deliberately absent from `DEFAULT_ADMIN`.** Configuring
 the organisation — including the `exec`, `ssh` and ephemeral-key org switches —
@@ -300,6 +312,7 @@ The catalogue splits powers that look adjacent, and each split was paid for:
 | `VIEW_EXEC_AUDIT` | `EXEC_DEVICE` | an admin should see every command the fleet ran without silently gaining the power to run one |
 | `VIEW_SSH_AUDIT` | `SSH_DEVICE` | same asymmetry, and `VIEW_SSH_AUDIT` *is* in `DEFAULT_ADMIN` while `SSH_DEVICE` is not |
 | `REMOTE_CONTROL` | `RECORD_REMOTE_SCREEN` | watching a screen ends with the session; a recording is a copy that outlives it (FR-85) |
+| `KNOWHOW_VIEW` | `KNOWHOW_EDIT` | reading where things are is not changing what every member and every session is told is there (FR-90 P4; the edit bit does include the view) |
 | `EXEC_DEVICE` / `SSH_DEVICE` | `HIVE_RUN` | running a command yourself is not handing a model a shell on the box to run its own — and a session runs as the device-mapped account, not SYSTEM/root, so neither power contains the other (FR-90) |
 | `ADMINISTRATOR` under break-glass | recording | break-glass skips the host's consent, so a recording made under it would be covert — the hub strips `RECORD` whatever the mask says |
 | `ADMINISTRATOR` under break-glass | privacy mode | the same session never covers the device's screen: a curtain would hide it from the one person who could object — the hub strips the session's `PRIVACY` bit (FR-99) |

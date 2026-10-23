@@ -462,7 +462,7 @@ The bullets below describe the design *once #888 lands*:
   `MANAGE_AGENTS`.
 - **`VIEW_RELAY_AUDIT`** — in `DEFAULT_ADMIN`, mirroring `VIEW_EXEC_AUDIT` (1<<28) and
   `VIEW_SSH_AUDIT` (1<<30).
-- ⚠️ `ALL = (1 << 31) - 1` (`role.rs:133`) must be bumped in the same commit;
+- ⚠️ `ALL = (1 << 31) - 1` (`role.rs:146`) must be bumped in the same commit;
   `all_contains_every_named_permission` will force it.
 - **The approval itself is audited** — it is the privilege-granting action, and the
   exit-node precedent auditing nothing is a gap to not copy.
@@ -726,7 +726,7 @@ Verified against `origin/master`, 2026-08-28.
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
-| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:133` |
+| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
