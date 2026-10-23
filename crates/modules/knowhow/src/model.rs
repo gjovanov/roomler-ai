@@ -131,6 +131,10 @@ pub struct KnowhowEntity {
     pub status: String,
     /// Where it came from: [`SOURCE_PERSON`] in P4-1.
     pub source: String,
+    /// P4-3a-2 — the device whose scan made it, for a scan's entity: the one
+    /// device whose later scans keep it, change it and retire it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<ObjectId>,
     /// Bumped by every write; a write names the rev it read.
     pub rev: i64,
     #[serde(default)]
@@ -160,6 +164,9 @@ pub struct Fact {
     /// The person, for a person's fact.
     #[serde(default)]
     pub by: Option<ObjectId>,
+    /// P4-3a-2 — the device whose scan said it, for a scan's fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<ObjectId>,
     pub observed_at: DateTime,
     /// When a probe last confirmed it (P4-5).
     #[serde(default)]
@@ -183,6 +190,9 @@ pub struct KnowhowEdge {
     pub attrs: Document,
     pub status: String,
     pub source: String,
+    /// P4-3a-2 — the device whose scan made it, for a scan's link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<ObjectId>,
     pub rev: i64,
     #[serde(default)]
     pub created_by: Option<ObjectId>,
@@ -218,6 +228,9 @@ pub struct KnowhowHistory {
     pub source: String,
     #[serde(default)]
     pub by: Option<ObjectId>,
+    /// P4-3a-2 — the device whose scan wrote, for a scan's write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<ObjectId>,
     pub at: DateTime,
     /// What the write set: a create's whole body, an update's changed fields
     /// (facts as `{path, value}` rows, a null value for one removed), an
@@ -266,6 +279,34 @@ pub struct KnowhowScan {
     pub truncated: bool,
     #[serde(default)]
     pub detail: Option<String>,
+    /// P4-3a-2 — what its answer wrote onto the map; absent until written,
+    /// and for an answer that writes nothing (`failed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<ScanWritten>,
+}
+
+/// P4-3a-2 — what a scan wrote onto the map (decision 42).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanWritten {
+    /// The device's checkouts and listeners the scan holds on the map.
+    #[serde(default)]
+    pub checkouts: u32,
+    #[serde(default)]
+    pub endpoints: u32,
+    /// Shared repositories and clusters it made, bare.
+    #[serde(default)]
+    pub repos: u32,
+    #[serde(default)]
+    pub clusters: u32,
+    /// Links it made.
+    #[serde(default)]
+    pub links: u32,
+    /// What its device's earlier scans wrote and this one archived.
+    #[serde(default)]
+    pub retired: u32,
+    /// The map was full: what did not fit was not written.
+    #[serde(default)]
+    pub full: bool,
 }
 
 impl KnowhowScan {
@@ -499,6 +540,30 @@ pub fn merge_facts(
     by: Option<ObjectId>,
     now: DateTime,
 ) -> (Vec<Fact>, Vec<Document>) {
+    let who = Provenance {
+        source,
+        by,
+        device: None,
+    };
+    merge_facts_from(current, changes, who, now)
+}
+
+/// Who says what a write sets: its source, and the person or the device
+/// behind it (P4-3a-2: a scan's facts name their device).
+#[derive(Debug, Clone, Copy)]
+pub struct Provenance<'a> {
+    pub source: &'a str,
+    pub by: Option<ObjectId>,
+    pub device: Option<ObjectId>,
+}
+
+/// [`merge_facts`], with the whole provenance a fact keeps.
+pub fn merge_facts_from(
+    current: &[Fact],
+    changes: &[(String, Option<Bson>)],
+    who: Provenance<'_>,
+    now: DateTime,
+) -> (Vec<Fact>, Vec<Document>) {
     let mut facts = current.to_vec();
     let mut changed = Vec::new();
     for (path, value) in changes {
@@ -514,8 +579,9 @@ pub fn merge_facts(
                 let fact = Fact {
                     path: path.clone(),
                     value: v.clone(),
-                    source: source.into(),
-                    by,
+                    source: who.source.into(),
+                    by: who.by,
+                    device: who.device,
                     observed_at: now,
                     verified_at: None,
                     status: STATUS_ACTIVE.into(),
@@ -673,6 +739,7 @@ mod tests {
             value,
             source: source.into(),
             by: None,
+            device: None,
             observed_at: DateTime::from_millis(1),
             verified_at: Some(DateTime::from_millis(2)),
             status: status.into(),

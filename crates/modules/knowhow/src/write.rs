@@ -11,18 +11,21 @@ use tracing::error;
 use crate::KnowhowState;
 use crate::dao::MAX_EDGES;
 use crate::model::{
-    KnowhowHistory, OP_ARCHIVE, SOURCE_PERSON, SOURCE_SYNC, STATUS_ARCHIVED, TARGET_EDGE,
-    TARGET_ENTITY,
+    KnowhowHistory, OP_ARCHIVE, Provenance, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SYNC,
+    STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
 };
 
 /// The links an archive takes with it, per read.
 const ARCHIVE_BATCH: usize = 500;
 
 /// What every history row of one write shares: its organization, who wrote
-/// (a person, or nobody for the sync), from which source, and when.
+/// (a person, the device whose scan it was, or nobody for the sync), from
+/// which source, and when.
 pub(crate) struct Stamp {
     pub tid: ObjectId,
     pub by: Option<ObjectId>,
+    /// P4-3a-2 — the device, for a scan's write.
+    pub device: Option<ObjectId>,
     pub source: &'static str,
     pub at: DateTime,
 }
@@ -33,6 +36,7 @@ impl Stamp {
         Self {
             tid,
             by: Some(by),
+            device: None,
             source: SOURCE_PERSON,
             at: DateTime::now(),
         }
@@ -43,8 +47,29 @@ impl Stamp {
         Self {
             tid,
             by: None,
+            device: None,
             source: SOURCE_SYNC,
             at: DateTime::now(),
+        }
+    }
+
+    /// A device's scan (P4-3a-2): the device said it, and no person.
+    pub(crate) fn scan(tid: ObjectId, device: ObjectId) -> Self {
+        Self {
+            tid,
+            by: None,
+            device: Some(device),
+            source: SOURCE_SCAN,
+            at: DateTime::now(),
+        }
+    }
+
+    /// The provenance a fact this write sets keeps.
+    pub(crate) fn provenance(&self) -> Provenance<'static> {
+        Provenance {
+            source: self.source,
+            by: self.by,
+            device: self.device,
         }
     }
 
@@ -69,6 +94,7 @@ impl Stamp {
             op: op.into(),
             source: self.source.into(),
             by: self.by,
+            device: self.device,
             at: self.at,
             set,
         }

@@ -42,11 +42,13 @@ use serde_json::{Map, Value, json};
 
 use crate::KnowhowState;
 use crate::dao::{MAX_EDGES, MAX_ENTITIES, Search};
+use crate::intake::{SCANNED_FACTS, SCANNED_MACHINE_FACTS};
 use crate::model::{
     Fact, KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS, OP_ARCHIVE,
-    OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SYNC, STATUS_ACTIVE, STATUS_ARCHIVED, SYNCED_KINDS,
-    TARGET_EDGE, TARGET_ENTITY, check_attrs, check_edge_kind, check_env, check_fact_path,
-    check_fact_value, check_key, check_kind, check_kind_word, check_name, merge_facts,
+    OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SYNC, STATUS_ACTIVE, STATUS_ARCHIVED,
+    SYNCED_KINDS, TARGET_EDGE, TARGET_ENTITY, check_attrs, check_edge_kind, check_env,
+    check_fact_path, check_fact_value, check_key, check_kind, check_kind_word, check_name,
+    merge_facts,
 };
 use crate::sync::SYNCED_FACTS;
 use crate::view::{CardView, EdgeView, EntityView, HistoryView, LinkView, NodeView};
@@ -173,62 +175,89 @@ fn stale(what: &str, asked: i64) -> ApiError {
     ))
 }
 
-/// ⚠️ What the fleet says of a machine is the fleet's (P4-2a): its name, its
-/// owner and the facts the sync owns ([`SYNCED_FACTS`]), the network's among
-/// them since P4-2b. A person's change to one would be undone by the next
-/// sync, so it is refused, and so is archiving a machine, which leaves the
-/// map when its device is removed. A person may still give a machine an
-/// environment, attributes and facts of their own.
+/// ⚠️ What the fleet says of a machine is the fleet's (P4-2a, P4-2b), and
+/// what a device's scan says is the device's (P4-3a-2): a machine's or a
+/// scan entity's name, its owner and the facts its source owns, and any fact
+/// a scan said. A person's change to one would be undone by the next sync or
+/// scan, so it is refused; a person may still give either an environment,
+/// attributes and facts of their own.
 fn the_fleets(current: &KnowhowEntity, body: &UpdateEntity) -> Result<(), ApiError> {
-    if current.source != SOURCE_SYNC {
-        return Ok(());
-    }
+    let devices = current.source == SOURCE_SYNC || scans_own(current);
     let mut named: Vec<&str> = Vec::new();
-    if body.name.is_some() {
+    if devices && body.name.is_some() {
         named.push("name");
     }
-    if body.owner_id.is_some() {
+    if devices && body.owner_id.is_some() {
         named.push("owner_id");
     }
+    let mut a_scans = scans_own(current);
     if let Some(facts) = &body.facts {
-        named.extend(
-            facts
-                .keys()
-                .map(String::as_str)
-                .filter(|p| SYNCED_FACTS.contains(p)),
-        );
+        for path in facts.keys().map(String::as_str) {
+            let scans = scans_path(current, path);
+            if scans || current.source == SOURCE_SYNC && SYNCED_FACTS.contains(&path) {
+                named.push(path);
+                a_scans |= scans;
+            }
+        }
     }
     if named.is_empty() {
         return Ok(());
     }
+    let who = if a_scans {
+        "its device's scan says"
+    } else {
+        "the fleet says"
+    };
     Err(bad(format!(
-        "the fleet says this of a {}: {} — change the device instead",
+        "{who} this of a {}: {} — change the device instead",
         current.kind,
         named.join(", ")
     )))
 }
 
-/// P4-2b — how many facts of a person's an entity holds. A synced one keeps
-/// room for every fact the sync owns, so the sync never takes it past
+/// P4-3a-2 — one of a device's own scan entities (a checkout, a listener).
+fn scans_own(current: &KnowhowEntity) -> bool {
+    current.source == SOURCE_SCAN && current.device.is_some()
+}
+
+/// Whether `path` is a scan's on `current`: one its scan owns there, or a
+/// fact a scan said.
+fn scans_path(current: &KnowhowEntity, path: &str) -> bool {
+    scans_own(current) && SCANNED_FACTS.contains(&path)
+        || current.source == SOURCE_SYNC && SCANNED_MACHINE_FACTS.contains(&path)
+        || current
+            .facts
+            .iter()
+            .any(|f| f.path == path && f.source == SOURCE_SCAN)
+}
+
+/// Whether `path` is kept for the sync or a scan on `current`.
+fn reserved(current: &KnowhowEntity, path: &str) -> bool {
+    if current.source == SOURCE_SYNC {
+        SYNCED_FACTS.contains(&path) || SCANNED_MACHINE_FACTS.contains(&path)
+    } else {
+        scans_own(current) && SCANNED_FACTS.contains(&path)
+    }
+}
+
+/// P4-2b — how many facts of a person's an entity holds. A machine keeps
+/// room for every fact the sync and its scans own (P4-3a-2), and a scan's
+/// own entity for every fact its scans own, so neither ever takes one past
 /// [`MAX_FACTS`]: a person's own are held to what is left.
 fn persons_room(current: &KnowhowEntity) -> usize {
     if current.source == SOURCE_SYNC {
-        MAX_FACTS - SYNCED_FACTS.len()
+        MAX_FACTS - SYNCED_FACTS.len() - SCANNED_MACHINE_FACTS.len()
+    } else if scans_own(current) {
+        MAX_FACTS - SCANNED_FACTS.len()
     } else {
         MAX_FACTS
     }
 }
 
-/// The facts of `facts` that count against a person's room: on a synced
-/// entity, those at a path the sync does not own.
+/// The facts of `facts` that count against a person's room: those at a path
+/// not kept for the sync or a scan.
 fn persons_facts(current: &KnowhowEntity, facts: &[Fact]) -> usize {
-    if current.source != SOURCE_SYNC {
-        return facts.len();
-    }
-    facts
-        .iter()
-        .filter(|f| !SYNCED_FACTS.contains(&f.path.as_str()))
-        .count()
+    facts.iter().filter(|f| !reserved(current, &f.path)).count()
 }
 
 /// A body's `facts`: path → value, or — in an update only — null to remove
@@ -614,6 +643,7 @@ pub async fn create_entity(
         facts,
         status: STATUS_ACTIVE.into(),
         source: SOURCE_PERSON.into(),
+        device: None,
         rev: 1,
         created_by: Some(auth.user_id),
         created_at: now,
@@ -783,14 +813,21 @@ pub async fn archive_entity(
     let tid = writer(&state, &tenant_id, &auth).await?;
     let id = parse_id(&entity_id, "entity_id")?;
     // P4-2a — a machine leaves the map when its device is removed, never by a
-    // person's hand: the next sync would only put it back.
-    if let Some(current) = state.entities.get_live(tid, id).await?
-        && current.source == SOURCE_SYNC
-    {
-        return Err(bad(format!(
-            "a {} leaves the map when its device is removed",
-            current.kind
-        )));
+    // person's hand: the next sync would only put it back. P4-3a-2 — and a
+    // scan's own entity when its device's scans stop reporting it.
+    if let Some(current) = state.entities.get_live(tid, id).await? {
+        if current.source == SOURCE_SYNC {
+            return Err(bad(format!(
+                "a {} leaves the map when its device is removed",
+                current.kind
+            )));
+        }
+        if scans_own(&current) {
+            return Err(bad(format!(
+                "a {} leaves the map when its device's scans no longer report it",
+                current.kind
+            )));
+        }
     }
     let stamp = Stamp::person(tid, auth.user_id);
     match archive_at(&state, &stamp, id, query.rev).await? {
@@ -852,6 +889,7 @@ pub async fn create_edge(
         attrs,
         status: STATUS_ACTIVE.into(),
         source: SOURCE_PERSON.into(),
+        device: None,
         rev: 1,
         created_by: Some(auth.user_id),
         created_at: now,
