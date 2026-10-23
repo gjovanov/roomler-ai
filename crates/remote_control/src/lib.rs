@@ -54,6 +54,9 @@ pub mod session;
 pub mod setup_diagnostics;
 pub mod signaling;
 pub mod turn_creds;
+/// FR-115 P4b — coturn's per-allocation totals, read by the cluster's
+/// collector and by a PoP's `derp-relay` alike.
+pub mod turn_stats;
 pub mod turn_url;
 /// FR-90 P3-3b — the vault's lease vocabulary: refusal words and bounds both
 /// ends read.

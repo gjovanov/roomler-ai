@@ -189,6 +189,73 @@ pub fn verify_allowance_set(token: &str, key: &DecodingKey) -> Result<AllowanceS
         .map_err(|e| format!("allowance set verify: {e}"))
 }
 
+/// FR-115 P4b-2 — the audience of the API's request for a PoP's TURN usage.
+/// Its own, so a ticket, a set and a request can never stand in for each
+/// other.
+pub const TURN_USAGE_AUDIENCE: &str = "derp-turn-usage";
+/// How long a request lives. One is signed for each pull, so seconds.
+pub const TURN_USAGE_REQUEST_TTL_SECS: u64 = 60;
+/// Clock-skew tolerance on a request's `exp`.
+pub const TURN_USAGE_LEEWAY_SECS: u64 = 30;
+
+/// FR-115 P4b-2 — the API's request for a regional PoP's TURN usage
+/// (`GET /stats/turn-usage`). What that answers is coturn's per-allocation
+/// totals, whose usernames name the paying org and the principal, so unlike
+/// the load snapshot on `/stats` it is not public. The PoP serves it only to
+/// the holder of the ticket key, checked with the public key it already holds:
+/// still no new secret on a PoP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnUsageRequestClaims {
+    /// Always [`TURN_USAGE_AUDIENCE`].
+    pub aud: String,
+    pub iat: u64,
+    pub exp: u64,
+    /// The region the request is for. A PoP refuses a request signed for
+    /// another, so one captured on its way to one PoP opens no other.
+    pub region: String,
+}
+
+impl DerpTicketSigner {
+    /// FR-115 P4b-2 — sign one pull of `region`'s TURN usage.
+    pub fn sign_turn_usage_request(&self, region: &str) -> Result<String, String> {
+        let iat = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let claims = TurnUsageRequestClaims {
+            aud: TURN_USAGE_AUDIENCE.to_string(),
+            iat,
+            exp: iat + TURN_USAGE_REQUEST_TTL_SECS,
+            region: region.to_string(),
+        };
+        jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &self.enc)
+            .map_err(|e| format!("turn usage request sign: {e}"))
+    }
+}
+
+/// FR-115 P4b-2 — verify a request for this PoP's TURN usage: EdDSA signature
+/// by the ticket key, `aud == "derp-turn-usage"`, unexpired within
+/// [`TURN_USAGE_LEEWAY_SECS`], and signed for THIS PoP's `region`.
+pub fn verify_turn_usage_request(
+    token: &str,
+    key: &DecodingKey,
+    region: &str,
+) -> Result<TurnUsageRequestClaims, String> {
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&[TURN_USAGE_AUDIENCE]);
+    validation.leeway = TURN_USAGE_LEEWAY_SECS;
+    let claims = jsonwebtoken::decode::<TurnUsageRequestClaims>(token, key, &validation)
+        .map(|d| d.claims)
+        .map_err(|e| format!("turn usage request verify: {e}"))?;
+    if claims.region != region {
+        return Err(format!(
+            "turn usage request verify: signed for {:?}, this is {region:?}",
+            claims.region
+        ));
+    }
+    Ok(claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +329,48 @@ mod tests {
         let token =
             jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &signer.enc).unwrap();
         assert!(verify_allowance_set(&token, &key).is_err());
+    }
+
+    /// FR-115 P4b-2 — a request round-trips for its own region only, and is
+    /// neither a ticket nor a set.
+    #[test]
+    fn a_turn_usage_request_is_its_own_audience_and_region() {
+        let (signer, key) = test_signer();
+        let token = signer.sign_turn_usage_request("us-east").unwrap();
+        let claims = verify_turn_usage_request(&token, &key, "us-east").expect("fresh");
+        assert_eq!(claims.aud, TURN_USAGE_AUDIENCE);
+        assert_eq!(claims.exp - claims.iat, TURN_USAGE_REQUEST_TTL_SECS);
+
+        assert!(
+            verify_turn_usage_request(&token, &key, "eu-north").is_err(),
+            "signed for another PoP"
+        );
+        assert!(verify(&token, &key).is_err(), "a request admits nobody");
+        assert!(
+            verify_allowance_set(&token, &key).is_err(),
+            "nor is it a set"
+        );
+        let (ticket, _) = signer.mint("6a54bf440b4fd609a7356f97", "cHVia2V5").unwrap();
+        assert!(verify_turn_usage_request(&ticket, &key, "us-east").is_err());
+        let set = signer.sign_allowance_set(BTreeMap::new(), 90).unwrap();
+        assert!(verify_turn_usage_request(&set, &key, "us-east").is_err());
+        let (_, other_key) = test_signer();
+        assert!(verify_turn_usage_request(&token, &other_key, "us-east").is_err());
+    }
+
+    /// A request signed long ago is refused past the small leeway.
+    #[test]
+    fn an_expired_turn_usage_request_is_refused() {
+        let (signer, key) = test_signer();
+        let claims = TurnUsageRequestClaims {
+            aud: TURN_USAGE_AUDIENCE.to_string(),
+            iat: 1_000,
+            exp: 1_060,
+            region: "us-east".into(),
+        };
+        let token =
+            jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &signer.enc).unwrap();
+        assert!(verify_turn_usage_request(&token, &key, "us-east").is_err());
     }
 
     #[test]

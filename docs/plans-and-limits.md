@@ -84,7 +84,7 @@ staged by the mode.
 | meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:286`) | `media:error`; a rejoining participant keeps their seat |
 | meeting length | the sweep (`crates/modules/conference/src/meeting_cap.rs:100`) | `room:call_ending_soon` at 55, `room:call_ended {reason: plan_limit}` at 60 |
 | concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1577`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
-| relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:620`) and on every PoP (`crates/derp-relay/src/main.rs:147`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
+| relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:620`) and on every PoP (`crates/derp-relay/src/main.rs:148`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
 | recordings, exit nodes, MagicDNS | `require_feature` at each route | 403 in feature wording ("not available on the Free plan") |
 
 The two fences that are not a request — a meeting that runs long, a session started on
@@ -138,13 +138,13 @@ flowchart LR
 | The job | `crates/modules/network/src/relay_allowance.rs:114` (`compute`), every 5 min (`:42`) | one pod (a Redis claim), only where plans are sold, publishes the networks of every org past its allowance, each with its rate, for 15 min (`:45`) |
 | The refresh | `crates/modules/network/src/relay_allowance.rs:253`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
 | The bucket on the API pods | `crates/modules/network/src/derp.rs:620` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:82`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
-| The bucket on the PoPs | `crates/derp-relay/src/main.rs:147`, the set arriving on `POST /stats` (`:291`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:211`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:169`). A PoP that holds no set throttles nothing |
+| The bucket on the PoPs | `crates/derp-relay/src/main.rs:148`, the set arriving on `POST /stats` (`:519`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:232`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:169`). A PoP that holds no set throttles nothing |
 | What the org sees | `crates/api/src/routes/cost.rs:501` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced` and `throttled` |
-| TURN bytes per org (P4b) | `crates/modules/network/src/turn_usage.rs:175`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. Counted, never held: holding them is P4c |
+| TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:327`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. Counted, never held: holding them is P4c |
 
 ⚠️ **The allowance counts DERP bytes only.** TURN bytes have been attributed per org since
-2026-10-22, on the cluster's coturn; the PoPs' coturn is P4b-2. Nothing reads them for the
-throttle until P4c. A username that names no org (the session-less pre-fetch) is logged as
+2026-10-22 on the cluster's coturn, and P4b-2 brings in the PoPs' coturn, one PoP at a time.
+Nothing reads them for the throttle until P4c. A username that names no org (the session-less pre-fetch) is logged as
 unattributed, never guessed.
 
 ⚠️ **A direct path and an org relay meet neither meter**, because no server process ever sees
@@ -189,7 +189,7 @@ subscription's item instead of starting a second one (`crates/services/src/strip
 Every org is created on `free`, on every server (`crates/services/src/dao/tenant.rs:284`).
 On the hosted service that is a plan; on a self-hosted server it only means nobody sold the
 org anything. `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the
-hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:298`); the
+hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:314`); the
 published self-host image and the compose build both leave it out. With it false,
 `roomler_core::quota` refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and
 the session cap (`crates/modules/remote/src/controller.rs:745`) and the meeting sweep

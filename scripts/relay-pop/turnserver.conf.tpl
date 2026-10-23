@@ -33,5 +33,8 @@ no-cli
 # load-aware routing input). Binds :9641 on all interfaces — provision.sh
 # firewalls it to loopback; only derp-relay's localhost scrape reaches it.
 prometheus
+# FR-115 P4b-2: each allocation's totals to the loopback Redis, for per-org
+# TURN bytes (rendered by provision.sh from TURN_STATS in pop.env).
+${TURN_STATSDB_LINE}
 log-file=stdout
 simple-log

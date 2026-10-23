@@ -37,8 +37,8 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
-    response::Response,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -48,11 +48,12 @@ use roomler_ai_remote_control::derp_frame::frame_is_bulk;
 use roomler_ai_remote_control::derp_ticket::{self, AllowanceSetClaims};
 // Shared through remote_control so mint and verify can never version-drift.
 use roomler_ai_remote_control::derp_ticket::jsonwebtoken::DecodingKey;
-use serde::Deserialize;
-use std::collections::HashMap;
+use roomler_ai_remote_control::turn_stats;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -232,12 +233,178 @@ impl Allowance {
     }
 }
 
+/// FR-115 P4b-2 — how long this PoP keeps coturn's totals for the API to
+/// pull. Every API pod pulls on every poll (30 s), so an hour outlasts a long
+/// API outage; past it the bytes are lost (under-reported), never invented.
+const TURN_USAGE_RETENTION_SECS: u64 = 3600;
+/// The most totals kept, whatever their age: a bound on memory, not a working
+/// limit (a PoP ends a handful of allocations a minute).
+const TURN_USAGE_MAX_KEPT: usize = 50_000;
+/// The most totals one pull returns; the rest come with `more: true`.
+const TURN_USAGE_PAGE: usize = 2_000;
+
+/// FR-115 P4b-2 — coturn's per-allocation totals on this PoP, as its
+/// statistics DB published them to the PoP's own Redis
+/// (`remote_control::turn_stats`), numbered and kept an hour for the API to
+/// pull from `GET /stats/turn-usage`.
+///
+/// ⚠ Like [`NetworkBytes`], this attributes nothing. The usernames name the
+/// paying org, and it is the API that books each leg, once across its pods
+/// (`roomler_core::turn_bytes`): the PoP only keeps what coturn said. It does
+/// not aggregate per org either, because every API pod pulls, and a
+/// cumulative counter diffed by two pods is booked twice (#2763).
+struct TurnUsage {
+    /// Changes on every start, so a puller's cursor into an earlier process's
+    /// numbering is never read against this one's.
+    boot: String,
+    inner: Mutex<TurnUsageInner>,
+}
+
+#[derive(Default)]
+struct TurnUsageInner {
+    last_seq: u64,
+    kept: VecDeque<TurnTotal>,
+}
+
+/// One message as coturn published it, numbered in arrival order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct TurnTotal {
+    seq: u64,
+    /// When this PoP heard it (unix seconds).
+    at: u64,
+    /// coturn's channel and payload, verbatim.
+    ch: String,
+    p: String,
+}
+
+impl TurnUsage {
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Self {
+            boot: format!("{nanos:x}-{:x}", std::process::id()),
+            inner: Mutex::default(),
+        }
+    }
+
+    /// Keep one total, dropping whatever is past the retention or the cap.
+    fn keep(&self, ch: String, p: String, now: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.last_seq += 1;
+        let seq = g.last_seq;
+        g.kept.push_back(TurnTotal {
+            seq,
+            at: now,
+            ch,
+            p,
+        });
+        Self::prune(&mut g, now);
+    }
+
+    fn prune(g: &mut TurnUsageInner, now: u64) {
+        let oldest = now.saturating_sub(TURN_USAGE_RETENTION_SECS);
+        while g.kept.len() > TURN_USAGE_MAX_KEPT || g.kept.front().is_some_and(|t| t.at < oldest) {
+            g.kept.pop_front();
+        }
+    }
+
+    /// The totals after `after` in this process's numbering, a page at a
+    /// time. A cursor from another process (another `boot`, or none) starts
+    /// from the oldest kept.
+    fn after(&self, boot: Option<&str>, after: u64, now: u64) -> (Vec<TurnTotal>, bool) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune(&mut g, now);
+        let from = if boot == Some(self.boot.as_str()) {
+            after
+        } else {
+            0
+        };
+        let mut page: Vec<TurnTotal> = g
+            .kept
+            .iter()
+            .filter(|t| t.seq > from)
+            .take(TURN_USAGE_PAGE + 1)
+            .cloned()
+            .collect();
+        let more = page.len() > TURN_USAGE_PAGE;
+        page.truncate(TURN_USAGE_PAGE);
+        (page, more)
+    }
+
+    /// What `/stats` reports. Its presence is how the API knows this endpoint
+    /// keeps totals to pull, as `allowance`'s is for the push.
+    fn snapshot(&self) -> serde_json::Value {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        serde_json::json!({
+            "boot": self.boot,
+            "kept": g.kept.len(),
+            "last_seq": g.last_seq,
+        })
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// FR-115 P4b-2 — subscribe to coturn's totals on this PoP's Redis and keep
+/// them, reconnecting with a backoff. coturn and that Redis live on this
+/// host; while Redis is down, only the totals published meanwhile are lost.
+async fn collect_turn_usage(url: String, usage: Arc<TurnUsage>) {
+    let mut backoff = 1u64;
+    loop {
+        match subscribe_turn_usage(&url, &usage).await {
+            Ok(()) => {
+                backoff = 1;
+                warn!("derp-relay: coturn's statistics subscription ended; reconnecting");
+            }
+            Err(e) => warn!(
+                %e,
+                "derp-relay: subscribing to coturn's statistics failed; retrying in {backoff}s"
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+async fn subscribe_turn_usage(url: &str, usage: &TurnUsage) -> Result<(), redis::RedisError> {
+    let client = redis::Client::open(url)?;
+    let mut pubsub = client.get_async_pubsub().await?;
+    for channel in turn_stats::CHANNELS {
+        pubsub.psubscribe(channel).await?;
+    }
+    info!("derp-relay: subscribed to coturn's statistics");
+    let mut stream = pubsub.on_message();
+    while let Some(msg) = stream.next().await {
+        let channel = msg.get_channel_name().to_string();
+        let Ok(payload) = msg.get_payload::<String>() else {
+            continue;
+        };
+        // Keep only what the API can book. It parses again, with this code.
+        if turn_stats::parse(&channel, &payload).is_some() {
+            usage.keep(channel, payload, unix_now());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct RelayState {
     registry: Registry,
     ticket_key: Arc<DecodingKey>,
     network_bytes: NetworkBytes,
     allowance: Arc<Allowance>,
+    /// `REGION`: what `/stats` reports, and the region a TURN usage request
+    /// must be signed for.
+    region: Arc<str>,
+    /// FR-115 P4b-2 — `Some` when `TURN_STATS_REDIS` names this PoP's Redis.
+    turn_usage: Option<Arc<TurnUsage>>,
 }
 
 #[derive(Deserialize)]
@@ -258,12 +425,30 @@ async fn main() {
     let ticket_key = derp_ticket::decoding_key_from_public_b64(&public_b64)
         .expect("DERP_TICKET_PUBLIC_KEY is not a valid Ed25519 public key");
     let bind = std::env::var("DERP_BIND").unwrap_or_else(|_| "127.0.0.1:8443".into());
+    let region: Arc<str> = std::env::var("REGION").unwrap_or_default().into();
+
+    // FR-115 P4b-2 — keep coturn's totals for the API when this PoP's coturn
+    // publishes them to a local Redis (`redis-statsdb`).
+    let turn_usage = match std::env::var("TURN_STATS_REDIS") {
+        Ok(url) if !url.trim().is_empty() => {
+            if region.is_empty() {
+                warn!("TURN_STATS_REDIS is set but REGION is empty: every pull will be refused");
+            }
+            let usage = Arc::new(TurnUsage::new());
+            tokio::spawn(collect_turn_usage(url, usage.clone()));
+            info!(%region, "derp-relay: keeping coturn's totals for the API to pull");
+            Some(usage)
+        }
+        _ => None,
+    };
 
     let state = RelayState {
         registry: Arc::new(DashMap::new()),
         ticket_key: Arc::new(ticket_key),
         network_bytes: Arc::new(DashMap::new()),
         allowance: Arc::new(Allowance::default()),
+        region,
+        turn_usage,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -279,8 +464,55 @@ fn router(state: RelayState) -> Router {
         // FR-115 P4a-2 — the API's poll GETs the snapshot and POSTs the
         // over-allowance set, on the one path nginx already proxies.
         .route("/stats", get(stats).post(allowance_push))
+        // FR-115 P4b-2 — under `/stats`, because nginx proxies that prefix
+        // already, so no PoP's nginx needs a change.
+        .route("/stats/turn-usage", get(turn_usage_pull))
         .route("/derp", get(derp_upgrade))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct TurnUsageParams {
+    boot: Option<String>,
+    after: Option<u64>,
+}
+
+/// `GET /stats/turn-usage?boot=…&after=…` — FR-115 P4b-2: the coturn totals
+/// this PoP keeps, after the caller's cursor (`boot` + the last `seq` read).
+/// Not public, unlike `/stats`, because the usernames name orgs and
+/// principals: `Authorization: Bearer` must carry a request the API signed
+/// with the ticket key for THIS region
+/// (`remote_control::derp_ticket::verify_turn_usage_request`). 404 when this
+/// PoP keeps no totals (`TURN_STATS_REDIS` unset), 401 when the request does
+/// not verify.
+async fn turn_usage_pull(
+    State(state): State<RelayState>,
+    Query(q): Query<TurnUsageParams>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(usage) = &state.turn_usage else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if let Err(e) =
+        derp_ticket::verify_turn_usage_request(token.trim(), &state.ticket_key, &state.region)
+    {
+        debug!(%e, "derp-relay: refused a turn usage request");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (totals, more) = usage.after(q.boot.as_deref(), q.after.unwrap_or(0), unix_now());
+    axum::Json(serde_json::json!({
+        "boot": usage.boot,
+        "totals": totals,
+        "more": more,
+    }))
+    .into_response()
 }
 
 /// `POST /stats` — FR-115 P4a-2: the API's over-allowance set, an EdDSA JWT
@@ -360,7 +592,7 @@ async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value>
         .unwrap_or(0.0);
 
     axum::Json(serde_json::json!({
-        "region": std::env::var("REGION").unwrap_or_default(),
+        "region": &*state.region,
         "cpus": cpus,
         "load1": load1,
         "load5": load5,
@@ -390,6 +622,9 @@ async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value>
         // networks are throttled, how old the pushed set is, and the frames
         // dropped. `age_s` null = no live set (nothing is throttled).
         "allowance": state.allowance.snapshot(),
+        // FR-115 P4b-2 — present (an object) only when this PoP keeps coturn's
+        // totals: the API pulls `/stats/turn-usage` from exactly those.
+        "turn_usage": state.turn_usage.as_ref().map(|u| u.snapshot()),
     }))
 }
 
@@ -585,11 +820,23 @@ mod tests {
     }
 
     async fn serve(key: DecodingKey) -> (std::net::SocketAddr, Registry) {
+        let (addr, registry, _) = serve_with(key, None).await;
+        (addr, registry)
+    }
+
+    /// A relay for region `us-east`; `turn_usage` as `TURN_STATS_REDIS` would
+    /// set it.
+    async fn serve_with(
+        key: DecodingKey,
+        turn_usage: Option<Arc<TurnUsage>>,
+    ) -> (std::net::SocketAddr, Registry, Option<Arc<TurnUsage>>) {
         let state = RelayState {
             registry: Arc::new(DashMap::new()),
             ticket_key: Arc::new(key),
             network_bytes: Arc::new(DashMap::new()),
             allowance: Arc::new(Allowance::default()),
+            region: "us-east".into(),
+            turn_usage: turn_usage.clone(),
         };
         let registry = state.registry.clone();
         let app = router(state);
@@ -598,7 +845,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (addr, registry)
+        (addr, registry, turn_usage)
     }
 
     async fn connect(
@@ -895,5 +1142,161 @@ mod tests {
         // Once the held set has lapsed, even an older one is taken.
         assert!(a.apply(claims(&[("net1", 2_000)], now_secs() - 5, 60)));
         assert_eq!(a.rate_of("net1"), Some(2_000));
+    }
+
+    // ── FR-115 P4b-2 — coturn's totals, kept for the API to pull ────────
+
+    const TOTAL: &str = "turn/realm/coturn-us-east.example/user/1792000000:u:org-6a975e17971e2d55ddcdedb2/allocation/001000000000000042/total_traffic";
+
+    /// Tiny HTTP/1.0 GET with an optional bearer; the status and the body.
+    async fn get_lite(
+        addr: std::net::SocketAddr,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        s.write_all(format!("GET {path} HTTP/1.0\r\nHost: t\r\n{auth}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).await.unwrap();
+        let status = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    /// Totals are numbered in arrival order and read after a cursor, a page
+    /// at a time; a cursor from another process starts from the oldest kept.
+    #[test]
+    fn totals_are_numbered_and_read_after_a_cursor() {
+        let u = TurnUsage::new();
+        let now = now_secs();
+        for i in 0..5 {
+            u.keep(
+                TOTAL.into(),
+                format!("rcvp=1, rcvb=1, sentp=1, sentb={i}"),
+                now,
+            );
+        }
+        let (all, more) = u.after(None, 0, now);
+        assert_eq!(
+            all.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        assert!(!more);
+        let (rest, _) = u.after(Some(&u.boot), 3, now);
+        assert_eq!(rest.iter().map(|t| t.seq).collect::<Vec<_>>(), [4, 5]);
+        let (stale, _) = u.after(Some("another-process"), 3, now);
+        assert_eq!(
+            stale.len(),
+            5,
+            "an old process's cursor reads from the oldest"
+        );
+        assert_eq!(u.snapshot()["kept"], 5);
+        assert_eq!(u.snapshot()["last_seq"], 5);
+    }
+
+    /// Past the retention a total is gone; past a page, `more` says so.
+    #[test]
+    fn totals_age_out_and_page() {
+        let u = TurnUsage::new();
+        let now = now_secs();
+        u.keep(
+            TOTAL.into(),
+            "sentb=1".into(),
+            now - TURN_USAGE_RETENTION_SECS - 10,
+        );
+        for _ in 0..TURN_USAGE_PAGE + 3 {
+            u.keep(TOTAL.into(), "sentb=2".into(), now);
+        }
+        let (page, more) = u.after(None, 0, now);
+        assert_eq!(page.len(), TURN_USAGE_PAGE);
+        assert!(more);
+        assert_eq!(page[0].seq, 2, "the total past the retention is gone");
+        let (rest, more) = u.after(Some(&u.boot), page.last().unwrap().seq, now);
+        assert_eq!(rest.len(), 3);
+        assert!(!more);
+    }
+
+    /// Only the API's request for THIS region reads the totals; `/stats`
+    /// carries the marker the API pulls by, and a relay keeping no totals
+    /// has neither.
+    #[tokio::test]
+    async fn only_the_apis_request_for_this_region_reads_the_totals() {
+        let (signer, key) = test_signer();
+        let (addr, _, usage) = serve_with(key, Some(Arc::new(TurnUsage::new()))).await;
+        let usage = usage.unwrap();
+        usage.keep(
+            TOTAL.into(),
+            "rcvp=10, rcvb=1200, sentp=12, sentb=34567".into(),
+            now_secs(),
+        );
+
+        assert_eq!(
+            get_lite(addr, "/stats/turn-usage", None).await.0,
+            401,
+            "no request"
+        );
+        let other = signer.sign_turn_usage_request("eu-north").unwrap();
+        assert_eq!(
+            get_lite(addr, "/stats/turn-usage", Some(&other)).await.0,
+            401,
+            "signed for another PoP"
+        );
+        let (foreign, _) = test_signer();
+        let alien = foreign.sign_turn_usage_request("us-east").unwrap();
+        assert_eq!(
+            get_lite(addr, "/stats/turn-usage", Some(&alien)).await.0,
+            401,
+            "a foreign key"
+        );
+        let (ticket, _) = signer.mint("net1", &BASE64.encode(pk(1))).unwrap();
+        assert_eq!(
+            get_lite(addr, "/stats/turn-usage", Some(&ticket)).await.0,
+            401,
+            "a ticket is not a request"
+        );
+
+        let ok = signer.sign_turn_usage_request("us-east").unwrap();
+        let (status, body) = get_lite(addr, "/stats/turn-usage?after=0", Some(&ok)).await;
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["boot"], usage.boot.as_str());
+        assert_eq!(v["more"], false);
+        assert_eq!(v["totals"][0]["seq"], 1);
+        assert_eq!(v["totals"][0]["ch"], TOTAL);
+        assert_eq!(
+            v["totals"][0]["p"],
+            "rcvp=10, rcvb=1200, sentp=12, sentb=34567"
+        );
+        let path = format!("/stats/turn-usage?boot={}&after=1", usage.boot);
+        let (_, body) = get_lite(addr, &path, Some(&ok)).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["totals"].as_array().unwrap().len(),
+            0,
+            "nothing after the cursor"
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(&reqwest_lite(addr, "/stats").await).unwrap();
+        assert_eq!(v["turn_usage"]["kept"], 1, "{v}");
+        assert_eq!(v["region"], "us-east");
+
+        let (_, plain_key) = test_signer();
+        let (plain, _) = serve(plain_key).await;
+        let v: serde_json::Value =
+            serde_json::from_str(&reqwest_lite(plain, "/stats").await).unwrap();
+        assert!(v["turn_usage"].is_null(), "no totals kept, no marker: {v}");
+        assert_eq!(get_lite(plain, "/stats/turn-usage", Some(&ok)).await.0, 404);
     }
 }

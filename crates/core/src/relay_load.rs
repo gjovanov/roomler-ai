@@ -171,9 +171,10 @@ fn takes_allowance_push(body: &serde_json::Value) -> bool {
         .is_some_and(serde_json::Value::is_object)
 }
 
-/// The push targets: each region's endpoints that took the push on their
-/// last answered `GET`. A region left with none is dropped.
-fn allowance_push_targets(
+/// Each region's endpoints that are in `set`: those whose last answered `GET`
+/// took the push ([`takes_allowance_push`]), or keep coturn's totals
+/// ([`keeps_turn_usage`]). A region left with none is dropped.
+fn endpoints_in(
     targets: &[(String, Vec<String>)],
     takers: &std::collections::HashSet<String>,
 ) -> Vec<(String, Vec<String>)> {
@@ -189,6 +190,26 @@ fn allowance_push_targets(
         })
         .filter(|(_, urls)| !urls.is_empty())
         .collect()
+}
+
+/// FR-115 P4b-2 — does this `/stats` body come from a derp-relay that keeps
+/// coturn's totals for the API to pull? Only one whose coturn publishes to the
+/// PoP's own Redis reports `turn_usage` (an object). Every other endpoint is
+/// never pulled.
+fn keeps_turn_usage(body: &serde_json::Value) -> bool {
+    body.get("turn_usage")
+        .is_some_and(serde_json::Value::is_object)
+}
+
+/// The pull for one endpoint: its `/stats` path plus `/turn-usage` (under the
+/// prefix every PoP's nginx already proxies), after the cursor this pod holds
+/// for it.
+fn turn_usage_url(stats_url: &str, cursor: Option<&(String, u64)>) -> String {
+    let base = format!("{}/turn-usage", stats_url.trim_end_matches('/'));
+    match cursor {
+        Some((boot, after)) => format!("{base}?boot={boot}&after={after}"),
+        None => base,
+    }
 }
 
 /// FR-115 P4a-2 — the push of the over-allowance set to the PoPs, on the
@@ -283,6 +304,144 @@ impl AllowancePush {
     }
 }
 
+/// The most pages one endpoint is read in one poll; the rest wait for the next.
+const TURN_USAGE_PAGES_PER_POLL: usize = 10;
+
+/// FR-115 P4b-2 — TURN bytes from the regional PoPs' coturn. Each PoP's
+/// `derp-relay` keeps the per-allocation totals its coturn publishes to the
+/// PoP's own Redis. On its `/stats` poll, every pod pulls them from each PoP
+/// that reports `turn_usage` ([`keeps_turn_usage`]), after the cursor it
+/// holds, and books each through [`crate::turn_bytes::record`]: once across
+/// pods (the PoP's region is in the claim), and never guessed.
+///
+/// Why a pull of the totals themselves, not a per-org counter on `/stats`:
+/// every pod polls every PoP, and a cumulative counter diffed by two pods is
+/// booked twice (#2763). And unlike `/stats` the pull is not public, because
+/// the usernames name orgs and principals: each request is signed with the
+/// ticket key for that PoP's region (`derp_ticket::sign_turn_usage_request`),
+/// which the PoP checks with the public key it already holds.
+///
+/// Every failure under-reports and nothing is retried. The claim makes a
+/// re-read harmless (a pod that restarts reads the PoP's whole hour again, and
+/// books only what no pod has), but a failed bucket write is dropped.
+pub struct TurnUsagePull {
+    redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
+    stats: Arc<StatsDao>,
+    db_name: String,
+    signer: roomler_ai_remote_control::derp_ticket::DerpTicketSigner,
+}
+
+/// One page of a PoP's kept totals, as `derp-relay` answers it.
+#[derive(serde::Deserialize)]
+struct TurnUsagePage {
+    boot: String,
+    totals: Vec<PulledTotal>,
+    #[serde(default)]
+    more: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct PulledTotal {
+    seq: u64,
+    ch: String,
+    p: String,
+}
+
+impl TurnUsagePull {
+    /// `None` without a usable ticket key: no PoP would answer a pull.
+    pub fn new(
+        settings: &roomler_ai_config::RelaySettings,
+        redis: Arc<crate::ws::redis_pubsub::RedisPubSub>,
+        stats: Arc<StatsDao>,
+        db_name: &str,
+    ) -> Option<Self> {
+        let private_b64 = settings.derp_ticket_private_key.as_deref()?;
+        match roomler_ai_remote_control::derp_ticket::DerpTicketSigner::from_pkcs8_b64(private_b64)
+        {
+            Ok(signer) => Some(Self {
+                redis,
+                stats,
+                db_name: db_name.to_string(),
+                signer,
+            }),
+            Err(e) => {
+                warn!(%e, "turn usage pull: no usable ticket key; PoP TURN bytes are not attributed");
+                None
+            }
+        }
+    }
+
+    /// Read one endpoint's totals after `cursor`, a page at a time, and book
+    /// them. The cursor advances past every total READ.
+    async fn pull(
+        &self,
+        client: &reqwest::Client,
+        region: &str,
+        stats_url: &str,
+        cursor: &mut Option<(String, u64)>,
+    ) {
+        for _ in 0..TURN_USAGE_PAGES_PER_POLL {
+            let token = match self.signer.sign_turn_usage_request(region) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(%e, "turn usage pull: signing failed");
+                    return;
+                }
+            };
+            let url = turn_usage_url(stats_url, cursor.as_ref());
+            let page = match client.get(&url).bearer_auth(&token).send().await {
+                Ok(r) if r.status().is_success() => match r.json::<TurnUsagePage>().await {
+                    Ok(page) => page,
+                    Err(e) => {
+                        debug!(%region, %stats_url, %e, "turn usage pull: bad body");
+                        return;
+                    }
+                },
+                Ok(r) => {
+                    debug!(%region, %stats_url, status = %r.status(), "turn usage pull: refused");
+                    return;
+                }
+                Err(e) => {
+                    debug!(%region, %stats_url, %e, "turn usage pull: failed");
+                    return;
+                }
+            };
+            for t in &page.totals {
+                let Some(r) = roomler_ai_remote_control::turn_stats::parse(&t.ch, &t.p) else {
+                    continue;
+                };
+                use crate::turn_bytes::{Outcome, Source};
+                match crate::turn_bytes::record(
+                    &self.redis,
+                    &self.stats,
+                    &self.db_name,
+                    Source::Pop(region),
+                    &r,
+                )
+                .await
+                {
+                    Outcome::Unattributed => info!(
+                        %region,
+                        username = %r.username,
+                        bytes = r.sentb,
+                        "turn usage pull: a username naming no org (unattributed, never guessed)"
+                    ),
+                    Outcome::Failed(e) => {
+                        warn!(%region, %e, "turn usage pull: not recorded (under-reports)")
+                    }
+                    Outcome::Booked(_) | Outcome::AlreadyBooked | Outcome::Nothing => {}
+                }
+            }
+            if let Some(last) = page.totals.last() {
+                *cursor = Some((page.boot.clone(), last.seq));
+            }
+            if !page.more {
+                return;
+            }
+        }
+    }
+}
+
 /// Spawn the poller. No-op (never spawns) when regions are disabled or none
 /// exposes a `/stats` endpoint, or when `relay.stats_poll_secs` is 0.
 pub fn spawn_poller(
@@ -296,6 +455,8 @@ pub fn spawn_poller(
     networks: Option<Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>>,
     // FR-115 P4a-2 — `None` ⇒ no push, and so no PoP throttles (fail open).
     allowance_push: Option<AllowancePush>,
+    // FR-115 P4b-2 — `None` ⇒ the PoPs' TURN bytes are not attributed.
+    turn_pull: Option<TurnUsagePull>,
 ) {
     let poll_secs = settings.stats_poll_secs;
     let busy_load = settings.busy_load;
@@ -340,6 +501,10 @@ pub fn spawn_poller(
         // FR-115 P4a-2 — the endpoints whose last answered `GET` reported an
         // `allowance`: the only ones the set is pushed to.
         let mut takers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // FR-115 P4b-2 — the endpoints whose last answered `GET` reported
+        // `turn_usage`, and the cursor (boot, last seq) this pod holds for each.
+        let mut turn_keepers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut turn_cursors: HashMap<String, (String, u64)> = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(poll_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -377,6 +542,11 @@ pub fn spawn_poller(
                         takers.insert(url.clone());
                     } else {
                         takers.remove(url);
+                    }
+                    if keeps_turn_usage(&body) {
+                        turn_keepers.insert(url.clone());
+                    } else {
+                        turn_keepers.remove(url);
                     }
                     agg.add(
                         &body,
@@ -494,9 +664,31 @@ pub fn spawn_poller(
             // After the GETs, so even the first poll pushes only to the
             // endpoints that take it.
             if let Some(push) = &allowance_push {
-                let to = allowance_push_targets(&targets, &takers);
+                let to = endpoints_in(&targets, &takers);
                 if !to.is_empty() {
                     push.push(&client, &to, poll_secs.saturating_mul(3)).await;
+                }
+            }
+            // FR-115 P4b-2 — pull every PoP that keeps coturn's totals, all at
+            // once, so one dead PoP does not stretch the tick.
+            if let Some(pull) = &turn_pull {
+                let pulls = endpoints_in(&targets, &turn_keepers)
+                    .into_iter()
+                    .flat_map(|(region, urls)| {
+                        urls.into_iter().map(move |url| (region.clone(), url))
+                    })
+                    .map(|(region, url)| {
+                        let mut cursor = turn_cursors.get(&url).cloned();
+                        let client = &client;
+                        async move {
+                            pull.pull(client, &region, &url, &mut cursor).await;
+                            (url, cursor)
+                        }
+                    });
+                for (url, cursor) in futures::future::join_all(pulls).await {
+                    if let Some(c) = cursor {
+                        turn_cursors.insert(url, c);
+                    }
                 }
             }
         }
@@ -638,6 +830,37 @@ mod tests {
         ));
     }
 
+    /// FR-115 P4b-2 — only a derp-relay that keeps coturn's totals is
+    /// pulled: one whose `/stats` carries a `turn_usage` object. A PoP whose
+    /// coturn publishes nowhere reports `null`; an older one, nothing.
+    #[test]
+    fn only_a_body_reporting_turn_usage_is_pulled() {
+        assert!(keeps_turn_usage(&serde_json::json!({
+            "turn_usage": { "boot": "18f2-1a", "kept": 0, "last_seq": 0 }
+        })));
+        assert!(!keeps_turn_usage(
+            &serde_json::json!({ "turn_usage": null })
+        ));
+        assert!(!keeps_turn_usage(&serde_json::json!({ "cpus": 2 })));
+    }
+
+    /// The pull goes under the `/stats` prefix the PoPs' nginx proxies, with
+    /// the cursor once this pod holds one.
+    #[test]
+    fn the_pull_is_under_stats_with_the_cursor() {
+        assert_eq!(
+            turn_usage_url("https://derp-us-east.roomler.ai/stats", None),
+            "https://derp-us-east.roomler.ai/stats/turn-usage"
+        );
+        assert_eq!(
+            turn_usage_url(
+                "https://derp-us-east.roomler.ai/stats/",
+                Some(&("18f2-1a".to_string(), 42))
+            ),
+            "https://derp-us-east.roomler.ai/stats/turn-usage?boot=18f2-1a&after=42"
+        );
+    }
+
     #[test]
     fn push_targets_keep_only_the_endpoints_that_take_it() {
         let targets = vec![
@@ -653,7 +876,7 @@ mod tests {
         let takers: std::collections::HashSet<String> =
             std::iter::once("https://derp-us-east/stats".to_string()).collect();
         assert_eq!(
-            allowance_push_targets(&targets, &takers),
+            endpoints_in(&targets, &takers),
             vec![(
                 "us-east".to_string(),
                 vec!["https://derp-us-east/stats".to_string()]
@@ -661,7 +884,7 @@ mod tests {
             "a region left with no taker is dropped, not pushed to"
         );
         // Before any GET has answered, nobody is pushed to.
-        assert!(allowance_push_targets(&targets, &Default::default()).is_empty());
+        assert!(endpoints_in(&targets, &Default::default()).is_empty());
     }
 
     #[test]

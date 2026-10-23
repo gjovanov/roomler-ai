@@ -225,3 +225,144 @@ async fn the_rc_prefetch_is_charged_to_the_devices_org() {
     .await;
     assert_eq!(org_of_username(&u), None, "a device of another org: {u}");
 }
+
+/// FR-115 P4b-2 — a regional PoP's coturn totals, pulled by both pods from
+/// the PoP's `derp-relay`, are booked once for the org the username names.
+/// The fake PoP plays `derp-relay`: it reports `turn_usage` on `/stats`, and
+/// answers `/stats/turn-usage` only to a request that verifies with the ticket
+/// key's PUBLIC half for its own region. It ignores the cursor and serves the
+/// same two legs on every pull, so "once" here is the claim's doing across
+/// pods AND polls, not the cursor's.
+#[tokio::test]
+async fn a_pops_totals_are_pulled_and_booked_once_across_pods() {
+    use axum::response::IntoResponse;
+    use base64::Engine as _;
+    use roomler_ai_remote_control::derp_ticket::{self, DerpTicketSigner};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let pkcs8 =
+        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let private_b64 = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
+    let signer = DerpTicketSigner::from_pkcs8_b64(&private_b64).unwrap();
+    let public =
+        Arc::new(derp_ticket::decoding_key_from_public_b64(signer.public_key_b64()).unwrap());
+
+    // What the PoP keeps; filled once the org exists.
+    let totals: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let (served, refused) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let pop = {
+        let (totals, public, served, refused) = (
+            totals.clone(),
+            public.clone(),
+            served.clone(),
+            refused.clone(),
+        );
+        axum::Router::new()
+            .route(
+                "/stats",
+                axum::routing::get(|| async {
+                    axum::Json(json!({
+                        "cpus": 1,
+                        "turn_usage": { "boot": "fake-boot", "kept": 2, "last_seq": 2 },
+                    }))
+                }),
+            )
+            .route(
+                "/stats/turn-usage",
+                axum::routing::get(move |headers: axum::http::HeaderMap| {
+                    let (totals, public, served, refused) = (
+                        totals.clone(),
+                        public.clone(),
+                        served.clone(),
+                        refused.clone(),
+                    );
+                    async move {
+                        let ok = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.strip_prefix("Bearer "))
+                            .is_some_and(|t| {
+                                derp_ticket::verify_turn_usage_request(t, &public, "pop-test")
+                                    .is_ok()
+                            });
+                        if !ok {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        served.fetch_add(1, Ordering::Relaxed);
+                        let totals = totals.lock().unwrap().clone();
+                        axum::Json(json!({ "boot": "fake-boot", "totals": totals, "more": false }))
+                            .into_response()
+                    }
+                }),
+            )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pop_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, pop).await.unwrap() });
+
+    let (app1, _app2) = TestApp::spawn_pair(move |s| {
+        attribution_on(s);
+        s.stats.enabled = true;
+        s.turn.url = Some("turn:coturn.example:3478".into());
+        s.turn.shared_secret = Some(ObjectId::new().to_hex());
+        s.relay.regions_enabled = true;
+        s.relay.regions = Some(format!(
+            r#"[{{"id":"pop-test","turn_url":"turn:coturn-pop.example:3478","stats_urls":["http://{pop_addr}/stats"]}}]"#
+        ));
+        s.relay.stats_poll_secs = 1;
+        s.relay.derp_ticket_private_key = Some(private_b64.clone());
+    })
+    .await;
+    if app1.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let t = app1.seed_tenant("fr115turn9").await;
+    let org = ObjectId::parse_str(&t.tenant_id).unwrap();
+    let username = format!(
+        "1792000000:{}",
+        charged(&ObjectId::new().to_hex(), &org.to_hex())
+    );
+    let (client, peer) = channels(&username, 909);
+    *totals.lock().unwrap() = vec![
+        json!({ "seq": 1, "at": 0, "ch": client, "p": "rcvp=10, rcvb=1000, sentp=20, sentb=40000" }),
+        json!({ "seq": 2, "at": 0, "ch": peer, "p": "rcvp=20, rcvb=40000, sentp=10, sentb=2000" }),
+    ];
+
+    // Until both legs land, then three more pulls by the pods (the fake
+    // serves the same legs every time).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while turn_bytes(&app1, org).await < 42_000 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let pulls_then = served.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while served.load(Ordering::Relaxed) < pulls_then + 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        served.load(Ordering::Relaxed) >= pulls_then + 3,
+        "the pods kept pulling"
+    );
+    assert_eq!(
+        turn_bytes(&app1, org).await,
+        42_000,
+        "each leg once: 40,000 toward the client plus 2,000 toward the peer"
+    );
+    assert_eq!(
+        refused.load(Ordering::Relaxed),
+        0,
+        "every pod's request verified"
+    );
+
+    // The negative control: the fake refuses a request that is not the API's.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{pop_addr}/stats/turn-usage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    assert_eq!(refused.load(Ordering::Relaxed), 1);
+}

@@ -72,6 +72,16 @@ else
   export EXTERNAL_IP_LINE="# external-ip not needed (public IP bound directly)"
   export RELAY_IP="${PUBLIC_IP}"
 fi
+# FR-115 P4b-2: coturn's per-allocation totals for per-org TURN bytes, through
+# the compose file's loopback Redis (:6390) to derp-relay. On unless pop.env
+# says TURN_STATS=0.
+if [ "${TURN_STATS:-1}" != "0" ]; then
+  export TURN_STATSDB_LINE='redis-statsdb="ip=127.0.0.1 port=6390 dbname=0 connect_timeout=5"'
+  export TURN_STATS_REDIS="redis://127.0.0.1:6390"
+else
+  export TURN_STATSDB_LINE="# redis-statsdb off (TURN_STATS=0 in pop.env)"
+  export TURN_STATS_REDIS=""
+fi
 envsubst < "$POP/turnserver.conf.tpl" > "$POP/turnserver.conf.new"
 if cmp -s "$POP/turnserver.conf.new" "$POP/turnserver.conf" 2>/dev/null; then
   rm -f "$POP/turnserver.conf.new"
