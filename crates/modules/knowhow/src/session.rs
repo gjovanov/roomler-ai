@@ -67,43 +67,6 @@ pub(crate) enum Question {
 }
 
 impl Question {
-    /// The question a frame asks, or the frame back when it asks none.
-    fn of(msg: ClientMsg) -> Result<Self, ClientMsg> {
-        match msg {
-            ClientMsg::KnowhowSearch {
-                req_id,
-                session_id,
-                fence,
-                q,
-                kind,
-                env,
-                limit,
-            } => Ok(Self::Search {
-                req_id,
-                session_id,
-                fence,
-                q,
-                kind,
-                env,
-                limit,
-            }),
-            ClientMsg::KnowhowGet {
-                req_id,
-                session_id,
-                fence,
-                kind,
-                key,
-            } => Ok(Self::Get {
-                req_id,
-                session_id,
-                fence,
-                kind,
-                key,
-            }),
-            other => Err(other),
-        }
-    }
-
     fn req_id(&self) -> &str {
         match self {
             Self::Search { req_id, .. } | Self::Get { req_id, .. } => req_id,
@@ -130,9 +93,38 @@ impl Questions {
     /// Queue the question `msg` asks, or answer it `busy` when its
     /// connection's queue is full. The frame back when it asks no question.
     pub(crate) fn take(&self, ctx: &AgentCtx, msg: ClientMsg) -> Option<ClientMsg> {
-        let question = match Question::of(msg) {
-            Ok(q) => q,
-            Err(other) => return Some(other),
+        let question = match msg {
+            ClientMsg::KnowhowSearch {
+                req_id,
+                session_id,
+                fence,
+                q,
+                kind,
+                env,
+                limit,
+            } => Question::Search {
+                req_id,
+                session_id,
+                fence,
+                q,
+                kind,
+                env,
+                limit,
+            },
+            ClientMsg::KnowhowGet {
+                req_id,
+                session_id,
+                fence,
+                kind,
+                key,
+            } => Question::Get {
+                req_id,
+                session_id,
+                fence,
+                kind,
+                key,
+            },
+            other => return Some(other),
         };
         let queued = match self.conns.get(&ctx.conn_id).map(|q| q.value().clone()) {
             Some(queue) => queue.try_send(question).map_err(|e| match e {
@@ -538,10 +530,30 @@ mod tests {
         }
     }
 
-    /// A frame that asks no question goes back untouched, for the scans'
-    /// handler or the Hub.
+    /// A connection's context, its answers read from the receiver.
+    fn ctx() -> (AgentCtx, mpsc::Receiver<ServerMsg>) {
+        let (tx, rx) = mpsc::channel(4);
+        let ctx = AgentCtx {
+            conn_id: "c1".into(),
+            agent_id: ObjectId::new(),
+            tenant_id: ObjectId::new(),
+            owner_user_id: ObjectId::new(),
+            agent_version: "0.4.159".into(),
+            os: roomler_ai_remote_control::models::OsKind::Linux,
+            dialed_tid: None,
+            conn_established_ms: 0,
+            tx,
+        };
+        (ctx, rx)
+    }
+
+    /// A frame that asks no question goes back untouched, for the Hub; a
+    /// question on a connection with no queue (its hello not yet run here)
+    /// is answered `busy`, never dropped.
     #[test]
     fn a_frame_that_asks_nothing_is_handed_back() {
+        let (ctx, mut rx) = ctx();
+        let questions = Questions::default();
         let scanned = ClientMsg::KnowhowScanned {
             scan_id: ObjectId::new(),
             outcome: roomler_ai_remote_control::knowhow::ScanOutcome::NoRoots,
@@ -550,9 +562,23 @@ mod tests {
             findings: Vec::new(),
         };
         assert!(matches!(
-            Question::of(scanned),
-            Err(ClientMsg::KnowhowScanned { .. })
+            questions.take(&ctx, scanned),
+            Some(ClientMsg::KnowhowScanned { .. })
         ));
+        let get = ClientMsg::KnowhowGet {
+            req_id: "q1".into(),
+            session_id: ObjectId::new(),
+            fence: 1,
+            kind: "database".into(),
+            key: "prod-mongo".into(),
+        };
+        assert!(questions.take(&ctx, get).is_none(), "a question is taken");
+        match rx.try_recv() {
+            Ok(ServerMsg::KnowhowRefused { req_id, reason }) => {
+                assert_eq!((req_id.as_str(), reason.as_str()), ("q1", "busy"));
+            }
+            other => panic!("not a refusal: {other:?}"),
+        }
     }
 
     /// A refusal names its question, clipped to the bound a device keeps.
