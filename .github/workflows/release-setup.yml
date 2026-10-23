@@ -88,6 +88,14 @@ on:
 permissions:
   contents: write
 
+# FR-6 wave 26 (#773): rehearsals on one branch, the post-release reseed among
+# them, run one at a time, so two never race each other's --clobber on one
+# seed. None is cancelled once running; GitHub keeps one waiting. A tag run
+# gets a group of its own.
+concurrency:
+  group: release-setup-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # ---------------------------------------------------------------------------
   # 0. Validate version matches Cargo.toml
@@ -194,30 +202,66 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
-      - name: Cache cargo
+      - name: Restore cargo seed (release-asset store)
+        # FR-6 wave 26 (#773): the wizard releases built cold. Swatinem saved
+        # only on non-tag runs, release-agent.yml's lockstep job dispatches
+        # this file on the TAG ref, and the one master run (2026-10-14) left
+        # nothing that outlived the Actions pool's LRU. setup-v0.4.135, two
+        # hours after it, was the last warm release (macOS 10.3 min, Windows
+        # 8.4). From 0.4.140 to 0.4.156 every sampled job logged "No cache
+        # found" (macOS 21.8, Windows 15.8 on 0.4.156). The seed now lives on
+        # the `seed-cache` release, restored by family name like
+        # release-agent.yml's, and the `reseed` job below republishes it from
+        # a master rehearsal after every release.
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
           shared-key: setup-linux
-          # Tag-ref cache saves can never be restored by a future tag run
-          # (GH cache isolation: own ref or default branch only) — only
-          # non-tag runs (dispatch rehearsals on master) save.
-          save-if: ${{ github.ref_type != 'tag' }}
-      - name: Install Tauri Linux system deps
+      - name: Configure apt retries and refresh the index
+        # FR-6 wave 26: before the cached install, as release-agent.yml does.
+        # On a stale index the action resolves versions the mirror has
+        # dropped, installs nothing and still reports success.
+        run: |
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
+      - name: Install Tauri Linux system deps (cached apt)
         # webkit2gtk + libsoup + ayatana; librsvg2 for icon decode. Same
         # set as the legacy tunnel wizard (roomler-setup pulls the same
         # Tauri Linux runtime). roomlerd comes in with DEFAULT
         # features (signalling-only) — no vcpkg/FFmpeg/libvpx needed.
+        #
+        # FR-6 wave 26 (#773): from the Actions cache, not the mirror. In
+        # rehearsal run 39958936515 the raw apt-get fetched 61.2 MB in
+        # 19 min 34 s (52 kB/s) from azure.archive.ubuntu.com, longer than
+        # the rest of the job together. A tag run restores the set a master
+        # rehearsal saved (the reseed job's). ⚠️ The action keys on the
+        # package list + `version` + CPU arch only, never the OS release:
+        # `u2404` is ubuntu-latest's today, so bump it when that moves.
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+          version: setup-linux-u2404-v1
+      - name: Verify the wizard's build deps landed (fallback to apt-get)
+        # Asks what the build consults, never the action's status: a restore
+        # untars files and registers nothing (release-agent.yml's guard).
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            patchelf
+          set -euo pipefail
+          pkgs="libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf"
+          check() {
+            sudo ldconfig
+            for m in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 librsvg-2.0 ayatana-appindicator3-0.1; do
+              pkg-config --exists "$m" || { echo "missing: pkg-config module $m"; return 1; }
+            done
+            command -v patchelf >/dev/null || { echo "missing: patchelf"; return 1; }
+          }
+          if ! check; then
+            echo "::warning::the cached apt set did not deliver the wizard's build deps; installing directly"
+            # shellcheck disable=SC2086
+            sudo apt-get install -y --no-install-recommends $pkgs
+          fi
+          check || { echo "::error::the wizard's build deps are still missing after the fallback install"; exit 1; }
       - name: Build wizard (release)
         run: cargo build -p roomler-setup --release
       - name: Strip binary
@@ -244,6 +288,16 @@ jobs:
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
+      - name: Publish cargo seed (rehearsals only)
+        # A tag run never publishes: it stays as fast as the seed lets it,
+        # and the reseed rehearsal it dispatches publishes instead.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: setup-linux
 
   # ---------------------------------------------------------------------------
   # 1b. Linux aarch64 (FR-97 P7b) — the same wizard, built on the arm64 runner
@@ -264,23 +318,44 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
-      - name: Cache cargo
+      - name: Restore cargo seed (release-asset store)
+        # FR-6 wave 26: see build-linux.
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
           shared-key: setup-linux-arm64
-          save-if: ${{ github.ref_type != 'tag' }}
-      - name: Install Tauri Linux system deps
+      - name: Configure apt retries and refresh the index
+        # FR-6 wave 26: see build-linux.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            patchelf
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
+      - name: Install Tauri Linux system deps (cached apt)
+        # FR-6 wave 26: see build-linux. Its own key (`u2204`, this runner's
+        # release): never share build-linux's 24.04 entry, or 24.04 libraries
+        # would unpack onto this 22.04 builder.
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+          version: setup-linux-arm64-u2204-v1
+      - name: Verify the wizard's build deps landed (fallback to apt-get)
+        run: |
+          set -euo pipefail
+          pkgs="libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf"
+          check() {
+            sudo ldconfig
+            for m in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 librsvg-2.0 ayatana-appindicator3-0.1; do
+              pkg-config --exists "$m" || { echo "missing: pkg-config module $m"; return 1; }
+            done
+            command -v patchelf >/dev/null || { echo "missing: patchelf"; return 1; }
+          }
+          if ! check; then
+            echo "::warning::the cached apt set did not deliver the wizard's build deps; installing directly"
+            # shellcheck disable=SC2086
+            sudo apt-get install -y --no-install-recommends $pkgs
+          fi
+          check || { echo "::error::the wizard's build deps are still missing after the fallback install"; exit 1; }
       - name: Build wizard (release)
         run: cargo build -p roomler-setup --release
       - name: Strip binary
@@ -316,6 +391,14 @@ jobs:
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
+      - name: Publish cargo seed (rehearsals only)
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: setup-linux-arm64
 
   # ---------------------------------------------------------------------------
   # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball
@@ -334,17 +417,24 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
-      - name: Cache cargo
+      - name: Restore cargo seed (release-asset store)
+        # FR-6 wave 26: see build-linux. This target holds two triples, so
+        # the accretion GC's whole-target drop gets a higher ceiling.
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "5000"
         with:
-          workspaces: '. -> target'
           shared-key: setup-macos
-          save-if: ${{ github.ref_type != 'tag' }}
-      - name: Build wizard x86_64
-        run: cargo build -p roomler-setup --release --target x86_64-apple-darwin
-      - name: Build wizard aarch64
-        run: cargo build -p roomler-setup --release --target aarch64-apple-darwin
+      - name: Build wizard x86_64 + aarch64
+        # One invocation for both triples (FR-6 wave 26): cargo then fills
+        # one target's serial tail (its last crates and the link) with the
+        # other's crates, where two invocations ran 11.2 + 9.0 min back to
+        # back (run 39943332027).
+        run: >-
+          cargo build -p roomler-setup --release
+          --target x86_64-apple-darwin --target aarch64-apple-darwin
       - name: Lipo into universal
         run: |
           mkdir -p target/release-universal
@@ -453,6 +543,14 @@ jobs:
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
+      - name: Publish cargo seed (rehearsals only)
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: setup-macos
 
   # ---------------------------------------------------------------------------
   # 3. Windows x86_64 — SIGN the EXE, then zip it (pick_setup_asset wants .zip)
@@ -466,7 +564,9 @@ jobs:
     # (the tenant rejects wildcard tag subjects) — do not remove.
     environment: release
     permissions:
-      contents: read
+      # write, not read (FR-6 wave 26): a rehearsal publishes this job's
+      # cargo seed as a release asset, as release-agent.yml's Windows jobs do.
+      contents: write
       id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
@@ -474,13 +574,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
-      - name: Cache cargo
+      - name: Restore cargo seed (release-asset store)
+        # FR-6 wave 26: see build-linux.
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
           shared-key: setup-windows
-          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build wizard (release)
         shell: pwsh
         # Static CRT: the wizard is a double-click EXE extracted from a
@@ -543,6 +644,16 @@ jobs:
             ${{ steps.zip.outputs.artifact }}
             ${{ steps.zip.outputs.artifact }}.sha256
           retention-days: 30
+      - name: Publish cargo seed (rehearsals only)
+        # After the signing step, and it builds nothing: it packs `target`
+        # as it is (the signed EXE included), never relinks.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          shared-key: setup-windows
 
   # ---------------------------------------------------------------------------
   # 4. Publish GitHub Release
@@ -779,3 +890,45 @@ jobs:
             gh issue close "$n" --repo "${{ github.repository }}" --reason completed \
               --comment "$(printf '%s published on %s: %s\n\n/api/setup serves the current wizard again, so the condition this issue reports no longer holds. Closed automatically; a later failure opens a new issue.\n' "$TAG" "$(date -u +%F)" "$run_url")"
           done
+
+  # ---------------------------------------------------------------------------
+  # 7. Re-seed the cargo caches from master (FR-6 wave 26, #773)
+  # ---------------------------------------------------------------------------
+  # A tag run never publishes its seeds (the build jobs' `ref_type != 'tag'`),
+  # so after every published release this dispatches an artifacts-only
+  # rehearsal on master that does, as release-agent.yml's `reseed` job does
+  # for the agent: the next release restores today's dependencies instead of
+  # building them. signing_mode=off: a seed needs no signature, and an
+  # unsigned rehearsal publishes nothing (publish_release=false).
+  reseed:
+    name: Re-seed the wizard's cargo caches (post-release)
+    if: needs.validate-version.outputs.is_release == 'true'
+    needs: [validate-version, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - name: Dispatch the seed rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The rehearsal validates its version against master's Cargo.toml,
+          # which may have moved on since this tag: read it there.
+          version=$(awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "Dispatching the wizard seed rehearsal for ${version}"
+          gh workflow run release-setup.yml --ref master \
+            -f version="${version}" -f publish_release=false -f signing_mode=off
