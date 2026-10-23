@@ -239,6 +239,22 @@ impl AppState {
             redis_pubsub.clone().and_then(|redis| {
                 crate::relay_load::AllowancePush::new(&settings.relay, redis, db.name())
             }),
+            // FR-115 P4b-2 — the PoPs' coturn totals, pulled on the same poll
+            // and booked once across pods. Behind the switch the cluster's
+            // collector reads (`relay_allowance.turn_attribution`), and only
+            // with stats (it books into the usage ledger) and Redis (the
+            // once-only claim).
+            redis_pubsub
+                .clone()
+                .filter(|_| settings.relay_allowance.turn_attribution && settings.stats.enabled)
+                .and_then(|redis| {
+                    crate::relay_load::TurnUsagePull::new(
+                        &settings.relay,
+                        redis,
+                        stats.clone(),
+                        db.name(),
+                    )
+                }),
         );
 
         // C-1 — the directory heartbeat: every 30 s, re-assert this pod's

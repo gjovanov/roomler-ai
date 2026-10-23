@@ -161,18 +161,20 @@ impl TestApp {
     /// one shared Redis at :6379), each with its own pod-local in-memory
     /// state (rc-hub, room manager, …). The second app shortens nothing;
     /// pass a `mutator` applied to BOTH apps' settings for e.g. short
-    /// liveness deadlines.
-    pub async fn spawn_pair(mutator: fn(&mut Settings)) -> (Self, Self) {
+    /// liveness deadlines. A closure works too (FR-115 P4b-2's PoP test hands
+    /// both pods the address of a fake PoP it has just bound).
+    pub async fn spawn_pair(mutator: impl Fn(&mut Settings) + Clone) -> (Self, Self) {
         init_tracing();
         let shared_db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
         let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let (db1, pod1) = (shared_db.clone(), format!("testpod1-{run}"));
+        let first = mutator.clone();
         let app1 = Self::spawn_with_settings(move |s| {
             s.database.name = db1.clone();
             // C-1: distinct stable pod identities per in-process app (env
             // vars are process-global, so identity must ride Settings).
             s.app.pod_id = Some(pod1.clone());
-            mutator(s);
+            first(s);
         })
         .await;
         let (db2, pod2) = (shared_db.clone(), format!("testpod2-{run}"));

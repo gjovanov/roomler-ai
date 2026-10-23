@@ -130,7 +130,7 @@ landed yet is computed at one seat, the floor, so a missing number can only unde
 Every org is created on `free` (`crates/services/src/dao/tenant.rs:284`), on every server.
 On the hosted service that is a plan; on a self-hosted server it is only the absence of
 one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the hosted
-`saas` module is compiled in and switched on (`crates/api/src/state.rs:298`). The published
+`saas` module is compiled in and switched on (`crates/api/src/state.rs:314`). The published
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
@@ -351,7 +351,7 @@ the throttle shapes **bulk only**:
 ```mermaid
 flowchart LR
     FL["usage flush, every pod<br/>(derp.rs:178)"] --> L[("stats_usage")]
-    PP["PoP /stats poll<br/>(relay_load.rs:355)"] --> L
+    PP["PoP /stats poll<br/>(relay_load.rs:521)"] --> L
     L --> J["allowance job, one pod, every 5 min:<br/>month-to-date per org vs<br/>relay_bytes_per_month × seats"]
     J -->|plans_sold only| S[("over-allowance set<br/>(Redis, networks of flagged orgs)")]
     S --> A["each API pod: refresh every 60 s<br/>→ DashSet lookup in forward_frame"]
@@ -438,6 +438,9 @@ read 2026-10-20). The cluster's coturn is 4.18.0, linked with hiredis.
    coturn's statistics. The PoP's `derp-relay` daemon subscribes and keeps per-org totals. It
    reports them on the `/stats` poll the API already makes (`crates/core/src/relay_load.rs`),
    and the API turns them into `turn_bytes`. The PoP stays database-free.
+   *Superseded by [P4b-2, as built](#p4b-2-as-built-the-pops-coturn-pulled-and-booked-once):* the
+   PoP keeps coturn's totals themselves and the API pulls them. A per-org counter on `/stats`
+   would be booked twice by two pods (#2763), and `/stats` is public.
 4. **Exact, but not immediate.** `total_traffic` lands when the allocation ends, so a long
    allocation reports late. For AC8, which is accounting, that is enough. P4c's throttle needs
    fresher numbers and can add the 4096-packet deltas then.
@@ -460,7 +463,7 @@ cluster *before any edit* found it behind on two counts:
 - It pinned coturn **4.17.0**, a pin that had never been applied. The workers ran **4.18.0**
   through `:latest`, so re-running the role would have downgraded TURN on all three at once.
 - Its template lacked the `prometheus` line, which the DERP sidecar's `/stats` scrapes
-  (`crates/derp-relay/src/main.rs:396`).
+  (`crates/derp-relay/src/main.rs:627`).
 
 The role was first brought level with what ran. Then it gained `redis-statsdb` with three
 choices:
@@ -486,6 +489,58 @@ exactly the parsed format. The role was then applied one worker at a time
   *As run:* no relay-forced session. Fleet traffic populated four orgs within minutes. The
   bytes were traced to two known lane sessions and to a throwaway org whose only devices were
   the AC7 rig's (field log, 2026-10-22).
+
+### P4b-2, as built: the PoPs' coturn, pulled and booked once
+
+Item 3 above had each PoP sum per-org totals and report them on `/stats`. Two facts about the
+PoP path made that wrong:
+
+- **Every API pod polls every PoP.** A cumulative counter diffed by two pods is booked twice.
+  The FR-20 path that books the PoPs' DERP bytes does exactly that, latently, because no node
+  homes to a PoP yet (#2763).
+- **`/stats` is public.** The usernames coturn reports name the paying org and the principal.
+
+So the PoP keeps coturn's totals themselves, and the API pulls them:
+
+```mermaid
+sequenceDiagram
+  participant C as coturn (PoP)
+  participant R as Redis (PoP, loopback)
+  participant D as derp-relay (PoP)
+  participant A as each API pod
+  participant L as stats_usage
+  C->>R: PUBLISH the totals when an allocation ends
+  R->>D: the two total_traffic patterns
+  D->>D: keep each, numbered by boot and seq, for an hour
+  A->>D: GET /stats reports turn_usage
+  A->>D: GET /stats/turn-usage after the cursor, signed for the region
+  D-->>A: the totals after the cursor
+  A->>L: turn_bytes once per leg across pods (SET NX, region in the key)
+```
+
+| Piece | Where |
+|---|---|
+| The parser, one for both readers | `crates/remote_control/src/turn_stats.rs:42` (`parse`), moved from the cluster's collector |
+| The PoP's store and its collector | `crates/derp-relay/src/main.rs:256` (`TurnUsage`), `:372` (the subscription to `TURN_STATS_REDIS`) |
+| The PoP's endpoint | `crates/derp-relay/src/main.rs:484` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
+| The signed request | `crates/remote_control/src/derp_ticket.rs:220` (sign), `:239` (verify): audience `derp-turn-usage`, a `region` claim, 60 s |
+| The pull | `crates/core/src/relay_load.rs:327` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:199`) |
+| The booking, one for both readers | `crates/core/src/turn_bytes.rs:86` (`record`). The cluster's claim key is P4b-1's, unchanged (`:71`) |
+| The PoP deploy | `scripts/relay-pop/`: a `redis` service, `TURN_STATS` in `pop.env`, `TURN_STATS_REDIS` for derp-relay, coturn pinned |
+
+- **Once, by the claim, not the cursor.** Each pod keeps its own cursor (`boot` + the last
+  `seq`), so a pod that restarts reads the PoP's whole hour again. The claim, which carries the
+  PoP's region, then books only what no pod has.
+- **Pinned to what runs.** The four PoPs run coturn **4.16.0** (pulled as `:latest`, two weeks
+  up on 2026-10-23), not the cluster's 4.18.0, and the compose file now pins that digest. A rehearsal on
+  it gave the same channels and payload format, Redis support linked, and the Redis host
+  auto-denied as a relay peer.
+- **Nothing new is public, and no secret is new.** The pull carries a request signed with the
+  DERP ticket key, which the PoP checks with the public half it already holds.
+- **Kill switches.** `TURN_STATS=0` in a PoP's `pop.env` (then re-provision), and
+  `relay_allowance.turn_attribution` on the API, which also stops the cluster's collector.
+- **Not yet monitored in the cost view.** `turn_bytes` stays `monitored: false` until the PoPs
+  report in the field.
 
 ### Meetings
 
@@ -565,7 +620,7 @@ room is piped across workers. That is O4.
 | P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`83e9a9772`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
 | P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | ✅ **live and field-verified 2026-10-21**: #2637 (`726654b35` since the 2026-10-21 history rewrite), session slots in the cluster directory (*P3b, as proposed*), with O6 + O7 as the operator decided them on 2026-10-20. The integration lane ran all 11 `org_session_cap` tests, two pods among them. Promoted with `hosted-20261021-adbdadc`, then `rc.session_slots` switched on (deploy `596782e`), on the operator's go. In the field, both halves of AC6 hold: same-org with the slot doing the refusing (red, then green), and cross-org through FR-52's external path (field log) |
 | P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 **live 2026-10-21**, switched on in the deploy repo (`f5940b7`) on the operator's go. At that moment 0 orgs were over their allowance, so it held nobody. On prod all three of AC7's clauses hold (field log): the throttle and the direct path since 2026-10-21, and the org relay since 2026-10-22. Each was measured as a pair against a DERP arm on the same org and ledger. Still owed: O3's usability items. The design was approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `d6235e5ee`) is on the API pods; P4a-3 (#2629, `b2c66f102`) is the analytics surface; P4a-2 (#2633, `11f18c33a`) merged 2026-10-20: the PoPs throttle by the set the API signs and pushes on its `/stats` poll, and a PoP that holds no set throttles nothing. All four PoPs have run it since 2026-10-21 06:11Z, and the API's push has reached every one since the 12:46Z promote (field log) |
-| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | 🟡 **live on the cluster's coturn 2026-10-22**. Designed 2026-10-20 (#2619). P4b-1 (#2622, `54a3709ff`) makes TURN usernames name the paying org (`:org-`) and adds the collector. coturn-worker-1..3 are pinned to the 4.18.0 they ran, and they have published to Redis since 22:14–22:21Z (k8s-cluster-multi `e352c63`, one worker at a time; *As built* above). `relay_allowance.turn_attribution` has been on since 22:25:55Z (deploy `b656323`). AC8 is field-verified (field log). Next: **P4b-2**, the PoPs' coturn. Until it lands, the cost view keeps TURN `monitored: false` |
+| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | 🟡 **live on the cluster's coturn 2026-10-22**. Designed 2026-10-20 (#2619). P4b-1 (#2622, `54a3709ff`) makes TURN usernames name the paying org (`:org-`) and adds the collector. coturn-worker-1..3 are pinned to the 4.18.0 they ran, and they have published to Redis since 22:14–22:21Z (k8s-cluster-multi `e352c63`, one worker at a time; *As built* above). `relay_allowance.turn_attribution` has been on since 22:25:55Z (deploy `b656323`). AC8 is field-verified (field log). **P4b-2** (the PoPs' coturn) is built (*P4b-2, as built*), each PoP keeping coturn's totals for the API to pull with a signed request, and is deployed one PoP at a time after it merges. Until the PoPs report in the field, the cost view keeps TURN `monitored: false` |
 | P4c | TURN throttle for over-allowance orgs | `relay_allowance.turn = false` | ⬜ |
 | P4d | Exit nodes on Free | revert (data only) | ⬜ |
 | P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ✅ merged #2583 (`8ed9ccb34`); AC9 field-verified on prod 2026-10-20 in real time (warned at 55:00, ended at 60:00); the SFU measurement found nothing to measure (O4) |
