@@ -939,7 +939,9 @@ mod tests {
         // SAFETY: reads the caller's own credentials; it cannot fail.
         let as_root = unsafe { libc::geteuid() } == 0;
         let missing = root.path().join("missing");
-        let (s, _tmp) = scanner(&[root.path(), &missing, Path::new("/")]);
+        // `/` first: a macOS temp path is long enough to push a later root's
+        // reason past the detail's 200 characters.
+        let (s, _tmp) = scanner(&[Path::new("/"), root.path(), &missing]);
         let (tx, mut rx) = mpsc::channel(4);
 
         handle_scan(Some(&s), ObjectId::new(), true, tx);
@@ -953,9 +955,11 @@ mod tests {
         assert_eq!(outcome, ScanOutcome::Done, "{detail}");
         assert!(truncated);
         assert_eq!(findings.len(), 1);
-        assert!(detail.starts_with("2 of 3 roots not read"), "{detail}");
+        assert!(
+            detail.starts_with("2 of 3 roots not read: / (owned by root"),
+            "{detail}"
+        );
         assert!(detail.contains("missing"), "{detail}");
-        assert!(detail.contains("/ (owned by root"), "{detail}");
     }
 
     /// A child that fails or hangs leaves its root unread.
