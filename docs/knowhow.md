@@ -422,7 +422,7 @@ machine's MagicDNS name off the map until a later sync put it back
 **Declared tunnel routes** (`[[tunnel_routes]]`) are not among the facts: the server never
 holds them. They live in the device's own config, outside its remote configuration surface,
 and the tunnel hub knows only the flows live on its pod. They come with the device's own scan
-(P4-3b).
+(§11.1), which sends them from P4-3b-1.
 
 ## 11. Scans (P4-3a)
 
@@ -430,8 +430,9 @@ A scan is the server's request and the device's answer (decision 38): a person a
 to scan, and the device reads only the roots its owner lists, each as the account that owns it
 ([`scan.rs`](../crates/modules/knowhow/src/scan.rs)). P4-3a-1 builds the request, its
 delivery and the answer's record; P4-3a-2 writes what a scan found onto the map (§11.1,
-decision 42). The device's half (the roots, the scanners) is P4-3b's. The design, with
-decisions 41–44, is the FR-90 spec's §3e "P4-3, scans, as designed".
+decision 42). The device's half (the roots, the scanners) is P4-3b's, designed with
+decisions 45–47 in the FR-90 spec's §3e "P4-3b, a device's scan, as designed". The server's
+half, with decisions 41–44, is its §3e "P4-3, scans, as designed".
 
 ```mermaid
 sequenceDiagram
@@ -587,7 +588,10 @@ entities with its machine.
 
 | Step | Builds |
 |---|---|
-| P4-3b | the device's half of scans (§11 built the server's): the roots its owner lists in `knowhow_scan_roots` (decision 38), each read as the account that owns it, for metadata only; the `knowhow-scan` verb advertised, and a kube context's token offered to the vault on the device, never sent |
+| P4-3b-1 | the device's half of scans (§11 built the server's), on Linux and macOS: the roots its owner lists in `knowhow_scan_roots` (decision 38), read again at each scan, each by a child running as the account that owns it, for metadata only; the `knowhow-scan` verb advertised; checkouts and the primary's declared tunnel routes; an answer `truncated` whenever a root went unread, so only a scan that read everything it lists retires anything |
+| P4-3b-2 | the services a checkout's manifests name, and kube contexts from a kubeconfig the owner lists (decision 46), its users never read |
+| P4-3b-3 | the device's TCP listeners, behind its own `knowhow_scan_listeners` (decision 47) |
+| P4-3b-4 | Windows, every root read as the console user (decision 45) |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |

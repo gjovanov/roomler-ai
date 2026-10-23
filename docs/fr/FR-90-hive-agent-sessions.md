@@ -3095,7 +3095,11 @@ sequenceDiagram
 | P4-3a-0 | the scans' design (§3e "P4-3, scans, as designed"), and decisions 41–44 | docs only | — |
 | P4-3a-1 | device scans, the server's half, the protocol and its record: `rc:knowhow.scan` and `rc:knowhow.scanned` (`Owner::Knowhow`), the `knowhow-scan` verb, the findings' closed shapes and the credential shapes refused; a scan's request, `knowhow_scans`, its delivery, and its answer recorded once, counted by kind | the same | — |
 | P4-3a-2 | device scans, the intake: what a scan writes as its device's (decision 42), its provenance (`device`), what a later scan archives, and a removed device's scan entities | the same | — |
-| P4-3b | device scans, the device's half: `knowhow_scan_roots` as decision 38 says; repositories and checkouts, kube contexts, manifests, listening services, and the device's declared tunnel routes (`[[tunnel_routes]]`, which the server never holds) | device `knowhow_scan_roots` empty | AC15 (repositories, checkouts) |
+| P4-3b-0 | the device's scan's design (§3e "P4-3b, a device's scan, as designed"), and decisions 45–47 | docs only | — |
+| P4-3b-1 | device scans, the device's half, on Linux and macOS: `knowhow_scan_roots` as decision 38 says, read again at each scan; the `knowhow-scan` verb; the frame on the primary's connection alone, run once; each root read by a child as the account that owns it, never through another account's link; the walk and its bounds; checkouts (remotes, branch, root commit); the primary's declared tunnel routes (`[[tunnel_routes]]`, which the server never holds); the answer, checked and bounded, `truncated` whenever a root went unread | device `knowhow_scan_roots` empty | AC15 (repositories, checkouts) |
+| P4-3b-2 | what a checkout's manifests and a listed kubeconfig say: the services compose and Kubernetes manifests name, and kube contexts as decision 46 says, through one bounded YAML reader | the same | — |
+| P4-3b-3 | the device's listeners, as decision 47 says | device `knowhow_scan_listeners` off | — |
+| P4-3b-4 | Windows, as decision 45 says | device `knowhow_scan_roots` empty | — |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, over `rc:knowhow.*`, believed from the session's record; and `knowhow_propose` as decision 39 says | `[modules] knowhow` | — |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says | the same | — |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving | the same; the vault's own gates | AC15 ("through the mesh") |
@@ -3153,16 +3157,85 @@ sequenceDiagram
   source described. The worst a lying device does is describe itself falsely, and
   name a repository or a cluster that does not exist.
 - ⚠️ **Metadata, never contents.** A checkout's remotes, root commit and branch; a manifest's
-  service names and images; a context's server and CA. A kube context's token is offered to the
-  vault on the device (P4-3b) and never sent, and the intake refuses any finding holding a
-  credential's shape, so nothing a session could not be shown reaches the map.
+  service names and images; a context's server and CA. A kube context's user is never read
+  (P4-3b-0 withdrew what this block first said, that its token would be offered to the vault on
+  the device), and the intake refuses any finding holding a credential's shape, so nothing a
+  session could not be shown reaches the map.
 - ⚠️ **The device decides what is read** (decision 38): the request names no root, and a device
   whose owner lists none answers `no_roots`. The server cannot widen a scan.
 - ⚠️ **Never as the daemon.** Each root is read as the account that owns it (P4-3b), so a scan
   sees what that account sees and no more.
 - **Not in P4-3:** a cadence (decision 44); a secondary organization's scans (decision 43); file
-  contents; importing a found token into the vault, which P4-3b offers on the device and the
-  vault's own routes take.
+  contents; importing a found token into the vault, which only an administrator does, through the
+  vault's own routes.
+
+**P4-3b, a device's scan, as designed (P4-3b-0).** The device's half of decision 38: the daemon
+reads the roots its owner lists, each through a child running as the account that owns it, and
+answers with what it found, checked as the server will check it. Nothing is read that no root
+names, nothing is read as root or SYSTEM, and only a scan that read everything it lists may retire
+anything.
+
+```mermaid
+sequenceDiagram
+    participant H as knowhow, the pod holding the device
+    participant D as roomlerd, as root or SYSTEM
+    participant C as roomlerd knowhow-scan, as the root's account
+    H->>D: rc:knowhow.scan {scan_id}
+    D->>D: the primary's connection? this scan id already run? its roots read again
+    loop each root it lists
+        D->>D: resolved, and its account found (never uid 0, never chosen by a link)
+        D->>C: spawned as that account, with the root and its bounds
+        C->>C: the walk, each checkout read as text
+        C-->>D: one finding a line, then the end
+        D->>D: each finding checked as the server will, the bounds kept
+    end
+    D->>D: the primary's declared tunnel routes, and the listeners when switched on
+    D->>H: rc:knowhow.scanned {scan_id, outcome, detail, truncated, findings}
+```
+
+| Piece | Design |
+|---|---|
+| the roots | `knowhow_scan_roots`, absolute paths, the device's own as `hive_roots` is (`crates/agent-core/src/config.rs:488`): set in its config or over the LocalAPI (`crates/agent-core/src/config_surface.rs:405`, read by `parse_absolute_list`, `:2879`), absent from `DesiredConfig` and named in the test that keeps every device-owned key out of it (`crates/remote_control/src/models.rs:9193`). **Empty means nothing is read**: the answer is `no_roots`. Read again from the config file at each scan, so an owner's edit takes the next scan with no restart. A folder is walked for checkouts; a file is read as a kubeconfig (decision 46) |
+| the verb | `knowhow-scan`, advertised by every build that can scan (`rpc_caps`, `agents/roomlerd/src/encode/caps.rs:1878`) whatever its roots say, since an empty list is an answer: Linux and macOS from P4-3b-1, Windows from P4-3b-4. Compiled where agent sessions are (`cfg(hive_host)`: the `hive` feature, which every release build carries, `.github/workflows/release-agent.yml:530`), since it shares their drop |
+| the frame | `rc:knowhow.scan`, in `handle_server_msg` (`agents/roomlerd/src/signaling.rs:3008`), on the **primary's** connection only (`OrgCtx.is_primary`, `:496`): one arriving on a secondary's is answered `failed` and never run (decision 43), so the gate holds at the device as well as at the server's 409. The scan runs off the signaling loop, never awaited in it, and answers on the primary's connection of the moment, as a session's reports do (`agents/roomlerd/src/hive/supervisor.rs:1547`) |
+| once | one scan at a time. A scan id already running is not started again, and the last 16 answers are kept in memory, so a scan delivered again after a lost connection (the delivery, in P4-3's design above) is answered from what it found, never run twice |
+| whose eyes | each root is read by a child, `roomlerd knowhow-scan` (hidden, as `caps-probe` and `portal-helper` are, `agents/roomlerd/src/main.rs:227`, `:250`), running as the account that owns the root (decision 38): exec's one drop (`drop_body`, `agents/roomlerd/src/exec.rs:1328`), with `no_new_privs` on Linux as an agent session has it (`:1216`). uid 0 is refused (`:1048`), so a root owned by root is never read: the owner lists the folders below it. A daemon that is not root, a per-user install, reads only the roots it owns, as itself. The child's environment is emptied but for its account's `HOME`, `USER` and `LOGNAME`, a fixed `PATH` and `LANG=C`: it reads no config and holds no token, and a fault in one of its readers costs a child, never the daemon |
+| a link cannot choose the account | the daemon resolves each root, and a symbolic link on the way must belong to root or to the account that owns where it leads, or the root is refused: otherwise an account could link a listed folder of its own to another account's, and the scan would read that one with its owner's eyes. The child resolves the root again and refuses one that is no longer its account's. The walk follows no link |
+| the walk | bounded: 8 levels below the root, 100,000 entries, 60 s a root and 5 min a scan; on the root's own filesystem, so a hung network share cannot stall it; in sorted order, so a scan cut at a bound is cut at the same place each time; dot-folders and the usual build and dependency trees (`node_modules`, `target`, `vendor`, `.venv` and their kin) skipped; at low priority. A folder holding `.git` (a folder, or a file naming one: a worktree) is a checkout, and the walk goes no deeper into it for others |
+| a checkout | read as text, never through git's porcelain: each remote's URL from its config (the shared one, for a worktree), any user and password taken out, and a remote still holding a credential's shape dropped; its branch from `HEAD`; its root commit by `git rev-list --max-parents=0 HEAD` as its account, with hooks, fsmonitor, prompts and lazy fetches off and 5 s each, only where a real git is installed (on macOS `/usr/bin/git` is a stub that offers the console user an install dialog unless the developer tools are there), and never in a shallow clone, whose boundary is not its root. None otherwise |
+| manifests (P4-3b-2) | in a checkout, three levels down at most: compose files (`compose.yaml`, `docker-compose.yml` and their kin) and Kubernetes manifests (the documents of a workload kind), each service's name and image; 256 KiB a file, 200 files a checkout. Read through `yaml-rust2`'s event parser (already in the lockfile, by `config`), never its loader, which copies an anchor's whole subtree at every alias, so a file of a few lines can grow without bound: here an alias counts as its anchor's size against 100,000 nodes a document, and a file past it is skipped. Helm templates are not YAML until rendered, and are skipped |
+| kube contexts (P4-3b-2) | from a file the owner lists as a root (decision 46), read as the account that owns it: each context's name, server and namespace, and its cluster's CA as the SHA-256 of its certificate, the fingerprint `openssl x509 -noout -fingerprint -sha256` prints, so a person can check it by hand. The reader skips `users` without keeping a byte of it |
+| listeners (P4-3b-3) | when the owner switches on `knowhow_scan_listeners` (decision 47): the machine's TCP listeners from the system's own table, read by the daemon, since no account's file is opened. The readers `port_holder` has for one port (`agents/roomlerd/src/tunnel/port_holder.rs:148`, `:251`, `:315`), widened to every port; the daemon's own left out |
+| declared tunnel routes | the daemon's own `[[tunnel_routes]]` (`crates/agent-core/src/config.rs:1937`), read again with the roots: each route's id, kind (as `flow`), local port, node, remote and whether it is enabled (`crates/localapi/src/lib.rs:905`). The primary's only (`org` absent or `primary`): a secondary's route names another organization's node |
+| the answer | each finding checked as the server will check it (`Finding::check`, `crates/remote_control/src/knowhow.rs:249`) and dropped, counted, when refused, so the device never sends what the intake would refuse; a finding two roots share sent once; cut at 2,000 findings or 1 MiB (`:24`, `:26`). `done`, and `truncated` as well when a root was refused, unreadable, cut at a bound or killed at its deadline; `failed` when no root could be read. `detail` names the roots not read, and why |
+| Windows (P4-3b-4) | decision 45: every root read as the console user, through the console-user spawn exec and SSH use (`agents/roomlerd/src/exec.rs:3391`; who that is, `agents/roomlerd/src/hive_win.rs:135`). Nobody signed in is `failed` (`no_console_user`), never a read as SYSTEM |
+| the kill switches | the device's `knowhow_scan_roots` empty (nothing read: `no_roots`); its `knowhow_scan_listeners` off (no listener) |
+
+- ⚠️ **Only a scan that read everything it lists retires anything.** A root that is missing,
+  refused or cut makes the answer `truncated`, and a truncated scan archives nothing (P4-3's
+  design above). So a folder on an unplugged disk, or a typo, never archives what earlier scans
+  found: the scan's `detail` names it on screen instead, until the owner fixes the list.
+- ⚠️ **macOS's protected folders.** A root under `~/Desktop`, `~/Documents` or `~/Downloads` reads
+  "Operation not permitted" unless `roomlerd` holds Full Disk Access. It is reported unread, with
+  that reason, and never read again as another account.
+- ⚠️ **A per-user Linux daemon** runs with `ProtectHome=read-only`
+  (`agents/roomlerd/packaging/linux/roomler.service:38`), which still lets it read its own roots;
+  the root unit has no home sandboxing at all
+  (`agents/roomlerd/packaging/linux/roomlerd.service:74`).
+- ⚠️ **No token is offered to the vault.** P4-3's design said a kube context's token would be
+  offered to the vault on the device; P4-3b-0 withdraws it. A device writes no secret into the
+  vault (only an administrator does, through its routes, `docs/vault.md` §6), and a cluster's
+  credential is the Kubernetes minter's to mint (`docs/vault.md` §20). The scan never reads a
+  context's user, so it holds no token to offer. The comment that still says so
+  (`crates/remote_control/src/knowhow.rs:121`) is corrected in P4-3b-2.
+- **Tests.** The walk, the readers, the bounds and the answer as unit tests over temporary trees,
+  under `hive::`, so the macOS lane's filter runs them as well (`.github/workflows/ci.yml:1230`;
+  the Linux lane runs every one, `:607`). The frame end to end as an integration test, with the
+  scanner run in-process, since the harness has no `roomlerd` binary to spawn. The child and its
+  drop are proven on the field, on Linux and macOS (P4k): no CI runner is root beside other
+  accounts' folders.
+- **Not in P4-3b:** submodules and bare repositories; UDP listeners; `$KUBECONFIG` (the owner
+  lists each file); a local preview of what a scan would say; a cadence (decision 44).
 
 ### 3f. The brain
 
@@ -3549,7 +3622,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P4-2b | the network's half of the sync (`docs/knowhow.md` §10.2): a machine's lease (`overlay.ipv4`), its name there and its MagicDNS name as the device list shows them, the subnets it carries for its peers (`overlay.routes`: approved and still offered, the default route apart, at most 64) and whether it is an exit (`overlay.exit`, the data plane's), its tunnel mesh routes, whether its build serves roomler SSH and gate 3. An overlay fact exists while the device holds a live node, so an evicted node's facts leave the machine and the rest of it stays. Read at a hello (the device's own node) and by the reconcile (the organization's nodes, once): the network calls nobody, and a hook on its join path would put a map's freshness on the mesh's. A machine keeps room for the sync's 14 facts: a person's own stop at 50, and an edit that adds none still passes. Declared tunnel routes moved to P4-3b, because the server never holds them. Still no module edge: the overlay's rows are read through the shared DAOs, the domain through core's tenants | `knowhow.tenants`; `[modules] knowhow` | **merged** #2752 `5d61defda` |
 | P4-3a-0 | the scans' design (§3e "P4-3, scans, as designed"), docs only. A scan is the server's request and the device's answer: a person with `KNOWHOW_EDIT` asks for a device (decision 41), only its primary enrollment's (decision 43), only when asked (decision 44), and a device that cannot scan is refused 412. The request is a row in `knowhow_scans`, and the row is the bus, the vault's way: the pod holding the device's connection pushes `rc:knowhow.scan` at once, at its next sweep or at the device's next hello, after a compare-and-set to `delivered`, so no `knowhow → fleet` edge is needed. The device answers `rc:knowhow.scanned` with typed, closed and bounded findings, none holding a credential. A scan writes what lives on its device and nothing else (decision 42): its checkouts and listeners, keyed by its node id; shared repositories and clusters made bare and never changed; links from its own entities; and a later scan archives what it no longer reports. Source `scan` and the device on every write. Poses decisions 41–44 | docs only | **merged** #2753 `6506e9b93` |
 | P4-3a-1 | device scans, the protocol and its record (`docs/knowhow.md` §11). The wire: `Owner::Knowhow`, `rc:knowhow.scan {scan_id}` and `rc:knowhow.scanned {scan_id, outcome, detail, truncated, findings}`, its outcome `failed` for an unknown word or none; the verb `knowhow-scan`, matched whole; `remote_control::knowhow`'s closed findings (a checkout with its manifests' services, a kube context, a listener, a declared tunnel route, whose kind travels as `flow` since `kind` names the finding), read one at a time so an unknown kind is skipped and counted, bounded (2,000, 1 MiB, each string), and `holds_credential`, which refuses a finding holding a URL's password, a known token's prefix, an AWS access key, a PEM block or a JWT. The request: `POST …/knowhow/scan` (`KNOWHOW_EDIT`, decision 41) → 202 with the scan or the device's pending one (a partial unique index on `pending`); 409, not P4-0's 412, for a device that cannot scan or is a secondary enrollment (`update_mode: primary_org`, decision 43), as fleet refuses an update push a device would ignore. The delivery, the vault's way: a connection is linked at its hello when its device can scan; the scan goes at once from the pod holding it, from that pod's sweep (`knowhow.scan_sweep_secs`, 5 s) when another pod took the request, or at the device's next hello, each first send a compare-and-set to `delivered` and put back when it cannot go out in 2 s; a delivered scan still unanswered goes again at the next hello. The answer: recorded once, by the device it was sent to; a `done` answer counted by kind, one past its bounds `failed`, a detail clamped and withheld when it holds a credential's shape; nothing of a finding stored yet. `knowhow_scans` kept 90 days; 24 h unanswered is `expired`. Still no module edge | `knowhow.tenants`; `[modules] knowhow` | **merged** #2754 `902f01a0e` |
-| P4-3a-2 | what a scan writes, as decision 42 recommends (`docs/knowhow.md` §11.1): written once the answer took, so a scan is written once, and stamped on its record (`written`). Its device's own: a `checkout` keyed `<node id>/<16 hex of the path's SHA-256>` (a path is not a key) with `path`, `remotes`, `root_commit`, `branch` and `services`; an `endpoint` keyed `<node id>:<port>/<protocol>`; its machine's `tunnel.declared`. Shared, bare, never changed and no device's: a `repo` keyed by its remote (host and path, lowercase, no scheme, user, port or `.git`) and a `cluster` keyed by its server's `host:port`. Links: `checked_out_at`, `part_of` (the remote's name), `runs_on`, `reachable_via` (the device's contexts). `device` on every entity, link, fact and history row a scan writes, beside `by`. A complete scan archives what its device's earlier scans wrote and it no longer reports, never a shared entity; a truncated or failed one archives nothing, `no_roots` all of it; a removed device takes its scan part. A key a person holds is left as it is. What a scan says is the device's: a person's change to a scan entity's name, owner or scanned facts, to a machine's `tunnel.declared` or to any fact a scan said, and archiving a scan entity, are refused 400. A machine now keeps room for 15 facts, so a person's own stop at 49 (50 in P4-2b); a scan entity's at 55 | `knowhow.tenants`; `[modules] knowhow` | **in review** |
+| P4-3a-2 | what a scan writes, as decision 42 recommends (`docs/knowhow.md` §11.1): written once the answer took, so a scan is written once, and stamped on its record (`written`). Its device's own: a `checkout` keyed `<node id>/<16 hex of the path's SHA-256>` (a path is not a key) with `path`, `remotes`, `root_commit`, `branch` and `services`; an `endpoint` keyed `<node id>:<port>/<protocol>`; its machine's `tunnel.declared`. Shared, bare, never changed and no device's: a `repo` keyed by its remote (host and path, lowercase, no scheme, user, port or `.git`) and a `cluster` keyed by its server's `host:port`. Links: `checked_out_at`, `part_of` (the remote's name), `runs_on`, `reachable_via` (the device's contexts). `device` on every entity, link, fact and history row a scan writes, beside `by`. A complete scan archives what its device's earlier scans wrote and it no longer reports, never a shared entity; a truncated or failed one archives nothing, `no_roots` all of it; a removed device takes its scan part. A key a person holds is left as it is. What a scan says is the device's: a person's change to a scan entity's name, owner or scanned facts, to a machine's `tunnel.declared` or to any fact a scan said, and archiving a scan entity, are refused 400. A machine now keeps room for 15 facts, so a person's own stop at 49 (50 in P4-2b); a scan entity's at 55 | `knowhow.tenants`; `[modules] knowhow` | **merged** #2755 `4778fda64` |
+| P4-3b-0 | the device's scan's design (§3e "P4-3b, a device's scan, as designed"), docs only. The daemon reads the roots its owner lists in `knowhow_scan_roots` (device-owned, never in `DesiredConfig`, read again at each scan; a folder walked for checkouts, a file read as a kubeconfig), each through a hidden child, `roomlerd knowhow-scan`, running as the account that owns the root by exec's one drop: uid 0 refused, a daemon that is not root reading only its own roots, and each symbolic link on the way belonging to root or to the account it leads to, so no link chooses the account. The frame runs on the primary's connection only, once per scan id, off the signaling loop. The walk is bounded (8 levels, 100,000 entries, 60 s a root, 5 min a scan, one filesystem, sorted, build trees skipped); a checkout is read as text (remotes without their users or passwords, its branch, its root commit by `git rev-list` only where a real git is installed and never in a shallow clone); manifests and kubeconfigs go through `yaml-rust2`'s event parser with a node budget that counts an alias as its anchor, `users` never kept; listeners come from the system's table, only behind `knowhow_scan_listeners`; the primary's declared tunnel routes. The answer is checked as the server will check it, bounded, and `truncated` whenever a root went unread, so only a scan that read everything it lists retires anything. Withdraws P4-3's offer of a found token to the vault: a device writes no secret. Steps: P4-3b-1 (Linux and macOS: checkouts and routes), P4-3b-2 (manifests, kube contexts), P4-3b-3 (listeners), P4-3b-4 (Windows, as the console user). Poses decisions 45–47 | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -4485,6 +4559,38 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: a pod roll reconnects every device at once, and each would scan.
     - *Or: on a cadence, an organization's setting.*
       - What it costs: a scheduler and a setting, before anyone has asked for either.
+45. **Whose eyes read a root on Windows** (P4-3b), for the operator to confirm (posted in step 231).
+    - *Recommended: the console user's, for every root listed*, as agent sessions run on Windows
+      (decided on 2026-10-07). Nobody signed in answers `failed` (`no_console_user`), never a read
+      as SYSTEM.
+      - What it costs: who is signed in decides what a scan sees, and a root that user cannot read
+        is reported unread.
+    - *Or: only the roots the console user owns*, as each root is read by its owner on Linux and
+      macOS.
+      - What it costs: a folder made from an elevated shell belongs to the Administrators group,
+        and would never be read.
+    - *Or: no scans on Windows until one is asked for.*
+      - What it costs: a Windows machine's checkouts stay off the map.
+46. **Where a scan finds kube contexts** (P4-3b), for the operator to confirm (posted in step 231).
+    - *Recommended: in a kubeconfig the owner lists among `knowhow_scan_roots`*: a file listed
+      there is read as a kubeconfig, as the account that owns it, for its contexts and clusters
+      alone.
+      - What it costs: the owner lists each kubeconfig as well as the folders.
+    - *Or: in each root's account's `~/.kube/config`.*
+      - What it costs: a file outside every listed root is read, and it is the file that holds the
+        account's cluster credentials.
+    - *Or: nowhere until P4-6 asks for them.*
+      - What it costs: the map's clusters wait, and `roomler_connect` has no cluster to reach.
+47. **What a scan says of the device's listeners** (P4-3b), for the operator to confirm (posted in
+    step 231).
+    - *Recommended: its TCP listeners, when the owner switches on `knowhow_scan_listeners`*, a
+      second device-owned key, default off: a listener is under no root, and its process names
+      software a person runs.
+      - What it costs: one more key for an owner who wants them on the map.
+    - *Or: in every scan with a root.*
+      - What it costs: listing a folder would report what the machine runs, which no root names.
+    - *Or: nothing until P4-6 asks for them.*
+      - What it costs: `roomler_connect` would find no listener to connect to.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
