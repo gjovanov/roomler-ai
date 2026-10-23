@@ -1377,10 +1377,9 @@ export interface RcAppsCoverage {
   missing_tools?: RcAppsMissingTool[]
 }
 /** FR-56 AC10 — why remote apps are unavailable on this host, from the agent.
- *  `code` is a closed set on the agent side (`disabled`, `no_session`,
- *  `no_x_display`, `cannot_run_as`, `tool_missing`, `platform`, and since
- *  FR-97 P2c `switched_off`); the sentence is composed there, because only
- *  the agent knows which arm it took, and the viewer shows it as is. Rides
+ *  `code` is a closed set on the agent side (`disabled`, `no_session`, `no_x_display`,
+ *  `cannot_run_as`, `tool_missing`, `platform`, FR-97 P2c's `switched_off`); the
+ *  sentence is composed there, because only the agent knows which arm it took. Rides
  *  every `supported: false` list reply and every focus/launch refusal that had
  *  no backend. Absent from agents older than AC10. */
 export interface RcAppsUnavailable {
