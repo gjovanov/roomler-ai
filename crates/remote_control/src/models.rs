@@ -9271,6 +9271,10 @@ mod tests {
             // its egress decided by the vault: a server that could clear it
             // would hand every session here the device's own network.
             "hive_egress",
+            // FR-90 P4-3b-1 — which folders a knowhow scan reads (decision
+            // 38): a server that could set it could make every device read,
+            // and describe to the map, whatever folder it named.
+            "knowhow_scan_roots",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

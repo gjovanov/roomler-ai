@@ -537,6 +537,17 @@ const KEYS: &[KeyMeta] = &[
         kind: "bool",
         description: "FR-90 - run every agent session on this device in Claude Code's sandbox: its commands reach only the hosts the organization's vault allows the session's role (net:egress), through a proxy in this daemon, and write only to their working directory, temp, and the session's own cache. A session is refused where the sandbox cannot run: Linux without bubblewrap and socat, Claude Code before 2.1.285. On Windows, where no sandbox runs, every session gets the proxy named in its environment, advisory. Only with vault_enabled. Never settable by the server. Default: OFF.",
     },
+    // FR-90 P4-3b-1 — what a knowhow scan reads (decision 38): the device's,
+    // like every Hive key, and absent from `DesiredConfig`, since a server
+    // that could set it would choose which folders a device reads.
+    KeyMeta {
+        key: "knowhow_scan_roots",
+        group: Group::Access,
+        tier: Tier::Standard,
+        live: true,
+        kind: "list",
+        description: "FR-90 - comma-separated absolute folders this device's knowhow scans read: each is walked for its git checkouts (their remotes, branch and first commit), as the account that owns the folder - never SYSTEM/root, and never a folder root owns. Metadata only, never file contents. Read again at each scan. Never settable by the server. Empty = nothing is read.",
+    },
     KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
@@ -1978,6 +1989,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_net" => Some(fmt_bool(cfg.hive_net)),
         "hive_ssh" => Some(fmt_bool(cfg.hive_ssh)),
         "hive_egress" => Some(fmt_bool(cfg.hive_egress)),
+        "knowhow_scan_roots" => Some(cfg.knowhow_scan_roots.join(",")),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2335,6 +2347,10 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "hive_net" => cfg.hive_net = parse_bool_or(value, false)?,
         "hive_ssh" => cfg.hive_ssh = parse_bool_or(value, false)?,
         "hive_egress" => cfg.hive_egress = parse_bool_or(value, false)?,
+        // Clearing empties the list: nothing is read, the fail-safe direction.
+        "knowhow_scan_roots" => {
+            cfg.knowhow_scan_roots = parse_absolute_list("knowhow_scan_roots", value)?
+        }
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -3244,6 +3260,9 @@ mod tests {
             "external_access_enabled",
             "external_consent_mode",
             "external_max_permissions",
+            // FR-90 P4-3b-1 — read at use: from the config FILE at every
+            // knowhow scan, so nothing re-seeds it.
+            "knowhow_scan_roots",
         ]
         .into_iter()
         .map(String::from)
@@ -4555,6 +4574,50 @@ mod tests {
             apply(&mut cfg, key, None).unwrap();
         }
         assert!(!cfg.hive_enabled && cfg.hive_accounts.is_empty() && cfg.hive_roots.is_empty());
+    }
+
+    /// FR-90 P4-3b-1 — a knowhow scan reads nothing until the owner lists a
+    /// root: empty by default and again when cleared, absolute paths only,
+    /// and live, since every scan reads it from the file.
+    #[test]
+    fn knowhow_scan_roots_default_empty_absolute_and_live() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(cfg.knowhow_scan_roots.is_empty(), "nothing is read");
+        let e = entry_for(&cfg, "knowhow_scan_roots").unwrap();
+        assert_eq!(e.group, Group::Access.wire());
+        assert_eq!(e.kind, "list");
+        assert!(!e.restart_required, "read at every scan");
+
+        let (a, b) = if cfg!(windows) {
+            (r"C:\src", r"D:\work")
+        } else {
+            ("/home/dev/src", "/srv/work")
+        };
+        apply(
+            &mut cfg,
+            "knowhow_scan_roots",
+            Some(&format!(" {a} ,{b}, ")),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.knowhow_scan_roots,
+            vec![a.to_string(), b.to_string()],
+            "trimmed, blanks dropped"
+        );
+        assert_eq!(
+            entry_for(&cfg, "knowhow_scan_roots").unwrap().value,
+            Some(format!("{a},{b}"))
+        );
+        assert!(
+            apply(&mut cfg, "knowhow_scan_roots", Some("src,relative/dir")).is_err(),
+            "a relative path is refused"
+        );
+        assert_eq!(cfg.knowhow_scan_roots.len(), 2, "a refusal changes nothing");
+        apply(&mut cfg, "knowhow_scan_roots", None).unwrap();
+        assert!(
+            cfg.knowhow_scan_roots.is_empty(),
+            "cleared: nothing is read"
+        );
     }
 
     /// FR-90 P1e — core memory is shown to a session only when the device's
