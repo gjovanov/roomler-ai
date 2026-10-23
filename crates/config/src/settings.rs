@@ -396,6 +396,18 @@ pub struct RelayAllowanceSettings {
     /// `ROOMLER__RELAY_ALLOWANCE__TURN_ATTRIBUTION`.
     #[serde(default)]
     pub turn_attribution: bool,
+    /// FR-115 P4c-0 — `turn_bytes` count toward the month's relay, beside
+    /// `derp_bytes`, for the throttle and the org's page alike (the plan
+    /// sells "DERP + TURN"). Default **off**: it ships dark and is switched
+    /// on per deployment. Env: `ROOMLER__RELAY_ALLOWANCE__COUNT_TURN`.
+    #[serde(default)]
+    pub count_turn: bool,
+    /// FR-115 P4c-1 — an over-allowance org's overlay pairs leave TURN for
+    /// the DERP floor, where the throttle holds bulk and never a handshake:
+    /// the server's verdict stamps them DERP, and their TURN grants are
+    /// withheld. Default **off**. Env: `ROOMLER__RELAY_ALLOWANCE__TURN`.
+    #[serde(default)]
+    pub turn: bool,
 }
 
 fn relay_allowance_free_rate_kbps() -> u32 {
@@ -413,6 +425,8 @@ impl Default for RelayAllowanceSettings {
             free_rate_kbps: relay_allowance_free_rate_kbps(),
             paid_rate_kbps: relay_allowance_paid_rate_kbps(),
             turn_attribution: false,
+            count_turn: false,
+            turn: false,
         }
     }
 }

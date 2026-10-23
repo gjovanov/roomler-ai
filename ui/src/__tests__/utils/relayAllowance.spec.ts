@@ -61,6 +61,22 @@ describe('FR-115 P4a: relayAllowanceView', () => {
     expect(v.policyNote).toBeNull()
   })
 
+  it('says TURN counts, and that only the mesh is slowed, once the server counts it (P4c-0)', () => {
+    const policy = relayAllowanceView(q({ enforced: true, counts_turn: true }))
+    expect(policy.policyNote).toContain('remote desktop and meetings included')
+    expect(policy.policyNote).toContain('mesh relay slows to 1 Mbit/s')
+    expect(policy.policyNote).toContain('never cut off')
+    const held = relayAllowanceView(
+      q({ used_bytes: 11 * GB, enforced: true, throttled: true, counts_turn: true }),
+    )
+    expect(held.throttledNote).toContain('past its relay allowance')
+    expect(held.throttledNote).toContain('slowed to 1 Mbit/s until 1 November')
+    expect(held.throttledNote).toContain('remote desktop and meetings are not affected')
+    // An older server sends no flag: DERP alone, the wording as before.
+    const old = relayAllowanceView(q({ enforced: true }))
+    expect(old.policyNote).not.toContain('remote desktop')
+  })
+
   it('shows an unlimited plan without a bar', () => {
     const v = relayAllowanceView(q({ allowance_bytes: null, rate_kbps: null }))
     expect(v.usage).toBe('3.2 GB (unlimited)')

@@ -4,9 +4,9 @@
 billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b since
 2026-10-21), and the meeting cap (P5). The relay allowance on DERP (P4a) has been on since
 2026-10-21. Per-org TURN bytes (P4b) have been counted on the cluster's coturn since
-2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). Throttling TURN (P4c) is not
-built. Claims were checked against the code at
-`8ab970586`, and the relay allowance section at `d13831d31`.
+2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). Bringing TURN under the
+allowance (P4c) is built and ships switched off. Claims were checked against the code at
+`8ab970586`, and the relay allowance section at `d4eb310a9` plus this change.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
 This page is the engineering view: where the numbers live, the one place they are compared,
@@ -106,7 +106,7 @@ another pod — are where the design is unusual:
   needed. An account in no org gets Free's one session, counted against the account. When
   Redis cannot answer, the hub's count decides, as before.
 
-### The relay allowance: a throttle, never a refusal (P4a, P4b)
+### The relay allowance: a throttle, never a refusal (P4a, P4b, P4c)
 
 An org past its month's `relay_bytes_per_month` (§1) is never disconnected. Its mesh keeps
 the DERP floor, the path that always connects, and only that floor's **bulk** frames slow
@@ -114,6 +114,13 @@ down: to 1 Mbit/s on Free and 4 Mbit/s on a paid plan (`relay_allowance.free_rat
 `paid_rate_kbps`, `crates/config/src/settings.rs:389`). A WireGuard handshake and disco are
 never held. A throttle that delayed a handshake past its retry window would turn "slow" into
 "down" for exactly the hosts that have no other path.
+
+P4c extends it to TURN, behind two switches that ship **off**. With `count_turn` (P4c-0),
+`turn_bytes` count toward the allowance beside `derp_bytes`. With `turn` (P4c-1), the org's
+overlay pairs leave TURN for that same DERP floor, and so meet the same throttle. Remote
+desktop, meetings, hive and tunnels keep TURN: a browser's WebRTC has no DERP path, and a
+tunnel's TURN leg cannot be steered from the server. The plan's session and meeting caps bound
+them instead, and their bytes still count (FR-115 *P4c, as proposed*).
 
 ```mermaid
 flowchart LR
@@ -123,11 +130,12 @@ flowchart LR
     R -->|PSUBSCRIBE, SET NX once| TU["turn_usage.rs"]
     TU -->|turn_bytes| L
   end
-  subgraph held["Held: DERP only"]
-    L -->|month-to-date derp_bytes, every 5 min, one pod| J["relay_allowance::compute"]
+  subgraph held["Held: the mesh's relay"]
+    L -->|month-to-date derp_bytes, plus turn_bytes with count_turn, every 5 min, one pod| J["relay_allowance::compute"]
     J -->|networks over, each with its rate, TTL 15 min| S[("over-allowance set")]
     S -->|every 60 s| P["API pods: a bucket on bulk frames"]
     S -->|signed POST on the /stats poll| Q["every PoP: the same bucket"]
+    S -->|with turn: a DERP verdict, no TURN grant| V["the org's overlay pairs: on the DERP floor"]
   end
   X["direct path, org relay"] -.->|no server process sees the bytes| N["neither meter"]
 ```
@@ -135,18 +143,24 @@ flowchart LR
 | Piece | Where | What it does |
 |---|---|---|
 | The numbers | `crates/services/src/relay_allowance.rs:25` (`allowance_bytes`), `:41` (`rate_for`) | the allowance for the plan and seats, and the rate for an org past it |
-| Month to date | `crates/services/src/dao/stats.rs:206` (`relay_month_to_date`) | `derp_bytes` from the hourly rollups since the month began, plus the current hour's raw buckets |
-| The job | `crates/modules/network/src/relay_allowance.rs:114` (`compute`), every 5 min (`:42`) | one pod (a Redis claim), only where plans are sold, publishes the networks of every org past its allowance, each with its rate, for 15 min (`:45`) |
-| The refresh | `crates/modules/network/src/relay_allowance.rs:253`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
-| The bucket on the API pods | `crates/modules/network/src/derp.rs:620` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:82`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
+| Month to date | `crates/services/src/dao/stats.rs:208` (`relay_month_to_date`) | `derp_bytes` from the hourly rollups since the month began, plus the current hour's raw buckets. With `count_turn` (P4c-0, `crates/config/src/settings.rs:404`), `turn_bytes` beside them, for the throttle and the org's page alike |
+| The job | `crates/modules/network/src/relay_allowance.rs:122` (`compute`), every 5 min (`:42`) | one pod (a Redis claim), only where plans are sold, publishes the networks of every org past its allowance, each with its rate, for 15 min (`:45`) |
+| The refresh | `crates/modules/network/src/relay_allowance.rs:274`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
+| The bucket on the API pods | `crates/modules/network/src/derp.rs:620` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:86`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
 | The bucket on the PoPs | `crates/derp-relay/src/main.rs:148`, the set arriving on `POST /stats` (`:529`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:219`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:156`). A PoP that holds no set throttles nothing |
-| What the org sees | `crates/api/src/routes/cost.rs:530` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced` and `throttled` |
-| TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. Counted, never held: holding them is P4c |
+| The mesh leaves TURN (P4c-1) | `crates/modules/network/src/overlay.rs:2350` (`turn_withheld`, behind `crates/config/src/settings.rs:410`), the relay request (`overlay.rs:931`, decided by `:2360` `keeps_pair_on_derp`), the warm creds (`:207`), the verdict (`:2312`), and the re-stamp (`:1329` `refan_networks`, from `crates/modules/network/src/relay_allowance.rs:204`) | an over-allowance org's overlay pair gets no TURN grant and a DERP verdict, and a node too old for verdicts gets a forced-DERP pin. Only a pair with a DERP floor at both ends: any other keeps its grant, since withholding it would refuse the pair. An org relay still wins. When the set changes, the network's pairs are re-stamped at once |
+| What the org sees | `crates/api/src/routes/cost.rs:531` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced`, `throttled`, and `counts_turn` (P4c-0) |
+| TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. With `count_turn` they count toward the allowance (P4c-0) |
 
-⚠️ **The allowance counts DERP bytes only.** TURN bytes have been attributed per org since
-2026-10-22 on the cluster's coturn, and P4b-2 brings in the PoPs' coturn, one PoP at a time.
-Nothing reads them for the throttle until P4c. A username that names no org (the session-less pre-fetch) is logged as
-unattributed, never guessed.
+⚠️ **Until `count_turn` is switched on, the allowance counts DERP bytes only.** TURN bytes have
+been attributed per org on every coturn since 2026-10-23 (the cluster's since 2026-10-22), but
+only P4c-0 makes the allowance read them. A username that names no org (the session-less
+pre-fetch) is logged as unattributed, never guessed.
+
+⚠️ **The pod's over-allowance map is process-wide, with each entry tagged by its database**
+(`crates/modules/network/src/relay_allowance.rs:166`). In production a process serves one
+database, so this changes nothing. In a test process, though, several apps share the map, and
+each app's refresh replaces only its own entries.
 
 ⚠️ **A direct path and an org relay meet neither meter**, because no server process ever sees
 their bytes. That is placement, not a filter, and a future meter fed from agent-reported
@@ -208,6 +222,8 @@ Each fence now has an integration test on a server without `saas`.
 | `ROOMLER__RC__SESSION_SLOTS=false` | P3b's cluster-wide count: back to P3's count on the device's hub, and external (FR-52) sessions uncapped. On in production; it takes effect on a rollout restart, since the ConfigMap carries no content hash |
 | `ROOMLER__RELAY_ALLOWANCE__ENABLED=false` | the relay allowance on DERP (P4a): no over-allowance set is published, and the API pods and every PoP drop the one they hold within a period. On in production since 2026-10-21; like the line above, it takes effect on a rollout restart |
 | `ROOMLER__RELAY_ALLOWANCE__TURN_ATTRIBUTION=false` | per-org TURN bytes (P4b): no subscription to coturn's statistics, so no `turn_bytes`. On in production since 2026-10-22, and also applied on a rollout restart. coturn keeps publishing, and a message nobody hears is dropped. An empty `coturn_redis_statsdb` in `k8s-cluster-multi`'s coturn role stops the publishing itself |
+| `ROOMLER__RELAY_ALLOWANCE__COUNT_TURN=false` | P4c-0: the allowance counts `derp_bytes` only, for the throttle and the org's page alike. **Off by default**; the next job run (≤ 5 min) recomputes the set without TURN |
+| `ROOMLER__RELAY_ALLOWANCE__TURN=false` | P4c-1: an over-allowance org's overlay pairs are granted TURN again, and their verdicts follow capability. **Off by default**. A pair a forced-DERP pin already holds keeps it until the pin lapses (30 min) |
 | `ROOMLER__MEETINGS__FREE_CAP=false` | the meeting-length cap |
 | `ROOMLER__STRIPE__SEAT_SYNC=false` | the quantity reconcile (the quantity is then set at checkout only) |
 | an org's `settings.plan_enforcement = off` | every **staged** limit for that org (never an established one) |
@@ -215,9 +231,7 @@ Each fence now has an integration test on a server without `saas`.
 
 ## 8. Not built yet
 
-- **The relay allowance on TURN (P4c):** TURN bytes past the plan's allowance are throttled,
-  never refused (a host behind symmetric NAT has no other path). The per-org TURN attribution
-  it needs exists on every coturn: the cluster's since 2026-10-22 (P4b) and the PoPs' since
-  2026-10-23 (P4b-2). Today the allowance itself still counts DERP bytes only. The DERP half
-  (P4a) has been on since 2026-10-21, on the API pods and the regional PoPs.
+- **The relay allowance on TURN (P4c) is built, but not yet switched on.** P4c-0 counts
+  TURN toward the allowance, and P4c-1 moves an over-allowance org's overlay pairs to the DERP
+  floor (§4). Both switches ship off and are turned on in the deploy repo per deployment.
 - **Exit nodes on Free (P4d):** after the throttle exists.

@@ -216,7 +216,7 @@ which can create a folder) and Use default.
 - **Server** — `GET /api/agent/self/devices` and `/api/agent/self/mesh`, host-owned (the
   network module is optional), agent-token authenticated through the fleet extractor's
   shared `authenticate()`. The visible set is **self ∪ the join-time netmap shaping**,
-  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:527-550` and
+  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:534-557` and
   reused by `handle_overlay_join`, so the list can never show a peer the netmap withholds:
   `off`/`warn` list every live node, `enforce` only the shaped set. The device's own live node
   is found **before** any ACL read (`try_load_acl` creates the network on miss and must never

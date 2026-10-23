@@ -50,16 +50,23 @@ export function relayAllowanceView(q: RelayAllowance): RelayAllowanceView {
   )
   const rate = q.rate_kbps !== null ? rateText(q.rate_kbps) : null
   const day = resetDay(q.resets_at)
+  // FR-115 P4c-0: with TURN counted, remote desktop and meetings fill the
+  // allowance too, but only the mesh is slowed past it.
+  const turn = q.counts_turn === true
   return {
     usage: `${used} of ${decimalBytes(q.allowance_bytes)}`,
     percent,
     throttledNote:
       q.throttled && rate
-        ? `This org is past its mesh relay allowance for the month. Mesh traffic relayed through Roomler's servers is slowed to ${rate} until ${day}. Direct connections are not affected.`
+        ? turn
+          ? `This org is past its relay allowance for the month. Mesh traffic relayed through Roomler's servers is slowed to ${rate} until ${day}. Direct connections, remote desktop and meetings are not affected.`
+          : `This org is past its mesh relay allowance for the month. Mesh traffic relayed through Roomler's servers is slowed to ${rate} until ${day}. Direct connections are not affected.`
         : null,
     policyNote:
       q.enforced && !q.throttled && rate
-        ? `Past the allowance, mesh relay slows to ${rate} until the month ends. It is never cut off.`
+        ? turn
+          ? `All relayed traffic counts, remote desktop and meetings included. Past the allowance, mesh relay slows to ${rate} until the month ends. It is never cut off.`
+          : `Past the allowance, mesh relay slows to ${rate} until the month ends. It is never cut off.`
         : null,
   }
 }

@@ -88,7 +88,7 @@ the relay node for the member.
 
 ⚠️ **An unreadable policy set is a refusal, never a grant.** The mint reads policies
 through `try_load_acl`
-([`overlay.rs:2076`](../crates/modules/network/src/overlay.rs#L2076)), which returns
+([`overlay.rs:2152`](../crates/modules/network/src/overlay.rs#L2152)), which returns
 `Result`. The older `load_acl` fails open, byte-identical to "no ACL configured", and a
 gate written against it would have granted on a Mongo blip. `PolicyUnreadable` is its
 own deny reason, so a blip is never mistaken for a policy decision.
