@@ -336,7 +336,8 @@ unchanged.
 
 | Forwarded | Owner |
 |---|---|
-| `LOCK_HINT`, `CLIPBOARD_MAC_WATCH`, `MAC_LAYOUT` | FR-97's Mac kill switches (P2d-1, P2e-1, P2d-2a) |
+| `LOCK_HINT`, `CLIPBOARD_MAC_WATCH`, `MAC_LAYOUT`, `MAC_DISPLAY_MATCH` | FR-97's Mac kill switches (P2d-1, P2e-1, P2d-2a, P2d-2b) |
+| `DISPLAY_MATCH` | the owner's display-match policy (FR-97 P2d-2b), published only when it is not the default; the worker keeps the stricter of it and its own (`never`, then `auto`, then `always`), so neither half loosens the other's (`agents/roomlerd/src/display_match.rs:1211`) |
 | `FPS_HIGH`, `FPS_DENY` | FR-119's high-refresh picker and its per-cell ceilings |
 | `ENCODER_CELLS_DENY` | the encoder-cells kill switch: a gate applies at every entry point, and the worker is where a session's encoders open |
 

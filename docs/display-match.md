@@ -287,10 +287,62 @@ sequenceDiagram
 - **The guard needs somewhere to live.** No `$XDG_RUNTIME_DIR`, no switch: an X11 mode outlives the process
   that set it, and a mode a crash stranded would be the person's screen until they fixed it themselves.
 
+## A Mac's main display (FR-97 P2d-2b)
+
+A Mac switches its main display the way the other two do: the owner's `display_match`, and under `auto`
+whether someone is at the screen. It runs in the process that serves the session, which is the per-user half,
+or on a supervised Mac the GUI worker that the root half's sessions are delegated to
+([`display_match.rs:351`](../agents/roomlerd/src/display_match.rs#L351) `mac_offered`). Kill switch
+`ROOMLERD_MAC_DISPLAY_MATCH=0`.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as roomlerd (the GUI session's)
+    participant P as presence
+    participant W as WindowServer
+    V->>A: rc:display-match {width, height}
+    A->>P: who is at the screen?
+    P-->>A: unattended (the HID idle clock: no person's input for 5 min)
+    A->>W: CGDisplayCopyAllDisplayModes (low-resolution duplicates too)
+    W-->>A: the modes, and the one shown (1024x768 pt at 2048x1536 px)
+    A->>W: CGDisplaySetDisplayMode (672x504 pt at 1344x1008 px)
+    A-->>V: rc:display-match.state {on, mode 1344x1008}
+    Note over A,W: the capture opens its stream again at the new size
+    V->>A: the session ends
+    A->>W: CGDisplaySetDisplayMode (the start mode)
+    Note over A,W: if the process dies instead, WindowServer puts the mode back itself
+```
+
+| | A person's X11 display | A Mac's main display |
+|---|---|---|
+| Who is at the screen | the X idle clock | the HID idle clock (`CGEventSourceSecondsSinceLastEventType` over the HID system state), which injected input moves as it moves Windows' clock, and the session's lock as keep busy reads it ([`presence.rs:277`](../agents/roomlerd/src/presence.rs#L277)) |
+| The modes | the active output's list | the display's own list with its low-resolution duplicates, at the scale it shows, so a HiDPI desktop stays HiDPI and its text keeps the size the person reads it at; at the chosen size, its refresh rate where offered, else the highest ([`display_match.rs:119`](../agents/roomlerd/src/display_match.rs#L119) `pick_mac_mode`) |
+| Several displays | more than one active output answers `unsupported` | the same, for more than one active display |
+| After a crash | a restore guard in `$XDG_RUNTIME_DIR` | nothing to do: a mode set by `CGDisplaySetDisplayMode` lasts only as long as the process that set it ([`display_match.rs:672`](../agents/roomlerd/src/display_match.rs#L672)) |
+| Our own switch | an idle-clock move inside it is the machine's (`own_switch_explains`) | never seen: the pointer clamp moves the session's combined clock, not the HID one |
+| A supervised Mac | — | the root hands its worker its kill switch and its `display_match`, and the worker keeps the stricter of that policy and its own ([`display_match.rs:1211`](../agents/roomlerd/src/display_match.rs#L1211) `with_root_floor`; FR-43's `WORKER_ENV_FORWARD`) |
+| Kill switch | `ROOMLERD_X11_DISPLAY_MATCH=0` | `ROOMLERD_MAC_DISPLAY_MATCH=0`, and `display_match = never` |
+
+- 🔍 **Measured before it was built** (FR-97 §8, a tart Mac, macOS 15.7.7). A mode set by `CGDisplaySetDisplayMode`
+  was back to the person's 3 s after the setting process was killed with SIGKILL, and after a normal exit. A
+  configuration completed `ForAppOnly` behaved the same, and only `ForSession` outlived its process. So a Mac
+  needs no restore guard, as Windows' `CDS_FULLSCREEN` needs none. The FR-97 spec had assumed the opposite.
+- 🔍 **The pointer clamp, measured.** A switch to a smaller mode under the pointer moved the pointer to the new
+  edge and reset the session's combined idle clock, but not the HID one. A move posted at the HID tap, as the
+  agent's injector posts it, reset both. So presence reads the HID clock and explains the controller's input
+  with the tracker it shares with Windows, with no exception for the switch itself.
+- **The capture follows the mode.** A Mac's stream is a `CGDisplayStream` opened at a size, so after a switch it
+  opens again, as X11's capturer does
+  ([`capture/scrap_backend.rs:296`](../agents/roomlerd/src/capture/scrap_backend.rs#L296)).
+- **Off the main thread.** `CGDisplaySetDisplayMode` from a second thread switched the mode and returned 0
+  (measured), so the switch does not wait on the AppKit pump.
+
 ## What it does not do
 
-- macOS and Wayland hosts, and a Linux system install: display match runs on Windows, on a Linux virtual
-  desktop, and on a person's own X11 display with one active output (FR-97 P3e-2).
+- Wayland hosts and a Linux system install: display match runs on Windows, on a Linux virtual desktop, on a
+  person's own X11 display with one active output (FR-97 P3e-2), and on a Mac with one active display (FR-97
+  P2d-2b).
 - DPI and scaling are never changed.
 - One primary display; several displays at once are P4.
 

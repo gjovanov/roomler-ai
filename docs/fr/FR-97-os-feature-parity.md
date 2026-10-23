@@ -239,7 +239,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | 🟡 since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:347`), in a session; a request waiting for consent is not told (P2d-1 found it: the prompt's probe answers `None` here) | ✅ since P2d-1: advisory, from the session dictionary (`lock_state.rs:357`), in a session (`input: "unknown"`) and at a prompt | The pump's `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-326`), on purpose: the hint never becomes its overlay. *P2d-1:* the prompt's probe asks a Mac's session (`lock_state.rs:301-320`) | P2d-1, P3b |
 | R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ✅ since P2d-2a: Text Input Sources, on AppKit's main thread | Windows-only cap (`caps.rs:1574-1578` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:1694-1705`), and on Linux only in an X11 session, without `set` under GNOME (`:876`). *P2d-2a:* a Mac (`agents/roomlerd/src/input/layout_mac.rs:54`) | P2d, P3e |
-| R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ❌ | `display_match.rs:911`. *P3e-2:* `agents/roomlerd/src/display_match.rs:333` `x11_offered`; the viewer's toggle followed the OS until P3e-2 | P2d, P3e |
+| R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ✅ since P2d-2b: the main display, with one active display, at its scale and refresh rate; the mode reverts by itself if the process dies | `display_match.rs:911`. *P3e-2:* `agents/roomlerd/src/display_match.rs:333` `x11_offered`; the viewer's toggle followed the OS until P3e-2. *P2d-2b:* `agents/roomlerd/src/display_match.rs:351` `mac_offered` | P2d, P3e |
 | R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ✅ since P2e-1, behind the pasteboard's change count | Forced off (`clipboard.rs:818-822` before P3e-3a) ✔ while advertised (`caps.rs:1653-1661`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:643` `x11_gate`. *P2e-1:* `agents/roomlerd/src/clipboard.rs:756` `mac_gate` | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:1044` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10105-10108`) | FR-93 P7 |
@@ -668,9 +668,9 @@ test of the SIGKILL property itself.
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
   says it in a session only: its read is a `loginctl` run, which does not belong on the signalling loop, so a prompt
   there is not told (R5). *P2d-2:* layout through TIS (`TISCopyCurrentKeyboardInputSource` /
-  `TISSelectInputSource`). Display-match through `CGDisplaySetDisplayMode` with a restore guard: macOS has no
-  `CDS_FULLSCREEN`-style auto-revert, so the daemon owns the restore, after a crash too. The cursor shape needs AppKit
-  and follows D3.
+  `TISSelectInputSource`). Display-match through `CGDisplaySetDisplayMode`. This spec first said it needed a restore
+  guard, since macOS was taken to have no `CDS_FULLSCREEN`-style auto-revert; P2d-2b measured the opposite (below).
+  The cursor shape needs AppKit and follows D3.
   *P2d-2a, as built (the layout):* `input::layout_mac` (`agents/roomlerd/src/input/layout_mac.rs:54`) answers
   `rc:layout` and `rc:layout.set` with the Windows and X11 modules' snapshot, watch and switch, so the peer's emitter,
   its control-DC send and the arbiter's `LayoutSet` arm are now built for all three. Text Input Sources must be called
@@ -681,6 +681,17 @@ test of the SIGKILL property itself.
   on, not asked of the process's own session, for the same reason as P2e-1: on a supervised Mac the root daemon says
   the hello. `cargo test` cannot call Text Input Sources (its threads are not the main thread), so the pure parts are
   unit tests and the calls are proven on a tart Mac (§8).
+  *P2d-2b, as built (display match, #2771):* measured first on a tart Mac (§8). A mode set by
+  `CGDisplaySetDisplayMode` reverts when the process that set it dies, SIGKILL included, so a Mac needs no restore
+  guard. The call works off the main thread. Injected input moves the HID idle clock, and a smaller mode's pointer
+  clamp moves only the session's combined one. So `display_match::mac`
+  (`agents/roomlerd/src/display_match.rs:672`) picks the largest mode that fits the stage at the start mode's scale
+  and refresh rate (`pick_mac_mode`, `:119`), and presence reads the HID clock with the tracker Windows uses
+  (`agents/roomlerd/src/presence.rs:277`). The capture reopens its stream on a mode change. Three gates that had kept
+  a Mac out of the path were found reading it end to end and are open now: `decide_request`'s OS check, the
+  "person comes back" watcher, and the unlock re-decision. On a supervised Mac the root forwards its kill switch and
+  its `display_match`, and the worker keeps the stricter of that and its own (`with_root_floor`, `display_match.rs:1211`). Kill switch
+  `ROOMLERD_MAC_DISPLAY_MATCH=0`. Details: `docs/display-match.md`.
 - **P2e, clipboard.** Image watching on the `NSPasteboard` change count (the Windows sequence-number shape); RTF as
   `public.rtf` beside the HTML lane.
   *P2e-1, as built (images):* `clipboard::mac_gate` (`agents/roomlerd/src/clipboard.rs:756`) is P3e-3a's X11 gate
@@ -1192,7 +1203,7 @@ model on Windows, so the three agree on what the mode means.
 | **P2b** | macOS native consent panel (D3): `viewer-indicator-macos` in the release feature set (merged #2681; proven on a tart Mac, red on 0.4.149, and on the operator's MacBook, the root half's own panel included; released in 0.4.153) | the release feature set | one Mac, then the field Macs | S–M |
 | **P2c** | macOS Remote Apps | `[apps] enabled` | a field Mac | M–L |
 | **P2d-1** | macOS lock hint: the session dictionary's lock, to the viewer's chip in a session (`input: "unknown"`) and to a request waiting for consent (`host_locked`); the chip's neutral title. Released in 0.4.150 (#2683) | `ROOMLERD_LOCK_HINT=0` | a tart Mac, red on 0.4.149 | S |
-| **P2d-2** | macOS layout, display-match. *P2d-2a* (the layout: Text Input Sources on AppKit's main thread; built, #2728; field-verified on a tart Mac, red on 0.4.153, §8; rides 0.4.156); *P2d-2b* (display-match) not built | P2d-2a: `ROOMLERD_MAC_LAYOUT=0`; P2d-2b: per-verb caps | a tart Mac with two layouts, red on 0.4.153; then the field Mac on the release | M |
+| **P2d-2** | macOS layout, display-match. *P2d-2a* (the layout: Text Input Sources on AppKit's main thread; built, #2728; field-verified on a tart Mac, red on 0.4.153, §8; rides 0.4.156); *P2d-2b* (display match: `CGDisplaySetDisplayMode`, crash-safe by construction, presence from the HID idle clock; built, #2771) | P2d-2a: `ROOMLERD_MAC_LAYOUT=0`; P2d-2b: `ROOMLERD_MAC_DISPLAY_MATCH=0` | a tart Mac with two layouts, red on 0.4.153; then the field Mac on the release | M |
 | **P2e** | macOS clipboard images + RTF. *P2e-1* (copied images, behind the pasteboard's change count; built, #2722; field-verified on a tart Mac, red on 0.4.153, §8); *P2e-2* (RTF as `public.rtf`) not built | P2e-1: `ROOMLERD_CLIPBOARD_MAC_WATCH=0`; P2e-2: `ROOMLERD_CLIPBOARD_NATIVE=0` | a tart Mac, red on 0.4.153; then the field Mac on the release | S–M |
 | **P2f** | macOS microphone for recordings | the recording's `mic` option | a field Mac | S–M |
 | **P2g** | The companion's Devices page and mesh on a two-half Mac come from the root half, over a person socket it serves the console user; a Linux system install's person socket serves the same two verbs (D2). Released in 0.4.150 (#2663) | `ROOMLERD_PERSON_SOCKET=0` | a tart Mac with both halves, red on 0.4.149; the operator's MacBook | S |
