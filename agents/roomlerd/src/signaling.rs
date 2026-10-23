@@ -792,6 +792,15 @@ pub async fn run(
     // daemon reach the loop that actually owns that session.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) -> Result<()> {
+    // #2551 — the encoder capability probe runs at the process's first
+    // `caps::detect()` (memoized after). That used to be the hello's, inside
+    // `connect_once` with the pump already counting. On a probe-cache miss
+    // (no cache yet, a week's age, a driver change) the probe children may
+    // take up to 60 s each, and a watchdog kill at 90 s left the cache
+    // unwritten, so the restarted worker probed again: a crash loop with the
+    // device offline. Warm it here instead, with the pump gated off and on a
+    // blocking thread.
+    let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
     // Created once; the receiver is polled inside connect_once across

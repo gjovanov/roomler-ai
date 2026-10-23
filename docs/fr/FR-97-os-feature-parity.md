@@ -666,7 +666,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1428-1494`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:3760`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:3769`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
