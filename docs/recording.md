@@ -700,20 +700,22 @@ to the default INPUT device. The recorder opens
 `cpal_backend::Source::SystemOnly`, which refuses instead
 (`system_audio_unavailable`).
 
-⚠️ **Not yet on macOS.** Computer audio there needs ScreenCaptureKit (macOS 13+;
-the bundle targets 12). The microphone needs cpal on macOS, plus
-`NSMicrophoneUsageDescription` and the `audio-input` entitlement in the
-bundle. Both are refused by name until then — and computer audio is **never
+⚠️ **On macOS, computer audio since FR-97 P2a; the microphone not yet.**
+Computer audio comes from ScreenCaptureKit (`crate::audio::open_mac_system_audio`,
+the live session's own capture), in the person's session the recorder runs
+in. The microphone needs cpal on macOS, plus `NSMicrophoneUsageDescription`
+and the `audio-input` entitlement in the bundle (FR-97 P2f). It is refused by
+name until then. Before P2a computer audio was refused there too — and it is **never
 offered** where it cannot be recorded (#1760):
 
-| Computer audio | Windows | Linux | macOS · a build without `audio` |
-|---|---|---|---|
-| `system_audio_supported()` (`agents/roomlerd/src/recording/mod.rs`): the `audio` feature on Windows or Linux — the ONE answer every row below reads | yes | yes | **no** |
-| the recorder child (`child.rs` `open_system_audio`) | WASAPI loopback | the PulseAudio / PipeWire monitor | refuses `system_audio_unavailable` with the same words (`SYSTEM_AUDIO_UNSUPPORTED`); each `cfg` arm asserts at compile time that it agrees with the fn |
-| the device's caps (`remote.rs` `advertise`) | `remote-audio` while the owner allows it | same | never `remote-audio`, whatever the owner set |
-| a remote start asking for audio (`remote.rs` `precheck`) | `audio_not_allowed` until the owner allows it | same | `audio_unsupported`, ahead of the owner's gate, the words in `detail` |
-| every `rc:record.state` (`audio_unavailable`) | absent, or `audio_not_allowed` | same | `audio_unsupported`: the viewer's box is greyed out, unticked, with the sentence beside it |
-| the LocalAPI state (`RecordingState.system_audio_unavailable_reason`) | absent | absent | the words: the companion's **Computer audio** box and the owner's **Include computer audio** toggle are greyed out, unticked, with them |
+| Computer audio | Windows | Linux | macOS (FR-97 P2a) | a build without `audio` |
+|---|---|---|---|---|
+| `system_audio_supported()` (`agents/roomlerd/src/recording/mod.rs`): the `audio` feature on Windows, Linux or macOS — the ONE answer every row below reads | yes | yes | yes | **no** |
+| the recorder child (`child.rs` `open_system_audio`) | WASAPI loopback | the PulseAudio / PipeWire monitor | ScreenCaptureKit (`audio::open_mac_system_audio`); refused, with the reason, under `ROOMLERD_SCK_AUDIO=0` | refuses `system_audio_unavailable` with the same words (`SYSTEM_AUDIO_UNSUPPORTED`); each `cfg` arm asserts at compile time that it agrees with the fn |
+| the device's caps (`remote.rs` `advertise`) | `remote-audio` while the owner allows it | same | same | never `remote-audio`, whatever the owner set |
+| a remote start asking for audio (`remote.rs` `precheck`) | `audio_not_allowed` until the owner allows it | same | same | `audio_unsupported`, ahead of the owner's gate, the words in `detail` |
+| every `rc:record.state` (`audio_unavailable`) | absent, or `audio_not_allowed` | same | same | `audio_unsupported`: the viewer's box is greyed out, unticked, with the sentence beside it |
+| the LocalAPI state (`RecordingState.system_audio_unavailable_reason`) | absent | absent | absent | the words: the companion's **Computer audio** box and the owner's **Include computer audio** toggle are greyed out, unticked, with them |
 
 ⚠️ **The gate is the capability, or it is a courtesy.** Before #1760 the
 remote gates read the `audio` FEATURE, which the macOS build has (it is in

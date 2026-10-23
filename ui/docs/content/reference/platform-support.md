@@ -18,7 +18,7 @@ that is greyed out always carries the device's own reason.
 - **⛔ Ruled out** icon:danger — the OS itself prevents it. The reason is below.
 :::
 
-These tables describe agent 0.4.158; a row that names a later version is coming
+These tables describe agent 0.4.159; a row that names a later version is coming
 in the next release. The engineering record behind them, with
 the code each verdict comes from, is
 [`docs/platform-support.md`](https://github.com/gjovanov/roomler-ai/blob/master/docs/platform-support.md).
@@ -57,8 +57,8 @@ organization chooses it with `roomler org overlay <org> netstack`
 |---|---|---|---|
 | Your desktop, with a system install and nothing configured | ✅ | 🟡 GNOME and KDE, while your session is unlocked and you can be told who is viewing | 🟡 an opt-in |
 | The lock screen and sign-in screen, nobody signed in | ✅ Machine — system | 🟡 only when you switch screen capture on yourself | ⛔ |
-| The computer's sound | ✅ | ✅ | ❌ |
-| Recording with sound | ✅ | ✅ | 🟡 picture only |
+| The computer's sound | ✅ | ✅ | ✅ from agent 0.4.160 |
+| Recording with sound | ✅ | ✅ | 🟡 the computer's sound from agent 0.4.160, not the microphone yet |
 | Ctrl+Alt+Del | ✅ the real one, from a Machine — system install where policy allows | ⛔ sent as ordinary keys, which GNOME and KDE use to log out | ⛔ hidden: it means nothing on a Mac |
 | An approval panel on the host | ✅ | ✅ X11 · ⛔ Wayland: the desktop app asks | ✅ from agent 0.4.153 · before it, the desktop app asks |
 | "The host is locked" before you connect | ✅ | ❌ | ✅ from agent 0.4.150 |

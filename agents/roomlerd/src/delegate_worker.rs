@@ -283,6 +283,7 @@ async fn attach_once(
             permissions = ?caps.permissions,
             record = ?caps.record,
             apps = ?caps.apps,
+            audio = ?caps.audio,
             "delegation: announcing our capabilities to the daemon"
         );
         write_frame(

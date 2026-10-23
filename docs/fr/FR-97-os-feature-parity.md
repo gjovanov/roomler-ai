@@ -237,7 +237,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:253`) | ❌ | macOS: no capture backend; since P0c no `opus` either (`encode/caps.rs:703`) ✔. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
+| R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:253`) | ✅ since P2a: ScreenCaptureKit's mix of every app, in a process with a window-server session; on a supervised Mac the GUI worker, whose offer the root's row carries | Was: macOS had no capture backend; since P0c no `opus` either (`encode/caps.rs:703`) ✔. *P2a:* `agents/roomlerd/src/audio/sck.rs`. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
 | R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ✅ since 0.4.153 (P2b): in the release set (`.github/workflows/release-agent.yml:2581`); on a supervised Mac the root half draws it (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ✅ since P2c: the window server's list, focus through Accessibility, launch through LaunchServices and Terminal; on a supervised Mac the GUI worker serves it, and the root's row carries its words | Was: `Unavailable::Platform` (`apps/mod.rs:347`), no `apps/macos.rs`. *P2c:* `agents/roomlerd/src/apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
@@ -248,7 +248,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:1044` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10112-10115`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
-| R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 picture only | No SCK audio; cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:332-333`) | P2a, P2f |
+| R12 | Recording with audio | ✅ system + mic | ✅ | 🟡 the computer's sound since P2a (the recorder child opens the session's own capture); not the microphone | Was: no SCK audio. cpal is not a macOS dependency (`agents/roomlerd/Cargo.toml:332-333`), so the microphone waits for P2f | P2a, P2f |
 | R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:231`) | D2 |
 | R14 | "Being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | CGDisplayStream ignores `NSWindowSharingNone` (`desktop-companion.md:514-517`) | D2 |
 | R15 | Greeter, nobody signed in | ✅ SystemContext | 🟡 DRM, opt-in | ⛔ | macOS loginwindow: §7 | FR-93 / FR-95 |
@@ -632,6 +632,22 @@ test of the SIGKILL property itself.
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
   is 15, `docs/installation.md:267-282`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
+  *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
+  `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
+  existing `AudioCapture` seam (`audio::open_default`, and the recorder child's `open_system_audio`). Four things the
+  measurement and the delegation decided:
+  - **No resampling.** SCK delivers 48 kHz stereo 32-bit float, *non-interleaved*, in 960-frame buffers, 50 a second:
+    Opus's own 20 ms frame. The capture interleaves to 16-bit (`audio::planar_f32_to_i16`) and hands each buffer on.
+  - **It hears the mix, not the device.** Two system sounds read back with the Mac's output **muted**, so the lab's
+    cells run muted: tart passes a VM's sound through to the MacBook's speakers.
+  - **The root's row carries the worker's offer.** The root is in no window-server session and says `no-session`. Its
+    hello and heartbeat take the attached worker's `audio` words and `unavailable.audio`
+    (`DelegateHost::effective_audio`), and its `rc:session.request` handler decides a delegated session's audio by
+    the worker's offer. Before this, a session asking for sound got none: the root's own offer was empty.
+  - **A kill switch that reaches the half that captures.** `ROOMLERD_SCK_AUDIO=0` refuses `switched_off` from the
+    capture and says `switched-off` on the hello. It is in `WORKER_ENV_FORWARD`, so the root's environment reaches
+    the worker. The first Objective-C class this codebase defines (`define_class!`): ScreenCaptureKit hands samples
+    only to an object conforming to `SCStreamOutput`.
 - **D2, video through SCK as well.** It would bring dirty rects (R13), keep the banner out of the stream (R14), and
   cursor metadata (R4), but it replaces a backend that works. Decide on a measured A/B of latency and CPU.
 - **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2564-2578`: a dispatch
@@ -1230,7 +1246,7 @@ model on Windows, so the three agree on what the mode means.
 | **P1b** | macOS exit + subnet serving through pf (D1) | `ROOMLERD_PF_NAT=0` | vmtest: a macOS exit for Linux and Windows clients | M–L |
 | **P1c** | macOS DNS: MagicDNS + the exit catch-all | `ROOMLERD_MACOS_DNS_STEER=0` | vmtest | M |
 | **P1d** | A macOS per-org utun run once; the stale warning; the port holder. *In review:* run on the released 0.4.143 (§8); the warning removed; the port holder through `lsof` | — | a tart Mac, two orgs | S |
-| **P2a** | macOS system audio (SCK) | `ROOMLERD_SCK_AUDIO=0` | a field Mac | M–L |
+| **P2a** | macOS system audio (SCK), for a session and a recording, captured by a supervised Mac's GUI worker (built, red on 0.4.158 on a tart Mac with both halves, §8) | `ROOMLERD_SCK_AUDIO=0` (forwarded to the worker) | a tart Mac with both halves, muted, red on 0.4.158; then the field Mac on the release | M–L |
 | **P2b** | macOS native consent panel (D3): `viewer-indicator-macos` in the release feature set (merged #2681; proven on a tart Mac, red on 0.4.149, and on the operator's MacBook, the root half's own panel included; released in 0.4.153) | the release feature set | one Mac, then the field Macs | S–M |
 | **P2c** | macOS Remote Apps: the window server's list, AX focus, LaunchServices and Terminal launch, served by a supervised Mac's GUI worker (built, #2790; field-verified on a tart Mac with both halves, red on 0.4.158, §8) | `[virtual_desktop_apps] enabled = false` in either half's config (the root's reaches the worker as `ROOMLERD_APPS=0`) | a tart Mac with both halves, red on 0.4.158; then the field Mac on the release | M–L |
 | **P2d-1** | macOS lock hint: the session dictionary's lock, to the viewer's chip in a session (`input: "unknown"`) and to a request waiting for consent (`host_locked`); the chip's neutral title. Released in 0.4.150 (#2683) | `ROOMLERD_LOCK_HINT=0` | a tart Mac, red on 0.4.149 | S |
@@ -1321,6 +1337,8 @@ one depends on it.
   steer is gone. *(Field-verified on 0.4.137, 2026-10-15, §8.)*
 - [ ] **AC7 (P2a, P2f):** a Mac session plays the host's audio; a Mac recording carries system audio and the
   microphone.
+  *(P2a, the session's audio, on a tart Mac with both halves and the viewer on the root's row, §8: red on 0.4.158,
+  no audio track while sounds played.)*
 - [ ] **AC8 (P2b–P2e):** on a Mac, the native consent panel answers; Remote Apps lists, focuses and launches; the
   locked-host hint arrives; layout switching and display-match work and restore; copied images reach the viewer.
   *(The locked-host hint (P2d-1) arrives in a session and at a prompt on a tart Mac with both halves, red on 0.4.149
@@ -1686,3 +1704,5 @@ one depends on it.
 | 2026-10-23 | P2c's candidate (the `.pkg` from release-lane rehearsal 40012600235 on `5b2d84c81`, `aba66d14…`) | the same tart set-up, with Screen Recording and Accessibility written into TCC for the installed bundle's own designated requirement (the vmtest lane's `grant_tcc`). Rig `mac-p2c2.sh` → `mac-guest-p2c2.sh` | 🟢 **P2c (AC8's Remote Apps).** The worker announced `apps: [status, list, focus, launch]` at attach. The root's next heartbeat carried the same words, so both rows said them. The viewer's entry read "List, focus or launch apps on the controlled host". The dialog's list answered in 85 ms: `Calculator` (focused), `b.txt — TextEdit`, `a.txt — TextEdit`, `Roomler` (the companion), with `coverage.sources: [quartz]` and nothing unlisted. **Focus:** a click on `a.txt — TextEdit` answered `ok` in 143 ms, and the host's own probe read a.txt in front. **Launch:** "New bash session" answered `ok` in 186 ms, and a Terminal window `roomler-bash-fad06740.command — bash` opened in front. No dialog or prompt appeared on the console |
 | 2026-10-23 | the same candidate, `[virtual_desktop_apps] enabled = false` in the ROOT's config only | the same set-up | 🟢 **P2c's kill switch, from the root.** The root logged "the worker inherits the root's session knobs keys=[ROOMLERD_APPS]", and the worker's environment carried `ROOMLERD_APPS=0`. The worker announced `apps: [status]`, and both rows said `status` alone. The viewer's entry read "…not available when this agent announced itself — open to see why". Its list answered `supported: false`, `unavailable: switched_off`, naming the root half's config. Nothing was focused or launched on the host |
 | 2026-10-23 | the same candidate, `enabled = false` in the PERSON's config only | the same set-up | 🟢 **P2c's kill switch, from the person.** The root's config said `true`, and no floor was forwarded. The worker still announced `status` alone, and the list answered `unavailable: disabled`, naming the worker's own config. Each half's switch is reported as that half's |
+| 2026-10-23 | no agent: `system_profiler` and `afplay` in the VM, then a ScreenCaptureKit probe (`sckprobe`, Objective-C, built on the MacBook) run as the console user | throwaway tart Macs (macOS 15.7.7) | 🔍 **P2a, measured before it was built.** The VM has an "Apple Virtual Sound Device", 2 channels in and out at 48 kHz, and tart passes its sound through to the MacBook's speakers (one test phrase played there, at about 20:27Z). With the VM's output **muted**, an `SCStream` with `capturesAudio` heard both sounds `afplay` played (rms 0.034 and 0.040, peak 0.20 and 0.36, silence 0 between). Format: 48000 Hz, 2 channels, Float32, non-interleaved (flags 0x29), 50 buffers a second of 960 frames, Opus's own 20 ms frame. At volume 0, unmuted, it heard them too. No prompt appeared |
+| 2026-10-23 | released 0.4.158 (`7ddec094…`) | a throwaway tart Mac with both halves, the root's supervisor starting the worker, sessions auto-granted, TCC granted, the output muted. The deployed viewer (Playwright from mars) on the ROOT's row with its "receive host audio" preference on, reading its inbound audio's stats every second while the guest played four system sounds. Rig `mac-p2a.sh` → `mac-guest-p2a.sh`, spec `p2a-audio.spec.ts` | 🔴 **P2a (AC7's session audio): the red.** Both rows said `audio: null` and `unavailable.audio: no-backend` ("System-audio capture is not implemented on this OS yet"). The session carried no audio track at all: `tracks=0` for all 24 s, while the sounds played |
