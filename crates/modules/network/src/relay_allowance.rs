@@ -140,6 +140,10 @@ pub async fn compute(
         let Some(&bytes) = used.get(&id) else {
             continue;
         };
+        // The operator's own orgs: never throttled, whatever they relay.
+        if roomler_ai_services::relay_allowance::is_exempt(s, &id) {
+            continue;
+        }
         if let Some(rate) = rate_for(&t.plan, t.billed_seats(), bytes, s) {
             rate_of_org.insert(id, rate);
         }

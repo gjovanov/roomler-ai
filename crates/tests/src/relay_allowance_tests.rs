@@ -497,6 +497,55 @@ async fn turn_bytes_count_toward_the_allowance_only_with_count_turn() {
     }
 }
 
+/// FR-115 — an exempt org (`exempt_tenants`: the operator's own) and an
+/// Enterprise org are never in the set, however much they relay. The same
+/// Free org without the exemption is: the red half.
+#[tokio::test]
+async fn exempt_and_enterprise_orgs_are_never_throttled() {
+    let exempt_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        enable(s);
+        s.relay_allowance.exempt_tenants = Some(format!("{},not-an-id", exempt_id.to_hex()));
+    })
+    .await;
+    // A Free org past its 10 GB, not exempt: throttled.
+    let free = app.seed_tenant("fr115exempt1").await;
+    let free_id = oid(&free.tenant_id);
+    let free_net = network_of(&app, free_id).await;
+    relayed_this_month(&app, free_id, 11 * GB).await;
+    // Its twin under the exempt id, past the same 10 GB.
+    let tenants = app.db.collection::<Document>("tenants");
+    let mut twin = tenants
+        .find_one(doc! { "_id": free_id })
+        .await
+        .unwrap()
+        .expect("the seeded tenant");
+    twin.insert("_id", exempt_id);
+    twin.insert("slug", format!("fr115exempt-{}", exempt_id.to_hex()));
+    tenants.insert_one(twin).await.unwrap();
+    let exempt_net = network_of(&app, exempt_id).await;
+    relayed_this_month(&app, exempt_id, 11 * GB).await;
+    // An Enterprise org past what Business would allow one seat.
+    let ent = app.seed_tenant("fr115exempt2").await;
+    let ent_id = oid(&ent.tenant_id);
+    let ent_net = network_of(&app, ent_id).await;
+    set_plan(&app, ent_id, "enterprise", 1).await;
+    relayed_this_month(&app, ent_id, 500 * GB).await;
+
+    let set = relay_allowance::compute(net(&app), DateTime::now())
+        .await
+        .unwrap();
+    assert_eq!(set.get(&free_net), Some(&125_000), "{set:?}");
+    assert!(
+        !set.contains_key(&exempt_net),
+        "an exempt org is never throttled: {set:?}"
+    );
+    assert!(
+        !set.contains_key(&ent_net),
+        "Enterprise has no allowance: {set:?}"
+    );
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
