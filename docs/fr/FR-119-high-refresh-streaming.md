@@ -23,8 +23,8 @@ latency side; this FR is the cadence side.
 | What | Where | Consequence |
 |---|---|---|
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9836`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10254` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9843`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10261` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts were whole milliseconds (**fixed in P2a**, §4.2) | master `c636c6e8c` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
 | The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1717`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2289`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2312`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
 | The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
@@ -149,7 +149,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. P2 is built; its field proof is P3 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. P2 is built; its field proof is P3 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155). **Run 2, 2026-10-23** (§8): #2758 verified on 0.4.155. AC4 attempt 2, direct from Edge at the Mac's native size, was granted 120 and then taken back by the pipe; it found P2b-4 and P2b-5 |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -511,6 +511,73 @@ ms is 106 fps, under the 108 AC4 asks for.
   sleep overshoots by 1.4 ms, the bucket holds 120 asks a second and the legacy rule falls to about 106. A negative
   control, `pull_gate` returning `None` (master's behaviour), fails exactly those two tests and no other.
 
+### 4.9 P2b-7 — the viewer measures decode health in time, not frames, as built (2026-10-23)
+
+Found on AC4's third attempt (§8, 2026-10-23, 0.4.158). The host delivered 109–116 fps in every window, but about
+every 30 s the viewer said it was struggling, and the agent's viewer-rate cap shed frames for 4–8 s: 13–60 fps
+delivered, with the session's IDR counter jumping 2–3 at each dip and nowhere else.
+
+- **The cause.** The viewer's flow control (P6 of the Parsec-class plan) counted frames: a worker dropped deltas, and
+  asked for an IDR, once the decoder's queue held more than 4; a 1 s window was "bad" once it held more than 2. A
+  frame count is a different amount of time at every rate: 4 frames are 67 ms at 60, 33 ms at 120 and 133 ms at 30.
+  At 120 one slow keyframe decode put 5 frames behind it, so the shed fired, its IDR fired it again, and two bad
+  windows sent `struggling`. The count also missed the frames already inside the codec: WebCodecs'
+  `decodeQueueSize` holds only the requests not yet handed to it. This is §3.5's "thresholds become times", which
+  P2 had not built.
+- **The fix** (`ui/src/workers/rc-hop-stats.ts:285`). Both rules read the decode BACKLOG: how long the oldest frame
+  still waiting for its output has waited since it was submitted. `DecodeBacklog` keeps the submit times the HEVC
+  and VP9-444 workers already kept for their submit→output statistic. Output follows submission order (the agent's
+  encoders send no B-frames), so a frame that outputs retires every older frame still pending: the decoder skipped
+  those, and they must not age for ever.
+  - The shed drops an arriving delta when the backlog exceeds 67 ms (`:349`, sampled once per arriving frame,
+    `rc-hevc-worker.ts:745`, `rc-vp9-444-worker.ts:668`).
+  - A window is bad on a shed, or when its MEAN backlog exceeds 33 ms (`:355`, read at
+    `useRemoteControl.ts:6905`). One slow keyframe lifts a few frames' ages and barely moves a mean; a decoder that
+    cannot keep up lifts every sample.
+  - Both are P6's counts as the time they meant at 60 fps, the rate they were tuned at, and now mean the same at
+    every rate.
+- **Knobs** in ms (`roomler-rc-max-backlog-ms`, `roomler-rc-struggle-backlog-ms`, `useRemoteControl.ts:2451`). A
+  viewer still carrying the retired frame-count knobs has them read as the ms they meant at 60 fps.
+- **The HUD** shows the backlog's window mean and max beside the raw queue. `rc:decodestat` is unchanged, so the
+  agent needs nothing.
+- **Tests** (`useRemoteControl.spec.ts:4168`). A synthetic decoder shows one 40 ms keyframe is the same backlog at
+  30, 60, 120 and 144 fps and sheds nothing, while a decoder that cannot keep up is still shed and reported at 60
+  and 120. Skipped frames do not fake a backlog. Plus the window mean and max, and the knobs with the legacy
+  conversion. Negative controls, each run alone, fail exactly their test: the threshold halved (what P6's count
+  meant at 120), and skipped frames kept.
+
+### 4.10 P2b-8 — the evidence gate runs on every window, rejects the transport's opening, and reads whole windows, as built (2026-10-23)
+
+Found on the same attempt. In two of four direct sessions a freshly granted 120 fps was taken back one second in,
+on `pipe`, and held at 60 for exactly the capacity claim's 60 s TTL. Three defects in what the rate controllers took
+as evidence, each fixed where it lives rather than around FR-119's grant.
+
+- **The gate ran on constrained windows only.** A direct window was evidence by definition, so FR-119's grant (which
+  only runs on a direct path) read capacity claims nothing had gated. The gate now runs on every window
+  (`encode/governor.rs:1071`). On a direct window the classifier does not run, so its state is `Unknown` with no
+  predecessor, and only the agent's own stall and the opening apply.
+- **The opening is not evidence** (`encode/evidence.rs:71`). The session's first keyframe, meeting a transport still
+  ramping, blocked sends for 43–82 ms, and the drain rate folded as a capacity of 14–22 Mbps against the 104 Mbps
+  ceiling at 120. `Reason::Opening` rejects any window a pass of which fell inside FR-35's opener window: at least
+  2 s from the first keyframe and until the send ledger drains, at most 3 s, now kept for every session
+  (`peer.rs:8823`). FR-35 already declined to cut for that burst, so it is not congestion either. Its counter is
+  appended to `evidence_rejected` (fifth), so the first four positions keep their meaning.
+- **The window was one pass long.** The pump hands its sender facts to the governor on every pass, as deltas since
+  the previous pass, and each call overwrote the last. A stalled pass anywhere but in a window's last iteration
+  never reached `AgentStalled`, and `frames_sent` and `gate_skips` read 0–2 where the window held 30–120.
+  `WindowSenderStats::absorb` (`governor.rs:372`, called from `note_window_sender`, `:1429`) folds the passes: counts
+  add, the longest wait wins, the average is weighted by frames sent (the send task records a wait for every frame
+  it writes), `opening` ORs, and the levels are the latest.
+  ⚠️ This also corrects the inputs FR-71's classifier reads on constrained sessions: a gate skip anywhere in a window
+  now classifies it `overproduced`, and the silent-viewer gap rule sees real frame counts. That is what the
+  classifier's tests always encoded; it was never what the field ran. Watch the relay fleet's `pipe_states` and
+  `evidence_rejected` after the release that carries it.
+- **Tests** (`governor.rs:3728`, `:3769`, `:3800`, `evidence.rs` tests). A window is the sum of its passes. A stalled
+  pass early in a window still rejects it, which is red on the overwrite. A direct window in the opening folds no
+  capacity, and the same window after the opening folds as before, which is red with the gate constrained-only. The
+  negative controls, each alone, fail exactly their test. CI's `ffmpeg-encoder` clippy lane compiles the pump change,
+  proven with a planted fault.
+
 ## 5. Acceptance criteria
 
 - [ ] **AC1 — P0 measured.** The pts test is red on master and green after P2. L0's 120 and 144 cells hold their
@@ -568,6 +635,9 @@ ms is 106 fps, under the 108 AC4 asks for.
 | 2026-10-23 | agent 0.4.155, `fps_high = true` in the root's config only | **The two-half fix in the field** (FR-43's #2758). The worker's own config has no `fps_high` | **The worker takes the root's knob.** When the root spawned the worker it logged `macOS supervisor: the worker inherits the root's session knobs keys=["ROOMLERD_FPS_HIGH"]`, and the worker honoured the viewer's ask: `FR-119: frame rate decided … want=120` on a direct session, `refused=Some((120, Constrained))` on a relayed one. On 0.4.154 the same state ignored the ask |
 | 2026-10-23 | agent 0.4.155 | **AC4, attempt 2.** The MacBook, direct (host to host on one LAN), to Edge on neo16, whose panel is 2560×1600 at 240 Hz. At the Mac's native 3024×1964, with a 120 fps video moving on it | **Granted, then taken back by the pipe, as designed. Not an AC4 run.** `asked=Some(120) base_fps=60 want=120`, and the swap was adopted in 20 ms with no freeze. Three things stopped it. (1) The viewer-rate cap held the old 60 for 5 s (`cap_fps=60 skip_divisor=2`), so the trial measured nothing: **P2b-4**. (2) The capture delivered 97 fps at 120 and 54 at 60, because the macOS period ran from each frame's arrival: **P2b-5**. (3) When the full rate reached Edge, one send blocked for 44 ms. That one window gave a capacity of 10.1 Mbit/s against a ceiling of 104 Mbit/s at 120 for 5.9 Mpixel, so the grant went back to 60 on `pipe` (a capacity holds for 60 s). The session before it, at the same geometry, ended in an SCTP error and Edge reconnected; the panel is driven by a Radeon 610M, and which GPU Edge decoded on was not read. AC4's D1 is up to 1440p, so the next run picks 1080p. The log printed `refused=None` beside `want=60` because a refusal is named only once the stream runs below the ask, and the line is written before the swap down |
 | 2026-10-23 | agent 0.4.157 (P2b-4, P2b-5) | **P2b-5's first after.** The MacBook, a relayed session at a 30 target, against the same kind of session on 0.4.155 earlier that day; the same 120 fps video moving | **Better, not yet the target.** The capture rate went from 28.09 fps (mean of 3,794 heartbeat windows) to 29.05 (937 windows, each 28.9–29.2): the wait and the copy are out of the period. What remains is each sleep overshooting by about 1.4 ms, and at 120 that would be 8 + 1.4 ms a frame, 106 fps, under AC4's 108: **P2b-6** |
+| 2026-10-23 | agent 0.4.158 (P2b-4 to P2b-6) | **Why the viewer relayed, twice.** Edge on neo16, which had gone direct that morning | **Two field traps, neither ours.** (1) A **PureVPN Proxy** extension in that Edge profile set `webrtc.ip_handling_policy = disable_non_proxied_udp`, its WebRTC leak protection. The profile then gathered no candidate at all, not even with a STUN server, so every session went through a TURN relay over TCP and ran at a relay's 30. Found in the profile's `Secure Preferences`, not in any policy; removing the extension restored host and server-reflexive candidates. (2) A second viewer **joins the first viewer's pipeline** (`media_share: joined shared encoder pipeline as follower`): a direct Edge session behind a relayed Chrome tab ran at that tab's 30. Close every other viewer of the host before a rate test |
+| 2026-10-23 | agent 0.4.158, the viewer's shipped defaults | **AC4, attempt 3.** The MacBook direct to Edge (no VPN extension), 1662×1080 (a 1080p target) and native 3024×1964, at 120, then 60 | **The host holds 120; the viewer and the opening do not, yet. AC4 not met.** Captured and encoded 109–116 fps in every 2 s window. The trial was **Proven** twice: native, 1,129 frames in 10.0 s of activity, 112.8 fps, p99 interval 16.593 ms, p90 encode 3.9 ms; 1080p, 112.1 fps, p99 16.583 ms. But about every 30 s the viewer flagged `struggling` and the agent shed frames for 4–8 s, delivering 13–60 fps. The session's IDR counter jumped exactly there (9→10, 10→12, 12→13→16, 16→18→21): one keyframe, then the viewer's own frame-count sheds asking for more. No contiguous 60 s at 108 or more: **P2b-7**. In two of four direct sessions, 120 was taken back one second in on `pipe` and held for 60 s: the opening window's blocked sends (43–82 ms) had folded as 14–22 Mbps of capacity against a 104 Mbps ceiling: **P2b-8**. The negative arm at 60 delivered a steady 57.6–58.2 fps, from 54 on 0.4.155 (P2b-5) |
+| 2026-10-23 | agent 0.4.158, P2b-7's rules set by hand | **The design check for P2b-7.** The same cell, with the viewer's two thresholds set to what P6's counts mean in time at 120 fps (8 and 4 frames, i.e. 67 and 33 ms) | **64 s at 108.4–115.5 fps, no struggle, no new IDR.** From the moment 120 was granted, 32 windows in a row at 108 or more; the viewer-rate cap did not fire once, and the IDR counter stayed at 10. The trial was Proven again at p99 16.583 ms. The 120 came only after 60 s at 60: the opening's capacity claim again (P2b-8). AC4 needs this with the shipped defaults, after P2b-7 and P2b-8 ship |
 
 ## 9. Related
 
