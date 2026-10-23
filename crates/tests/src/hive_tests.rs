@@ -910,6 +910,101 @@ async fn a_session_is_a_secret_room_its_device_writes_stubs_into() {
     );
 }
 
+/// `PUT …/agent/{id}` with a display name, as the device list's edit dialog
+/// does; `""` clears it.
+async fn rename(app: &TestApp, tid: &str, token: &str, agent_id: &str, display_name: &str) {
+    let resp = app
+        .auth_put(&format!("/api/tenant/{tid}/agent/{agent_id}"), token)
+        .json(&json!({ "display_name": display_name }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "rename: {}", resp.status());
+}
+
+/// FR-116 AC4 — what a PERSON reads in a session's room names its device as
+/// the device list does: the author line and the notes say the display name,
+/// and a rename reaches the next message. The record keeps the machine's
+/// name: the device's harness reads it, and the CLI's selectors resolve it
+/// where a display name resolves nothing.
+#[tokio::test]
+async fn a_sessions_room_names_its_device_as_the_device_list_does() {
+    let app = hive_app().await;
+    let seeded = app.seed_tenant("hivelabel").await;
+    let tid = seeded.tenant_id.clone();
+    let token = seeded.admin.access_token.clone();
+    let mut dev = device(&app, &seeded, "hive-label", RUNS_HIVE).await;
+    rename(&app, &tid, &token, &dev.agent_id, "Front desk").await;
+
+    let caller = start(&app, &tid, &token, &dev.agent_id, "/srv/app");
+    let target = async {
+        let f = read_until(&mut dev.ws, "rc:hive.start").await.unwrap();
+        send(
+            &mut dev.ws,
+            json!({"t": "rc:hive.start_ack", "session_id": f["session_id"], "fence": 1, "account": "dev"}),
+        )
+        .await;
+    };
+    let (body, ()) = tokio::join!(caller, target);
+    assert_eq!(body["outcome"], "accepted", "{body}");
+    let sid = body["session"]["id"].as_str().unwrap().to_string();
+    let room = body["session"]["room_id"]
+        .as_str()
+        .expect("a session has a room")
+        .to_string();
+    // The record keeps the machine's name.
+    assert_eq!(body["session"]["device_name"], "hive-label", "{body}");
+
+    // The start note: its author and its words name the device by its label.
+    let items = wait_messages(&app, &tid, &token, &room, "the start note", |items| {
+        items.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Started on"))
+        })
+    })
+    .await;
+    let started = items
+        .iter()
+        .find(|m| m["content"].as_str().unwrap().contains("Started on"))
+        .unwrap();
+    assert_eq!(started["author_name"], "Claude · Front desk", "{started}");
+    let words = started["content"].as_str().unwrap();
+    assert!(words.contains("Started on **Front desk**"), "{started}");
+    assert!(!words.contains("hive-label"), "{started}");
+
+    // A rename reaches the next message: the turn's stub.
+    rename(&app, &tid, &token, &dev.agent_id, "Reception").await;
+    let stub_of = |turn: u32| format!("{sid}#{turn}");
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 1,
+               "status": "running", "prompted_by": seeded.admin.id, "steps": 0}),
+    )
+    .await;
+    let items = wait_messages(&app, &tid, &token, &room, "turn 1's stub", |items| {
+        items.iter().any(|m| bound_to(m, &stub_of(1)))
+    })
+    .await;
+    let stub = items.iter().find(|m| bound_to(m, &stub_of(1))).unwrap();
+    assert_eq!(stub["author_name"], "Claude · Reception", "{stub}");
+
+    // A cleared display name: the machine's name again, never an empty one.
+    rename(&app, &tid, &token, &dev.agent_id, "").await;
+    send(
+        &mut dev.ws,
+        json!({"t": "rc:hive.turn", "session_id": sid, "fence": 1, "turn": 2,
+               "status": "running", "prompted_by": seeded.admin.id, "steps": 0}),
+    )
+    .await;
+    let items = wait_messages(&app, &tid, &token, &room, "turn 2's stub", |items| {
+        items.iter().any(|m| bound_to(m, &stub_of(2)))
+    })
+    .await;
+    let stub = items.iter().find(|m| bound_to(m, &stub_of(2))).unwrap();
+    assert_eq!(stub["author_name"], "Claude · hive-label", "{stub}");
+}
+
 /// Gate 4 (`HIVE_RUN`) for a plain member: a 200 carrying the reason, no
 /// session created, nothing sent — and an audit row, because a refusal is
 /// the interesting decision.

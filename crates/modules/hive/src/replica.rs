@@ -377,7 +377,8 @@ async fn note_tail(state: &HiveState, s: &AgentSession, device_id: ObjectId, now
         .find_live_in_tenant(s.tenant_id, device_id)
         .await
     {
-        Ok(a) => a.name,
+        // FR-116 AC4 — as a person reads the device.
+        Ok(a) => crate::room::label_of(&a),
         Err(_) => String::new(),
     };
     info!(

@@ -17,6 +17,8 @@ use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::{Binding, NotificationSource, NotificationType};
 use roomler_ai_mod_chat::bound::BoundChat;
 use roomler_ai_remote_control::hive::{HiveApprovalStatus, HiveTurnStatus};
+use roomler_ai_remote_control::models::Agent;
+use roomler_ai_services::dao::agent::AgentDao;
 use roomler_core::Core;
 use roomler_core::notify::{NotifyParams, PushTo};
 use tracing::{debug, warn};
@@ -54,18 +56,20 @@ pub(crate) async fn open(
     Ok(room.id.expect("a stored room has an id"))
 }
 
-/// Post a note the session authors into its room. Best-effort.
+/// Post a note the session authors into its room. Best-effort. A note that
+/// names a device is built from [`for_people`]'s copy by its caller.
 pub(crate) async fn note(state: &HiveState, s: &AgentSession, text: String) {
     let (Some(sid), Some(room)) = (s.id, s.room_id) else {
         return;
     };
+    let author = for_people(&state.fleet.agents, s).await.author_display();
     if let Err(e) = state
         .chat
         .post_agent_message(
             s.tenant_id,
             room,
             sid,
-            s.author_display(),
+            author,
             Binding::new(MODULE, sid.to_hex()),
             text,
         )
@@ -101,6 +105,60 @@ pub(crate) fn name_label(name: &str) -> String {
     } else {
         format!("**{}**", md_escape(name))
     }
+}
+
+/// FR-116 AC4 — a device as a person reads it: the device list's label, the
+/// admin's display name when there is one, else the machine's name. What a
+/// PERSON reads here (the session's author line, its notes, an approval's
+/// notification) names devices this way. The record, and what the device's
+/// harness reads, keep the machine's name: the CLI's selectors resolve that
+/// name, and a display name resolves nothing.
+pub(crate) fn label_of(device: &Agent) -> String {
+    device_list_label(&device.name, device.display_name.as_deref())
+}
+
+/// The device list's rule (the web app's `deviceLabel()`): the display name
+/// when it says something, else the machine's name.
+fn device_list_label(name: &str, display_name: Option<&str>) -> String {
+    display_name
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(name)
+        .to_string()
+}
+
+/// The label of `device` while the org lists it; `kept`, the name the record
+/// holds, once it does not or when the lookup fails.
+async fn label_or(agents: &AgentDao, tenant: ObjectId, device: ObjectId, kept: &str) -> String {
+    match agents.find_live_in_tenant(tenant, device).await {
+        Ok(a) => label_of(&a),
+        Err(_) => kept.to_string(),
+    }
+}
+
+/// `s` with its device named for a person: a copy for text, never stored.
+pub(crate) async fn for_people(agents: &AgentDao, s: &AgentSession) -> AgentSession {
+    let mut shown = s.clone();
+    shown.location.device_name = label_or(
+        agents,
+        s.tenant_id,
+        s.location.device_id,
+        &s.location.device_name,
+    )
+    .await;
+    shown
+}
+
+/// `p` with both of its devices named for a person: a copy for text, never
+/// stored.
+pub(crate) async fn promotion_for_people(
+    agents: &AgentDao,
+    tenant: ObjectId,
+    p: &Promotion,
+) -> Promotion {
+    let mut shown = p.clone();
+    shown.to_name = label_or(agents, tenant, p.to, &p.to_name).await;
+    shown.from.device_name = label_or(agents, tenant, p.from.device_id, &p.from.device_name).await;
+    shown
 }
 
 /// FR-90 P2e-3 — "moving": who moves it, where to, and that the primary
@@ -381,13 +439,14 @@ pub(crate) async fn turn_stub(state: &HiveState, s: &AgentSession, r: TurnReport
             debug!(session = %sid, turn = r.turn, newest = t.turn, "hive: a report for an older turn");
         }
         _ => {
+            let author = for_people(&state.fleet.agents, s).await.author_display();
             let posted = state
                 .chat
                 .post_agent_message(
                     s.tenant_id,
                     room,
                     sid,
-                    s.author_display(),
+                    author,
                     Binding::new(MODULE, format!("{}#{}", sid.to_hex(), r.turn)),
                     text,
                 )
@@ -583,13 +642,14 @@ async fn post_approval_stub(
     approval_id: &str,
     text: String,
 ) {
+    let author = for_people(&state.fleet.agents, s).await.author_display();
     let posted = state
         .chat
         .post_agent_message(
             s.tenant_id,
             room,
             sid,
-            s.author_display(),
+            author,
             Binding::new(MODULE, format!("{}!{approval_id}", sid.to_hex())),
             text,
         )
@@ -661,12 +721,16 @@ pub async fn post_approval_card(
         return None;
     };
     let chat = BoundChat::new(core);
+    // A stateless DAO over the core's database: the caller is another module.
+    let author = for_people(&AgentDao::new(&core.db), s)
+        .await
+        .author_display();
     match chat
-        .post_agent_message(s.tenant_id, room, sid, s.author_display(), binding, text)
+        .post_agent_message(s.tenant_id, room, sid, author.clone(), binding, text)
         .await
     {
         Ok(message_id) => {
-            notify_approval_with(core, &chat, s, sid, room).await;
+            notify_approval_with(core, &chat, s, sid, room, &author).await;
             Some((room, message_id))
         }
         Err(e) => {
@@ -702,15 +766,18 @@ pub async fn edit_approval_card(
 /// they are: a desk with the app open is not a phone in a pocket. It names
 /// the session, never the call.
 async fn notify_approval(state: &HiveState, s: &AgentSession, sid: ObjectId, room: ObjectId) {
-    notify_approval_with(&state.core, &state.chat, s, sid, room).await;
+    let author = for_people(&state.fleet.agents, s).await.author_display();
+    notify_approval_with(&state.core, &state.chat, s, sid, room, &author).await;
 }
 
+/// `author` names the session as its room does ([`for_people`]).
 async fn notify_approval_with(
     core: &Core,
     chat: &BoundChat,
     s: &AgentSession,
     sid: ObjectId,
     room: ObjectId,
+    author: &str,
 ) {
     let mut drivers = Vec::new();
     for d in s.all_drivers() {
@@ -724,7 +791,7 @@ async fn notify_approval_with(
     let params = NotifyParams {
         tenant_id: s.tenant_id,
         notification_type: NotificationType::ApprovalRequest,
-        title: format!("{} needs approval", s.author_display()),
+        title: format!("{author} needs approval"),
         body: format!("“{}” is waiting for a driver to answer.", s.title),
         link: format!("/tenant/{}/room/{}", s.tenant_id.to_hex(), room.to_hex()),
         source: NotificationSource {
@@ -861,6 +928,19 @@ mod tests {
             tail_note("venus", 1)
         );
         assert!(tail_note("", 2).starts_with("↩️ the device holds 2 events"));
+    }
+
+    /// FR-116 AC4 — a person reads a device as the device list names it.
+    #[test]
+    fn a_device_reads_as_the_device_list_names_it() {
+        assert_eq!(
+            device_list_label("hive-label", Some("Front desk")),
+            "Front desk"
+        );
+        assert_eq!(device_list_label("hive-label", None), "hive-label");
+        // A blank display name says nothing: the machine's name, never "".
+        assert_eq!(device_list_label("hive-label", Some("  ")), "hive-label");
+        assert_eq!(device_list_label("hive-label", Some("")), "hive-label");
     }
 
     fn report(status: Option<HiveTurnStatus>) -> TurnReport {

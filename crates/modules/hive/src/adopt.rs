@@ -282,7 +282,8 @@ async fn decide(
         None,
     )
     .await;
-    room::note(state, &session, room::adopted_note(&session)).await;
+    let shown = room::for_people(&state.fleet.agents, &session).await;
+    room::note(state, &session, room::adopted_note(&shown)).await;
     Ok((sid, 1))
 }
 
