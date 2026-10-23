@@ -1995,7 +1995,7 @@ the phase it died in, which is what parts 3 and 4 are for.
 
 The console line is invisible during exactly the sessions this exists to
 explain — nobody has devtools open when a connect takes 15 s — so
-`describeConnectTiming()` (`rcConnectTiming.ts:279`) turns one attempt's marks
+`describeConnectTiming()` (`rcConnectTiming.ts:284`) turns one attempt's marks
 into a sentence in the app snackbar, naming which wait dominated in plain words,
 with the short mark name in the tail so a reported snackbar is traceable without
 devtools (`(stalled at answer)`).
@@ -2003,10 +2003,10 @@ devtools (`(stalled at answer)`).
 | rule | why |
 |---|---|
 | **Consent is never named as "what was slow"** (`HUMAN_PACED`, `:240`) | `ready` is human-paced by design; blaming the operator's own approval is true, useless, and points them at themselves. Locked by a test, because the failure mode is a *confidently wrong* message, not a missing one |
-| A normal connect says nothing (`CONNECT_SLOW_MS` = 7 s, `:247`) | above the measured healthy band, below the reported 10–15 s; a threshold inside the band trains people to dismiss the message |
+| A normal connect says nothing (`CONNECT_SLOW_MS` = 7 s, `:247`), **judged on the machine's share** (`:350`) | above the measured healthy band, below the reported 10–15 s; a threshold inside the band trains people to dismiss the message. ⚠️ #2787: the total used to include the consent wait, so every attended connect read "slower than usual" and named a machine step — measured 35.6 s, 33.6 s of it the owner approving, blamed on a 1.5 s network path. The human-paced waits now come off the total before the threshold (`:312`), and the sentence states them (`Connected in 35.6 s, 33.6 s of it waiting for approval.`) once they reach a second (`APPROVAL_MENTION_MS`, `:252`) |
 | A retry is always notable, even when the total looks fine | the operator waited through a lost attempt either way — and that is the FR-22 signature |
 | `afterDrop` changes the wording | `attempt > 1` has two causes that look identical in the counter: a request never answered, and a session that WORKED and then dropped. Field-found: the first wording named the wrong one |
-| Stall warnings throttle (20 s, `:253`); resolutions never | a flapping path would bury its own message, but showing "it is failing" and suppressing "it finally connected" leaves a warning with no ending |
+| Stall warnings throttle (20 s, `:258`); resolutions never | a flapping path would bury its own message, but showing "it is failing" and suppressing "it finally connected" leaves a warning with no ending |
 | Operator cancellation is silent | telling someone their own button press interrupted a connect is noise |
 
 ⚠️ **#822's snackbar never fired in the field**, twice over: the clock started at

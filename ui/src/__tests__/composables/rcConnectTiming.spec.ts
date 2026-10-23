@@ -154,15 +154,52 @@ describe('FR-22 operator-facing connect verdict', () => {
     // exactly that reason. Reporting "most of the wait was someone
     // approving" would be both true and useless, and would point the
     // operator at themselves instead of at the slow step.
+    // The machine's share here is 10 s, so this connect IS slow (#2787:
+    // the person's 20 s alone no longer makes it so).
     const v = describeConnectTiming(marks({
       request_sent: 0, session_created: 40,
       ready: 20000,          // a person took 20 s to click Allow
       offer_sent: 20010, answer: 20200, pc_connected: 21000,
-      dc_open: 21200, first_frame: 26000,
+      dc_open: 21200, first_frame: 30000,
     }))
+    expect(v.notable).toBe(true)
     expect(v.text).not.toContain('approving')
     // The real dominant non-human wait is the last leg to first frame.
     expect(v.text).toContain('the first video frame arriving')
+    // The approval is stated as a fact, so the total adds up.
+    expect(v.text).toContain('20.0 s of it waiting for approval')
+  })
+
+  it('judges the machine\'s share, not the time a person took to approve (#2787)', () => {
+    // Field, 2026-10-23: a `push` session its owner approved after 33.6 s.
+    // The machine's share was 2.0 s, and the toast still read "slower than
+    // usual. Most of the wait was opening a network path to the device
+    // (1.5 s)": the owner's own approval, made to look like a fault.
+    const v = describeConnectTiming(marks({
+      ws_ready: 0, turn_ready: 44, probes_ready: 57, request_sent: 58,
+      session_created: 92, ready: 33691, offer_sent: 33698, answer: 33762,
+      pc_connected: 35262, dc_open: 35356, first_frame: 35588,
+    }))
+    expect(v.notable).toBe(false)
+    expect(v.color).toBe('info')
+    expect(v.text).toBe('Connected in 35.6 s, 33.6 s of it waiting for approval.')
+  })
+
+  it('never mentions an approval nobody gave', () => {
+    // An `auto` grant settles consent in tens of milliseconds (15 ms in the
+    // same field run). It is still the human-paced step, but "0.0 s of it
+    // waiting for approval" would be noise.
+    const quick = describeConnectTiming(marks({
+      request_sent: 0, session_created: 103, ready: 118, offer_sent: 125,
+      answer: 192, pc_connected: 1730, dc_open: 1825, first_frame: 2262,
+    }))
+    expect(quick.text).toBe('Connected in 2.3 s.')
+    const slow = describeConnectTiming(marks({
+      request_sent: 0, session_created: 40, ready: 60, offer_sent: 70,
+      answer: 300, pc_connected: 9000, dc_open: 9200, first_frame: 11000,
+    }))
+    expect(slow.notable).toBe(true)
+    expect(slow.text).not.toContain('approval')
   })
 
   it('reports a retry even when the total looks acceptable', () => {
