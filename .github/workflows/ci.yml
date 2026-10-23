@@ -1228,12 +1228,15 @@ jobs:
       # unless `ROOMLERD_TEST_MAC_PASTEBOARD=1`; a runner has nobody's copy to lose.
       # FR-97 P2d-2a: and the Mac keyboard layout's pure parts (the tag table,
       # the token, the snapshot), which build only with `enigo-input`.
+      # FR-97 P2c: and Remote Apps (`apps::`), whose macOS backend compiles on
+      # every Mac build: its listing filter, the Terminal script's quoting and
+      # the env floor, on the platform they serve.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac::
+          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the

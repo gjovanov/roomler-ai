@@ -1573,6 +1573,18 @@ async fn connect_once(
     {
         hello_caps.record = record;
     }
+    // FR-97 P2c — and its Remote Apps words, the same way: a delegated
+    // session's control channel ends on the worker's peer, so the worker
+    // serves `rc:apps.*` in the person's window-server session, while this
+    // root daemon is in none and says `status` alone. Our own words are kept
+    // for when no worker is attached (`detect()` memoizes them).
+    let own_apps: Vec<String> = hello_caps.apps.clone();
+    if ctx.is_primary
+        && let Some(apps) = delegation.host().and_then(|d| d.effective_apps())
+    {
+        hello_caps.apps = apps;
+    }
+    let mut last_announced_apps: Vec<String> = hello_caps.apps.clone();
     // FR-85 P3b — what the hello told the server about remote recording, so
     // the heartbeat re-announces the moment the owner's gate changes it.
     let mut last_announced_record: Vec<String> = hello_caps.record.clone();
@@ -2189,6 +2201,13 @@ async fn connect_once(
                     .then(|| delegate.as_ref().and_then(|d| d.effective_record()))
                     .flatten()
                     .unwrap_or_else(record_caps);
+                // FR-97 P2c — and its Remote Apps words, the same way: a
+                // worker that attaches after the hello (or leaves) is news.
+                let apps_now = ctx
+                    .is_primary
+                    .then(|| delegate.as_ref().and_then(|d| d.effective_apps()))
+                    .flatten()
+                    .unwrap_or_else(|| own_apps.clone());
                 let keep_busy_now = crate::keep_busy::advertised();
                 let sas_now = sas_advertised();
                 let desktop_now = crate::desktop_brief::current();
@@ -2206,6 +2225,7 @@ async fn connect_once(
                 let session_policy_now = crate::session_policy::caps_policy();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
+                    && apps_now == last_announced_apps
                     && keep_busy_now == last_announced_keep_busy
                     && sas_now == last_announced_sas
                     && desktop_now == last_announced_desktop
@@ -2218,6 +2238,7 @@ async fn connect_once(
                 } else {
                     last_announced_permissions = caps_now.clone();
                     last_announced_record = record_now.clone();
+                    last_announced_apps = apps_now.clone();
                     last_announced_keep_busy = keep_busy_now;
                     last_announced_sas = sas_now;
                     last_announced_desktop = desktop_now;
@@ -2242,6 +2263,7 @@ async fn connect_once(
                     crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
                     crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
                     c.record = record_now;
+                    c.apps = apps_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
                         c.has_input_permission = has_input;
@@ -2249,6 +2271,7 @@ async fn connect_once(
                     info!(
                         permissions = ?c.permissions,
                         record = ?c.record,
+                        apps = ?c.apps,
                         desktop = ?c.desktop,
                         "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                     );

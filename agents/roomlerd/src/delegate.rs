@@ -802,6 +802,21 @@ impl DelegateHost {
         held.as_ref().map(|c| c.record.clone())
     }
 
+    /// FR-97 P2c — the Remote Apps words (`AgentCaps.apps`) this DEVICE
+    /// should advertise, given who is attached: the worker's. A delegated
+    /// session's control channel ends on the worker's peer, so `rc:apps.*` is
+    /// served there, in the person's window-server session, with the
+    /// person's grants and config. This root daemon is in no session and
+    /// could serve none of it.
+    ///
+    /// `None` = no worker, or one that has not sent its caps: the caller keeps
+    /// its own (`status` alone). A worker older than P2c sends no words, so
+    /// the device advertises nothing it cannot serve.
+    pub fn effective_apps(&self) -> Option<Vec<String>> {
+        let held = self.inner.worker_caps.lock().expect("worker caps mutex");
+        held.as_ref().map(|c| c.apps.clone())
+    }
+
     /// The `permissions` this DEVICE should advertise, given who is attached.
     ///
     /// `None` = "nothing to override" — no worker, or one that has not sent its
@@ -2254,6 +2269,37 @@ mod params_tests {
         *host.inner.worker_caps.lock().unwrap() = Some(AgentCaps::default());
         assert_eq!(
             host.effective_record(),
+            Some(Vec::new()),
+            "an older worker says nothing, and so does the device"
+        );
+    }
+
+    /// FR-97 P2c — the same for Remote Apps: the worker serves `rc:apps.*`
+    /// (the session's control channel ends on its peer), so while one is
+    /// attached the DEVICE advertises the worker's words; and a worker older
+    /// than P2c, which sends none, makes the device advertise none.
+    #[test]
+    fn the_device_advertises_the_attached_workers_apps_words() {
+        let host = DelegateHost::new();
+        assert_eq!(
+            host.effective_apps(),
+            None,
+            "no worker: nothing to override"
+        );
+        let words = vec![
+            "status".to_string(),
+            "list".to_string(),
+            "focus".to_string(),
+            "launch".to_string(),
+        ];
+        *host.inner.worker_caps.lock().unwrap() = Some(AgentCaps {
+            apps: words.clone(),
+            ..Default::default()
+        });
+        assert_eq!(host.effective_apps(), Some(words));
+        *host.inner.worker_caps.lock().unwrap() = Some(AgentCaps::default());
+        assert_eq!(
+            host.effective_apps(),
             Some(Vec::new()),
             "an older worker says nothing, and so does the device"
         );
