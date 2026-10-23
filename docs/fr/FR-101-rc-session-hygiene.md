@@ -81,7 +81,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
   `AUDIO` permission bit is read by nothing; the hub clears it along with the flag.
 - The strip takes effect on every deployed agent, because the agent already enforces the grant it is
   sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1204`) and
-  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:10662`), and adds no audio track
+  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:10661`), and adds no audio track
   without `audio_enabled`. Until P2c the viewer does not explain the refusal.
 - ⚠️ **Mid-roll.** An absent `session_policy` in the relay body comes from an origin pod older than
   the feature and reads as unrestricted: that pod applied no policy and would have granted the
@@ -236,7 +236,7 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
   | Entry point | Where | Before P1b |
   |---|---|---|
   | The agent's enrollment: `roomlerd enroll` / `re-enroll`, the wizard's agent role, the desktop companion | [`enrollment.rs:568`](../../crates/agent-core/src/enrollment.rs#L568) | promoted, but only a lower-case `http://` |
-  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3410`](../../crates/agent-core/src/config.rs#L3410) → [`secure_server_urls`, `:2457`](../../crates/agent-core/src/config.rs#L2457) | dialled as written |
+  | Every load of the agent config: `server_url`, `ws_url`, each `[[orgs]]` entry's | [`config.rs:3456`](../../crates/agent-core/src/config.rs#L3456) → [`secure_server_urls`, `:2457`](../../crates/agent-core/src/config.rs#L2457) | dialled as written |
   | `roomler enroll` and the wizard's tunnel role | [`roomler-cli/src/config.rs:67`](../../agents/roomler-cli/src/config.rs#L67), called at [`cli.rs:1250`](../../agents/roomler-cli/src/cli.rs#L1250) and [`orchestrator_tunnel.rs:236`](../../agents/roomler-setup/src/orchestrator_tunnel.rs#L236) | the tunnel token was posted as written |
   | The tunnel CLI's config, from the file or `ROOMLER_TUNNEL_SERVER` | [`roomler-cli/src/config.rs:46`](../../agents/roomler-cli/src/config.rs#L46) | dialled as written |
   | `roomlerd anchor create` (FR-104) | `exec_service::origin_ok` | refuses plaintext already; unchanged |

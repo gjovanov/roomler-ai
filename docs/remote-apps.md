@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:9195`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:9194`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -137,7 +137,7 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:944`,
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:950`,
 `:624` via `with_config_lists` `:655`) — in the daemon, never in the
 caps-probe child (§4.3).
 
@@ -261,12 +261,12 @@ restart changes it. That is why P6 added a fourth value:
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
   `caps_cache.rs:277`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:1749`; a test locks
+  and the child's struct carries none (`apps_caps`, `caps.rs:1755`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:848`; `files_caps` `:1738`), which a
+  seam (`with_config_lists`, `caps.rs:853`; `files_caps` `:1744`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
@@ -400,7 +400,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2920`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2957`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.

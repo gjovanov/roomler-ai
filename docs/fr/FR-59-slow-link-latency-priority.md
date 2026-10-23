@@ -61,7 +61,7 @@ therefore **increased**.
 
 4. **The queue budget is denominated in the nominal ceiling.**
    `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:360`, called once at
-   `peer.rs:4791`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
+   `peer.rs:4790`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
    budget is **3.4 seconds** of standing queue. The gate never fired.
 
 5. **The only true latency signal is silent, rejected, or toothless.** `viewer_age_ms=None` in
@@ -73,10 +73,10 @@ therefore **increased**.
 6. **Video rides a reliable + ordered DataChannel.** FR-17 stage B exists but is behind a
    viewer `localStorage` opt-in (`useRemoteControl.ts:3021`). On a lossy mobile link every lost
    chunk head-of-line-blocks the stream *and* burns scarce capacity retransmitting a frame that
-   is already stale. `peer.rs:2872` still records "a gap cannot occur".
+   is already stale. `peer.rs:2871` still records "a gap cannot occur".
 
 Aside, and load-bearing for P6: FR-35's rate memory keys on `nominated_remote_ip`
-(`peer.rs:1539`) — on a TURN relay that is the **relay's** address, so a fast office day writes
+(`peer.rs:1538`) — on a TURN relay that is the **relay's** address, so a fast office day writes
 `5_069_353` into a key a slow airport session inherits for `TTL` (7 days).
 
 ## Key design

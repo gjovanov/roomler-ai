@@ -887,7 +887,7 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
             // FR-97 P2d-2b — a Mac switches unless its owner turned it off.
             OsKind::Macos => Unavailable::new(
                 "unsupported",
-                "This Mac's display is not switched to your window: display match is turned off on this Mac",
+                "This Mac's display cannot be switched to your window: display match is turned off on this Mac",
             ),
             OsKind::Linux | OsKind::Windows => Unavailable::new(
                 "unsupported",
@@ -2924,7 +2924,8 @@ mod tests {
     #[test]
     fn a_host_whose_display_cannot_be_switched_says_so() {
         use roomler_ai_remote_control::models::OsKind;
-        for os in [OsKind::Windows, OsKind::Linux] {
+        // FR-97 P2d-2b — a Mac that can switch says nothing too.
+        for os in [OsKind::Windows, OsKind::Linux, OsKind::Macos] {
             let can = with_honest_words(p0c_caps(), &p0c_facts(os));
             assert!(!can.unavailable.contains_key("display-match"), "{os:?}");
         }

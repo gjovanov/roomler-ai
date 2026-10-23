@@ -90,7 +90,7 @@ operator's to restore; the product's job is to say so.
    turned out to have a GUI session and to capture fine. The ordering is right;
    the evidence for it was wrong, and no fleet host currently exercises it.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
-   `video_info_payload` (`peer.rs:4596`) and sent with the same
+   `video_info_payload` (`peer.rs:4595`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
    (rc.87: a once-only send races the control-DC open and is silently lost).
    It is peer-to-peer JSON on the control channel, **not** a `ClientMsg` /
@@ -136,7 +136,7 @@ operator's to restore; the product's job is to say so.
 - Restoring the permission itself. A remote agent must not be able to grant
   itself screen capture, and nothing here tries.
 - Making `has_input_permission` track the OS rather than the build
-  (`encode/caps.rs:1806` records that gap). Same class, separate change.
+  (`encode/caps.rs:1812` records that gap). Same class, separate change.
 - Re-signing or pinning the macOS identity so TCC grants survive a
   certificate change. That is FR-7's ground, and the answer there is that a
   Developer ID move is a one-time cost.
