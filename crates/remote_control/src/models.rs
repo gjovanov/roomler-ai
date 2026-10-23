@@ -391,7 +391,9 @@ pub struct AgentCaps {
     ///
     /// * `"list"`, `"focus"`, `"launch"` — the agent could manage a desktop
     ///   when it announced itself (a Linux virtual desktop or a logged-in
-    ///   X11/Xwayland session, or Windows) AND `virtual_desktop_apps.enabled`.
+    ///   X11/Xwayland session, Windows, or since FR-97 P2c a Mac's GUI
+    ///   session) AND `virtual_desktop_apps.enabled`. A supervised Mac's root
+    ///   row carries its GUI worker's words, since the worker serves them.
     /// * `"status"` (FR-56 AC10) — this build has a Remote Apps backend and
     ///   answers `rc:apps.list` honestly: with the list, or with
     ///   `unavailable: {code, reason}` when there is no desktop to manage.
