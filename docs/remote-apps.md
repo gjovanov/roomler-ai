@@ -65,7 +65,7 @@ Three properties of the wire are load-bearing:
   handing it to `wmctrl -i -a` so a crafted id cannot become a flag
   (`agents/roomlerd/src/apps/linux.rs:337`).
 - 🔑 **Launch takes a key, never a command.** `resolve_app`
-  (`agents/roomlerd/src/apps/mod.rs:536`) is the security gate: the key must be
+  (`agents/roomlerd/src/apps/mod.rs:618`) is the security gate: the key must be
   in the device's own allowlist and the entry's `command` is run as argv with
   no shell, so a compromised viewer can start only what the device's owner
   wrote into its config, and there is no injection surface to reason about.
@@ -130,6 +130,58 @@ helper (`agents/roomlerd/src/companion.rs:598`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
+## 2b. The macOS backend — in which process, and with which APIs (FR-97 P2c)
+
+A Mac publishes its window list to any process in the person's window-server
+session, so the question is not *which display* but *which process*. A
+supervised Mac runs two halves (FR-43): the root LaunchDaemon, which holds the
+enrollment and the overlay and is in **no** window-server session, and the GUI
+worker it starts in the console user's session, which holds the Screen
+Recording and Accessibility grants and owns every session's WebRTC peer. A
+delegated session's `control` channel therefore ends on the worker, and so does
+every `rc:apps.*` request — no new delegation frame was needed. The backend
+(`agents/roomlerd/src/apps/macos.rs`) uses no AppKit, the same rule as the rest
+of the Mac session code.
+
+```mermaid
+flowchart LR
+    V["viewer — the device's row<br/>(the root's enrollment)"] -- "rc:session.*" --> D["root daemon<br/>no window-server session"]
+    D -- "FR-43 delegation<br/>(the session's offer, ICE)" --> WK["GUI worker<br/>the person's session"]
+    V <-. "control DataChannel (P2P)<br/>rc:apps.list · focus · launch" .-> WK
+    WK --> CG["CGWindowListCopyWindowInfo<br/>— the list"]
+    WK --> AX["AXUIElement<br/>— the focus"]
+    WK --> LS["/usr/bin/open -b …<br/>— the launch"]
+    WK -- "WorkerCaps {apps}" --> D
+    D -- "hello / heartbeat: the worker's apps words" --> SRV[(server row)]
+```
+
+| Verb | How | Measured before it was written (tart, macOS 15.7.7, FR-97 §8) |
+|---|---|---|
+| **list** | the window server's two lists, filtered by `quartz_listing` (`agents/roomlerd/src/apps/mod.rs`): layer 0 and alpha above 0; the **on-screen** windows first, front to back, the first one marked `focused`; then the **off-screen windows that have a title** (minimised, a hidden app's, another Space's). Titled `a.txt — TextEdit`, or the app's name alone when the window has none | The on-screen list held exactly the person's 3 windows. The full list added **18 untitled helpers** (menu strips, cursor views, a panel service) next to the one titled window that was minimised. So *titled* is what separates a window from a helper off screen |
+| **focus** | the owner's pid **from the window server** (the browser sends only the id); the app's `AXWindows`, matched by `_AXUIElementGetWindow` (looked up with `dlsym`, so a macOS without it costs the exact match, never the agent's start), else by title and frame; a hidden app is unhidden and a minimised window restored, **each waited out** until the window is on screen; then `AXFrontmost` + `AXRaise` + `AXMain`, judged by the window server's front window, with one retry | Calculator refuses `AXRaise` (-25205), and `AXFrontmost` alone brought it forward, so no single call's error fails a focus. ⚠️ Raising a window of a **hidden** app answered success on every call and left the app unhidden *behind* the front one; unhiding first, then waiting 50 ms for the window, fixed it. A lookup by id with `kCGWindowListOptionIncludingWindow` alone finds **nothing** for a minimised window, so the lookup scans the full list |
+| **launch** | the allowlist's argv, run as the worker (the person, in their session), so `["open", "-b", "<bundle id>"]` goes through LaunchServices. A `terminal` (or `tmux`) entry opens a **new Terminal window**: a self-deleting `.command` script (`rm -f -- "$0"`, then `exec` of the argv, every word single-quoted) written `0700` with `create_new` in the person's own temporary directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, because `sudo` resets the worker's `TMPDIR`), opened with `open -b com.apple.Terminal`. The launcher is waited for (5 s): a failure carries what it wrote to stderr, and no launch leaves a zombie behind | `open -b com.apple.Terminal` opens a window only when Terminal is not running; the `.command` script opened a new window every time and was gone by the time it ran. No AppleScript, so no Automation prompt |
+
+Three rules this backend keeps, each with its reason:
+
+- ⚠️ **The daemon's hello carries the worker's words.** The root is in no
+  session, so its own `apps` are `status` alone (`availability` answers
+  `no_session`). While a worker is attached, the hello and the heartbeat take
+  the worker's `apps` from its `WorkerCaps` (`DelegateHost::effective_apps`),
+  as they already take its `record`: the device advertises what the half that
+  serves the session can do. Primary org only, like delegation itself. A worker
+  older than P2c sends no words, so the device advertises none.
+- ⚠️ **The root's `false` reaches the worker as `ROOMLERD_APPS=0`.** The worker
+  reads its *own* config, so before P2c a root-side
+  `[virtual_desktop_apps] enabled = false` would have changed nothing on the
+  Mac's sessions — the trap #2758 closed for the env switches. `env_fallbacks`
+  publishes `APPS=0` from a config that says `false`, the supervisor forwards it
+  (`WORKER_ENV_FORWARD`), and the worker refuses `switched_off`. It is a
+  **floor**: nothing in the environment switches Remote Apps on against a
+  config that says `false`, and the root's `true` imposes nothing.
+- ⚠️ **`tmux` is not used on a Mac.** A stock macOS has none, and a shell in a
+  Terminal window is what the seeded `bash` entry asks for; its `session` stays
+  empty, and nothing persists past the window.
+
 ## 3. The tiers, and what each one says
 
 This is the table AC10 was audited against (2026-09-25, agent 0.4.102). The two
@@ -155,7 +207,7 @@ caps-probe child (§4.3).
 | **nobody logged in** (headless, greeter, no Xvfb) | absent | bare `supported:false` | **NO** — `graphical_session`'s sentence was thrown away by `.ok()?` | `status` + `unavailable{no_session}` |
 | **privilege drop failed** | absent | bare `supported:false` | **NO** — swallowed, then the log blamed Xwayland | `unavailable{cannot_run_as}`, and discovery stops at the first |
 | **disabled in config** | absent | bare `supported:false` | **NO** — one `info!` at boot | `status` + `unavailable{disabled}` |
-| **macOS** | absent | bare `supported:false` | no — and nothing to change: there is no backend | unchanged by design: no `status`, no button; `platform` answers a stray request |
+| **macOS** | absent | bare `supported:false` | no — and nothing to change: there is no backend | unchanged by design: no `status`, no button; `platform` answers a stray request. **Since FR-97 P2c** (§2b): `status · list · focus · launch` from a per-user agent or a supervised Mac's GUI worker, and on the root's row while its worker is attached; `quartz` lists every window, so nothing is unlisted (only the titles, without the Screen Recording grant) |
 | **Windows** | `list · focus · launch` whenever enabled | `EnumWindows` on the active desktop; `sources: win32`, nothing to miss | n/a | `+ status`. ⚠️ Unverified: a SYSTEM worker with nobody logged in or a locked screen — `EnumWindows` on the wrong window station returns few or no windows, which is the P2 shape ("quiet desktop"); `windows.rs` names `SetThreadDesktop` as the fix *when observed* |
 | **user logs in after the daemon booted** | absent — **for the process lifetime** | the live reply says `supported:true` | NO — the button was hidden, so nobody asked | `status` shows the entry; the dialog is live |
 | **session gone by click time** (advertised at hello, user logged out) | `list · focus · launch` | bare `supported:false`; the entry greyed out with no tooltip | **NO** | reason in the dialog; the entry is never disabled |
@@ -177,14 +229,14 @@ that is the truth: a short list looks exactly like a quiet desktop. This is the
 `Some([])`-vs-`None` distinction on its fourth surface in this codebase
 (overlay ACL ingress rules, `ssh_activity`, FR-49's dark org): an empty list and
 an unenumerable source are different facts, and only the reply can tell them
-apart. `Coverage` (`agents/roomlerd/src/apps/mod.rs:127`) is a **trait method**,
+apart. `Coverage` (`agents/roomlerd/src/apps/mod.rs:139`) is a **trait method**,
 not a field set at construction, so the compiler forces every backend to answer
 — it caught the test fake the day it was added.
 
 | Field | Meaning | Absent means |
 |---|---|---|
-| `sources: ["x11"]` / `["win32"]` | the window sources this listing enumerated | (always present when `coverage` is) |
-| `unlisted: "native Wayland windows: …"` | a source that exists on this host and could **not** be enumerated, with the reason | the listing is complete for this desktop — an X11 or Xvfb session has no second source to caveat |
+| `sources: ["x11"]` / `["win32"]` / `["quartz"]` | the window sources this listing enumerated (`quartz`: the macOS window server, FR-97 P2c) | (always present when `coverage` is) |
+| `unlisted: "native Wayland windows: …"` | a source that exists on this host and could **not** be enumerated, with the reason. On a Mac without the Screen Recording grant: *window titles*, which the window server then withholds | the listing is complete for this desktop — an X11 or Xvfb session has no second source to caveat |
 | `missing_tools: [{tool, blocks, install}]` | helpers this backend shells out to that are **not installed**, probed **per call, never cached** (a host can gain `tmux` at any moment — FR-45's lesson about caches and start order) | ⚠️ on the wire, *nothing missing* and *older agent* are the same bytes: the agent skips an empty list. The viewer therefore renders nothing for both and never invents an empty array, which would claim "checked, none" |
 
 - ⚠️ **`supported` stays `true` when `missing_tools` is non-empty.** Listing
@@ -202,14 +254,14 @@ not a field set at construction, so the compiler forces every backend to answer
   `pre_exec` hook long after the environment was copied, so the target user's
   login `PATH` never enters into it (`linux.rs:209`). Asking any other way
   answers about an environment the child never gets.
-- **`coverage` rides the error arm too** (`mod.rs:433`). A failed listing is
+- **`coverage` rides the error arm too** (`mod.rs:548`). A failed listing is
   exactly where an empty list is most likely to be read as calm.
 
 ### 4.2 `unavailable` — why there is no listing at all (P6)
 
 Every reply that says `supported: false`, and every focus/launch refused for
 want of a backend, carries `unavailable: {code, reason}` (`Unavailable`,
-`agents/roomlerd/src/apps/mod.rs:176`). The sentence is composed on the agent,
+`agents/roomlerd/src/apps/mod.rs:189`). The sentence is composed on the agent,
 not in the viewer, because only the agent knows which arm it took — the same
 rule FR-80 applied to the capture reason. The `code` is a **closed set**, and a
 compatibility surface like every other `rc:*` string: a test locks that the
@@ -224,11 +276,12 @@ into `starts_with`).
 | `no_x_display` | a session exists, no candidate display answered | a Wayland compositor without Xwayland; this backend manages X11 windows only |
 | `cannot_run_as` | the session's owner was found and the privilege drop failed | the account is unresolvable or the drop was refused; commands are never run as root instead |
 | `tool_missing` | `wmctrl` is not installed (session arm) — the whole feature, launch included, since this backend needs it to find and manage the desktop | `apt install wmctrl` |
-| `platform` | no backend for this OS | reached only by a stray request; the hello never advertises anything here |
+| `platform` | no backend for this OS (the BSDs; macOS until FR-97 P2c) | reached only by a stray request; the hello never advertises anything here |
+| `switched_off` | `ROOMLERD_APPS=0` in the agent's environment (FR-97 P2c) — on a Mac, the root half's `enabled = false`, forwarded to the GUI worker (§2b) | remove the variable, or enable them in that config, and restart the daemon. Its own code, because `disabled` points at the process's own config, which on a worker may well say `true` |
 
 The legacy `error` string on a focus/launch refusal keeps its shape and
 *contains* the reason, so a viewer that reads nothing else still shows it
-(`mod.rs:521`).
+(`mod.rs:603`).
 
 ### 4.3 The hello is a boot-time snapshot; the reply is live
 
@@ -236,7 +289,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:37`,
 `:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
-(`agents/roomlerd/src/signaling.rs:1304`, `:1937`)
+(`agents/roomlerd/src/signaling.rs:1304`, `:1949`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -244,14 +297,14 @@ restart changes it. That is why P6 added a fourth value:
 - **`status`** — *this build has a Remote Apps backend and answers
   `rc:apps.list` honestly*: with the list when there is a desktop, with
   `unavailable` when there is not. Advertised whenever the platform has a
-  backend (`apps::has_backend`, `mod.rs:357`), independent of what the host
+  backend (`apps::has_backend`, `mod.rs:434`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
   (`ui/src/views/remote/RemoteControl.vue:4589` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
   or the reason (`useRemoteControl.ts:9601`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
-- 🔑 **`availability_for()` is the single source for both** (`mod.rs:321`): the
+- 🔑 **`availability_for()` is the single source for both** (`mod.rs:396`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
   can disagree only by *time*, never by logic — **and never by which process
   asked.** ⚠️ The review of #1667 found that claim false on a caps-cache
@@ -291,7 +344,7 @@ server outlives both), it is `ssh`-attachable from a real login
 
 - 🔑 **Our own windows carry a known title**, so a window maps back to its
   session or allowlist key without pid/`xprop` correlation
-  (`classify_title`, `mod.rs:650`). Anything else is an unmanaged window and is
+  (`classify_title`, `mod.rs:732`). Anything else is an unmanaged window and is
   reported with its real title.
 - ⚠️ **A re-attach target is validated as a plain session token**
   (`is_safe_session`, `linux.rs:447`) — defence in depth against a crafted
@@ -350,7 +403,10 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 | 2026-09-26 | the hosted server | the viewer half | **not yet deployable**: `/health` still `0.4.102`, and the served `RemoteControl-*.js` has none of the P6 strings — the deployed dialog still drops `missing_tools` until a server promote |
 | 2026-10-07 | GNOME Wayland (Asahi), a live session in a browser; prod 0.4.116 serving the P6 viewer, agent 0.4.116 | the viewer half of P6 — P2 + P5 on a screen | the Apps dialog rendered *Not listed — native Wayland windows: …* and *tmux is not installed on the agent host — persistent shell sessions … (apt install tmux)* beside the one Xwayland window, under the title *List, focus or launch apps on the controlled host* — 3 s after the request, in a hidden tab |
 | 2026-10-07 | the viewer's roster (three orgs) | a refusing host to read | none: no online hello is `status` without `list`; the cluster nodes run Xvfb, the Wayland host has a session, macOS hides the entry; the WSL node's remote view hands the connection to the Windows host on the same machine (twice) |
-| owed | a host whose live reply refuses — nobody logged in and no Xvfb, or the Wayland host after a logout | the refusal rendered | the dialog showing the `no_session` reason instead of *"No windows reported"* — its content is proven on the agent (0.4.103), its rendering by the parser tests only |
+| 2026-10-23 | throwaway tart Macs (macOS 15.7.7), a probe run as the console user | FR-97 P2c, measured before it was built (§2b) | the on-screen list held the 3 real windows, the full list 18 untitled helpers more; a hidden app's raised window came back *behind*, until unhide-then-wait; Calculator refuses `AXRaise`; a `.command` script opens a new Terminal window every time |
+| 2026-10-23 | a tart Mac with both halves, the viewer on the root's row (a delegated session); released 0.4.158 | P2c's red | both rows `apps: null`, no entry; a raw `rc:apps.list` answered by the worker in 40 ms: `unavailable: platform` |
+| 2026-10-23 | the same, P2c's candidate | P2c's green, and its kill switch from either half | both rows `status · list · focus · launch`; the list in 85 ms with `sources: quartz`; a click brought a.txt in front (the host's probe); "New bash session" opened a Terminal window. The root's `enabled = false` → the worker's `switched_off`; the person's → `disabled` (FR-97 §8). **A refusal rendered:** the deployed viewer's dialog showed the `disabled` sentence as its warning, over an empty *Open windows* and with no *"No windows reported"* (the cell's screenshot) |
+| owed | a host whose live reply refuses — nobody logged in and no Xvfb, or the Wayland host after a logout | the refusal rendered (the same rendering is proven for `disabled`, the row above; this one is `no_session`'s own text) | the dialog showing the `no_session` reason instead of *"No windows reported"* — its content is proven on the agent (0.4.103), its rendering by the parser tests only |
 
 Still owed to a human: a window streamed to the browser and a switch between
 two (somebody must answer the picker), and native enumeration on a wlroots host
@@ -376,12 +432,17 @@ terminal = true
 [virtual_desktop_apps.allowlist.editor] # a GUI app: argv, no shell
 command  = ["gnome-text-editor", "--new-window"]
 label    = "Text editor"
+
+[virtual_desktop_apps.allowlist.safari] # a Mac app, through LaunchServices (FR-97 P2c)
+command  = ["open", "-b", "com.apple.Safari"]
+label    = "Safari"
 ```
 
 | Key | Where | Default | Notes |
 |---|---|---|---|
 | `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1531`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
-| `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch |
+| `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux and macOS, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch. On a Mac a `terminal`/`tmux` entry opens a new Terminal window running it, and an app is `["open", "-b", "<bundle id>"]` (§2b) |
+| `ROOMLERD_APPS` | env (`apps::APPS_ENV`); published as `0` by `env_fallbacks` from a config that says `false` | unset | FR-97 P2c — a **floor**: `0`/`false`/`no`/`off` switches Remote Apps off (`switched_off`), nothing switches them on. A supervised Mac's root forwards it to its GUI worker, which is how the root's `enabled = false` reaches the sessions |
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1073`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
@@ -409,9 +470,11 @@ must never write the device's config as a side effect of being run.
 
 | File | Owns |
 |---|---|
-| `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage` `:127`, `MissingTool` `:151`, `Unavailable` `:176` with `code` `:209` and `reason` `:221`), the `WindowManager` trait (`:259`), `availability` (`:314`) and `availability_for` (`:321`), `has_backend` (`:357`), `backend` (`:367`), `handle_control_message` (`:390`) and the pure `dispatch` seam (`:410`), the three reply builders (`:433`, `:471`, `:489`), `unavailable_reply` (`:521`), `resolve_app` (`:536`), the `wmctrl`/tmux parsers and `classify_title` (`:650`) |
+| `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage` `:139`, `MissingTool` `:164`, `Unavailable` `:189` with `code` `:229` and `reason` `:242`), the `WindowManager` trait (`:288`), the env floor (`APPS_ENV` `:338`, `permitted` `:355`), `availability` (`:389`) and `availability_for` (`:396`), `has_backend` (`:434`), `backend` (`:448`), `handle_control_message` (`:475`) and the pure `dispatch` seam (`:492`), the three reply builders (`:515`, `:553`, `:571`), `unavailable_reply` (`:603`), `resolve_app` (`:618`), the `wmctrl`/tmux parsers and `classify_title` (`:732`), the macOS listing (`QuartzWindow` `:764`, `quartz_listing` `:800`) and the Terminal script (`terminal_script` `:865`) |
 | `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:228`), `coverage` (`:254`), `list` (`:274`), `focus` (`:337`), `launch` (`:368`), `discover` (`:480`) and its test seam `discover_with` (`:497`), `refused` (`:579`), `Probe` (`:589`) and `probe` (`:605`), `find_xauthority` (`:648`) |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
+| `agents/roomlerd/src/apps/macos.rs` | FR-97 P2c: the window server's list (`quartz_windows`), the AX focus (`ax_window`, `MacWm::focus`), the launcher (`run_launcher`) and the Terminal script (`write_script`, `person_temp_dir`), `availability` (a window-server session or `no_session`). Its pure halves are in `mod.rs`: `QuartzWindow`, `quartz_listing`, `quartz_title`, `parse_quartz_window_id`, `terminal_script`, `terminal_script_name`, and the env floor (`APPS_ENV`, `apps_switched_off`, `permitted`) |
+| `agents/roomlerd/src/delegate.rs` · `signaling.rs` · `macos_supervisor.rs` | FR-97 P2c on a supervised Mac: `effective_apps` (the worker's words), the hello and heartbeat that carry them, and `WORKER_ENV_FORWARD`'s `APPS` |
 | `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1612`, `:1618`), assigned by `with_config_lists` (`:777`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1657`, `:1664`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:789`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |

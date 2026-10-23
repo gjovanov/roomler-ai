@@ -390,8 +390,8 @@ pub struct AgentCaps {
     /// EQUALITY:
     ///
     /// * `"list"`, `"focus"`, `"launch"` — the agent could manage a desktop
-    ///   when it announced itself (a Linux virtual desktop or a logged-in
-    ///   X11/Xwayland session, or Windows) AND `virtual_desktop_apps.enabled`.
+    ///   when it announced itself (a Linux virtual desktop or X11/Xwayland
+    ///   session, Windows, a Mac's GUI session) AND `virtual_desktop_apps.enabled`.
     /// * `"status"` (FR-56 AC10) — this build has a Remote Apps backend and
     ///   answers `rc:apps.list` honestly: with the list, or with
     ///   `unavailable: {code, reason}` when there is no desktop to manage.

@@ -283,6 +283,10 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // for it, which the worker holds as a floor under its own.
     "MAC_DISPLAY_MATCH",
     "DISPLAY_MATCH",
+    // FR-97 P2c — Remote Apps: the root's `[virtual_desktop_apps] enabled =
+    // false`, published as `0`, which the worker that serves `rc:apps.*` holds
+    // as a floor under its own config.
+    "APPS",
     // FR-119 — the high-refresh picker and its per-cell ceilings.
     "FPS_HIGH",
     "FPS_DENY",
@@ -818,6 +822,8 @@ mod tests {
             "FPS_DENY" => Some("*:144".to_string()),
             "CLIPBOARD_MAC_WATCH" => Some("0".to_string()),
             "ENCODER_CELLS_DENY" => Some("hevc_videotoolbox:yuv444".to_string()),
+            // FR-97 P2c — the root's `[virtual_desktop_apps] enabled = false`.
+            "APPS" => Some("0".to_string()),
             // Set on the root, but root-only: never forwarded.
             "RELAY_SERVER_ENABLED" => Some("true".to_string()),
             _ => None,
@@ -826,6 +832,7 @@ mod tests {
             worker_env_args(root),
             vec![
                 "ROOMLERD_CLIPBOARD_MAC_WATCH=0",
+                "ROOMLERD_APPS=0",
                 "ROOMLERD_FPS_DENY=*:144",
                 "ROOMLERD_ENCODER_CELLS_DENY=hevc_videotoolbox:yuv444",
             ]
