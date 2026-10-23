@@ -1054,6 +1054,13 @@ fn open_in_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) -> R
 /// GLib 2.84, mutter 48, Chromium 148, the browser behind another window):
 /// no context and GDK's own context both left it behind; the explicit
 /// token brought it forward.
+///
+/// ⚠️ A PLAIN context, never GDK's own with the token set on it: on Wayland
+/// GDK's answers `get_display` with the compositor socket's name
+/// (`wayland-0`), and GIO writes that into the launched program's `DISPLAY`,
+/// where an X11 client the browser starts would look for an X server that
+/// does not exist. Measured on the same box: GDK's `'wayland-0'`, a plain
+/// context's `None`.
 #[cfg(target_os = "linux")]
 fn launch_default_handler(url: &str) -> Result<(), String> {
     use gio::prelude::*;
