@@ -302,6 +302,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         hive_net: false,
         hive_ssh: false,
         hive_egress: false,
+        // FR-90 P4-3b-1: nothing scanned until the owner lists a root.
+        knowhow_scan_roots: Vec::new(),
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,

@@ -161,6 +161,12 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-3b-1 — a device's scan end to end: the real agent loop scans the
+/// roots its config file lists onto the map; a root gone unread retires
+/// nothing; an emptied list answers `no_roots`. Linux: the agent's scanner
+/// rides the `hive` feature, which this crate's dev-dependency turns on there.
+#[cfg(all(test, target_os = "linux"))]
+mod knowhow_device_scan_tests;
 /// FR-90 P4-3a-2 — what a scan writes: its device's own part, shared entities
 /// made bare and linked, a later scan's archive, the device's word kept the
 /// device's, a device describing only itself, a removal's archive.

@@ -2082,6 +2082,13 @@ fn rpc_caps() -> Vec<String> {
     // it. A property of the BUILD, as `hive-purge-all` is.
     #[cfg(hive_host)]
     caps.push(RpcCap::HivePurgeDrain);
+    // FR-90 P4-3b-1 — and scans the roots its owner lists on
+    // `rc:knowhow.scan`, each as the account that owns it. A property of the
+    // BUILD, as `hive-purge` is: an empty `knowhow_scan_roots` is an answer
+    // (`no_roots`), never a reason to stay silent. Linux and macOS; Windows
+    // advertises it from P4-3b-4.
+    #[cfg(all(hive_host, unix))]
+    caps.push(RpcCap::KnowhowScan);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.

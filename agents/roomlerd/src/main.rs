@@ -1353,6 +1353,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(roomlerd::hive::purge_main());
     }
 
+    // FR-90 P4-3b-1 — `roomlerd knowhow-scan`: one root of a knowhow scan,
+    // read AS THE ACCOUNT THAT OWNS IT, for metadata alone. The request on
+    // stdin, one line to stdout.
+    #[cfg(all(hive_host, unix))]
+    if roomlerd::hive::knowhow::scan_args() {
+        std::process::exit(roomlerd::hive::knowhow::scan_main());
+    }
+
     // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
     // which the daemon runs AS THE CONSOLE USER before the harness starts, as
     // the Unix wrapper runs as the account. None of the setup below is its.
@@ -4107,6 +4115,14 @@ async fn run_cmd(
     // terminal-error slot / OrgCtx) are minted here so the registry rows and
     // the spawned supervisors share the SAME instances.
     let primary_ctx = signaling::OrgCtx::primary(primary_token.clone()).with_renewal(token_renewal);
+    // FR-90 P4-3b-1 — the primary's knowhow scanner, reading its roots from
+    // this config file under the LocalAPI's own write lock. A secondary's
+    // context has none (decision 43).
+    #[cfg(all(hive_host, unix))]
+    let primary_ctx = primary_ctx.with_knowhow(roomlerd::hive::knowhow::Scanner::subprocess(
+        config_path.clone(),
+        cfg_write_lock.clone(),
+    ));
     let mut org_spawns: Vec<OrgSpawn> = Vec::new();
     // Multi-org — every secondary org.s live overlay view, so `peers` can
     // report all orgs (the receivers used to be dropped on the floor).

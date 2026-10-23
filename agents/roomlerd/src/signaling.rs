@@ -522,6 +522,11 @@ pub struct OrgCtx {
     /// FR-103 — rung once the server has ACCEPTED the token on a connect:
     /// the renewal task looks after every connect.
     renewal_connected: Arc<tokio::sync::Notify>,
+    /// FR-90 P4-3b-1 — the device's knowhow scanner, on the primary's context
+    /// alone (decision 43): `None` on a secondary's, and on a daemon with no
+    /// config file to read its roots from.
+    #[cfg(all(hive_host, unix))]
+    pub knowhow: Option<Arc<crate::hive::knowhow::Scanner>>,
 }
 
 impl OrgCtx {
@@ -535,6 +540,8 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(all(hive_host, unix))]
+            knowhow: None,
         }
     }
 
@@ -550,6 +557,9 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
+            // Decision 43: a secondary enrollment never scans.
+            #[cfg(all(hive_host, unix))]
+            knowhow: None,
         }
     }
 
@@ -557,6 +567,14 @@ impl OrgCtx {
     /// environment's; a test passes its own).
     pub fn with_renewal(mut self, renewal: crate::token_renewal::Settings) -> Self {
         self.renewal = renewal;
+        self
+    }
+
+    /// FR-90 P4-3b-1 — the scanner `rc:knowhow.scan` runs on (`run_cmd`
+    /// passes the daemon's; a test passes one that reads in-process).
+    #[cfg(all(hive_host, unix))]
+    pub fn with_knowhow(mut self, scanner: Arc<crate::hive::knowhow::Scanner>) -> Self {
+        self.knowhow = Some(scanner);
         self
     }
 
@@ -6408,6 +6426,37 @@ async fn handle_server_msg(
                         .await;
                 let _ = tx.send(reply).await;
             });
+        }
+
+        // FR-90 P4-3b-1 — the server asks this device to scan the roots its
+        // owner lists. Run off this loop, on the primary's scanner alone,
+        // and always answered: the scan's record waits on it.
+        ServerMsg::KnowhowScan { scan_id } => {
+            #[cfg(all(hive_host, unix))]
+            crate::hive::knowhow::handle_scan(
+                ctx.knowhow.as_ref(),
+                scan_id,
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            // A build that does not scan never advertises `knowhow-scan`, so
+            // no server asks it; one that asks anyway is told, not left to
+            // expire.
+            #[cfg(not(all(hive_host, unix)))]
+            {
+                let tx = outbound_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(ClientMsg::KnowhowScanned {
+                            scan_id,
+                            outcome: roomler_ai_remote_control::knowhow::ScanOutcome::Failed,
+                            detail: Some("this build does not scan".into()),
+                            truncated: false,
+                            findings: Vec::new(),
+                        })
+                        .await;
+                });
+            }
         }
 
         // Remaining tunnel-flow `ServerMsg` variants

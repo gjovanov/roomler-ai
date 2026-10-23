@@ -1713,8 +1713,8 @@ pub enum ClientMsg {
         /// re-clamped on receipt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
-        /// The device stopped at [`crate::knowhow::MAX_FINDINGS`] or
-        /// [`crate::knowhow::MAX_SCAN_BYTES`].
+        /// The device stopped at a bound ([`crate::knowhow::MAX_FINDINGS`],
+        /// [`crate::knowhow::MAX_SCAN_BYTES`]), or left a root it lists unread.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
