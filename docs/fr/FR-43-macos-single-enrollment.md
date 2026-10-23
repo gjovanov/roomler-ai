@@ -347,6 +347,14 @@ start a second one in the person's session. A session-side knob joins the list
 when it is added; a test keeps the root-only ones out
 (`no_root_only_knob_is_forwarded_to_the_worker`).
 
+⚠️ **The root's value wins over the person's own.** Through P2 the worker keeps
+its own enrollment (the fallback, above) and reads the person's config. An
+environment variable beats a config key, so while the root has a value for a
+forwarded knob, the person's own value for it does not apply, whether it was set
+by hand or pushed to the per-user row. For a kill switch that is the point, since
+one account must not undo a switch set for the machine. To give the per-user row
+its own value, clear the root's.
+
 ### Components
 
 | where | change |
@@ -740,3 +748,39 @@ whether it can. The no-worker criterion asks for a **wire** measurement, and the
 of a log line on another device is inference from behaviour, which it rules out. And
 `has_input_permission: true` in the caps is only AC4's reporting half — that criterion
 also needs real input accepted with no TCC re-prompt.
+
+### 2026-10-23 — #2758: the worker obeys the root's switches (red on 0.4.154, green on its candidate)
+
+Throwaway tart Macs (macOS 15.7.7), both halves enrolled in the vmtest org, sessions
+auto-granted, the root's supervisor on and the LaunchAgent booted out, so the GUI worker is
+the per-user half, started by the root. `ROOMLERD_CLIPBOARD_MAC_WATCH=0`,
+`ROOMLERD_LOCK_HINT=0` and the root-only `ROOMLERD_AUTO_UPDATE=0` were set in the root's
+LaunchDaemon plist only. A Playwright viewer on mars connected to the **root's** row, so the
+session was delegated to the worker (`serving a delegated rc message kind="rc:ice"` in its
+log). It subscribed to text and image events, and the guest copied a 64×48 PNG, then a
+line of text, as the console user.
+
+| | 🔴 released 0.4.154 | 🟢 the candidate (rehearsal 39912891967, `.pkg` `9ea527d4…`) | the candidate, no switch (control) |
+|---|---|---|---|
+| the worker's `ROOMLERD_*` (`ps -E`) | none | `CLIPBOARD_MAC_WATCH=0`, `LOCK_HINT=0`; not `AUTO_UPDATE` | none |
+| the root's log | — | `the worker inherits the root's session knobs keys=["ROOMLERD_LOCK_HINT", "ROOMLERD_CLIPBOARD_MAC_WATCH"]` | — |
+| the hello: root's row / per-user row | `not-watched` / no word | `not-watched` / `not-watched` | no word / no word |
+| the copied image | pushed unasked 0.9 s after the copy (`clipboard:img-begin` 64×48, 1010 bytes) | nothing: 0 binary frames | pushed unasked 0.9 s after the copy |
+| the copied text | arrived | arrived | arrived |
+
+The red is the defect in one line: the root's hello said `not-watched`, and the session it
+handed over pushed the image anyway. The control shows the candidate still watches images
+when no switch is set, so the green's silence is the switch.
+
+🔍 **`ps -E` lists a forwarded variable twice, and only one of them is a variable.** sudo
+sets `SUDO_COMMAND` to the whole command line it ran, and that line now carries the
+`ROOMLERD_K=v` arguments. Split on spaces, those arguments read like variables. A
+synthetic `sudo -u '#501' /usr/bin/env WENV_PROBE=1 /bin/sleep` showed `WENV_PROBE=1` once
+inside `SUDO_COMMAND` and once on its own, with an argv of just `/bin/sleep 12`.
+
+🔍 **A dead end, kept.** The first red attempt enrolled only the root half. The supervisor
+found no worker in 90 s, as in P2b's root-only tart runs on 2026-10-22. Through P2 the
+worker keeps its own enrollment and that layout has none; why no worker appeared was not
+diagnosed further. The root served the session
+itself, and no push arrived at all, not even text, because a root daemon outside the
+console session cannot reach the pasteboard.
