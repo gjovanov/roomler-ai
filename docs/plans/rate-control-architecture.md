@@ -39,7 +39,7 @@ indexed by `session_id`) — the only structured per-session record and the shad
    way WebRTC's VT encoder does it). Nine heuristics ration this cost; on LAN pairs the AIMD crosses
    a rung nearly every window (44 swap IDRs/day on one host).
 2. **No single model of the pipe** — eight estimators composed with "the lower of" rules in
-   `RateGovernor::pre_encode_tick` (`encode/governor.rs:482`) and `tick_viewer_window` (:708).
+   `RateGovernor::pre_encode_tick` (`encode/governor.rs:518`) and `tick_viewer_window` (:708).
 3. **The wrong data path.** ICE nominated the overlay host pair (`100.65.0.5 ↔ 100.65.0.6`) so
    video rode WebRTC → TUN → WireGuard → DERP/TLS → corp VPN, shed by our own DERP mux
    (`queue_max_age` 100 ms, `crates/tunnel-core/src/transport/derp.rs:64–77`). The rc.319
@@ -85,7 +85,7 @@ targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `enc
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:203`; parity test :1935).
-Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:6817–6771`) with
+Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:6819–6771`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:29`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
@@ -113,7 +113,7 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 |---|---|---|---|
 | A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:4912, 4856–4863, 6100–6147, 6158–6194, 6251–6256`; `mod.rs:417–474` | A0 pass on QSV, switch ON one release |
 | A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:4979–4991, 5022–5088`; `encoder.rs:1525–1546`; `aimd.rs:285–338`; `mod.rs:370–381` | VT measured or kept on the settle rule |
-| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:695–699`; `peer.rs:3831` | — |
+| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:731–699`; `peer.rs:3831` | — |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
 `kf_gate` (kf_policy.rs), `send_epoch` for those rebuilds.
@@ -138,8 +138,8 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:1237–1270`, parser `peer.rs:7491–7365`): `frames_lost`
-(chunk gaps, already in `rc-hevc-worker.ts:325`), `frames_rx`, `delay_slope_ms_s` (least-squares
+`decodeStatWireMessage` `useRemoteControl.ts:1239–1270`, parser `peer.rs:7493–7365`): `frames_lost`
+(chunk gaps, already in `rc-hevc-worker.ts:330`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:102–138` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
 pins; floor is a constant per path (`area_min_bitrate_bps` direct, 200 k constrained), ceiling =

@@ -37,6 +37,18 @@
 // invalid window's numbers are DROPPED. The window after it is measured on its
 // own merits, which is what every one of the three events wanted and what the
 // deferral machinery in T2 was approximating with a buffer.
+//
+// # Every window, direct ones included (FR-119 P2b-8)
+//
+// Until P2b-8 the gate ran on constrained windows only, and a direct window was
+// evidence by definition. FR-119's grant, which only ever runs on a direct
+// path, then read capacity claims nothing had gated: on the MacBook a session's
+// opening window (its first keyframe into a transport still ramping) blocked
+// sends for 43–82 ms, folded as a capacity of 14–22 Mbps against a 104 Mbps
+// ceiling, and took a freshly granted 120 fps back for the claim's whole
+// 60 s. Twice in four direct sessions. On a direct window the facts that
+// exist there apply — the agent's own stall and the opening; the classifier
+// verdicts stay constrained-only, because the classifier does not run there.
 
 use super::pipe_state::PipeState;
 
@@ -50,6 +62,13 @@ pub enum Reason {
     /// candidate. (2026-09-08 12:15: 2.9 s and 7.4 s passes, every timed phase
     /// at 0 ms.)
     AgentStalled,
+    /// FR-119 P2b-8 — the window falls inside the transport's opening: the
+    /// first keyframe meeting a transport that is still ramping up. A send
+    /// blocked here measured that ramp as much as the path, so its drain rate
+    /// is at best a lower bound, never a capacity. The opening is FR-35's
+    /// opener window (at least 2 s from the first keyframe and until the send
+    /// ledger drains, at most 3 s), now kept for every session.
+    Opening,
     /// The classifier says the transport stalled in this window.
     TransitStalled,
     /// The window BEFORE this one stalled. What arrives here is the stall's
@@ -66,6 +85,7 @@ impl Reason {
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::AgentStalled => "agent-stalled",
+            Reason::Opening => "opening",
             Reason::TransitStalled => "transit-stalled",
             Reason::StallShadow => "stall-shadow",
             Reason::CarrierChanged => "carrier-changed",
@@ -80,8 +100,8 @@ impl Reason {
     /// transport is not a measurement — but it is the transport pushing back,
     /// which is the only push-back a relay-TCP session produces at all.
     ///
-    /// The other three say nothing about the rate, and each would be a
-    /// regression if it cut:
+    /// The others say nothing about the rate, and each would be a regression
+    /// if it cut:
     ///
     /// - `AgentStalled` implicates the LOOP, not the pipe. Cutting on it is
     ///   the 2026-09-08 12:15 defect exactly: 6.60 → 0.68 Mbps on a path that
@@ -90,6 +110,8 @@ impl Reason {
     ///   double-counts one event, which is how FR-35's halving overshot.
     /// - `CarrierChanged` measured a different path — that is a re-anchor to
     ///   the new carrier's memory, not a cut.
+    /// - `Opening` is the opening keyframe draining into a transport that is
+    ///   still ramping, which FR-35 already declined to cut for.
     ///
     /// ⚠️ True here is NOT "cut". A transit stall on a path we are NOT
     /// overdriving is FR-71's finding 4 (an 8 Mbps relay leg
@@ -100,16 +122,23 @@ impl Reason {
     pub fn is_congestion(self) -> bool {
         match self {
             Reason::TransitStalled => true,
-            Reason::AgentStalled | Reason::StallShadow | Reason::CarrierChanged => false,
+            Reason::AgentStalled
+            | Reason::Opening
+            | Reason::StallShadow
+            | Reason::CarrierChanged => false,
         }
     }
 
+    /// The counter's position in [`Rejections::counts`]. `Opening` came last
+    /// and is appended, so the four positions a heartbeat reader already knows
+    /// keep their meaning.
     fn index(self) -> usize {
         match self {
             Reason::AgentStalled => 0,
             Reason::TransitStalled => 1,
             Reason::StallShadow => 2,
             Reason::CarrierChanged => 3,
+            Reason::Opening => 4,
         }
     }
 }
@@ -126,6 +155,10 @@ pub struct WindowFacts {
     /// FFmpeg pump counts them (`encode::stall`); a pump that keeps no
     /// send-side figures passes `false` and the remaining conditions stand.
     pub agent_stalled: bool,
+    /// FR-119 P2b-8 — is the transport still in its opening ([`Reason::Opening`])?
+    /// The FFmpeg pump keeps FR-35's opener window for every session; a pump
+    /// that keeps no send-side figures passes `false`.
+    pub opening: bool,
     /// Did the overlay carrier under the session change since the last
     /// window? (V2 wires this; V1 always passes `false`.)
     pub carrier_changed: bool,
@@ -135,6 +168,9 @@ pub struct WindowFacts {
 pub fn rejected(f: WindowFacts) -> Option<Reason> {
     if f.agent_stalled {
         return Some(Reason::AgentStalled);
+    }
+    if f.opening {
+        return Some(Reason::Opening);
     }
     if f.state == PipeState::TransitStalled {
         return Some(Reason::TransitStalled);
@@ -151,7 +187,7 @@ pub fn rejected(f: WindowFacts) -> Option<Reason> {
 /// Rejected windows per reason, for the heartbeat. One field replaces the four
 /// counters T1b, T2 and T2b each added for their own rule.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Rejections([u32; 4]);
+pub struct Rejections([u32; 5]);
 
 impl Rejections {
     pub fn note(&mut self, r: Reason) {
@@ -159,8 +195,8 @@ impl Rejections {
         self.0[i] = self.0[i].saturating_add(1);
     }
 
-    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed]`.
-    pub fn counts(&self) -> [u32; 4] {
+    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening]`.
+    pub fn counts(&self) -> [u32; 5] {
         self.0
     }
 
@@ -178,6 +214,7 @@ mod tests {
             state,
             prev_state: Some(PipeState::Clear),
             agent_stalled: false,
+            opening: false,
             carrier_changed: false,
         }
     }
@@ -229,6 +266,7 @@ mod tests {
             state: PipeState::Overproduced,
             prev_state: Some(PipeState::TransitStalled),
             agent_stalled: false,
+            opening: false,
             carrier_changed: false,
         };
         assert_eq!(rejected(shadow), Some(Reason::StallShadow));
@@ -236,6 +274,7 @@ mod tests {
             state: PipeState::Clear,
             prev_state: Some(PipeState::Overproduced),
             agent_stalled: false,
+            opening: false,
             carrier_changed: false,
         };
         assert_eq!(rejected(after), None);
@@ -252,6 +291,7 @@ mod tests {
                 state,
                 prev_state: prev,
                 agent_stalled: false,
+                opening: false,
                 carrier_changed: false,
             });
             if let Some(r) = r {
@@ -261,7 +301,7 @@ mod tests {
             prev = Some(state);
         }
         assert_eq!(seen, vec![Some(Reason::StallShadow), None, None]);
-        assert_eq!(rejections.counts(), [0, 0, 1, 0]);
+        assert_eq!(rejections.counts(), [0, 0, 1, 0, 0]);
         assert_eq!(rejections.total(), 1);
     }
 
@@ -288,8 +328,57 @@ mod tests {
     fn only_a_transit_stall_also_speaks_about_the_rate() {
         assert!(Reason::TransitStalled.is_congestion());
         assert!(!Reason::AgentStalled.is_congestion());
+        assert!(!Reason::Opening.is_congestion());
         assert!(!Reason::StallShadow.is_congestion());
         assert!(!Reason::CarrierChanged.is_congestion());
+    }
+
+    /// FR-119 P2b-8 — a window inside the transport's opening is not evidence,
+    /// whatever the classifier made of it (and on a direct window there is no
+    /// classifier verdict at all: `Unknown`).
+    #[test]
+    fn the_opening_rejects_the_window_whatever_the_classifier_said() {
+        for state in [
+            PipeState::Unknown,
+            PipeState::Clear,
+            PipeState::Overproduced,
+            PipeState::TransitStalled,
+            PipeState::ViewerLate,
+        ] {
+            let f = WindowFacts {
+                opening: true,
+                ..facts(state)
+            };
+            assert_eq!(
+                rejected(f),
+                Some(Reason::Opening),
+                "state {}",
+                state.as_str()
+            );
+        }
+    }
+
+    /// The agent's own stall is the more specific answer: it explains a wait
+    /// that never reached the transport at all.
+    #[test]
+    fn a_stalled_pump_pass_outranks_the_opening() {
+        let f = WindowFacts {
+            agent_stalled: true,
+            opening: true,
+            ..facts(PipeState::Clear)
+        };
+        assert_eq!(rejected(f), Some(Reason::AgentStalled));
+    }
+
+    /// The opening is counted in its own, appended, position: the four that a
+    /// heartbeat reader already parses keep their meaning.
+    #[test]
+    fn the_opening_counts_in_the_fifth_position() {
+        let mut rejections = Rejections::default();
+        rejections.note(Reason::Opening);
+        rejections.note(Reason::AgentStalled);
+        assert_eq!(rejections.counts(), [1, 0, 0, 0, 1]);
+        assert_eq!(rejections.total(), 2);
     }
 
     /// The first window of a session has no predecessor and is not in anyone's

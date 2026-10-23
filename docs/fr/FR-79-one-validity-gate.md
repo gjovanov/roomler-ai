@@ -168,6 +168,26 @@ while opening over costs dropped frames, an abandoned ceiling and a visible
 stall — which is what the operator reported and what tonight's five sessions
 stopped doing.
 
+### Extended by FR-119 P2b-8 (2026-10-23): every window, the opening, whole windows
+
+[FR-119](FR-119-high-refresh-streaming.md) §4.10 found three gaps in what this gate
+saw, when a freshly granted 120 fps was taken back one second into two of four
+direct sessions on the MacBook:
+
+- **The gate ran on constrained windows only.** A direct window was evidence by
+  definition, and FR-119's grant, which only runs on a direct path, read capacity
+  claims nothing had gated. It now runs on every window; on a direct one the
+  classifier does not run, so only the agent's own stall and the opening apply.
+- **A fifth reason, `Opening`.** A window any pass of which fell inside FR-35's
+  opener window (now kept for every session) is not evidence: the first keyframe
+  meeting a ramping transport blocked sends for 43–82 ms and folded as 14–22 Mbps
+  of capacity against a 104 Mbps ceiling. Not congestion either. Its counter is
+  appended to `evidence_rejected`, so the first four keep their positions.
+- **The window was one pass long.** The pump hands its sender facts over on every
+  pass and each call overwrote the last, so `AgentStalled` only ever saw a stall in
+  a window's final pass. The governor now sums the passes
+  (`WindowSenderStats::absorb`).
+
 ## Phases
 
 | phase | scope | kill switch | status |

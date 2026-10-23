@@ -166,9 +166,12 @@ import {
   clockSample,
   frameAgeMs,
   QueueDrift,
-  DEFAULT_MAX_DECODE_QUEUE,
-  DEFAULT_STRUGGLE_QUEUE,
+  DEFAULT_MAX_BACKLOG_MS,
+  DEFAULT_STRUGGLE_BACKLOG_MS,
   DEFAULT_STRUGGLE_WINDOWS,
+  DecodeBacklog,
+  backlogShouldDrop,
+  isBadDecodeWindow,
 } from '@/workers/rc-hop-stats'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
@@ -4096,35 +4099,57 @@ describe('P1 — viewer diagnosis localStorage knobs', () => {
 
 describe('P6 — flow-control knobs + sustained-window struggle rule', () => {
   afterEach(() => {
+    localStorage.removeItem('roomler-rc-max-backlog-ms')
+    localStorage.removeItem('roomler-rc-struggle-backlog-ms')
     localStorage.removeItem('roomler-rc-max-queue')
     localStorage.removeItem('roomler-rc-struggle-queue')
     localStorage.removeItem('roomler-rc-struggle-windows')
   })
 
-  it('storedFlowParams defaults match the pre-P6 baked constants', () => {
+  it('storedFlowParams defaults are P6’s frame counts as the time they meant at 60 fps', () => {
     expect(storedFlowParams()).toEqual({
-      maxQueue: DEFAULT_MAX_DECODE_QUEUE,
-      struggleQueue: DEFAULT_STRUGGLE_QUEUE,
+      maxBacklogMs: DEFAULT_MAX_BACKLOG_MS,
+      struggleBacklogMs: DEFAULT_STRUGGLE_BACKLOG_MS,
       struggleWindows: DEFAULT_STRUGGLE_WINDOWS,
     })
-    // Lock the actual values too — these ARE the wire behaviour.
-    expect(storedFlowParams()).toEqual({ maxQueue: 4, struggleQueue: 2, struggleWindows: 2 })
+    // Lock the actual values too — these ARE the wire behaviour: 4 and 2
+    // frames at 60 fps.
+    expect(storedFlowParams()).toEqual({
+      maxBacklogMs: 67,
+      struggleBacklogMs: 33,
+      struggleWindows: 2,
+    })
   })
 
   it('storedFlowParams honours the localStorage overrides with clamps', () => {
-    localStorage.setItem('roomler-rc-max-queue', '8')
-    localStorage.setItem('roomler-rc-struggle-queue', '0')
+    localStorage.setItem('roomler-rc-max-backlog-ms', '120')
+    localStorage.setItem('roomler-rc-struggle-backlog-ms', '50')
     localStorage.setItem('roomler-rc-struggle-windows', '1')
-    expect(storedFlowParams()).toEqual({ maxQueue: 8, struggleQueue: 0, struggleWindows: 1 })
+    expect(storedFlowParams()).toEqual({
+      maxBacklogMs: 120,
+      struggleBacklogMs: 50,
+      struggleWindows: 1,
+    })
     // Out-of-range clamps instead of trusting the raw value.
-    localStorage.setItem('roomler-rc-max-queue', '9999')
+    localStorage.setItem('roomler-rc-max-backlog-ms', '99999')
+    localStorage.setItem('roomler-rc-struggle-backlog-ms', '0')
     localStorage.setItem('roomler-rc-struggle-windows', '0')
     const clamped = storedFlowParams()
-    expect(clamped.maxQueue).toBe(60)
+    expect(clamped.maxBacklogMs).toBe(2000)
+    expect(clamped.struggleBacklogMs).toBe(1)
     expect(clamped.struggleWindows).toBe(1)
     // Garbage falls back to the defaults.
-    localStorage.setItem('roomler-rc-max-queue', 'banana')
-    expect(storedFlowParams().maxQueue).toBe(DEFAULT_MAX_DECODE_QUEUE)
+    localStorage.setItem('roomler-rc-max-backlog-ms', 'banana')
+    expect(storedFlowParams().maxBacklogMs).toBe(DEFAULT_MAX_BACKLOG_MS)
+  })
+
+  it('FR-119 P2b-7 — a retired frame-count knob is read as the ms it meant at 60 fps', () => {
+    localStorage.setItem('roomler-rc-max-queue', '8')
+    localStorage.setItem('roomler-rc-struggle-queue', '4')
+    expect(storedFlowParams()).toMatchObject({ maxBacklogMs: 133, struggleBacklogMs: 67 })
+    // The ms knob wins over a legacy one still lying around.
+    localStorage.setItem('roomler-rc-max-backlog-ms', '90')
+    expect(storedFlowParams().maxBacklogMs).toBe(90)
   })
 
   it('normalizeIntKnob parses, truncates, clamps, and defaults', () => {
@@ -4138,6 +4163,95 @@ describe('P6 — flow-control knobs + sustained-window struggle rule', () => {
     expect(normalizeIntKnob('', 4, 1, 60)).toBe(4)
     expect(normalizeIntKnob('banana', 4, 1, 60)).toBe(4)
     expect(normalizeIntKnob(Number.NaN, 4, 1, 60)).toBe(4)
+  })
+
+  describe('FR-119 P2b-7 — decode health in TIME, not frames', () => {
+    // A synthetic decoder: frame i arrives at i × `periodMs` and decodes in
+    // `decodeMs(i)`, one frame at a time, in order. Outputs due by an arrival
+    // are delivered before it is sampled, as the worker sees them. Returns the
+    // largest backlog seen at an arrival, the window mean, and how many
+    // arriving deltas the shed rule dropped.
+    function run(periodMs: number, frames: number, decodeMs: (i: number) => number) {
+      const backlog = new DecodeBacklog()
+      const outputs: Array<{ ts: number; at: number }> = []
+      let decoderFreeAt = 0
+      let maxAge = 0
+      let drops = 0
+      for (let i = 0; i < frames; i++) {
+        const now = i * periodMs
+        while (outputs.length > 0 && outputs[0].at <= now) {
+          const o = outputs.shift()!
+          backlog.output(o.ts, o.at)
+        }
+        const age = backlog.sample(now)
+        maxAge = Math.max(maxAge, age)
+        // Frame 0 is the keyframe, which the shed rule never drops.
+        if (i > 0 && backlogShouldDrop(age, DEFAULT_MAX_BACKLOG_MS)) {
+          drops++
+          continue
+        }
+        backlog.submitted(i, now)
+        decoderFreeAt = Math.max(decoderFreeAt, now) + decodeMs(i)
+        outputs.push({ ts: i, at: decoderFreeAt })
+      }
+      return { maxAge, mean: backlog.takeWindow().meanMs, drops }
+    }
+
+    it('one slow keyframe is the same backlog at every rate, and sheds nothing', () => {
+      for (const fps of [30, 60, 120, 144]) {
+        // A 40 ms keyframe, then deltas that decode in 2 ms.
+        const r = run(1000 / fps, fps, (i) => (i === 0 ? 40 : 2))
+        expect(r.maxAge, `${fps} fps`).toBeLessThanOrEqual(40)
+        expect(r.drops, `${fps} fps`).toBe(0)
+        expect(isBadDecodeWindow(r.drops, r.mean, DEFAULT_STRUGGLE_BACKLOG_MS), `${fps} fps`).toBe(
+          false,
+        )
+      }
+      // What P6's frame count did with the same 40 ms at 120 fps: 5 frames
+      // queued behind the keyframe, over its 4, so it dropped and asked for
+      // an IDR — the cascade the MacBook run measured every ~30 s.
+      expect(Math.ceil(40 / (1000 / 120))).toBeGreaterThan(4)
+    })
+
+    it('a decoder that cannot keep up is still shed and reported, at any rate', () => {
+      for (const fps of [60, 120]) {
+        // Every frame takes 1.5 periods, so the backlog grows without bound.
+        const period = 1000 / fps
+        const r = run(period, fps, () => period * 1.5)
+        expect(r.drops, `${fps} fps`).toBeGreaterThan(0)
+        expect(isBadDecodeWindow(r.drops, r.mean, DEFAULT_STRUGGLE_BACKLOG_MS), `${fps} fps`).toBe(
+          true,
+        )
+      }
+    })
+
+    it('a frame the decoder skipped does not fake a backlog', () => {
+      const b = new DecodeBacklog()
+      b.submitted(1, 0)
+      b.submitted(2, 5) // never output: the decoder skipped it
+      b.submitted(3, 10)
+      expect(b.output(1, 12)).toBe(12)
+      expect(b.ageMs(20)).toBe(15) // frame 2, waiting since 5
+      expect(b.output(3, 22)).toBe(12) // 3 is out, so 2 was skipped
+      expect(b.ageMs(500)).toBe(0)
+      expect(b.output(99, 600)).toBeUndefined() // never submitted
+    })
+
+    it('the window mean and max are taken and reset', () => {
+      const b = new DecodeBacklog()
+      b.submitted(1, 0)
+      b.sample(10)
+      b.sample(30)
+      expect(b.takeWindow()).toEqual({ meanMs: 20, maxMs: 30 })
+      expect(b.takeWindow()).toEqual({ meanMs: 0, maxMs: 0 })
+    })
+
+    it('a window is bad on a drop, or on a sustained backlog over the threshold', () => {
+      expect(isBadDecodeWindow(1, 0, 33)).toBe(true)
+      expect(isBadDecodeWindow(0, 34, 33)).toBe(true)
+      expect(isBadDecodeWindow(0, 33, 33)).toBe(false)
+      expect(isBadDecodeWindow(0, 5, 33)).toBe(false)
+    })
   })
 
   it('StruggleWindow needs the configured consecutive run and resets on one clean window', () => {

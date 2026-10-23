@@ -6611,8 +6611,10 @@ async fn media_pump_ffmpeg_dc(
     // FR-65 P0 — worst single loop pass in the window, and how many overran.
     let mut iter_us_max: u64 = 0;
     let mut pump_stalls: u32 = 0;
-    // FR-79 — `pump_stalls` at the last viewer window, so the window's own
-    // stalled-pass count is a delta rather than a running total.
+    // FR-79 — `pump_stalls` at the last PASS, so each pass hands the governor
+    // a delta; the governor folds the passes into the viewer window
+    // (`WindowSenderStats::absorb`, FR-119 P2b-8 — until then it kept only the
+    // last pass, and these marks were read as if they were per window).
     let mut win_stalls_last: u32 = 0;
     let stall_watch = crate::encode::pump_stall_watch_enabled();
     let stall_warn = Duration::from_millis(crate::encode::pump_stall_warn_ms());
@@ -8788,10 +8790,11 @@ async fn media_pump_ffmpeg_dc(
         // SLOWEST viewer: fold every follower's decode report in and take
         // the max divisor. Also steps the spill gate (a sustained large
         // deviation detaches the most deviant follower to its own encoder).
-        // FR-71 T1a — hand the governor this window's sender-side facts before
-        // it folds the viewer's report, so the plane verdict reads both sides
-        // of the same window. Deltas against the running counters (the
-        // heartbeat swaps some of them, so it reads the totals, not swaps).
+        // FR-71 T1a — hand the governor this PASS's sender-side facts, every
+        // pass, before it folds the viewer's report; it adds the passes up into
+        // the window (FR-119 P2b-8), so the plane verdict reads both sides of
+        // the same window. Deltas against the running counters (the heartbeat
+        // swaps some of them, so it reads the totals, not swaps).
         {
             let sent_now = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
             let sw_sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
@@ -8814,6 +8817,10 @@ async fn media_pump_ffmpeg_dc(
                 // send task waited on something this window cannot attribute
                 // to the pipe.
                 stalled_passes: pump_stalls.saturating_sub(win_stalls_last),
+                // FR-119 P2b-8 — the opening is not evidence about the pipe:
+                // the first keyframe meeting a transport still ramping. A
+                // window any pass of which was in the opening is rejected.
+                opening: !opener_grace_done,
             });
             win_stalls_last = pump_stalls;
             win_sent_last = sent_now;
