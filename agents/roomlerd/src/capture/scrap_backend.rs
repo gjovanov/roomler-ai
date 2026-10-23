@@ -216,6 +216,10 @@ impl ScrapCapture {
                 let mut native_h = h;
                 #[cfg(target_os = "macos")]
                 let mut last_reopen = Instant::now();
+                // FR-97 P2d-2b — display match switched the Mac's mode under the
+                // stream, which keeps the geometry it opened with: open it again.
+                #[cfg(target_os = "macos")]
+                let mut seen_mode = crate::display_match::mode_generation();
 
                 // FR-29 P1 — built HERE, on the capture worker, because an
                 // X11 connection has the same thread affinity the XShm
@@ -288,7 +292,12 @@ impl ScrapCapture {
                         // degrades to one rebuild per second (a survivable
                         // stream + a visible log cadence) instead of a rebuild
                         // per frame (a dead session on every codec).
-                        if want != applied && last_reopen.elapsed() >= Duration::from_secs(1) {
+                        let now_mode = crate::display_match::mode_generation();
+                        let mode_changed = now_mode != seen_mode;
+                        if (want != applied || mode_changed)
+                            && last_reopen.elapsed() >= Duration::from_secs(1)
+                        {
+                            seen_mode = now_mode;
                             let (nw, nh) = ((want >> 32) as u32, (want & 0xFFFF_FFFF) as u32);
                             // Query the panel's true pixel size BEFORE the
                             // display is consumed by the capturer build; a
@@ -333,6 +342,7 @@ impl ScrapCapture {
                                         height = h,
                                         native_w,
                                         native_h,
+                                        mode_changed,
                                         "capture: re-opened the stream at the encode box (CoreGraphics scales; no CPU resample)"
                                     );
                                 }

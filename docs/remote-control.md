@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1700` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1516`, `peer.rs:1558`, `peer.rs:1484` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1515`, `peer.rs:1557`, `peer.rs:1483` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -384,7 +384,7 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:831`](../agents/roomlerd/src/encode/caps.rs#L831)), applied in
+([`caps.rs:836`](../agents/roomlerd/src/encode/caps.rs#L836)), applied in
 `detect()` ([`caps.rs:624`](../agents/roomlerd/src/encode/caps.rs#L624))
 after the config lists, over plain `HostFacts`
 ([`caps.rs:636`](../agents/roomlerd/src/encode/caps.rs#L636)), so it runs and
@@ -394,7 +394,7 @@ is tested on every OS.
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3308`](../agents/roomlerd/src/signaling.rs#L3308)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:812`](../agents/roomlerd/src/encode/caps.rs#L812)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:817`](../agents/roomlerd/src/encode/caps.rs#L817)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -437,7 +437,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:770`](../agents/roomlerd/src/encode/caps.rs#L770)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:209`](../agents/roomlerd/src/audio_source.rs#L209)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:775`](../agents/roomlerd/src/encode/caps.rs#L775)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | nothing yet (ScreenCaptureKit audio is FR-97 P2a) | the hello offers no track (`no-backend`, §5.1b) |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -528,10 +528,10 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:12978`](../agents/roomlerd/src/peer.rs#L12978)) sends it
+The pump ([`peer.rs:12977`](../agents/roomlerd/src/peer.rs#L12977)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5486`](../agents/roomlerd/src/peer.rs#L5486); the viewer parses it
+[`peer.rs:5485`](../agents/roomlerd/src/peer.rs#L5485); the viewer parses it
 at [`useRemoteControl.ts:1493`](../ui/src/composables/useRemoteControl.ts#L1493)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3209`](../ui/src/views/remote/RemoteControl.vue#L3209)).
@@ -568,7 +568,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10005`](../agents/roomlerd/src/peer.rs#L10005)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10004`](../agents/roomlerd/src/peer.rs#L10004)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1426`](../ui/src/composables/useRemoteControl.ts#L1426) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
@@ -1761,8 +1761,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12899`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12877`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3847`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12846`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:12898`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:12876`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:3847`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:12845`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:576`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:316`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:754`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:408`, #2326) |
@@ -2244,7 +2244,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1739`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1738`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:265` joins it), and sessions
@@ -2759,8 +2759,8 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
-(`agents/roomlerd/src/peer.rs:1551`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:10605`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:1550`) and its `rc:layout.set` arm
+(`agents/roomlerd/src/peer.rs:10604`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
@@ -2822,7 +2822,7 @@ the compositor's, and no protocol the desktops share reads or sets it.
 Xwayland's XKB group is a copy of what the compositor sends, and locking it
 does not reach the compositor. A system install reaches the screen through DRM
 and has no X connection (FR-113). Both leave `layout` out of the hello
-(`agents/roomlerd/src/encode/caps.rs:871`), with no reason in `unavailable`:
+(`agents/roomlerd/src/encode/caps.rs:876`), with no reason in `unavailable`:
 there is no control to grey, so the chip does not appear, as before P3e.
 
 ### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)
