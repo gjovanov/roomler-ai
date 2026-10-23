@@ -2119,6 +2119,9 @@ async fn connect_once(
             }
             _ = heartbeat.tick() => {
                 let _stage = watchdog::enter(ctx.pump, "heartbeat");
+                // #2551 — the first named stall froze in this arm, so each
+                // step of it is a stage of its own.
+                watchdog::stage(ctx.pump, "heartbeat.flows");
                 // Wave 3 — tunnel volume the server cannot see for itself
                 // (the payload rides the P2P data channel). Cumulative for
                 // each forward's life, so the server treats it like the
@@ -2129,7 +2132,10 @@ async fn connect_once(
                         (rx.saturating_add(f.bytes_in), tx.saturating_add(f.bytes_out))
                     },
                 );
-                // The borrow guards are dropped before the send await.
+                // The borrow guards are dropped before the send await. No OS
+                // read here: the host counters come from the sampler thread's
+                // cache (#2551), so the view guard is held for a pure walk.
+                watchdog::stage(ctx.pump, "heartbeat.sys");
                 let sys = sys_sampler.sample(&overlay_view_tx.borrow(), tunnel_bytes);
                 // NAT-traversal health. `None` only while the overlay runtime
                 // hasn't published a gather yet — once it has, a measured 0 is
@@ -2158,6 +2164,7 @@ async fn connect_once(
                 //
                 // ⚠️ Sending them every beat would be ~200 bytes of nothing on
                 // a frequent message. `None` means "no news", not "no caps".
+                watchdog::stage(ctx.pump, "heartbeat.caps");
                 let caps_now = delegate.as_ref().and_then(|d| d.effective_permissions());
                 // FR-85 P3b — the owner's remote-recording gate is live, so its
                 // word is news too: an OFF must stop the hub granting RECORD
@@ -2239,10 +2246,11 @@ async fn connect_once(
                     Some(Box::new(c))
                 };
                 let hb = ClientMsg::AgentHeartbeat {
-                    rss_mb: sys.rss_mb,
-                    cpu_pct: sys.cpu_pct,
+                    // #2551 — no block until the sampler's first read lands.
+                    rss_mb: sys.as_ref().map_or(0, |s| s.rss_mb),
+                    cpu_pct: sys.as_ref().map_or(0.0, |s| s.cpu_pct),
                     active_sessions: peers.len().min(u8::MAX as usize) as u8,
-                    sys: Some(sys),
+                    sys,
                     srflx_count,
                     warm_relay,
                     // FR-27 — cached for 10 min inside, so this is a map lookup
@@ -2252,6 +2260,7 @@ async fn connect_once(
                     // FR-92 P5b — where keep busy runs, for the device list.
                     keep_busy: crate::keep_busy::brief(),
                 };
+                watchdog::stage(ctx.pump, "heartbeat.send");
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
@@ -2273,6 +2282,7 @@ async fn connect_once(
                     // hold different senders, so one peer's full or closed
                     // queue — or its telemetry timing out — skips that peer
                     // and never stops the others.
+                    watchdog::stage(ctx.pump, "heartbeat.stats");
                     send_one_session_stats(*session_id, peer, ctx.pump).await;
                 }
                 watchdog::tick(ctx.pump);

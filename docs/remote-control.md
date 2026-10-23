@@ -3057,6 +3057,38 @@ is silent while it waits.
   own log line about 1 stall in 6, measured on a Windows dev box on
   2026-10-19.
 
+**What the first named stall found** (#2551). The first stall to name
+its stage came on 2026-10-22, under 0.4.151, and read
+`signaling=93s@heartbeat`. Every await in that arm was already bounded.
+The arm also read the host counters for its telemetry block, inline,
+while holding the overlay view's watch guard. That read is the process
+table and, on Windows, `GetIfTable2` (the whole IP Helper interface
+table), on a host whose adapters and routes churn.
+- The read now runs on one sampler thread per process, every 30 s,
+  into a cache (`host_sampler_loop`,
+  `agents/roomlerd/src/telemetry.rs:135`).
+  - The heartbeat only copies the cache (`SysSampler::sample`,
+    `agents/roomlerd/src/telemetry.rs:256`). A blocked read now costs
+    stale counters, never the loop.
+  - The thread is detached, so a read blocked in the OS cannot hold up
+    the runtime's shutdown either.
+- Two log lines show whether this was the cause. Either one beside a
+  stall confirms it; a stall without them rules it out.
+  - A read slower than 5 s logs `host sampler: reading the host
+    counters was slow (#2551)` with its duration.
+  - A heartbeat that finds a read running for 60 s says so, once per
+    episode.
+- Until the first read completes, a heartbeat carries no `sys` block
+  rather than zeros. The rollups take each cumulative counter as
+  `max - min` per bucket, so a zero would read as a since-boot spike.
+- The arm is staged step by step: `heartbeat.flows`, `heartbeat.sys`,
+  `heartbeat.caps`, `heartbeat.send`, `heartbeat.stats`
+  (`agents/roomlerd/src/signaling.rs:2124` onwards).
+- ⚠️ `heartbeat.caps` can still block. When the advertised caps change
+  and the encoder-caps cache misses (it lives a week, keyed on the GPU
+  and driver), the capability probe runs synchronously: two children of
+  up to 60 s each.
+
 **Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
 (`auth_backoff_for`): 30s → 60s → 5min → 1h capped. Server-side
