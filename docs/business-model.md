@@ -133,7 +133,7 @@ webhook, so **renaming one is a migration**, not a copy change.
 | Users | 10, enforced | per seat | per seat |
 | Devices · tunnel clients | 100 · 100 | 1,000 · 1,000 | 5,000 · 5,000 |
 | MagicDNS | ✅ | ✅ | ✅ |
-| Exit nodes | from FR-115 P4d | ✅ | ✅ |
+| Exit nodes | ✅ (FR-115 P4d) | ✅ | ✅ |
 | Concurrent remote sessions | 1 per org | 1 per seat | ∞ (fair use) |
 | Relay (DERP + TURN) at full speed | 10 GB / month | 25 GB per seat | 100 GB per seat |
 | Meetings | 10 people, 60 minutes | 50 people | 100 people + recordings |
@@ -148,8 +148,9 @@ subscription bills (`Tenant::billed_seats`).
 Notes that matter more than the numbers:
 
 - **The mesh is on every tier, including Free**, and since FR-115 so is every mesh
-  feature that costs nothing (MagicDNS). Exit nodes join Free once the relay throttle
-  exists: an exit whose path falls to DERP is the one way Free could cost real money.
+  feature that costs nothing (MagicDNS). Exit nodes joined Free with FR-115 P4d, once the
+  relay allowance held what they relay: an exit whose path falls to a relay was the one
+  way Free could cost real money, and past the allowance that path is throttled.
 - **Free fences by objective limits, never by "personal use" detection** — one
   concurrent remote session, ten users, no support sessions to other orgs (FR-52).
   The remote-desktop vendors fence free with commercial-use detection; we allow

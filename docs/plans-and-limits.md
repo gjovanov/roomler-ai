@@ -14,7 +14,7 @@ which limits can be softened and which cannot, and the switches that turn each o
 
 ## 1. Where the numbers live
 
-One function holds the matrix: `Plan::limits_for(seats)` (`crates/db/src/models/tenant.rs:554`). Fields priced
+One function holds the matrix: `Plan::limits_for(seats)` (`crates/db/src/models/tenant.rs:555`). Fields priced
 per seat (concurrent sessions on Pro, relay, storage) are multiplied by the org's billed
 seats, `Tenant::billed_seats` (`crates/db/src/models/tenant.rs:466`): one on Free, the subscription's quantity
 on a paid plan, never below one. A paid org whose webhook has not landed yet is computed at
@@ -28,7 +28,7 @@ one seat, so a missing number can only under-grant.
 | `video_max_participants` · `meeting_max_minutes` | **10 · 60** | 50 · unlimited | 100 · unlimited |
 | `storage_bytes` | 1 GiB | 10 GiB per seat | 50 GiB per seat |
 | `relay_bytes_per_month` | 10 GB | 25 GB per seat | 100 GB per seat |
-| `magic_dns` · `exit_nodes` · `recordings` | yes · no · no | yes · yes · no | yes · yes · yes |
+| `magic_dns` · `exit_nodes` · `recordings` | yes · **yes** (P4d) · no | yes · yes · no | yes · yes · yes |
 
 "Unlimited" is spelled `u32::MAX`, never `Option`: a counted cap reads it as "no cap"
 (`count_cap`), and the published JSON carries the number. `billing_tests` reads most of
@@ -37,7 +37,7 @@ summary.
 
 **Enterprise** (not sold at checkout, so not in the table) has Business's limits with one
 difference: it has **no relay allowance**. Its relay is "custom" on the ladder, so nothing
-throttles it (`crates/db/src/models/tenant.rs:621`).
+throttles it (`crates/db/src/models/tenant.rs:624`).
 
 ## 2. One decision point
 
@@ -90,7 +90,7 @@ staged by the mode.
 | meeting length | the sweep (`crates/modules/conference/src/meeting_cap.rs:100`) | `room:call_ending_soon` at 55, `room:call_ended {reason: plan_limit}` at 60 |
 | concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1577`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
 | relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:620`) and on every PoP (`crates/derp-relay/src/main.rs:148`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
-| recordings, exit nodes, MagicDNS | `require_feature` at each route | 403 in feature wording ("not available on the Free plan") |
+| recordings, exit nodes, MagicDNS | `require_feature` at each route | 403 in feature wording ("not available on the Free plan"). Every plan has exit nodes (since P4d) and MagicDNS, so of these three only recordings is refused today |
 
 The two fences that are not a request — a meeting that runs long, a session started on
 another pod — are where the design is unusual:

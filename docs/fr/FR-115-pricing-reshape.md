@@ -104,7 +104,7 @@ bandwidth on a price list (Tailscale lowers DERP quality instead).
 | Users | **10, enforced** | per seat | per seat | per seat |
 | Devices · tunnel clients | **100 · 100** (was 3 · 3) | 1,000 · 1,000 (was 30) | 5,000 · 5,000 (was 300) | custom |
 | MagicDNS | **yes** (was Pro) | yes | yes | yes |
-| Exit nodes | **yes, from P4d** (after the throttle exists) | yes | yes | yes |
+| Exit nodes | **yes** (P4d, once the throttle held what they relay) | yes | yes | yes |
 | Concurrent remote sessions | **1 per org, enforced** | 1 per seat | unlimited (fair use) | unlimited |
 | Support sessions to other orgs (FR-52) | — | yes | yes | yes |
 | Relay (DERP + TURN) at full speed | 10 GB / month, then throttled | 25 GB per seat, pooled | 100 GB per seat, pooled | custom |
@@ -627,7 +627,7 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:404`,
   an internal org that would cross its allowance on test traffic alone. The operator took all
   three answers:
   - **Enterprise has no relay allowance.** Its relay is "custom" on the ladder
-    (`crates/db/src/models/tenant.rs:621`).
+    (`crates/db/src/models/tenant.rs:624`).
   - **The operator's orgs are exempt.** `relay_allowance.exempt_tenants`
     (`crates/config/src/settings.rs:416`) names them, and `is_exempt`
     (`crates/services/src/relay_allowance.rs:42`) is asked by both the job and the org's page.
@@ -636,6 +636,25 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:404`,
   Proof: `relay_allowance_tests::exempt_and_enterprise_orgs_are_never_throttled`. A Free org
   past its 10 GB is throttled, and its twin under an exempt id and an Enterprise org past
   500 GB are not.
+
+### P4d, as built: exit nodes on Free
+
+Free's `exit_nodes` is `true` (`crates/db/src/models/tenant.rs:565`). The plans list says so
+(`crates/services/src/stripe.rs:728`), and so do the static home that renders that list, the
+app's fallback copy (`ui/src/utils/landing.ts:180`) and the billing page, which reads the
+limit. It waited for the throttle. An exit node carries a host's whole egress, and on a pair
+that falls to a relay, those bytes were the one way Free could cost real money. Past the
+allowance, that path is now throttled on DERP (P4a), and the overlay leaves TURN for it (P4c).
+
+- **In practice it changes less than the ladder suggests.** `ExitNodes` is not an established
+  limit (`crates/services/src/quota.rs:93`), and every new org's `plan_enforcement` is `warn`.
+  So a Free org in `warn` could already make an exit node: the gate in `set_exit_node`
+  (`crates/modules/network/src/routes/overlay_route.rs:394`) let it through and counted a quota
+  collision. P4d stops counting that collision, and lets an org in `enforce` do the same. Such
+  an org was refused 403 before.
+- **Proof:** `free_gives_devices_and_mesh_and_fences_concurrency` (`tenant.rs`), and
+  `billing_tests` and `ui/e2e/billing.spec.ts`, which read `exit_nodes: true` for Free from
+  `/api/stripe/plans`.
 
 ### Meetings
 

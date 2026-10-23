@@ -310,12 +310,14 @@ async fn a_feature_the_plan_includes_is_allowed() {
 /// holding a feature they are not allowed to turn off — strictly worse than the
 /// feature having been free. Only enabling is gated.
 ///
-/// FR-115 put MagicDNS on every plan, so exit nodes (Free gets them at P4d)
-/// carry the property. The gate runs before the node lookup: enabling an
-/// unknown node on Free is refused BY THE PLAN (403, feature wording), while
-/// disabling it gets as far as the lookup (404) — the plan never refused it.
+/// Exit nodes carried the property until FR-115 P4d put them on Free: every
+/// plan has them now, so no plan refuses the enable either. The gate runs
+/// before the node lookup, so an unknown node shows the plan's answer alone:
+/// on Free under `enforce`, enabling it gets as far as the lookup (404) where
+/// it was refused by the plan (403) before P4d, and disabling it is never
+/// the plan's to refuse.
 #[tokio::test]
-async fn an_exit_node_can_always_be_turned_off_but_not_on() {
+async fn a_free_org_may_enable_an_exit_node_and_always_turn_one_off() {
     let app = TestApp::spawn().await;
     let t = app.seed_tenant("planexit").await;
     set_plan(&app, &t.tenant_id, "free", "enforce").await;
@@ -328,11 +330,11 @@ async fn an_exit_node_can_always_be_turned_off_but_not_on() {
         .send()
         .await
         .unwrap();
-    assert_eq!(on.status(), 403, "Free must not enable an exit node yet");
+    let status = on.status();
     let body = on.text().await.unwrap_or_default();
-    assert!(
-        body.contains("not available on the Free plan"),
-        "the refusal must be the plan's, got: {body}"
+    assert_eq!(
+        status, 404,
+        "Free has exit nodes since P4d: the plan lets the enable reach the lookup, got: {body}"
     );
 
     let off = app

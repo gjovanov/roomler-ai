@@ -1513,7 +1513,7 @@ sequenceDiagram
 
 ### The six kinds — `billing_events`
 
-[`process`, stripe.rs:761](../crates/services/src/stripe.rs) records every billing kind
+[`process`, stripe.rs:1242](../crates/services/src/stripe.rs) records every billing kind
 before the tenant-state updates it always made; [`parse`, billing.rs:297](../crates/services/src/billing.rs)
 reads Stripe's objects for both API versions in the field (the classic shape and the
 2025-03-31 "basil" one, which moved `invoice.subscription` under `parent`, a line's

@@ -507,9 +507,10 @@ pub struct PlanLimits {
     /// Overlay mesh membership (private network between the tenant's
     /// nodes). On for every plan — it's the product's spine.
     pub overlay_mesh: bool,
-    /// Exit nodes (route a node's whole egress through a mesh peer). Free
-    /// gets them once the relay throttle exists (FR-115 P4d): an exit node
-    /// whose path falls to DERP is the one way Free could cost real money.
+    /// Exit nodes (route a node's whole egress through a mesh peer). On
+    /// every plan since FR-115 P4d: an exit node whose path falls to a relay
+    /// was the one way Free could cost real money, and the relay allowance
+    /// now holds it (P4a for DERP, P4c for TURN).
     pub exit_nodes: bool,
     /// MagicDNS (tenant overlay DNS domain).
     pub magic_dns: bool,
@@ -559,7 +560,9 @@ impl Plan {
                 max_devices: 100,
                 max_tunnel_clients: 100,
                 overlay_mesh: true,
-                exit_nodes: false,
+                // FR-115 P4d — the relay allowance throttles what an exit
+                // node relays, so Free gets them too.
+                exit_nodes: true,
                 magic_dns: true,
                 max_concurrent_sessions: 1,
                 relay_bytes_per_month: 10 * GB,
@@ -709,8 +712,8 @@ mod plan_tests {
         assert_eq!(free.max_tunnel_clients, 100);
         assert!(free.magic_dns);
         assert!(
-            !free.exit_nodes,
-            "exit nodes wait for the relay throttle (P4d)"
+            free.exit_nodes,
+            "exit nodes are on Free once the relay throttle holds them (P4d)"
         );
         assert_eq!(free.max_concurrent_sessions, 1);
         assert_eq!(free.max_members, 10);
