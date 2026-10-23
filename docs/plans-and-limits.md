@@ -217,7 +217,7 @@ Each fence now has an integration test on a server without `saas`.
 
 - **The relay allowance on TURN (P4c):** TURN bytes past the plan's allowance are throttled,
   never refused (a host behind symmetric NAT has no other path). The per-org TURN attribution
-  it needs has existed on the cluster's coturn since 2026-10-22 (P4b). The PoPs' coturn
-  (P4b-2) comes first. The DERP half (P4a) has been on since 2026-10-21, on the API pods and
-  the regional PoPs.
+  it needs exists on every coturn: the cluster's since 2026-10-22 (P4b) and the PoPs' since
+  2026-10-23 (P4b-2). Today the allowance itself still counts DERP bytes only. The DERP half
+  (P4a) has been on since 2026-10-21, on the API pods and the regional PoPs.
 - **Exit nodes on Free (P4d):** after the throttle exists.
