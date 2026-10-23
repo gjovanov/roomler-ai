@@ -747,7 +747,7 @@ mod tests {
 
         // Over, at 1 B/s: the bucket's 64 KiB minimum burst lets ~53 of
         // these through, and then holds.
-        crate::relay_allowance::apply(std::collections::HashMap::from([(network, 1)]));
+        crate::relay_allowance::apply("derp-test", std::collections::HashMap::from([(network, 1)]));
         let mut passed = 0;
         for _ in 0..200 {
             forward_frame(&registry, &acl, network, &src, &bulk);
@@ -767,7 +767,7 @@ mod tests {
         forward_frame(&registry, &acl, network, &src, &hello);
         assert!(rx.try_recv().is_ok(), "the handshake is never held back");
         assert_eq!(billed(), before + 32 + 148, "and it is billed as carried");
-        crate::relay_allowance::apply(std::collections::HashMap::new());
+        crate::relay_allowance::apply("derp-test", std::collections::HashMap::new());
     }
     /// FR-20 acceptance: *"measured DERP forward-path overhead is within noise
     /// of the pre-change baseline"*. `#[ignore]`d — it is a measurement, not a

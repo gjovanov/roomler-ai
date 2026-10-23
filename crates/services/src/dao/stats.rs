@@ -202,22 +202,33 @@ impl StatsDao {
     /// the raw tier for the open one. The rollup recomputes its open bucket,
     /// so reading the hourly tier up to this hour's start and the raw tier
     /// from it counts every byte once. The throttle's job and the org's
-    /// analytics page both read this (`crate::relay_allowance`).
+    /// analytics page both read this (`crate::relay_allowance`), and both
+    /// pass the same `count_turn` (P4c-0: `turn_bytes` count too), so what an
+    /// org is shown is what it is throttled by.
     pub async fn relay_month_to_date(
         &self,
         tenant: Option<ObjectId>,
         now: DateTime,
+        count_turn: bool,
     ) -> DaoResult<HashMap<ObjectId, u64>> {
         use futures::TryStreamExt;
 
         let start = crate::relay_allowance::month_start(now);
         let hour = DateTime::from_millis(now.timestamp_millis() / 3_600_000 * 3_600_000);
+        let meter = if count_turn {
+            Bson::Document(doc! { "$in": [
+                Meter::DerpBytes.as_str(),
+                Meter::TurnBytes.as_str(),
+            ] })
+        } else {
+            Bson::String(Meter::DerpBytes.as_str().to_string())
+        };
         let mut out: HashMap<ObjectId, u64> = HashMap::new();
         for (coll, ts) in [
             (STATS_USAGE_1H, doc! { "$gte": start, "$lt": hour }),
             (STATS_USAGE, doc! { "$gte": hour }),
         ] {
-            let mut filter = doc! { "meter": Meter::DerpBytes.as_str(), "ts": ts };
+            let mut filter = doc! { "meter": meter.clone(), "ts": ts };
             if let Some(t) = tenant {
                 filter.insert("tenant_id", t);
             }

@@ -140,8 +140,9 @@ export interface ResourcesPayload {
 
 /**
  * FR-115 P4a — the org's relay allowance this month, by the throttle's own
- * arithmetic: bytes relayed through DERP since the first of the month (UTC)
- * against the plan's allowance for its seats. Units, never money.
+ * arithmetic: bytes relayed through DERP (and TURN, when `counts_turn`) since
+ * the first of the month (UTC) against the plan's allowance for its seats.
+ * Units, never money.
  */
 export interface RelayAllowance {
   month_start: string
@@ -154,6 +155,11 @@ export interface RelayAllowance {
   /** the throttle is on for this deployment; off, the allowance is only shown */
   enforced: boolean
   throttled: boolean
+  /**
+   * FR-115 P4c-0: TURN bytes count toward `used_bytes` (remote desktop and
+   * meetings included), not DERP alone. Absent from older servers: DERP alone.
+   */
+  counts_turn?: boolean
 }
 
 export interface OrgsPayload {

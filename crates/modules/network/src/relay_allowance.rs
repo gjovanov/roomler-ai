@@ -13,9 +13,9 @@
 //!
 //! * **The job.** Every [`JOB_EVERY`], one pod (a Redis claim), and only where
 //!   plans are sold, reads month-to-date `derp_bytes` per org from FR-20's
-//!   ledger, compares it with `relay_bytes_per_month` for the org's plan and
-//!   seats, and publishes the networks of every org over it, each with its
-//!   rate, for [`SET_TTL`].
+//!   ledger (and `turn_bytes` with it under P4c-0's `count_turn`), compares it
+//!   with `relay_bytes_per_month` for the org's plan and seats, and publishes
+//!   the networks of every org over it, each with its rate, for [`SET_TTL`].
 //! * **The refresh.** Every pod reads the set every [`REFRESH_EVERY`] into a
 //!   local map. An absent or unreadable set is an EMPTY one, so a stopped job,
 //!   a Redis outage and the kill switch all fail OPEN, within [`SET_TTL`] at
@@ -49,8 +49,12 @@ pub const REFRESH_EVERY: Duration = Duration::from_secs(60);
 /// burst of full-size frames can always start.
 const MIN_BURST_BYTES: f64 = 64.0 * 1024.0;
 
-/// network → throttled rate (bytes/s), as this pod last read it.
-static OVER: LazyLock<DashMap<ObjectId, u64>> = LazyLock::new(DashMap::new);
+/// network → (throttled rate in bytes/s, the database whose set it came
+/// from), as this pod last read it. The database scopes [`apply`]: a
+/// deployment is one database, so in production the tag is the same on every
+/// entry, but the apps of one test process share this map and each must
+/// replace only its own entries.
+static OVER: LazyLock<DashMap<ObjectId, (u64, String)>> = LazyLock::new(DashMap::new);
 /// `OVER.len()`, kept beside it so the hot path costs one relaxed load (a
 /// `DashMap::is_empty` would read-lock every shard).
 static OVER_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -67,7 +71,7 @@ pub fn rate_of(network_id: &ObjectId) -> Option<u64> {
     if OVER_LEN.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    OVER.get(network_id).map(|r| *r)
+    OVER.get(network_id).map(|r| r.0)
 }
 
 /// A bulk frame: WireGuard transport data (type 4), or anything that is
@@ -106,7 +110,11 @@ pub async fn month_to_date(
     state: &NetworkState,
     now: DateTime,
 ) -> anyhow::Result<HashMap<ObjectId, u64>> {
-    Ok(state.stats.relay_month_to_date(None, now).await?)
+    let count_turn = state.settings.relay_allowance.count_turn;
+    Ok(state
+        .stats
+        .relay_month_to_date(None, now, count_turn)
+        .await?)
 }
 
 /// The over-allowance set at `now`: network → rate, for every network of
@@ -151,39 +159,52 @@ pub async fn compute(
         .collect())
 }
 
-/// Replace this pod's set: networks that left it lose their bucket, and the
-/// changes are logged (an org entering or leaving the throttle is rare).
-pub fn apply(next: HashMap<ObjectId, u64>) {
-    let entered: Vec<String> = next
+/// Replace this pod's set for database `db`: networks that left it lose
+/// their bucket, and the changes are logged (an org entering or leaving the
+/// throttle is rare). Returns the networks that entered or left, the ones
+/// whose overlay pairs P4c-1 re-stamps.
+pub fn apply(db: &str, next: HashMap<ObjectId, u64>) -> Vec<ObjectId> {
+    let entered: Vec<ObjectId> = next
         .keys()
         .filter(|k| !OVER.contains_key(*k))
-        .map(|k| k.to_hex())
+        .copied()
         .collect();
-    let mut left_ids: Vec<ObjectId> = Vec::new();
-    OVER.retain(|k, _| {
-        let keep = next.contains_key(k);
+    let mut left: Vec<ObjectId> = Vec::new();
+    OVER.retain(|k, v| {
+        let keep = v.1 != db || next.contains_key(k);
         if !keep {
-            left_ids.push(*k);
+            left.push(*k);
         }
         keep
     });
     for (k, v) in &next {
-        OVER.insert(*k, *v);
+        OVER.insert(*k, (*v, db.to_string()));
     }
-    OVER_LEN.store(next.len(), Ordering::Relaxed);
+    OVER_LEN.store(OVER.len(), Ordering::Relaxed);
     // A network that left the set drops its bucket; one that re-enters
     // later starts with a full burst.
-    for k in &left_ids {
+    for k in &left {
         BUCKETS.remove(k);
     }
-    let left: Vec<String> = left_ids.iter().map(|k| k.to_hex()).collect();
     if !entered.is_empty() || !left.is_empty() {
+        let hex = |v: &[ObjectId]| v.iter().map(|o| o.to_hex()).collect::<Vec<_>>();
         info!(
             over = next.len(),
-            ?entered,
-            ?left,
+            entered = ?hex(&entered),
+            left = ?hex(&left),
             "relay allowance: the throttled networks changed"
         );
+    }
+    entered.into_iter().chain(left).collect()
+}
+
+/// [`apply`] this database's set, then, with P4c-1 on, re-stamp the overlay
+/// pairs of every network that entered or left it, so their relay tier
+/// flips now rather than at the next incidental re-fan.
+pub async fn apply_and_refan(state: &NetworkState, next: HashMap<ObjectId, u64>) {
+    let changed = apply(state.db.name(), next);
+    if state.settings.relay_allowance.turn && !changed.is_empty() {
+        crate::overlay::refan_networks(state, &changed).await;
     }
 }
 
@@ -243,7 +264,7 @@ pub async fn publish(state: &NetworkState, now: DateTime) -> Option<usize> {
                 warn!(%e, "relay allowance: the set could not be published");
             }
         }
-        None => apply(set),
+        None => apply_and_refan(state, set).await,
     }
     Some(n)
 }
@@ -269,7 +290,7 @@ pub async fn refresh(state: &NetworkState) {
                 .collect()
         })
         .unwrap_or_default();
-    apply(next);
+    apply_and_refan(state, next).await;
 }
 
 /// Start the job (it competes for the tick on every pod) and the refresh.
@@ -312,7 +333,7 @@ mod tests {
             enabled: true,
             free_rate_kbps: 1_000,
             paid_rate_kbps: 4_000,
-            turn_attribution: false,
+            ..RelayAllowanceSettings::default()
         }
     }
 
@@ -401,17 +422,41 @@ mod tests {
     fn the_map_follows_the_set() {
         let _map = TEST_MAP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (a, b) = (ObjectId::new(), ObjectId::new());
-        apply(HashMap::from([(a, 125_000)]));
+        assert_eq!(apply("db", HashMap::from([(a, 125_000)])), vec![a]);
         assert_eq!(rate_of(&a), Some(125_000));
         assert_eq!(rate_of(&b), None);
-        apply(HashMap::from([(b, 500_000)]));
+        let changed = apply("db", HashMap::from([(b, 500_000)]));
+        assert_eq!(changed, vec![b, a], "b entered, a left");
         assert_eq!(
             rate_of(&a),
             None,
             "a network that left the set is free again"
         );
         assert_eq!(rate_of(&b), Some(500_000));
-        apply(HashMap::new());
+        assert!(
+            apply("db", HashMap::from([(b, 125_000)])).is_empty(),
+            "a new rate for a network still in the set is no change of tier"
+        );
+        assert_eq!(rate_of(&b), Some(125_000));
+        assert_eq!(apply("db", HashMap::new()), vec![b]);
         assert_eq!(rate_of(&b), None);
+    }
+
+    /// A set replaces only its own database's entries: the apps of one test
+    /// process share the map, and an app reading an empty set must not lift
+    /// another database's throttles.
+    #[test]
+    fn a_set_replaces_only_its_own_databases_entries() {
+        let _map = TEST_MAP_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (mine, theirs) = (ObjectId::new(), ObjectId::new());
+        apply("db-a", HashMap::from([(mine, 125_000)]));
+        apply("db-b", HashMap::from([(theirs, 500_000)]));
+        assert_eq!(rate_of(&mine), Some(125_000));
+        assert_eq!(rate_of(&theirs), Some(500_000));
+        assert!(apply("db-b", HashMap::new()) == vec![theirs]);
+        assert_eq!(rate_of(&mine), Some(125_000), "db-a's entry stands");
+        assert_eq!(rate_of(&theirs), None);
+        apply("db-a", HashMap::new());
+        assert_eq!(rate_of(&mine), None);
     }
 }

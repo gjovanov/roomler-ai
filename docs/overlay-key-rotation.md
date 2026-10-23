@@ -163,7 +163,7 @@ The device's report is a **claim** (the `ssh_activity` sense). What the server c
 *verify* is the join: `rc:overlay.join` under the new public key passes
 `wg_key_taken_by_other` (machine-scoped, so a device rotating its own key is admitted
 — `security-baseline.md` §4), and the server stamps what the device presented onto
-the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:536-559`
+the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:543-566`
 → `dao/agent.rs:770`). It is stamped on **every** join, not only after a rotation, so
 the grid can always show the device's current key.
 
@@ -312,7 +312,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:361-377`, `:440-461` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:536-559`; `crates/services/src/dao/agent.rs:945` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:543-566`; `crates/services/src/dao/agent.rs:945` |
 | the conditional report write | `crates/services/src/dao/agent.rs:999-1029` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-676`, `:1452-1460` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
