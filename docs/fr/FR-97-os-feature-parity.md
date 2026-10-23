@@ -684,7 +684,7 @@ test of the SIGKILL property itself.
   the session the worker's, and `sudo`'s `env_reset` gave the worker none of the root's `ROOMLERD_*`. So
   `ROOMLERD_LOCK_HINT` (P2d-1), `ROOMLERD_CLIPBOARD_MAC_WATCH` (P2e-1) and `ROOMLERD_MAC_LAYOUT` (P2d-2a), set on the
   root, changed the hello and not the session. From 0.4.155 the supervisor hands the worker the root's effective
-  value of each (FR-43's `WORKER_ENV_FORWARD`, #WEFPR); a per-user half's own LaunchAgent environment is unchanged.
+  value of each (FR-43's `WORKER_ENV_FORWARD`, #2758); a per-user half's own LaunchAgent environment is unchanged.
 - **P2f, a microphone for recordings.** cpal on macOS, `NSMicrophoneUsageDescription` in the bundle (a missing key
   ends the process at first access), and the audio-input entitlement.
 - **P2g, the companion's Devices page on a two-half Mac (D2).** Reported by the operator on 2026-10-21: the Mac's
