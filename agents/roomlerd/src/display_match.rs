@@ -1336,7 +1336,8 @@ fn decide_request(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answe
     let virtual_desktop = crate::virtual_desktop::switchable_display().is_some();
     // FR-97 P3e-2 — and a person's own X11 display, where `presence` reads the
     // X idle clock and logind's lock hint, as it reads Windows' on Windows.
-    if !cfg!(target_os = "windows") && !virtual_desktop && !x11_offered() {
+    // FR-97 P2d-2b — and a Mac's main display, presence from its HID clock.
+    if !cfg!(target_os = "windows") && !virtual_desktop && !x11_offered() && !mac_offered() {
         return Answer::Refused(Refusal::Unsupported);
     }
     let presence = || {
