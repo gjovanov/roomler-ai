@@ -360,6 +360,10 @@ pub(crate) struct Run {
     /// The vault, where this device takes leases; without it the vault tools
     /// are not offered.
     pub(crate) vault: Option<Arc<dyn VaultTools>>,
+    /// FR-90 P4-4-1b — the organization's map, where the server said at the
+    /// device's hello that it is there; without it the knowhow tools are not
+    /// offered.
+    pub(crate) knowhow: Option<Arc<dyn super::knowhow_tools::KnowhowTools>>,
     /// P3-4c-1 — where and as whom the session's commands run; none where no
     /// command runs (Windows: no sandbox for a value there).
     #[cfg(feature = "vault")]
@@ -382,6 +386,8 @@ struct Ctx {
     /// P3-4b — the run's fence, and its vault tools' answers.
     fence: u64,
     vault: Option<Arc<dyn VaultTools>>,
+    /// FR-90 P4-4-1b — what the knowhow tools ask.
+    knowhow: Option<Arc<dyn super::knowhow_tools::KnowhowTools>>,
     /// P3-4c-1 — where `vault_exec` runs a command.
     #[cfg(feature = "vault")]
     exec: Option<super::vault_exec::ExecTarget>,
@@ -740,6 +746,7 @@ pub(crate) fn open(
         session: run.session,
         fence: run.fence,
         vault: run.vault,
+        knowhow: run.knowhow,
         #[cfg(feature = "vault")]
         exec: run.exec,
         #[cfg(feature = "vault")]
@@ -818,6 +825,7 @@ pub(crate) fn open(
         session,
         fence: run.fence,
         vault: run.vault,
+        knowhow: run.knowhow,
         #[cfg(feature = "vault")]
         exec: run.exec,
         #[cfg(feature = "vault")]
@@ -1263,6 +1271,42 @@ async fn vault_tool(
     let _ = out.send(reply(&id, result)).await;
 }
 
+/// FR-90 P4-4-1b — one knowhow tool call, from asking to answering, as a
+/// vault tool's is: what the map says, as text, or why it said nothing.
+async fn knowhow_tool(
+    ctx: Arc<Ctx>,
+    id: Value,
+    name: String,
+    args: Value,
+    out: mpsc::Sender<String>,
+    calls: Calls,
+    cancel: CancellationToken,
+) {
+    let key = id.to_string();
+    let asked = async {
+        match &ctx.knowhow {
+            Some(k) => {
+                super::knowhow_tools::call(k.as_ref(), ctx.session, ctx.fence, &name, &args).await
+            }
+            None => Err("this device offers its sessions no map".into()),
+        }
+    };
+    let answered = tokio::select! {
+        a = asked => Some(a),
+        _ = cancel.cancelled() => None,
+    };
+    calls.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    // A cancelled request gets no answer (MCP).
+    let Some(answered) = answered else {
+        return;
+    };
+    let result = match answered {
+        Ok(v) => json!({"content": [{"type": "text", "text": v.to_string()}]}),
+        Err(why) => json!({"content": [{"type": "text", "text": why}], "isError": true}),
+    };
+    let _ = out.send(reply(&id, result)).await;
+}
+
 /// What the vault answers one vault tool call, for the session's run.
 async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String> {
     let Some(vault) = &ctx.vault else {
@@ -1469,6 +1513,11 @@ async fn on_message(
             if ctx.vault.is_some() && placeholder_offered(ctx) {
                 tools.extend(placeholder_tools());
             }
+            // FR-90 P4-4-1b — the map's reads, where the server said it is
+            // there, and only the ones it answers.
+            if let Some(k) = &ctx.knowhow {
+                tools.extend(super::knowhow_tools::tools(&k.offered()));
+            }
             reply(&id, json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -1487,7 +1536,14 @@ async fn on_message(
             #[cfg(not(feature = "vault"))]
             let placeholder = false;
             let vault = ctx.vault.is_some() && (is_vault_tool(name) || net || ssh || placeholder);
-            if name != "approve" && !vault {
+            // FR-90 P4-4-1b — a knowhow tool, on a branch of its own: the
+            // vault's chain reads any name it does not know as
+            // `vault_describe`.
+            let knowhow = ctx
+                .knowhow
+                .as_ref()
+                .is_some_and(|k| k.offered().contains(&name));
+            if name != "approve" && !vault && !knowhow {
                 error(&id, -32602, "unknown tool")
             } else {
                 let cancel = stop.child_token();
@@ -1496,6 +1552,18 @@ async fn on_message(
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(id.to_string(), cancel.clone());
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                if knowhow {
+                    tokio::spawn(knowhow_tool(
+                        Arc::clone(ctx),
+                        id,
+                        name.to_string(),
+                        args,
+                        out.clone(),
+                        Arc::clone(calls),
+                        cancel,
+                    ));
+                    return;
+                }
                 if vault {
                     tokio::spawn(vault_tool(
                         Arc::clone(ctx),

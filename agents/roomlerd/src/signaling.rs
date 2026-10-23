@@ -1700,9 +1700,12 @@ async fn connect_once(
     }
     // FR-90 — and its Hive state reports: point the supervisor at THIS one,
     // which also replays the latest state of every session a dropped
-    // connection may have lost.
+    // connection may have lost. P4-4-1b — and its sessions' questions about
+    // the map, whose server's word that the map is there is forgotten until
+    // this connection's knowhow says it again (`rc:knowhow.served`).
     #[cfg(hive_host)]
     if ctx.is_primary {
+        crate::hive::knowhow_tools::on_connected(outbound_tx.clone());
         crate::hive::on_connected(outbound_tx.clone());
     }
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
@@ -6531,6 +6534,39 @@ async fn handle_server_msg(
                         })
                         .await;
                 });
+            }
+        }
+
+        // FR-90 P4-4-1b — the map is there for this device's sessions, and
+        // the answers to their questions: taken on the primary's connection
+        // alone, the one the questions go out on. A build that runs no
+        // session never advertises `knowhow-tools`, so it is sent none.
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowServed { tools } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_served(&tools);
+            }
+        }
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowFound {
+            req_id,
+            entities,
+            truncated,
+        } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_found(&req_id, entities, truncated);
+            }
+        }
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowCard { req_id, card } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_card(&req_id, card);
+            }
+        }
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowRefused { req_id, reason } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_refused(&req_id, reason);
             }
         }
 

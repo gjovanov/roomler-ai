@@ -49,7 +49,7 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | peer fan-out | `overlay.rs:538-568` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:4037`) | an upsert IS the update; the re-join already carries the new key to every peer |
 | peer reinstall | `crates/tunnel-core/src/overlay/runtime/establish.rs:1147-1180` | "peer's WG public key changed — reinstalling its carrier" (`PeerRoute::Keep`) |
 | DERP | `crates/api/src/ws/derp.rs:339-362` (pubkey must equal the row's), `derp_acl.rs:99-140` rebuilt on every join (`overlay.rs:488-497`) | the row must carry the new key BEFORE the node re-registers — the join does exactly that |
-| the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2829-2851` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
+| the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2832-2854` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |
 | the report-back precedent | `ClientMsg::ConfigStatus` (`signaling.rs:505`), `record_config_report` (`ws/remote_control.rs:940-985`), `config_audit` (`models.rs:5166-5184`) | the shape to copy: revision-bumped request, device reports the revision, server resolves ONE state |
 | capability verbs | `crates/remote_control/src/models.rs:271-384` | `RpcCap` — no rotation verb exists |
 | UI | `ui/src/components/admin/AgentsSection.vue:1918-1906`, `ui/src/stores/agents.ts:749-704` | "Update now"; **no view shows the overlay public key anywhere** |
