@@ -259,7 +259,8 @@ A room or message response may carry `binding {module, ref}` — another module 
 means (FR-90: an agent session's room, and the turn stubs in it). Chat stores it and never
 interprets it. A message also carries `author_type` (`user` · `bot` · `webhook` · `system`).
 An agent's message is authored by its **session**: `author_id` is the session's id and
-`author_name` is `Claude · <device>`. The edit and delete routes match the author, so they
+`author_name` is `Claude · <device>`, the device named as the device list names it (its display
+name, else its machine's name; FR-116 AC4). The edit and delete routes match the author, so they
 refuse every person, the session's owner included — a stub reads as the agent's, and only the
 agent's session can change it.
 

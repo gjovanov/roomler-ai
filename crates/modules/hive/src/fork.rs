@@ -486,7 +486,7 @@ pub async fn fork(
                 reason: None,
                 message: Some(format!(
                     "{} takes a copy of the session first; the fork starts there once it has",
-                    device.name
+                    room::label_of(&device)
                 )),
                 session: None,
             },
@@ -551,7 +551,7 @@ pub async fn fork(
         room::note(
             &state,
             &parent,
-            room::forked_note(&fork.title, &device.name, &folder, &by),
+            room::forked_note(&fork.title, &room::label_of(&device), &folder, &by),
         )
         .await;
     }
@@ -579,7 +579,8 @@ pub(crate) async fn make_joined(
         Err(e) => {
             warn!(session = %sid, device = %p.to, %e, "hive: a fork's device was not read — the fork is not made");
             let why = "its device could not be read (the server's log says why)";
-            room::note(state, parent, room::fork_failed_note(p, why)).await;
+            let shown = room::promotion_for_people(&state.fleet.agents, parent.tenant_id, p).await;
+            room::note(state, parent, room::fork_failed_note(&shown, why)).await;
             return;
         }
     };
@@ -617,14 +618,15 @@ pub(crate) async fn make_joined(
                 .as_ref()
                 .filter(|_| answer.outcome != "refused")
             {
-                let note = room::forked_note(&fork.title, &device.name, &p.folder, &by);
+                let note = room::forked_note(&fork.title, &room::label_of(&device), &p.folder, &by);
                 room::note(state, parent, note).await;
             }
         }
         Err(e) => {
             warn!(session = %sid, %e, "hive: a fork whose device took its copy was not made");
             let why = "the server could not make it (its log says why)";
-            room::note(state, parent, room::fork_failed_note(p, why)).await;
+            let shown = room::promotion_for_people(&state.fleet.agents, parent.tenant_id, p).await;
+            room::note(state, parent, room::fork_failed_note(&shown, why)).await;
         }
     }
     // P2g-4b — the server is done trying: unless the fork's start is still

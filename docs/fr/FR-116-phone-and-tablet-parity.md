@@ -4,7 +4,8 @@
 P1–P8 since 2026-10-20 09:33Z (`hosted-20261020-9776afb`), D1 (#2599) and the D6 smoke (#2601) since 13:53Z, P3d (#2607)
 since 14:39Z (`hosted-20261020-3fbc5ad`), P6c (#2652) and the pin fix #2653 since 2026-10-21 13:18Z
 (`hosted-20261021-f72df08`), P5c (#2768) since 2026-10-23 18:51Z (`hosted-20261023-978e47b`); AC1–AC3 and AC5–AC9
-field-verified there (§8); open: AC4's last item (the agent's message author, FR-90's) · **Owner:** the web app (UI); P6 touches three server payloads ·
+field-verified there (§8); open: AC4's last item, the agent's message author and the room's notes in hive, which P6d
+(#2792) names by the display name · **Owner:** the web app (UI); P6 touches three server payloads and P6d hive's room texts ·
 **Anchors:** master `bfcb2349b` · **Builds on:** [FR-12](FR-12-onboarding-tutorial.md) (the tour anchors),
 [FR-103](FR-103-device-credentials-renew-themselves.md) and [FR-106](FR-106-devices-say-when-not-updating.md) (the
 "needs a person" chips), [FR-111](FR-111-touch-controls.md) (touch control of the viewer, left as it is)
@@ -206,6 +207,7 @@ actions inside the viewport.
 | **P5c** — #2768 | a running session's state chips and tools ride their own row under the toolbar, at every width (`#rc-tb-strip`, `RemoteControl.vue:886`; one `<Teleport>`, `:58-840`, gated by `sessionToolsOnStrip`, `:2450`), so the toolbar keeps Back, the device's name, Disconnect and Fullscreen; Connect's phases keep the one row. P5's single scrolling row could not: the tools overflowed it, and an overflowing flex row shrinks the title first — to its 96 px minimum on a phone, to 0 px on a 1300 px desktop (the operator chose the strip for desktop too, 2026-10-23) | revert: UI only | a session at 360 px on production, red (§8, 2026-10-23), then this build served at the production origin, green at 360–1920 px; then production as deployed (`hosted-20261023-978e47b`), green | S |
 | **P6** — P6a #2584 (UI) · P6b #2586 (D4, the server); hive's rows are FR-90's and stay open | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
 | **P6c** — #2652 | hive's session rows and dialogs name the device as the Devices page does (a UI join on `device_id`; the kept `device_name` only for a device the org no longer lists). The agent's message author, `Claude · <device_name>` (`crates/modules/hive/src/model.rs:640`), is stamped by the server and stays FR-90's | revert: UI only | the hive pages on production after a promote | S |
+| **P6d** — #2792 | what the server writes into a session's room names the device as the device list does: the author line `Claude · <device>`, the notes (started, adopted, refused, managed, moving, moved, forked, the failures, tail), an approval's notification, and the reasons a move or fork sends back. It is resolved live when the text is written: `crates/modules/hive/src/room.rs` `for_people` / `promotion_for_people`. The record (`location.device_name`, `to_name`) and what the device's harness reads (the memory snapshot, a move's resume note) keep the machine's name, which the CLI's selectors resolve. Taken with the operator's go (2026-10-23), FR-90 told on #1827 | revert: a display-only lookup, nothing stored changes | `hive_tests::a_sessions_room_names_its_device_as_the_device_list_does` (a display name, a rename, a cleared one), then a session's room on production after a promote | S |
 | **P7** — #2575 (sign-in) · P7b #2587 (the landing bar) | public pages, sign-in | revert | iOS Safari sign-in (the operator) | S |
 | **P8** — docs: this PR, a stack on #2582; the smoke: open (§6) | docs + the phone-width smoke | — | CI | S |
 
@@ -222,8 +224,8 @@ Found by the audit and fixed outside the phases (every width): a deep link to an
   the P8 smoke's). *(§8. The idle viewer's secondary break-glass button still reaches 361 px; #2601 shortens it.)*
 - [ ] **AC4**: a device is named by its display name everywhere a person reads a device name: the Devices page and
   its dialogs, the audit pages, the overlay pages, the Tunnel ACL, analytics, usage, hive. *(§8: every surface
-  but hive verified on production 2026-10-20. Hive's rows and dialogs: P6c. Still open: the agent's message
-  author in a session room, `Claude · <device_name>`, which the server stamps (FR-90's).)*
+  but hive verified on production 2026-10-20. Hive's rows and dialogs: P6c. The agent's message author in a
+  session room, `Claude · <device_name>`, and the room's notes: P6d, ticked once it is verified on production.)*
 - [x] **AC5**: complex dialogs are full screen on `xs` with their actions reachable. *(§8, 2026-10-20.)*
 - [x] **AC6**: chat and calls on a phone: Send is always visible; message actions work by tap, and nothing invisible
   takes a tap; the transcript closes; a call leaves visible controls once you leave its page. *(§8, 2026-10-21: on

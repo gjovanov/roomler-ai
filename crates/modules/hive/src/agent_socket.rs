@@ -532,13 +532,14 @@ async fn apply_reports(
                             // first start: one at a later fence is a move's, or
                             // a move back's, whose notes are the promotion's.
                             if !moved && (refused.is_some() || s.fence <= 1) {
+                                let shown = room::for_people(&state.fleet.agents, &s).await;
                                 let text = match refused {
                                     // P2f-4b — a terminal session made a managed one.
                                     None if s.from_terminal.is_some() => {
-                                        room::made_managed_note(&s)
+                                        room::made_managed_note(&shown)
                                     }
-                                    None => room::started_note(&s),
-                                    Some(_) => room::refused_note(&s),
+                                    None => room::started_note(&shown),
+                                    Some(_) => room::refused_note(&shown),
                                 };
                                 room::note(state, &s, text).await;
                             }
