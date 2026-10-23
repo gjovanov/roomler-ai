@@ -1813,8 +1813,11 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
 ///
 /// `list` / `focus` / `launch` are advertised only when this process can
 /// manage a desktop right now (a Linux virtual desktop or a logged-in
-/// X11/Xwayland session, or Windows) AND the operator hasn't disabled it; the
-/// browser gates its Apps menu on this list, and older agents omit the field.
+/// X11/Xwayland session, Windows, or a macOS process in a window-server
+/// session) AND the operator hasn't disabled it; the browser gates its Apps
+/// menu on this list, and older agents omit the field. A supervised Mac's
+/// root daemon is never in a session: its hello carries its GUI worker's
+/// words instead (`DelegateHost::effective_apps`).
 /// `status` (AC10) says "this build has a Remote Apps backend and answers
 /// `rc:apps.list` honestly": with the list when there is a desktop, with
 /// `unavailable: {code, reason}` when there is not. It is what lets the viewer
@@ -3149,7 +3152,9 @@ mod tests {
         };
         let apps = apps_caps_for(&off);
         let apps: Vec<&str> = apps.iter().map(String::as_str).collect();
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        // FR-97 P2c — macOS has a backend too, so it says `status` like the
+        // other two.
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         {
             assert_eq!(
                 apps,
@@ -3157,7 +3162,7 @@ mod tests {
                 "disabled: `status` alone — the entry shows, and the reply says `disabled`"
             );
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
             assert!(
                 apps.is_empty(),

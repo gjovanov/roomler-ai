@@ -24,6 +24,4 @@ docs/overlay-key-rotation.md	config_surface.rs:1096-1069
 docs/overlay-key-rotation.md	config_surface.rs:1096-1069
 docs/overlay-key-rotation.md	crates/agent-core/src/config.rs:980-868
 docs/overlay-key-rotation.md	crates/agent-core/src/config.rs:980-868
-docs/overlay-key-rotation.md	signaling.rs:4201-4168
-docs/overlay-key-rotation.md	signaling.rs:4326-4291
 docs/overlay-key-rotation.md	ui/src/stores/agents.ts:948-902

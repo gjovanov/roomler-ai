@@ -282,6 +282,7 @@ async fn attach_once(
         tracing::info!(
             permissions = ?caps.permissions,
             record = ?caps.record,
+            apps = ?caps.apps,
             "delegation: announcing our capabilities to the daemon"
         );
         write_frame(

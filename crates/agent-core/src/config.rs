@@ -3322,6 +3322,13 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
             cfg.display_match.as_str().to_string(),
         );
     }
+    // FR-97 P2c — Remote Apps switched off, as `0`, and only then: the env
+    // twin can only switch them off (`roomlerd::apps::APPS_ENV`), so a
+    // supervised Mac's root hands its `false` to the worker that serves
+    // `rc:apps.*`, and its `true` imposes nothing on the person's own config.
+    if !cfg.virtual_desktop_apps.enabled {
+        fallbacks.insert("APPS".to_string(), "0".to_string());
+    }
     // FR-119 P2b — the frame-rate denylist, read by the pump once per session.
     if let Some(v) = &cfg.fps_deny {
         fallbacks.insert("FPS_DENY".to_string(), v.clone());
@@ -3717,6 +3724,21 @@ mod tests {
         assert_eq!(
             env_fallbacks(&cfg).get("DISPLAY_MATCH").map(String::as_str),
             Some("always")
+        );
+    }
+
+    /// FR-97 P2c — Remote Apps reach the map only when switched off, as `0`:
+    /// a supervised Mac's root forwards an off to its worker, and an on (the
+    /// default) imposes nothing on the person's own config.
+    #[test]
+    fn remote_apps_ride_the_map_only_when_switched_off() {
+        let mut cfg = test_fixture();
+        assert!(cfg.virtual_desktop_apps.enabled, "on, the default");
+        assert_eq!(env_fallbacks(&cfg).get("APPS"), None);
+        cfg.virtual_desktop_apps.enabled = false;
+        assert_eq!(
+            env_fallbacks(&cfg).get("APPS").map(String::as_str),
+            Some("0")
         );
     }
 

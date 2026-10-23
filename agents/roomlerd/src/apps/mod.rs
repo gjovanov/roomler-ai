@@ -28,10 +28,10 @@
 //! ([`Unavailable`]) — the reason rides the reply, not only the daemon log.
 //!
 //! `window_id` is an **opaque string** the browser only round-trips
-//! (X11 hex on Linux, HWND decimal on Windows). Launch takes an
-//! allowlist **key** only — never a command line — so a compromised
-//! browser can start only operator-approved apps, and `command` is run
-//! as argv (no shell), so there is no injection surface.
+//! (X11 hex on Linux, HWND decimal on Windows, CGWindowID decimal on
+//! macOS). Launch takes an allowlist **key** only — never a command line —
+//! so a compromised browser can start only operator-approved apps, and
+//! `command` is run as argv (no shell), so there is no injection surface.
 //!
 //! ## Platform backends
 //! * `linux` — `wmctrl` (list/focus) + `tmux` (bash sessions) + `xterm`.
@@ -39,8 +39,12 @@
 //!   xterm attached to it — survives agent restart/disconnect and is
 //!   ssh-attachable. Windows are matched back to their session/app via a
 //!   `roomler:tmux:<s>` / `roomler:app:<key>` xterm-title convention.
-//! * `windows` — Phase 2 (`EnumWindows` / `SetForegroundWindow` /
-//!   `CreateProcessAsUser` in the active session). Not built yet.
+//! * `windows` — `EnumWindows` / `SetForegroundWindow` / a plain spawn on
+//!   the active user's desktop.
+//! * `macos` — FR-97 P2c: the window server's list, the Accessibility API
+//!   for focus, LaunchServices (`open -b`) for launch, and a Terminal window
+//!   for a terminal entry. It serves where the session's peer runs: a
+//!   per-user agent, or a supervised Mac's GUI worker.
 //!
 //! The pure parsers + resolvers live here (portable, unit-tested); the
 //! platform I/O lives in the cfg-gated submodules.
@@ -58,6 +62,8 @@ mod linux;
 /// build without the recorder has no unused re-export.
 #[cfg(all(target_os = "linux", feature = "recording"))]
 pub(crate) use linux::find_xauthority;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -69,7 +75,8 @@ mod windows;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WindowInfo {
     /// Opaque window handle: X11 hex id (`0x03400007`) on Linux, HWND
-    /// decimal on Windows. The browser round-trips it in `rc:apps.focus`.
+    /// decimal on Windows, CGWindowID decimal on macOS. The browser
+    /// round-trips it in `rc:apps.focus`.
     pub window_id: String,
     /// Human-friendly title (our `roomler:*` prefix stripped).
     pub title: String,
@@ -130,7 +137,8 @@ pub struct ResolvedApp {
 /// other three taught: silence reads as absence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Coverage {
-    /// Window sources this listing enumerated: `x11`, `wayland`.
+    /// Window sources this listing enumerated: `x11`, `wayland`, `win32`,
+    /// `quartz` (the macOS window server, FR-97 P2c).
     pub sources: Vec<&'static str>,
     /// A source that exists on this host but could NOT be enumerated, with
     /// the reason. `None` when the listing is complete.
@@ -203,8 +211,15 @@ pub enum Unavailable {
         tool: &'static str,
         install: &'static str,
     },
-    /// This platform has no Remote Apps backend (macOS, the BSDs).
+    /// This platform has no Remote Apps backend (the BSDs).
     Platform,
+    /// FR-97 P2c — `ROOMLERD_APPS=0` in this process's environment. Apart
+    /// from an operator's own export, this is how a supervised Mac's root
+    /// half hands its `[virtual_desktop_apps] enabled = false` to the GUI
+    /// worker that serves the sessions (FR-43's forward), so the reason names
+    /// both. Not [`Self::Disabled`]: that one points at THIS process's
+    /// config, and on a worker that config may well say `true`.
+    SwitchedOff,
 }
 
 impl Unavailable {
@@ -219,6 +234,7 @@ impl Unavailable {
             Self::CannotRunAs { .. } => "cannot_run_as",
             Self::ToolMissing { .. } => "tool_missing",
             Self::Platform => "platform",
+            Self::SwitchedOff => "switched_off",
         }
     }
 
@@ -250,8 +266,16 @@ impl Unavailable {
                  needs it to find and manage the desktop."
             ),
             Self::Platform => "Remote apps have no backend on this platform — they exist for \
-                               Linux desktops (X11, or Wayland through Xwayland) and Windows."
+                               Linux desktops (X11, or Wayland through Xwayland), Windows and \
+                               macOS."
                 .to_string(),
+            Self::SwitchedOff => format!(
+                "Remote apps are switched off on this device by `{APPS_ENV}=0` in the agent's \
+                 environment — on a Mac, the form in which the root half's \
+                 `[virtual_desktop_apps] enabled = false` reaches the GUI worker that serves \
+                 the session. Remove the variable, or enable them in that config, and restart \
+                 the daemon."
+            ),
         }
     }
 
@@ -302,12 +326,58 @@ pub fn apps_config() -> VirtualDesktopAppsConfig {
     APPS_CONFIG.get().cloned().unwrap_or_default()
 }
 
+/// FR-97 P2c — the environment's word on Remote Apps, the env twin of
+/// `[virtual_desktop_apps] enabled`. `env_fallbacks` publishes `0` from a
+/// config that says `false`, and a supervised Mac's root half forwards it to
+/// its GUI worker (`macos_supervisor::WORKER_ENV_FORWARD`), which serves every
+/// session: without it, the root's `false` changed nothing on the Mac's
+/// sessions.
+///
+/// ⚠️ A floor, never a ceiling: it can switch Remote Apps off, and nothing
+/// switches them ON against a config that says `false`.
+pub const APPS_ENV: &str = "ROOMLERD_APPS";
+
+/// [`APPS_ENV`]'s reading: only an explicit false word switches Remote Apps
+/// off. Unset, or anything else, leaves the config to decide.
+pub fn apps_switched_off(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+/// Whether Remote Apps may run at all here: the config, then the floor.
+/// `Err` says which of the two refused.
+///
+/// The floor is read from the ENVIRONMENT alone (either prefix), as
+/// `display_match`'s root floor is: the config fallback behind `node_env` is
+/// this process's own config, which `cfg` already is.
+fn permitted(cfg: &VirtualDesktopAppsConfig) -> Result<(), Unavailable> {
+    let env = tunnel_core::env::PREFIXES
+        .iter()
+        .find_map(|prefix| std::env::var(format!("{prefix}APPS")).ok());
+    permitted_with(cfg, env.as_deref())
+}
+
+/// [`permitted`] against an explicit [`APPS_ENV`] value — the test seam, so
+/// no test has to set a process-wide variable the others read.
+fn permitted_with(cfg: &VirtualDesktopAppsConfig, env: Option<&str>) -> Result<(), Unavailable> {
+    if !cfg.enabled {
+        return Err(Unavailable::Disabled);
+    }
+    if apps_switched_off(env) {
+        return Err(Unavailable::SwitchedOff);
+    }
+    Ok(())
+}
+
 /// Can this process manage a desktop right now — and if not, why not.
 ///
 /// Linux: virtual-desktop mode, **or** a logged-in user's session whose X
 /// display answers (FR-56 P1 — including a Wayland session, because its
 /// compositor runs Xwayland). Windows: the agent always drives the active
-/// user's desktop.
+/// user's desktop. macOS (FR-97 P2c): a process in a window-server session —
+/// a per-user agent or a supervised Mac's GUI worker, never the root daemon.
 ///
 /// The hello advertises `list`/`focus`/`launch` on `Ok` (`encode::caps::detect`
 /// assigns them from [`availability_for`] with the installed config, in the
@@ -324,9 +394,7 @@ pub fn availability() -> Result<(), Unavailable> {
 /// uses (so its answer is testable without installing a process-global
 /// config) and the one the reply path shares.
 pub fn availability_for(cfg: &VirtualDesktopAppsConfig) -> Result<(), Unavailable> {
-    if !cfg.enabled {
-        return Err(Unavailable::Disabled);
-    }
+    permitted(cfg)?;
     #[cfg(target_os = "linux")]
     {
         // ⚠️ NOT `env::var_os("DISPLAY").is_some()` any more. That asked
@@ -342,7 +410,11 @@ pub fn availability_for(cfg: &VirtualDesktopAppsConfig) -> Result<(), Unavailabl
         // Windows: the agent always drives the active user's desktop.
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::availability()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Err(Unavailable::Platform)
     }
@@ -360,7 +432,11 @@ pub fn apps_supported() -> bool {
 /// with no backend stays silent, exactly as before: there is nothing a reason
 /// could change there, and a permanently disabled button is noise.
 pub const fn has_backend() -> bool {
-    cfg!(any(target_os = "linux", target_os = "windows"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ))
 }
 
 /// Construct the platform backend, or say why apps can't be managed on this
@@ -378,7 +454,11 @@ pub fn backend() -> Result<Box<dyn WindowManager>, Unavailable> {
     {
         Ok(Box::new(windows::WindowsWm) as Box<dyn WindowManager>)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::availability().map(|()| Box::new(macos::MacWm) as Box<dyn WindowManager>)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Err(Unavailable::Platform)
     }
@@ -396,13 +476,10 @@ pub fn handle_control_message(val: &Value) -> Value {
     let cfg = apps_config();
     // FR-56 P1: the backend discovers its own target — the daemon's `DISPLAY`
     // (virtual-desktop mode, unchanged and still first) or the display of
-    // whoever is at the screen. When apps are disabled we build no backend →
-    // replies say `supported:false`, and (AC10) why.
-    let be = if cfg.enabled {
-        backend()
-    } else {
-        Err(Unavailable::Disabled)
-    };
+    // whoever is at the screen. When apps are disabled (the config, or since
+    // FR-97 P2c the env floor) we build no backend → replies say
+    // `supported:false`, and (AC10) why.
+    let be = permitted(&cfg).and_then(|()| backend());
     match &be {
         Ok(b) => dispatch(val, &cfg, Ok(b.as_ref())),
         Err(why) => dispatch(val, &cfg, Err(why)),
@@ -674,6 +751,146 @@ pub fn classify_title(raw: &str) -> ClassifiedTitle {
         session: None,
         app_key: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// macOS (FR-97 P2c) — the pure halves of the backend in `macos.rs`
+// ---------------------------------------------------------------------------
+
+/// One window as the macOS window server lists it
+/// (`CGWindowListCopyWindowInfo`), before [`quartz_listing`] filters it. Here
+/// and portable, so the filter is unit-tested on every OS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuartzWindow {
+    /// `kCGWindowNumber`, the CGWindowID.
+    pub id: u32,
+    /// `kCGWindowOwnerPID`.
+    pub pid: i32,
+    /// `kCGWindowLayer`: 0 for an app's normal windows. The menu bar, the
+    /// Dock and Control Center's items sit above it (20–25, measured).
+    pub layer: i64,
+    /// `kCGWindowOwnerName`: the app.
+    pub owner: String,
+    /// `kCGWindowName`. `None` when the key is absent (the window server's
+    /// own windows, and every other app's without the Screen Recording
+    /// grant); `Some("")` for an untitled window.
+    pub name: Option<String>,
+    /// `kCGWindowIsOnscreen`: off for a minimised window, a hidden app's, and
+    /// one on another Space.
+    pub on_screen: bool,
+    /// `kCGWindowAlpha`.
+    pub alpha: f64,
+    /// `kCGWindowBounds`: x, y, width, height in global points from the top
+    /// left.
+    pub bounds: (f64, f64, f64, f64),
+}
+
+/// The macOS listing, from the window server's two lists: `front` (on screen
+/// only, front to back) and `all`.
+///
+/// - **Layer 0, visible.** Normal windows; an alpha-0 one is nothing to show.
+/// - **On screen first, in the window server's front-to-back order**, the
+///   first one marked `focused`: the window in front, which is the focused
+///   one unless the active app has no window at all.
+/// - **Then the windows that are off screen AND titled**: a minimised window,
+///   a hidden app's, one on another Space. Measured on a tart Mac (FR-97 §8):
+///   every off-screen layer-0 window WITHOUT a title was an app's invisible
+///   helper (menu strips, cursor views, a panel service) — 18 of them beside
+///   3 real windows — so those are left out.
+pub fn quartz_listing(front: &[QuartzWindow], all: &[QuartzWindow]) -> Vec<WindowInfo> {
+    let normal = |w: &&QuartzWindow| w.layer == 0 && w.alpha > 0.0;
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<WindowInfo> = Vec::new();
+    for w in front.iter().filter(normal) {
+        if seen.insert(w.id) {
+            out.push(WindowInfo {
+                window_id: w.id.to_string(),
+                title: quartz_title(&w.owner, w.name.as_deref()),
+                app_key: None,
+                session: None,
+                focused: out.is_empty(),
+            });
+        }
+    }
+    let titled = |w: &&QuartzWindow| w.name.as_deref().is_some_and(|n| !n.trim().is_empty());
+    for w in all
+        .iter()
+        .filter(normal)
+        .filter(|w| !w.on_screen)
+        .filter(titled)
+    {
+        if seen.insert(w.id) {
+            out.push(WindowInfo {
+                window_id: w.id.to_string(),
+                title: quartz_title(&w.owner, w.name.as_deref()),
+                app_key: None,
+                session: None,
+                focused: false,
+            });
+        }
+    }
+    out
+}
+
+/// A Mac window's title for the list. A Mac title seldom names its app
+/// ("a.txt", "Untitled"), so the app follows it — unless they are the same
+/// word ("Calculator") or the window has none.
+pub fn quartz_title(owner: &str, name: Option<&str>) -> String {
+    let owner = owner.trim();
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) if n != owner && !owner.is_empty() => format!("{n} — {owner}"),
+        Some(n) => n.to_string(),
+        None if owner.is_empty() => "(untitled window)".to_string(),
+        None => owner.to_string(),
+    }
+}
+
+/// A macOS `window_id` back to its CGWindowID: plain decimal, never 0.
+pub fn parse_quartz_window_id(id: &str) -> Option<u32> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse::<u32>().ok().filter(|&n| n != 0)
+}
+
+/// One argv word for `/bin/sh`, single-quoted: nothing inside expands.
+fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// The script a terminal entry runs in a new Terminal window on a Mac. It
+/// deletes itself first, then `exec`s the allowlisted argv, each word
+/// single-quoted: the command is the operator's, from the config, and the
+/// browser only ever named its key. `None` for an empty command.
+pub fn terminal_script(key: &str, command: &[String]) -> Option<String> {
+    if command.is_empty() {
+        return None;
+    }
+    let argv: Vec<String> = command.iter().map(|w| sh_quote(w)).collect();
+    // The key is only a comment, but a newline in it would end the comment.
+    let key: String = key.chars().filter(|c| !c.is_control()).collect();
+    Some(format!(
+        "#!/bin/sh\n# roomlerd, Remote Apps: the allowlist entry {}. It deletes itself.\n\
+         rm -f -- \"$0\"\nexec {}\n",
+        sh_quote(&key),
+        argv.join(" ")
+    ))
+}
+
+/// That script's file name. Terminal shows it in the window's title, so it
+/// carries the key; the nonce keeps two launches apart.
+pub fn terminal_script_name(key: &str, nonce: u64) -> String {
+    let safe: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    let safe = if safe.is_empty() {
+        "app"
+    } else {
+        safe.as_str()
+    };
+    format!("roomler-{safe}-{:08x}.command", nonce & 0xffff_ffff)
 }
 
 #[cfg(test)]
@@ -969,7 +1186,182 @@ mod tests {
                 install: "apt install wmctrl",
             },
             Unavailable::Platform,
+            Unavailable::SwitchedOff,
         ]
+    }
+
+    /// FR-97 P2c — the env floor: only an explicit false word switches Remote
+    /// Apps off, it refuses with its own reason, and it can never switch them
+    /// ON against a config that says `false`.
+    #[test]
+    fn the_env_floor_only_ever_switches_off() {
+        for off in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(apps_switched_off(Some(off)), "{off:?}");
+        }
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("on"),
+        ] {
+            assert!(!apps_switched_off(on), "{on:?}");
+        }
+        let on = cfg_with(&[("bash", true)]);
+        assert_eq!(permitted_with(&on, None), Ok(()));
+        assert_eq!(permitted_with(&on, Some("1")), Ok(()));
+        assert_eq!(
+            permitted_with(&on, Some("0")),
+            Err(Unavailable::SwitchedOff),
+            "the floor refuses a config that says yes"
+        );
+        let mut off = on.clone();
+        off.enabled = false;
+        assert_eq!(
+            permitted_with(&off, Some("1")),
+            Err(Unavailable::Disabled),
+            "and nothing in the environment switches a `false` config back on"
+        );
+        assert_eq!(permitted_with(&off, Some("0")), Err(Unavailable::Disabled));
+    }
+
+    fn qw(id: u32, owner: &str, name: Option<&str>, on_screen: bool) -> QuartzWindow {
+        QuartzWindow {
+            id,
+            pid: 500,
+            layer: 0,
+            owner: owner.to_string(),
+            name: name.map(str::to_string),
+            on_screen,
+            alpha: 1.0,
+            bounds: (0.0, 0.0, 600.0, 400.0),
+        }
+    }
+
+    /// FR-97 P2c — the listing on run 1's measured lists (a tart Mac, macOS
+    /// 15.7.7): three real windows on screen, then the full list's 18 untitled
+    /// helpers and the menu bar's layers. After a minimise, b.txt is off
+    /// screen and STILL listed, by its title; no helper ever is.
+    #[test]
+    fn the_mac_listing_keeps_real_windows_and_drops_the_helpers() {
+        let mut menubar = qw(15, "Window Server", Some("Menubar"), true);
+        menubar.layer = 24;
+        let mut dock = qw(7, "Dock", Some("Dock"), true);
+        dock.layer = 20;
+        let front = vec![
+            qw(40, "Calculator", Some("Calculator"), true),
+            qw(32, "TextEdit", Some("a.txt"), true),
+            menubar.clone(),
+            dock,
+        ];
+        let mut all = vec![
+            qw(40, "Calculator", Some("Calculator"), true),
+            qw(39, "Calculator", Some(""), false),
+            qw(34, "Open and Save Panel Service", Some(""), false),
+            qw(33, "CursorUIViewService", Some(""), false),
+            qw(32, "TextEdit", Some("a.txt"), true),
+            qw(31, "TextEdit", Some("b.txt"), false),
+            qw(16, "Window Server", None, false),
+            qw(13, "Finder", Some(""), false),
+            menubar,
+        ];
+        let mut ghost = qw(9, "Ghost", Some("an invisible overlay"), true);
+        ghost.alpha = 0.0;
+        all.push(ghost);
+        let listed = quartz_listing(&front, &all);
+        let ids: Vec<&str> = listed.iter().map(|w| w.window_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["40", "32", "31"],
+            "on screen front to back, then the minimised titled one"
+        );
+        assert!(listed[0].focused, "the window in front is the focused one");
+        assert!(listed[1..].iter().all(|w| !w.focused));
+        assert_eq!(
+            listed[0].title, "Calculator",
+            "the app's name once, not twice"
+        );
+        assert_eq!(listed[1].title, "a.txt — TextEdit");
+        assert_eq!(listed[2].title, "b.txt — TextEdit");
+        assert!(
+            listed
+                .iter()
+                .all(|w| w.session.is_none() && w.app_key.is_none())
+        );
+    }
+
+    /// An untitled window ON screen is still a window (the app names it), and
+    /// nothing is listed twice.
+    #[test]
+    fn the_mac_listing_keeps_an_untitled_window_on_screen_once() {
+        let front = vec![qw(5, "Preview", Some(""), true), qw(6, "Notes", None, true)];
+        let all = front.clone();
+        let listed = quartz_listing(&front, &all);
+        let titles: Vec<&str> = listed.iter().map(|w| w.title.as_str()).collect();
+        assert_eq!(titles, vec!["Preview", "Notes"]);
+        assert!(quartz_listing(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn mac_titles_and_window_ids() {
+        assert_eq!(quartz_title("TextEdit", Some("a.txt")), "a.txt — TextEdit");
+        assert_eq!(
+            quartz_title("Calculator", Some(" Calculator ")),
+            "Calculator"
+        );
+        assert_eq!(quartz_title("Finder", Some("")), "Finder");
+        assert_eq!(quartz_title("Finder", None), "Finder");
+        assert_eq!(quartz_title("", Some("x")), "x");
+        assert_eq!(quartz_title("", None), "(untitled window)");
+
+        assert_eq!(parse_quartz_window_id("40"), Some(40));
+        assert_eq!(parse_quartz_window_id("4294967295"), Some(u32::MAX));
+        for bad in ["", "0", "-1", "+4", " 4", "0x28", "4294967296", "12a"] {
+            assert_eq!(parse_quartz_window_id(bad), None, "{bad:?}");
+        }
+    }
+
+    /// FR-97 P2c — a terminal entry's script: it deletes itself and `exec`s
+    /// the argv, every word single-quoted, so nothing in the config's words
+    /// expands or chains — whatever the words are.
+    #[test]
+    fn the_mac_terminal_script_quotes_every_word() {
+        let s = terminal_script("bash", &["bash".to_string()]).unwrap();
+        assert_eq!(
+            s,
+            "#!/bin/sh\n# roomlerd, Remote Apps: the allowlist entry 'bash'. It deletes itself.\n\
+             rm -f -- \"$0\"\nexec 'bash'\n"
+        );
+        let nasty = [
+            "/usr/bin/env".to_string(),
+            "it's".to_string(),
+            "$(reboot)".to_string(),
+            "a; rm -rf ~".to_string(),
+            "`id`".to_string(),
+        ];
+        let s = terminal_script("k\nexec evil", &nasty).unwrap();
+        assert!(
+            s.ends_with("exec '/usr/bin/env' 'it'\\''s' '$(reboot)' 'a; rm -rf ~' '`id`'\n"),
+            "{s}"
+        );
+        assert_eq!(
+            s.lines().count(),
+            4,
+            "a newline in the key cannot add a line: {s}"
+        );
+        assert!(terminal_script("bash", &[]).is_none());
+
+        assert_eq!(
+            terminal_script_name("bash", 0x1a2b_3c4d),
+            "roomler-bash-1a2b3c4d.command"
+        );
+        assert_eq!(
+            terminal_script_name("../../x y", 0x1_0000_0001),
+            "roomler-xy-00000001.command",
+            "only a safe name, never a path"
+        );
+        assert_eq!(terminal_script_name("", 7), "roomler-app-00000007.command");
     }
 
     #[test]
