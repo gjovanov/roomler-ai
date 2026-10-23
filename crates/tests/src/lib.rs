@@ -161,6 +161,11 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-2b — the network's word on each machine: its lease, names,
+/// carried routes, exit, SSH and tunnel routes, through a real overlay join;
+/// an evicted node's facts gone with it; a machine's room kept for the sync.
+#[cfg(test)]
+mod knowhow_network_sync_tests;
 /// FR-90 P4-2a — the fleet's devices mirrored onto the map: a hello's
 /// machine, the fleet's changes, the fleet's facts kept the fleet's, a
 /// removal's archive, and the reconcile that retires what is gone.

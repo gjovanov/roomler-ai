@@ -11,9 +11,9 @@ sessions read it too, through their toolbelt.
 > §3e "P4, knowhow, as designed" (#1827). The design is
 > [`roomler-hive-design.md`](roomler-hive-design.md) §9. **This page describes
 > what is built: P4-1, the module, its store and the people's routes; and
-> P4-2a, the fleet's devices mirrored as machines (§10).** People and the fleet
-> fill the map so far. The network's half of the sync (P4-2b), device scans
-> (P4-3), a session's reads and proposals (P4-4), probes (P4-5) and
+> P4-2, the fleet's devices mirrored as machines, with what the fleet and the
+> network say of each (§10).** People and the sync fill the map so far. Device
+> scans (P4-3), a session's reads and proposals (P4-4), probes (P4-5) and
 > `roomler_connect` (P4-6) come with the steps that build them (§11).
 
 ## 1. A map, not a gate
@@ -55,7 +55,7 @@ An **entity** is one thing the organization has
 | `env` | an environment, one lowercase word (`prod`, `staging`), or none |
 | `owner_id` | the member who answers for it, or none. A member of the organization, checked on every write |
 | `attrs` | a JSON object, up to 16 KiB stored: what describes it |
-| `facts` | what is known of it, each with its provenance (below), up to 64 |
+| `facts` | what is known of it, each with its provenance (below), up to 64. A machine keeps 14 of them for the sync (§10) |
 | `status` | `active`; `archived` once tombstoned. `proposed` and `stale` come with P4-4 and P4-5 |
 | `source` | where it came from: `person` in P4-1; `sync`, `scan` and `session` later |
 | `rev` | bumped by every write. A write names the rev it read (§3) |
@@ -110,7 +110,7 @@ A **fact** is a path, a value and where the value came from
 
 ⚠️ **A `machine` is never a person's.** A machine mirrors a device, and the sync
 records it (§10), keyed by its node id with its overlay address beside its name
-(P4-2b): labels move and are reused, and MagicDNS can be dead on a GPO-locked
+(§10.2): labels move and are reused, and MagicDNS can be dead on a GPO-locked
 desktop and is absent on macOS. A create naming `machine` is refused **400**
 ([`SYNCED_KINDS`](../crates/modules/knowhow/src/model.rs#L46)). A host
 that is no device is an `endpoint`.
@@ -118,7 +118,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Three collections, per organization
-([`lib.rs:175`](../crates/modules/knowhow/src/lib.rs#L175)):
+([`lib.rs:187`](../crates/modules/knowhow/src/lib.rs#L187)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -223,7 +223,7 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | GET | `/map/{id}` | its neighbourhood (§7): `?depth=` 1 (default) or 2, `?kind=`, `?env=` → `{center, entities, edges, truncated}` | `KNOWHOW_VIEW` |
 | GET | `/history` | the writes, newest first; `?entity=` one entity's, its links' included, archived or not; `?limit=` 1–200 | `KNOWHOW_VIEW` |
 | POST | `/entity` | `{kind, key, name, env?, owner_id?, attrs?, facts?: {path: value}}` → **201**. **409** when a live entity holds the kind and key; **400** for `machine`, a kind or a spelling outside the rules, a null fact, an owner who is no member; **422** for an unknown field | `KNOWHOW_EDIT` |
-| PATCH | `/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?: {path: value or null}}`: `""` clears `env` and `owner_id`; `attrs` is replaced whole; `facts` is merged by path (§2). **409** at a rev already gone; a change that changes nothing writes nothing and answers the entity as it is. `kind` and `key` are unknown fields (**422**). A machine's name, owner and synced facts are the fleet's (**400**, §10) | `KNOWHOW_EDIT` |
+| PATCH | `/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?: {path: value or null}}`: `""` clears `env` and `owner_id`; `attrs` is replaced whole; `facts` is merged by path (§2). **409** at a rev already gone; a change that changes nothing writes nothing and answers the entity as it is. `kind` and `key` are unknown fields (**422**). A machine's name, owner and synced facts are the fleet's (**400**, §10), and a person's own facts on a machine stop at 50 (**400**, §10) | `KNOWHOW_EDIT` |
 | DELETE | `/entity/{id}?rev=…` | archive it and its links: `{archived, links_archived}`. **409** at a rev already gone, **404** once archived; **400** for a machine, which leaves when its device does (§10) | `KNOWHOW_EDIT` |
 | POST | `/edge` | `{from, to, kind, attrs?}`: two live entities of the organization → **201**. **409** when they are already linked by that kind; **400** for a link to itself | `KNOWHOW_EDIT` |
 | PATCH | `/edge/{id}` | `{rev, attrs}`: its attributes, replaced. Its ends and kind never change: a different link is archived and made again | `KNOWHOW_EDIT` |
@@ -232,7 +232,7 @@ All under `/api/tenant/{tenant_id}/knowhow`
 ## 7. A neighbourhood
 
 The map route walks the links both ways, one step at a time
-([`routes.rs:408`](../crates/modules/knowhow/src/routes.rs#L408)). Each step
+([`routes.rs:431`](../crates/modules/knowhow/src/routes.rs#L431)). Each step
 is one indexed read of the live links from or to the step's entities, at most
 500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L243)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
@@ -276,12 +276,12 @@ years after it was written, so it has no TTL.
 | `knowhow_edges` | link: from, to, kind, attributes, status, source, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)` | tombstoned, kept |
 | `knowhow_history` | write | `(tenant_id, at desc, _id desc)`, `(tenant_id, entity_ids, at desc, _id desc)` | kept, no TTL |
 
-## 10. Machines, from the fleet (P4-2a)
+## 10. Machines, from the fleet and the network (P4-2)
 
 Every live device of an organization knowhow serves is a **machine** on the map
 ([`sync.rs`](../crates/modules/knowhow/src/sync.rs)). The sync is the first of the
-design's sources and the most trusted: what the fleet says of a device is the server's
-own record, not anybody's claim.
+design's sources and the most trusted: what the fleet and the network say of a device is
+the server's own record, not anybody's claim.
 
 | A machine's | Is |
 |---|---|
@@ -289,7 +289,7 @@ own record, not anybody's claim.
 | `name` | the label the device list shows: its display name, else its own name. A label the map cannot keep falls back to the machine's name, then to its id, never to nothing |
 | `owner_id` | the device's owner |
 | `source` | `sync`; its history rows too, with no person behind them |
-| facts, the sync's | `machine_name`, `os`, `arch` (where the device said it), `version`, `ephemeral`, `tags` ([`SYNCED_FACTS`](../crates/modules/knowhow/src/sync.rs#L53)), each sourced `sync`, with no `by` |
+| facts, the sync's | what the fleet says (§10.1) and what the network says (§10.2), fourteen paths in all ([`SYNCED_FACTS`](../crates/modules/knowhow/src/sync.rs#L68)), each sourced `sync`, with no `by` |
 
 ```mermaid
 sequenceDiagram
@@ -307,8 +307,10 @@ sequenceDiagram
     Note over K: at boot, and every knowhow.sync_secs, a reconcile
 ```
 
-It hears of a device from core, never from a call by fleet, so the module still has no
-edge in the graph. It reads devices through the shared `AgentDao`, as the vault does.
+It hears of a device from core, never from a call by fleet or the network, so the module
+still has no edge in the graph. It reads devices through the shared `AgentDao`, as the
+vault does, and the overlay through the shared overlay DAOs: a stateless dependency is no
+edge (FR-69's rule 5).
 
 - **A hello** mirrors its device: an enrolment's first, and every reconnect. It runs off the
   socket's path, so a slow database never delays a device's session.
@@ -318,9 +320,9 @@ edge in the graph. It reads devices through the shared `AgentDao`, as the vault 
 - **A removal** archives the machine and every link to it, each in the history.
 - **The reconcile** brings every served organization into line. It runs at boot, on the pod
   that holds the startup lease, and every `knowhow.sync_secs` (default 600) on every pod. It
-  catches what no hook carries, such as a display name. It also retires a machine whose device
-  went while knowhow was not looking: switched off, or a removal whose hook failed. A second
-  run changes nothing.
+  catches what no hook carries, such as a display name and everything the network says
+  (§10.2). It also retires a machine whose device went while knowhow was not looking:
+  switched off, or a removal whose hook failed. A second run changes nothing.
 
 > [!WARNING]
 > **A sync that fails is logged, never the caller's failure.** No rename, no update and above
@@ -333,19 +335,92 @@ edge in the graph. It reads devices through the shared `AgentDao`, as the vault 
 > machine an environment, attributes and facts of their own, and every sync leaves those as
 > they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L182)).
 
+> [!NOTE]
+> **A machine keeps room for the sync's facts.** An entity holds at most 64 facts, and the
+> sync owns 14 of a machine's paths, so a person's own facts on a machine stop at 50
+> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L214)), and no sync
+> takes a machine past 64. An edit that adds none of a person's still passes, so a machine
+> that a newly synced path left past its room can still be tidied.
+
 | Setting | Effect |
 |---|---|
 | `knowhow.sync_secs` (`ROOMLER__KNOWHOW__SYNC_SECS`) | how often each pod reconciles, in seconds; 0 or absent: 600 |
 
-Overlay addresses, the MagicDNS name, approved routes, exits, declared tunnel routes and SSH
-are the network's half, P4-2b.
+### 10.1 What the fleet says (P4-2a)
+
+`machine_name`, `os`, `arch` (where the device said it), `version`, `ephemeral` and `tags`:
+the device row as the fleet keeps it.
+
+### 10.2 What the network says (P4-2b)
+
+| Fact | Is | Present |
+|---|---|---|
+| `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
+| `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
+| `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L225)) | while the organization has a MagicDNS domain |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6555)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
+| `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
+| `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
+| `ssh.policy` | gate 3: `on` while the organization lets it accept sessions, else `off` | always |
+
+```mermaid
+flowchart LR
+    subgraph network["the network's rows"]
+        N["overlay_nodes: the device's live node<br/>its address, label and carried routes"]
+        O["overlay_networks: the organization's one network"]
+        T["tenants: the MagicDNS domain"]
+    end
+    A["agents: tunnel routes, the ssh verb, gate 3"]
+    H["a hello"] --> S["the sync"]
+    R["the reconcile, every knowhow.sync_secs"] --> S
+    N --> S
+    O --> S
+    T --> S
+    A --> S
+    S -->|"facts sourced sync"| M["the machine"]
+    style S fill:#f3e8fd
+```
+
+A hello reads the device's own node ([`device`](../crates/modules/knowhow/src/sync.rs#L356));
+the reconcile reads the organization's live nodes once, by device
+([`device_nodes`](../crates/modules/knowhow/src/sync.rs#L318)). An overlay fact
+exists while the device holds a live node and leaves the machine with it: an evicted node's
+facts go at the next sync, and the rest of the machine stays, because an eviction forces a new
+lease and is no removal.
+
+> [!WARNING]
+> **The network tells nobody when it changes, so its word reaches the map late.** A first
+> join (which follows the hello), an admin's approval of a route or an exit, gate 3, the
+> organization's MagicDNS domain and a device's tunnel routes (fleet's `agent_updated` fires
+> for tags and an owner only) reach the machine at the device's next hello or the next
+> reconcile, within `knowhow.sync_secs`. Nothing calls knowhow, and a hook on the overlay's
+> join path would buy a fresher map with the mesh's own latency, the wrong way round for a
+> map.
+
+> [!IMPORTANT]
+> **What the network says is no promise of reach.** `ssh.server` says the device's build
+> carries roomler SSH's server, not that the device switched it on (its own gate 4, which the
+> server cannot see), nor that anyone may open a session: gates 1 and 2 still decide, and
+> `ssh.policy` is gate 3 alone ([roomler-ssh.md](roomler-ssh.md)). `overlay.routes` and
+> `overlay.exit` are the data plane's (an approval the device no longer offers is no route),
+> and the overlay ACL still decides what passes. `tunnel.routes` are still gated by the
+> organization's tunnel policies.
+
+⚠️ **A MagicDNS read that fails fails the sync.** Read as "no domain", it would take every
+machine's MagicDNS name off the map until a later sync put it back
+([`magic_domain`](../crates/modules/knowhow/src/sync.rs#L308)).
+
+**Declared tunnel routes** (`[[tunnel_routes]]`) are not among the facts: the server never
+holds them. They live in the device's own config, outside its remote configuration surface,
+and the tunnel hub knows only the flows live on its pod. They come with the device's own scan
+(P4-3b).
 
 ## 11. What comes next
 
 | Step | Builds |
 |---|---|
-| P4-2b | the network's half of the sync: each machine's overlay addresses and MagicDNS name, its approved routes, exit, declared tunnel routes and SSH. Brings `knowhow → network` |
-| P4-3a, P4-3b | device scans, the server's half and the device's: `knowhow_scan_roots`, a device-owned list as decision 38 says; repositories and checkouts, kube contexts, manifests, listening services, metadata only |
+| P4-3a, P4-3b | device scans, the server's half and the device's: `knowhow_scan_roots`, a device-owned list as decision 38 says; repositories and checkouts, kube contexts, manifests, listening services and the device's declared tunnel routes, metadata only |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, believed from the session's record (`knowhow → hive`), and `knowhow_propose` as decision 39 says |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |

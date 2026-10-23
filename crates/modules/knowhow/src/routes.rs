@@ -43,7 +43,7 @@ use serde_json::{Map, Value, json};
 use crate::KnowhowState;
 use crate::dao::{MAX_EDGES, MAX_ENTITIES, Search};
 use crate::model::{
-    KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS, OP_ARCHIVE,
+    Fact, KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS, OP_ARCHIVE,
     OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SYNC, STATUS_ACTIVE, STATUS_ARCHIVED, SYNCED_KINDS,
     TARGET_EDGE, TARGET_ENTITY, check_attrs, check_edge_kind, check_env, check_fact_path,
     check_fact_value, check_key, check_kind, check_kind_word, check_name, merge_facts,
@@ -174,11 +174,11 @@ fn stale(what: &str, asked: i64) -> ApiError {
 }
 
 /// ⚠️ What the fleet says of a machine is the fleet's (P4-2a): its name, its
-/// owner and the facts the sync owns ([`SYNCED_FACTS`]). A person's change
-/// to one would be undone by the next sync, so it is refused, and so is
-/// archiving a machine, which leaves the map when its device is removed. A
-/// person may still give a machine an environment, attributes and facts of
-/// their own.
+/// owner and the facts the sync owns ([`SYNCED_FACTS`]), the network's among
+/// them since P4-2b. A person's change to one would be undone by the next
+/// sync, so it is refused, and so is archiving a machine, which leaves the
+/// map when its device is removed. A person may still give a machine an
+/// environment, attributes and facts of their own.
 fn the_fleets(current: &KnowhowEntity, body: &UpdateEntity) -> Result<(), ApiError> {
     if current.source != SOURCE_SYNC {
         return Ok(());
@@ -206,6 +206,29 @@ fn the_fleets(current: &KnowhowEntity, body: &UpdateEntity) -> Result<(), ApiErr
         current.kind,
         named.join(", ")
     )))
+}
+
+/// P4-2b — how many facts of a person's an entity holds. A synced one keeps
+/// room for every fact the sync owns, so the sync never takes it past
+/// [`MAX_FACTS`]: a person's own are held to what is left.
+fn persons_room(current: &KnowhowEntity) -> usize {
+    if current.source == SOURCE_SYNC {
+        MAX_FACTS - SYNCED_FACTS.len()
+    } else {
+        MAX_FACTS
+    }
+}
+
+/// The facts of `facts` that count against a person's room: on a synced
+/// entity, those at a path the sync does not own.
+fn persons_facts(current: &KnowhowEntity, facts: &[Fact]) -> usize {
+    if current.source != SOURCE_SYNC {
+        return facts.len();
+    }
+    facts
+        .iter()
+        .filter(|f| !SYNCED_FACTS.contains(&f.path.as_str()))
+        .count()
 }
 
 /// A body's `facts`: path → value, or — in an update only — null to remove
@@ -713,8 +736,16 @@ pub async fn update_entity(
             Some(auth.user_id),
             now,
         );
-        if facts.len() > MAX_FACTS {
-            return Err(bad(format!("an entity holds at most {MAX_FACTS} facts")));
+        // An edit that adds none of a person's passes: a path the sync took
+        // over later can leave a machine past its room, and tidying it must
+        // stay possible.
+        let room = persons_room(&current);
+        let held = persons_facts(&current, &facts);
+        if held > room && held > persons_facts(&current, &current.facts) {
+            return Err(bad(format!(
+                "a {} holds at most {room} facts of a person's",
+                current.kind
+            )));
         }
         if !changed.is_empty() {
             set.insert("facts", facts_bson(&facts)?);

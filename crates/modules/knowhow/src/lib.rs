@@ -56,6 +56,10 @@ pub struct KnowhowState {
     /// P4-2a — the fleet's devices, read to mirror them (the shared
     /// stateless DAO, as the vault reads them: no module edge).
     pub agents: Arc<roomler_ai_services::dao::agent::AgentDao>,
+    /// P4-2b — the network's word on them: each device's live overlay node,
+    /// and the organization's network, read through the same shared DAOs.
+    pub overlay_nodes: Arc<roomler_ai_services::dao::overlay_node::OverlayNodeDao>,
+    pub overlay_networks: Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>,
     /// The organizations whose map it keeps (`knowhow.tenants`).
     pub scope: Arc<scope::TenantScope>,
 }
@@ -78,12 +82,14 @@ impl FromRef<KnowhowState> for Core {
 impl Module for KnowhowState {
     const ID: &'static str = "knowhow";
 
-    /// No module state, and no module edge yet. P4-2a reads the fleet's
-    /// devices through the shared `AgentDao` and hears of them through
-    /// core's hooks and agent socket, so it calls no module. `knowhow →
-    /// fleet` comes with the first use of fleet's Hub (P4-3a, asking a device
-    /// to scan), `knowhow → network` with P4-2b, and `knowhow → hive` with
-    /// P4-4's session reads.
+    /// No module state, and no module edge yet. P4-2 reads the fleet's
+    /// devices and the network's overlay through the shared stateless DAOs
+    /// and hears of devices through core's hooks and agent socket, so it
+    /// calls no module (FR-69 rule 5: a stateless dependency is no edge).
+    /// `knowhow → fleet` comes with the first use of fleet's Hub (P4-3a,
+    /// asking a device to scan), and `knowhow → hive` with P4-4's session
+    /// reads; `knowhow → network` only with a step that needs the network's
+    /// live state.
     type Deps = ();
 
     async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
@@ -95,6 +101,12 @@ impl Module for KnowhowState {
             edges: Arc::new(dao::EdgeDao::new(db)),
             history: Arc::new(dao::HistoryDao::new(db)),
             agents: Arc::new(roomler_ai_services::dao::agent::AgentDao::new(db)),
+            overlay_nodes: Arc::new(roomler_ai_services::dao::overlay_node::OverlayNodeDao::new(
+                db,
+            )),
+            overlay_networks: Arc::new(
+                roomler_ai_services::dao::overlay_network::OverlayNetworkDao::new(db),
+            ),
             scope: Arc::new(scope),
             core,
         };

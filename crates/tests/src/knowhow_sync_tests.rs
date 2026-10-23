@@ -24,7 +24,7 @@ use crate::vault_lease_tests::enroll;
 
 /// The machine a device is on the map, as its card: `None` while there is
 /// none.
-async fn machine(app: &TestApp, t: &SeededTenant, agent_id: &str) -> Option<Value> {
+pub(crate) async fn machine(app: &TestApp, t: &SeededTenant, agent_id: &str) -> Option<Value> {
     let (code, card) = call(app.auth_get(
         &kpath(
             &t.tenant_id,
@@ -38,7 +38,7 @@ async fn machine(app: &TestApp, t: &SeededTenant, agent_id: &str) -> Option<Valu
 
 /// Wait until the machine's card satisfies `ready` (the hello's sync runs
 /// off the socket's path).
-async fn wait_machine(
+pub(crate) async fn wait_machine(
     app: &TestApp,
     t: &SeededTenant,
     agent_id: &str,
@@ -58,7 +58,7 @@ async fn wait_machine(
     );
 }
 
-fn fact(card: &Value, path: &str) -> Value {
+pub(crate) fn fact(card: &Value, path: &str) -> Value {
     card["entity"]["facts"]
         .as_array()
         .unwrap()
@@ -69,7 +69,7 @@ fn fact(card: &Value, path: &str) -> Value {
 }
 
 /// Change the device the fleet's way (`PUT …/agent/{id}`), as its owner.
-async fn update_device(app: &TestApp, t: &SeededTenant, agent_id: &str, body: Value) {
+pub(crate) async fn update_device(app: &TestApp, t: &SeededTenant, agent_id: &str, body: Value) {
     let (code, resp) = call(
         app.auth_put(
             &format!("/api/tenant/{}/agent/{agent_id}", t.tenant_id),
@@ -81,7 +81,7 @@ async fn update_device(app: &TestApp, t: &SeededTenant, agent_id: &str, body: Va
     assert_eq!(code, 200, "{body} → {resp}");
 }
 
-fn knowhow(app: &TestApp) -> &roomler_ai_mod_knowhow::KnowhowState {
+pub(crate) fn knowhow(app: &TestApp) -> &roomler_ai_mod_knowhow::KnowhowState {
     app.state
         .modules
         .knowhow
