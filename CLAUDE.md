@@ -269,6 +269,9 @@ crates/
   modules/vault/      → FR-90 P3 secrets: each value sealed under its own data key,
                         wrapped to an `age` KEK; RRNs; `vault_audit`. No route answers a
                         value. On core alone so far; switch defaults OFF (`docs/vault.md`)
+  modules/knowhow/    → FR-90 P4 the organization's map: entities, the links between them,
+                        `knowhow_history`. A map, not a gate: it grants nothing. On core
+                        alone so far; switch defaults OFF (`docs/knowhow.md`)
   api/              → Axum HTTP/WS server: ~85 routes + /ws + /health; `compose.rs` is
                       the host composition
   tests/            → Integration tests (spawns real servers; drives the agent in-process)

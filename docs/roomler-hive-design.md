@@ -196,7 +196,7 @@ flowchart BT
   re-created, not depended on (FR-69 rule 5).
 - Hive is the first module that depends on both a collaboration module and `fleet`. The
   forbidden pairs (`chat ↔ remote`, `chat ↔ network`, `remote ↔ network`,
-  `crates/core/src/graph.rs:13-19`) stay untouched; the new `EDGES` are listed above.
+  `crates/core/src/graph.rs:13-20`) stay untouched; the new `EDGES` are listed above.
   Viewer peers need TURN credentials, which `remote` serves; Hive mints its own with the
   same stateless helper (`crates/remote_control/src/turn_creds.rs:46-85`) instead of
   adding a `hive → remote` edge.
@@ -322,13 +322,13 @@ records that a session happened, not what was in it.
   travel as chat's `message:create` and `message:update`. Live turn content never rides
   this plane (§5.2).
 - **Permission bits.** Bits 0–31 of the `u64` catalogue are all assigned and
-  `ALL = (1 << 32) - 1` (`crates/db/src/models/role.rs:161`). Hive widens `ALL` and adds
+  `ALL = (1 << 32) - 1` (`crates/db/src/models/role.rs:191`). Hive widens `ALL` and adds
   `HIVE_RUN` (start and drive sessions), `HIVE_ADMIN`, `VAULT_ADMIN`, `KNOWHOW_EDIT` and
   `BRAIN_REVIEW`; the owner role picks them up through the additive reconcile.
   ⚠️ `HIVE_RUN` is remote code execution on a device. Like `EXEC_DEVICE`,
   `SSH_DEVICE` and `RECORD_REMOTE_SCREEN`, it goes in **no managed role below the
   `ADMINISTRATOR` bypass**, and FR-82's test that pins those three,
-  `no_managed_role_below_administrator_seeds_a_root_shell` (`role.rs:396`), pins it too.
+  `no_managed_role_below_administrator_seeds_a_root_shell` (`role.rs:429`), pins it too.
 - **Plans (D3).** Hive is the "AI" of the Business tier, which the business model
   already names (`docs/business-model.md:110-120`) and the code doesn't enforce yet:
   `PlanLimits` has no AI field (`crates/db/src/models/tenant.rs:251-257`) and limits are

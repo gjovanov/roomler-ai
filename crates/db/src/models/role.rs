@@ -110,6 +110,19 @@ pub mod permissions {
     /// typing commands as you on that box" is still a power an org grants on
     /// purpose or not at all.
     pub const HIVE_RUN: u64 = 1 << 32;
+    /// FR-90 P4 — read the organization's map, knowhow: its machines,
+    /// repositories, databases, clusters and services, and how each is
+    /// reached (decision 37: from `member` up, not `guest`). A session reads
+    /// what its starter may.
+    ///
+    /// Safe in every managed row from `member` up because the map grants
+    /// nothing: the vault, the network and the device still decide every
+    /// reach. What it shows is where things are, never a way in.
+    pub const KNOWHOW_VIEW: u64 = 1 << 33;
+    /// FR-90 P4 — change the map: add, change and archive what it holds,
+    /// every change recorded with who made it (decision 36: `admin`). It
+    /// implies reading it.
+    pub const KNOWHOW_EDIT: u64 = 1 << 34;
     // ⚠️ Bit 52 is the ceiling, and the reason is the JSON number rather than
     // anything here: a mask crosses the wire as a JSON integer, which is exact
     // only below 2^53. The UI mirror (`ui/src/utils/permissions.ts`) does its
@@ -137,7 +150,10 @@ pub mod permissions {
         | ADD_REACTIONS
         | CONNECT_VOICE
         | SPEAK
-        | STREAM_VIDEO;
+        | STREAM_VIDEO
+        // FR-90 P4 — the map, read (decision 37). In this composite, so
+        // `moderator` and `admin` hold it too; `guest` has its own mask.
+        | KNOWHOW_VIEW;
 
     /// Admin permissions (all except ADMINISTRATOR)
     pub const DEFAULT_ADMIN: u64 = DEFAULT_MEMBER
@@ -164,12 +180,15 @@ pub mod permissions {
         // SYSTEM/root with nobody watching. Both stay explicit grants.
         | VIEW_EXEC_AUDIT
         // Same split for SSH: see the audit without gaining the session.
-        | VIEW_SSH_AUDIT;
+        | VIEW_SSH_AUDIT
+        // FR-90 P4 — the map, changed (decision 36). It grants nothing, so
+        // changing it is an administrator's job, not an owner's grant.
+        | KNOWHOW_EDIT;
 
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
-    pub const ALL: u64 = (1 << 33) - 1;
+    pub const ALL: u64 = (1 << 35) - 1;
 
     /// Every named bit, with its wire name. Lives here rather than in the test
     /// module because two callers need it: `all_contains_every_named_permission`
@@ -210,6 +229,8 @@ pub mod permissions {
         ("VIEW_SSH_AUDIT", VIEW_SSH_AUDIT),
         ("RECORD_REMOTE_SCREEN", RECORD_REMOTE_SCREEN),
         ("HIVE_RUN", HIVE_RUN),
+        ("KNOWHOW_VIEW", KNOWHOW_VIEW),
+        ("KNOWHOW_EDIT", KNOWHOW_EDIT),
     ];
 
     /// Names of every named bit set in `mask`, for error messages. An
@@ -565,6 +586,22 @@ mod tests {
             0,
             "HIVE_RUN must stay an explicit grant"
         );
+    }
+
+    #[test]
+    fn the_map_is_read_from_member_up_and_changed_by_admins() {
+        // FR-90 P4 — decisions 37 and 36, as the managed rows carry them. The
+        // reconcile hands each row's bits to every existing org at the next
+        // boot, so these are the rows that decide who reads the map.
+        let mask = |name: &str| ManagedRole::by_name(name).unwrap().permissions;
+        for name in ["member", "moderator", "admin"] {
+            assert_ne!(mask(name) & KNOWHOW_VIEW, 0, "`{name}` cannot read the map");
+        }
+        assert_eq!(mask("guest") & KNOWHOW_VIEW, 0, "a guest reads no map");
+        assert_ne!(mask("admin") & KNOWHOW_EDIT, 0, "admins change the map");
+        for name in ["member", "moderator", "guest"] {
+            assert_eq!(mask(name) & KNOWHOW_EDIT, 0, "`{name}` changes the map");
+        }
     }
 
     #[test]

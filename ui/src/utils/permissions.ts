@@ -33,7 +33,7 @@ export interface PermissionFlag {
 
 export const ADMINISTRATOR = 1 << 23
 
-/** All 31 defined flags, grouped for the role-editor UI. */
+/** All 35 defined flags, grouped for the role-editor UI. */
 export const PERMISSION_FLAGS: PermissionFlag[] = [
   // ── General ──────────────────────────────────────────────────────
   { key: 'VIEW_CHANNELS', bit: 1 << 0, label: 'View channels', group: 'General' },
@@ -145,6 +145,27 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     description:
       'Start and drive AI agent sessions on a device. A session runs as the account the device maps you to — never SYSTEM or root — and only where the device allows it. It runs commands on that device, so no role gets this by default.',
   },
+  // ── Knowhow ──────────────────────────────────────────────────────
+  // FR-90 P4 — the organization's map. It grants nothing: the vault, the
+  // network and the device still decide every reach, so reading it is in the
+  // member preset (decision 37) and changing it in the admin one (36).
+  {
+    key: 'KNOWHOW_VIEW',
+    // `2 ** 33`: a shift cannot express it in JS.
+    bit: 2 ** 33,
+    label: 'View the map',
+    group: 'Knowhow',
+    description:
+      'Read the organization’s map: its machines, repositories, databases, clusters and services, and how each is reached. The map grants nothing: every reach is still decided by the vault, the network and the device.',
+  },
+  {
+    key: 'KNOWHOW_EDIT',
+    bit: 2 ** 34,
+    label: 'Edit the map',
+    group: 'Knowhow',
+    description:
+      'Add, change and archive what the map holds. Every change is recorded with who made it, and editing the map includes reading it.',
+  },
 ]
 
 /** Group names in display order (insertion order of the flags above). */
@@ -170,6 +191,7 @@ export const DEFAULT_MEMBER = byKeys([
   'CONNECT_VOICE',
   'SPEAK',
   'STREAM_VIDEO',
+  'KNOWHOW_VIEW',
 ])
 
 /**
@@ -199,16 +221,17 @@ export const DEFAULT_ADMIN = maskUnion(
     'VIEW_REMOTE_AUDIT',
     'VIEW_EXEC_AUDIT',
     'VIEW_SSH_AUDIT',
+    'KNOWHOW_EDIT',
   ]),
 )
 
 /**
- * Every defined bit — server `ALL = (1 << 33) - 1` = bits 0–32.
- * Written as `2 ** 33 - 1` because the Rust spelling is not a JS expression
- * at all: a shift coerces to int32, so `1 << 33` is 2 (see the int32 note at
+ * Every defined bit — server `ALL = (1 << 35) - 1` = bits 0–34.
+ * Written as `2 ** 35 - 1` because the Rust spelling is not a JS expression
+ * at all: a shift coerces to int32, so `1 << 35` is 8 (see the int32 note at
  * the top of this file).
  */
-export const ALL_PERMISSIONS = 2 ** 33 - 1
+export const ALL_PERMISSIONS = 2 ** 35 - 1
 
 /**
  * Mask arithmetic that is exact to `Number.MAX_SAFE_INTEGER`, i.e. bits 0–52.

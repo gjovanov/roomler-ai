@@ -8840,6 +8840,7 @@ dependencies = [
  "roomler-ai-mod-conference",
  "roomler-ai-mod-fleet",
  "roomler-ai-mod-hive",
+ "roomler-ai-mod-knowhow",
  "roomler-ai-mod-network",
  "roomler-ai-mod-remote",
  "roomler-ai-mod-saas",
@@ -8988,6 +8989,24 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "roomler-ai-mod-knowhow"
+version = "0.4.154"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bson",
+ "futures",
+ "mongodb",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-services",
+ "roomler-core",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

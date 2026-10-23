@@ -29,6 +29,7 @@ flowchart BT
     saas["modules/saas (add-on)<br/>Stripe · newsletter · plan compliance"]
     hive["modules/hive (FR-90, default OFF)<br/>agent sessions: the record + lifecycle<br/>rc:hive.* · hive_audit · turn stubs · never content"]
     vault["modules/vault (FR-90 P3, default OFF)<br/>secrets under envelope encryption (an age KEK)<br/>RRNs · vault_audit · never a value in an answer"]
+    knowhow["modules/knowhow (FR-90 P4, default OFF)<br/>the organization's map: entities · links<br/>knowhow_history · a map, never a gate"]
     fleet --> core
     chat --> core
     saas --> core
@@ -38,17 +39,19 @@ flowchart BT
     hive -->|"a session's frames ride the agent socket"| fleet
     hive -->|"a session IS a secret room"| chat
     vault -->|"P3-3b: a lease is believed from the session's record"| hive
+    knowhow -->|"P4-1: on core alone"| core
     style core fill:#e8f0fe
     style saas fill:#fff4e5
     style hive fill:#f3e8fd
     style vault fill:#f3e8fd
+    style knowhow fill:#f3e8fd
 ```
 
 Three rules keep it a monolith rather than a pile of crates:
 
 | Rule | What it means in code |
 |---|---|
-| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the six edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`, `vault → hive`); FR-90 P3-3b added `vault → hive` (a lease is believed only from the session record's device at its fence), and `vault → fleet` arrives with P3-3c. Any module may call core; core **never** calls a module. |
+| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the six edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`, `vault → hive`); FR-90 P3-3b added `vault → hive` (a lease is believed only from the session record's device at its fence), and `vault → fleet` arrives with P3-3c. FR-90 P4-1's `knowhow` has none yet: its edges to `fleet`, `network` and `hive` come with P4-2 and P4-4. Any module may call core; core **never** calls a module. |
 | **Core membership is narrow** | Something is in `roomler-core` only if at least two modules need it **and** it is identity, tenancy or infrastructure. Everything else belongs to exactly one module. |
 | **Inverse flows are hooks** | When core must reach "up" (a tenant is archived, an agent is removed), it invokes a registry of hooks in a fixed order — see §6. |
 
@@ -73,6 +76,7 @@ inside one (FR-24, FR-69 AC10).
 | Stripe, the public updates list + newsletter, plan compliance | **saas** | an add-on feature on the api crate; no self-host image carries it |
 | agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; one of the two modules whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`, with `vault`), so `switched_off` lists it until an operator turns it on (`[modules] hive`, or a `hive.tenants` list — FR-90 P1g-2); leads `HOOK_ORDER` as a session holder |
 | the vault: `vault_secrets` + `vault_versions` (each value sealed under its own data key, wrapped to an `age` KEK) + `vault_audit`, the administrator's metadata routes — none answers a value; P3-2a's `vault_roles` + `vault_policies` (Cedar, checked on write) and `simulate`; P3-3b's leases (`rc:vault.lease` answered on the asking connection) and `vault_leases`; P3-3c's revocation (`rc:vault.revoke`); P3-4d's device reports (`rc:vault.activity`, fire-and-forget) into `vault_activity`, a claim kept apart from `vault_audit`; P3-4e's approval cards (`vault_approvals`, the answer route) | **vault** (FR-90 P3-1, P3-2a, P3-2b, P3-3b, P3-3c, P3-4d, P3-4e) | `Module::Deps = ()`: its one edge, `vault → hive` (P3-3b), reads session records through hive's stateless DAO, which is not a `Deps` (rule 5), so a vault mounted without hive finds no session to lease for. P3-4e calls hive's public `access::may_answer` and `room::post_approval_card` over the same edge; each builds what it needs from the core (chat's `BoundChat` is stateless), so there is still no `Deps` and no `vault → chat` edge. It registers an agent-socket handler for the `rc:vault.*` namespace (`Owner::Vault`), with one lease queue per connection. Its switch defaults **off** like hive's, and a `vault.tenants` list mounts it by itself. Second in `HOOK_ORDER`, right after `hive`: from P3-3 it holds leases that sessions hold, so it revokes them once the sessions have ended and while the device is still there to be told. P3-2b — it registers the **session gate** (`Hooks.session`, a `SessionGate`): hive asks it, through core, before a session takes a vault role or moves with one, since hive must never call the vault ([vault.md](vault.md) §8). P3-3c — it registers a `FleetLifecycle` for `agent_removed` (a removed device's leases taken back and told, a failure logged rather than refusing the removal), and pushes a revocation itself: each pod tells the devices connected to it on the connections its lease socket holds, so it needs neither fleet's Hub nor a `vault → fleet` edge ([vault.md](vault.md) §11) |
+| knowhow, the organization's map: `knowhow_entities` + `knowhow_edges` + `knowhow_history` (every write a compare-and-set on `rev`, appended after it), the people's routes (search, a card, a neighbourhood, create, update, archive), read with `KNOWHOW_VIEW` and written with `KNOWHOW_EDIT`. It grants nothing | **knowhow** (FR-90 P4) | on core alone in P4-1 (`Module::Deps = ()`); composed last and last in `HOOK_ORDER`, with no hook yet ([knowhow.md](knowhow.md)) |
 | the device listing (`/tenant/{tid}/device`) | **the host** | a view over fleet (required) and network (optional) — see §4's lesson |
 
 ---
@@ -130,7 +134,7 @@ What the host drives, and in which order — each of these is a rule paid for in
 ```mermaid
 flowchart LR
     subgraph feats["Cargo features on crates/api"]
-        F1["profile-full = chat + conference + fleet + remote + network + hive + vault"]
+        F1["profile-full = chat + conference + fleet + remote + network + hive + vault + knowhow"]
         F2["profile-collab = chat + conference"]
         F3["profile-remote = fleet + remote"]
         F4["profile-mesh = fleet + network"]
@@ -350,6 +354,11 @@ forces a catch-all in every consumer everywhere — too invasive for the existin
 Core never calls a module, so the cascades that cross modules are **hooks** core invokes in
 `hooks::HOOK_ORDER`: session holders → lease holders → the record owner. A failing holder stops
 the cascade.
+
+FR-90 P4-1 puts `knowhow` last. It holds nothing a device or a member needs released, only a map
+of them, and registers no hook yet: its mirror of a removed machine (P4-2) is archived after every
+holder has let go, so a holder that fails, stopping the cascade, leaves the map still showing the
+device that is still there.
 
 FR-90 P3-2b adds a hook that is a **question**, not a cascade: `SessionGate`
 (`Hooks.session`), which only the vault registers. Hive owns the session, and `vault → hive` is

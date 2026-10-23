@@ -1,0 +1,29 @@
+[package]
+name = "roomler-ai-mod-knowhow"
+license = "AGPL-3.0-only"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "FR-90 module: knowhow — the organization's map, the server side: what exists, where it lives and how each is reached, as entities and the edges between them, with the history of every write. A map, not a gate: it grants nothing."
+
+[lib]
+name = "roomler_ai_mod_knowhow"
+path = "src/lib.rs"
+
+# P4-1 depends on core alone. Its three edges come with the steps that use
+# them: `knowhow → fleet` and `knowhow → network` with P4-2's sync,
+# `knowhow → hive` (a session's question believed from its record) with P4-4.
+[dependencies]
+roomler-core = { path = "../../core" }
+roomler-ai-config = { path = "../../config" }
+roomler-ai-db = { path = "../../db" }
+roomler-ai-services = { path = "../../services" }
+
+anyhow.workspace = true
+axum.workspace = true
+bson.workspace = true
+futures.workspace = true
+mongodb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

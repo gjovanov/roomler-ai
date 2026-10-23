@@ -148,7 +148,7 @@ age-keygen -o kek.txt          # keep it out of every backup the database is in
   key (`PUT …/value`, `POST …/verify`) answer **503** with the reason. The
   reason is always a fixed sentence and never repeats the setting.
 - The KEK never prints. `VaultSettings`' `Debug` is written by hand
-  ([`settings.rs`](../crates/config/src/settings.rs#L109)), and so is the
+  ([`settings.rs`](../crates/config/src/settings.rs#L113)), and so is the
   KEK's ([`crypto.rs`](../crates/modules/vault/src/crypto.rs#L121)). The boot
   log names the recipient only.
 - `GET …/vault` reports `other_kek`: how many versions were wrapped to a KEK
@@ -1947,7 +1947,7 @@ network module:
   record (§10);
 - the network module may not ask the vault, because `hive ↔ network` is
   forbidden both ways
-  ([`graph.rs:103`](../crates/core/src/graph.rs#L103)).
+  ([`graph.rs:109`](../crates/core/src/graph.rs#L109)).
 
 So the vault decides, with Cedar's `net:socks` or `net:forward` (§7). It
 answers with a **grant**: a token signed by core's auth service under an
@@ -2286,7 +2286,7 @@ again (decision 25, P3-9-2).
 | the decision | `secret:connect` in the schema ([`policy.cedarschema:118`](../crates/modules/vault/src/policy.cedarschema#L118)); `ACTION_CONNECT` and `NAMED_ONLY` ([`policy.rs:83`](../crates/modules/vault/src/policy.rs#L83)); the three guardrails ([`policy.rs:192`](../crates/modules/vault/src/policy.rs#L192)); `Ask::ConnectSecret` ([`policy.rs:614`](../crates/modules/vault/src/policy.rs#L614)) |
 | the handler | [`connect.rs`](../crates/modules/vault/src/connect.rs) `connect` ([`connect.rs:105`](../crates/modules/vault/src/connect.rs#L105): the checks above), answered in order on the lease queue (§10, [`lease.rs:497`](../crates/modules/vault/src/lease.rs#L497)) |
 | the revocation | `verdict`'s person's branch ([`revoke.rs:288`](../crates/modules/vault/src/revoke.rs#L288)), its owner read once a check ([`revoke.rs:427`](../crates/modules/vault/src/revoke.rs#L427)) |
-| the switch | `vault.people` (`ROOMLER__VAULT__PEOPLE`, [`settings.rs:123`](../crates/config/src/settings.rs#L123)), read by `TenantScope::parse_opt_in` ([`scope.rs:57`](../crates/modules/vault/src/scope.rs#L57)) |
+| the switch | `vault.people` (`ROOMLER__VAULT__PEOPLE`, [`settings.rs:127`](../crates/config/src/settings.rs#L127)), read by `TenantScope::parse_opt_in` ([`scope.rs:57`](../crates/modules/vault/src/scope.rs#L57)) |
 | `simulate` | `secret:connect` ([`policy_routes.rs:938`](../crates/modules/vault/src/policy_routes.rs#L938)): the principal the device's owner, no mode, and `approver_id` for what a yes would change |
 | the device's half | P3-9-2a, below: the daemon's ask and the endpoint it serves, renewed |
 | the person's command | P3-9-2b, below: the LocalAPI's `Connect`, on the daemon's own endpoint only, held to decision 26, and `roomler connect` in the foreground |

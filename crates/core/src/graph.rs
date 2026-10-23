@@ -16,6 +16,7 @@ pub const MODULES: &[&str] = &[
     "network",
     "hive",
     "vault",
+    "knowhow",
 ];
 
 /// The allowed **module → module** call edges. Every module may call core;
@@ -32,6 +33,11 @@ pub const MODULES: &[&str] = &[
 /// device a session's record places it on, at its fence, read through hive's
 /// own DAO. `vault → fleet` (the Hub, to push a revocation) comes with P3-3c.
 /// Hive never calls the vault: it asks through core's `SessionGate` hook.
+///
+/// FR-90 P4 — `knowhow` has no edge yet: P4-1 is the store, on core alone.
+/// Its three come with the steps that use them — `knowhow → fleet` and
+/// `knowhow → network` with P4-2's sync, `knowhow → hive` (a session's
+/// question believed from its record) with P4-4 — and nothing calls it.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),

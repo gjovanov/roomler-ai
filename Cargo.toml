@@ -36,6 +36,9 @@ members = [
     # FR-90 P3 — the vault: secrets under envelope encryption, and the audit
     # of every decision. Never a value in an answer.
     "crates/modules/vault",
+    # FR-90 P4 — knowhow: the organization's map, and the history of every
+    # write to it. A map, not a gate: it grants nothing.
+    "crates/modules/knowhow",
 
     "crates/api",
     "crates/tests",
