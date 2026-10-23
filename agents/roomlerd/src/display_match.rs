@@ -37,6 +37,16 @@
 //! it already lists, with a restore guard that a crash cannot strand, since an
 //! X11 mode outlives the process that set it. Who is at that screen comes from
 //! the X idle clock (`presence`). Kill switch `ROOMLERD_X11_DISPLAY_MATCH=0`.
+//!
+//! FR-97 P2d-2b — **a Mac's main display** ([`mac_offered`]): switched to a
+//! mode it lists, at the scale it shows (a HiDPI desktop stays HiDPI) and at
+//! its refresh rate where offered ([`pick_mac_mode`]), through
+//! `CGDisplaySetDisplayMode`. That mode belongs to the process that set it: the
+//! window server puts the person's own mode back when the process ends, killed
+//! included (measured on a tart Mac, FR-97 §8), so a Mac needs no restore
+//! guard, as Windows' `CDS_FULLSCREEN` needs none. One active display only, as
+//! on X11. Who is at that screen comes from the HID idle clock (`presence`).
+//! Kill switch `ROOMLERD_MAC_DISPLAY_MATCH=0`.
 
 use crate::config::DisplayMatchPolicy;
 use crate::presence::Presence;
@@ -69,6 +79,67 @@ pub fn pick_display_mode(modes: &[(u32, u32)], req_w: u32, req_h: u32) -> Option
         }
     }
     best
+}
+
+/// FR-97 P2d-2b — one mode of a Mac display, as CoreGraphics lists it. Plain
+/// data, so the choice in [`pick_mac_mode`] is tested on every platform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacMode {
+    /// `CGDisplayModeGetIODisplayModeID`: which mode this is.
+    pub id: i32,
+    /// The desktop's size in points, the unit the person's interface is laid
+    /// out in.
+    pub points: (u32, u32),
+    /// Its size in pixels: what the capture carries, and what the viewer's
+    /// stage is measured in.
+    pub pixels: (u32, u32),
+    /// The refresh rate in Hz, `0.0` where the display does not say.
+    pub hz: f64,
+    /// `CGDisplayModeIsUsableForDesktopGUI`.
+    pub usable: bool,
+}
+
+impl MacMode {
+    /// Pixels per point across, ×100 so two modes compare exactly: 100 is a
+    /// 1x desktop, 200 a HiDPI one.
+    fn scale(&self) -> u32 {
+        match self.points.0 {
+            0 => 0,
+            pw => self.pixels.0 * 100 / pw,
+        }
+    }
+}
+
+/// FR-97 P2d-2b — the mode a Mac takes for a viewer's `req_w × req_h` pixels:
+/// among the usable modes at `start`'s scale, the largest in pixels that fits
+/// ([`pick_display_mode`]), so a HiDPI desktop stays HiDPI and its text keeps
+/// the size the person reads it at. At that size, `start`'s refresh rate where
+/// it is offered (a 120 Hz panel stays at 120 Hz), else the highest. `None`
+/// when nothing fits. Pure.
+pub fn pick_mac_mode(
+    modes: &[MacMode],
+    start: &MacMode,
+    req_w: u32,
+    req_h: u32,
+) -> Option<MacMode> {
+    let scale = start.scale();
+    let candidates = || modes.iter().filter(move |m| m.usable && m.scale() == scale);
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for m in candidates() {
+        if !sizes.contains(&m.pixels) {
+            sizes.push(m.pixels);
+        }
+    }
+    let size = pick_display_mode(&sizes, req_w, req_h)?;
+    let start_rate = |m: &MacMode| (m.hz - start.hz).abs() < 0.5;
+    candidates()
+        .filter(|m| m.pixels == size)
+        .max_by(|a, b| {
+            (start_rate(a), a.hz)
+                .partial_cmp(&(start_rate(b), b.hz))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .copied()
 }
 
 /// FR-108 P2 — a 60 Hz modeline for exactly `w × h`, named `roomler-WxH`: the
@@ -244,7 +315,7 @@ mod lin {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "enigo-input")))]
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -265,6 +336,20 @@ pub fn x11_offered() -> bool {
         && std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
         && std::env::var_os("WAYLAND_DISPLAY").is_none_or(|w| w.is_empty())
         && !crate::virtual_desktop::active()
+}
+
+/// FR-97 P2d-2b — kill switch `ROOMLERD_MAC_DISPLAY_MATCH=0`.
+pub fn mac_enabled() -> bool {
+    tunnel_core::env::flag("MAC_DISPLAY_MATCH", true)
+}
+
+/// FR-97 P2d-2b — display match may switch a Mac's main display: the
+/// `enigo-input` build, whose keep-busy host reads the session's lock for
+/// `presence`, with the switch on. Asked of the switch and not of this
+/// process's session, for P2e-1's reason: on a supervised Mac the root daemon
+/// says the hello, and the GUI worker inside the session serves it.
+pub fn mac_offered() -> bool {
+    cfg!(all(target_os = "macos", feature = "enigo-input")) && mac_enabled()
 }
 
 /// FR-97 P3e-2 — one output, as `xrandr --current` lists it.
@@ -570,6 +655,258 @@ fn switch_window_holds(input: u32, start: u32, end: u32, slack: u32) -> bool {
     delta(input, start) >= -i64::from(slack) && delta(input, end) <= i64::from(slack)
 }
 
+/// FR-97 P2d-2b — display match on a Mac's main display (see the module doc).
+///
+/// - **No restore guard.** A mode set by `CGDisplaySetDisplayMode` lasts only
+///   as long as the process that set it: measured on a tart Mac, the person's
+///   mode was back 3 s after a SIGKILL, and after a normal exit. Only a
+///   `ForSession` configuration outlives its process, and this never makes one.
+/// - **One display.** Switching the main display of several moves the others'
+///   places, so a Mac with more than one active display is `unsupported`, as on
+///   X11.
+/// - **The pointer.** A smaller mode clamps the pointer to its edge, which
+///   moves the session's combined idle clock; `presence` reads the HID one,
+///   which only input moves (measured), so the switch is never taken for a
+///   person.
+#[cfg(all(target_os = "macos", feature = "enigo-input"))]
+mod mac {
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    use super::{ApplyError, MacMode};
+
+    type CFTypeRef = *const c_void;
+    type CFArrayRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CGDisplayModeRef = *const c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayCopyAllDisplayModes(display: u32, options: CFDictionaryRef) -> CFArrayRef;
+        fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
+        fn CGDisplayModeGetWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetHeight(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetRefreshRate(mode: CGDisplayModeRef) -> f64;
+        fn CGDisplayModeIsUsableForDesktopGUI(mode: CGDisplayModeRef) -> bool;
+        fn CGDisplayModeGetIODisplayModeID(mode: CGDisplayModeRef) -> i32;
+        fn CGDisplayModeRelease(mode: CGDisplayModeRef);
+        fn CGDisplaySetDisplayMode(
+            display: u32,
+            mode: CGDisplayModeRef,
+            options: CFDictionaryRef,
+        ) -> i32;
+        static kCGDisplayShowDuplicateLowResolutionModes: *const c_void;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: CFArrayRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFArrayRef, index: isize) -> *const c_void;
+        fn CFDictionaryCreate(
+            allocator: *const c_void,
+            keys: *const *const c_void,
+            values: *const *const c_void,
+            num_values: isize,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+        fn CFRelease(cf: CFTypeRef);
+        static kCFBooleanTrue: *const c_void;
+        // Structs whose addresses are all this code needs.
+        static kCFTypeDictionaryKeyCallBacks: u8;
+        static kCFTypeDictionaryValueCallBacks: u8;
+    }
+
+    /// A CoreFoundation object this code owns, released on drop.
+    struct Owned(CFTypeRef);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a Create/Copy result we own, released exactly once.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    /// The display's modes, the duplicate low-resolution ones included: a
+    /// person who chose a 1x desktop at a size a HiDPI mode also has must find
+    /// their scale in the list.
+    struct Modes(Owned);
+
+    impl Modes {
+        fn of(display: u32) -> Option<Modes> {
+            // SAFETY: the key and value are the frameworks' own constants and
+            // the callbacks their own structs, so the dictionary retains them
+            // as CoreFoundation types; both results are Create/Copy, ours.
+            unsafe {
+                let keys = [kCGDisplayShowDuplicateLowResolutionModes];
+                let values = [kCFBooleanTrue];
+                let options = Owned(CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    1,
+                    (&kCFTypeDictionaryKeyCallBacks as *const u8).cast(),
+                    (&kCFTypeDictionaryValueCallBacks as *const u8).cast(),
+                ));
+                let list = CGDisplayCopyAllDisplayModes(display, options.0);
+                (!list.is_null()).then(|| Modes(Owned(list)))
+            }
+        }
+
+        fn refs(&self) -> impl Iterator<Item = CGDisplayModeRef> + '_ {
+            // SAFETY: a live array we own; its values are borrowed (Get rule)
+            // and used only while it lives.
+            let n = unsafe { CFArrayGetCount((self.0).0) };
+            (0..n).map(move |i| unsafe { CFArrayGetValueAtIndex((self.0).0, i) })
+        }
+
+        fn all(&self) -> Vec<MacMode> {
+            self.refs().map(mode_of).collect()
+        }
+
+        fn by_id(&self, id: i32) -> Option<CGDisplayModeRef> {
+            // SAFETY: a live mode from the array.
+            self.refs()
+                .find(|&m| unsafe { CGDisplayModeGetIODisplayModeID(m) } == id)
+        }
+    }
+
+    fn mode_of(m: CGDisplayModeRef) -> MacMode {
+        // SAFETY: `m` is a live display mode (from a list we hold, or a copy
+        // the caller releases after this returns); these are plain getters.
+        unsafe {
+            MacMode {
+                id: CGDisplayModeGetIODisplayModeID(m),
+                points: (
+                    CGDisplayModeGetWidth(m) as u32,
+                    CGDisplayModeGetHeight(m) as u32,
+                ),
+                pixels: (
+                    CGDisplayModeGetPixelWidth(m) as u32,
+                    CGDisplayModeGetPixelHeight(m) as u32,
+                ),
+                hz: CGDisplayModeGetRefreshRate(m),
+                usable: CGDisplayModeIsUsableForDesktopGUI(m),
+            }
+        }
+    }
+
+    /// The mode the display shows now.
+    fn current(display: u32) -> Option<MacMode> {
+        // SAFETY: a Copy result, released here after it is read.
+        unsafe {
+            let m = CGDisplayCopyDisplayMode(display);
+            if m.is_null() {
+                return None;
+            }
+            let mode = mode_of(m);
+            CGDisplayModeRelease(m);
+            Some(mode)
+        }
+    }
+
+    /// The main display, when it is the only active one.
+    fn the_display() -> Result<u32, ApplyError> {
+        let mut ids = [0u32; 8];
+        let mut n = 0u32;
+        // SAFETY: a stack buffer of the size passed, and a count to fill.
+        let rc = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut n) };
+        if rc != 0 || n != 1 {
+            tracing::info!(
+                rc,
+                displays = n,
+                "display-match: a Mac switches only with exactly one active display"
+            );
+            return Err(ApplyError::Unsupported);
+        }
+        // SAFETY: no arguments, no failure mode.
+        Ok(unsafe { CGMainDisplayID() })
+    }
+
+    /// The mode the display showed before this hold's first switch; `None`
+    /// while no switch of ours is in force.
+    static START: Mutex<Option<MacMode>> = Mutex::new(None);
+
+    fn set(display: u32, modes: &Modes, id: i32) -> Result<(), i32> {
+        let Some(mode) = modes.by_id(id) else {
+            return Err(-100); // the mode left the list (a display change raced us)
+        };
+        // SAFETY: a live mode from `modes`, which the caller holds; no options.
+        let rc = unsafe { CGDisplaySetDisplayMode(display, mode, std::ptr::null()) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        super::MODE_GENERATION.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), ApplyError> {
+        let display = the_display()?;
+        let (Some(modes), Some(shown)) = (Modes::of(display), current(display)) else {
+            tracing::info!("display-match: this Mac's display lists no modes");
+            return Err(ApplyError::Unsupported);
+        };
+        let mut st = super::lock(&START);
+        // A second switch in one hold keeps the FIRST start mode.
+        let start = st.unwrap_or(shown);
+        let all = modes.all();
+        let Some(target) = super::pick_mac_mode(&all, &start, req_w, req_h) else {
+            return Err(ApplyError::NoFittingMode {
+                req_w,
+                req_h,
+                modes: all.len(),
+            });
+        };
+        if target.id == shown.id {
+            return Ok(target.pixels); // already there: nothing to change or restore
+        }
+        if let Err(rc) = set(display, &modes, target.id) {
+            tracing::warn!(
+                rc,
+                mode = target.id,
+                "display-match: CGDisplaySetDisplayMode refused the mode"
+            );
+            return Err(ApplyError::SwitchFailed(rc));
+        }
+        *st = Some(start);
+        match current(display) {
+            Some(now) if now.pixels == target.pixels => Ok(target.pixels),
+            other => {
+                tracing::warn!(?other, "display-match: the display did not follow the mode");
+                Err(ApplyError::SwitchFailed(-4))
+            }
+        }
+    }
+
+    /// Back to the mode the display showed before the first switch. No-op when
+    /// nothing is in force. Ending the process would do the same.
+    pub fn restore() {
+        let Some(start) = super::lock(&START).take() else {
+            return;
+        };
+        // SAFETY: no arguments, no failure mode.
+        let display = unsafe { CGMainDisplayID() };
+        let Some(modes) = Modes::of(display) else {
+            tracing::warn!("display-match: restore failed — the display lists no modes");
+            return;
+        };
+        match set(display, &modes, start.id) {
+            Ok(()) => tracing::info!(
+                mode = start.id,
+                "display-match: the display's own mode is back"
+            ),
+            Err(rc) => tracing::warn!(rc, mode = start.id, "display-match: restore failed"),
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -719,14 +1056,18 @@ impl std::fmt::Display for ApplyError {
                 f,
                 "no supported mode fits within {req_w}x{req_h} ({modes} modes)"
             ),
-            // rc.191's text on Windows; FR-108 P2's switch is `xrandr`.
+            // rc.191's text on Windows; FR-108 P2's switch is `xrandr`, and
+            // FR-97 P2d-2b's on a Mac `CGDisplaySetDisplayMode`.
             Self::SwitchFailed(rc) if cfg!(target_os = "windows") => {
                 write!(f, "ChangeDisplaySettingsExW failed rc={rc}")
+            }
+            Self::SwitchFailed(rc) if cfg!(target_os = "macos") => {
+                write!(f, "CGDisplaySetDisplayMode failed rc={rc}")
             }
             Self::SwitchFailed(rc) => write!(f, "xrandr failed rc={rc}"),
             Self::Unsupported => write!(
                 f,
-                "display-match runs on Windows and on a Linux virtual desktop on Xorg with the dummy driver"
+                "display-match runs on Windows, on Linux on a person's own X11 display or the agent's virtual desktop, and on a Mac with one display"
             ),
         }
     }
@@ -734,8 +1075,9 @@ impl std::fmt::Display for ApplyError {
 
 /// Apply a display-match request: pick the best-fitting mode for the
 /// viewer's stage and switch to it. Returns the mode picked (for the log)
-/// or why not. Windows, and (FR-108 P2) a Linux virtual desktop on Xorg with
-/// the dummy driver; anything else is unsupported.
+/// or why not. Windows; (FR-108 P2) a Linux virtual desktop on Xorg with
+/// the dummy driver; (FR-97 P3e-2) a person's own X11 display; and (FR-97
+/// P2d-2b) a Mac's main display. Anything else is unsupported.
 pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), ApplyError> {
     #[cfg(target_os = "windows")]
     {
@@ -779,7 +1121,19 @@ pub fn apply(req_w: u32, req_h: u32) -> Result<(u32, u32), ApplyError> {
             .map(|_| (w, h))
             .map_err(ApplyError::SwitchFailed)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    // FR-97 P2d-2b — a Mac's main display.
+    #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+    {
+        if mac_offered() {
+            return mac::apply(req_w, req_h);
+        }
+        Err(ApplyError::Unsupported)
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "linux",
+        all(target_os = "macos", feature = "enigo-input")
+    )))]
     {
         let _ = (req_w, req_h);
         Err(ApplyError::Unsupported)
@@ -795,6 +1149,8 @@ pub fn restore() {
         lin::restore();
         x11::restore();
     }
+    #[cfg(all(target_os = "macos", feature = "enigo-input"))]
+    mac::restore();
 }
 
 // ── Multi-user P3: per-session ownership ────────────────────────────────────
@@ -1517,5 +1873,113 @@ mod tests {
         // 1280/800 = 1.60.
         let modes = [(1280, 800), (1024, 1000)];
         assert_eq!(pick_display_mode(&modes, 1300, 1010), Some((1024, 1000)));
+    }
+
+    /// FR-97 P2d-2b — a Mac's modes as a tart Mac's virtual display lists them
+    /// (macOS 15.7, FR-97 §8): each HiDPI size beside a 1x twin, plus a mode
+    /// the desktop cannot use.
+    fn mac(id: i32, points: (u32, u32), pixels: (u32, u32), hz: f64) -> super::MacMode {
+        super::MacMode {
+            id,
+            points,
+            pixels,
+            hz,
+            usable: true,
+        }
+    }
+
+    fn tart_modes() -> Vec<super::MacMode> {
+        let mut m = vec![
+            mac(1, (512, 384), (1024, 768), 60.0),
+            mac(2, (640, 480), (1280, 960), 60.0),
+            mac(3, (672, 504), (1344, 1008), 60.0),
+            mac(4, (800, 600), (1600, 1200), 60.0),
+            mac(6, (960, 720), (1920, 1440), 60.0),
+            mac(7, (1024, 768), (2048, 1536), 60.0),
+            mac(8, (1024, 768), (1024, 768), 60.0),
+            mac(9, (1280, 960), (1280, 960), 60.0),
+            mac(11, (1600, 1200), (1600, 1200), 60.0),
+            mac(13, (2048, 1536), (2048, 1536), 60.0),
+        ];
+        let mut unusable = mac(19, (640, 480), (640, 480), 60.0);
+        unusable.usable = false;
+        m.push(unusable);
+        m
+    }
+
+    /// A HiDPI desktop stays HiDPI: the largest HiDPI mode inside the stage,
+    /// never the 1x mode of the same pixels, whose text would be half the size.
+    #[test]
+    fn a_hidpi_mac_stays_hidpi_inside_the_stage() {
+        use super::pick_mac_mode;
+        let modes = tart_modes();
+        let start = modes[5]; // 1024×768 pt at 2048×1536 px
+        // A 1920×1080 stage: 1344×1008 px is the largest HiDPI mode inside it;
+        // 1x has 1600×1200 and 1280×960, both 1x, so neither is a candidate.
+        assert_eq!(
+            pick_mac_mode(&modes, &start, 1920, 1080).map(|m| m.id),
+            Some(3)
+        );
+        // A stage as large as the panel keeps the panel's own mode.
+        assert_eq!(
+            pick_mac_mode(&modes, &start, 2048, 1536).map(|m| m.id),
+            Some(7)
+        );
+        // Smaller than every HiDPI mode: nothing fits, and the display is left alone.
+        assert_eq!(pick_mac_mode(&modes, &start, 1000, 700), None);
+    }
+
+    /// A person who chose a 1x desktop keeps 1x, and an unusable mode is never picked.
+    #[test]
+    fn a_1x_mac_stays_1x_and_skips_what_the_desktop_cannot_use() {
+        use super::pick_mac_mode;
+        let modes = tart_modes();
+        let start = modes[9]; // 2048×1536 at 1x
+        // A 1920×1080 stage: 1280×960 at 1x, never 1344×1008, which is HiDPI.
+        assert_eq!(
+            pick_mac_mode(&modes, &start, 1920, 1080).map(|m| m.id),
+            Some(9)
+        );
+        assert_eq!(
+            pick_mac_mode(&modes, &start, 1700, 1300).map(|m| m.id),
+            Some(11)
+        );
+        assert_eq!(
+            pick_mac_mode(&modes, &start, 1300, 1000).map(|m| m.id),
+            Some(9)
+        );
+        // 640×480 is listed but unusable, so a stage only it fits gets nothing.
+        assert_eq!(pick_mac_mode(&modes, &start, 700, 500), None);
+    }
+
+    /// At the chosen size the start's refresh rate wins where it is offered (a
+    /// 120 Hz panel stays at 120 Hz), else the highest rate.
+    #[test]
+    fn a_mac_keeps_its_refresh_rate_where_the_size_offers_it() {
+        use super::pick_mac_mode;
+        let modes = [
+            mac(1, (1512, 982), (3024, 1964), 120.0),
+            mac(2, (1512, 982), (3024, 1964), 60.0),
+            mac(3, (1352, 878), (2704, 1756), 60.0),
+            mac(4, (1352, 878), (2704, 1756), 120.0),
+            mac(5, (1352, 878), (2704, 1756), 48.0),
+            mac(6, (1147, 745), (2294, 1490), 60.0),
+            mac(7, (1147, 745), (2294, 1490), 50.0),
+        ];
+        let at_120 = modes[0];
+        assert_eq!(
+            pick_mac_mode(&modes, &at_120, 2800, 1800).map(|m| m.id),
+            Some(4)
+        );
+        let at_60 = modes[1];
+        assert_eq!(
+            pick_mac_mode(&modes, &at_60, 2800, 1800).map(|m| m.id),
+            Some(3)
+        );
+        // 120 Hz is not offered at 2294×1490: the highest there.
+        assert_eq!(
+            pick_mac_mode(&modes, &at_120, 2400, 1500).map(|m| m.id),
+            Some(6)
+        );
     }
 }

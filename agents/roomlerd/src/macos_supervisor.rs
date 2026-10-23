@@ -279,6 +279,8 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     "CLIPBOARD_MAC_WATCH",
     // FR-97 P2d-2a — the keyboard layout through Text Input Sources.
     "MAC_LAYOUT",
+    // FR-97 P2d-2b — display match on the main display.
+    "MAC_DISPLAY_MATCH",
     // FR-119 — the high-refresh picker and its per-cell ceilings.
     "FPS_HIGH",
     "FPS_DENY",

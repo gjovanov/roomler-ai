@@ -669,7 +669,7 @@ pub(crate) struct HostFacts {
     pub(crate) layout_switchable: bool,
     /// Display match can switch this host's display (FR-97 P3e-2): Windows;
     /// on Linux a person's own X11 display or the daemon's own virtual desktop
-    /// on Xorg's dummy driver; not macOS.
+    /// on Xorg's dummy driver; (P2d-2b) a Mac, unless its kill switch is off.
     pub(crate) display_switchable: bool,
 }
 
@@ -758,7 +758,12 @@ fn display_switchable() -> bool {
         crate::display_match::x11_offered()
             || crate::virtual_desktop::switchable_display().is_some()
     }
-    #[cfg(not(target_os = "linux"))]
+    // FR-97 P2d-2b — a Mac, wherever its kill switch is on.
+    #[cfg(target_os = "macos")]
+    {
+        crate::display_match::mac_offered()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         cfg!(target_os = "windows")
     }
@@ -879,9 +884,10 @@ pub(crate) fn with_honest_words(mut caps: AgentCaps, facts: &HostFacts) -> Agent
     // a Linux virtual desktop that could switch; it follows this word now.
     if !facts.display_switchable {
         let why = match facts.os {
+            // FR-97 P2d-2b — a Mac switches unless its owner turned it off.
             OsKind::Macos => Unavailable::new(
                 "unsupported",
-                "This Mac's display cannot be switched to your window: display match is built for Windows and for Linux on X11",
+                "This Mac's display is not switched to your window: display match is turned off on this Mac",
             ),
             OsKind::Linux | OsKind::Windows => Unavailable::new(
                 "unsupported",
@@ -3051,7 +3057,8 @@ mod tests {
             assert_eq!(f.layout_reachable, crate::input::layout_mac::offered());
             #[cfg(all(target_os = "macos", not(feature = "enigo-input")))]
             assert!(!f.layout_reachable);
-            assert!(!f.display_switchable);
+            // FR-97 P2d-2b — wherever its kill switch is on.
+            assert_eq!(f.display_switchable, crate::display_match::mac_offered());
         }
     }
 
