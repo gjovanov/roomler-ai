@@ -933,7 +933,7 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 New module `crates/tests/src/peer_relay_tests.rs`. Model on
 `crates/tests/src/relay_region_tests.rs:46` (40 lines; `TestApp::spawn_with_settings`,
-`fixtures/test_app.rs:179`, with both a REST and an in-process `app.state` assertion). For a
+`fixtures/test_app.rs:181`, with both a REST and an in-process `app.state` assertion). For a
 two-pod topology copy `cluster_tests.rs:798` via `spawn_pair` (`test_app.rs:152`).
 
 Server-decision tests — all implementable as described: `mint_refused_when_mode_off`,

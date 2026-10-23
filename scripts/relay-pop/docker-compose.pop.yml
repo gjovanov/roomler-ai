@@ -3,12 +3,33 @@
 # port juggling). Rendered configs + certs live in /opt/relay-pop.
 services:
   coturn:
-    image: coturn/coturn:latest
+    # Pinned by DIGEST. `:latest` re-pulled whatever upstream had published on
+    # every recreate, so a PoP could change TURN version under a live session.
+    # This is coturn 4.16.0, what all four PoPs ran on 2026-10-23. Upgrade one
+    # PoP at a time: pull the tag, read its digest, put it here.
+    image: coturn/coturn@sha256:01fc8655e7c262fa4ccfb8dca74ff80fb372b0ee021e80370a4d3e3dd01a951e
     network_mode: host
     restart: unless-stopped
     volumes:
       - /opt/relay-pop/turnserver.conf:/etc/turnserver.conf:ro
       - /opt/relay-pop/certs:/certs:ro
+
+  # FR-115 P4b-2 — coturn's statistics DB (`redis-statsdb`). coturn publishes
+  # each allocation's totals here, and derp-relay keeps them an hour for the
+  # API to pull. Loopback only, no persistence, a memory bound: nothing here
+  # outlives a restart, and nothing off this host can reach it. TURN does not
+  # depend on it; a coturn without it only stops reporting.
+  redis:
+    # redis:7.4-alpine on 2026-10-23, pinned for the same reason as coturn.
+    image: redis@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
+    network_mode: host
+    restart: unless-stopped
+    command:
+      [
+        "redis-server", "--bind", "127.0.0.1", "--port", "6390",
+        "--save", "", "--appendonly", "no",
+        "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru",
+      ]
 
   derp-relay:
     image: debian:trixie-slim
@@ -20,6 +41,9 @@ services:
       DERP_TICKET_PUBLIC_KEY: ${DERP_TICKET_PUBLIC_KEY}
       REGION: ${REGION}
       RUST_LOG: info
+      # FR-115 P4b-2 — the Redis coturn publishes its totals to; empty (when
+      # pop.env says TURN_STATS=0) keeps none, and the API pulls nothing here.
+      TURN_STATS_REDIS: ${TURN_STATS_REDIS:-}
     volumes:
       # Linux x86_64 binary built by CI / the build host:
       #   cargo build -p derp-relay --release

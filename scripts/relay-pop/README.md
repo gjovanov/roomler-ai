@@ -103,6 +103,30 @@ coturn's own :443 DNAT under the same watch:
   >> ~/relay-pop-health.log 2>&1 || <alert: gh issue / mail>
 ```
 
+## Per-org TURN bytes (FR-115 P4b-2)
+
+coturn publishes each allocation's totals to a loopback-only Redis on the PoP
+(the compose file's `redis` on `127.0.0.1:6390`, from `redis-statsdb` in
+`turnserver.conf`), and derp-relay keeps them an hour (`TURN_STATS_REDIS`).
+Every API pod pulls them on its `/stats` poll from `GET /stats/turn-usage`, under
+the prefix nginx already proxies, and books each leg once across pods as the
+paying org's `turn_bytes`.
+
+That endpoint is **not** public, unlike `/stats`, because the usernames name
+orgs and principals. The API signs each request with the DERP ticket key for
+this PoP's `REGION`, and derp-relay checks it with the public key it already
+holds, so there is still no secret on the PoP. `GET /stats` reports
+`turn_usage` (an object) only when totals are kept. That object is how the
+API knows to pull.
+
+| Switch | Turns off |
+|---|---|
+| `TURN_STATS=0` in `pop.env`, then re-provision | this PoP's statsdb line and derp-relay's collector; Redis idles |
+| `ROOMLER__RELAY_ALLOWANCE__TURN_ATTRIBUTION=false` on the API | every pull, and the cluster's collector |
+
+Neither touches TURN itself: a coturn whose Redis is down, unresolvable or
+restarting keeps relaying, and only its totals are lost.
+
 ## Rollback
 
 A misbehaving region: set its spec `"enabled": false` (or drop it) and
