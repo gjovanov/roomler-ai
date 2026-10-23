@@ -3092,7 +3092,8 @@ sequenceDiagram
 | P4-1 | the module and its store: entities, edges and their history; the people's routes (search, get, a neighbourhood, create, update, archive); `KNOWHOW_VIEW` and `KNOWHOW_EDIT` as decisions 36 and 37 say; `docs/knowhow.md` | `knowhow.tenants`; `[modules] knowhow` | — |
 | P4-2a | fleet's half of the sync: each device's machine (its label, node id, owner, OS, architecture, version, tags), on a hello, a rename, an update and a removal, and reconciled at boot and every `knowhow.sync_secs`; what the fleet says of a machine is the fleet's | the same | AC15 (machines) |
 | P4-2b | network's half: each machine's overlay address, its name there and its MagicDNS name, the routes it carries and whether it is an exit, its tunnel routes and SSH, read at a hello and by the reconcile (the network calls nobody); a machine keeps room for the sync's facts. Declared tunnel routes moved to P4-3b: the server never holds them | the same | AC15 (machines) |
-| P4-3a | device scans, the server's half: `rc:knowhow.scan` and `rc:knowhow.scanned`, the `knowhow-scan` verb, a scan's facts recorded as its device's | the same | — |
+| P4-3a-0 | the scans' design (§3e "P4-3, scans, as designed"), and decisions 41–44 | docs only | — |
+| P4-3a-1 | device scans, the server's half: `rc:knowhow.scan` and `rc:knowhow.scanned`, the `knowhow-scan` verb, a scan's request and its record, the intake, and what a scan writes as its device's (decision 42) | the same | — |
 | P4-3b | device scans, the device's half: `knowhow_scan_roots` as decision 38 says; repositories and checkouts, kube contexts, manifests, listening services, and the device's declared tunnel routes (`[[tunnel_routes]]`, which the server never holds) | device `knowhow_scan_roots` empty | AC15 (repositories, checkouts) |
 | P4-4 | the toolbelt's reads, `knowhow_search` and `knowhow_get`, over `rc:knowhow.*`, believed from the session's record; and `knowhow_propose` as decision 39 says | `[modules] knowhow` | — |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says | the same | — |
@@ -3100,6 +3101,67 @@ sequenceDiagram
 | P4-7 | the map in the web app | the SPA | — |
 | P4-8 | chips: `#` in the composer, the MCP resource, the terminal's hook | the same | — |
 | P4k | the field run in the test organization | — | AC15 |
+
+**P4-3, scans, as designed (P4-3a-0).** A scan is the server's request and the device's answer
+(decision 38): a person asks a device to scan, the device reads the roots its owner lists, and
+what it finds becomes the device's own part of the map: its checkouts and the repositories they
+belong to, the clusters its kube contexts reach, the services its manifests describe, the ports it
+listens on and the tunnel routes it declares. P4-3a builds the server's half (the frames, the
+request and its record, the intake and what a scan may write); P4-3b the device's (the roots, the
+scanners, each root read as its own account).
+
+```mermaid
+sequenceDiagram
+    participant P as a person (KNOWHOW_EDIT)
+    participant K as knowhow, any pod
+    participant M as knowhow_scans
+    participant H as knowhow, the pod holding the device
+    participant D as the device (roomlerd)
+    P->>K: POST knowhow/scan {device}
+    K->>M: a scan, requested (412 if the device cannot scan)
+    K-->>P: 202 {scan}
+    H->>M: requested scans of the devices connected here (at once, at a sweep, at a hello)
+    H->>M: requested to delivered, a compare-and-set
+    H->>D: rc:knowhow.scan {scan_id}
+    D->>D: the roots its owner lists, each read as the account that owns it
+    D->>H: rc:knowhow.scanned {scan_id, outcome, findings}
+    H->>H: the findings checked, then written as the device's (source scan)
+    H->>M: answered, with its counts
+```
+
+| Piece | Design |
+|---|---|
+| who asks | a person with `KNOWHOW_EDIT` (decision 41), for a live device of the organization: `POST /api/tenant/{tid}/knowhow/scan {device}` → **202** `{scan}`. **412** when the device's last hello did not advertise `knowhow-scan`, since an agent that cannot scan never answers; a scan already requested or delivered for the device is answered as it is, never doubled |
+| when | when a person asks (decision 44). No cadence, and nothing at a hello but the delivery of what was asked |
+| which devices | a device's primary enrollment only (decision 43), as exits, org relays and daemon-hosted forwards are: its roots are one device-owned list |
+| the frames | `rc:knowhow.scan {scan_id}` to the device and `rc:knowhow.scanned {scan_id, outcome, detail?, findings}` from it, owned by `knowhow` through a new `Owner::Knowhow` in `namespace()` (`crates/remote_control/src/signaling.rs:2553`, `:2675`). The request names no roots: the device's own `knowhow_scan_roots` decides (decision 38). The verb `knowhow-scan` is an `RpcCap` (`crates/remote_control/src/models.rs:849`), matched whole |
+| the delivery | the vault's way (`crates/modules/vault/src/revoke.rs:506`): the row is the bus, and each pod tells the devices connected to it. The pod that took the request pushes at once when the device is connected there; any other pod finds the row at its next sweep (`knowhow.scan_sweep_secs`, 5 s by default), and an offline device is told at its next hello. Each push is preceded by a compare-and-set from `requested` to `delivered`, so a device whose connection moved between pods is told once; a scan delivered and still unanswered is delivered again at the device's next hello, since its connection may have died with it (the device runs a scan id once, and the server keeps the first answer). A module answers a device on the connection's own sender (`crates/core/src/agent_socket.rs:63`), so no `knowhow → fleet` edge is needed: the Hub is pod-local (`crates/modules/fleet/src/hub.rs:2684`), and reaching it from another pod would mean a cluster control frame of fleet's for every knowhow request (`crates/modules/hive/src/purge.rs:871`) |
+| the record | `knowhow_scans`, one row per request: the device, who asked and when, `requested` → `delivered` → `done` · `no_roots` · `failed`, or `expired` 24 h after the request when no answer came; when it was delivered and answered; its counts (`repos`, `checkouts`, `clusters`, `endpoints`, `retired`) and a `detail`. A person reads a device's scans (`GET …/knowhow/scan?device=`), so "asked, never delivered", "delivered, never answered", "answered: nothing listed" and "answered: failed" are four states on screen, each with its own fix. Kept 90 days |
+| the answer | `outcome` `done`, `no_roots` (the owner lists nothing: an answer, and the only one a device with an empty list gives) or `failed` with a `detail`. An answer for a scan this connection was not sent (another device's, one already answered, a made-up id) is dropped and logged |
+| the findings | a typed list, each closed (unknown fields refused), bounded in count (2,000) and size (1 MiB per frame, under the socket's 8 MiB, `crates/core/src/ws/upgrade.rs:28`), strings bounded: a `checkout` (its path, remotes, root commit, branch, and the services its compose and Kubernetes manifests name, each a name and an image), a kube `context` (its name, server, namespace and the CA's SHA-256), a `listener` (port, protocol, bound address, process name) and a declared `tunnel_route` (its id, kind, local port, the node and `host:port` it reaches, and whether it is enabled: `RouteDescriptor`'s fields less its transport and organization, `crates/localapi/src/lib.rs:905`). No field holds a credential, and a finding whose strings hold one's shape is refused whole |
+| what a scan writes | decision 42: what lives on its device, and nothing else. Its **checkouts** (`checkout`, keyed `<node id>/<16 hex of the path's SHA-256>`, since a path is not a key: case, spaces, separators; the path is a fact), its **listeners** (`endpoint`, keyed `<node id>:<port>/<protocol>`), and its declared tunnel routes (a fact of its own machine, `tunnel.declared`). Shared entities, a **repository** (`repo`, keyed by its remote normalized: `github.com/acme/api`, no scheme, user, port or `.git`) and a **cluster** (`cluster`, keyed by its server's `host:port`), are made bare (kind, key, name) when absent and never changed once there; the device's own entities link to them (`checkout part_of repo`, `cluster reachable_via machine` with the context's name, namespace and CA as the link's attributes) and to its machine (`checkout checked_out_at machine`, `endpoint runs_on machine`) |
+| provenance | source `scan`, and the device, on every entity, link and fact a scan writes, and on its history rows: a new `device` field beside `by`, which stays a person's (`crates/modules/knowhow/src/model.rs:155`) |
+| a later scan | replaces its device's part: what it no longer reports is archived (its own entities and links, never a shared entity), and an unchanged finding writes nothing. A device removed from the fleet takes its scan entities with its machine |
+| whose it is | a scan's own entities and facts are its device's, as a machine's are the fleet's (`crates/modules/knowhow/src/routes.rs:182`): a person may describe them further, never change or archive what the scan said, since the next scan would undo it |
+| the bounds | a scan's writes count against the map's 10,000 entities and 50,000 links (`crates/modules/knowhow/src/dao.rs:25`); one that would pass them writes what fits and answers `done` with `truncated` |
+| the kill switches | `knowhow.tenants`; `[modules] knowhow`; the device's `knowhow_scan_roots`, empty by default (P4-3b) |
+
+- ⚠️ **A scan is the device's claim about itself.** A compromised device can lie about what it
+  holds, so it is believed about nothing else: it writes only entities keyed by its own node id
+  and the facts of its own machine, makes a shared entity only bare, and changes none another
+  source described. The worst a lying device does is describe itself falsely, and
+  name a repository or a cluster that does not exist.
+- ⚠️ **Metadata, never contents.** A checkout's remotes, root commit and branch; a manifest's
+  service names and images; a context's server and CA. A kube context's token is offered to the
+  vault on the device (P4-3b) and never sent, and the intake refuses any finding holding a
+  credential's shape, so nothing a session could not be shown reaches the map.
+- ⚠️ **The device decides what is read** (decision 38): the request names no root, and a device
+  whose owner lists none answers `no_roots`. The server cannot widen a scan.
+- ⚠️ **Never as the daemon.** Each root is read as the account that owns it (P4-3b), so a scan
+  sees what that account sees and no more.
+- **Not in P4-3:** a cadence (decision 44); a secondary organization's scans (decision 43); file
+  contents; importing a found token into the vault, which P4-3b offers on the device and the
+  vault's own routes take.
 
 ### 3f. The brain
 
@@ -3483,7 +3545,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P4-0 | knowhow's design (§3e "P4, knowhow, as designed"), docs only: the organization's map (machines, repositories and checkouts, databases, clusters, services) with how a session reaches each, its facts verified by probes, granting nothing: the vault and the network still decide every reach. A module of its own, composed last, its edges to `fleet`, `network` and `hive`; a store of entities, edges and their history; sources in order of trust (sync, scans, people, a session's proposals); the toolbelt's reads, a probe, and `roomler_connect(entity)`; the map and `#` chips. P4's steps P4-1 to P4-8 and its field run. Decisions 36 (who changes the map), 37 (who reads it), 38 (what a device scans), 39 (a session's proposals before P5) and 40 (when a fact turns stale) are the operator's | docs only | **merged** #2743 `ff74488ae` |
 | P4-1 | the module and its store (`docs/knowhow.md`): `crates/modules/knowhow`, on core alone (its edges come with P4-2 and P4-4), composed last and last in `HOOK_ORDER`, its switch `[modules] knowhow` default OFF and a `knowhow.tenants` list that mounts it by itself. Entities in `knowhow_entities`, unique by kind and key among the live, and the links between them in `knowhow_edges`, unique by their ends and kind among the live; every write a compare-and-set on `rev`, appended to `knowhow_history` after it. Facts carry their provenance, and a person's change to one never restamps another. A `machine` is never a person's: P4-2's sync records it. The people's routes: the status, a search, a card by id or by kind and key, a neighbourhood one or two steps out, read a bounded step at a time rather than by `$graphLookup`, whose traversal has no limit of its own, the history, and create, update and archive for entities and links. `KNOWHOW_VIEW` (bit 33, in `DEFAULT_MEMBER`) and `KNOWHOW_EDIT` (bit 34, in `DEFAULT_ADMIN`, including reading), as decisions 37 and 36 recommend, pending the operator's word | `knowhow.tenants`; `[modules] knowhow` | **merged** #2748 `9ebbb76c2` |
 | P4-2a | the fleet's half of the sync (`docs/knowhow.md` §10): every live device of a served organization a `machine`, keyed by its node id, named by its label and owned by its owner; its OS, architecture, version, tags and whether it is ephemeral are the sync's facts. A hello mirrors it (an enrolment's first, every reconnect), off the socket's path; fleet's hooks carry a rename, an update and a removal, which archives the machine and its links; a reconcile at boot (on the pod that holds the startup lease) and every `knowhow.sync_secs` (600 by default) catches what no hook carries and retires a machine whose device is gone. A failure is logged, never the caller's: no removal waits on the map. What the fleet says of a machine is the fleet's: a person's change to its name, owner or a synced fact, and archiving it, are refused. Still no module edge: devices are read through the shared `AgentDao`, events heard through core | `knowhow.tenants`; `[modules] knowhow` | **merged** #2751 `8d2adbc9b` |
-| P4-2b | the network's half of the sync (`docs/knowhow.md` §10.2): a machine's lease (`overlay.ipv4`), its name there and its MagicDNS name as the device list shows them, the subnets it carries for its peers (`overlay.routes`: approved and still offered, the default route apart, at most 64) and whether it is an exit (`overlay.exit`, the data plane's), its tunnel mesh routes, whether its build serves roomler SSH and gate 3. An overlay fact exists while the device holds a live node, so an evicted node's facts leave the machine and the rest of it stays. Read at a hello (the device's own node) and by the reconcile (the organization's nodes, once): the network calls nobody, and a hook on its join path would put a map's freshness on the mesh's. A machine keeps room for the sync's 14 facts: a person's own stop at 50, and an edit that adds none still passes. Declared tunnel routes moved to P4-3b, because the server never holds them. Still no module edge: the overlay's rows are read through the shared DAOs, the domain through core's tenants | `knowhow.tenants`; `[modules] knowhow` | **in review** |
+| P4-2b | the network's half of the sync (`docs/knowhow.md` §10.2): a machine's lease (`overlay.ipv4`), its name there and its MagicDNS name as the device list shows them, the subnets it carries for its peers (`overlay.routes`: approved and still offered, the default route apart, at most 64) and whether it is an exit (`overlay.exit`, the data plane's), its tunnel mesh routes, whether its build serves roomler SSH and gate 3. An overlay fact exists while the device holds a live node, so an evicted node's facts leave the machine and the rest of it stays. Read at a hello (the device's own node) and by the reconcile (the organization's nodes, once): the network calls nobody, and a hook on its join path would put a map's freshness on the mesh's. A machine keeps room for the sync's 14 facts: a person's own stop at 50, and an edit that adds none still passes. Declared tunnel routes moved to P4-3b, because the server never holds them. Still no module edge: the overlay's rows are read through the shared DAOs, the domain through core's tenants | `knowhow.tenants`; `[modules] knowhow` | **merged** #2752 `5d61defda` |
+| P4-3a-0 | the scans' design (§3e "P4-3, scans, as designed"), docs only. A scan is the server's request and the device's answer: a person with `KNOWHOW_EDIT` asks for a device (decision 41), only its primary enrollment's (decision 43), only when asked (decision 44), and a device that cannot scan is refused 412. The request is a row in `knowhow_scans`, and the row is the bus, the vault's way: the pod holding the device's connection pushes `rc:knowhow.scan` at once, at its next sweep or at the device's next hello, after a compare-and-set to `delivered`, so no `knowhow → fleet` edge is needed. The device answers `rc:knowhow.scanned` with typed, closed and bounded findings, none holding a credential. A scan writes what lives on its device and nothing else (decision 42): its checkouts and listeners, keyed by its node id; shared repositories and clusters made bare and never changed; links from its own entities; and a later scan archives what it no longer reports. Source `scan` and the device on every write. Poses decisions 41–44 | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -4380,6 +4443,45 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         must say so, or verify it by hand.
     - *Or: never by itself*, its age shown.
       - What it costs: a fact a probe last saw a year ago reads as well as one verified today.
+41. **Who may ask a device to scan** (P4-3), for the operator to confirm (posted in step 228).
+    - *Recommended: `KNOWHOW_EDIT`*, since a scan writes the map and the device's own
+      `knowhow_scan_roots` decides what is read.
+      - What it costs: a map editor can make any device of the organization read its listed
+        roots, though only what its owner listed and only as each root's own account.
+    - *Or: `MANAGE_AGENTS`*, since asking a device to act is a management act, as exec's and SSH's
+      policies are.
+      - What it costs: a person who keeps the map could not fill it from the devices.
+    - *Or: the device's owner as well*, for their own device.
+      - What it costs: a member without `KNOWHOW_EDIT` would write the map through their device.
+42. **What a scan may write** (P4-3), for the operator to confirm (posted in step 228).
+    - *Recommended: what lives on its device*: its checkouts and listeners, keyed by its node id,
+      and the facts of its own machine; a repository or a cluster made bare when absent and never
+      changed once there; links from its own entities to them. A later scan archives what it no
+      longer reports.
+      - What it costs: what devices agree on about a shared repository or cluster (its root
+        commit, its CA) stays on each device's own checkout or link, never on the shared entity.
+    - *Or: facts on shared entities too, each naming its device.*
+      - What it costs: one device's claim would sit on an entity every session reads, and a lying
+        device could restamp what another said.
+    - *Or: every finding `proposed`* until a probe or a person confirms it.
+      - What it costs: AC15's "fleet sync plus one device scan yield the org's machines, repos and
+        checkouts" would wait on a person.
+43. **A secondary organization's scans** (P4-3), for the operator to confirm (posted in step 228).
+    - *Recommended: the primary enrollment only*, as exits, org relays and daemon-hosted forwards
+      are: the roots are one device-owned list.
+      - What it costs: an organization a device joined second cannot map it.
+    - *Or: every organization the device is enrolled in.*
+      - What it costs: each would read the same roots, so a second organization's admin would see
+        the owner's repositories.
+    - *Or: a root list per organization.*
+      - What it costs: a per-organization surface in the device's config for one feature.
+44. **When a device scans** (P4-3), for the operator to confirm (posted in step 228).
+    - *Recommended: when a person asks*, and on no cadence until one is asked for.
+      - What it costs: the map is as fresh as the last scan someone asked for.
+    - *Or: at every hello of a device that can scan.*
+      - What it costs: a pod roll reconnects every device at once, and each would scan.
+    - *Or: on a cadence, an organization's setting.*
+      - What it costs: a scheduler and a setting, before anyone has asked for either.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
