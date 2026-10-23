@@ -24,14 +24,28 @@
 //! ⚠️ A sync that fails is logged, never the caller's failure. A map is not a
 //! gate: no rename, no update and above all no removal may fail because the
 //! map could not be written. The next sync tries again.
+//!
+//! P4-2b adds the network's word on each machine: the address it leases on
+//! the organization's overlay, its name there and its MagicDNS name, the
+//! routes it carries for its peers and whether it is an exit, the subnets it
+//! is a gateway for in the tunnel mesh, and SSH (whether its build serves
+//! roomler SSH, and whether the organization lets it accept sessions). Each
+//! is what the server records, never a promise of reach: every reach is
+//! still decided where it always was.
+//!
+//! ⚠️ The network tells nobody when it changes, and nothing calls knowhow, so
+//! the network's word reaches the map at the device's next hello or the next
+//! reconcile: a first join, an admin's approval, gate 3, the organization's
+//! MagicDNS domain. A hook on the overlay's join path would buy a fresher map
+//! with the mesh's own latency, the wrong way round for a map.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bson::{Bson, Document, doc, oid::ObjectId};
-use roomler_ai_remote_control::models::Agent;
+use roomler_ai_remote_control::models::{Agent, DEFAULT_ROUTE_V4, NodeRef, OverlayNode, RpcCap};
 use roomler_ai_services::dao::base::{DaoError, DaoResult};
 use roomler_core::{
     AgentCtx, AgentSocketLifecycle, FleetLifecycle, ReleasedLease, RenamePropagation,
@@ -41,16 +55,42 @@ use tracing::{debug, info, warn};
 use crate::KnowhowState;
 use crate::dao::MAX_ENTITIES;
 use crate::model::{
-    KnowhowEntity, OP_CREATE, OP_UPDATE, SOURCE_SYNC, STATUS_ACTIVE, TARGET_ENTITY, check_name,
-    merge_facts,
+    KnowhowEntity, MAX_FACTS, OP_CREATE, OP_UPDATE, SOURCE_SYNC, STATUS_ACTIVE, TARGET_ENTITY,
+    check_name, merge_facts,
 };
 use crate::write::{Stamp, archive_entity, record};
 
 /// The kind a device is on the map.
 pub const MACHINE: &str = "machine";
 
-/// What the fleet says of a machine: the facts the sync owns, by path.
-pub const SYNCED_FACTS: &[&str] = &["arch", "ephemeral", "machine_name", "os", "tags", "version"];
+/// What the fleet and the network say of a machine: the facts the sync owns,
+/// by path.
+pub const SYNCED_FACTS: &[&str] = &[
+    "arch",
+    "ephemeral",
+    "machine_name",
+    "os",
+    "overlay.exit",
+    "overlay.ipv4",
+    "overlay.magicdns",
+    "overlay.name",
+    "overlay.routes",
+    "ssh.policy",
+    "ssh.server",
+    "tags",
+    "tunnel.routes",
+    "version",
+];
+
+// A machine keeps room for every one of them beside a person's own
+// (`routes::persons_room`).
+const _: () = assert!(SYNCED_FACTS.len() < MAX_FACTS);
+
+/// The most routes one list on a machine holds: the fleet's own bound on a
+/// device's tunnel routes. What an overlay node carries is what its device
+/// offers and an admin approved, which nothing bounds, so a longer list is
+/// cut to its first this many, and the log says so.
+pub const MAX_SYNCED_ROUTES: usize = 64;
 
 /// How often every pod reconciles its served organizations' machines when
 /// `knowhow.sync_secs` is 0 or absent.
@@ -70,7 +110,7 @@ pub struct Mirror {
     pub facts: Vec<(String, Option<Bson>)>,
 }
 
-/// What the sync reads of a device's row.
+/// What the sync reads of a device's row, and of what the network says of it.
 #[derive(Debug, Clone, Copy)]
 pub struct Device<'a> {
     pub id: ObjectId,
@@ -83,31 +123,102 @@ pub struct Device<'a> {
     pub version: &'a str,
     pub ephemeral: bool,
     pub tags: &'a [String],
+    /// P4-2b — the subnets it is a gateway for in the tunnel mesh, as an
+    /// admin set them.
+    pub tunnel_routes: &'a [String],
+    /// Whether its build serves roomler SSH: the `ssh` verb, matched whole.
+    pub ssh_server: bool,
+    /// Gate 3 as the row spells it (`off`, `on`).
+    pub ssh_policy: Option<&'a str>,
+    /// Its overlay node, while it holds a live one.
+    pub node: Option<Node<'a>>,
+    /// The organization's MagicDNS domain, when it set one.
+    pub domain: Option<&'a str>,
+}
+
+/// What the sync reads of a device's overlay node (P4-2b).
+#[derive(Debug, Clone, Copy)]
+pub struct Node<'a> {
+    /// The address it leases on the organization's overlay.
+    pub ipv4: &'a str,
+    /// Its name there, the MagicDNS label: empty on a row from before names.
+    pub label: &'a str,
+    /// The routes it carries for its peers: approved by an admin AND still
+    /// offered by the device ([`OverlayNode::effective_routes`]). Never the
+    /// approval alone, which outlives the offer on purpose.
+    pub routes: &'a [String],
 }
 
 impl<'a> Device<'a> {
-    /// The row's view. `None` for a row read without its id.
-    pub fn of(agent: &'a Agent, os: Option<&'a str>) -> Option<Self> {
+    /// The row's view, beside the network's. `None` for a row read without
+    /// its id.
+    pub fn of(
+        agent: &'a Agent,
+        spelled: &'a Spelled,
+        node: Option<Node<'a>>,
+        domain: Option<&'a str>,
+    ) -> Option<Self> {
         Some(Self {
             id: agent.id?,
             name: &agent.name,
             display_name: agent.display_name.as_deref(),
             owner_id: agent.owner_user_id,
-            os,
+            os: spelled.os.as_deref(),
             arch: agent.arch.as_deref(),
             version: &agent.agent_version,
             ephemeral: agent.ephemeral,
             tags: &agent.tags,
+            tunnel_routes: &agent.routes,
+            ssh_server: agent.capabilities.has_rpc(RpcCap::Ssh),
+            ssh_policy: spelled.ssh_policy.as_deref(),
+            node,
+            domain,
         })
     }
 }
 
-/// A device's OS as its row spells it.
-fn os_of(agent: &Agent) -> Option<String> {
-    match bson::to_bson(&agent.os) {
+/// A device row's enumerations as the row spells them.
+#[derive(Debug, Clone, Default)]
+pub struct Spelled {
+    pub os: Option<String>,
+    pub ssh_policy: Option<String>,
+}
+
+impl Spelled {
+    pub fn of(agent: &Agent) -> Self {
+        Self {
+            os: spelling(&agent.os),
+            ssh_policy: spelling(&agent.ssh_policy.mode),
+        }
+    }
+}
+
+/// A unit variant as its row spells it.
+fn spelling<T: serde::Serialize>(value: &T) -> Option<String> {
+    match bson::to_bson(value) {
         Ok(Bson::String(s)) => Some(s),
         _ => None,
     }
+}
+
+/// A list of routes as a fact, cut to [`MAX_SYNCED_ROUTES`].
+fn route_list<'r>(device: ObjectId, path: &str, routes: impl Iterator<Item = &'r String>) -> Bson {
+    let routes: Vec<&String> = routes.collect();
+    if routes.len() > MAX_SYNCED_ROUTES {
+        warn!(
+            %device,
+            path,
+            carried = routes.len(),
+            "knowhow: a device has more routes than a machine's fact holds; the map shows the first {MAX_SYNCED_ROUTES}"
+        );
+    }
+    Bson::Array(
+        routes
+            .into_iter()
+            .take(MAX_SYNCED_ROUTES)
+            .map(|r| Bson::String(r.clone()))
+            .collect(),
+    )
 }
 
 /// A device, as the map shows it.
@@ -123,6 +234,24 @@ pub fn mirror(d: Device<'_>) -> Mirror {
         .unwrap_or_else(|_| d.id.to_hex());
     let text = |s: &str| Bson::String(s.to_string());
     let tags = Bson::Array(d.tags.iter().map(|t| text(t)).collect());
+    // P4-2b — the overlay's facts exist while the device holds a live node,
+    // and leave the machine with it. The exit is the data plane's: an
+    // approved default route the device still offers.
+    let node = d.node;
+    let dns_label = node.map(|n| n.label).filter(|l| !l.is_empty());
+    // The name the device list shows (`node_bits`): the label under the
+    // organization's domain, when it has both.
+    let magicdns = dns_label
+        .zip(d.domain)
+        .map(|(l, domain)| text(&format!("{l}.{domain}")));
+    let exit = node.map(|n| Bson::Boolean(n.routes.iter().any(|r| r == DEFAULT_ROUTE_V4)));
+    let subnets = node.map(|n| {
+        route_list(
+            d.id,
+            "overlay.routes",
+            n.routes.iter().filter(|r| *r != DEFAULT_ROUTE_V4),
+        )
+    });
     let facts = vec![
         (
             "arch".to_string(),
@@ -131,7 +260,18 @@ pub fn mirror(d: Device<'_>) -> Mirror {
         ("ephemeral".to_string(), Some(Bson::Boolean(d.ephemeral))),
         ("machine_name".to_string(), Some(text(d.name))),
         ("os".to_string(), d.os.map(text)),
+        ("overlay.exit".to_string(), exit),
+        ("overlay.ipv4".to_string(), node.map(|n| text(n.ipv4))),
+        ("overlay.magicdns".to_string(), magicdns),
+        ("overlay.name".to_string(), dns_label.map(text)),
+        ("overlay.routes".to_string(), subnets),
+        ("ssh.policy".to_string(), d.ssh_policy.map(text)),
+        ("ssh.server".to_string(), Some(Bson::Boolean(d.ssh_server))),
         ("tags".to_string(), Some(tags)),
+        (
+            "tunnel.routes".to_string(),
+            Some(route_list(d.id, "tunnel.routes", d.tunnel_routes.iter())),
+        ),
         (
             "version".to_string(),
             Some(d.version).filter(|v| !v.is_empty()).map(text),
@@ -144,11 +284,56 @@ pub fn mirror(d: Device<'_>) -> Mirror {
     }
 }
 
-/// A row's mirror, or `None` for one read without its id.
-fn mirror_of(agent: &Agent) -> Option<(ObjectId, Mirror)> {
-    let os = os_of(agent);
-    let d = Device::of(agent, os.as_deref())?;
+/// A row's mirror beside its live overlay node and the organization's
+/// MagicDNS domain, or `None` for a row read without its id.
+fn mirror_of(
+    agent: &Agent,
+    node: Option<&OverlayNode>,
+    domain: Option<&str>,
+) -> Option<(ObjectId, Mirror)> {
+    let spelled = Spelled::of(agent);
+    let carried = node.map(OverlayNode::effective_routes);
+    let node = node.zip(carried.as_deref()).map(|(n, routes)| Node {
+        ipv4: &n.overlay_ip,
+        label: &n.name,
+        routes,
+    });
+    let d = Device::of(agent, &spelled, node, domain)?;
     Some((d.id, mirror(d)))
+}
+
+/// The organization's MagicDNS domain, when it set one. ⚠️ A failed read
+/// fails the sync rather than reading as none, which would take every
+/// machine's MagicDNS name off the map until a later sync put it back.
+async fn magic_domain(state: &KnowhowState, tid: ObjectId) -> DaoResult<Option<String>> {
+    match state.tenants.base.find_by_id(tid).await {
+        Ok(tenant) => Ok(tenant.settings.magic_dns_domain),
+        Err(DaoError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The organization's live overlay nodes that are devices, by device: one
+/// network per organization, and a tunnel client is no device.
+async fn device_nodes(
+    state: &KnowhowState,
+    tid: ObjectId,
+) -> DaoResult<HashMap<ObjectId, OverlayNode>> {
+    let network = state.overlay_networks.find_for_tenant(tid).await?;
+    let Some(network_id) = network.and_then(|n| n.id) else {
+        return Ok(HashMap::new());
+    };
+    let nodes = state
+        .overlay_nodes
+        .list_active_in_network(tid, network_id)
+        .await?;
+    Ok(nodes
+        .into_iter()
+        .filter_map(|n| match n.node_ref {
+            NodeRef::Agent { agent_id } => Some((agent_id, n)),
+            NodeRef::TunnelClient { .. } => None,
+        })
+        .collect())
 }
 
 /// What one machine's sync did.
@@ -181,7 +366,15 @@ pub async fn device(
         Err(DaoError::NotFound) => return Ok(Synced::Gone),
         Err(e) => return Err(e),
     };
-    match mirror_of(&agent) {
+    let node = state
+        .overlay_nodes
+        .find_live_by_agent(tenant_id, agent_id)
+        .await?;
+    let domain = match node {
+        Some(_) => magic_domain(state, tenant_id).await?,
+        None => None,
+    };
+    match mirror_of(&agent, node.as_ref(), domain.as_deref()) {
         Some((id, m)) => put(state, tenant_id, id, &m).await,
         None => Ok(Synced::Gone),
     }
@@ -348,9 +541,17 @@ pub async fn all(state: &KnowhowState) -> DaoResult<Reconciled> {
 /// One organization's reconcile.
 async fn organization(state: &KnowhowState, tid: ObjectId, out: &mut Reconciled) -> DaoResult<()> {
     let devices = state.agents.list_all_active_for_tenant(tid).await?;
+    // P4-2b — the network's word on them, read once for the organization.
+    let nodes = device_nodes(state, tid).await?;
+    let domain = if nodes.is_empty() {
+        None
+    } else {
+        magic_domain(state, tid).await?
+    };
     let mut live = HashSet::new();
     for agent in &devices {
-        let Some((aid, m)) = mirror_of(agent) else {
+        let node = agent.id.and_then(|id| nodes.get(&id));
+        let Some((aid, m)) = mirror_of(agent, node, domain.as_deref()) else {
             continue;
         };
         live.insert(aid.to_hex());
@@ -496,7 +697,137 @@ mod tests {
             version: "0.4.154",
             ephemeral: false,
             tags,
+            tunnel_routes: &[],
+            ssh_server: false,
+            ssh_policy: Some("off"),
+            node: None,
+            domain: None,
         }
+    }
+
+    fn fact(m: &Mirror, path: &str) -> Option<Bson> {
+        m.facts.iter().find(|(p, _)| p == path).unwrap().1.clone()
+    }
+
+    fn texts(list: &[&str]) -> Bson {
+        Bson::Array(list.iter().map(|s| Bson::String(s.to_string())).collect())
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// P4-2b — what the network says: the lease, the names, the routes it
+    /// carries without the default route, the exit, SSH and tunnel routes.
+    #[test]
+    fn the_networks_word_on_a_machine() {
+        let none: Vec<String> = Vec::new();
+        let carried = strings(&["10.20.0.0/16", DEFAULT_ROUTE_V4, "192.168.7.0/24"]);
+        let tunnel = strings(&["172.16.5.0/24"]);
+        let mut d = device(&none, None);
+        d.node = Some(Node {
+            ipv4: "100.64.0.7",
+            label: "build-01",
+            routes: &carried,
+        });
+        d.domain = Some("corp.example");
+        d.ssh_server = true;
+        d.ssh_policy = Some("on");
+        d.tunnel_routes = &tunnel;
+        let m = mirror(d);
+        assert_eq!(
+            fact(&m, "overlay.ipv4"),
+            Some(Bson::String("100.64.0.7".into()))
+        );
+        assert_eq!(
+            fact(&m, "overlay.name"),
+            Some(Bson::String("build-01".into()))
+        );
+        assert_eq!(
+            fact(&m, "overlay.magicdns"),
+            Some(Bson::String("build-01.corp.example".into())),
+            "the device list's name: the label under the domain"
+        );
+        assert_eq!(fact(&m, "overlay.exit"), Some(Bson::Boolean(true)));
+        assert_eq!(
+            fact(&m, "overlay.routes"),
+            Some(texts(&["10.20.0.0/16", "192.168.7.0/24"])),
+            "the subnets it carries; the default route is the exit's fact"
+        );
+        assert_eq!(fact(&m, "ssh.server"), Some(Bson::Boolean(true)));
+        assert_eq!(fact(&m, "ssh.policy"), Some(Bson::String("on".into())));
+        assert_eq!(fact(&m, "tunnel.routes"), Some(texts(&["172.16.5.0/24"])));
+    }
+
+    /// Off the overlay, a machine has no overlay facts: each is removed, and
+    /// what the device row says stays.
+    #[test]
+    fn a_device_off_the_overlay_has_no_overlay_facts() {
+        let none: Vec<String> = Vec::new();
+        let mut d = device(&none, None);
+        d.domain = Some("corp.example");
+        let m = mirror(d);
+        for path in [
+            "overlay.exit",
+            "overlay.ipv4",
+            "overlay.magicdns",
+            "overlay.name",
+            "overlay.routes",
+        ] {
+            assert_eq!(fact(&m, path), None, "{path}");
+        }
+        assert_eq!(fact(&m, "ssh.server"), Some(Bson::Boolean(false)));
+        assert_eq!(fact(&m, "ssh.policy"), Some(Bson::String("off".into())));
+        assert_eq!(fact(&m, "tunnel.routes"), Some(texts(&[])));
+    }
+
+    /// A node that carries nothing is no exit and routes nothing; a node
+    /// with no label has no name and no MagicDNS name; an organization with
+    /// no domain gives none either.
+    #[test]
+    fn a_name_needs_a_label_and_magicdns_a_domain_too() {
+        let none: Vec<String> = Vec::new();
+        let mut d = device(&none, None);
+        d.node = Some(Node {
+            ipv4: "100.64.0.9",
+            label: "",
+            routes: &none,
+        });
+        d.domain = Some("corp.example");
+        let m = mirror(d);
+        assert_eq!(fact(&m, "overlay.name"), None);
+        assert_eq!(fact(&m, "overlay.magicdns"), None);
+        assert_eq!(fact(&m, "overlay.exit"), Some(Bson::Boolean(false)));
+        assert_eq!(fact(&m, "overlay.routes"), Some(texts(&[])));
+        d.node = Some(Node {
+            ipv4: "100.64.0.9",
+            label: "box",
+            routes: &none,
+        });
+        d.domain = None;
+        let m = mirror(d);
+        assert_eq!(fact(&m, "overlay.name"), Some(Bson::String("box".into())));
+        assert_eq!(fact(&m, "overlay.magicdns"), None, "no domain, no MagicDNS");
+    }
+
+    /// A route list longer than a machine holds is cut to its first
+    /// [`MAX_SYNCED_ROUTES`].
+    #[test]
+    fn a_route_list_is_cut_to_what_a_machine_holds() {
+        let many: Vec<String> = (0..MAX_SYNCED_ROUTES + 6)
+            .map(|i| format!("10.{i}.0.0/16"))
+            .collect();
+        let mut d = device(&[], None);
+        d.tunnel_routes = &many;
+        let Some(Bson::Array(kept)) = fact(&mirror(d), "tunnel.routes") else {
+            panic!("a list");
+        };
+        assert_eq!(kept.len(), MAX_SYNCED_ROUTES);
+        assert_eq!(
+            kept[0],
+            Bson::String("10.0.0.0/16".into()),
+            "the first kept"
+        );
     }
 
     #[test]

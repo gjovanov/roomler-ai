@@ -10,11 +10,11 @@ description = "FR-90 module: knowhow — the organization's map, the server side
 name = "roomler_ai_mod_knowhow"
 path = "src/lib.rs"
 
-# On core alone, and no module edge yet. P4-2a reads the fleet's devices
-# through the shared AgentDao (their model is `roomler-ai-remote-control`'s)
-# and hears of them through core's hooks. The edges come with the steps that
-# call a module: `knowhow → fleet` (its Hub) with P4-3a, `knowhow → network`
-# with P4-2b, `knowhow → hive` (a session's question believed from its
+# On core alone, and no module edge yet. P4-2 reads the fleet's devices and
+# the network's overlay through the shared DAOs (their models are
+# `roomler-ai-remote-control`'s) and hears of devices through core's hooks.
+# The edges come with the steps that call a module: `knowhow → fleet` (its
+# Hub) with P4-3a, `knowhow → hive` (a session's question believed from its
 # record) with P4-4.
 [dependencies]
 roomler-core = { path = "../../core" }
