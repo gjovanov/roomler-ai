@@ -331,8 +331,13 @@ Ticked only where a run is recorded in the field log below.
 
 - [x] With `consent_mode = prompt`, controlling a device puts a panel on that
       device's screen and Approve starts the session — **Windows**, 0.4.16.
-      ⚠️ The `prompt_owner = true` half is untested: every fleet device is owned
-      by a different user id than the test account, so the toggle never renders.
+      **The `prompt_owner = true` half: GNOME on Wayland, the lab's Fedora Asahi
+      box, agent and API 0.4.158, 2026-10-23**, with the controller signed in as
+      the device's owner. Unset → `effective_mode=AutoGrant`, nothing on screen;
+      set → the companion's panel (`native=false`, as designed there), Approve →
+      `Prompt { timeout: 300s } granted=true` → connected; Deny → `UserDenied`;
+      restored → `AutoGrant` again. Set through the API, not the dialog. See the
+      2026-10-23 log.
 - [x] Deny, and "nobody answered", are **distinguishable at the controller**.
 - [x] A host with no reachable prompt surface reports `no_prompt_surface`; the
       controller is told nobody could be asked, and the audit row says so —
@@ -350,8 +355,11 @@ Ticked only where a run is recorded in the field log below.
       re-proven (auto-granted again, 0.3 ms). See the 2026-09-25 log.
 - [ ] All five modes exercised end-to-end on the fleet, each recorded with the
       surface that served it. `auto`, `prompt` and the host half of
-      `prompt_then_email` are done; `email` / `push` resolve at the **owner**,
-      a different account here.
+      `prompt_then_email` are done. **`push`, 2026-10-23**: it resolved at the
+      owner through the in-app notification alone, because this deployment has
+      no push service (`vapid_public_key` is empty), so there is no web-push card
+      to measure. `email` resolves at the owner's real inbox and is not
+      exercised.
 - [ ] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one.
       ⚠️ Blocked on `EXEC_DEVICE` / `SSH_DEVICE`, which are deliberately not in
       `DEFAULT_ADMIN` — an operator grant, not a code change.
@@ -970,3 +978,42 @@ Found: the socket's own lifecycle lines never reach the log.
 - **Why it is a follow-up.** Units already on disk set `RUST_LOG` wholesale, so a fix there needs the care FR-21's rename of the daemon's own target did (`logging.rs`, `mirror_legacy_log_target`).
 
 The guest was destroyed by name afterwards.
+
+### 2026-10-23 — `prompt_owner` and `push` on GNOME Wayland (agent and API 0.4.158)
+
+The setup:
+- **The device:** the lab's Fedora Asahi box (Fedora 42, aarch64, GNOME on Wayland), with a **system** daemon and the companion, both 0.4.158. The daemon had started the companion.
+- **The server:** `hosted-20261023-978e47b` (0.4.158).
+- **The controller:** Chrome on a Windows PC, signed in as the device's **owner**. That is what made `prompt_owner` testable at all; AC1's old note said every device was owned by an account other than the test one.
+- **The policy:** written through the API (`PUT /api/tenant/{tid}/agent/{id}` with `access_policy`), not the dialog. Its as-found value, every field unset, was read first. After each mode it was put back and read back equal.
+
+| run | access policy | the device's log | the device's screen | the controller |
+|---|---|---|---|---|
+| control | as found | `decision=Granted effective_mode=AutoGrant` | nothing | connected; first frame 2.3 s |
+| prompt | `prompt_owner = true` (mode unset, so `prompt`) | `consent prompt surface … native=false notified=false have_surface=true`, then `operator consent required` | the companion's panel over its Devices window: *Remote control request*, *«owner» is requesting to control this device.*, *On behalf of «org»*, the four permissions, *Expires in 4:44*, Deny / Approve | *awaiting_consent*: "Waiting for the agent to allow the connection…" |
+| Approve, 34 s later | same | `operator consent decision outcome=Granted` → `effective_mode=Prompt { timeout: 300s } granted=true` → `PC state … Connected` 1.5 s later | the banner *Being viewed by «owner»*, with Disconnect | connected; first frame 35.8 s, 34.0 s of it the wait |
+| prompt, the companion's window hidden (Super+H) | same | the same three lines | the panel as **a window of its own**, centred, on top of a maximized app | awaiting_consent |
+| Deny | same | `outcome=Denied` → `granted=false` → `session terminated … reason=UserDenied` | the panel gone | "Someone at that device declined the request." |
+| restored | as found | `effective_mode=AutoGrant` | nothing | connected; first frame 2.7 s |
+| push | `consent_mode = push`, `prompt_owner = true` | `owner-side consent (email/push) — agent waits for the server to resolve … consent_mode=Some(Push)` | nothing, by design | awaiting_consent until the owner answered |
+
+**How `push` reached the owner:**
+- The owner's in-app notification (*Remote control request*, *«owner» wants to control «device»*) was written in the same second as the request, and the bell showed its badge.
+- Its `/consent/<token>` page took the Approve: *Approved — the session can now start.* The controller connected; first frame 35.6 s, 33.6 s of it the wait.
+- **No web-push card exists to measure.** `GET /api/push/config` answers `vapid_public_key: ""`, and the server logged `Push consent mode but no push service is configured — owner cannot approve` (`crates/modules/fleet/src/consent_consumer.rs:254`).
+- The in-app leg that every owner-side mode gets (`consent_consumer.rs:192`) carried the request. So "cannot approve" is wrong whenever the owner has the app open.
+
+**What this establishes, and what it does not:**
+- On GNOME Wayland, a root daemon has no native panel (`native=false`), as designed, and the companion served every prompt.
+- That held with the companion's window hidden too: the panel opens a window of its own, and mutter put it on top.
+- Not exercised here:
+  - a companion that is NOT running (the daemon starts one first, `companion::ensure_running`);
+  - a locked GNOME screen (a Linux host does not report `host_locked` yet; `docs/remote-control.md`, *A locked host*);
+  - the notification fallback (FR-93 P6f).
+- `email` was not run: it would mail the owner's real inbox.
+
+**Found:**
+- **The connect toast blamed a machine step for the owner's approval.** After the push run it read *"Connected in 35.6 s - slower than usual. Most of the wait was opening a network path to the device (1.5 s)."* The machine's share was 2.0 s; the rest was the owner approving. The prompt run's record has the same shape. Filed as #2787, fixed by #2788.
+- **The `/consent/<token>` page names neither the controller nor the device** ("Someone is requesting…"), while the notification that links to it names both. Plausibly deliberate: the link is a bearer capability, and it is the same page an email carries. Recorded, not filed.
+
+**A wrong turn:** the toast's total was first read as 23.0 s, off a half-scale screenshot. The browser's persisted record (FR-22 part 4: `agent_logs`, target `rc.connect`) says 35.6 s. Read the record, not the screenshot.

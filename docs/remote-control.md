@@ -1080,9 +1080,21 @@ directive on `ServerMsg::Request`:
 |---|---|---|---|
 | `auto` | nobody | — | grants immediately |
 | `prompt` | whoever is at the device | **5 min** | raises an on-host prompt |
-| `email` | the device OWNER, by approve-link | 5 min | waits; the SERVER resolves |
-| `push` | the device owner, by web-push card | 5 min | waits; the SERVER resolves |
+| `email` | the device OWNER, by approve-link, and in-app | 5 min | waits; the SERVER resolves |
+| `push` | the device owner, by web-push card, and in-app | 5 min | waits; the SERVER resolves |
 | `prompt_then_email` | **both, in parallel** | host 30 s / owner 5 min | prompts AND the server emails |
+
+**Every owner-side mode also reaches the owner in-app.** Before the email or push
+leg, the server writes the owner a notification linking to the same
+`/consent/<token>` approve page and fans it to their open tabs
+([`consent_consumer.rs:192`](../crates/modules/fleet/src/consent_consumer.rs#L192)).
+⚠️ A deployment without a push service has **no** web-push leg. `GET
+/api/push/config` then answers an empty `vapid_public_key`, and `push` reaches the
+owner in-app only: an owner who does not have the app open learns of the request
+only from the bell. The server's warning says `owner cannot approve`
+([`:254`](../crates/modules/fleet/src/consent_consumer.rs#L254)), and that is
+wrong whenever the in-app leg reaches them. Measured on roomler.ai on 2026-10-23:
+no push service, and the owner approved through the bell (the FR-27 log).
 
 Plain `prompt` waits **5 minutes** (FR-34, field CORPLAP-1): a device set to it may
 be LOCKED when a session starts, and the operator has to walk to the machine,
@@ -1124,7 +1136,9 @@ own headless boxes is the common case. ⚠️ That made the picker look broken o
 any fleet where one person owns every device: the setting had no observable
 effect and nothing on screen said so. `AccessPolicy.prompt_owner` (FR-27,
 default off) opts the owner back in, and the Devices grid now labels the state
-either way.
+either way. Field-verified on GNOME Wayland on 2026-10-23: unset, the owner's own
+session auto-granted; set, the companion's panel asked, and Approve and Deny each
+did what they say (the FR-27 log).
 
 **The device has the last word.** The directive is a CEILING. A device with
 `auto_grant_session = false` prompts even under an `auto` directive — the agent

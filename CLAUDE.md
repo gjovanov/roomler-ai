@@ -817,8 +817,11 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
   though its X display connects: the only viewer of that Xvfb is a remote
   controller, so an unattended host reports `timeout` where the truth is
   `no_prompt_surface`, and an attended one lets viewer A approve viewer B.
-  Still unverified: `prompt_owner`, `no_prompt_surface`, two concurrent viewers,
-  `email`/`push`, and the macOS/X11 panels. Detail: `docs/fr/FR-27-*.md`.
+  Field-verified: `no_prompt_surface` (2026-08-29, 2026-09-25), and `prompt_owner`
+  on GNOME Wayland (2026-10-23, the companion served it). ⚠️ `push` reaches the
+  owner **in-app only**: prod has no push service (`vapid_public_key` is empty).
+  Still unverified: two concurrent viewers, `email`, and the macOS/X11 panels.
+  Detail: `docs/fr/FR-27-*.md`.
 - **[LOW]** [2026-08-03] Overlay ACL is feature-complete but **not field-proven
   under `enforce`**. ⚠️ `ingress_rules` is `Option`: `None` = no ACL compiled (fall
   back to the coarse scope), `Some([])` = **deny** — never collapse them. Rules ship
