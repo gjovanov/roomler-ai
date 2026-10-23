@@ -675,3 +675,17 @@ itself on the affected run's page. Baseline when the program started: releases t
     19, and the wizard's never did. Both now do (`setup-linux-u2404-v1`,
     `setup-linux-arm64-u2204-v1`, each keyed to its runner's Ubuntu release), with the
     release lane's pkg-config guard and `apt-get` fallback.
+  - Rehearsal 3 (39963375648): both apt caches missed and were saved (127 MB, 112 MB), and
+    the guard did not fall back.
+  - Rehearsal 4 (39965573505), **10.2 min wall-clock**: both apt steps were hits (5–6 s),
+    and every seed restored.
+
+    | job | rehearsal 4 job | build step | a tag run (no publish) | 0.4.156 release |
+    |---|---|---|---|---|
+    | macOS universal | 7.6 min | 5.6 | ~6.8 | 21.8 |
+    | Windows x86_64 | 9.9 | 7.3 | ~8.8 | 15.8 |
+    | Linux x86_64 | 4.7 | 3.5 | ~4.2 | 8.7 |
+    | Linux aarch64 | 4.4 | 2.8 | ~3.7 | 8.1 |
+
+    Across rehearsals 2–4, warm builds ran 5.6–9.1 min on macOS and 5.5–7.3 on Windows;
+    the spread is runner speed. Windows is the wizard lane's long pole now.
