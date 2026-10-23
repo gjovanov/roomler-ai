@@ -29,7 +29,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
+use bson::{Bson, Document, doc, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{
@@ -39,17 +39,18 @@ use roomler_core::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tracing::error;
 
 use crate::KnowhowState;
 use crate::dao::{MAX_EDGES, MAX_ENTITIES, Search};
 use crate::model::{
-    KnowhowEdge, KnowhowEntity, KnowhowHistory, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS,
-    OP_ARCHIVE, OP_CREATE, OP_UPDATE, SOURCE_PERSON, STATUS_ACTIVE, STATUS_ARCHIVED, SYNCED_KINDS,
+    KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS, OP_ARCHIVE,
+    OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SYNC, STATUS_ACTIVE, STATUS_ARCHIVED, SYNCED_KINDS,
     TARGET_EDGE, TARGET_ENTITY, check_attrs, check_edge_kind, check_env, check_fact_path,
     check_fact_value, check_key, check_kind, check_kind_word, check_name, merge_facts,
 };
+use crate::sync::SYNCED_FACTS;
 use crate::view::{CardView, EdgeView, EntityView, HistoryView, LinkView, NodeView};
+use crate::write::{Stamp, archive_entity as archive_at, record};
 
 /// What a member of an organization knowhow does not keep a map for is
 /// told, on every route.
@@ -64,8 +65,6 @@ pub const MAX_LINKS: usize = 200;
 pub const MAX_MAP_EDGES: usize = 500;
 /// The longest search text, in characters.
 pub const MAX_QUERY_CHARS: usize = 200;
-/// The links an archive takes with it, per read.
-const ARCHIVE_BATCH: usize = 500;
 
 // ─── the gate ───────────────────────────────────────────────────────────────
 
@@ -174,57 +173,39 @@ fn stale(what: &str, asked: i64) -> ApiError {
     ))
 }
 
-/// What every history row of one request shares: its organization, the
-/// person who wrote, and when.
-struct Stamp {
-    tid: ObjectId,
-    by: ObjectId,
-    at: DateTime,
-}
-
-impl Stamp {
-    fn new(tid: ObjectId, auth: &AuthUser) -> Self {
-        Self {
-            tid,
-            by: auth.user_id,
-            at: DateTime::now(),
-        }
+/// ⚠️ What the fleet says of a machine is the fleet's (P4-2a): its name, its
+/// owner and the facts the sync owns ([`SYNCED_FACTS`]). A person's change
+/// to one would be undone by the next sync, so it is refused, and so is
+/// archiving a machine, which leaves the map when its device is removed. A
+/// person may still give a machine an environment, attributes and facts of
+/// their own.
+fn the_fleets(current: &KnowhowEntity, body: &UpdateEntity) -> Result<(), ApiError> {
+    if current.source != SOURCE_SYNC {
+        return Ok(());
     }
-
-    /// The row for one write: to `target` `target_id`, touching
-    /// `entity_ids`, making rev `rev`.
-    fn row(
-        &self,
-        target: &str,
-        target_id: ObjectId,
-        entity_ids: Vec<ObjectId>,
-        rev: i64,
-        op: &str,
-        set: Document,
-    ) -> KnowhowHistory {
-        KnowhowHistory {
-            id: None,
-            tenant_id: self.tid,
-            target: target.into(),
-            target_id,
-            entity_ids,
-            rev,
-            op: op.into(),
-            source: SOURCE_PERSON.into(),
-            by: Some(self.by),
-            at: self.at,
-            set,
-        }
+    let mut named: Vec<&str> = Vec::new();
+    if body.name.is_some() {
+        named.push("name");
     }
-}
-
-/// Appended after the writes they record. A row that cannot be written is
-/// said in the log, and the write stands: it happened, and the row it
-/// changed still names who changed it.
-async fn record(state: &KnowhowState, rows: Vec<KnowhowHistory>) {
-    if let Err(e) = state.history.append(&rows).await {
-        error!(%e, rows = rows.len(), "knowhow: writes stand but their history could not be appended");
+    if body.owner_id.is_some() {
+        named.push("owner_id");
     }
+    if let Some(facts) = &body.facts {
+        named.extend(
+            facts
+                .keys()
+                .map(String::as_str)
+                .filter(|p| SYNCED_FACTS.contains(p)),
+        );
+    }
+    if named.is_empty() {
+        return Ok(());
+    }
+    Err(bad(format!(
+        "the fleet says this of a {}: {} — change the device instead",
+        current.kind,
+        named.join(", ")
+    )))
 }
 
 /// A body's `facts`: path → value, or — in an update only — null to remove
@@ -589,10 +570,10 @@ pub async fn create_entity(
         Some(v) => check_attrs(v, MAX_ATTRS_BYTES).map_err(bad)?,
         None => Document::new(),
     };
-    let stamp = Stamp::new(tid, &auth);
+    let stamp = Stamp::person(tid, auth.user_id);
     let now = stamp.at;
     let changes = fact_changes(body.facts.as_ref(), false)?;
-    let (facts, said) = merge_facts(&[], &changes, auth.user_id, now);
+    let (facts, said) = merge_facts(&[], &changes, SOURCE_PERSON, Some(auth.user_id), now);
     if state.entities.count_live(tid).await? >= MAX_ENTITIES {
         return Err(ApiError::Conflict(format!(
             "the map holds its most entities ({MAX_ENTITIES})"
@@ -683,7 +664,8 @@ pub async fn update_entity(
     if current.rev != body.rev {
         return Err(stale("entity", body.rev));
     }
-    let stamp = Stamp::new(tid, &auth);
+    the_fleets(&current, &body)?;
+    let stamp = Stamp::person(tid, auth.user_id);
     let now = stamp.at;
     // What the row gets, and what the history says it got.
     let mut set = Document::new();
@@ -724,7 +706,13 @@ pub async fn update_entity(
     }
     let changes = fact_changes(body.facts.as_ref(), true)?;
     if !changes.is_empty() {
-        let (facts, changed) = merge_facts(&current.facts, &changes, auth.user_id, now);
+        let (facts, changed) = merge_facts(
+            &current.facts,
+            &changes,
+            SOURCE_PERSON,
+            Some(auth.user_id),
+            now,
+        );
         if facts.len() > MAX_FACTS {
             return Err(bad(format!("an entity holds at most {MAX_FACTS} facts")));
         }
@@ -736,8 +724,7 @@ pub async fn update_entity(
     if set.is_empty() {
         return Ok(Json(EntityView::of(&current)));
     }
-    set.insert("updated_by", auth.user_id);
-    set.insert("updated_at", now);
+    set.extend(stamp.touched());
     let Some(after) = state.entities.update_at(tid, id, body.rev, set).await? else {
         return Err(stale("entity", body.rev));
     };
@@ -764,67 +751,24 @@ pub async fn archive_entity(
 ) -> Result<Json<Value>, ApiError> {
     let tid = writer(&state, &tenant_id, &auth).await?;
     let id = parse_id(&entity_id, "entity_id")?;
-    let stamp = Stamp::new(tid, &auth);
-    let set = doc! {
-        "status": STATUS_ARCHIVED, "deleted_at": stamp.at,
-        "updated_by": stamp.by, "updated_at": stamp.at,
-    };
-    let Some(after) = state.entities.update_at(tid, id, query.rev, set).await? else {
-        return Err(match state.entities.get_live(tid, id).await? {
+    // P4-2a — a machine leaves the map when its device is removed, never by a
+    // person's hand: the next sync would only put it back.
+    if let Some(current) = state.entities.get_live(tid, id).await?
+        && current.source == SOURCE_SYNC
+    {
+        return Err(bad(format!(
+            "a {} leaves the map when its device is removed",
+            current.kind
+        )));
+    }
+    let stamp = Stamp::person(tid, auth.user_id);
+    match archive_at(&state, &stamp, id, query.rev).await? {
+        Some(links) => Ok(Json(json!({ "archived": true, "links_archived": links }))),
+        None => Err(match state.entities.get_live(tid, id).await? {
             Some(_) => stale("entity", query.rev),
             None => ApiError::NotFound("no such entity".into()),
-        });
-    };
-    let mut rows = vec![stamp.row(
-        TARGET_ENTITY,
-        id,
-        vec![id],
-        after.rev,
-        OP_ARCHIVE,
-        doc! { "status": STATUS_ARCHIVED },
-    )];
-    // Whatever the links' archive met, the rows it made are recorded.
-    let links = archive_links(&state, &stamp, id, &mut rows).await;
-    record(&state, rows).await;
-    Ok(Json(json!({ "archived": true, "links_archived": links? })))
-}
-
-/// Every live link of an archived entity, archived with it.
-async fn archive_links(
-    state: &KnowhowState,
-    stamp: &Stamp,
-    id: ObjectId,
-    rows: &mut Vec<KnowhowHistory>,
-) -> Result<usize, ApiError> {
-    let mut archived = 0;
-    for _ in 0..=(MAX_EDGES as usize / ARCHIVE_BATCH) {
-        let batch = state
-            .edges
-            .touching(stamp.tid, &[id], ARCHIVE_BATCH as i64)
-            .await?;
-        if batch.is_empty() {
-            break;
-        }
-        for e in batch {
-            let Some(eid) = e.id else { continue };
-            let archived_edge = state
-                .edges
-                .archive_live(stamp.tid, eid, stamp.by, stamp.at)
-                .await?;
-            if let Some(after) = archived_edge {
-                archived += 1;
-                rows.push(stamp.row(
-                    TARGET_EDGE,
-                    eid,
-                    vec![after.from, after.to],
-                    after.rev,
-                    OP_ARCHIVE,
-                    doc! { "status": STATUS_ARCHIVED, "cause": "entity_archived" },
-                ));
-            }
-        }
+        }),
     }
-    Ok(archived)
 }
 
 #[derive(Deserialize, Debug)]
@@ -866,7 +810,7 @@ pub async fn create_edge(
             "the map holds its most links ({MAX_EDGES})"
         )));
     }
-    let stamp = Stamp::new(tid, &auth);
+    let stamp = Stamp::person(tid, auth.user_id);
     let now = stamp.at;
     let mut edge = KnowhowEdge {
         id: None,
@@ -932,7 +876,7 @@ pub async fn update_edge(
     if attrs == current.attrs {
         return Ok(Json(EdgeView::of(&current)));
     }
-    let stamp = Stamp::new(tid, &auth);
+    let stamp = Stamp::person(tid, auth.user_id);
     let set = doc! { "attrs": attrs.clone(), "updated_by": stamp.by, "updated_at": stamp.at };
     let Some(after) = state.edges.update_at(tid, id, body.rev, set).await? else {
         return Err(stale("link", body.rev));
@@ -960,7 +904,7 @@ pub async fn archive_edge(
 ) -> Result<Json<Value>, ApiError> {
     let tid = writer(&state, &tenant_id, &auth).await?;
     let id = parse_id(&edge_id, "edge_id")?;
-    let stamp = Stamp::new(tid, &auth);
+    let stamp = Stamp::person(tid, auth.user_id);
     let set = doc! {
         "status": STATUS_ARCHIVED, "deleted_at": stamp.at,
         "updated_by": stamp.by, "updated_at": stamp.at,

@@ -161,6 +161,11 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-2a — the fleet's devices mirrored onto the map: a hello's
+/// machine, the fleet's changes, the fleet's facts kept the fleet's, a
+/// removal's archive, and the reconcile that retires what is gone.
+#[cfg(test)]
+mod knowhow_sync_tests;
 /// FR-90 P4-1 — knowhow, the organization's map: off until turned on, read
 /// from `member` up and changed by `admin`, each entity named once, every
 /// change at the rev it was read, links that go with what they link, and

@@ -172,6 +172,12 @@ pub struct KnowhowSettings {
     /// switch.
     #[serde(default)]
     pub tenants: String,
+    /// P4-2a — how often each pod reconciles its served organizations'
+    /// machines with the fleet's devices, in seconds
+    /// (`ROOMLER__KNOWHOW__SYNC_SECS`): the longest a change no hook carries
+    /// (a display name) waits to reach the map. 0 or absent: 600.
+    #[serde(default)]
+    pub sync_secs: u64,
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.

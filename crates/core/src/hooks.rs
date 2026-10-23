@@ -45,10 +45,10 @@ use bson::oid::ObjectId;
 /// device is still there to be told. P3-1 registers no hooks.
 ///
 /// FR-90 P4 — `knowhow` comes last. It holds nothing a device or a member
-/// needs released, only a map of them: its mirror of a removed machine (P4-2)
-/// is archived after every holder has let go, so a holder that fails, which
-/// stops the cascade, leaves the map still showing the device that is still
-/// there. P4-1 registers no hooks.
+/// needs released, only a map of them: its mirror of a removed machine
+/// (P4-2a) is archived after every holder has let go, so a holder that fails,
+/// which stops the cascade, leaves the map still showing the device that is
+/// still there. Its own failure is logged, never the cascade's refusal.
 pub const HOOK_ORDER: &[&str] = &[
     "hive",
     "vault",

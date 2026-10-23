@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 
-async fn knowhow_app() -> TestApp {
+pub(crate) async fn knowhow_app() -> TestApp {
     TestApp::spawn_with_settings(|s| {
         s.modules.knowhow = true;
         // Many calls per test: the default limiter would answer 429 first.
@@ -29,25 +29,30 @@ async fn knowhow_app() -> TestApp {
     .await
 }
 
-fn kpath(tid: &str, rest: &str) -> String {
+pub(crate) fn kpath(tid: &str, rest: &str) -> String {
     format!("/api/tenant/{tid}/knowhow{rest}")
 }
 
 /// Status and the body as JSON.
-async fn call(req: reqwest::RequestBuilder) -> (u16, Value) {
+pub(crate) async fn call(req: reqwest::RequestBuilder) -> (u16, Value) {
     let resp = req.send().await.unwrap();
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
-fn patch(app: &TestApp, path: &str, token: &str) -> reqwest::RequestBuilder {
+pub(crate) fn patch(app: &TestApp, path: &str, token: &str) -> reqwest::RequestBuilder {
     app.client
         .patch(app.url(path))
         .header("Authorization", format!("Bearer {token}"))
 }
 
-async fn create(app: &TestApp, t: &SeededTenant, token: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create(
+    app: &TestApp,
+    t: &SeededTenant,
+    token: &str,
+    body: Value,
+) -> (u16, Value) {
     call(
         app.auth_post(&kpath(&t.tenant_id, "/entity"), token)
             .json(&body),
@@ -56,7 +61,12 @@ async fn create(app: &TestApp, t: &SeededTenant, token: &str, body: Value) -> (u
 }
 
 /// An entity the owner puts on the map; its id and rev.
-async fn entity(app: &TestApp, t: &SeededTenant, kind: &str, key: &str) -> (String, i64) {
+pub(crate) async fn entity(
+    app: &TestApp,
+    t: &SeededTenant,
+    kind: &str,
+    key: &str,
+) -> (String, i64) {
     let (code, body) = create(
         app,
         t,
@@ -71,7 +81,13 @@ async fn entity(app: &TestApp, t: &SeededTenant, kind: &str, key: &str) -> (Stri
     )
 }
 
-async fn link(app: &TestApp, t: &SeededTenant, from: &str, kind: &str, to: &str) -> (u16, Value) {
+pub(crate) async fn link(
+    app: &TestApp,
+    t: &SeededTenant,
+    from: &str,
+    kind: &str,
+    to: &str,
+) -> (u16, Value) {
     call(
         app.auth_post(&kpath(&t.tenant_id, "/edge"), &t.admin.access_token)
             .json(&json!({ "from": from, "kind": kind, "to": to })),
@@ -98,7 +114,7 @@ fn sorted(ids: &[&String]) -> Vec<String> {
 }
 
 /// Give a member exactly one of the organization's managed roles.
-async fn hold_only(app: &TestApp, t: &SeededTenant, user_id: &str, role: &str) {
+pub(crate) async fn hold_only(app: &TestApp, t: &SeededTenant, user_id: &str, role: &str) {
     let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
     let uid = ObjectId::parse_str(user_id).unwrap();
     let role_id = app
