@@ -449,7 +449,7 @@ enum Command {
         /// (internal, P3) the controller's display name.
         #[arg(long, hide = true)]
         remote_user_name: Option<String>,
-        /// Also record what the computer plays (Windows, Linux).
+        /// Also record what the computer plays (Windows, Linux, macOS).
         #[arg(long)]
         system_audio: bool,
         /// Also record the microphone.
