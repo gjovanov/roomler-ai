@@ -148,8 +148,8 @@ pub async fn list_members(
                 .to_lowercase()
                 .cmp(&b.display_name.to_lowercase()),
             Some("email") => a.email.to_lowercase().cmp(&b.email.to_lowercase()),
-            // Default AND explicit joined_at: the pre-FR order.
-            _ => a.joined_at.cmp(&b.joined_at),
+            // Default AND explicit joined_at: the pre-FR order, by instant.
+            _ => super::grid::cmp_instants(&a.joined_at, &b.joined_at),
         };
         let ord = if desc { ord.reverse() } else { ord };
         ord.then_with(|| a.id.cmp(&b.id))
