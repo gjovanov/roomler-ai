@@ -534,7 +534,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5485`](../agents/roomlerd/src/peer.rs#L5485); the viewer parses it
 at [`useRemoteControl.ts:1544`](../ui/src/composables/useRemoteControl.ts#L1544)
 and puts it on the toggle's title
-([`RemoteControl.vue:3266`](../ui/src/views/remote/RemoteControl.vue#L3266)).
+([`RemoteControl.vue:3351`](../ui/src/views/remote/RemoteControl.vue#L3351)).
 
 | `code` | Means |
 |---|---|
