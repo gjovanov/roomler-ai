@@ -1485,6 +1485,41 @@ pub enum ConsentMode {
     PromptThenEmail,
 }
 
+/// #2810 — who a session's consent asks, as the CONTROLLER needs to know it.
+///
+/// The viewer used to word every wait and every "no" as if someone at the
+/// device had been prompted: "Nobody answered the prompt on that device… ask
+/// the person there". Under `email` and `push` nobody at the device is asked
+/// at all; the device's OWNER is. Carried on `rc:session.created` so the
+/// viewer can say who it is waiting on, and whose silence ended it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentAsks {
+    /// Whoever is at the device (`prompt`).
+    Host,
+    /// The device's owner, by approve-link or in the app (`email`, `push`).
+    Owner,
+    /// Both at once (`prompt_then_email`): the device's short host window and
+    /// the owner's longer one.
+    Both,
+}
+
+impl ConsentMode {
+    /// #2810 — who this mode asks. `None` for `auto`: nobody is asked, so
+    /// there is nothing to word. ⚠️ Not a promise that nobody WILL be asked: a
+    /// device whose own `auto_grant_session = false` floor prompts under an
+    /// `auto` directive (`consent::strictest_of`) asks its host anyway, and a
+    /// viewer reading `None` keeps the host-prompt wording for exactly that.
+    pub fn asks(self) -> Option<ConsentAsks> {
+        match self {
+            ConsentMode::Auto => None,
+            ConsentMode::Prompt => Some(ConsentAsks::Host),
+            ConsentMode::Email | ConsentMode::Push => Some(ConsentAsks::Owner),
+            ConsentMode::PromptThenEmail => Some(ConsentAsks::Both),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AccessPolicy {
     /// How consent is obtained for a non-owner controller. `None` = inherit the

@@ -67,6 +67,8 @@ import {
   RC_STALL_FAIL_TICKS,
   isRetryableTerminateReason,
   friendlyEndReason,
+  parseConsentAsks,
+  awaitingConsentLabel,
   endedByHost,
   isRetryableRcErrorCode,
   isFalloutOfEndedSession,
@@ -4386,6 +4388,45 @@ describe('FR-27: friendlyEndReason', () => {
     }
     expect(friendlyEndReason(undefined)).toBeNull()
     expect(friendlyEndReason('some_future_reason')).toBeNull()
+  })
+
+  it('#2810: words a consent end for the person who was actually asked', () => {
+    // Field, 2026-10-23: an `email` session nobody approved ended with "ask
+    // the person there" - but under `email`/`push` nobody at the device is
+    // asked; the device's OWNER is.
+    const ownerTimeout = friendlyEndReason('consent_timeout', undefined, 'owner')!
+    expect(ownerTimeout).toMatch(/owner/)
+    expect(ownerTimeout).toMatch(/nothing was declined/i)
+    expect(ownerTimeout).not.toMatch(/person there|on that device/i)
+    const ownerDenied = friendlyEndReason('user_denied', undefined, 'owner')!
+    expect(ownerDenied).toMatch(/owner declined/)
+    expect(ownerDenied).not.toMatch(/at that device/)
+    // `prompt_then_email` asks both: a final timeout means neither answered,
+    // and a "no" may have come from either.
+    expect(friendlyEndReason('consent_timeout', undefined, 'both')).toMatch(/at that device or by the device's owner/)
+    expect(friendlyEndReason('user_denied', undefined, 'both')).toMatch(/either at that device or by the device's owner/)
+    // The host, an `auto` grant (null) and an older server (undefined) keep
+    // the host wording, unchanged.
+    for (const asks of ['host', null, undefined] as const) {
+      expect(friendlyEndReason('consent_timeout', undefined, asks)).toBe(friendlyEndReason('consent_timeout'))
+      expect(friendlyEndReason('user_denied', undefined, asks)).toBe('Someone at that device declined the request.')
+    }
+    // Who was asked never makes a nominal ending speak.
+    expect(friendlyEndReason('controller_hangup', undefined, 'owner')).toBeNull()
+  })
+
+  it('#2810: reads consent_asks, ignoring a word this build does not know', () => {
+    expect(parseConsentAsks('host')).toBe('host')
+    expect(parseConsentAsks('owner')).toBe('owner')
+    expect(parseConsentAsks('both')).toBe('both')
+    for (const v of [undefined, null, '', 'group', 42, {}]) expect(parseConsentAsks(v)).toBeNull()
+  })
+
+  it('#2810: says who the wait is for', () => {
+    expect(awaitingConsentLabel('owner')).toMatch(/device's owner to approve/)
+    expect(awaitingConsentLabel('both')).toMatch(/someone at that device, or the device's owner/)
+    expect(awaitingConsentLabel('host')).toBe('Waiting for the agent to allow the connection…')
+    expect(awaitingConsentLabel(null)).toBe('Waiting for the agent to allow the connection…')
   })
 
   it("FR-101 P4b: names the org's maximum length when that is the limit that ended it", () => {

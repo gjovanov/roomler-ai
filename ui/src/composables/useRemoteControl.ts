@@ -771,6 +771,36 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
   }
 }
 
+/** #2810 - who a session's consent asks, as `rc:session.created` says it. */
+export type ConsentAsks = 'host' | 'owner' | 'both'
+
+/**
+ * #2810 - read `consent_asks`. Anything else - absent, or a value from a
+ * newer server this build does not know - is `null`, and the viewer keeps
+ * the host-prompt wording: an unknown word is ignored, never an error.
+ */
+export function parseConsentAsks(v: unknown): ConsentAsks | null {
+  return v === 'host' || v === 'owner' || v === 'both' ? v : null
+}
+
+/**
+ * #2810 - what the viewer says while it waits for consent, for whoever the
+ * consent asks. The owner of a device set to `email` or `push` is not at the
+ * device, so "waiting for the agent" told the person waiting nothing useful;
+ * `null` keeps the host wording (an `auto` grant a device's own floor turned
+ * into a prompt, or an older server).
+ */
+export function awaitingConsentLabel(asks: ConsentAsks | null): string {
+  switch (asks) {
+    case 'owner':
+      return "Waiting for the device's owner to approve the connection…"
+    case 'both':
+      return "Waiting for someone at that device, or the device's owner, to approve the connection…"
+    default:
+      return 'Waiting for the agent to allow the connection…'
+  }
+}
+
 /**
  * FR-27 - user-facing text for a session that ended before it started.
  *
@@ -783,8 +813,19 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
  *
  * Returns `null` for a nominal end (hangups, idle timeouts) so the caller can
  * stay silent - an alert on a normal disconnect is noise.
+ *
+ * #2810 - `asks` is who the session's consent asked (`rc:session.created`'s
+ * `consent_asks`). Under `email`/`push` nobody at the device is asked; the
+ * device's OWNER is, and "ask the person there" sent the reader to the wrong
+ * person. `null` (an `auto` grant, or an older server) keeps the host
+ * wording, which is also right for a device whose own floor prompts its host
+ * under an `auto` directive.
  */
-export function friendlyEndReason(reason: unknown, limit?: unknown): string | null {
+export function friendlyEndReason(
+  reason: unknown,
+  limit?: unknown,
+  asks?: ConsentAsks | null,
+): string | null {
   // FR-101 P4b — a limit the organization set ended it (`rc:terminate`'s
   // `limit`). Said as such: "idle" would be the wrong story for someone who
   // was working the whole time.
@@ -805,8 +846,16 @@ export function friendlyEndReason(reason: unknown, limit?: unknown): string | nu
   }
   switch (reason) {
     case 'user_denied':
+      if (asks === 'owner') return "The device's owner declined the request."
+      // `prompt_then_email`: an explicit Deny at the device ends it, and so
+      // does the owner's on the approve page; this end does not say which.
+      if (asks === 'both') return "The request was declined, either at that device or by the device's owner."
       return 'Someone at that device declined the request.'
     case 'consent_timeout':
+      if (asks === 'owner') return "The device's owner did not answer in time. Nothing was declined - try again, or ask them to approve it."
+      // `prompt_then_email`: the host's short window going unanswered hands
+      // over to the owner, so this end means the owner's window ran out too.
+      if (asks === 'both') return "Nobody approved in time, at that device or by the device's owner. Nothing was declined - try again."
       return 'Nobody answered the prompt on that device in time. Nothing was declined - try again, or ask the person there to approve it.'
     case 'no_prompt_surface':
       return 'That device could not show a prompt to anyone - nobody is signed in at its screen, or the Roomler desktop app is not running there. Start it on the device, or set this device to email/push consent.'
@@ -4943,6 +4992,10 @@ export function useRemoteControl(
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
+  /** #2810 — who this session's consent asks (`rc:session.created`'s
+   *  `consent_asks`): `host`, `owner` or `both`. `null` = an `auto` grant or
+   *  an older server, and the viewer keeps its host-prompt wording. */
+  const consentAsks = ref<ConsentAsks | null>(null)
   /** FR-97 P3b — what the host says its lock screen does with input: a Linux
    *  lock screen TAKES it (captured and typed into like any other screen), so
    *  the chip must not say input is suppressed; a Mac's is `unknown` (P2d-1).
@@ -8249,6 +8302,9 @@ export function useRemoteControl(
       // FR-34 — a fresh attempt starts un-locked-known; the agent tells us
       // via rc:consent.pending if the host is locked.
       hostLocked.value = false
+      // #2810 — and who its consent asks, so the wait and a consent end are
+      // worded for the person actually asked.
+      consentAsks.value = parseConsentAsks(msg.consent_asks)
       phase.value = 'awaiting_consent'
       // Consent is human-paced on Prompt-mode devices; the SERVER owns
       // that timeout (consent_timeout). Ours only covers requesting/
@@ -8520,7 +8576,7 @@ export function useRemoteControl(
         // FR-27 - a non-nominal end gets a sentence, not the enum name. The
         // mapping returns null for every nominal reason, so the set of
         // reasons that surface is the set that has something to say.
-        const friendly = friendlyEndReason(msg.reason, msg.limit)
+        const friendly = friendlyEndReason(msg.reason, msg.limit, consentAsks.value)
         if (friendly) error.value = friendly
       }
       teardown()
@@ -13089,6 +13145,8 @@ export function useRemoteControl(
      * padlock overlay frame.
      */
     hostLocked,
+    /** #2810 — who this session's consent asks; `null` = host wording. */
+    consentAsks,
     /** FR-97 P3b — what the lock screen does with input: the chip says it. */
     hostLockedInput,
     keepBusy,

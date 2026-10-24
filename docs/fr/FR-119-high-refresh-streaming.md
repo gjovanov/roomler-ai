@@ -532,11 +532,11 @@ delivered, with the session's IDR counter jumping 2–3 at each dip and nowhere 
   - The shed drops an arriving delta when the backlog exceeds 67 ms (`:349`, sampled once per arriving frame,
     `rc-hevc-worker.ts:745`, `rc-vp9-444-worker.ts:668`).
   - A window is bad on a shed, or when its MEAN backlog exceeds 33 ms (`:355`, read at
-    `useRemoteControl.ts:6905`). One slow keyframe lifts a few frames' ages and barely moves a mean; a decoder that
+    `useRemoteControl.ts:6958`). One slow keyframe lifts a few frames' ages and barely moves a mean; a decoder that
     cannot keep up lifts every sample.
   - Both are P6's counts as the time they meant at 60 fps, the rate they were tuned at, and now mean the same at
     every rate.
-- **Knobs** in ms (`roomler-rc-max-backlog-ms`, `roomler-rc-struggle-backlog-ms`, `useRemoteControl.ts:2451`). A
+- **Knobs** in ms (`roomler-rc-max-backlog-ms`, `roomler-rc-struggle-backlog-ms`, `useRemoteControl.ts:2500`). A
   viewer still carrying the retired frame-count knobs has them read as the ms they meant at 60 fps.
 - **The HUD** shows the backlog's window mean and max beside the raw queue. `rc:decodestat` is unchanged, so the
   agent needs nothing.

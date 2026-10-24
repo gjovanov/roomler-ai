@@ -369,11 +369,24 @@ Ticked only where a run is recorded in the field log below.
       - `prompt_then_email`: the host half earlier; the owner half on 2026-10-23,
         when the host prompt timed out at 30 s, the session waited, and the
         owner's Approve connected it.
-      See the 2026-10-23/24 log. ⚠️ The controller's wording for an owner-side
-      mode still speaks of "the person there": #2810.
-- [ ] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one.
-      ⚠️ Blocked on `EXEC_DEVICE` / `SSH_DEVICE`, which are deliberately not in
-      `DEFAULT_ADMIN` — an operator grant, not a code change.
+      See the 2026-10-23/24 log. The controller's wording for an owner-side
+      mode used to speak of "the person there". Since #2810, the viewer is
+      told who is asked (`consent_asks` on `rc:session.created`) and words its
+      wait and the outcome for that person.
+- [x] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one
+      — **2026-10-24, the lab's Fedora Asahi box (GNOME on Wayland), agent
+      0.4.162.** The gates were opened only for the run, then closed and
+      re-proven closed. The command went to the person at the screen, not root.
+      All three prompts came from the companion, on the same surface as the RC
+      one in the 2026-10-23 log:
+      - *Command execution request*, with the command shown → Approve → it ran
+        (`wlab`, exit 0);
+      - *SSH session request* → Approve → the one command ran (`wlab`, exit 0).
+
+      The earlier blocker (`EXEC_DEVICE` / `SSH_DEVICE`) was no longer one: the
+      controller holds both. Found on the way, #2815: each request is shown
+      twice, the exec prompt names the org "primary", and the SSH prompt shows
+      a raw identity. See the 2026-10-24 log.
 - [x] P9, on a Mac: a session start brings the banner up without taking focus (the
       next click into the person's own window acts), it hides 2.5 s after the
       pointer leaves (after its 4 s first show), returns after a 1.2 s rest at the
@@ -1086,3 +1099,31 @@ A browser switch takes longer than the 2 s takeover window, so the holder would 
 - **One B session ended `ControllerHangup`** about 35 s after its window went behind A's. A deliberate repeat did NOT reproduce it: one viewer, its tab hidden behind another tab for 38 s, and the agent's pump kept sending while the page stayed connected. The cause is unknown; recorded, not filed.
 
 The box's access policy was restored and read back equal after every run.
+
+### 2026-10-24 — the `exec` and `ssh` prompts on GNOME Wayland (agent 0.4.162)
+
+The same box (`native=false`: the companion is the surface). The operator approved the run in chat. Every gate was opened for it and closed after:
+- **Gate 1, the org's switches:** already on for this org (`remote_exec_enabled`, `remote_ssh_enabled`); untouched.
+- **Gate 2, the caller:** the controller already holds `EXEC_DEVICE` and `SSH_DEVICE`.
+- **Gate 3, the device's policies:** set through the API.
+  - exec: `mode: on`, `consent_mode: prompt`, `run_as: console_user`, so the command runs as the person at the screen, not root.
+  - SSH: `mode: on`, `account_mode: console_user`, `consent_mode: prompt`.
+- **Gate 4, the device's own switches:** `exec_enabled` and `ssh_enabled` set to true. `ssh_enabled` takes effect only on a restart, so the daemon was restarted.
+
+| request | what the companion showed | answer | result |
+|---|---|---|---|
+| `roomler exec … -- 'id -un; uname -sr'` | *Command execution request*: "«owner» (via «controller host») wants to run a command on this device", the command in a box, "Expires in 26s" | none in time | the CLI: "the operator at this device did not approve the command (Timeout)" |
+| the same, again | the same | Approve at ~7 s | `wlab`, the kernel version, exit 0 |
+| `roomler ssh … -- 'id -un; uname -sr'` | *SSH session request*: "ssh:«owner» (via «controller host»)@«overlay ip»:«port» wants to open an SSH session on this device", "run a command" | Approve at ~8 s | the CLI: "waiting up to 30s for approval at the device…", then `wlab`, exit 0 |
+
+**Restored** in reverse:
+- both policies back to their defaults, which the API reads back as absent;
+- `exec_enabled` and `ssh_enabled` back to `false` (as found), and the daemon restarted;
+- `ssh_account_mode` and `ssh_max_privilege` were never set.
+
+**Re-proven closed:** `roomler exec` answers "remote execution is not enabled on this device", and `roomler ssh` answers "this device does not accept SSH sessions (its policy is off)".
+
+**Found:** #2815.
+- Each request appeared **twice**: in the companion's prompt window AND as a modal in its main window. Both close on one answer. On 10-23 the main window was centred, so its modal sat exactly under the prompt window and nobody saw two.
+- The exec prompt reads "On behalf of **primary**", where the RC prompt said the org's name.
+- The SSH prompt's requester line is a raw `ssh:…@ip:port`.

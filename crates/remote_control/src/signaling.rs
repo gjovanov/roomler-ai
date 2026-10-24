@@ -3159,6 +3159,13 @@ pub enum ServerMsg {
         /// limit, or none this device can keep.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idle_secs: Option<u32>,
+        /// #2810 — who this session's consent asks (`host`, `owner` or
+        /// `both`), from the mode the hub resolved, so the viewer words its
+        /// wait and a `consent_timeout` / `user_denied` end for the person who
+        /// was actually asked. Additive: absent = an `auto` grant, or a server
+        /// older than the field; a viewer then keeps its host-prompt wording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent_asks: Option<crate::models::ConsentAsks>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -8733,6 +8740,7 @@ mod tests {
             privacy_refused: None,
             features_refused: None,
             idle_secs: None,
+            consent_asks: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -8935,6 +8943,7 @@ mod tests {
             privacy_refused: None,
             features_refused,
             idle_secs: None,
+            consent_asks: None,
         };
         let none = serde_json::to_string(&mk(None)).unwrap();
         assert!(!none.contains("features_refused"), "{none}");
@@ -9004,6 +9013,7 @@ mod tests {
             privacy_refused: None,
             features_refused: None,
             idle_secs,
+            consent_asks: None,
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("idle_secs"), "{none}");
@@ -9037,6 +9047,53 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// #2810 — who the consent asks, on `rc:session.created`: skipped when
+    /// absent (an `auto` grant, or an older server), each of the three
+    /// spellings round-trips, and a frame from a server older than the field
+    /// reads as `None`, so a viewer keeps its host-prompt wording.
+    #[test]
+    fn rc_session_created_says_who_the_consent_asks() {
+        use crate::models::{ConsentAsks, ConsentMode};
+        let created = |consent_asks| ServerMsg::SessionCreated {
+            session_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            agent_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            permissions: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: None,
+            idle_secs: None,
+            consent_asks,
+        };
+        let none = serde_json::to_string(&created(None)).unwrap();
+        assert!(!none.contains("consent_asks"), "{none}");
+        for (asks, wire) in [
+            (ConsentAsks::Host, "host"),
+            (ConsentAsks::Owner, "owner"),
+            (ConsentAsks::Both, "both"),
+        ] {
+            let s = serde_json::to_string(&created(Some(asks))).unwrap();
+            assert!(s.contains(&format!(r#""consent_asks":"{wire}""#)), "{s}");
+            match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+                ServerMsg::SessionCreated { consent_asks, .. } => {
+                    assert_eq!(consent_asks, Some(asks))
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        let older = r#"{"t":"rc:session.created","session_id":"507f1f77bcf86cd799439011","agent_id":"507f1f77bcf86cd799439012"}"#;
+        match serde_json::from_str::<ServerMsg>(older).unwrap() {
+            ServerMsg::SessionCreated { consent_asks, .. } => assert_eq!(consent_asks, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // What the hub sends for each mode: nobody for `auto`, the owner for
+        // the two owner-side modes, both for `prompt_then_email`.
+        assert_eq!(ConsentMode::Auto.asks(), None);
+        assert_eq!(ConsentMode::Prompt.asks(), Some(ConsentAsks::Host));
+        assert_eq!(ConsentMode::Email.asks(), Some(ConsentAsks::Owner));
+        assert_eq!(ConsentMode::Push.asks(), Some(ConsentAsks::Owner));
+        assert_eq!(ConsentMode::PromptThenEmail.asks(), Some(ConsentAsks::Both));
     }
 
     /// FR-99 P3b — the lock ask on `rc:request`: skipped when absent, its
