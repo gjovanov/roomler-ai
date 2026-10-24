@@ -106,6 +106,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 24 | 10-20 | **The integration suite runs as three shards**, each on its own runner with its own mongod at 2 threads. Each shard lists the same binaries, sorts the (test, binary) pairs and runs every third with `--exact`; each must report every test it was handed. Only the first shard publishes the cargo cache | #2596 |
 | 25 | 10-20 | **A merge burst queues one run, not one per commit**: `ci.yml`, `integration-tests.yml` and `installer-smoke.yml` group master's runs by branch, so GitHub keeps one running (never cancelled) and one waiting, and a newer push cancels the waiting one. PR pushes cancel their superseded run; a dispatch gets a group of its own | #2624 |
 | 26 | 10-23 | **The setup wizard's release lane gets seeds**: `release-setup.yml`'s four build jobs restore from the `seed-cache` release (`seed-setup-<platform>`) instead of Swatinem, rehearsals publish, and a `reseed` job dispatches a master rehearsal after every published release. The macOS job builds both triples in one cargo invocation, and both Linux jobs install their Tauri deps from cached apt sets (wave 19's pattern) | #2778 |
+| 27 | 10-24 | **PR CI's two long poles.** The integration suite runs as four shards, not three. FR-90 P1i's Windows agent-session tests move out of `windows-overlay-clippy` into a parallel `windows-agent-sessions` job with its own seed family | #2844 |
 
 ## Acceptance criteria
 
@@ -689,3 +690,30 @@ itself on the affected run's page. Baseline when the program started: releases t
 
     Across rehearsals 2–4, warm builds ran 5.6–9.1 min on macOS and 5.5–7.3 on Windows;
     the spread is runner speed. Windows is the wizard lane's long pole now.
+- 2026-10-24: **a review of every lane** (wave 27). Master on 10-24, mean job times over
+  13 CI runs, 12 integration runs and 7 installer runs:
+
+  | lane | job | mean | max | against 10 min |
+  |---|---|---|---|---|
+  | CI | Windows overlay clippy | 11.2 | 13.3 | over |
+  | CI | Rust lint | 9.0 | 11.4 | close |
+  | CI | macOS overlay check | 8.6 | 12.1 | close |
+  | CI | the other six jobs | 4.2–8.4 | | under |
+  | integration | each of three shards | 12.4–12.6 | 15.5 | over |
+  | installer smoke | MSI / macOS pkg | 10.7 / 9.8 | 13.4 / 11.6 | close |
+
+  Every cache restored warm; nothing was cold by mistake. The jobs grew: Windows overlay
+  clippy now carries FR-90 P1i's agent-session tests (4.3–4.7 min) and FR-99 P1b's privacy
+  curtain (2.8–3.1 min), and lint runs eight clippy passes. The operator chose four levers.
+  This wave takes the two in PR CI: a fourth integration shard, and the agent-session
+  tests in their own Windows job.
+  - Wizard tag runs were 10–15 min end to end (was 16–41), but two defects showed. Every
+    release since 0.4.164 ran the wizard TWICE (the `setup-v` tag push, then the lockstep
+    dispatch 13–25 min later). The cached apt set hit in only two of six tag runs: master's
+    copy was LRU-evicted twice (the wizard touches it a few times a day, so a CI rotation
+    that pushes the pool past 10 GB takes it first), and ubuntu-latest's move to 26.04
+    changed its key. One miss waited 19.2 min on the mirror. Both are the next wave.
+  - ⚠️ ubuntu-latest is 26.04 now for some jobs (the 0.4.165 wizard built there). Both
+    0.4.163's and 0.4.165's x86_64 wizards need GLIBC_2.39, so nothing broke yet. But
+    that job floats with the image, and the binary has never run on 22.04 or Debian 12,
+    where the arm64 wizard and the agent `.deb` pin 22.04 for exactly that floor.

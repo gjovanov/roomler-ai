@@ -80,7 +80,7 @@ on:
 permissions:
   contents: read
 
-# FR-6 wave 25 (#773): ci.yml's rule, since one run here is three jobs. A
+# FR-6 wave 25 (#773): ci.yml's rule, since one run here is four jobs. A
 # newer push to a PR cancels its running suite. On master a running suite
 # always finishes (it publishes the cargo cache), and a newer push cancels
 # only the run still waiting behind it. A dispatch gets a group of its own,
@@ -91,20 +91,22 @@ concurrency:
 
 jobs:
   integration:
-    name: Integration suite (MongoDB + Redis) ${{ matrix.shard }}/3
+    name: Integration suite (MongoDB + Redis) ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
-    # FR-6 wave 24 (#773): the suite runs as three shards, each on its own
-    # runner with its own mongod, and each takes every third test of the
-    # sorted listing (see "Run the suite"). Not more threads against one
-    # mongod: every test creates and drops a database of ~246 WiredTiger
-    # files, and at 4 threads the dropped ones piled up to 63,769 open files
-    # of the 64,000 ceiling until mongod aborted (dispatch run 39312454242).
-    # Three shards at 2 threads each keep every mongod at the load this lane
-    # has always run. A shard is ~10 min warm, so 45 leaves a cold build room.
+    # FR-6 wave 24 (#773): the suite runs as shards, each on its own runner
+    # with its own mongod, and each takes every Nth test of the sorted
+    # listing (see "Run the suite"). Not more threads against one mongod:
+    # every test creates and drops a database of ~246 WiredTiger files, and
+    # at 4 threads the dropped ones piled up to 63,769 open files of the
+    # 64,000 ceiling until mongod aborted (dispatch run 39312454242). Each
+    # shard at 2 threads keeps its mongod at the load this lane has always
+    # run. Wave 27: four shards, not three. On 10-24 master's three shards
+    # averaged 12.4-12.6 min a job, and the suite keeps growing. The shard
+    # count is the matrix's length (`strategy.job-total`), nothing else.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     timeout-minutes: 45
     # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
     # release asset (ci-seed-save), which needs `contents: write`.
@@ -337,7 +339,7 @@ jobs:
           # Every shard lists the same binaries, sorts the same (test, binary)
           # pairs and takes every Nth from its own offset, so between them the
           # shards run each test exactly once, and a module's tests spread
-          # over all three. (The crate has no doc tests to lose.)
+          # over all of them. (The crate has no doc tests to lose.)
           mapfile -t bins < <(cargo test -p roomler-ai-tests --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
           echo "test binaries: ${#bins[@]}"
@@ -505,8 +507,8 @@ jobs:
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
       - name: Publish the cargo cache (release-asset store)
-        # The first shard alone: all three build the same target, and three
-        # uploads of one asset would race each other's --clobber.
+        # The first shard alone: every shard builds the same target, and
+        # parallel uploads of one asset would race each other's --clobber.
         if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success' && strategy.job-index == 0
         continue-on-error: true
         uses: ./.github/actions/ci-seed-save
