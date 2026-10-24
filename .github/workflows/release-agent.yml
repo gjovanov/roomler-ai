@@ -2880,6 +2880,8 @@ jobs:
                   <string>Roomler Daemon captures the screen to stream it to an authorised remote controller.</string>
               <key>NSAppleEventsUsageDescription</key>
                   <string>Roomler Daemon injects input events on behalf of an authorised remote controller.</string>
+              <key>NSMicrophoneUsageDescription</key>
+                  <string>Roomler Daemon records the microphone into a screen recording when the person at this computer asks for it.</string>
           </dict>
           </plist>
           PLIST

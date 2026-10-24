@@ -35,7 +35,7 @@
 
 use async_trait::async_trait;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod cpal_backend;
 pub mod opus_encode;
 #[cfg(target_os = "linux")]
