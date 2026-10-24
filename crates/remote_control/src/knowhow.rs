@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P4-3 — knowhow's scan vocabulary: what a device says it found, and
 //! the words and bounds both ends read (the FR-90 spec, §3e "P4-3, scans, as
-//! designed"); and P4-4's, a session's questions ([`session_limits`]).
+//! designed"); P4-4's, a session's questions ([`session_limits`]); and
+//! P4-5's, a probe and what it measured ([`ProbeKind`], [`never_probed`]).
 //!
 //! The frames (`crate::signaling`): the server's `rc:knowhow.scan` and the
 //! device's `rc:knowhow.scanned`. A finding is metadata about the device
@@ -15,6 +16,8 @@
 //! refused. So a newer device's answer is never lost whole, and no known
 //! kind can carry an extra field: a closed shape is what keeps a credential
 //! from riding along in one nobody looks at.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -524,6 +527,234 @@ impl SessionRefusal {
     }
 }
 
+// ─── probes (P4-5) ──────────────────────────────────────────────────────────
+
+/// FR-90 P4-5 — what a probe is (decision 55): a connect, never a
+/// conversation. The frame carries it as its word ([`ProbeKind::as_str`]),
+/// so a kind a newer server sends still reaches an older device, which
+/// answers `failed` rather than never.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeKind {
+    /// A connect and its round trip, then a close: not a byte sent.
+    Tcp,
+    /// A TLS handshake with the server name, the leaf certificate's names
+    /// and its SHA-256 fingerprint read, then a close: nothing sent past the
+    /// ClientHello, no client certificate, and the chain neither trusted nor
+    /// refused, since a private CA is what an organization's own services
+    /// have.
+    Tls,
+}
+
+impl ProbeKind {
+    pub const ALL: [ProbeKind; 2] = [Self::Tcp, Self::Tls];
+
+    /// The spelling on the wire and in the record. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+        }
+    }
+
+    /// A word, read back: `None` for one this build does not know.
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == word)
+    }
+}
+
+/// How a probe ended, as the device says it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeOutcome {
+    /// Measured: it connected, and for `tls` the handshake finished and the
+    /// leaf certificate was read.
+    Ok,
+    /// No connection: refused, timed out, no route, or a name that did not
+    /// resolve.
+    Unreachable,
+    /// The device may not reach it: outside what its owner lists in
+    /// `knowhow_probe_reach` (decision 53), or an address never probed
+    /// ([`never_probed`]). It says nothing of the target.
+    NotAllowed,
+    /// Not measured: a handshake that failed past the connect, or a probe the
+    /// device could not run; why is the answer's `detail`.
+    Failed,
+}
+
+impl ProbeOutcome {
+    /// The spelling on the wire and in the record. Locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Unreachable => "unreachable",
+            Self::NotAllowed => "not_allowed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// An answer that names no outcome failed.
+pub(crate) fn probe_failed() -> ProbeOutcome {
+    ProbeOutcome::Failed
+}
+
+/// A word a newer device sends, or none, is `failed`: an answer must never
+/// read as measured when it was not.
+pub(crate) fn probe_outcome_lenient<'de, D>(de: D) -> Result<ProbeOutcome, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Value::String(word) = Value::deserialize(de)? else {
+        return Ok(ProbeOutcome::Failed);
+    };
+    Ok(ProbeOutcome::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(word.as_str()),
+    )
+    .unwrap_or(ProbeOutcome::Failed))
+}
+
+/// FR-90 P4-5 — a probe's bounds, read by both ends (the FR-90 spec, §3e
+/// "P4-5, verification, as designed").
+pub mod probe_limits {
+    /// A probe's whole deadline on the device, the connect and a TLS
+    /// handshake together (decision 55).
+    pub const TIMEOUT_SECS: u64 = 10;
+    /// The longest round trip the server records, in milliseconds: the
+    /// deadline, and a second more for the device's clock.
+    pub const MAX_RTT_MS: u32 = 11_000;
+    /// A host, at most: a DNS name's own bound (RFC 1035).
+    pub const MAX_HOST: usize = 253;
+    /// The names of one certificate an answer carries, at most.
+    pub const MAX_TLS_NAMES: usize = 100;
+}
+
+/// What a `tls` probe read of the leaf certificate.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeTls {
+    /// Its subject alternative names, DNS names and IP addresses, as the
+    /// certificate spells them.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// The SHA-256 of its DER encoding, in hex ([`fingerprint_hex`]).
+    pub fingerprint: String,
+}
+
+impl ProbeTls {
+    /// An answer's raw `tls`, read: its names lowercase, its fingerprint 64
+    /// lowercase hex. `Err` for one malformed, past a bound, or holding a
+    /// credential's shape. It travels as raw JSON so that such a one costs
+    /// only itself: the answer around it is still read.
+    pub fn read(raw: &Value) -> Result<Self, &'static str> {
+        let tls: ProbeTls = serde_json::from_value(raw.clone()).map_err(|_| "malformed")?;
+        if tls.names.len() > probe_limits::MAX_TLS_NAMES {
+            return Err("more names than an answer carries");
+        }
+        let mut names = Vec::with_capacity(tls.names.len());
+        for name in &tls.names {
+            if name.is_empty()
+                || name.len() > probe_limits::MAX_HOST
+                || name.chars().any(|c| c.is_control() || c.is_whitespace())
+                || holds_credential(name)
+            {
+                return Err("a name that is no certificate's");
+            }
+            names.push(name.to_ascii_lowercase());
+        }
+        let fingerprint =
+            fingerprint_hex(&tls.fingerprint).ok_or("a fingerprint that is no SHA-256")?;
+        Ok(Self { names, fingerprint })
+    }
+}
+
+/// A SHA-256 fingerprint as both ends compare it: 64 lowercase hex, read from
+/// hex in either case, with or without a `:` between its bytes (as `openssl
+/// x509 -fingerprint` prints one). `None` for anything else.
+pub fn fingerprint_hex(raw: &str) -> Option<String> {
+    let hex: String = raw.chars().filter(|c| *c != ':').collect();
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| hex.to_ascii_lowercase())
+}
+
+/// FR-90 P4-5 — a host a probe may name, in the spelling both ends compare:
+/// an IP address as the standard library prints it, or a DNS name in
+/// lowercase without its trailing dot. `None` for anything else: a URL, a
+/// path, a port, a space, a zone, a label past 63 bytes or a name past
+/// [`probe_limits::MAX_HOST`], and a name whose last label does not start
+/// with a letter (`1.2.3`, `0x7f.1`, `2130706433`), which a resolver may read
+/// as an address.
+pub fn probe_host(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > probe_limits::MAX_HOST + 1 {
+        return None;
+    }
+    if let Ok(ip) = raw.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let name = raw.strip_suffix('.').unwrap_or(raw).to_ascii_lowercase();
+    if name.is_empty() || name.len() > probe_limits::MAX_HOST {
+        return None;
+    }
+    let label_ok = |label: &str| {
+        let b = label.as_bytes();
+        !b.is_empty()
+            && b.len() <= 63
+            && b.iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+            && b[0] != b'-'
+            && b[b.len() - 1] != b'-'
+    };
+    let last = name.rsplit('.').next()?;
+    (name.split('.').all(label_ok) && last.as_bytes()[0].is_ascii_lowercase()).then_some(name)
+}
+
+/// AWS's metadata service over IPv6, outside link-local.
+const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+/// Alibaba Cloud's metadata service, inside `100.64.0.0/10`: the range an
+/// overlay's own addresses come from, so a list allowing the mesh would
+/// otherwise allow it too. One host of that range is never probed.
+const ALIBABA_METADATA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
+/// FR-90 P4-5 — an address no probe ever reaches, whatever a device's list
+/// says (decision 53): link-local (`169.254.0.0/16`, `fe80::/10`), where
+/// every major cloud's metadata service answers, and the two metadata
+/// addresses outside it ([`AWS_METADATA_V6`], [`ALIBABA_METADATA`]); `0.0.0.0/8`
+/// and `::`, where a listener binds and to which a connect may reach the
+/// device itself; and multicast and broadcast, which nothing connects to. An
+/// IPv4 address carried in IPv6 (mapped, `::ffff:a.b.c.d`, or behind the
+/// NAT64 prefix `64:ff9b::/96`) is held to the IPv4 rules.
+///
+/// ⚠️ The server checks a target it reads; the device checks every address a
+/// name resolves to, before the connect, and connects only to one it checked.
+pub fn never_probed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => never_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return never_v4(v4);
+            }
+            let s = v6.segments();
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = s[6].to_be_bytes();
+                let [c, d] = s[7].to_be_bytes();
+                return never_v4(Ipv4Addr::new(a, b, c, d));
+            }
+            v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xffc0) == 0xfe80
+                || v6 == AWS_METADATA_V6
+        }
+    }
+}
+
+fn never_v4(ip: Ipv4Addr) -> bool {
+    ip.is_link_local()
+        || ip.octets()[0] == 0
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip == ALIBABA_METADATA
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,5 +973,151 @@ mod tests {
             assert_eq!(SessionRefusal::from_wire(r.wire()), Some(r));
         }
         assert_eq!(SessionRefusal::from_wire("teleported"), None);
+    }
+
+    /// P4-5 — WIRE LOCK: a probe's kinds and its outcomes. A kind this build
+    /// does not know reads as none, and an outcome a newer device sends, or
+    /// none, as `failed`.
+    #[test]
+    fn probe_words_are_locked() {
+        assert_eq!(ProbeKind::ALL.map(ProbeKind::as_str), ["tcp", "tls"]);
+        for k in ProbeKind::ALL {
+            assert_eq!(ProbeKind::from_word(k.as_str()), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), json!(k.as_str()));
+        }
+        assert_eq!(ProbeKind::from_word("http"), None);
+        for (o, w) in [
+            (ProbeOutcome::Ok, "ok"),
+            (ProbeOutcome::Unreachable, "unreachable"),
+            (ProbeOutcome::NotAllowed, "not_allowed"),
+            (ProbeOutcome::Failed, "failed"),
+        ] {
+            assert_eq!(o.as_str(), w);
+            assert_eq!(serde_json::to_value(o).unwrap(), json!(w));
+        }
+        #[derive(Deserialize)]
+        struct W {
+            #[serde(deserialize_with = "probe_outcome_lenient")]
+            o: ProbeOutcome,
+        }
+        for v in [json!({"o": "maybe"}), json!({"o": 1}), json!({"o": null})] {
+            let w: W = serde_json::from_value(v).unwrap();
+            assert_eq!(w.o, ProbeOutcome::Failed);
+        }
+    }
+
+    /// P4-5 — a probe's host is an address or a name, spelled one way, and
+    /// never something a resolver might read as an address in disguise.
+    #[test]
+    fn a_probes_host_is_an_address_or_a_name() {
+        for (raw, want) in [
+            ("10.0.4.12", "10.0.4.12"),
+            ("::1", "::1"),
+            ("2001:DB8::1", "2001:db8::1"),
+            ("DB-1.Acme.Internal", "db-1.acme.internal"),
+            ("api.example.com.", "api.example.com"),
+            ("localhost", "localhost"),
+            ("9lives.example", "9lives.example"),
+        ] {
+            assert_eq!(probe_host(raw).as_deref(), Some(want), "{raw}");
+        }
+        let long_label = format!("{}.example", "a".repeat(64));
+        let long_name = format!("{}example", "a.".repeat(130));
+        for bad in [
+            "",
+            "https://acme.test",
+            "acme.test:443",
+            "acme.test/x",
+            "a b",
+            "1.2.3",
+            "0x7f.1",
+            "2130706433",
+            "010.0.0.1",
+            "fe80::1%eth0",
+            "-x.acme.test",
+            "x-.acme.test",
+            "a..acme.test",
+            "ünï.acme.test",
+            "under_score.acme.test",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            assert_eq!(probe_host(bad), None, "{bad:?}");
+        }
+    }
+
+    /// P4-5 — link-local and the metadata addresses outside it are never
+    /// probed, nor an address that is no destination, nor any of them
+    /// carried in IPv6; loopback, private and public addresses are a list's
+    /// to decide.
+    #[test]
+    fn link_local_and_metadata_are_never_probed() {
+        for never in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            "febf::1",
+            "fd00:ec2::254",
+            "100.100.100.200",
+            "0.0.0.0",
+            "0.1.2.3",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+            "::ffff:169.254.169.254",
+            "::ffff:0.0.0.0",
+            "64:ff9b::a9fe:a9fe",
+        ] {
+            assert!(never_probed(never.parse().unwrap()), "{never}");
+        }
+        for listable in [
+            "127.0.0.1",
+            "::1",
+            "10.0.4.12",
+            "192.168.1.10",
+            "172.16.5.1",
+            "100.64.0.7",
+            "100.100.100.201",
+            "fd00:ec2::253",
+            "fec0::1",
+            "8.8.8.8",
+            "2001:db8::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::808:808",
+        ] {
+            assert!(!never_probed(listable.parse().unwrap()), "{listable}");
+        }
+    }
+
+    /// P4-5 — what a TLS probe read, as the server records it: its names in
+    /// lowercase and its fingerprint in one spelling; a field this build does
+    /// not know, too many names, a name holding a credential's shape or a
+    /// space, or a fingerprint that is no SHA-256, refused.
+    #[test]
+    fn a_tls_answer_is_read_in_one_spelling() {
+        let fp = "AB".repeat(32);
+        let colons = ["ab"; 32].join(":");
+        for raw in [fp.clone(), colons] {
+            let t = ProbeTls::read(
+                &json!({"names": ["API.Example.com", "10.0.0.1"], "fingerprint": raw}),
+            )
+            .unwrap();
+            assert_eq!(t.names, ["api.example.com", "10.0.0.1"]);
+            assert_eq!(t.fingerprint, "ab".repeat(32));
+        }
+        assert_eq!(fingerprint_hex(&"0".repeat(63)), None);
+        assert_eq!(fingerprint_hex(&"g".repeat(64)), None);
+        let leak = format!("https://dev:{}@x.example.com", "hunter2");
+        for bad in [
+            json!({"names": [], "fingerprint": fp, "chain": []}),
+            json!({"names": vec!["a.example.com"; probe_limits::MAX_TLS_NAMES + 1], "fingerprint": fp}),
+            json!({"names": [leak], "fingerprint": fp}),
+            json!({"names": ["a b"], "fingerprint": fp}),
+            json!({"names": [], "fingerprint": "md5:0123"}),
+            json!("tls"),
+        ] {
+            assert!(ProbeTls::read(&bad).is_err(), "{bad}");
+        }
     }
 }

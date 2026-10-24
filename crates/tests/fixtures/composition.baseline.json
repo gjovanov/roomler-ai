@@ -693,6 +693,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/knowhow/probe",
+      "methods": "GET,HEAD,POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/knowhow/scan",
       "methods": "GET,HEAD,POST"
     },
@@ -2030,6 +2034,47 @@
                 "$type": "objectId"
               }
             }
+          }
+        ]
+      },
+      {
+        "collection": "knowhow_probes",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "pending": true
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "entity_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "device_id": 1,
+              "state": 1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -4373,6 +4418,47 @@
         ]
       },
       {
+        "collection": "knowhow_probes",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "pending": true
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "entity_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "device_id": 1,
+              "requested_at": -1
+            }
+          },
+          {
+            "key": {
+              "device_id": 1,
+              "state": 1
+            }
+          },
+          {
+            "key": {
+              "requested_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "knowhow_scans",
         "indexes": [
           {
@@ -5855,6 +5941,7 @@
     "rc:knowhow.search",
     "rc:knowhow.get",
     "rc:knowhow.propose",
+    "rc:knowhow.probed",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5985,6 +6072,7 @@
     "rc:knowhow.card",
     "rc:knowhow.proposed",
     "rc:knowhow.refused",
+    "rc:knowhow.probe",
     "rc:pong",
     "rc:error",
     "rc:overlay.netmap"
@@ -6024,6 +6112,7 @@
     "rc:hive.view.ice": "hive",
     "rc:ice": "remote",
     "rc:knowhow.get": "knowhow",
+    "rc:knowhow.probed": "knowhow",
     "rc:knowhow.propose": "knowhow",
     "rc:knowhow.scanned": "knowhow",
     "rc:knowhow.search": "knowhow",
