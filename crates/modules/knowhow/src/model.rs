@@ -139,6 +139,9 @@ pub struct KnowhowEntity {
     /// P4-4-2 — the session whose proposal made it, for a session's entity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ObjectId>,
+    /// P4-4-3 — the person who confirmed a proposal, and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<Confirmed>,
     /// Bumped by every write; a write names the rev it read.
     pub rev: i64,
     #[serde(default)]
@@ -174,6 +177,9 @@ pub struct Fact {
     /// P4-4-2 — the session that proposed it, for a session's fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ObjectId>,
+    /// P4-4-3 — the person who confirmed a proposed fact, and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<Confirmed>,
     pub observed_at: DateTime,
     /// When a probe last confirmed it (P4-5).
     #[serde(default)]
@@ -203,6 +209,9 @@ pub struct KnowhowEdge {
     /// P4-4-2 — the session whose proposal made it, for a session's link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ObjectId>,
+    /// P4-4-3 — the person who confirmed a proposed link, and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<Confirmed>,
     pub rev: i64,
     #[serde(default)]
     pub created_by: Option<ObjectId>,
@@ -217,6 +226,14 @@ pub struct KnowhowEdge {
 
 impl KnowhowEdge {
     pub const COLLECTION: &'static str = "knowhow_edges";
+}
+
+/// P4-4-3 — a person's word on a proposal (decision 52): who confirmed it,
+/// and when, kept beside the session that proposed it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct Confirmed {
+    pub by: ObjectId,
+    pub at: DateTime,
 }
 
 /// What one write did, appended after it.
@@ -265,6 +282,8 @@ pub const TARGET_EDGE: &str = "edge";
 pub const OP_CREATE: &str = "create";
 pub const OP_UPDATE: &str = "update";
 pub const OP_ARCHIVE: &str = "archive";
+/// P4-4-3 — a person confirmed a proposal: it is believed from then on.
+pub const OP_CONFIRM: &str = "confirm";
 
 /// P4-3a — one scan asked of a device (the FR-90 spec, §3e "P4-3, scans, as
 /// designed"): who asked and when, where it is, and how it ended. The row is
@@ -609,6 +628,7 @@ pub fn merge_facts_from(
                     by: who.by,
                     device: who.device,
                     session: who.session,
+                    confirmed: None,
                     observed_at: now,
                     verified_at: None,
                     status: status.into(),
@@ -768,6 +788,7 @@ mod tests {
             by: None,
             device: None,
             session: None,
+            confirmed: None,
             observed_at: DateTime::from_millis(1),
             verified_at: Some(DateTime::from_millis(2)),
             status: status.into(),

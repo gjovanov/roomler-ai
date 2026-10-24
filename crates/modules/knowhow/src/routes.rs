@@ -16,6 +16,9 @@
 //! | `POST …/knowhow/edge` | link two | `KNOWHOW_EDIT` |
 //! | `PATCH …/knowhow/edge/{id}` | change a link's attributes, at its rev | `KNOWHOW_EDIT` |
 //! | `DELETE …/knowhow/edge/{id}?rev=` | archive a link | `KNOWHOW_EDIT` |
+//! | `POST …/knowhow/entity/{id}/confirm` | a person's word on a session's proposed entity, at its rev (P4-4-3) | `KNOWHOW_EDIT` |
+//! | `POST …/knowhow/entity/{id}/fact/confirm` | on one proposed fact, at its entity's rev | `KNOWHOW_EDIT` |
+//! | `POST …/knowhow/edge/{id}/confirm` | on a proposed link, at its rev | `KNOWHOW_EDIT` |
 //!
 //! `KNOWHOW_EDIT` includes reading: who may change the map may read it.
 //! Membership comes first, as everywhere: someone outside an organization
@@ -44,11 +47,11 @@ use crate::KnowhowState;
 use crate::dao::{MAX_EDGES, MAX_ENTITIES, Search};
 use crate::intake::{SCANNED_FACTS, SCANNED_MACHINE_FACTS};
 use crate::model::{
-    Fact, KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS, OP_ARCHIVE,
-    OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SYNC, STATUS_ACTIVE, STATUS_ARCHIVED,
-    SYNCED_KINDS, TARGET_EDGE, TARGET_ENTITY, check_attrs, check_edge_kind, check_env,
-    check_fact_path, check_fact_value, check_key, check_kind, check_kind_word, check_name,
-    merge_facts,
+    Confirmed, Fact, KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS,
+    OP_ARCHIVE, OP_CONFIRM, OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SYNC,
+    STATUS_ACTIVE, STATUS_ARCHIVED, STATUS_PROPOSED, SYNCED_KINDS, TARGET_EDGE, TARGET_ENTITY,
+    check_attrs, check_edge_kind, check_env, check_fact_path, check_fact_value, check_key,
+    check_kind, check_kind_word, check_name, merge_facts,
 };
 use crate::sync::SYNCED_FACTS;
 use crate::view::{CardView, EdgeView, EntityView, HistoryView, LinkView, NodeView};
@@ -647,6 +650,7 @@ pub async fn create_entity(
         source: SOURCE_PERSON.into(),
         device: None,
         session: None,
+        confirmed: None,
         rev: 1,
         created_by: Some(auth.user_id),
         created_at: now,
@@ -894,6 +898,7 @@ pub async fn create_edge(
         source: SOURCE_PERSON.into(),
         device: None,
         session: None,
+        confirmed: None,
         rev: 1,
         created_by: Some(auth.user_id),
         created_at: now,
@@ -999,4 +1004,157 @@ pub async fn archive_edge(
     );
     record(&state, vec![row]).await;
     Ok(Json(json!({ "archived": true })))
+}
+
+// ─── a person's word on a proposal (P4-4-3) ─────────────────────────────────
+
+/// `{rev}` — the rev a confirmation was asked against.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmBody {
+    pub rev: i64,
+}
+
+/// `{rev, path}` — a fact's confirmation, at its entity's rev.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmFact {
+    pub rev: i64,
+    pub path: String,
+}
+
+fn not_a_proposal(what: &str, status: &str) -> ApiError {
+    ApiError::Conflict(format!(
+        "only a proposal is confirmed: this {what} is {status}"
+    ))
+}
+
+/// `POST /api/tenant/{tenant_id}/knowhow/entity/{entity_id}/confirm` — a
+/// person's word on a session's proposed entity (decision 52): `active` from
+/// now on, who confirmed it and when kept beside the session that proposed
+/// it, at the rev it was read. Its facts are each confirmed on their own:
+/// a reviewer may believe the database and doubt its port. Rejecting a
+/// proposal is archiving it.
+pub async fn confirm_entity(
+    State(state): State<KnowhowState>,
+    auth: AuthUser,
+    Path((tenant_id, entity_id)): Path<(String, String)>,
+    Json(body): Json<ConfirmBody>,
+) -> Result<Json<EntityView>, ApiError> {
+    let tid = writer(&state, &tenant_id, &auth).await?;
+    let id = parse_id(&entity_id, "entity_id")?;
+    let current = live_entity(&state, tid, id).await?;
+    if current.status != STATUS_PROPOSED {
+        return Err(not_a_proposal("entity", &current.status));
+    }
+    if current.rev != body.rev {
+        return Err(stale("entity", body.rev));
+    }
+    let stamp = Stamp::person(tid, auth.user_id);
+    let mut set = doc! {
+        "status": STATUS_ACTIVE,
+        "confirmed": confirmed_bson(auth.user_id, stamp.at)?,
+    };
+    set.extend(stamp.touched());
+    let Some(after) = state.entities.update_at(tid, id, body.rev, set).await? else {
+        return Err(stale("entity", body.rev));
+    };
+    let row = stamp.row(
+        TARGET_ENTITY,
+        id,
+        vec![id],
+        after.rev,
+        OP_CONFIRM,
+        doc! { "status": STATUS_ACTIVE },
+    );
+    record(&state, vec![row]).await;
+    Ok(Json(EntityView::of(&after)))
+}
+
+/// `POST /api/tenant/{tenant_id}/knowhow/entity/{entity_id}/fact/confirm` —
+/// a person's word on one proposed fact, at its entity's rev: `active`, with
+/// who confirmed it and when. Its entity is left as it is. Rejecting one is
+/// removing it (`PATCH` with the path set to null).
+pub async fn confirm_fact(
+    State(state): State<KnowhowState>,
+    auth: AuthUser,
+    Path((tenant_id, entity_id)): Path<(String, String)>,
+    Json(body): Json<ConfirmFact>,
+) -> Result<Json<EntityView>, ApiError> {
+    let tid = writer(&state, &tenant_id, &auth).await?;
+    let id = parse_id(&entity_id, "entity_id")?;
+    let current = live_entity(&state, tid, id).await?;
+    let Some(at) = current.facts.iter().position(|f| f.path == body.path) else {
+        return Err(ApiError::NotFound("no fact at that path".into()));
+    };
+    if current.facts[at].status != STATUS_PROPOSED {
+        return Err(not_a_proposal("fact", &current.facts[at].status));
+    }
+    if current.rev != body.rev {
+        return Err(stale("entity", body.rev));
+    }
+    let stamp = Stamp::person(tid, auth.user_id);
+    let mut facts = current.facts.clone();
+    facts[at].status = STATUS_ACTIVE.into();
+    facts[at].confirmed = Some(Confirmed {
+        by: auth.user_id,
+        at: stamp.at,
+    });
+    let mut set = doc! { "facts": facts_bson(&facts)? };
+    set.extend(stamp.touched());
+    let Some(after) = state.entities.update_at(tid, id, body.rev, set).await? else {
+        return Err(stale("entity", body.rev));
+    };
+    let said = doc! { "facts": [{ "path": body.path.as_str(), "status": STATUS_ACTIVE }] };
+    let row = stamp.row(TARGET_ENTITY, id, vec![id], after.rev, OP_CONFIRM, said);
+    record(&state, vec![row]).await;
+    Ok(Json(EntityView::of(&after)))
+}
+
+/// `POST /api/tenant/{tenant_id}/knowhow/edge/{edge_id}/confirm` — a person's
+/// word on a proposed link, at its rev. Rejecting one is archiving it.
+pub async fn confirm_edge(
+    State(state): State<KnowhowState>,
+    auth: AuthUser,
+    Path((tenant_id, edge_id)): Path<(String, String)>,
+    Json(body): Json<ConfirmBody>,
+) -> Result<Json<EdgeView>, ApiError> {
+    let tid = writer(&state, &tenant_id, &auth).await?;
+    let id = parse_id(&edge_id, "edge_id")?;
+    let current = state
+        .edges
+        .get_live(tid, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("no such link".into()))?;
+    if current.status != STATUS_PROPOSED {
+        return Err(not_a_proposal("link", &current.status));
+    }
+    if current.rev != body.rev {
+        return Err(stale("link", body.rev));
+    }
+    let stamp = Stamp::person(tid, auth.user_id);
+    let set = doc! {
+        "status": STATUS_ACTIVE,
+        "confirmed": confirmed_bson(auth.user_id, stamp.at)?,
+        "updated_by": stamp.by,
+        "updated_at": stamp.at,
+    };
+    let Some(after) = state.edges.update_at(tid, id, body.rev, set).await? else {
+        return Err(stale("link", body.rev));
+    };
+    let ends = vec![after.from, after.to];
+    let row = stamp.row(
+        TARGET_EDGE,
+        id,
+        ends,
+        after.rev,
+        OP_CONFIRM,
+        doc! { "status": STATUS_ACTIVE },
+    );
+    record(&state, vec![row]).await;
+    Ok(Json(EdgeView::of(&after)))
+}
+
+fn confirmed_bson(by: ObjectId, at: bson::DateTime) -> Result<Bson, ApiError> {
+    bson::to_bson(&Confirmed { by, at }).map_err(|e| ApiError::Internal(e.to_string()))
 }

@@ -665,12 +665,24 @@
       "methods": "DELETE,PATCH"
     },
     {
+      "path": "/api/tenant/{tenant_id}/knowhow/edge/{edge_id}/confirm",
+      "methods": "POST"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/knowhow/entity",
       "methods": "GET,HEAD,POST"
     },
     {
       "path": "/api/tenant/{tenant_id}/knowhow/entity/{entity_id}",
       "methods": "DELETE,GET,HEAD,PATCH"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/entity/{entity_id}/confirm",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/knowhow/entity/{entity_id}/fact/confirm",
+      "methods": "POST"
     },
     {
       "path": "/api/tenant/{tenant_id}/knowhow/history",

@@ -22,9 +22,9 @@ sessions read it too, through their toolbelt.
 > believed from its record and held to its starter's `KNOWHOW_VIEW` (§12),
 > asked through the toolbelt's `knowhow_search` and `knowhow_get` (§12.1); and
 > P4-4-2, a session's proposals, made through the toolbelt's
-> `knowhow_propose`, written `proposed` and naming the session (§12.2).**
-> People, the sync, scans and sessions' proposals fill the map. Windows
-> (P4-3b-4), a person's word on a proposal (P4-4-3), probes (P4-5) and
+> `knowhow_propose`, written `proposed` and naming the session (§12.2); and
+> P4-4-3, a person's word on a proposal (§12.3).** People, the sync, scans
+> and sessions' proposals fill the map. Windows (P4-3b-4), probes (P4-5) and
 > `roomler_connect` (P4-6) come with the steps that build them (§13).
 
 ## 1. A map, not a gate
@@ -71,12 +71,13 @@ An **entity** is one thing the organization has
 | `source` | where it came from: `person`, `sync` (§10), `scan` (§11.1) or `session` (§12.2) |
 | `device` | for a scan's own entity, the device whose scans made it, keep it and retire it (§11.1); absent otherwise |
 | `session` | for a session's proposal, the session that made it (§12.2); absent otherwise |
+| `confirmed` | P4-4-3, for a confirmed proposal: `{by, at}`, the person who confirmed it and when (§12.3), shown as `confirmed_by` and `confirmed_at` |
 | `rev` | bumped by every write. A write names the rev it read (§3) |
 
 Kinds: `machine`, `repo`, `checkout`, `database`, `cluster`, `namespace`,
 `service`, `endpoint`, `bucket`, `cloud_account`, `domain`, `environment`,
 `team`, `doc`. An **edge** relates two entities, `from` `kind` `to`
-([`model.rs:188`](../crates/modules/knowhow/src/model.rs#L188)), its
+([`model.rs:194`](../crates/modules/knowhow/src/model.rs#L194)), its
 kind one of `runs_on`, `checked_out_at`, `deployed_to`, `depends_on`, `reads`,
 `writes`, `part_of`, `owned_by`, `documented_in`, `authenticates_with`,
 `reachable_via`, with attributes of its own (up to 4 KiB). No rule pairs an
@@ -92,19 +93,20 @@ flowchart LR
 ```
 
 A **fact** is a path, a value and where the value came from
-([`model.rs:163`](../crates/modules/knowhow/src/model.rs#L163)):
+([`model.rs:166`](../crates/modules/knowhow/src/model.rs#L166)):
 
 | Field | Meaning |
 |---|---|
 | `path` | `[a-z0-9]` then `[a-z0-9._-]`: `port`, `tls.fingerprint`. Stored beside the value, never as a key in the document, so a `.` is safe |
 | `value` | any JSON but null, up to 2 KiB |
 | `source`, `by`, `device`, `session` | `person` and who; `sync`, with nobody; `scan` and its device (§11.1); or `session` and the session that proposed it (§12.2) |
+| `confirmed` | for a proposed fact a person confirmed: who, and when (§12.3) |
 | `observed_at`, `verified_at` | when it was said; when a probe last confirmed it (P4-5) |
 | `status` | `active` for a person's, the sync's and a scan's. A session's is `proposed` until a probe or a person confirms it (decision 39, §12.2) |
 
 > [!IMPORTANT]
 > **A person's change to one fact never restamps another**
-> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L553)). An
+> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L572)). An
 > update names facts by path: a value sets that fact, as the caller's; null
 > removes it; a fact it does not name keeps who said it, from where and when,
 > and so does one set to the value it already holds while active. Restamping
@@ -131,7 +133,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Four collections, per organization
-([`lib.rs:234`](../crates/modules/knowhow/src/lib.rs#L234)):
+([`lib.rs:240`](../crates/modules/knowhow/src/lib.rs#L240)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -190,7 +192,7 @@ because a card and a neighbourhood show only the links whose other end is live.
 `knowhow.tenants` reads like `vault.tenants`: empty or `*` is every
 organization, and an entry that is not an organization id matches nothing
 ([`scope.rs`](../crates/modules/knowhow/src/scope.rs)). Every route checks, in
-this order ([`routes.rs:75`](../crates/modules/knowhow/src/routes.rs#L75)):
+this order ([`routes.rs:78`](../crates/modules/knowhow/src/routes.rs#L78)):
 
 1. **membership**: someone outside the organization is told `403 not_a_member`,
    and so learns nothing about whether its map is kept;
@@ -242,13 +244,16 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | POST | `/edge` | `{from, to, kind, attrs?}`: two live entities of the organization → **201**. **409** when they are already linked by that kind; **400** for a link to itself | `KNOWHOW_EDIT` |
 | PATCH | `/edge/{id}` | `{rev, attrs}`: its attributes, replaced. Its ends and kind never change: a different link is archived and made again | `KNOWHOW_EDIT` |
 | DELETE | `/edge/{id}?rev=…` | archive the link | `KNOWHOW_EDIT` |
+| POST | `/entity/{id}/confirm` | P4-4-3, a person's word on a session's proposed entity (§12.3): `{rev}` → **200**, `active`, with `confirmed_by` and `confirmed_at`. **409** for one that is no proposal or at a rev already gone. Its facts are each confirmed on their own | `KNOWHOW_EDIT` |
+| POST | `/entity/{id}/fact/confirm` | `{rev, path}`: one proposed fact, at its entity's rev → **200**. **404** for a path no fact holds, **409** for a fact that is no proposal or a rev already gone | `KNOWHOW_EDIT` |
+| POST | `/edge/{id}/confirm` | `{rev}`: a proposed link → **200**, as an entity's | `KNOWHOW_EDIT` |
 | POST | `/scan` | `{device}`: ask a device to scan (§11) → **202** with the scan, or the device's pending one. **409** for a device that cannot scan or is a secondary enrollment; **404** for one that is not the organization's | `KNOWHOW_EDIT` |
 | GET | `/scan?device=…` | a device's scans, newest first: `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts, truncated?, detail?}]}`; `?limit=` 1–200 | `KNOWHOW_VIEW` |
 
 ## 7. A neighbourhood
 
 The map route walks the links both ways, one step at a time
-([`routes.rs:462`](../crates/modules/knowhow/src/routes.rs#L462)). Each step
+([`routes.rs:465`](../crates/modules/knowhow/src/routes.rs#L465)). Each step
 is one indexed read of the live links from or to the step's entities, at most
 500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L265)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
@@ -271,14 +276,15 @@ stops there.
 
 ## 8. History
 
-One row per write ([`model.rs:224`](../crates/modules/knowhow/src/model.rs#L224)):
+One row per write ([`model.rs:241`](../crates/modules/knowhow/src/model.rs#L241)):
 
 | Field | Meaning |
 |---|---|
 | `target`, `target_id` | `entity` or `edge`, and which |
 | `entity_ids` | the entity, or the link's two ends: an entity's history is read by it, so a link made or archived shows in the history of both its ends |
-| `rev`, `op` | the rev the write made; `create`, `update` or `archive` |
+| `rev`, `op` | the rev the write made; `create`, `update`, `archive`, or (P4-4-3) `confirm`, a person's word on a proposal |
 | `source`, `by`, `at` | `person` and who, in P4-1; when |
+| `session`, `why` | P4-4-2: the session whose proposal wrote, and why it proposed (§12.2); absent otherwise |
 | `set` | what the write set: a create's whole body, an update's changed fields (facts as `{path, value}` rows, a null value for one removed), an archive's status and, for a link an entity's archive took, `cause: entity_archived` |
 
 The history is kept as long as the map: a fact's provenance may be asked for
@@ -350,13 +356,13 @@ edge (FR-69's rule 5).
 > its owner or a synced fact is refused **400**, because the next sync would undo it. So is
 > archiving a machine, which leaves the map when its device is removed. A person may give a
 > machine an environment, attributes and facts of their own, and every sync leaves those as
-> they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L184)).
+> they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L187)).
 
 > [!NOTE]
 > **A machine keeps room for the sync's facts.** An entity holds at most 64 facts, and the
 > sync owns 14 of a machine's paths and its scans one more (§11.1), so a person's own facts on
 > a machine stop at 49
-> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L247)), and no sync
+> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L250)), and no sync
 > takes a machine past 64. An edit that adds none of a person's still passes, so a machine
 > that a newly synced path left past its room can still be tidied.
 
@@ -572,7 +578,7 @@ person (`by`), as do its history rows. A shared repository or cluster is a scan'
 > a repository or a cluster that does not exist.
 
 **A later scan replaces its device's part**
-([`retire`](../crates/modules/knowhow/src/intake.rs#L678)):
+([`retire`](../crates/modules/knowhow/src/intake.rs#L681)):
 
 | The answer | Archives |
 |---|---|
@@ -953,12 +959,46 @@ proposals are counted one at a time.
 | `full` | the map, or the entity, has no room | once there is room |
 | `ceiling` | the session made its 50 | will not help |
 
+### 12.3 A person's word on a proposal (P4-4-3)
+
+A proposal stays `proposed` until a person confirms it, or a probe does
+(P4-5). Decision 52 as recommended: the person is one holding
+`KNOWHOW_EDIT`, decision 36's writer, through three routes (§6):
+
+```mermaid
+sequenceDiagram
+    participant S as a session (its toolbelt)
+    participant K as knowhow
+    participant P as a person with KNOWHOW_EDIT
+    S->>K: knowhow_propose (§12.2)
+    K-->>P: shown proposed, naming the session, with its why (the card, the history)
+    P->>K: POST …/entity/{id}/confirm {rev}, …/fact/confirm {rev, path}, or …/edge/{id}/confirm {rev}
+    K->>K: proposed? at that rev? then active, confirmed {by, at}, history op confirm
+    K-->>P: the entity or link, as it is now
+```
+
+| Word | What it does |
+|---|---|
+| confirm an entity | `active` from now on, its `confirmed` set to who and when, at the rev it was read. Its facts are each confirmed on their own: a reviewer may believe the database and doubt its port |
+| confirm a fact | one proposed fact, by its path, at its entity's rev: `active`, with its own `confirmed`. Its entity is left as it is, so a person's entity stays the person's |
+| confirm a link | as an entity, at the link's rev |
+| reject | what the routes already do: archive a proposed entity or link (`DELETE`), remove a proposed fact (`PATCH` with its path set to null) |
+
+What was proposed keeps naming its session after it is confirmed, so the
+card says both who proposed it and who believed it. The history's `confirm`
+row is the person's (`source: person`, `by`), never the session's. Only a
+proposal is confirmed: anything else is **409**, as a rev already gone is.
+
+> [!NOTE]
+> **Confirming changes nothing that decides a reach.** The map is still not a
+> gate (§1): a confirmed fact tells the next session where to look, and the
+> vault, the network and each device decide every reach as before.
+
 ## 13. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-4-3 | a person's word on a proposal: confirmed with who and when, or rejected as the routes already archive (decision 52) |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
