@@ -999,7 +999,7 @@ proposal is confirmed: anything else is **409**, as a rev already gone is.
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
+| P4-5 | verification, as the FR-90 spec's §3e "P4-5, verification, as designed" says (decisions 53–56): a probe asked of a device, which reaches only what its owner lists in `knowhow_probe_reach`, `tcp` and `tls` alone; `verified` on the facts it measured, a proposed fact it found as it says turned `active`; `knowhow_verify` asking a person each call; staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |

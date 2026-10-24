@@ -3106,7 +3106,10 @@ sequenceDiagram
 | P4-4-2a | `knowhow_propose`, the server's half, as decisions 39, 50 and 51 say: `rc:knowhow.propose` answered by an entity, a fact or a link written `proposed`, naming its session, within a ceiling; never into a device's part of the map | the same | — |
 | P4-4-2b | `knowhow_propose`, the device's half: the toolbelt's tool, offered when the server names it, its client and its settings | the same; no tool without `rc:knowhow.served` naming it | — |
 | P4-4-3 | a person's word on a proposal (decision 52): confirmed, with who and when, or rejected as the routes already archive | the same | — |
-| P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says | the same | — |
+| P4-5-0 | verification, as designed (§3e "P4-5, verification, as designed"), and decisions 53–56 | docs only | — |
+| P4-5-1a | the server's half: `POST …/knowhow/probe {entity, device, kind}` (`KNOWHOW_EDIT`), the target read from the entity's facts, `knowhow_probes` as the bus, `rc:knowhow.probe` and `.probed`, `verified` on the facts measured, a proposed fact a probe found as it says turned `active` (decision 56), and the staleness sweep (decision 40) | `[modules] knowhow`; `knowhow.stale_days` | — |
+| P4-5-1b | the device's half: `knowhow_probe_reach` (device-owned, live, absent from `DesiredConfig`), the probe as decision 55 says, resolved, checked and connected to what was checked, link-local never, the verb `knowhow-probe` | the same; device `knowhow_probe_reach` empty | — |
+| P4-5-2 | `knowhow_verify` in the toolbelt: a probe from the session's own device, the settings asking a person each call (decision 54) | the same; no tool without `rc:knowhow.served` naming it | — |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving | the same; the vault's own gates | AC15 ("through the mesh") |
 | P4-7 | the map in the web app | the SPA | — |
 | P4-8 | chips: `#` in the composer, the MCP resource, the terminal's hook | the same | — |
@@ -3308,6 +3311,61 @@ sequenceDiagram
 - **Not in P4-4:** `knowhow_neighbors` (the map route's neighbourhood: a card already holds its
   links); probes (P4-5); a person proposing through the routes (P4-7's map); a proposal's own
   expiry; a proposal replacing a fact (P5's contradiction cards).
+
+**P4-5, verification, as designed (P4-5-0).** A probe is the server's request and a device's
+answer, as a scan is: a device tries to reach one thing the map says is there, and what it
+measured is recorded on the facts it measured. What a probe may reach is the device's own
+decision (decision 53), since a probe leaves from inside whatever network the device sits in:
+on a corporate laptop, the corporate network. A fact no probe or person has confirmed for a
+while turns `stale` (decision 40).
+
+```mermaid
+sequenceDiagram
+    participant P as a person (KNOWHOW_EDIT), or a session (knowhow_verify)
+    participant K as knowhow
+    participant M as knowhow_probes
+    participant D as the device (roomlerd)
+    P->>K: probe {entity, device, kind}
+    K->>K: the target from the entity's facts (host, port, sni)
+    K->>M: a probe, requested
+    K->>D: rc:knowhow.probe {probe_id, kind, host, port, sni?}
+    D->>D: is it within knowhow_probe_reach? resolve, check every address, then connect
+    D->>K: rc:knowhow.probed {probe_id, outcome, rtt_ms?, tls?}
+    K->>K: verified {at, from_device, rtt_ms, carrier, ok} on the facts it measured
+```
+
+| Piece | Design |
+|---|---|
+| who asks | decision 54: a person with `KNOWHOW_EDIT`, for a live device of the organization, as a scan is asked (decision 41): `POST /api/tenant/{tid}/knowhow/probe {entity, device, kind}` → **202** `{probe}`; and, from P4-5-2, a session through the toolbelt's `knowhow_verify`, from its own device only, the settings asking a person each call as they ask for `net_socks` and `ssh_run` (`docs/hive.md`) |
+| the target | read by the server from the entity's own facts, never from the request: `address` (or `host`) and `port`, and for `tls` a server name (`sni`, or the host). An entity with no such facts is **400**. So a probe can only test what the map already says, and a request cannot aim a device anywhere else |
+| what a device may reach | decision 53: the device's own `knowhow_probe_reach`, an allowlist in the `forward_acl` entry's shape (a host pattern, a port range, `tcp`), empty by default, which means nowhere, the sense SSH's `direct-tcpip` gives an empty list (`docs/roomler-ssh.md`). Device-owned, live, absent from `DesiredConfig`, as `knowhow_scan_roots` is. Link-local addresses (`169.254.0.0/16`, `fe80::/10`: cloud metadata) are never probed, whatever the list says. The device resolves a name itself, checks every address it resolved, and connects only to an address it checked, so a name that resolves elsewhere by the time of the connect reaches nothing |
+| what a probe is | decision 55: `tcp`, a connect and its round trip, then a close; `tls`, a handshake with the server name, the leaf certificate's names and its SHA-256 fingerprint, then a close. No byte of payload, no client certificate, no credential, 10 s at most. Probes that need a credential (`SELECT 1` through `vault_connect`, `kubectl version`) wait for P4-6, which asks the vault for each |
+| the frames | `rc:knowhow.probe {probe_id, kind, host, port, sni?}` to the device and `rc:knowhow.probed {probe_id, outcome, rtt_ms?, tls?: {names, fingerprint}, detail?}` from it, owned by `knowhow`. `outcome` is `ok`, `unreachable`, `not_allowed` (outside the device's list, or link-local) or `failed`. The verb `knowhow-probe`, an `RpcCap` matched whole, on a device's primary enrollment only (decision 43's rule) |
+| the delivery | as a scan's: the row is the bus (`knowhow_probes`), each pod tells the devices connected to it, a compare-and-set from `requested` to `delivered` before each push, answered once. One probe at a time a device, 30 a minute; an unanswered one expires after 10 minutes |
+| the record | `knowhow_probes`, one row a request: the entity, the device, who asked (a person, or a session), the target as the server read it, the kind, `requested` → `delivered` → `ok` · `unreachable` · `not_allowed` · `failed`, or `expired`; the round trip and what TLS showed. Kept 90 days. A person reads an entity's probes, so "the device may not reach it" and "it did not answer" are two states on screen |
+| what it records | `verified {at, from_device, rtt_ms, carrier, ok}` on each fact it measured: `address`/`host` and `port` for any probe; `tls.names` and `tls.fingerprint` for `tls`, compared with what the facts say. The carrier says how the device reached it: `direct`, or `overlay` for an address in the organization's mesh |
+| what it confirms | decision 56: only what it measured. A proposed fact a probe measured and found as it says turns `active`, `verified` naming the probe (P4-4-3's `confirmed` stays a person's). A failed or different probe never changes a fact: it records `ok: false` (and what TLS showed), and the fact keeps its status |
+| staleness | decision 40 as recommended: `knowhow.stale_days` (30 by default), and a sweep that turns a fact not confirmed by a probe or a person for that long `stale`, its age from its last `verified.at` with `ok`, or its `observed_at`. A synced fact never turns stale. A new probe that finds it as it says, or a person's confirmation, makes it `active` again |
+| the kill switches | `knowhow.tenants`; `[modules] knowhow`; the device's `knowhow_probe_reach`, empty by default |
+
+- ⚠️ **A probe target is data someone wrote.** A person, the sync, a scan or a session's proposal
+  put the address on the map, so a probe is never aimed by the map alone. The device's owner
+  lists what may be reached, and the list is empty until they do. A server-pushed probe target is a
+  port scanner run by every device in the organization as SYSTEM or root
+  (`docs/peer-relays.md`), and `169.254.169.254:80` must never get through.
+- ⚠️ **Connect, never converse.** A probe sends nothing past a TLS ClientHello and reads nothing
+  past the server's certificate: no banner, no request, no credential. What it learns is whether
+  the address answers, and what certificate it presents.
+- ⚠️ **Resolve, check, then connect to what was checked.** A name is resolved on the device, and
+  every address is held to the list and the link-local rule before the connect, which goes to that
+  address, so a name that resolves elsewhere by the time of the connect reaches nothing.
+- ⚠️ **Still a map, not a gate.** A verified fact tells the next session where to look, and the
+  vault, the network and each device decide every reach as before. P4-6's `roomler_connect` asks
+  the vault and a person, whatever the map says.
+- **Not in P4-5:** credentialed probes (P4-6); a cadence (as decision 44 for scans: a probe runs
+  when asked); probing from a device other than the session's own through `knowhow_verify`; a
+  probe writing a fact it found that the map did not hold (a mismatch is recorded on the probe,
+  never written over the fact).
 
 ### 3f. The brain
 
@@ -3704,7 +3762,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P4-4-1b | the toolbelt's reads, the device's half (`docs/knowhow.md` §12.1): a client on the primary's connection (a `req_id` a question, 15 s each); the server's word kept from `rc:knowhow.served` on, each tool only when this build knows it, and forgotten at every primary connection; `knowhow_search` and `knowhow_get` in the toolbelt, offered at a run's launch and fixed for it, listed only as the server named them and called on a branch of their own, each argument checked before anything is asked; the session's settings allow exactly the tools offered (decision 39); `knowhow-tools` advertised by every build that runs sessions | the same; no tool without `rc:knowhow.served` | **merged** #2813 `ab3825111` |
 | P4-4-2a | `knowhow_propose`, the server's half (`docs/knowhow.md` §12.2), decisions 50 and 51 as recommended. The wire: `rc:knowhow.propose {req_id, session_id, fence, proposal, why}` (a bare one still decodes, so it is answered `bad_request`), `rc:knowhow.proposed {req_id, what, id, left}`, five more refusal words (`exists`, `reserved`, `refused`, `full`, `ceiling`), `knowhow_propose` named in `rc:knowhow.served`, and the bounds (50 proposals a session, a `why` of 500 characters). The server: believed as a question is; one of an entity, a fact at a free path of a live entity, or a link between two live entities, held as a person's write is; refused whole on a credential's shape in any of its text or its `why`; never a device's part (a machine, a key in a scan's shape, a path the fleet or a scan keeps, a link a scan makes: `checked_out_at` and `part_of` from a scan's checkout, `runs_on` from its endpoint, a cluster `reachable_via` a machine); nothing there already; written `proposed`, source `session`, the session on the row, each fact and the history row, the `why` on the history row; the ceiling counted from the history through a partial index on `{tenant_id, session}`. The device knows the five words in words of its own | the same | **merged** #2823 `bdee9d4c3` |
 | P4-4-2b | `knowhow_propose`, the device's half (`docs/knowhow.md` §12.1), decision 39 as recommended: the toolbelt's third knowhow tool, known to this build and so kept from `rc:knowhow.served` when the server names it, offered at a run's launch and allowed in its settings (no person a call). Its arguments checked before anything is asked: exactly one of `entity`, `fact` or `link`, an object, and a `why` of at most 500 characters. Carried as `rc:knowhow.propose` on the primary's connection, the session and its fence attached by the daemon; `rc:knowhow.proposed` read back as what was written, its id, `proposed`, and the proposals left. One asked and never answered may have been written all the same, and the model is told so | the same; no tool without `rc:knowhow.served` naming it | **merged** #2824 `806ab3333` |
-| P4-4-3 | a person's word on a proposal (`docs/knowhow.md` §12.3), decision 52 as recommended: one holding `KNOWHOW_EDIT` confirms a session's proposed entity (`POST …/entity/{id}/confirm {rev}`), one proposed fact by its path (`…/fact/confirm {rev, path}`) or a proposed link (`…/edge/{id}/confirm {rev}`), each a compare-and-set at its rev. It turns `active`, `confirmed: {by, at}` kept beside the session that proposed it, and the history says `confirm`, as the person's. An entity's facts are confirmed each on its own; a person's entity stays the person's. What is no proposal, or a rev already gone, is **409**. Rejecting is what the routes already do (archive, or remove a fact) | the same | **in review** |
+| P4-4-3 | a person's word on a proposal (`docs/knowhow.md` §12.3), decision 52 as recommended: one holding `KNOWHOW_EDIT` confirms a session's proposed entity (`POST …/entity/{id}/confirm {rev}`), one proposed fact by its path (`…/fact/confirm {rev, path}`) or a proposed link (`…/edge/{id}/confirm {rev}`), each a compare-and-set at its rev. It turns `active`, `confirmed: {by, at}` kept beside the session that proposed it, and the history says `confirm`, as the person's. An entity's facts are confirmed each on its own; a person's entity stays the person's. What is no proposal, or a rev already gone, is **409**. Rejecting is what the routes already do (archive, or remove a fact) | the same | **merged** #2825 `705f69256` |
+| P4-5-0 | verification, as designed (§3e "P4-5, verification, as designed"), docs only: a probe as a scan is, the server's request and a device's answer, with `knowhow_probes` as the bus; the target read from the entity's own facts, never from the request; what a device may reach its owner's device-owned list, empty by default, link-local never, a name resolved and every address checked before the connect; `tcp` and `tls` alone, no payload, no credential; `verified` recorded on the facts measured, a proposed fact a probe found as it says turned `active`; `knowhow_verify` asking a person each call; staleness as decision 40 recommends. Poses decisions 53–56 | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -4731,6 +4790,51 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Or: the session's starter, for their own sessions' proposals.*
       - What it costs: a model's claim becomes a fact on one person's word, the person whose
         session made it.
+53. **What a device may probe** (P4-5), for the operator to confirm (posted in step 243).
+    - *Recommended: what its owner lists in a device-owned `knowhow_probe_reach`*, an allowlist
+      in the `forward_acl` entry's shape, empty by default and so nowhere. Link-local addresses
+      are never probed, whatever it says. A probe leaves from inside the device's network, so the
+      owner decides, as they decide SSH's `direct-tcpip`.
+      - What it costs: no probe runs until an owner lists what may be reached, and an owner keeps
+        one more list.
+    - *Or: the device's `forward_acl` itself*, one list for SSH forwards and probes.
+      - What it costs: consenting to probes would consent to SSH forwards to the same places,
+        and a probe carries no bytes where a forward carries any.
+    - *Or: any public address* (`is_global_unicast`, as peer relays' static endpoints), with no
+      list.
+      - What it costs: nothing on a private network is verified, which is most of what a map of
+        an organization's infrastructure holds.
+54. **Who may ask a device to probe** (P4-5), for the operator to confirm (posted in step 243).
+    - *Recommended: a person with `KNOWHOW_EDIT`, as a scan is asked (decision 41); and a
+      session through `knowhow_verify`, from its own device, the settings asking a person each
+      call*, as they ask for the session's egress (`net_socks`, `ssh_run`).
+      - What it costs: a session cannot verify what it proposed without a person's word at that
+        moment.
+    - *Or: persons alone*, no `knowhow_verify`.
+      - What it costs: a session's proposals wait for a person to probe them.
+    - *Or: a session's `knowhow_verify` with no person asked*, within the device's list.
+      - What it costs: a model aims connections from the device at whatever the list allows,
+        unwatched.
+55. **What a probe is** (P4-5), for the operator to confirm (posted in step 243).
+    - *Recommended: `tcp` (a connect and its round trip) and `tls` (a handshake: the leaf
+      certificate's names and SHA-256 fingerprint)*, no payload, no credential. Probes that need a
+      credential wait for P4-6, which asks the vault for each.
+      - What it costs: a database or a cluster is verified as reachable, not as answering.
+    - *Or: those and an HTTP `HEAD` of a service's URL.*
+      - What it costs: a request a server logs and may act on, sent on the map's word.
+    - *Or: `tcp` alone.*
+      - What it costs: a certificate's names and fingerprint, the strongest evidence a probe can
+        gather without a credential, go unchecked.
+56. **What a probe confirms** (P4-5), for the operator to confirm (posted in step 243).
+    - *Recommended: only what it measured.* A proposed fact a probe found as it says turns
+      `active`, `verified` naming the probe; a failed or different probe records `ok: false` on
+      the fact and changes nothing else.
+      - What it costs: a proposed entity whose facts all verify still waits for a person's word
+        on the entity itself.
+    - *Or: the entity with its facts*, when every fact a probe measured verifies.
+      - What it costs: a model's claim that a thing exists becomes active on its port answering.
+    - *Or: nothing*: a probe records, and only a person confirms.
+      - What it costs: decision 39's "until a probe confirms it" never happens.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
