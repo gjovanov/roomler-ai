@@ -1095,6 +1095,10 @@ only from the bell. The server's warning says `owner cannot approve`
 ([`:254`](../crates/modules/fleet/src/consent_consumer.rs#L254)), and that is
 wrong whenever the in-app leg reaches them. Measured on roomler.ai on 2026-10-23:
 no push service, and the owner approved through the bell (the FR-27 log).
+roomler.ai has had a push service since 2026-10-24, and a browser **opts in**
+through the notification panel's *Turn on* (#2817); a page load never prompts.
+A card's click opens its `/consent/<token>` page in a window of its own (#2827):
+the first roomler window may be the very viewer waiting on that answer.
 
 **The controller is told who is asked (#2810).** `rc:session.created` carries
 `consent_asks` from the mode the hub resolved:

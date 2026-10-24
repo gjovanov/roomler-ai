@@ -359,9 +359,10 @@ Ticked only where a run is recorded in the field log below.
       - `auto`: no surface (the controls in the 2026-10-23 log).
       - `prompt`: the Windows native panel (0.4.16); the companion's panel on GNOME
         Wayland (2026-10-23).
-      - `push`: the owner's in-app notification and its `/consent/<token>` page.
-        This deployment has no push service (`vapid_public_key` is empty), so there
-        is no web-push card to measure (2026-10-23).
+      - `push`: the owner's in-app notification and its `/consent/<token>` page
+        (2026-10-23, while the deployment had no push service). Since 2026-10-24
+        there is also the **web-push card**: a browser that opted in showed it
+        seconds after the request (the 2026-10-24 log).
       - `email`: the owner's real inbox. SendGrid sent it, the owner confirmed it
         arrived, the email's link opened `/consent/<token>` with no referrer, and
         Approve connected the session (2026-10-24). An unanswered run timed out at
@@ -1127,3 +1128,26 @@ The same box (`native=false`: the companion is the surface). The operator approv
 - Each request appeared **twice**: in the companion's prompt window AND as a modal in its main window. Both close on one answer. On 10-23 the main window was centred, so its modal sat exactly under the prompt window and nobody saw two.
 - The exec prompt reads "On behalf of **primary**", where the RC prompt said the org's name.
 - The SSH prompt's requester line is a raw `ssh:…@ip:port`.
+
+### 2026-10-24 — `push` with its web-push card (API `hosted-20261024-9867bb4`)
+
+**Push went live on roomler.ai today, approved by the operator:**
+- VAPID keys were sealed into `roomler2-secret` (deploy #47) and applied by a rollout restart at 10:49Z.
+- That happened only after #2818 had made push an opt-in (#2817). Before it, the app asked every signed-in user for notification permission on page load.
+
+**The opt-in:**
+- A fresh load made no prompt and no subscribe call.
+- The notification panel offered *Turn on*. The operator clicked **Allow** in the browser's own prompt.
+- The subscription registered (`POST /api/push/subscribe` 200).
+
+**A `push` request** (owner as controller, `prompt_owner`, the lab's Fedora Asahi box):
+- **The server** logged `Push notification sent` to the browser's push endpoint.
+- **The service worker** displayed *Remote control request — «owner» wants to control «device»*, linking to `/consent/<token>`, within seconds.
+- **The controller** read "Waiting for the device's owner to approve the connection…" (#2810).
+
+**Found, #2827:** the owner clicked the toast, and that **hung up the session it was asking about**.
+- The device logged `session terminated … reason=ControllerHangup` at 13:19:06Z, one second before the approval (13:19:07Z, `POST …/approve` 200).
+- The cause: the service worker's click handler navigated the first open roomler window, the waiting viewer itself, to the consent page.
+- The fix (#2828) focuses a window already on that page and otherwise opens a new one, and never navigates an open window away.
+
+The device's access policy was restored and read back equal.
