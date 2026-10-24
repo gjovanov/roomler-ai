@@ -62,6 +62,7 @@ fn run() -> Run {
         session: ObjectId::new(),
         fence: 1,
         vault: None,
+        knowhow: None,
         #[cfg(feature = "vault")]
         exec: None,
         #[cfg(feature = "vault")]
@@ -816,6 +817,7 @@ async fn the_vault_tools_are_offered_only_where_the_device_takes_leases() {
             session: ObjectId::new(),
             fence: 1,
             vault: Some(vault.clone()),
+            knowhow: None,
             #[cfg(feature = "vault")]
             exec: None,
             #[cfg(feature = "vault")]
@@ -881,6 +883,7 @@ async fn a_vault_tool_answers_what_the_vault_says_for_the_sessions_run() {
             session: sid,
             fence: 7,
             vault: Some(vault.clone()),
+            knowhow: None,
             #[cfg(feature = "vault")]
             exec: None,
             #[cfg(feature = "vault")]
@@ -955,6 +958,7 @@ async fn a_cancelled_vault_call_gets_no_answer() {
             session: ObjectId::new(),
             fence: 1,
             vault: Some(vault.clone()),
+            knowhow: None,
             #[cfg(feature = "vault")]
             exec: None,
             #[cfg(feature = "vault")]
@@ -1041,6 +1045,7 @@ fn exec_belt_with(dir: &Path, vault: FakeVault) -> (Belt, Arc<FakeVault>, Object
             session: sid,
             fence: 5,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -1086,6 +1091,7 @@ async fn vault_exec_is_offered_and_never_allowed_unasked() {
             session: ObjectId::new(),
             fence: 1,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -1436,6 +1442,7 @@ async fn vault_request_asks_a_lease_ahead_and_answers_no_value() {
             session: sid,
             fence: 1,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -2155,6 +2162,7 @@ async fn a_proxy_connection_from_another_account_is_refused() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -2234,6 +2242,7 @@ async fn vault_connect_serves_a_loopback_endpoint() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -2471,6 +2480,7 @@ async fn vault_connect_serves_mongodb_on_a_loopback_port() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -2551,6 +2561,7 @@ fn http_belt(dir: &Path, values: &[(&str, &[u8])]) -> (Belt, Arc<FakeVault>, Obj
             session: sid,
             fence: 5,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -3824,6 +3835,7 @@ async fn an_http_connection_from_another_account_is_refused() {
             session: ObjectId::new(),
             fence: 5,
             vault: Some(vault.clone()),
+            knowhow: None,
             net: None,
             #[cfg(feature = "ssh-server")]
             ssh: None,
@@ -3909,6 +3921,7 @@ fn net_belt(
             session,
             fence,
             vault: Some(vault.clone()),
+            knowhow: None,
             exec: None,
             net: Some(hub.clone()),
             #[cfg(feature = "ssh-server")]
@@ -3973,6 +3986,7 @@ async fn the_net_tools_are_offered_only_where_the_owner_offers_egress() {
                 session: ObjectId::new(),
                 fence: 1,
                 vault: offered,
+                knowhow: None,
                 exec: None,
                 net,
                 #[cfg(feature = "ssh-server")]
@@ -4324,6 +4338,7 @@ fn ssh_belt(vault: FakeVault, ssh: FakeSsh) -> (Belt, Arc<FakeVault>, Arc<FakeSs
             session,
             fence: 4,
             vault: Some(vault.clone()),
+            knowhow: None,
             exec: None,
             net: None,
             ssh: Some(ssh.clone()),
@@ -4359,6 +4374,7 @@ async fn ssh_run_is_offered_only_where_the_owner_offers_it() {
                 session: ObjectId::new(),
                 fence: 1,
                 vault: offered,
+                knowhow: None,
                 exec: None,
                 net: None,
                 ssh: runner,
@@ -4987,6 +5003,7 @@ async fn vault_placeholder_is_offered_only_behind_the_egress_proxy() {
                 session,
                 fence: 1,
                 vault,
+                knowhow: None,
                 exec: None,
                 net: None,
                 #[cfg(feature = "ssh-server")]
@@ -5063,4 +5080,181 @@ async fn vault_placeholder_is_offered_only_behind_the_egress_proxy() {
     assert_eq!(vault.leases_asked().len(), 1);
     egress::drop_run(session, 1);
     placeholder::drop_run(session, 1);
+}
+
+// ─── FR-90 P4-4-1b — the map's reads ────────────────────────────────────────
+
+/// The map, as a test stands it in: the tools it says it answers, and every
+/// question it is asked (the session, the fence, what was asked).
+struct FakeKnowhow {
+    offered: Vec<&'static str>,
+    asked: std::sync::Mutex<Vec<(ObjectId, u64, String)>>,
+}
+
+impl FakeKnowhow {
+    fn offering(offered: &[&'static str]) -> Arc<Self> {
+        Arc::new(Self {
+            offered: offered.to_vec(),
+            asked: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn asked(&self) -> Vec<(ObjectId, u64, String)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl super::super::knowhow_tools::KnowhowTools for FakeKnowhow {
+    fn offered(&self) -> Vec<&'static str> {
+        self.offered.clone()
+    }
+
+    async fn search(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        ask: &super::super::knowhow_tools::Search,
+    ) -> Result<Value, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((session, fence, format!("search {}", ask.q)));
+        Ok(json!({"entities": [{"kind": "database", "key": "prod-mongo"}], "truncated": false}))
+    }
+
+    async fn get(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((session, fence, format!("get {kind}/{key}")));
+        if key == "staging-mongo" {
+            return Err(super::super::knowhow_tools::refusal("not_found"));
+        }
+        Ok(json!({"entity": {"kind": kind, "key": key}, "links": [], "truncated": false}))
+    }
+}
+
+fn knowhow_run(session: ObjectId, knowhow: Option<Arc<FakeKnowhow>>) -> Run {
+    Run {
+        session,
+        fence: 4,
+        vault: None,
+        knowhow: knowhow.map(|k| k as Arc<dyn super::super::knowhow_tools::KnowhowTools>),
+        #[cfg(feature = "vault")]
+        exec: None,
+        #[cfg(feature = "vault")]
+        net: None,
+        #[cfg(all(feature = "vault", feature = "ssh-server"))]
+        ssh: None,
+    }
+}
+
+async fn listed(c: &mut Client) -> Vec<String> {
+    c.send(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 90}))
+        .await;
+    c.recv().await["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// FR-90 P4-4-1b — the map's reads are offered on the server's word alone,
+/// and only the ones it answers; without a vault, as with one. A tool it
+/// did not name is an unknown tool, asked of nobody.
+#[tokio::test]
+async fn the_knowhow_tools_are_offered_only_on_the_servers_word() {
+    use roomler_ai_remote_control::knowhow::{TOOL_GET, TOOL_SEARCH};
+    let none = belt_running(me(), knowhow_run(ObjectId::new(), None), quick());
+    let mut c = Client::connect(&none).await;
+    assert_eq!(listed(&mut c).await, ["approve"]);
+    c.send(tool_call(1, "knowhow_search", json!({}))).await;
+    assert_eq!(c.recv().await["error"]["code"], -32602, "not offered here");
+
+    let both = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET]);
+    let b = belt_running(me(), knowhow_run(ObjectId::new(), Some(both)), quick());
+    let mut c = Client::connect(&b).await;
+    assert_eq!(
+        listed(&mut c).await,
+        ["approve", "knowhow_search", "knowhow_get"]
+    );
+
+    let only_get = FakeKnowhow::offering(&[TOOL_GET]);
+    let g = belt_running(
+        me(),
+        knowhow_run(ObjectId::new(), Some(only_get.clone())),
+        quick(),
+    );
+    let mut c = Client::connect(&g).await;
+    assert_eq!(listed(&mut c).await, ["approve", "knowhow_get"]);
+    c.send(tool_call(2, "knowhow_search", json!({"q": "mongo"})))
+        .await;
+    assert_eq!(
+        c.recv().await["error"]["code"],
+        -32602,
+        "a tool the server did not name is unknown"
+    );
+    assert!(only_get.asked().is_empty(), "and asked of nobody");
+}
+
+/// FR-90 P4-4-1b — a knowhow tool asks for the session's run (its session,
+/// its fence), never a person, and answers the map's word as text, or its
+/// refusal as an error the model reads.
+#[tokio::test]
+async fn a_knowhow_tool_answers_what_the_map_says_for_the_sessions_run() {
+    use roomler_ai_remote_control::knowhow::{TOOL_GET, TOOL_SEARCH};
+    let map = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET]);
+    let sid = ObjectId::new();
+    let mut b = belt_running(me(), knowhow_run(sid, Some(map.clone())), quick());
+    let mut c = Client::connect(&b).await;
+
+    c.send(tool_call(1, "knowhow_search", json!({"q": "mongo"})))
+        .await;
+    let found = c.recv().await;
+    assert!(found["result"].get("isError").is_none(), "{found}");
+    let text: Value =
+        serde_json::from_str(found["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["entities"][0]["key"], "prod-mongo");
+
+    c.send(tool_call(
+        2,
+        "knowhow_get",
+        json!({"kind": "database", "key": "staging-mongo"}),
+    ))
+    .await;
+    let missing = c.recv().await;
+    assert_eq!(missing["result"]["isError"], true, "{missing}");
+    assert!(
+        missing["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nothing on the map"),
+        "{missing}"
+    );
+
+    c.send(tool_call(3, "knowhow_get", json!({"kind": "database"})))
+        .await;
+    let short = c.recv().await;
+    assert_eq!(short["result"]["isError"], true, "{short}");
+
+    assert_eq!(
+        map.asked(),
+        [
+            (sid, 4, "search mongo".to_string()),
+            (sid, 4, "get database/staging-mongo".to_string()),
+        ],
+        "the run's own session and fence; a call missing its key asks nothing"
+    );
+    assert!(
+        b.events.try_recv().is_err(),
+        "no person is asked for a read"
+    );
 }

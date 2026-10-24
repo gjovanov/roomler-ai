@@ -17,13 +17,13 @@ sessions read it too, through their toolbelt.
 > P4-3b-1 to P4-3b-3, the device's own half on Linux and macOS: its
 > checkouts with the services their manifests name, a listed kubeconfig's
 > contexts, each root read as the account that owns it, and, when its owner
-> says so, the ports it listens on (§11.2); and P4-4-1a, the server's half of
-> a session's questions: the word that the map is there, a session's search
-> and card, believed from its record and held to its starter's
-> `KNOWHOW_VIEW` (§12).** People, the sync and scans fill the map. Windows
-> (P4-3b-4), the toolbelt's knowhow tools (P4-4-1b), a session's proposals
-> (P4-4-2), probes (P4-5) and `roomler_connect` (P4-6) come with the steps
-> that build them (§13).
+> says so, the ports it listens on (§11.2); and P4-4-1, a session's
+> questions: the word that the map is there, a session's search and card,
+> believed from its record and held to its starter's `KNOWHOW_VIEW` (§12),
+> asked through the toolbelt's `knowhow_search` and `knowhow_get` (§12.1).**
+> People, the sync and scans fill the map. Windows (P4-3b-4), a session's
+> proposals (P4-4-2), probes (P4-5) and `roomler_connect` (P4-6) come with the
+> steps that build them (§13).
 
 ## 1. A map, not a gate
 
@@ -841,12 +841,32 @@ a session proposed, each for what it is.
 > on, so a knowhow mounted without hive finds no session and refuses every
 > question `not_located`; the `knowhow` build feature implies `hive`.
 
+### 12.1 The toolbelt's tools (P4-4-1b)
+
+The device's half ([`knowhow_tools.rs`](../agents/roomlerd/src/hive/knowhow_tools.rs)):
+two tools in a session's toolbelt, `mcp__roomler__knowhow_search` and
+`mcp__roomler__knowhow_get`, compiled wherever agent sessions are (Linux, macOS,
+Windows), apart from the scanner.
+
+| Piece | Design |
+|---|---|
+| the verb | every build that runs sessions advertises `knowhow-tools`, so its server tells it whether the map is there |
+| the word | the device forgets `rc:knowhow.served` at every primary connection and keeps the tools it names from that frame on, each only when this build knows it |
+| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment, and its settings allow exactly those (`permissions.allow`), since a read asks no person (decision 39) |
+| the questions | on the primary's connection, a `req_id` each, the session and its fence attached by the daemon, never by the model; each answer matched to its question, 15 s each |
+| the tools | `knowhow_search {q?, kind?, env?, limit?}` and `knowhow_get {kind, key}`, each argument checked before anything is asked; the answer is the map's JSON as text, a refusal an error in words the model can act on |
+
+> [!WARNING]
+> **A tool the server did not name is an unknown tool.** A newer agent may know
+> a tool (P4-4-2's `knowhow_propose`) that an older server never answers: shown
+> anyway, every call would wait out its 15 s. So a session is offered only what
+> its server named, and a call of anything else is refused before it is asked.
+
 ## 13. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-4-1b | the toolbelt's `knowhow_search` and `knowhow_get`: the device's client on the primary's connection, the tools offered on the server's word (§12), allowed in the session's settings |
 | P4-4-2 | `knowhow_propose`: an entity, a fact or a link written `proposed`, naming its session, within a ceiling (decisions 39, 50, 51) |
 | P4-4-3 | a person's word on a proposal: confirmed with who and when, or rejected as the routes already archive (decision 52) |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |

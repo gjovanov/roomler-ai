@@ -4388,6 +4388,10 @@ impl Supervisor {
         // P3-4b — the vault tools, where the primary connection takes leases:
         // offered by the toolbelt and allowed in the settings, together.
         let vault = toolbelt::daemon_vault();
+        // FR-90 P4-4-1b — and the map's reads, where the server said at the
+        // hello that the map is there, likewise.
+        let knowhow = super::knowhow_tools::daemon_knowhow();
+        let knowhow_offered = knowhow.as_ref().map(|k| k.offered()).unwrap_or_default();
         // FR-90 P3-7-3c — and a session's own egress, where the owner offers it.
         #[cfg(feature = "vault")]
         let net = self.net_hub(vault.is_some());
@@ -4437,6 +4441,7 @@ impl Supervisor {
             net_tools,
             ssh_tools,
             proxy.clone(),
+            &knowhow_offered,
         )
         .map_err(|e| {
             (
@@ -4479,6 +4484,7 @@ impl Supervisor {
             session: order.session_id,
             fence: order.fence,
             vault,
+            knowhow,
             // P3-4c-1 — `vault_exec` runs as the session does: its account,
             // dropped as decision 13 drops it, its home, its folder.
             #[cfg(feature = "vault")]
@@ -4692,6 +4698,9 @@ impl Supervisor {
             .map_err(|e| failed("the session's runtime directory", e))?;
         // P3-4b — offered and allowed together, as on Unix.
         let vault = toolbelt::daemon_vault();
+        // FR-90 P4-4-1b — and the map's reads, as on Unix.
+        let knowhow = super::knowhow_tools::daemon_knowhow();
+        let knowhow_offered = knowhow.as_ref().map(|k| k.offered()).unwrap_or_default();
         // FR-90 P3-7-3c — and a session's own egress, as on Unix.
         #[cfg(feature = "vault")]
         let net = self.net_hub(vault.is_some());
@@ -4736,6 +4745,7 @@ impl Supervisor {
             net_tools,
             ssh_tools,
             proxy,
+            &knowhow_offered,
         )
         .map_err(|e| failed("writing the session settings", e))?;
         let relay = own_exe().map_err(|e| (HiveRefusal::LaunchFailed, e))?;
@@ -4743,6 +4753,7 @@ impl Supervisor {
             session: order.session_id,
             fence: order.fence,
             vault,
+            knowhow,
             // P3-4c-1 — no command runs with a value here: Windows has no
             // sandbox for one. The vault refuses `exec` first (AC13).
             #[cfg(feature = "vault")]
@@ -4931,6 +4942,7 @@ fn write_settings(
     net_tools: bool,
     ssh_tools: bool,
     egress: Option<EgressProxy>,
+    knowhow_tools: &[&'static str],
 ) -> Result<PathBuf, String> {
     let dir = runtime.join(sid);
     #[cfg(unix)]
@@ -4976,7 +4988,13 @@ fn write_settings(
         // P3-4b — the vault's reads need no person: their gate is the
         // vault's own `secret:list`, decided and recorded by the server; and
         // (P3-4c-3) neither does asking a lease ahead, which hands nothing.
-        allow_tools: vault_allow_tools(vault_tools),
+        // FR-90 P4-4-1b — nor do the map's reads, offered exactly where the
+        // toolbelt offers them: the server holds each to what the session's
+        // starter may read.
+        allow_tools: vault_allow_tools(vault_tools)
+            .into_iter()
+            .chain(super::knowhow_tools::allowed(knowhow_tools))
+            .collect(),
         // P3-4c — and each of its uses asks one, whatever a repository's
         // own settings allow; so does each egress listener (P3-7-3c), each
         // command run on another device (P3-8-2b-2), and each placeholder
@@ -7959,7 +7977,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "offered", true, false, false, None).unwrap();
+        write_settings(&runtime, "offered", true, false, false, None, &[]).unwrap();
         let offered = read("offered");
         #[cfg_attr(not(feature = "vault"), allow(unused_mut))]
         let mut allowed: Vec<&str> = toolbelt::VAULT_TOOLS.to_vec();
@@ -7989,7 +8007,7 @@ done
                 "{offered}"
             );
         }
-        write_settings(&runtime, "not-offered", false, false, false, None).unwrap();
+        write_settings(&runtime, "not-offered", false, false, false, None, &[]).unwrap();
         let doc = read("not-offered");
         assert!(
             doc["permissions"].get("allow").is_none(),
@@ -8005,6 +8023,54 @@ done
         );
     }
 
+    /// FR-90 P4-4-1b — a session's settings allow the map's reads exactly
+    /// where its toolbelt offers them, with or without the vault, and ask no
+    /// person for them (decision 39).
+    #[test]
+    fn the_settings_allow_the_knowhow_tools_only_where_they_are_offered() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let read = |sid: &str| -> serde_json::Value {
+            let path = runtime.join(sid).join("settings.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let both = [
+            roomler_ai_remote_control::knowhow::TOOL_SEARCH,
+            roomler_ai_remote_control::knowhow::TOOL_GET,
+        ];
+        write_settings(&runtime, "map", false, false, false, None, &both).unwrap();
+        let doc = read("map");
+        assert_eq!(
+            doc["permissions"]["allow"],
+            serde_json::json!(["mcp__roomler__knowhow_search", "mcp__roomler__knowhow_get"]),
+            "{doc}"
+        );
+        assert!(doc["permissions"].get("ask").is_none(), "{doc}");
+        write_settings(
+            &runtime,
+            "map-and-vault",
+            true,
+            false,
+            false,
+            None,
+            &both[1..],
+        )
+        .unwrap();
+        let allow = read("map-and-vault")["permissions"]["allow"].clone();
+        let allow: Vec<&str> = allow
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(allow.contains(&"mcp__roomler__vault_list"), "{allow:?}");
+        assert!(allow.contains(&"mcp__roomler__knowhow_get"), "{allow:?}");
+        assert!(
+            !allow.contains(&"mcp__roomler__knowhow_search"),
+            "only what is offered: {allow:?}"
+        );
+    }
+
     /// FR-90 P3-7-3c — a session's own egress is ASKED for on every call,
     /// where it is offered, beside the vault's uses; never allowed outright,
     /// and absent where it is not offered.
@@ -8017,7 +8083,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "net", true, true, false, None).unwrap();
+        write_settings(&runtime, "net", true, true, false, None, &[]).unwrap();
         let doc = read("net");
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::NET_TOOLS);
@@ -8028,7 +8094,7 @@ done
                 "{tool} is never allowed without a person: {doc}"
             );
         }
-        write_settings(&runtime, "no-net", true, false, false, None).unwrap();
+        write_settings(&runtime, "no-net", true, false, false, None, &[]).unwrap();
         let doc = read("no-net");
         assert!(
             !doc["permissions"]["ask"].to_string().contains("net_"),
@@ -8068,7 +8134,7 @@ done
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::PLACEHOLDER_TOOLS);
         for (sid, proxy) in [("sandboxed", sandbox()), ("advisory", advisory())] {
-            write_settings(&runtime, sid, true, false, false, proxy).unwrap();
+            write_settings(&runtime, sid, true, false, false, proxy, &[]).unwrap();
             let doc = read(sid);
             assert_eq!(doc["permissions"]["ask"], serde_json::json!(asked), "{doc}");
             assert!(
@@ -8083,7 +8149,7 @@ done
             ("no-vault", false, sandbox()),
             ("no-vault-advisory", false, advisory()),
         ] {
-            write_settings(&runtime, sid, vault, false, false, proxy).unwrap();
+            write_settings(&runtime, sid, vault, false, false, proxy, &[]).unwrap();
             assert!(
                 !read(sid).to_string().contains("vault_placeholder"),
                 "{sid}: not offered, not named"
@@ -8430,7 +8496,7 @@ done
             let path = runtime.join(sid).join("settings.json");
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
         };
-        write_settings(&runtime, "ssh", true, false, true, None).unwrap();
+        write_settings(&runtime, "ssh", true, false, true, None, &[]).unwrap();
         let doc = read("ssh");
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::SSH_TOOLS);
@@ -8439,13 +8505,13 @@ done
             !doc["permissions"]["allow"].to_string().contains("ssh_run"),
             "ssh_run is never allowed without a person: {doc}"
         );
-        write_settings(&runtime, "both", true, true, true, None).unwrap();
+        write_settings(&runtime, "both", true, true, true, None, &[]).unwrap();
         let mut asked: Vec<&str> = toolbelt::VAULT_USE_TOOLS.to_vec();
         asked.extend(toolbelt::NET_TOOLS);
         asked.extend(toolbelt::SSH_TOOLS);
         assert_eq!(read("both")["permissions"]["ask"], serde_json::json!(asked));
         for (sid, vault, ssh) in [("no-ssh", true, false), ("no-vault", false, true)] {
-            write_settings(&runtime, sid, vault, false, ssh, None).unwrap();
+            write_settings(&runtime, sid, vault, false, ssh, None, &[]).unwrap();
             let doc = read(sid);
             assert!(
                 !doc["permissions"].to_string().contains("ssh_run"),
