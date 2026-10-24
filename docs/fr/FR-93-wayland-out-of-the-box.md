@@ -306,7 +306,7 @@ between worktrees or inside one. Every capture/input knob flip forces a fresh ca
 
 ### 4.1 One desktop-session resolver
 
-`desktop::session()` replaces the five ad-hoc lookups (`companion.rs:975`, `recording/launch.rs:1442-1470`,
+`desktop::session()` replaces the five ad-hoc lookups (`companion.rs:975`, `recording/launch.rs:1552-1580`,
 `apps/linux.rs:501-511`, `keep_busy/logind.rs:91-110`, and the scrap arm's reliance on the daemon's own
 `DISPLAY`):
 
