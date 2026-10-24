@@ -15,6 +15,31 @@
       </v-btn>
     </v-list-subheader>
 
+    <!-- #2817 - desktop notifications are an opt-in: the browser's prompt
+         only ever follows this click, never a page load or a sign-in. -->
+    <v-list-item v-if="push === 'default'" class="notification-push-optin">
+      <v-list-item-title class="text-body-2 text-wrap">
+        Get notified on this device, even when Roomler is closed.
+      </v-list-item-title>
+      <template #append>
+        <v-btn
+          size="small"
+          variant="tonal"
+          color="primary"
+          :loading="pushBusy"
+          @click.stop="turnOnPush"
+        >
+          Turn on
+        </v-btn>
+      </template>
+    </v-list-item>
+    <v-list-item
+      v-else-if="push === 'denied'"
+      class="text-caption text-medium-emphasis notification-push-blocked"
+    >
+      Desktop notifications are blocked for this site in your browser's settings.
+    </v-list-item>
+
     <div v-if="store.loading" class="text-center pa-4">
       <v-progress-circular size="20" indeterminate />
     </div>
@@ -53,12 +78,27 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useNotificationStore, type Notification } from '@/stores/notification'
+import { enablePushNotifications, pushState, type PushState } from '@/composables/usePush'
 
 const store = useNotificationStore()
 const router = useRouter()
+
+// #2817 - where this browser stands on desktop notifications. Starts as
+// `unsupported` so nothing renders until it is known.
+const push = ref<PushState>('unsupported')
+const pushBusy = ref(false)
+
+async function turnOnPush() {
+  pushBusy.value = true
+  try {
+    push.value = await enablePushNotifications()
+  } finally {
+    pushBusy.value = false
+  }
+}
 
 const emit = defineEmits<{
   close: []
@@ -100,8 +140,9 @@ function handleClick(notif: Notification) {
   emit('close')
 }
 
-onMounted(() => {
+onMounted(async () => {
   store.fetchNotifications()
+  push.value = await pushState()
 })
 </script>
 
