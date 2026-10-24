@@ -2026,8 +2026,21 @@ jobs:
           # tag with no warning a release earlier, the opposite of this guard's
           # design. 22 restores warn (19.67) before fail, with ~4.3 MB of
           # headroom (the guard has kept ~5 over its baseline since P4b).
-          $p4bBaseline = 17.67
-          $ceilingMB = 22
+          # 0.4.164 re-baseline (2026-10-24). The warning had fired on every
+          # release since 0.4.125 (19.79), and the 0.4.164 rehearsal (run
+          # 40099509727) hard-failed at 22.00 MB. Measured from the published
+          # releases before re-pinning: since the 17.67 baseline (0.4.110) the
+          # per-User MSI grew +4.32 MB over fifty releases, and the Linux amd64
+          # .deb, which carries no Windows DLL, +3.85 (15.00 -> 18.85). The one
+          # Windows-only step, 0.4.123 -> 0.4.124 (+1.46, the .deb +0.13), is
+          # FR-90's `hive` entering the Windows release build (#1915), which
+          # the .deb had taken between 0.4.120 and 0.4.123 (+1.35, the MSI
+          # +0.05). The rest moves with the .deb: the agent's own code (FR-90,
+          # FR-97, FR-99, FR-118/119), not a stray payload. So the baseline is
+          # the measured 22.00 and the ceiling 26: the same ~4 MB of headroom,
+          # the warning back at +2 (24).
+          $p4bBaseline = 22.00
+          $ceilingMB = 26
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
