@@ -25,11 +25,13 @@ sessions read it too, through their toolbelt.
 > `knowhow_propose`, written `proposed` and naming the session (§12.2); and
 > P4-4-3, a person's word on a proposal (§12.3); and P4-5-1a, a probe's
 > server half: a person asks a device to probe an entity, the target read from
-> the entity's own facts, and what it measured recorded on them (§13).**
-> People, the sync, scans and sessions' proposals fill the map, and probes
-> verify it. Windows (P4-3b-4), the device's half of a probe (P4-5-1b),
-> `knowhow_verify` (P4-5-2), staleness (P4-5-3) and `roomler_connect` (P4-6)
-> come with the steps that build them (§14).
+> the entity's own facts, and what it measured recorded on them (§13); and
+> P4-5-1b, the device's half: only within what its owner lists in
+> `knowhow_probe_reach`, a connect and a close, and for TLS the certificate it
+> is shown (§13.2).** People, the sync, scans and sessions' proposals fill the
+> map, and probes verify it. Windows (P4-3b-4), `knowhow_verify` (P4-5-2),
+> staleness (P4-5-3) and `roomler_connect` (P4-6) come with the steps that
+> build them (§14).
 
 ## 1. A map, not a gate
 
@@ -1149,12 +1151,67 @@ probe and each fact's `{path, ok, status}`.
 |---|---|
 | `knowhow.scan_sweep_secs` | the same sweep: each pod looks for scans and probes asked of the devices connected to it |
 
+### 13.2 A device's probe (P4-5-1b)
+
+The device decides where it connects
+([`knowhow_probe.rs`](../agents/roomlerd/src/hive/knowhow_probe.rs)): its
+owner lists the places in `knowhow_probe_reach` (decision 53), and the list is
+empty until they do, which means nowhere. It is device-owned like
+`knowhow_scan_roots`: live, read from the config file again at each probe, and
+absent from `DesiredConfig`, so no server can set it. Every OS that runs
+sessions advertises `knowhow-probe`, on the primary's connection alone.
+
+```bash
+roomler config set knowhow_probe_reach '100.64.0.0/10:22,db.example.com:5432,*.example.com:443'
+```
+
+| An entry ([`parse_entry`](../crates/agent-core/src/probe_reach.rs#L36)) | Matches |
+|---|---|
+| `10.0.0.0/8`, `100.64.0.7`, `[fd00::/8]`, `[::1]` | an address the probe connects to (IPv6 in brackets) |
+| `db.example.com` | that name, when a probe asks for it |
+| `*.example.com` | a name under it, never the suffix itself |
+| `…:5432`, `…:8000-8999` | one port, or a range; every port when absent |
+
+```mermaid
+flowchart TD
+    F["rc:knowhow.probe {kind, host, port, sni?}"] --> P{"on the primary's connection?"}
+    P -->|no| NA["not_allowed"]
+    P -->|yes| L{"knowhow_probe_reach lists anything?"}
+    L -->|no| NA
+    L -->|yes| R["resolve the name here (an address is itself)"]
+    R --> N{"any address never probed?<br/>link-local · metadata · no destination"}
+    N -->|yes| NA
+    N -->|no| A{"an address rule holds it,<br/>or a name rule matches the name?"}
+    A -->|none passes| NA
+    A -->|some pass| C["connect to the first that answers,<br/>only among those that passed"]
+    C -->|nothing answers| U["unreachable"]
+    C -->|tcp| OK["ok {rtt_ms, address}"]
+    C -->|tls| T["handshake: the leaf's names and SHA-256,<br/>its signature checked, its chain not judged"]
+    T --> OK2["ok {rtt_ms, address, tls}"]
+    T -->|no TLS there| FL["failed"]
+```
+
+| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L257)) | Why |
+|---|---|
+| a name is resolved here, and **every** address is checked before any connect; one never-probed address refuses the whole probe | a name that points at a metadata service is not one to reach through its other addresses |
+| a connect goes only to an address that passed, the first that answers | a name that resolves elsewhere by the time of the connect reaches nothing new |
+| an address rule holds addresses, a name rule matches the name asked for ([`allows`](../crates/agent-core/src/probe_reach.rs#L181)) | listing `db.example.com` trusts that name's resolution; listing `10.0.0.0/8` trusts no name |
+| `tcp`: a connect and a close, not a byte sent | connect, never converse (decision 55) |
+| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L475)) | a private CA is what an organization's own services have; a probe says what the address presents |
+| ten seconds for the whole probe; a probe id run once, and one sent again answered as it was | the server sends a probe again at a hello while it is unanswered |
+
+> [!WARNING]
+> **Link-local and the cloud metadata addresses are never reached, whatever
+> the list says** (`never_probed`, §13). An owner who lists `0.0.0.0/0` still
+> never sends a probe to `169.254.169.254`. A list whose entry no longer reads
+> after a hand edit loses that entry: it can only narrow what is reached
+> ([`rules`](../crates/agent-core/src/probe_reach.rs#L170)).
+
 ## 14. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-5-1b | the device's half of a probe: `knowhow_probe_reach` (device-owned, empty by default, so nowhere), a name resolved and every address checked before the connect, `tcp` and `tls` as decision 55 says, the verb `knowhow-probe` |
 | P4-5-2 | `knowhow_verify` in the toolbelt: a probe from the session's own device, the settings asking a person each call (decision 54) |
 | P4-5-3 | staleness, decision 40: a fact no probe or person confirmed for `knowhow.stale_days` turns `stale` |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |

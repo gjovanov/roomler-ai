@@ -46,6 +46,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 bson = { workspace = true }
 tokio = { workspace = true }
+# FR-90 P4-5-1b — `knowhow_probe_reach`'s address ranges, read into the
+# `forward_acl` rule shape (already in the lockfile, through remote_control).
+ipnet = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

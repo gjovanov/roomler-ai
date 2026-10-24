@@ -630,6 +630,16 @@ pub struct AgentConfig {
     /// and never pushable.
     #[serde(default)]
     pub knowhow_scan_listeners: bool,
+    /// FR-90 P4-5-1b — where this device's knowhow probes may go (decision
+    /// 53), in [`crate::probe_reach`]'s syntax (`100.64.0.0/10:22`,
+    /// `db.example.com:5432`, `*.example.com:443`). **Empty means nowhere**:
+    /// every probe is answered `not_allowed`, since a probe leaves from
+    /// inside this device's own network. Link-local and the cloud metadata
+    /// addresses are never reached, whatever it lists. Read from this file
+    /// again at each probe, and never pushable: where a device connects to on
+    /// the map's word is its owner's call, not the server's.
+    #[serde(default)]
+    pub knowhow_probe_reach: Vec<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2846,6 +2856,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_egress: false,
         knowhow_scan_roots: Vec::new(),
         knowhow_scan_listeners: false,
+        knowhow_probe_reach: Vec::new(),
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,

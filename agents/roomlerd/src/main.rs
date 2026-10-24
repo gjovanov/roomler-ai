@@ -4125,6 +4125,13 @@ async fn run_cmd(
         config_path.clone(),
         cfg_write_lock.clone(),
     ));
+    // FR-90 P4-5-1b — and its prober, reading `knowhow_probe_reach` from the
+    // same file under the same lock at each probe. A secondary has none.
+    #[cfg(hive_host)]
+    let primary_ctx = primary_ctx.with_prober(roomlerd::hive::knowhow_probe::Prober::new(
+        config_path.clone(),
+        cfg_write_lock.clone(),
+    ));
     let mut org_spawns: Vec<OrgSpawn> = Vec::new();
     // Multi-org — every secondary org.s live overlay view, so `peers` can
     // report all orgs (the receivers used to be dropped on the floor).
