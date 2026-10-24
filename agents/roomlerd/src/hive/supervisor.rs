@@ -8023,9 +8023,9 @@ done
         );
     }
 
-    /// FR-90 P4-4-1b — a session's settings allow the map's reads exactly
+    /// FR-90 P4-4-1b — a session's settings allow the map's tools exactly
     /// where its toolbelt offers them, with or without the vault, and ask no
-    /// person for them (decision 39).
+    /// person for them (decision 39), a proposal (P4-4-2b) included.
     #[test]
     fn the_settings_allow_the_knowhow_tools_only_where_they_are_offered() {
         let root = tempfile::tempdir().unwrap();
@@ -8046,6 +8046,26 @@ done
             "{doc}"
         );
         assert!(doc["permissions"].get("ask").is_none(), "{doc}");
+        let all = [
+            roomler_ai_remote_control::knowhow::TOOL_SEARCH,
+            roomler_ai_remote_control::knowhow::TOOL_GET,
+            roomler_ai_remote_control::knowhow::TOOL_PROPOSE,
+        ];
+        write_settings(&runtime, "map-propose", false, false, false, None, &all).unwrap();
+        let doc = read("map-propose");
+        assert_eq!(
+            doc["permissions"]["allow"],
+            serde_json::json!([
+                "mcp__roomler__knowhow_search",
+                "mcp__roomler__knowhow_get",
+                "mcp__roomler__knowhow_propose"
+            ]),
+            "{doc}"
+        );
+        assert!(
+            doc["permissions"].get("ask").is_none(),
+            "a proposal asks no person: {doc}"
+        );
         write_settings(
             &runtime,
             "map-and-vault",

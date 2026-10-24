@@ -34,7 +34,7 @@ flowchart LR
         H["Claude Code, headless,<br/>as the mapped account"]
         ST[("hive.db<br/>the transcript")]
         SC["model sidecar<br/>on loopback"]
-        TB["toolbelt<br/>approve · vault_list · vault_describe<br/>vault_request · vault_exec · vault_render<br/>vault_connect · net_socks · net_forward<br/>ssh_run · vault_placeholder<br/>knowhow_search · knowhow_get"]
+        TB["toolbelt<br/>approve · vault_list · vault_describe<br/>vault_request · vault_exec · vault_render<br/>vault_connect · net_socks · net_forward<br/>ssh_run · vault_placeholder<br/>knowhow_search · knowhow_get · knowhow_propose"]
     end
     P["model provider"]
     B -->|"REST: start, stop, people, brain"| S
@@ -502,7 +502,11 @@ organization's map is there for its sessions, the toolbelt offers the map's
 reads, `knowhow_search` and `knowhow_get`, whether or not the device takes
 leases ([`knowhow.md`](knowhow.md) §12.1). Those need no approval: the
 settings allow exactly the ones offered, because the server holds each
-question to what the session's starter may read.
+question to what the session's starter may read. From P4-4-2b it offers
+`knowhow_propose` too, where the server names it, and that needs no approval
+either (decision 39): a proposal changes nothing a session relies on, it is
+written `proposed` for a person to review afterwards, and a session makes at
+most 50 ([`knowhow.md`](knowhow.md) §12.2).
 
 Claude Code starts its MCP servers itself, as the session's account, over stdio. So
 the server it starts is a relay, `roomlerd hive-mcp <socket>`, which pipes its stdin
@@ -904,7 +908,7 @@ again on one already there.
   unknown, and another session's directory stays closed, its own DACL granting only
   its account. The unit test runs as a restricted Medium copy of its own token, and
   fails on the old DACL
-  ([`supervisor.rs:12519`](../agents/roomlerd/src/hive/supervisor.rs#L12519)).
+  ([`supervisor.rs:12539`](../agents/roomlerd/src/hive/supervisor.rs#L12539)).
 
 ### macOS: the `/var` link
 
@@ -1582,7 +1586,7 @@ The device advertises `hive-replica` while its owner's `hive_replica` is on and 
 opened, and `hive-archive` while `hive_archive` is on too
 ([`caps.rs:2117-2122`](../agents/roomlerd/src/encode/caps.rs#L2117-L2122)). A secondary org's
 connection strips both words, in its hello and in every heartbeat that re-announces the
-caps ([`signaling.rs:6725`](../agents/roomlerd/src/signaling.rs#L6725)), so that org's
+caps ([`signaling.rs:6737`](../agents/roomlerd/src/signaling.rs#L6737)), so that org's
 placement never picks this device.
 
 ⚠️ **Only a device with copies to tell about sends a replica frame**
@@ -4206,7 +4210,7 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | A frame of its own, `rc:hive.search.grant`, never a field on the view grant. The device answers it as a view grant (`rc:hive.view.grant_ack`), and the peer rides the view's offer, ICE, renewal and close frames, keyed by the grant | a build before it must never read a search grant as a view of one session; the handshake is the one a view already proves | [`signaling.rs:4557`](../crates/remote_control/src/signaling.rs#L4557), [`view.rs:235`](../agents/roomlerd/src/hive/view.rs#L235) |
-| Sent only where the connection advertises `hive-search`: a build with `hive_archive` and `hive_replica` on. Matched by equality, and stripped from a secondary organization's connection with the other replica words | `hive` is its prefix and not the same promise: a build before it drops the grant, and the member would wait for an answer that never comes | [`models.rs:1024`](../crates/remote_control/src/models.rs#L1024), [`caps.rs:2128`](../agents/roomlerd/src/encode/caps.rs#L2128), [`signaling.rs:6735`](../agents/roomlerd/src/signaling.rs#L6735) |
+| Sent only where the connection advertises `hive-search`: a build with `hive_archive` and `hive_replica` on. Matched by equality, and stripped from a secondary organization's connection with the other replica words | `hive` is its prefix and not the same promise: a build before it drops the grant, and the member would wait for an answer that never comes | [`models.rs:1024`](../crates/remote_control/src/models.rs#L1024), [`caps.rs:2128`](../agents/roomlerd/src/encode/caps.rs#L2128), [`signaling.rs:6747`](../agents/roomlerd/src/signaling.rs#L6747) |
 | The device's own gates at every grant: the primary organization; an archive replica, by its owner's `hive_archive` and `hive_replica`, whatever the server asks; at most 500 sessions, the store's own bound on a filter, the two tied at compile time | a gate the server cannot open: a device that is no archive replica answers no search, whatever a server that may be compromised sends | [`view.rs:431`](../agents/roomlerd/src/hive/view.rs#L431), [`view.rs:85`](../agents/roomlerd/src/hive/view.rs#L85) |
 | What is searched: the sessions the grant names that the device holds a copy of, and nothing else. One named that it holds no copy of is left out; a copy it holds that the grant does not name is never searched, nor a session it ran itself. None left is `no_session` | the server names what the member may read; the device can narrow that, never widen it | [`view.rs:470`](../agents/roomlerd/src/hive/view.rs#L470) |
 | At most 8 searches a device, within its 32 viewers. A search is no session's viewer | a search is not a seat at one session's table, and a device's peers stay bounded | [`view.rs:495`](../agents/roomlerd/src/hive/view.rs#L495) |
