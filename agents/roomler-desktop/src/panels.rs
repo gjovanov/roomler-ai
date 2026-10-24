@@ -60,6 +60,9 @@ const TICK: Duration = Duration::from_millis(120);
 
 /// A session wants the banner (the session watch in `main.rs` says so).
 static BANNER_WANTED: AtomicBool = AtomicBool::new(false);
+/// #2815 — the consent prompt window could not be created, so the main
+/// window's modal must ask instead. Cleared the moment the window exists.
+static CONSENT_PANEL_FAILED: AtomicBool = AtomicBool::new(false);
 /// The banner was just brought up for a new session: the reveal watch starts
 /// from "visible, shown now".
 static BANNER_FRESH: AtomicBool = AtomicBool::new(false);
@@ -103,6 +106,15 @@ pub fn show_consent<R: Runtime>(app: &AppHandle<R>) {
         // reach is the failure mode we are here to fix.
         true,
     );
+}
+
+/// #2815 — whether the main window's consent modal must render the prompts
+/// the companion is asked to show. Only as the fallback the panel was always
+/// meant to have: the prompt window could not be created. Both rendered
+/// before, so each question came up twice. Until the window has been tried,
+/// the modal waits; the watch in `main.rs` opens it within one tick.
+pub fn consent_modal_needed() -> bool {
+    CONSENT_PANEL_FAILED.load(Ordering::SeqCst)
 }
 
 /// Bring the session banner up. Never focused and never in the taskbar — it is
@@ -309,6 +321,9 @@ fn show<R: Runtime>(
     focus: bool,
 ) {
     if let Some(win) = app.get_webview_window(label) {
+        if label == CONSENT {
+            CONSENT_PANEL_FAILED.store(false, Ordering::SeqCst);
+        }
         present(&win, focus);
         return;
     }
@@ -336,12 +351,20 @@ fn show<R: Runtime>(
         .visible(false)
         .build();
     let win = match built {
-        Ok(win) => win,
+        Ok(win) => {
+            if label == CONSENT {
+                CONSENT_PANEL_FAILED.store(false, Ordering::SeqCst);
+            }
+            win
+        }
         Err(e) => {
             // Loud: the fallback for a failed panel is the in-window modal the
             // SPA still carries, and a silent failure here would look exactly
             // like "consent does not work" — the bug this FR exists to close.
             tracing::error!(%label, %e, "could not create the panel window — falling back to the main window's modal");
+            if label == CONSENT {
+                CONSENT_PANEL_FAILED.store(true, Ordering::SeqCst);
+            }
             if let Some(main) = app.get_webview_window("main") {
                 let _ = main.show();
                 let _ = main.set_focus();

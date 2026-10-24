@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:5628` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:5632` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -470,7 +470,7 @@ The bullets below describe the design *once #888 lands*:
 **Rate limiting.** ⚠️ `handle_overlay_relay_request` has **none** — `crates/api/src/ws/overlay.rs`
 contains zero `RateLimiter` references. Both precedents this FR claims equivalence with do
 enforce one, deliberately after the identity gates so refusals are attributable:
-`agent_exec.rs:320` (30/min) and `agent_ssh.rs:541` (20/min). `CLAUDE.md` records why:
+`agent_exec.rs:322` (30/min) and `agent_ssh.rs:541` (20/min). `CLAUDE.md` records why:
 *"The HTTP `tower_governor` is per-IP and never saw the device-originated
 `rc:rpc.request` / `rc:ssh.request` WS legs, so those had no ceiling at all."* A mint is
 another device-originated WS leg and is **more** expensive, because it writes state onto a
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:5651` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:5655` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".

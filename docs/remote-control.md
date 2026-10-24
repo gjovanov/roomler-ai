@@ -1297,6 +1297,16 @@ the session user's own companion (`pgrep -u`), not anyone's.
 `roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
 
+⚠️ **Inside the companion, the prompt window asks; the main window's modal is
+only its fallback** (#2815). Both used to render every marker whose surface was
+not `native`. On the GNOME Wayland lab box on 2026-10-24, each exec and SSH
+question therefore came up twice at once: in the prompt window, and as a modal
+in the main window. Both closed on one answer, but two Approve buttons for one
+decision is how someone approves the wrong thing. The modal now renders only
+when the prompt window could not be created (`panels::consent_modal_needed`,
+asked through `cmd_consent_modal_needed`). When it cannot get that answer, it
+asks, so a question is never left with no one to show it.
+
 ⚠️ **A virtual-desktop host declines the native surface, even though its X
 display connects.**
 <!-- RETIRED-NAME-ANCHOR: the LEGACY env spelling FR-21 P3 kept working, and
