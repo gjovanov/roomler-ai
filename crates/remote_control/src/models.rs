@@ -9360,6 +9360,10 @@ mod tests {
             // listens on (decision 47): the owner's word about what the
             // machine runs, never the server's.
             "knowhow_scan_listeners",
+            // FR-90 P4-5-1b — where a knowhow probe may go (decision 53): a
+            // server that could set it could make every device connect from
+            // inside its own network to whatever the map names.
+            "knowhow_probe_reach",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
             "privacy_mode_allowed",

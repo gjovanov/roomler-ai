@@ -558,6 +558,17 @@ const KEYS: &[KeyMeta] = &[
         kind: "bool",
         description: "FR-90 - let this device's knowhow scans report the TCP ports it listens on: each port, its bound address and the process holding it, read by the daemon from the system's own table (this daemon's own ports left out). A listener is under no root, so it has its own switch. Read again at each scan. Never settable by the server. Default: OFF.",
     },
+    // FR-90 P4-5-1b — where a knowhow probe may go (decision 53): the
+    // device's, absent from `DesiredConfig`, since a server that could set
+    // it would choose where every device connects to from inside its network.
+    KeyMeta {
+        key: "knowhow_probe_reach",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: true,
+        kind: "list",
+        description: "FR-90 - comma-separated places this device's knowhow probes may reach, each HOST or HOST:PORTS: an address or range (100.64.0.0/10, 10.0.4.12, [fd00::/8]), a DNS name (db.example.com) or *. and a suffix (*.example.com), and one port or a range (5432, 8000-8999; all ports when absent). A probe connects and closes, and for TLS reads the server's certificate, never sending a request or a credential. Link-local and cloud metadata addresses are never reached, whatever it lists. Read again at each probe. Never settable by the server. Empty = nowhere.",
+    },
     KeyMeta {
         key: "ssh_enabled",
         group: Group::Ssh,
@@ -2001,6 +2012,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_egress" => Some(fmt_bool(cfg.hive_egress)),
         "knowhow_scan_roots" => Some(cfg.knowhow_scan_roots.join(",")),
         "knowhow_scan_listeners" => Some(fmt_bool(cfg.knowhow_scan_listeners)),
+        "knowhow_probe_reach" => Some(cfg.knowhow_probe_reach.join(",")),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2364,6 +2376,10 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         // Clearing turns it off, like every reporting switch.
         "knowhow_scan_listeners" => cfg.knowhow_scan_listeners = parse_bool_or(value, false)?,
+        // Clearing empties the list: no probe reaches anywhere.
+        "knowhow_probe_reach" => {
+            cfg.knowhow_probe_reach = crate::probe_reach::parse_list("knowhow_probe_reach", value)?
+        }
         "hive_update_wait_secs" => {
             cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
         }
@@ -3277,6 +3293,8 @@ mod tests {
             // knowhow scan, so nothing re-seeds them.
             "knowhow_scan_roots",
             "knowhow_scan_listeners",
+            // FR-90 P4-5-1b — and at every knowhow probe.
+            "knowhow_probe_reach",
         ]
         .into_iter()
         .map(String::from)
@@ -4632,6 +4650,54 @@ mod tests {
             cfg.knowhow_scan_roots.is_empty(),
             "cleared: nothing is read"
         );
+    }
+
+    /// FR-90 P4-5-1b — where a probe may go: nowhere by default and again
+    /// when cleared, live, read into one spelling, and a list with one entry
+    /// that does not read refused whole.
+    #[test]
+    fn knowhow_probe_reach_defaults_nowhere_and_reads_whole() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(cfg.knowhow_probe_reach.is_empty(), "nowhere");
+        let e = entry_for(&cfg, "knowhow_probe_reach").unwrap();
+        assert_eq!(e.group, Group::Access.wire());
+        assert_eq!(e.kind, "list");
+        assert!(!e.restart_required, "read at every probe");
+
+        apply(
+            &mut cfg,
+            "knowhow_probe_reach",
+            Some(" 100.64.0.0/10:22, DB.Example.com:5432 ,*.example.org:443 "),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.knowhow_probe_reach,
+            [
+                "100.64.0.0/10:22",
+                "db.example.com:5432",
+                "*.example.org:443"
+            ]
+        );
+        assert_eq!(
+            entry_for(&cfg, "knowhow_probe_reach").unwrap().value,
+            Some("100.64.0.0/10:22,db.example.com:5432,*.example.org:443".into())
+        );
+        assert!(
+            apply(
+                &mut cfg,
+                "knowhow_probe_reach",
+                Some("10.0.0.1:22,fd00::1:443")
+            )
+            .is_err(),
+            "an unbracketed IPv6 entry refuses the list"
+        );
+        assert_eq!(
+            cfg.knowhow_probe_reach.len(),
+            3,
+            "a refusal changes nothing"
+        );
+        apply(&mut cfg, "knowhow_probe_reach", None).unwrap();
+        assert!(cfg.knowhow_probe_reach.is_empty(), "cleared: nowhere");
     }
 
     /// FR-90 P4-3b-3 — a scan reports the device's listeners only when the

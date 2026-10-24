@@ -95,6 +95,10 @@ mod importer;
 /// macOS; Windows is P4-3b-4's.
 #[cfg(unix)]
 pub mod knowhow;
+/// FR-90 P4-5-1b — a device's knowhow probe: within what its owner lists in
+/// `knowhow_probe_reach`, a connect and a close, and for TLS the
+/// certificate it is shown. Every OS that runs sessions.
+pub mod knowhow_probe;
 /// FR-90 P4-4-1b — the toolbelt's knowhow reads: a session's questions about
 /// the organization's map, carried on the primary's connection and offered
 /// only on the server's word that the map is there. Every OS that runs

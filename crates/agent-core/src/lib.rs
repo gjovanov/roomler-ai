@@ -40,6 +40,9 @@ pub mod logging;
 pub mod logs_upload;
 pub mod machine;
 pub mod notify;
+/// FR-90 P4-5-1b — `knowhow_probe_reach`, where this device's knowhow
+/// probes may go: its syntax, shared by the config surface and the prober.
+pub mod probe_reach;
 pub mod recording_dir;
 /// macOS privacy-permission probes. Here rather than in `roomlerd`
 /// because the desktop companion needs them too and deliberately does NOT

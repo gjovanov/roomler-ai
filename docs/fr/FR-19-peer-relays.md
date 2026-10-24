@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2146`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1570`).
+(`agents/roomlerd/src/signaling.rs:1587`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -731,7 +731,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3100`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3111`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
