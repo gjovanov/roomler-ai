@@ -406,8 +406,8 @@ pub(crate) fn refusal(word: &str) -> String {
         }
         Some(SessionRefusal::Ended) => "this session is over".into(),
         Some(SessionRefusal::Denied) => {
-            "the person who started this session may not read the organization's map \
-             (their role holds no KNOWHOW_VIEW)"
+            "the person who started this session may not do that with the organization's \
+             map: reading it needs KNOWHOW_VIEW in their role, asking a probe KNOWHOW_EDIT"
                 .into()
         }
         Some(SessionRefusal::NotFound) => {
@@ -440,6 +440,12 @@ pub(crate) fn refusal(word: &str) -> String {
              own words instead",
             session_limits::MAX_PROPOSALS
         ),
+        Some(SessionRefusal::Unprobeable) => {
+            "that entity's facts say nowhere a probe reaches: it needs an address or a host, \
+             and a port, and a link-local, cloud metadata or listener-bind address is never \
+             probed"
+                .into()
+        }
         None => format!("the map refused: {word}"),
     }
 }

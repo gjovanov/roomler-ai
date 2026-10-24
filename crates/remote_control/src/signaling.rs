@@ -1785,6 +1785,28 @@ pub enum ClientMsg {
         why: String,
     },
 
+    /// FR-90 P4-5-2 — a session on this device asks this device to probe an
+    /// entity of the map, by its kind and key, as `probe` says (`tcp` or
+    /// `tls`; decision 54). Believed and held as [`ClientMsg::KnowhowSearch`]
+    /// is, the target read from the entity's own facts as a person's probe's
+    /// is, and answered at once with [`ServerMsg::KnowhowVerifying`] or
+    /// [`ServerMsg::KnowhowRefused`]; what the probe measured follows as
+    /// [`ServerMsg::KnowhowVerified`]. Absent, the strings read as empty and
+    /// are refused `bad_request`, so the frame is always answered.
+    #[serde(rename = "rc:knowhow.verify")]
+    KnowhowVerify {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        probe: String,
+    },
+
     /// FR-90 P4-5 — the device's answer to a [`ServerMsg::KnowhowProbe`]: how
     /// the probe ended, the round trip of its connect, the address it
     /// connected to (one it resolved and checked), and for `tls` what the
@@ -2764,6 +2786,7 @@ impl ClientMsg {
             ClientMsg::KnowhowGet { .. } => "rc:knowhow.get",
             ClientMsg::KnowhowPropose { .. } => "rc:knowhow.propose",
             ClientMsg::KnowhowProbed { .. } => "rc:knowhow.probed",
+            ClientMsg::KnowhowVerify { .. } => "rc:knowhow.verify",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2897,7 +2920,8 @@ impl ClientMsg {
             | ClientMsg::KnowhowSearch { .. }
             | ClientMsg::KnowhowGet { .. }
             | ClientMsg::KnowhowPropose { .. }
-            | ClientMsg::KnowhowProbed { .. } => Owner::Knowhow,
+            | ClientMsg::KnowhowProbed { .. }
+            | ClientMsg::KnowhowVerify { .. } => Owner::Knowhow,
         }
     }
 }
@@ -2956,6 +2980,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:knowhow.get", Owner::Knowhow),
     ("rc:knowhow.propose", Owner::Knowhow),
     ("rc:knowhow.probed", Owner::Knowhow),
+    ("rc:knowhow.verify", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -5075,6 +5100,30 @@ pub enum ServerMsg {
     /// [`crate::knowhow::SessionRefusal`].
     #[serde(rename = "rc:knowhow.refused")]
     KnowhowRefused { req_id: String, reason: String },
+
+    /// FR-90 P4-5-2 — a session's verify was asked: `probe_id` names the probe
+    /// its device is sent (or the one it is already running for the same
+    /// entity and kind). The probe goes out as soon as it is asked, so its
+    /// [`ServerMsg::KnowhowProbe`] may come before this answer. What it
+    /// measured follows as [`ServerMsg::KnowhowVerified`], on this same
+    /// connection.
+    #[serde(rename = "rc:knowhow.verifying")]
+    KnowhowVerifying {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        probe_id: ObjectId,
+    },
+
+    /// FR-90 P4-5-2 — a session's probe ended: the probe as the people's
+    /// listing shows it (its outcome, its round trip, the address, what TLS
+    /// showed, the facts it measured). Raw JSON, as a card is. Sent to the
+    /// device that ran it, once its answer is recorded.
+    #[serde(rename = "rc:knowhow.verified")]
+    KnowhowVerified {
+        #[serde(with = "oid_hex")]
+        probe_id: ObjectId,
+        probe: serde_json::Value,
+    },
 
     /// FR-90 P4-5 — a probe, asked of a device whose last hello advertised
     /// [`crate::models::RpcCap::KnowhowProbe`]: reach `host` on `port` as
@@ -7234,6 +7283,57 @@ mod tests {
                 other => panic!("not an answer: {other:?}"),
             }
         }
+    }
+
+    /// FR-90 P4-5-2 — a session's verify and its two answers: the entity by
+    /// its kind and key and the probe's kind as words, a bare one still
+    /// decoding so it is answered `bad_request`; `verifying` naming the probe,
+    /// and `verified` carrying the probe as raw JSON.
+    #[test]
+    fn knowhow_verify_frames_wire_shape_is_locked() {
+        let (session, probe) = (ObjectId::new(), ObjectId::new());
+        let verify = ClientMsg::KnowhowVerify {
+            req_id: "v1".into(),
+            session_id: session,
+            fence: 2,
+            kind: "endpoint".into(),
+            key: "db".into(),
+            probe: "tcp".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&verify).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.verify", "req_id": "v1",
+                               "session_id": session.to_hex(), "fence": 2,
+                               "kind": "endpoint", "key": "db", "probe": "tcp"})
+        );
+        assert_eq!(verify.namespace(), Owner::Knowhow);
+        assert_eq!(verify.wire_tag(), "rc:knowhow.verify");
+        let bare = serde_json::json!({"t": "rc:knowhow.verify", "req_id": "v2",
+                                      "session_id": session.to_hex(), "fence": 2});
+        match serde_json::from_value::<ClientMsg>(bare).unwrap() {
+            ClientMsg::KnowhowVerify {
+                kind, key, probe, ..
+            } => assert!(kind.is_empty() && key.is_empty() && probe.is_empty()),
+            other => panic!("not a verify: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowVerifying {
+                req_id: "v1".into(),
+                probe_id: probe,
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.verifying", "req_id": "v1",
+                               "probe_id": probe.to_hex()})
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowVerified {
+                probe_id: probe,
+                probe: serde_json::json!({"state": "ok"}),
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.verified", "probe_id": probe.to_hex(),
+                               "probe": {"state": "ok"}})
+        );
     }
 
     /// FR-90 P4-4-1 — a session's questions and their answers: the session
