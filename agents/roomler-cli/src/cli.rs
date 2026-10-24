@@ -648,7 +648,7 @@ enum RecordAction {
         /// Stop by itself after this many minutes. Default: 240.
         #[arg(long)]
         max_minutes: Option<u32>,
-        /// Also record what the computer plays (Windows, Linux).
+        /// Also record what the computer plays (Windows, Linux, macOS).
         #[arg(long)]
         system_audio: bool,
         /// Also record the microphone.

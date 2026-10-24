@@ -149,11 +149,11 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
     const r = useRemoteRecording()
     const { ch, sent } = fakeChannel()
     r.attach(ch)
-    // The device's answer to rc:record.status, before any start: a Mac.
+    // The device's answer to rc:record.status, before any start: an older Mac.
     ch.deliver({ t: 'rc:record.state', id: '', state: 'idle', audio_unavailable: 'audio_unsupported' })
     expect(r.audioUnavailable.value).toBe('audio_unsupported')
     expect(describeRecordReason(r.audioUnavailable.value)).toBe(
-      "this device can't record what the computer plays (Windows and Linux devices only, for now)",
+      "this device can't record what the computer plays (a Mac can, from agent 0.4.161)",
     )
     // A box that cannot be ticked never asks: even a stale tick sends no audio.
     r.start(true)

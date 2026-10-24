@@ -30,8 +30,8 @@
 > `roomler record` (§6), by roomler-desktop (§7), by a remote controller
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
-> person hands it. Still to come: the microphone and computer audio on macOS
-> (neither offered there, §9).
+> person hands it. Still to come: the microphone on macOS (FR-97 P2f, §9);
+> computer audio is recorded there since FR-97 P2a (agent 0.4.161).
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -845,7 +845,7 @@ sequenceDiagram
 | `disabled_on_device` | the owner's switch is off, read at the moment of asking and again after the prompt |
 | `unavailable` | there is nobody to record as (the kill switch; a macOS root daemon, which has no screen), or the session was handed to a macOS GUI worker by a daemon older than P1e-mac, which sent no record context |
 | `login_screen` | the device is at its login screen (decision 6): Windows' sign-in screen, a Linux greeter or root's own desktop. Refused before the host is asked; `detail` says it. The device still advertises `available`, and records once someone signs in |
-| `audio_unsupported` | computer audio was asked for and this device cannot record it at all (a Mac; a build without `audio`), whatever the owner set — named ahead of the owner's gate, since no setting fixes it, with the words in `detail` (#1760, §9). Additive on the wire: a viewer older than the code shows it as itself |
+| `audio_unsupported` | computer audio was asked for and this device cannot record it at all (a build without `audio`; a Mac before FR-97 P2a), whatever the owner set — named ahead of the owner's gate, since no setting fixes it, with the words in `detail` (#1760, §9). Additive on the wire: a viewer older than the code shows it as itself |
 | `audio_not_allowed` | computer audio was asked for and the owner has not allowed it |
 | `busy` | a recording is already running, local or remote |
 | `already_starting` | this session is already starting one |
@@ -1075,11 +1075,11 @@ sequenceDiagram
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
   `child.rs:380`); a recording never follows a user switch.
-- ⚠️ **Not built on macOS yet:** the microphone and computer audio (P1c-mac:
-  cpal, `NSMicrophoneUsageDescription`, the `audio-input` entitlement,
-  ScreenCaptureKit on 13+). They are refused by name, and computer audio is
-  never offered (#1760, §9): the worker advertises no `remote-audio`, the
-  viewer's box is greyed out, and so are the companion's. The banner is not
+- ⚠️ **Not built on macOS yet: the microphone** (FR-97 P2f: cpal,
+  `NSMicrophoneUsageDescription`, the `audio-input` entitlement); it is
+  refused by name. Computer audio is, since FR-97 P2a (ScreenCaptureKit, in
+  the worker's session): the worker advertises `remote-audio` while the owner
+  allows it, as any host does (§9). The banner is not
   capture-excluded there, so it appears in the recording.
 - **Unsupervised Mac** (the default): the per-user LaunchAgent is its own
   enrollment and records as the person, like any user install; the root row
@@ -1150,7 +1150,7 @@ without a PeerConnection or a save dialog.
 - **Record**: start, with "Include what the computer plays" as a separate,
   unticked box. Where the device says computer audio cannot go into a remote
   recording (`audio_unavailable` on every `rc:record.state`, #1760:
-  `audio_unsupported` on a Mac, `audio_not_allowed` until the owner allows
+  `audio_unsupported` on a build without `audio`, `audio_not_allowed` until the owner allows
   it) the box is **greyed out, unticked, with the sentence beside it** —
   never a box that only fails — and a start never asks for it; a device that
   sends no field (older than #1760) keeps the box offered, and refuses by
