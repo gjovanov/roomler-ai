@@ -1499,11 +1499,14 @@ jobs:
       # Windows gets (decision 17), and `vault::` does not match the module.
       # FR-90 P3-8-2a: `ssh_service::` — the SYSTEM service's claim and publish
       # are `cfg(windows)`, so no other lane runs what they say of one command.
+      # #2836: `overlay::socket_inherit_tests` — no tokio socket is inheritable,
+      # so a child the daemon spawns (the post-install watcher outlives it by
+      # design) never holds its ports. `cfg(windows)`: Unix sockets are CLOEXEC.
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
         # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy:: ssh_service::
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy:: ssh_service:: overlay::socket_inherit_tests
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
