@@ -1730,6 +1730,10 @@ jobs:
       # clippy reports `dead_code` on items that ARE used — from call sites
       # inside `#[cfg(feature = "vp9-444")]` functions in peer.rs.
       REC_FEATURES: recording,openh264-encoder,synthetic-frame-source,audio,ffmpeg-encoder,vp9-444,vp9-444-bindgen
+      # `audio` builds audiopus_sys's bundled libopus with CMake, whose
+      # CMakeLists declares a minimum below 3.5 that ubuntu-26.04's CMake 4
+      # refuses (the release builds set the same; see ci-linux-system-deps).
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain

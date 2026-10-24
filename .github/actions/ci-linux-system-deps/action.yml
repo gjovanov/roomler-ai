@@ -162,3 +162,13 @@ runs:
       # the action needs, since it drops env-libvpx-sys's restored build.
       - name: Point bindgen at the distro's libclang
         uses: ./.github/actions/bindgen-libclang
+
+      # 2026-10-24: ubuntu-26.04's CMake is 4.x, which refuses a
+      # `cmake_minimum_required` below 3.5, and audiopus_sys's bundled libopus
+      # declares one (`full` carries `audio`). The release builds and the
+      # macOS check set the same variable. On Linux it stayed hidden while the
+      # lanes restored an audiopus build from their caches, until #2835's run
+      # built it again and rust-lint failed configuring Opus.
+      - name: Let CMake 4 configure audiopus_sys's bundled libopus
+        shell: bash
+        run: echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
