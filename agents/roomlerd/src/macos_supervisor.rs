@@ -290,6 +290,10 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // FR-97 P2a — system audio through ScreenCaptureKit: the worker is the
     // half that captures a session's (and a recording's) sound.
     "SCK_AUDIO",
+    // FR-97 P2f-2 — the worker starts its recorders as their own responsible
+    // process, so macOS can ask the person about the microphone; `0` reverts
+    // to the plain spawn, where a supervised recorder refuses the microphone.
+    "RECORDER_DISCLAIM",
     // FR-119 — the high-refresh picker and its per-cell ceilings.
     "FPS_HIGH",
     "FPS_DENY",

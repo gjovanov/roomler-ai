@@ -106,6 +106,10 @@ pub mod lock_on_end;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
+/// FR-97 P2f-2 — start a child that is its own responsible process, so macOS
+/// asks the person about the microphone a supervised Mac's recorder opens.
+#[cfg(target_os = "macos")]
+pub mod macos_spawn;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
 pub mod mem_trim;
