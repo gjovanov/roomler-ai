@@ -5160,6 +5160,22 @@ impl super::super::knowhow_tools::KnowhowTools for FakeKnowhow {
                   "proposals_left": 49}),
         )
     }
+
+    async fn verify(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+        probe: roomler_ai_remote_control::knowhow::ProbeKind,
+    ) -> Result<Value, String> {
+        self.asked.lock().unwrap().push((
+            session,
+            fence,
+            format!("verify {kind}/{key} {}", probe.as_str()),
+        ));
+        Ok(json!({"probe_id": "p1", "state": "ok", "rtt_ms": 3}))
+    }
 }
 
 fn knowhow_run(session: ObjectId, knowhow: Option<Arc<FakeKnowhow>>) -> Run {
@@ -5344,5 +5360,58 @@ async fn a_proposal_is_offered_on_the_servers_word_and_asks_no_person() {
     assert!(
         b.events.try_recv().is_err(),
         "no person is asked for a proposal"
+    );
+}
+
+/// FR-90 P4-5-2b — `knowhow_verify` is offered only where the server names
+/// it, and carries the entity and the probe as its run's session at its
+/// fence. The person is asked by the session's settings before the call
+/// reaches the belt (`permissions.ask`, `the_settings_ask_a_person_for_each_verify`).
+#[tokio::test]
+async fn a_verify_is_offered_on_the_servers_word_and_asked_as_the_run() {
+    use roomler_ai_remote_control::knowhow::{TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY};
+    let db = || json!({"kind": "endpoint", "key": "db", "probe": "tls"});
+    let three = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE]);
+    let r = belt_running(
+        me(),
+        knowhow_run(ObjectId::new(), Some(three.clone())),
+        quick(),
+    );
+    let mut c = Client::connect(&r).await;
+    c.send(tool_call(1, "knowhow_verify", db())).await;
+    assert_eq!(
+        c.recv().await["error"]["code"],
+        -32602,
+        "a server that did not name it has no such tool"
+    );
+    assert!(three.asked().is_empty(), "and asked nobody");
+
+    let map = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY]);
+    let sid = ObjectId::new();
+    let b = belt_running(me(), knowhow_run(sid, Some(map.clone())), quick());
+    let mut c = Client::connect(&b).await;
+    assert_eq!(
+        listed(&mut c).await,
+        [
+            "approve",
+            "knowhow_search",
+            "knowhow_get",
+            "knowhow_propose",
+            "knowhow_verify"
+        ]
+    );
+    c.send(tool_call(2, "knowhow_verify", db())).await;
+    let checked = c.recv().await;
+    assert!(checked["result"].get("isError").is_none(), "{checked}");
+    let text: Value =
+        serde_json::from_str(checked["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["state"], "ok");
+    c.send(tool_call(3, "knowhow_verify", json!({"key": "db"})))
+        .await;
+    assert_eq!(c.recv().await["result"]["isError"], true);
+    assert_eq!(
+        map.asked(),
+        [(sid, 4, "verify endpoint/db tls".to_string())],
+        "the run's own session and fence; one naming no kind asks nothing"
     );
 }
