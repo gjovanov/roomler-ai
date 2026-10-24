@@ -366,7 +366,7 @@
           ? 'Trackpad: a finger moves the pointer; tap to click, hold then move to drag. Tap for direct touch.'
           : 'Direct touch: the finger is the pointer. Tap to use the screen as a trackpad.'"
         data-testid="rc-touch-mode"
-        @click="rc.setTouchMode(rc.touchMode.value === 'trackpad' ? 'direct' : 'trackpad')"
+        @click="toggleTouchMode"
       >
         <v-icon>{{ rc.touchMode.value === 'trackpad' ? 'mdi-gesture-swipe' : 'mdi-gesture-tap' }}</v-icon>
       </v-btn>
@@ -459,36 +459,50 @@
            every viewport. Relocated here from the retired Row 2.
            Absent when the grant has no CLIPBOARD: the channel they need
            was closed at `rc:session.created` (dropClipboardChannel). -->
-      <v-btn
+      <!-- FR-120 P1b — refused, each greys out and says why on a tap (the
+           span takes the tap a disabled button does not). -->
+      <span
         v-if="rc.phase.value === 'connected' && rc.clipboardGranted.value"
-        icon
-        variant="text"
-        size="small"
-        class="mr-1"
-        :loading="clipboardBusy"
-        :disabled="!!clipboardRefusal"
-        aria-label="Send my clipboard to the remote host"
-        :title="clipboardRefusal ?? 'Send my clipboard → remote'"
-        data-testid="rc-clipboard-send"
-        @click="onSendClipboard"
+        class="d-inline-flex"
+        data-testid="rc-clipboard-send-wrap"
+        @click="clipboardRefusal && explainRefusal(clipboardRefusal)"
       >
-        <v-icon>mdi-content-paste</v-icon>
-      </v-btn>
-      <v-btn
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          class="mr-1"
+          :loading="clipboardBusy"
+          :disabled="!!clipboardRefusal"
+          aria-label="Send my clipboard to the remote host"
+          :title="clipboardRefusal ?? 'Send my clipboard → remote'"
+          data-testid="rc-clipboard-send"
+          @click="onSendClipboard"
+        >
+          <v-icon>mdi-content-paste</v-icon>
+        </v-btn>
+      </span>
+      <span
         v-if="rc.phase.value === 'connected' && rc.clipboardGranted.value"
-        icon
-        variant="text"
-        size="small"
-        class="mr-1"
-        :loading="clipboardBusy"
-        :disabled="!!clipboardRefusal"
-        aria-label="Get the remote host's clipboard"
-        :title="clipboardRefusal ?? 'Get remote clipboard → me'"
-        data-testid="rc-clipboard-get"
-        @click="onGetClipboard"
+        class="d-inline-flex"
+        data-testid="rc-clipboard-get-wrap"
+        @click="clipboardRefusal && explainRefusal(clipboardRefusal)"
       >
-        <v-icon>mdi-content-copy</v-icon>
-      </v-btn>
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          class="mr-1"
+          :loading="clipboardBusy"
+          :disabled="!!clipboardRefusal"
+          aria-label="Get the remote host's clipboard"
+          :title="clipboardRefusal ?? 'Get remote clipboard → me'"
+          data-testid="rc-clipboard-get"
+          @click="onGetClipboard"
+        >
+          <v-icon>mdi-content-copy</v-icon>
+        </v-btn>
+      </span>
       <!-- FR-85 P3c — record the remote screen. The recording is made and kept
            on the device (a banner shows there while it runs); the menu starts
            and stops it and downloads what this controller recorded. Offered
@@ -688,6 +702,7 @@
         v-else-if="rc.phase.value === 'connected' && showsRecordRefusal(rc.recordRefused.value)"
         :title="`Recording unavailable: ${describeRecordReason(rc.recordRefused.value)}`"
         data-testid="rc-record-refused"
+        @click="explainRefusal(`Recording unavailable: ${describeRecordReason(rc.recordRefused.value)}`)"
       >
         <v-btn icon variant="text" size="small" class="mr-1" disabled aria-label="Recording unavailable">
           <v-icon>mdi-record-circle-outline</v-icon>
@@ -697,27 +712,35 @@
            the device puts the curtain up after its own gates and says why
            when it does not. A disabled control explains the server's strip
            reason; nothing shows where no curtain could ever be. -->
-      <v-btn
+      <!-- FR-120 P1b — not ready, it greys out and says why on a tap. -->
+      <span
         v-if="rc.phase.value === 'connected' && rc.privacyGranted.value"
-        icon
-        variant="text"
-        size="small"
-        class="mr-1"
-        :color="rc.privacy.on.value ? 'primary' : undefined"
-        :loading="rc.privacy.pending.value"
-        :disabled="!rc.privacy.ready.value"
-        :aria-pressed="rc.privacy.on.value"
-        :aria-label="rc.privacy.on.value ? 'Uncover the device screen' : 'Cover the device screen'"
-        :title="privacyTitle"
-        data-testid="rc-privacy-btn"
-        @click="rc.privacy.set(!rc.privacy.on.value)"
+        class="d-inline-flex"
+        data-testid="rc-privacy-wrap"
+        @click="!rc.privacy.ready.value && explainRefusal(privacyTitle)"
       >
-        <v-icon>{{ rc.privacy.on.value ? 'mdi-eye-off' : 'mdi-eye-off-outline' }}</v-icon>
-      </v-btn>
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          class="mr-1"
+          :color="rc.privacy.on.value ? 'primary' : undefined"
+          :loading="rc.privacy.pending.value"
+          :disabled="!rc.privacy.ready.value"
+          :aria-pressed="rc.privacy.on.value"
+          :aria-label="rc.privacy.on.value ? 'Uncover the device screen' : 'Cover the device screen'"
+          :title="privacyTitle"
+          data-testid="rc-privacy-btn"
+          @click="rc.privacy.set(!rc.privacy.on.value)"
+        >
+          <v-icon>{{ rc.privacy.on.value ? 'mdi-eye-off' : 'mdi-eye-off-outline' }}</v-icon>
+        </v-btn>
+      </span>
       <span
         v-else-if="rc.phase.value === 'connected' && showsPrivacyRefusal(rc.privacyRefused.value)"
         :title="`Privacy mode unavailable: ${describePrivacyReason(rc.privacyRefused.value)}`"
         data-testid="rc-privacy-refused"
+        @click="explainRefusal(`Privacy mode unavailable: ${describePrivacyReason(rc.privacyRefused.value)}`)"
       >
         <v-btn icon variant="text" size="small" class="mr-1" disabled aria-label="Privacy mode unavailable">
           <v-icon>mdi-eye-off-outline</v-icon>
@@ -778,6 +801,13 @@
               </v-list-item-title>
               <v-list-item-subtitle>
                 <span class="text-caption">{{ transferStatusLabel(t) }}</span>
+                <!-- FR-120 P1b — a failed transfer says why, as text: the
+                     error was only its icon's `title`. -->
+                <span
+                  v-if="t.status === 'error' && t.error"
+                  class="d-block text-caption text-error text-wrap"
+                  data-testid="rc-transfer-error"
+                >{{ t.error }}</span>
                 <v-progress-linear
                   v-if="
                     t.status === 'running' ||
@@ -1678,6 +1708,17 @@
           >
             1:1 Match host display — {{ displayMatchOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <!-- FR-120 P1b — a disabled control says why, as text: a disabled
+               v-btn takes no pointer events, so its `title` reached no one
+               (and a finger never). The same caption follows every disabled
+               control in this panel. -->
+          <div
+            v-if="!agentSupportsDisplayMatch"
+            class="text-caption text-medium-emphasis mt-1 ml-1"
+            data-testid="rc-display-match-why"
+          >
+            {{ displayMatchTooltip }}
+          </div>
           <div
             v-if="displayMatchSaid"
             class="text-caption text-medium-emphasis mt-1 ml-1"
@@ -1794,6 +1835,13 @@
           >
             Receive host audio — {{ audioOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <div
+            v-if="sessionLive || !agentSupportsAudio"
+            class="text-caption text-medium-emphasis mt-n1 mb-2 ml-1"
+            data-testid="rc-audio-why"
+          >
+            {{ audioTooltip }}
+          </div>
           <!-- loopback-TURN corp-relay assist (browser half; default-OFF).
                Surfaces the localStorage opt-in as a one-click toggle so the
                UDP-blocked-corp field test doesn't need DevTools. The agent
@@ -1811,6 +1859,13 @@
           >
             Corp relay assist — {{ localRelayOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <div
+            v-if="sessionLive"
+            class="text-caption text-medium-emphasis mt-n1 mb-2 ml-1"
+            data-testid="rc-local-relay-why"
+          >
+            {{ localRelayTooltip }}
+          </div>
           <!-- Clipboard auto-sync (v2). Live-effective (not gated on
                sessionLive) — the composable subscribes/unsubscribes on
                flip. Old agents: local→remote still auto-pushes; the
@@ -1833,6 +1888,13 @@
           >
             Clipboard auto-sync — {{ clipboardAutoSyncOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <div
+            v-if="rc.clipboardGranted.value && clipboardRefusal"
+            class="text-caption text-medium-emphasis mt-n1 mb-2 ml-1"
+            data-testid="rc-clipboard-autosync-why"
+          >
+            {{ clipboardRefusal }}
+          </div>
           <!-- FR-13 (#789): mac hosts only — Ctrl chords translate to Cmd
                (copy/paste work); switch OFF to send literal Ctrl for
                terminal work (SIGINT etc). -->
@@ -1901,6 +1963,13 @@
             >
               Browse remote files
             </v-btn>
+            <div
+              v-if="filesWhy"
+              class="text-caption text-medium-emphasis mt-n1 mb-2 ml-1"
+              data-testid="rc-files-why"
+            >
+              {{ filesWhy }}
+            </div>
             <!-- FR-56 AC10 — never disabled: a host that cannot serve the
                  feature says WHY in the dialog (`unavailable.reason`), and a
                  greyed button with no tooltip was the one place that reason
@@ -1959,11 +2028,12 @@
             size="small"
             :loading="rc.appsLoading.value"
             title="Refresh"
+            aria-label="Refresh"
             @click="refreshAppsSafe"
           >
             <v-icon>mdi-refresh</v-icon>
           </v-btn>
-          <v-btn icon size="small" title="Close" @click="appsDialog = false">
+          <v-btn icon size="small" title="Close" aria-label="Close" @click="appsDialog = false">
             <v-icon>mdi-close</v-icon>
           </v-btn>
         </v-toolbar>
@@ -2196,10 +2266,12 @@
         <v-icon class="ml-4">mdi-folder-open</v-icon>
         <v-toolbar-title>Remote files</v-toolbar-title>
         <v-spacer />
-        <v-btn icon variant="text" :disabled="dirLoading" title="Refresh" @click="navigateTo(currentDirPath)">
+        <!-- FR-120 P1b — every icon button here is named (`aria-label`), not
+             only titled: a title is a mouse's, and a screen reader's last resort. -->
+        <v-btn icon variant="text" :disabled="dirLoading" title="Refresh" aria-label="Refresh" @click="navigateTo(currentDirPath)">
           <v-icon>mdi-refresh</v-icon>
         </v-btn>
-        <v-btn icon variant="text" title="Close" @click="filesDrawer = false">
+        <v-btn icon variant="text" title="Close" aria-label="Close" @click="filesDrawer = false">
           <v-icon>mdi-close</v-icon>
         </v-btn>
       </v-toolbar>
@@ -2210,6 +2282,7 @@
           size="small"
           :disabled="isRootsView || dirLoading"
           title="Parent directory"
+          aria-label="Parent directory"
           @click="navigateTo(currentParent || '')"
         >
           <v-icon>mdi-arrow-up</v-icon>
@@ -2220,6 +2293,7 @@
           size="small"
           :disabled="dirLoading"
           title="Upload staging folder (rc.22 ESET-evasive staging — partials live here mid-upload)"
+          aria-label="Upload staging folder"
           @click="navigateTo(STAGING_PATH)"
         >
           <v-icon>mdi-package-variant-closed</v-icon>
@@ -2230,6 +2304,7 @@
           size="small"
           :disabled="dirLoading"
           title="Drives / roots"
+          aria-label="Drives and roots"
           @click="navigateTo('')"
         >
           <v-icon>mdi-monitor</v-icon>
@@ -2303,15 +2378,8 @@
               size="x-small"
               variant="text"
               :disabled="entry.is_dir ? !agentSupportsFolderDownload : !agentSupportsDownload"
-              :title="
-                entry.is_dir
-                  ? agentSupportsFolderDownload
-                    ? `Download ${entry.name} as zip (Chrome/Edge only)`
-                    : 'Folder download needs agent 0.3.0+'
-                  : agentSupportsDownload
-                    ? `Download ${entry.name}`
-                    : 'Download needs agent 0.3.0+'
-              "
+              :title="downloadLabel(entry)"
+              :aria-label="downloadLabel(entry)"
               @click.stop="downloadEntry(entry)"
             >
               <v-icon>{{ entry.is_dir ? 'mdi-folder-zip' : 'mdi-download' }}</v-icon>
@@ -2467,6 +2535,12 @@ const rc = useRemoteControl(agent, {
 })
 const { t } = useI18n()
 const { showSuccess, showError, showSnackbar } = useSnackbar()
+/** FR-120 P1b — a greyed toolbar control's reason, on a tap. A disabled v-btn takes no
+ *  pointer events, so the tap lands on the span around it, which says why: its `title`
+ *  reached a mouse only. */
+function explainRefusal(why: string | null | undefined): void {
+  if (why) showSnackbar(why, 'info', 6000)
+}
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
 const { mobile, xs, width: displayWidth } = useDisplay()
@@ -3032,6 +3106,17 @@ function formatFileSize(bytes: number | null): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
+/** A row's download button, named (title and `aria-label` both): what it downloads, or
+ *  why it cannot (FR-120 P1b — an icon button with only a `title` had no name). */
+function downloadLabel(entry: { name: string; is_dir: boolean }): string {
+  if (entry.is_dir) {
+    return agentSupportsFolderDownload.value
+      ? `Download ${entry.name} as zip (Chrome/Edge only)`
+      : 'Folder download needs agent 0.3.0+'
+  }
+  return agentSupportsDownload.value ? `Download ${entry.name}` : 'Download needs agent 0.3.0+'
+}
+
 async function downloadEntry(entry: { name: string; is_dir: boolean }) {
   // Reuse `nextDirPath`'s separator logic via a small wrapper:
   // for file entries the helper returns null (it's "next dir to
@@ -3501,6 +3586,18 @@ const touchModeOffered = (() => {
     return false
   }
 })()
+/** FR-120 P1b — a tap switches the touch mode and says how the new one works: the
+ *  gestures were only the button's `title`, which a finger never sees, and a finger is
+ *  the one thing this control is offered to. */
+const TOUCH_MODE_HELP = {
+  trackpad: 'Trackpad: a finger moves the pointer; tap to click, hold then move to drag.',
+  direct: 'Direct touch: the finger is the pointer.',
+} as const
+function toggleTouchMode(): void {
+  const next = rc.touchMode.value === 'trackpad' ? 'direct' : 'trackpad'
+  rc.setTouchMode(next)
+  showSnackbar(TOUCH_MODE_HELP[next], 'info', 5000)
+}
 /** FR-111 P3 — the on-screen controls: off, or a built-in preset, chosen per
  *  device and remembered in this browser. Offered where the touch mode is. */
 const touchControlsId = ref<string | null>(null)
@@ -4897,6 +4994,13 @@ const agentSupportsFolderDownload = computed(() =>
 // to render a "agent doesn't support download — upgrade to 0.3.0+"
 // hint when the operator opens the drawer.
 const isLegacyFileDc = computed(() => agentFilesCaps.value.length === 0)
+/** FR-120 P1b — why Upload and Browse are greyed, said under them: the session's refusal
+ *  covers both; else Browse's own reason. Null when both work. */
+const filesWhy = computed<string | null>(() => {
+  if (filesRefusal.value) return filesRefusal.value
+  if (agentSupportsBrowse.value) return null
+  return isLegacyFileDc.value ? 'Browse needs agent 0.3.0+ — upgrade host agent' : 'Browse disabled by host config'
+})
 
 // #1631 — the device this view is for, wherever it lives: the cached page
 // (the nav's live view over the store) first, else the single-device GET,
