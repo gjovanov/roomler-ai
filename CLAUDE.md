@@ -822,7 +822,8 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
   through `free` ↔ `exclusive` (2026-10-24; two BROWSERS on one PC are enough).
   ⚠️ `push` reaches the owner **in-app only**: prod has no push service
   (`vapid_public_key` is empty). ⚠️ The controller's wording for owner-side modes
-  still says "the person there" (#2810). Still unverified: the macOS/X11 panels.
+  still says "the person there" (#2810). The X11 panel was field-verified through
+  Xwayland in FR-93 AC10 (0.4.141). Still unverified: the macOS native panel.
   Detail: `docs/fr/FR-27-*.md`.
 - **[LOW]** [2026-08-03] Overlay ACL is feature-complete but **not field-proven
   under `enforce`**. ⚠️ `ingress_rules` is `Option`: `None` = no ACL compiled (fall
