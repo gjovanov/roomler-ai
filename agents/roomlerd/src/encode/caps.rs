@@ -2202,6 +2202,12 @@ fn rpc_caps() -> Vec<String> {
     // advertises it from P4-3b-4.
     #[cfg(all(hive_host, unix))]
     caps.push(RpcCap::KnowhowScan);
+    // FR-90 P4-4-1b — and its sessions can ask the organization's map, so
+    // its server tells it at each hello whether the map is there for them
+    // (`rc:knowhow.served`, decision 49). A property of the BUILD: every OS
+    // that runs sessions, the toolbelt's tools apart from the scanner.
+    #[cfg(hive_host)]
+    caps.push(RpcCap::KnowhowTools);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.

@@ -95,6 +95,11 @@ mod importer;
 /// macOS; Windows is P4-3b-4's.
 #[cfg(unix)]
 pub mod knowhow;
+/// FR-90 P4-4-1b — the toolbelt's knowhow reads: a session's questions about
+/// the organization's map, carried on the primary's connection and offered
+/// only on the server's word that the map is there. Every OS that runs
+/// sessions, apart from the scanner.
+pub mod knowhow_tools;
 mod lines;
 mod materializer;
 /// FR-90 P3-7-3c — `net_socks` and `net_forward`: a session's own egress, on
