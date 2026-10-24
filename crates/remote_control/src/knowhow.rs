@@ -436,6 +436,9 @@ pub const TOOL_GET: &str = "knowhow_get";
 /// FR-90 P4-4-2 — a session says what it learned, as a proposal (decisions
 /// 39 and 50).
 pub const TOOL_PROPOSE: &str = "knowhow_propose";
+/// FR-90 P4-5-2 — a session asks its own device to probe an entity of the
+/// map (decision 54), the settings asking a person each call.
+pub const TOOL_VERIFY: &str = "knowhow_verify";
 
 /// FR-90 P4-4-1 — why knowhow refused a session's question. The words are a
 /// compatibility surface: a device decides from them whether asking again
@@ -479,6 +482,10 @@ pub enum SessionRefusal {
     Full,
     /// The session made its most proposals (decision 51).
     Ceiling,
+    /// FR-90 P4-5-2 — the entity's facts say nowhere a probe reaches: no
+    /// host or port, a listener's bind address, an address never probed, or
+    /// a loopback address of another device.
+    Unprobeable,
 }
 
 impl SessionRefusal {
@@ -500,10 +507,11 @@ impl SessionRefusal {
             Self::Refused => "refused",
             Self::Full => "full",
             Self::Ceiling => "ceiling",
+            Self::Unprobeable => "unprobeable",
         }
     }
 
-    pub const ALL: [SessionRefusal; 14] = [
+    pub const ALL: [SessionRefusal; 15] = [
         Self::NotServed,
         Self::BadRequest,
         Self::NotLocated,
@@ -518,6 +526,7 @@ impl SessionRefusal {
         Self::Refused,
         Self::Full,
         Self::Ceiling,
+        Self::Unprobeable,
     ];
 
     /// A word, read back: `None` for one this build does not know, which a
@@ -967,6 +976,7 @@ mod tests {
                 "refused",
                 "full",
                 "ceiling",
+                "unprobeable",
             ]
         );
         for r in SessionRefusal::ALL {

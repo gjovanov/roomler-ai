@@ -673,6 +673,27 @@ async fn answered(state: &KnowhowState, ctx: &AgentCtx, probe_id: ObjectId, raw:
             warn!(probe = %probe_id, %e, "knowhow: what a probe measured was not recorded on its facts")
         }
     }
+    // P4-5-2 — a session's probe: its session waits for what it measured, on
+    // this same connection, the session's own device's.
+    if after.session.is_some() {
+        let now = state
+            .probes
+            .base
+            .find_by_id(probe_id)
+            .await
+            .unwrap_or(after);
+        let view = serde_json::to_value(ProbeView::of(&now)).unwrap_or(Value::Null);
+        let frame = ServerMsg::KnowhowVerified {
+            probe_id,
+            probe: view,
+        };
+        if !matches!(
+            tokio::time::timeout(SEND_WAIT, ctx.tx.send(frame)).await,
+            Ok(Ok(()))
+        ) {
+            debug!(probe = %probe_id, "knowhow: a session's probe ended, but its device's connection did not take the word");
+        }
+    }
 }
 
 /// An answer as the frame carried it.
@@ -719,6 +740,122 @@ impl AgentMsgHandler for ProbeAnswers {
     }
 }
 
+// ─── asking ─────────────────────────────────────────────────────────────────
+
+/// Who asks a probe (decision 54).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Asker {
+    /// A person with `KNOWHOW_EDIT`, through the route.
+    Person(ObjectId),
+    /// P4-5-2 — a session's `knowhow_verify`, from its own device.
+    Session(ObjectId),
+}
+
+/// Why a probe was not asked.
+#[derive(Debug)]
+pub(crate) enum NotAsked {
+    /// The device is not the organization's.
+    NoDevice,
+    /// It cannot probe, or is a secondary enrollment.
+    Refused(Refusal),
+    /// The entity's facts say nowhere a probe reaches: why.
+    Unprobeable(String),
+    /// The device was asked its most probes this minute.
+    RateLimited,
+    /// The device is running another probe.
+    Busy,
+    /// Its pending probe ended while this one was asked: ask again.
+    JustEnded,
+    Store(DaoError),
+}
+
+impl From<DaoError> for NotAsked {
+    fn from(e: DaoError) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// Ask `device` to probe `entity` as `kind`, for `asker`: the device's gates,
+/// the target read from the entity's facts, the device's ceiling, one probe
+/// at a time. The probe as it is now, sent at once when the device is
+/// connected here; or the device's pending one, when it is this same probe.
+pub(crate) async fn ask(
+    state: &KnowhowState,
+    tid: ObjectId,
+    entity: &KnowhowEntity,
+    device: ObjectId,
+    kind: ProbeKind,
+    asker: Asker,
+) -> Result<KnowhowProbe, NotAsked> {
+    let Some(entity_id) = entity.id else {
+        return Err(NotAsked::Unprobeable("an entity with no id".into()));
+    };
+    let agent = match state.agents.find_live_in_tenant(tid, device).await {
+        Ok(agent) => agent,
+        Err(DaoError::NotFound) => return Err(NotAsked::NoDevice),
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(why) = refusal(&agent) {
+        return Err(NotAsked::Refused(why));
+    }
+    let target = target(entity, kind, device).map_err(NotAsked::Unprobeable)?;
+    // Keyed on the device in both slots: the ceiling is the device's,
+    // whoever asks. Checked after every gate, so a refusal is attributable.
+    if !state.probe_limiter.check(device, device, RATE_PER_MINUTE) {
+        return Err(NotAsked::RateLimited);
+    }
+    let (requested_by, session) = match asker {
+        Asker::Person(user) => (Some(user), None),
+        Asker::Session(session) => (None, Some(session)),
+    };
+    let probe = KnowhowProbe {
+        id: None,
+        tenant_id: tid,
+        entity_id,
+        device_id: device,
+        requested_by,
+        session,
+        requested_at: DateTime::now(),
+        kind: kind.as_str().into(),
+        target,
+        state: PROBE_REQUESTED.into(),
+        pending: Some(true),
+        delivered_at: None,
+        answered_at: None,
+        rtt_ms: None,
+        address: None,
+        carrier: None,
+        tls: None,
+        detail: None,
+        measured: Vec::new(),
+    };
+    let id = match state.probes.create(&probe).await {
+        Ok(id) => id,
+        Err(DaoError::DuplicateKey(_)) => {
+            return match state.probes.pending_for(tid, device).await? {
+                Some(p) if p.entity_id == entity_id && p.kind == probe.kind => Ok(p),
+                Some(_) => Err(NotAsked::Busy),
+                None => Err(NotAsked::JustEnded),
+            };
+        }
+        Err(e) => return Err(e.into()),
+    };
+    info!(
+        probe = %id, tenant = %tid, entity = %entity_id, device = %device, asker = ?asker,
+        kind = kind.as_str(), "knowhow: a probe was asked"
+    );
+    let probe = KnowhowProbe {
+        id: Some(id),
+        ..probe
+    };
+    // At once, when the device is connected to this pod; any other pod's
+    // sweep finds it otherwise.
+    if let Some(link) = state.links.get(device, tid) {
+        deliver(state, &probe, &link).await;
+    }
+    Ok(state.probes.base.find_by_id(id).await.unwrap_or(probe))
+}
+
 // ─── the routes ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug)]
@@ -756,77 +893,35 @@ pub async fn request(
         .get_live(tid, entity_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such entity".into()))?;
-    let agent = match state.agents.find_live_in_tenant(tid, device).await {
-        Ok(agent) => agent,
-        Err(DaoError::NotFound) => return Err(ApiError::NotFound("no such device".into())),
-        Err(e) => return Err(e.into()),
-    };
-    if let Some(why) = refusal(&agent) {
-        return Err(ApiError::Conflict(why.message()));
-    }
-    let target = target(&entity, kind, device).map_err(ApiError::BadRequest)?;
-    // Keyed on the device in both slots: the ceiling is the device's,
-    // whoever asks. Checked after every gate, so a refusal is attributable.
-    if !state.probe_limiter.check(device, device, RATE_PER_MINUTE) {
-        let body = json!({
-            "error": "rate_limited",
-            "message": format!("this device was asked {RATE_PER_MINUTE} probes this minute: ask again later"),
-        });
-        return Ok((StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response());
-    }
-    let probe = KnowhowProbe {
-        id: None,
-        tenant_id: tid,
-        entity_id,
-        device_id: device,
-        requested_by: Some(auth.user_id),
-        session: None,
-        requested_at: DateTime::now(),
-        kind: kind.as_str().into(),
-        target,
-        state: PROBE_REQUESTED.into(),
-        pending: Some(true),
-        delivered_at: None,
-        answered_at: None,
-        rtt_ms: None,
-        address: None,
-        carrier: None,
-        tls: None,
-        detail: None,
-        measured: Vec::new(),
-    };
-    let id = match state.probes.create(&probe).await {
-        Ok(id) => id,
-        Err(DaoError::DuplicateKey(_)) => {
-            return match state.probes.pending_for(tid, device).await? {
-                Some(p) if p.entity_id == entity_id && p.kind == probe.kind => {
-                    Ok((StatusCode::ACCEPTED, Json(ProbeView::of(&p))).into_response())
-                }
-                Some(_) => Err(ApiError::Conflict(
-                    "this device is running another probe: ask again once it answers".into(),
-                )),
-                None => Err(ApiError::Conflict(
-                    "the device's pending probe just ended: ask again".into(),
-                )),
-            };
+    match ask(
+        &state,
+        tid,
+        &entity,
+        device,
+        kind,
+        Asker::Person(auth.user_id),
+    )
+    .await
+    {
+        Ok(probe) => Ok((StatusCode::ACCEPTED, Json(ProbeView::of(&probe))).into_response()),
+        Err(NotAsked::NoDevice) => Err(ApiError::NotFound("no such device".into())),
+        Err(NotAsked::Refused(why)) => Err(ApiError::Conflict(why.message())),
+        Err(NotAsked::Unprobeable(why)) => Err(ApiError::BadRequest(why)),
+        Err(NotAsked::RateLimited) => {
+            let body = json!({
+                "error": "rate_limited",
+                "message": format!("this device was asked {RATE_PER_MINUTE} probes this minute: ask again later"),
+            });
+            Ok((StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response())
         }
-        Err(e) => return Err(e.into()),
-    };
-    info!(
-        probe = %id, tenant = %tid, entity = %entity_id, device = %device, by = %auth.user_id,
-        kind = kind.as_str(), "knowhow: a probe was asked"
-    );
-    let probe = KnowhowProbe {
-        id: Some(id),
-        ..probe
-    };
-    // At once, when the device is connected to this pod; any other pod's
-    // sweep finds it otherwise.
-    if let Some(link) = state.links.get(device, tid) {
-        deliver(&state, &probe, &link).await;
+        Err(NotAsked::Busy) => Err(ApiError::Conflict(
+            "this device is running another probe: ask again once it answers".into(),
+        )),
+        Err(NotAsked::JustEnded) => Err(ApiError::Conflict(
+            "the device's pending probe just ended: ask again".into(),
+        )),
+        Err(NotAsked::Store(e)) => Err(e.into()),
     }
-    let now = state.probes.base.find_by_id(id).await.unwrap_or(probe);
-    Ok((StatusCode::ACCEPTED, Json(ProbeView::of(&now))).into_response())
 }
 
 #[derive(Deserialize, Debug)]

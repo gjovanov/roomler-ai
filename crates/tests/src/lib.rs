@@ -218,6 +218,11 @@ mod knowhow_sync_tests;
 /// another organization's id answered as a bogus one.
 #[cfg(test)]
 mod knowhow_tests;
+/// FR-90 P4-5-2a — a session's verify: offered to a device that probes,
+/// answered at once with the probe it asked, the probe sent to the session's
+/// own device, what it measured sent back; the refusals in a word.
+#[cfg(test)]
+mod knowhow_verify_tests;
 /// FR-115 P5 — the meeting-length cap: warned at 55, ended at 60, once.
 #[cfg(test)]
 mod meeting_cap_tests;
