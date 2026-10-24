@@ -1283,7 +1283,7 @@ sequenceDiagram
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-5-3 | staleness, decision 40: a fact no probe or person confirmed for `knowhow.stale_days` turns `stale` |
+| P4-5-3 | staleness, decisions 40 and 57: a person's fact or a confirmed proposal that no probe or person confirmed for `knowhow.stale_days` turns `stale`; the sync's and a scan's own facts never do, since a scan retires what it no longer finds (designed in P4-5-3-0) |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |
