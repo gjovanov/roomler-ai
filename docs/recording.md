@@ -31,8 +31,8 @@
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
 > person hands it. On macOS computer audio is recorded since FR-97 P2a (agent
-> 0.4.161), and the microphone since P2f (agent 0.4.163) except on a supervised
-> Mac, which refuses it by name for now (P2f-1b), §9.
+> 0.4.161), and the microphone since P2f (agent 0.4.163), on a supervised Mac
+> since P2f-2 (agent 0.4.168), §9.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
