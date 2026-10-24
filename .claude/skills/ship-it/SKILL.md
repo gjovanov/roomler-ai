@@ -97,6 +97,12 @@ carries no digest.
 - Rehearse with `signing_mode=local` dispatches, **never** with throwaway
   `agent-v*` tags.
 - macOS is all-or-nothing on six `APPLE_*` secrets.
+- ⚠️ **Signing a `.app` re-signs its main executable** — with `--force` that
+  replaces the binary's own signature, entitlements and all. The bundle
+  `codesign` must pass `--entitlements` too: without it every release shipped
+  NONE, unnoticed while every key was `false`, until FR-97 P2f needed
+  `device.audio-input` (a hardened-runtime microphone without it is refused).
+  The lane asserts the key on the final binary.
 - ⚠️ **There is no canary channel.** The updater (`pick_latest_release`) and
   `/api/agent/latest-release` skip drafts only; a PRE-release is accepted. So
   publishing ANY `agent-v*` release, even one marked pre-release, reaches the
