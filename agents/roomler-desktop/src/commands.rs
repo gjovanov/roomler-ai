@@ -1814,6 +1814,14 @@ pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
     }
 }
 
+/// #2815 — must the main window's modal ask the question itself? Only when
+/// the prompt window could not be opened. Otherwise that window is asking,
+/// and a modal under it would put two Approve buttons on one decision.
+#[tauri::command]
+pub fn cmd_consent_modal_needed() -> bool {
+    crate::panels::consent_modal_needed()
+}
+
 /// FR-27 — remote-control sessions currently LIVE on this device, for the
 /// "Being viewed by …" banner.
 ///

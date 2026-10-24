@@ -265,8 +265,10 @@ pub struct Caller {
     pub source: &'static str,
 }
 
-/// Evaluate gates 1–3. `Ok(())` means the command may be pushed; `Err` carries
-/// the reason, which the caller must audit before returning it.
+/// Evaluate gates 1–3. `Ok` means the command may be pushed, and carries the
+/// org's display name for the consent prompt (#2815): gate 1 has the tenant
+/// row in hand already. `Err` carries the reason, which the caller must audit
+/// before returning it.
 ///
 /// Split out from [`dispatch`] so the whole decision is testable as a table
 /// and so no path can accidentally skip a gate by taking a different route
@@ -277,7 +279,7 @@ pub async fn authorize(
     agent: &Agent,
     caller: &Caller,
     shell: &str,
-) -> Result<(), ExecDenyReason> {
+) -> Result<String, ExecDenyReason> {
     // Gate 1 — the org kill-switch. Checked first because it is the cheapest
     // and the most likely reason a fleet says no.
     let tenant = match state.tenants.base.find_by_id(tenant_id).await {
@@ -376,7 +378,7 @@ pub async fn authorize(
         return Err(ExecDenyReason::RateLimited);
     }
 
-    Ok(())
+    Ok(tenant.name)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -444,7 +446,7 @@ pub async fn dispatch(
             );
             deny(audit, reason, message)
         }
-        Ok(()) => {
+        Ok(org_name) => {
             let consent_mode = agent.exec_policy.effective_consent_mode();
             // FR-94 — a Windows device anchored for SYSTEM exec gets the
             // command through its service; every other device, as before.
@@ -467,6 +469,9 @@ pub async fn dispatch(
                 consent_mode: Some(consent_mode),
                 via_service,
                 run_as: as_person.then(|| run_as.wire().to_string()),
+                // #2815 — the prompt names the org by this, not by the
+                // enrollment's label (`primary` on the primary enrollment).
+                tenant_name: Some(org_name),
             };
             // An attended device spends up to the prompt window waiting for a
             // human BEFORE the command's own budget starts, so the two are

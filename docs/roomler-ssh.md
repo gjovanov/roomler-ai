@@ -770,6 +770,14 @@ roomler-ssh: waiting up to 30s for approval at the device…
 Without that line a policy of `prompt` is indistinguishable from a 30-second
 hang. Denial and timeout both refuse with their own reason and exit 1.
 
+**The prompt names the caller as the grant words it** (#2815): `«name» (via
+«device»)`, the way the screen-control and exec prompts word theirs. Until
+#2815 it showed the session's technical identity,
+`ssh:«name» (via «device»)@«overlay ip»:«port»`, which means nothing to the
+person deciding. That identity still attributes every log line and activity
+report (`ResolvedSessionPolicy::caller`). The prompt reads `prompt_name`, and
+so does the SYSTEM service's relay to the worker.
+
 ⚠️ **The broker is threaded, not discovered.** The consent broker rides
 `ssh::SessionServices` from the daemon through `overlay::maybe_start` into the
 server's `Ctx`, and the field is non-optional — a server that can be
@@ -1257,7 +1265,7 @@ it presented (P3-8-2b).
 
 | Piece | Where |
 |---|---|
-| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831)), `one_command` on `rc:ssh.grant` ([`:3775`](../crates/remote_control/src/signaling.rs#L3775)), `ssh_ticket_id` on `rc:ssh.response` ([`:3816`](../crates/remote_control/src/signaling.rs#L3816)); `RpcCap::SshOneCommand` ([`models.rs:1129`](../crates/remote_control/src/models.rs#L1129)) and the three refusals ([`models.rs:4842`](../crates/remote_control/src/models.rs#L4842)) |
+| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:831`](../crates/remote_control/src/signaling.rs#L831)), `one_command` on `rc:ssh.grant` ([`:3779`](../crates/remote_control/src/signaling.rs#L3779)), `ssh_ticket_id` on `rc:ssh.response` ([`:3820`](../crates/remote_control/src/signaling.rs#L3820)); `RpcCap::SshOneCommand` ([`models.rs:1129`](../crates/remote_control/src/models.rs#L1129)) and the three refusals ([`models.rs:4842`](../crates/remote_control/src/models.rs#L4842)) |
 | the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
 | the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
 | the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
@@ -1315,8 +1323,8 @@ session's grant backs it.
 
 | Piece | Where |
 |---|---|
-| the grant's field | `Grant::one_command` ([`ssh.rs:2834`](../agents/roomlerd/src/ssh.rs#L2834)), recorded by `record_grant` ([`:2910`](../agents/roomlerd/src/ssh.rs#L2910)), resolved into the session's policy ([`:826`](../agents/roomlerd/src/ssh.rs#L826)) |
-| the rules | one channel ([`ssh.rs:1680`](../agents/roomlerd/src/ssh.rs#L1680)), no forward ([`:1746`](../agents/roomlerd/src/ssh.rs#L1746)), one `exec` ([`:1841`](../agents/roomlerd/src/ssh.rs#L1841)), no shell ([`:1949`](../agents/roomlerd/src/ssh.rs#L1949)), no terminal ([`:1988`](../agents/roomlerd/src/ssh.rs#L1988)), no subsystem ([`:2091`](../agents/roomlerd/src/ssh.rs#L2091)) |
+| the grant's field | `Grant::one_command` ([`ssh.rs:2852`](../agents/roomlerd/src/ssh.rs#L2852)), recorded by `record_grant` ([`:2928`](../agents/roomlerd/src/ssh.rs#L2928)), resolved into the session's policy ([`:833`](../agents/roomlerd/src/ssh.rs#L833)) |
+| the rules | one channel ([`ssh.rs:1693`](../agents/roomlerd/src/ssh.rs#L1693)), no forward ([`:1759`](../agents/roomlerd/src/ssh.rs#L1759)), one `exec` ([`:1854`](../agents/roomlerd/src/ssh.rs#L1854)), no shell ([`:1964`](../agents/roomlerd/src/ssh.rs#L1964)), no terminal ([`:2003`](../agents/roomlerd/src/ssh.rs#L2003)), no subsystem ([`:2106`](../agents/roomlerd/src/ssh.rs#L2106)) |
 | the device's word | `ssh-one-command` in the hello ([`caps.rs:2051`](../agents/roomlerd/src/encode/caps.rs#L2051)) |
 | the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
 | the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2722`](../crates/remote_control/src/models.rs#L2722)) |

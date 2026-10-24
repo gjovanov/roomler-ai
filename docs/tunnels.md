@@ -924,7 +924,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2106`](../crates/remote_control/src/signaling.rs#L2106)), `net_grant_id` on `rc:tunnel.opened` ([`:3875`](../crates/remote_control/src/signaling.rs#L3875)) |
+| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2106`](../crates/remote_control/src/signaling.rs#L2106)), `net_grant_id` on `rc:tunnel.opened` ([`:3879`](../crates/remote_control/src/signaling.rs#L3879)) |
 | the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
 | each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
 | the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
