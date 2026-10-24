@@ -1084,6 +1084,9 @@ pub async fn handle_session(
         }),
         None,
         slot.clone(),
+        // FR-121 — an external session carries no relay descriptor (the
+        // viewer never probes for one, F4), so there is nothing to echo.
+        None,
     );
     // FR-115 P3b — a slot the hub did not take goes back now.
     if let Some(lease) = &slot {

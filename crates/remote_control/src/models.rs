@@ -1268,6 +1268,13 @@ pub enum RpcCap {
     /// it, and answers `not_allowed`. Not a prefix of another verb, nor
     /// another of it, and matching stays equality regardless.
     KnowhowProbe,
+    /// FR-121 — this device reports its loopback-TURN relay to the server
+    /// (`rc:agent.local_relay`), so a viewer on it can be handed the relay
+    /// without fetching 127.0.0.1. The viewer lists only such devices as
+    /// "this browser runs on". Advertised while the relay is switched on
+    /// (`ROOMLERD_LOCAL_TURN`, default on); a device with no overlay yet
+    /// still advertises it and reports `None`.
+    LocalRelay,
 }
 
 impl RpcCap {
@@ -1320,11 +1327,12 @@ impl RpcCap {
             Self::KnowhowScan => "knowhow-scan",
             Self::KnowhowTools => "knowhow-tools",
             Self::KnowhowProbe => "knowhow-probe",
+            Self::LocalRelay => "local-relay",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 41] = [
+    pub const ALL: [RpcCap; 42] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1366,6 +1374,7 @@ impl RpcCap {
         Self::KnowhowScan,
         Self::KnowhowTools,
         Self::KnowhowProbe,
+        Self::LocalRelay,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -7638,6 +7647,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowScan.wire(), "knowhow-scan");
         assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
+        assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
