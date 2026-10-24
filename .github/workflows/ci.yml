@@ -1627,6 +1627,11 @@ jobs:
             sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libvpx-dev
           fi
           ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
+      # 2026-10-24: this lane's cache was evicted, bindgen ran fresh under the
+      # image's libclang 22 and made libvpx's encoder config opaque, and the
+      # failed run saved those bindings (see the action).
+      - name: Point bindgen at the distro's libclang
+        uses: ./.github/actions/bindgen-libclang
       - name: Fetch vendored FFmpeg 9.0.1
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1725,6 +1730,10 @@ jobs:
       # clippy reports `dead_code` on items that ARE used — from call sites
       # inside `#[cfg(feature = "vp9-444")]` functions in peer.rs.
       REC_FEATURES: recording,openh264-encoder,synthetic-frame-source,audio,ffmpeg-encoder,vp9-444,vp9-444-bindgen
+      # `audio` builds audiopus_sys's bundled libopus with CMake, whose
+      # CMakeLists declares a minimum below 3.5 that ubuntu-26.04's CMake 4
+      # refuses (the release builds set the same; see ci-linux-system-deps).
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -1750,6 +1759,10 @@ jobs:
         # action — a handful of packages do not pay for a cache key that can
         # silently restore nothing.
         run: sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libasound2-dev cmake libvpx-dev
+      # 2026-10-24: `vp9-444-bindgen` under the image's newest libclang (22)
+      # makes libvpx's encoder config opaque (see the action).
+      - name: Point bindgen at the distro's libclang
+        uses: ./.github/actions/bindgen-libclang
       - name: Fetch the vendored FFmpeg with the AAC encoder + H.264 decoder
         env:
           GH_TOKEN: ${{ github.token }}
