@@ -2880,6 +2880,8 @@ jobs:
                   <string>Roomler Daemon captures the screen to stream it to an authorised remote controller.</string>
               <key>NSAppleEventsUsageDescription</key>
                   <string>Roomler Daemon injects input events on behalf of an authorised remote controller.</string>
+              <key>NSMicrophoneUsageDescription</key>
+                  <string>Roomler Daemon records the microphone into a screen recording when the person at this computer asks for it.</string>
           </dict>
           </plist>
           PLIST
@@ -3039,9 +3041,20 @@ jobs:
                    --entitlements agents/roomlerd/packaging/macos/entitlements.plist \
                    "stage/roomlerd.app/Contents/MacOS/roomlerd"
 
+          # Signing the BUNDLE re-signs its main executable, and with --force that
+          # signature replaces the one above, entitlements and all: without
+          # --entitlements here too, every release shipped NONE. Nobody noticed
+          # while every key was false; FR-97 P2f's candidate found it, a
+          # Developer-ID, hardened-runtime roomlerd with no audio-input, which is
+          # a microphone the system refuses.
           codesign --force --sign "Developer ID Application" \
                    --options runtime --timestamp \
+                   --entitlements agents/roomlerd/packaging/macos/entitlements.plist \
                    "stage/roomlerd.app"
+          # Assert it on what ships, not on what was asked for.
+          codesign -d --entitlements - "stage/roomlerd.app/Contents/MacOS/roomlerd" 2>/dev/null \
+            | grep -q 'com.apple.security.device.audio-input' \
+            || { echo "::error::roomlerd's final signature carries no audio-input entitlement"; exit 1; }
 
           # The CLI shim ships in the same .pkg, outside the bundle. Sign it
           # HERE: nothing may `cargo build` after this point (a relink strips

@@ -52,6 +52,11 @@ with nothing on it, or a cursor that will not click. If your first session looks
 like an empty wallpaper, this is why, essentially every time.
 :::
 
+A third grant, **Microphone**, matters only for a screen recording that
+includes the microphone (from agent 0.4.163). macOS asks the first time one
+does. Unlike the two above, it does not fail silently: if it is turned off,
+that recording is refused and names the setting.
+
 You do not have to hunt: the **menu-bar app** names whichever grant is missing
 and opens the right pane. The agent also probes both at startup and reports the
 state to the server, so the device list shows *"No screen access"* / *"No input

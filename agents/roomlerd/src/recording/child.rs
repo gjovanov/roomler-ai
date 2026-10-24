@@ -158,23 +158,28 @@ fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
     }
 }
 
-/// The microphone: the default input device.
+/// The microphone: the default input device. On a Mac, only where the
+/// person's privacy settings could let it hear anything (FR-97 P2f,
+/// [`super::mic_permission`]): a microphone they turned off records silence
+/// there instead of failing.
 #[cfg(feature = "audio")]
 fn open_microphone() -> Result<Box<dyn crate::audio::AudioCapture>> {
     #[cfg(feature = "synthetic-frame-source")]
     if std::env::var_os("ROOMLERD_SYNTHETIC_AUDIO").is_some() {
         return Ok(Box::new(crate::audio::NoopAudioCapture));
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    super::mic_permission::preflight()?;
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     {
         let cap = crate::audio::cpal_backend::CpalLoopbackCapture::open_source(
             crate::audio::cpal_backend::Source::Microphone,
         )?;
         Ok(Box::new(cap))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        bail!("recording the microphone on this platform arrives with FR-85 P1c (macOS)")
+        bail!("recording the microphone is not built for this platform")
     }
 }
 

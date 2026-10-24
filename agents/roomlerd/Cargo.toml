@@ -397,12 +397,12 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # never touch the `windows` crate. Feature list scoped to the MF, D3D11,
 # DXGI, and COM interfaces the encoder actually needs — full-crate
 # features blow up compile time without any benefit.
-# System-audio capture (`audio` feature). Linux = PulseAudio monitor
-# source; Windows = WASAPI loopback (open the default OUTPUT device as an
-# input). macOS uses a Noop stub (no cpal there) until ScreenCaptureKit
-# lands, so cpal is scoped to just these two targets. Optional so
-# default / signalling-only builds don't pull in the audio host libs.
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# cpal capture (`audio` feature). Linux = PulseAudio monitor source;
+# Windows = WASAPI loopback (open the default OUTPUT device as an input);
+# macOS = a recording's MICROPHONE only (FR-97 P2f): a Mac's computer audio
+# is ScreenCaptureKit's (P2a), never cpal's. Optional so default /
+# signalling-only builds don't pull in the audio host libs.
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 cpal = { version = "0.15", optional = true }
 
 [target.'cfg(unix)'.dependencies]
