@@ -1165,6 +1165,24 @@ jobs:
           # whoever ran `installer`. This job proved that on 2026-08-25 — an
           # install with ROOMLER_MACOS_DAEMON=1 logged the per-user lines and
           # none of the daemon ones — and the dead condition was removed.
+          # FR-119 P2b-9 — what launchd LOADED, not only what the file says. A
+          # job without a ProcessType reports `spawn type = daemon (3)` and runs
+          # throttled, in the utility band: the worker that runs every session
+          # is spawned inside this job, so its capture and encode ran there too.
+          # An Interactive job reports `interactive (4)`.
+          daemon_is_interactive() {
+            local pt spawn
+            pt=$(plutil -extract ProcessType raw /Library/LaunchDaemons/com.roomler.daemon.plist 2>/dev/null || true)
+            [ "$pt" = "Interactive" ] \
+              || { echo "::error::the installed daemon plist has ProcessType '${pt:-none}', not Interactive"; return 1; }
+            spawn=$(sudo launchctl print system/com.roomler.daemon 2>/dev/null \
+                      | awk -F' = ' '/spawn type/ {print $2; exit}' || true)
+            case "$spawn" in
+              interactive*) echo "  launchd runs the daemon as: $spawn" ;;
+              *) echo "::error::launchd runs com.roomler.daemon as '${spawn:-not loaded}', not interactive"; return 1 ;;
+            esac
+          }
+
           echo "=== install 1: enabled via the marker ==="
           # FR-46 P5a — deliberately seeded at the LEGACY path, so this install
           # exercises the postinstall migration end to end rather than only the
@@ -1179,6 +1197,7 @@ jobs:
           test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
             || { echo "::error::daemon plist missing after an enabled install"; exit 1; }
           echo "  daemon installed"
+          daemon_is_interactive
           # The migration must have MOVED it, not copied it: a legacy directory
           # left behind would be read again by the dual-read gates forever.
           test -f /etc/roomler/enable-daemon \
@@ -1194,6 +1213,7 @@ jobs:
             || { echo "::error::a plain re-install DELETED the enabled daemon — \
                  the self-update regression is back"; exit 1; }
           echo "  daemon survived the update"
+          daemon_is_interactive
 
           # And the opt-OUT path must still work: remove the marker, install,
           # daemon goes. Otherwise this test would pass by making the removal
