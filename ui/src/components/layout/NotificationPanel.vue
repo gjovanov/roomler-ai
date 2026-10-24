@@ -82,6 +82,7 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useNotificationStore, type Notification } from '@/stores/notification'
 import { enablePushNotifications, pushState, type PushState } from '@/composables/usePush'
+import { openInAppLink } from '@/utils/inAppLink'
 
 const store = useNotificationStore()
 const router = useRouter()
@@ -134,8 +135,10 @@ function handleClick(notif: Notification) {
   if (!notif.is_read) {
     store.markRead(notif.id)
   }
+  // #2841 - never navigate a live viewer or a call away from its session:
+  // on those pages the link opens in a new tab.
   if (notif.link) {
-    router.push(notif.link)
+    openInAppLink(router, notif.link)
   }
   emit('close')
 }

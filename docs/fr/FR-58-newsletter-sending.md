@@ -38,7 +38,7 @@ The list has been unreachable end-to-end since it shipped:
 2. **Confirm/unsubscribe outcomes are invisible.**
    `crates/api/src/routes/subscribe.rs:203-206` 303s to `{frontend_url}/?subscribe=…`,
    but `/` carries `meta:{auth:true}` and the router guard exact-matches
-   `to.fullPath === '/'` (`ui/src/plugins/router.ts:274`): a logged-out confirmer is
+   `to.fullPath === '/'` (`ui/src/plugins/router.ts:279`): a logged-out confirmer is
    bounced to `/login` with sessionStorage noise, a signed-in one renders the dashboard,
    and the `SUBSCRIBE_MESSAGES` handler (`ui/src/views/LandingView.vue:320-333`) is dead
    code.
@@ -137,7 +137,7 @@ config flag guarding the same door would be a second switch to forget.
 
 - Fix the two capture bugs; repoint the 303s at new public outcome pages
   `/newsletter/confirmed` + `/newsletter/unsubscribed` — the `/consent/:token` route
-  shape (`router.ts:58-65`): **no `meta.auth`, no `meta.guest`** (guest would bounce a
+  shape (`router.ts:63-70`): **no `meta.auth`, no `meta.guest`** (guest would bounce a
   signed-in unsubscriber to the dashboard), registered above the catch-all, render-only.
 - **Deferred landing prompt**: a dismissible card after ~60 % scroll or ~20 s, once ever —
   flat `roomler-newsletter-dismissed` latch (an anonymous visitor has no user id), every

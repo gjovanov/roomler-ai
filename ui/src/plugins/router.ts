@@ -25,6 +25,11 @@ declare module 'vue-router' {
      *  new URL. Absent = today's reuse, which the views that rewrite
      *  `route.query` in place depend on — do not key by fullPath. */
     remountOn?: string
+    /** #2841 — the page holds a live session that leaving would end or
+     *  hide: a remote-control viewer, a call. A link clicked inside the app
+     *  (the bell's) opens in a new tab here, never navigating this one
+     *  away (`utils/inAppLink.ts`). */
+    liveSession?: boolean
   }
 }
 
@@ -171,7 +176,7 @@ const routes: RouteRecordRaw[] = [
         path: 'connect/session',
         name: 'connect-session',
         component: () => import('@/views/remote/RemoteControl.vue'),
-        meta: { module: 'remote' },
+        meta: { module: 'remote', liveSession: true },
       },
       {
         path: 'tenant/:tenantId',
@@ -191,7 +196,7 @@ const routes: RouteRecordRaw[] = [
             path: 'room/:roomId/call',
             name: 'room-call',
             component: () => import('@/views/conference/ConferenceView.vue'),
-            meta: { module: 'conference' },
+            meta: { module: 'conference', liveSession: true },
           },
           {
             path: 'rooms',
@@ -347,7 +352,7 @@ const routes: RouteRecordRaw[] = [
             // view down and mount a fresh one for the new agentId, never
             // re-point the mounted one (its Connect kept dialling the old
             // device). Locked by KeyedRouterView.spec.ts on this record.
-            meta: { module: 'remote', remountOn: 'agentId' },
+            meta: { module: 'remote', remountOn: 'agentId', liveSession: true },
           },
         ],
       },
