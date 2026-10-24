@@ -1589,7 +1589,7 @@ simulate | lease`, `roomler knowhow search | show | add | link | verify`,
 
 Device config, on `roomler config`'s surface and default-deny: `hive_enabled`,
 `hive_replica`, `hive_archive`, `hive_accounts`, `hive_roots`, `hive_max_sessions`,
-`hive_store_quota`, `hive_harnesses`, `knowhow_scan_roots`.
+`hive_store_quota`, `hive_harnesses`, `knowhow_scan_roots`, `knowhow_probe_reach`.
 
 ## 15. Code layout
 

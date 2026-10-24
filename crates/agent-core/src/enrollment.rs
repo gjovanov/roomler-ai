@@ -306,6 +306,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         knowhow_scan_roots: Vec::new(),
         // FR-90 P4-3b-3: no listener reported until the owner says so.
         knowhow_scan_listeners: false,
+        // FR-90 P4-5-1b: no probe reaches anywhere until the owner lists it.
+        knowhow_probe_reach: Vec::new(),
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,

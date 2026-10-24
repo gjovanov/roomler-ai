@@ -527,6 +527,11 @@ pub struct OrgCtx {
     /// config file to read its roots from.
     #[cfg(all(hive_host, unix))]
     pub knowhow: Option<Arc<crate::hive::knowhow::Scanner>>,
+    /// FR-90 P4-5-1b — the device's knowhow prober, on the primary's context
+    /// alone, as the scanner is: `None` on a secondary's, and on a daemon
+    /// with no config file to read `knowhow_probe_reach` from.
+    #[cfg(hive_host)]
+    pub prober: Option<Arc<crate::hive::knowhow_probe::Prober>>,
 }
 
 impl OrgCtx {
@@ -542,6 +547,8 @@ impl OrgCtx {
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
             #[cfg(all(hive_host, unix))]
             knowhow: None,
+            #[cfg(hive_host)]
+            prober: None,
         }
     }
 
@@ -557,9 +564,11 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
-            // Decision 43: a secondary enrollment never scans.
+            // Decision 43: a secondary enrollment never scans, nor probes.
             #[cfg(all(hive_host, unix))]
             knowhow: None,
+            #[cfg(hive_host)]
+            prober: None,
         }
     }
 
@@ -575,6 +584,14 @@ impl OrgCtx {
     #[cfg(all(hive_host, unix))]
     pub fn with_knowhow(mut self, scanner: Arc<crate::hive::knowhow::Scanner>) -> Self {
         self.knowhow = Some(scanner);
+        self
+    }
+
+    /// FR-90 P4-5-1b — the prober `rc:knowhow.probe` runs on (`run_cmd`
+    /// passes the daemon's; a test passes one reading its own config).
+    #[cfg(hive_host)]
+    pub fn with_prober(mut self, prober: Arc<crate::hive::knowhow_probe::Prober>) -> Self {
+        self.prober = Some(prober);
         self
     }
 
@@ -6531,6 +6548,51 @@ async fn handle_server_msg(
                             detail: Some("this build does not scan".into()),
                             truncated: false,
                             findings: Vec::new(),
+                        })
+                        .await;
+                });
+            }
+        }
+
+        // FR-90 P4-5-1b — the server asks this device to probe one place the
+        // map says: within what its owner lists, on the primary's prober
+        // alone, run off this loop and always answered, since the probe's
+        // record waits on it.
+        ServerMsg::KnowhowProbe {
+            probe_id,
+            kind,
+            host,
+            port,
+            sni,
+        } => {
+            #[cfg(hive_host)]
+            crate::hive::knowhow_probe::handle(
+                ctx.prober.as_ref(),
+                crate::hive::knowhow_probe::Asked {
+                    id: probe_id,
+                    kind,
+                    host,
+                    port,
+                    sni,
+                },
+                ctx.is_primary,
+                outbound_tx.clone(),
+            );
+            // A build that does not probe never advertises `knowhow-probe`,
+            // so no server asks it; one that asks anyway is told.
+            #[cfg(not(hive_host))]
+            {
+                let _ = (kind, host, port, sni);
+                let tx = outbound_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(ClientMsg::KnowhowProbed {
+                            probe_id,
+                            outcome: roomler_ai_remote_control::knowhow::ProbeOutcome::Failed,
+                            rtt_ms: None,
+                            address: None,
+                            tls: None,
+                            detail: Some("this build does not probe".into()),
                         })
                         .await;
                 });

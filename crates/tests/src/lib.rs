@@ -161,6 +161,12 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-5-1b — a device's probe end to end: the real agent loop probes
+/// within the list its config file holds, what it measured on the map; an
+/// emptied list answers `not_allowed`. Linux, as the device's scan test is:
+/// the prober rides the `hive` feature this crate's dev-dependency turns on.
+#[cfg(all(test, target_os = "linux"))]
+mod knowhow_device_probe_tests;
 /// FR-90 P4-3b-1 — a device's scan end to end: the real agent loop scans the
 /// roots its config file lists onto the map; a root gone unread retires
 /// nothing; an emptied list answers `no_roots`. Linux: the agent's scanner
