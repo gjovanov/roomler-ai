@@ -353,13 +353,24 @@ Ticked only where a run is recorded in the field log below.
       `reason="no_prompt_surface"` → hub `NoPromptSurface` 41 ms later; the
       controller was told nobody could be asked. Both settings restored and
       re-proven (auto-granted again, 0.3 ms). See the 2026-09-25 log.
-- [ ] All five modes exercised end-to-end on the fleet, each recorded with the
-      surface that served it. `auto`, `prompt` and the host half of
-      `prompt_then_email` are done. **`push`, 2026-10-23**: it resolved at the
-      owner through the in-app notification alone, because this deployment has
-      no push service (`vapid_public_key` is empty), so there is no web-push card
-      to measure. `email` resolves at the owner's real inbox and is not
-      exercised.
+- [x] All five modes exercised end-to-end on the fleet, each recorded with the
+      surface that served it — **done 2026-10-24**, the last three on the lab's
+      Fedora Asahi box (GNOME on Wayland) with the owner as the controller:
+      - `auto`: no surface (the controls in the 2026-10-23 log).
+      - `prompt`: the Windows native panel (0.4.16); the companion's panel on GNOME
+        Wayland (2026-10-23).
+      - `push`: the owner's in-app notification and its `/consent/<token>` page.
+        This deployment has no push service (`vapid_public_key` is empty), so there
+        is no web-push card to measure (2026-10-23).
+      - `email`: the owner's real inbox. SendGrid sent it, the owner confirmed it
+        arrived, the email's link opened `/consent/<token>` with no referrer, and
+        Approve connected the session (2026-10-24). An unanswered run timed out at
+        5 min as `consent_timeout` (2026-10-23).
+      - `prompt_then_email`: the host half earlier; the owner half on 2026-10-23,
+        when the host prompt timed out at 30 s, the session waited, and the
+        owner's Approve connected it.
+      See the 2026-10-23/24 log. ⚠️ The controller's wording for an owner-side
+      mode still speaks of "the person there": #2810.
 - [ ] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one.
       ⚠️ Blocked on `EXEC_DEVICE` / `SSH_DEVICE`, which are deliberately not in
       `DEFAULT_ADMIN` — an operator grant, not a code change.
@@ -413,10 +424,24 @@ Ticked only where a run is recorded in the field log below.
       the caption has not been seen on a real row — and per #1617 the value is
       the *installed* version, so the one skew that actually happened (a 0.4.92
       companion still RUNNING under a 0.4.101 daemon) was invisible to it.
-- [ ] `free` ↔ `exclusive` verified with two concurrent viewers; the device policy
+- [x] `free` ↔ `exclusive` verified with two concurrent viewers; the device policy
       re-applies after every session ends. **Second half done** (re-seed proven on
-      one daemon process, no restart); the two-viewer half is blocked by a
-      same-host media failure and needs a second controller machine.
+      one daemon process, no restart). **Two-viewer half done 2026-10-24**, on the
+      lab's Fedora Asahi box (agent 0.4.162), with Edge and Chrome on ONE PC as the
+      two viewers:
+      - both connected ("2 viewers on this device (input: free)");
+      - a switch to `exclusive`;
+      - an idle takeover;
+      - a request refused while the holder was active, which reached both ends:
+        WAITING… for the requester, "… wants control · GRANT · IGNORE" for the
+        holder;
+      - the GRANT;
+      - the floor back to the remaining viewer when the holder left;
+      - back to `free`.
+
+      Every step is matched by an `input arbiter:` line. The old blocker was a
+      second viewer in the same BROWSER, not on the same machine. See the
+      2026-10-24 log.
 - [x] The `roomlerd` .deb's `Depends` still contains no GTK/webkit entry —
       `libasound2, libc6, libxcb-randr0, libxcb-shm0, libxcb1`, and the guard that
       asserts it actually runs now (#871).
@@ -1017,3 +1042,47 @@ The setup:
 - **The `/consent/<token>` page names neither the controller nor the device** ("Someone is requesting…"), while the notification that links to it names both. Plausibly deliberate: the link is a bearer capability, and it is the same page an email carries. Recorded, not filed.
 
 **A wrong turn:** the toast's total was first read as 23.0 s, off a half-scale screenshot. The browser's persisted record (FR-22 part 4: `agent_logs`, target `rc.connect`) says 35.6 s. Read the record, not the screenshot.
+
+### 2026-10-23/24 — `email`, `prompt_then_email`'s owner half, and two concurrent viewers
+
+The same box and controller as the entry above.
+- **API:** `hosted-20261023-0c0d5ff` on 10-23 and `hosted-20261023-c680ec9` on 10-24.
+- **Agent:** 0.4.158 on 10-23 and 0.4.162 on 10-24.
+- **Policy:** set through the API as before. After each run it was put back and read back equal.
+
+**`email`:**
+
+| run | the device's log | the server | the controller |
+|---|---|---|---|
+| 10-23 21:18Z | `owner-side consent (email/push) — agent waits for the server to resolve` | `Email sent via SendGrid … subject="Approve remote control of «device»?"`, 0.2 s after the request | after 5 min: *"Nobody answered the prompt on that device in time…"* (`consent_timeout`) |
+| 10-24 08:06Z | the same | the same; the owner confirmed both mails arrived | the owner opened the mail's link at 08:11:11Z and approved at 08:11:12Z, and the controller connected |
+
+How the 10-24 approval is known to come from the mail: the front proxy logged a `GET /consent/<token>` with **no referrer**, which is a page opened from the mail rather than from the app, then `POST …/approve` 200.
+
+The timeout's wording is wrong for an owner-side mode, because nobody at the device was asked. Filed as #2810.
+
+**`prompt_then_email`, the owner half (10-23 21:24Z).** The two halves start together; it is "and", not "then":
+- The companion's panel came up on the box ("Expires in 16s" at the screenshot).
+- SendGrid sent the owner's mail 0.4 s after the request.
+
+Nobody answered the panel. At 30 s the device logged `operator consent decision outcome=Timeout`, then `decision=Timeout effective_mode=Prompt { timeout: 30s } granted=false reason="timeout"`. The controller stayed on *awaiting_consent*: the session handed over to the owner, it did not end. The owner's Approve on `/consent/<token>` connected it, about 58 s after the request. No snackbar showed (#2787's fix, live since 20:39Z).
+
+**Two concurrent viewers (10-24 07:55–08:03Z, agent 0.4.162).** The viewers were Edge (A) and Chrome (B) on the same Windows PC, both signed in as the owner.
+
+| step | the viewers | the device's `input arbiter:` log |
+|---|---|---|
+| both connect | B: "2 viewers on this device (input: free)", frames decoding | `session registered … mode="free" sessions=2` |
+| B switches to exclusive | both: "(input: exclusive)"; B holds the floor | `mode changed session=<B> mode="exclusive"` |
+| A requests while B is idle | A takes the floor (`IDLE_TAKEOVER` is 2 s) | `floor request session=<A> granted=true` |
+| B requests while A is active | B: WAITING…; A: "«owner» wants control · GRANT · IGNORE" | `floor request session=<B> granted=false` |
+| A grants | A: REQUEST CONTROL | `floor grant holder=<A> to=<B> granted=true` |
+| B, the holder, leaves | A: "1 viewers (input: exclusive)" with no REQUEST CONTROL, so A holds the floor | `session terminated … reason=ControllerHangup` |
+| A switches back | "(input: free)" | `mode changed session=<A> mode="free"` |
+
+A browser switch takes longer than the 2 s takeover window, so the holder would have gone idle. To keep it ACTIVE, the holder's page dispatched synthetic pointer moves for 90 s. They moved the box's pointer within a small area and clicked nothing; the agent's `ghost cursor broadcast … total=300` counts them.
+
+**Two things that looked like failures and were not:**
+- **B's first request ended `agent_busy`** ("This device has reached its concurrent session limit"). A third viewer on the same network, neither test browser, had taken the device's second slot 4 s earlier; `rc_max_sessions` defaults to 2. The front proxy shows B's page loading only after that session's request. The cap worked as built.
+- **One B session ended `ControllerHangup`** about 35 s after its window went behind A's. A deliberate repeat did NOT reproduce it: one viewer, its tab hidden behind another tab for 38 s, and the agent's pump kept sending while the page stayed connected. The cause is unknown; recorded, not filed.
+
+The box's access policy was restored and read back equal after every run.
