@@ -14,8 +14,25 @@
 //! Opening it without that key ends the process, which is why the key ships
 //! in the same change as this code.
 //!
+//! ⚠️ **Except on a supervised Mac** (P2f-1b, measured on the operator's
+//! MacBook, 2026-10-24): the GUI worker is started by the ROOT daemon, which
+//! stays the responsible process of everything the worker starts, and macOS
+//! never asks the person about a microphone for root. The question answered
+//! "not determined", the real microphone opened, no prompt ever appeared, and
+//! three minutes of recording were silence. There, every answer refuses by
+//! name (the manager tells the recorder, [`SUPERVISED_ENV`]) until the worker
+//! is its own responsible process (P2f-2).
+//!
 //! The decision is plain data so it is tested on every OS (FR-43's practice);
 //! only the question itself is macOS's.
+
+/// Set (to `1`) by a supervised Mac worker's recording manager on its
+/// recorder: the microphone's question would be asked for the root daemon.
+pub const SUPERVISED_ENV: &str = "ROOMLERD_MACOS_SUPERVISED_RECORDER";
+
+/// What a supervised Mac's recorder answers, whatever the permission says.
+pub const SUPERVISED_WORDS: &str = "this Mac can't record the microphone yet: Roomler runs here \
+     under its system service, and macOS won't ask you about the microphone for it";
 
 /// `AVAuthorizationStatus`, as AVFoundation numbers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,14 +76,31 @@ impl MicPermission {
             Self::NotDetermined | Self::Authorized | Self::Unknown(_) => Ok(()),
         }
     }
+
+    /// [`Self::verdict`], unless the recorder runs under a supervised Mac's
+    /// worker: there even "authorized" is the person's answer for an app
+    /// macOS does not judge this microphone by, so every answer refuses.
+    pub fn verdict_where(self, supervised: bool) -> Result<(), &'static str> {
+        if supervised {
+            return Err(SUPERVISED_WORDS);
+        }
+        self.verdict()
+    }
 }
 
 /// Ask AVFoundation, and refuse where the microphone would record silence.
 #[cfg(all(target_os = "macos", feature = "audio"))]
 pub fn preflight() -> anyhow::Result<()> {
     let permission = MicPermission::from_raw(authorization_status());
-    tracing::info!(?permission, "recording: the microphone's permission");
-    permission.verdict().map_err(|words| anyhow::anyhow!(words))
+    let supervised = std::env::var_os(SUPERVISED_ENV).is_some_and(|v| v == "1");
+    tracing::info!(
+        ?permission,
+        supervised,
+        "recording: the microphone's permission"
+    );
+    permission
+        .verdict_where(supervised)
+        .map_err(|words| anyhow::anyhow!(words))
 }
 
 /// `[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]`,
@@ -123,5 +157,34 @@ mod tests {
         assert_eq!(MicPermission::Authorized.verdict(), Ok(()));
         // An answer this build cannot read is not a "no".
         assert_eq!(MicPermission::Unknown(-1).verdict(), Ok(()));
+    }
+
+    #[test]
+    fn a_supervised_macs_recorder_refuses_every_answer() {
+        // Measured on the operator's MacBook: "not determined", no prompt,
+        // three minutes of silence. "Authorized" is the person's answer, and
+        // macOS judges this microphone by the root daemon instead.
+        for p in [
+            MicPermission::NotDetermined,
+            MicPermission::Authorized,
+            MicPermission::Denied,
+            MicPermission::Restricted,
+            MicPermission::Unknown(-1),
+        ] {
+            assert_eq!(p.verdict_where(true), Err(SUPERVISED_WORDS), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn an_unsupervised_recorder_keeps_the_plain_verdict() {
+        for p in [
+            MicPermission::NotDetermined,
+            MicPermission::Authorized,
+            MicPermission::Denied,
+            MicPermission::Restricted,
+            MicPermission::Unknown(7),
+        ] {
+            assert_eq!(p.verdict_where(false), p.verdict(), "{p:?}");
+        }
     }
 }

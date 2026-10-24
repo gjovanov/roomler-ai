@@ -3353,6 +3353,7 @@ async fn run_cmd(
     // run`, and it is the one that makes "Apply now" refuse instead of
     // taking the device offline.
     let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    roomlerd::supervision::set_current(supervision);
     tracing::info!(
         supervisor = supervision.wire(),
         detail = ?supervision,

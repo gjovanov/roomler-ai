@@ -55,7 +55,9 @@ like an empty wallpaper, this is why, essentially every time.
 A third grant, **Microphone**, matters only for a screen recording that
 includes the microphone (from agent 0.4.163). macOS asks the first time one
 does. Unlike the two above, it does not fail silently: if it is turned off,
-that recording is refused and names the setting.
+that recording is refused and names the setting. Where the **root half** runs
+the screen (`macos_supervise_gui_worker`), macOS never asks, so the
+microphone is refused by name there for now instead of recording silence.
 
 You do not have to hunt: the **menu-bar app** names whichever grant is missing
 and opens the right pane. The agent also probes both at startup and reports the
