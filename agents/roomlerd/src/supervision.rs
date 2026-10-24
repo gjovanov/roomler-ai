@@ -252,6 +252,21 @@ pub fn detect_here(flag: Option<&str>, macos_supervised: bool) -> Supervision {
     detect(flag, macos_supervised, &env, cgroup.as_deref())
 }
 
+/// What supervises THIS process, as `run` decided it ([`detect_here`]), for
+/// what later spawns children that must know it. Set once, at start.
+static CURRENT: std::sync::OnceLock<Supervision> = std::sync::OnceLock::new();
+
+/// Remember this process's supervisor. Only the first call counts.
+pub fn set_current(supervision: Supervision) {
+    let _ = CURRENT.set(supervision);
+}
+
+/// This process's supervisor, once `run` has decided it; `None` before, and
+/// in any process that is not `run` (a recorder, a probe, a CLI).
+pub fn current() -> Option<Supervision> {
+    CURRENT.get().copied()
+}
+
 /// Everything [`decide_restart`] weighs, gathered before it is called.
 #[derive(Debug, Clone, Copy)]
 pub struct RestartInputs {

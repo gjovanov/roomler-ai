@@ -31,7 +31,8 @@
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
 > person hands it. On macOS computer audio is recorded since FR-97 P2a (agent
-> 0.4.161) and the microphone since P2f (agent 0.4.163), §9.
+> 0.4.161), and the microphone since P2f (agent 0.4.163) except on a supervised
+> Mac, which refuses it by name for now (P2f-1b), §9.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -709,7 +710,13 @@ AVFoundation says the person has not turned it off (`recording::mic_permission`)
 runs, and the file carries nothing. So *Denied* and *Restricted* refuse the
 start by name (`mic_unavailable`, the setting in `detail`), and an *undecided*
 microphone opens, which is when macOS asks the person (silence until they
-answer). The bundle carries `NSMicrophoneUsageDescription` (without it macOS
+answer). ⚠️ **Not on a supervised Mac** (P2f-1b): its GUI worker is started by
+the root daemon, which stays the recorder's responsible process, and macOS never
+asks the person about a microphone for root. Measured on the operator's MacBook
+(FR-97 §8): "not determined", the real microphone opened, no prompt, three
+minutes of silence. There the recorder refuses the microphone by name whatever
+the answer (the manager sets `mic_permission::SUPERVISED_ENV`), until P2f-2
+makes the worker its own responsible process. The bundle carries `NSMicrophoneUsageDescription` (without it macOS
 ends the process at its first access) and the `audio-input` entitlement
 (without it the hardened runtime refuses the microphone). Computer audio is
 **never offered** where it cannot be recorded (#1760):
@@ -1081,11 +1088,12 @@ sequenceDiagram
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
   `child.rs:399-407`); a recording never follows a user switch.
-- **Both audio sources are built on macOS**: computer audio since FR-97 P2a
-  (ScreenCaptureKit, in the worker's session: the worker advertises
-  `remote-audio` while the owner allows it, as any host does) and the
-  microphone since P2f (local only, as everywhere; macOS asks the person the
-  first time, §9). The banner is not
+- **Computer audio is built on a supervised Mac, the microphone not yet.**
+  Computer audio since FR-97 P2a (ScreenCaptureKit, in the worker's session:
+  the worker advertises `remote-audio` while the owner allows it, as any host
+  does). The microphone is refused by name (P2f-1b, §9): the root daemon that
+  started the worker is its recorder's responsible process, and macOS never
+  asks the person for root. The banner is not
   capture-excluded there, so it appears in the recording.
 - **Unsupervised Mac** (the default): the per-user LaunchAgent is its own
   enrollment and records as the person, like any user install; the root row
