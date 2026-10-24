@@ -127,7 +127,8 @@ pub struct KnowhowEntity {
     /// What is known of it, each fact with its own provenance, by path.
     #[serde(default)]
     pub facts: Vec<Fact>,
-    /// [`STATUS_ACTIVE`] for a person's; [`STATUS_ARCHIVED`] once tombstoned.
+    /// [`STATUS_ACTIVE`] for a person's; [`STATUS_PROPOSED`] for a session's
+    /// (P4-4-2); [`STATUS_ARCHIVED`] once tombstoned.
     pub status: String,
     /// Where it came from: [`SOURCE_PERSON`] in P4-1.
     pub source: String,
@@ -135,6 +136,9 @@ pub struct KnowhowEntity {
     /// device whose later scans keep it, change it and retire it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<ObjectId>,
+    /// P4-4-2 — the session whose proposal made it, for a session's entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ObjectId>,
     /// Bumped by every write; a write names the rev it read.
     pub rev: i64,
     #[serde(default)]
@@ -167,6 +171,9 @@ pub struct Fact {
     /// P4-3a-2 — the device whose scan said it, for a scan's fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<ObjectId>,
+    /// P4-4-2 — the session that proposed it, for a session's fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ObjectId>,
     pub observed_at: DateTime,
     /// When a probe last confirmed it (P4-5).
     #[serde(default)]
@@ -193,6 +200,9 @@ pub struct KnowhowEdge {
     /// P4-3a-2 — the device whose scan made it, for a scan's link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<ObjectId>,
+    /// P4-4-2 — the session whose proposal made it, for a session's link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ObjectId>,
     pub rev: i64,
     #[serde(default)]
     pub created_by: Option<ObjectId>,
@@ -231,6 +241,13 @@ pub struct KnowhowHistory {
     /// P4-3a-2 — the device whose scan wrote, for a scan's write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<ObjectId>,
+    /// P4-4-2 — the session whose proposal wrote, for a session's write:
+    /// what its ceiling counts (decision 51).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ObjectId>,
+    /// P4-4-2 — why the session proposed it, in its own words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
     pub at: DateTime,
     /// What the write set: a create's whole body, an update's changed fields
     /// (facts as `{path, value}` rows, a null value for one removed), an
@@ -544,20 +561,24 @@ pub fn merge_facts(
         source,
         by,
         device: None,
+        session: None,
     };
     merge_facts_from(current, changes, who, now)
 }
 
 /// Who says what a write sets: its source, and the person or the device
-/// behind it (P4-3a-2: a scan's facts name their device).
+/// behind it (P4-3a-2: a scan's facts name their device; P4-4-2: a session's
+/// name their session).
 #[derive(Debug, Clone, Copy)]
 pub struct Provenance<'a> {
     pub source: &'a str,
     pub by: Option<ObjectId>,
     pub device: Option<ObjectId>,
+    pub session: Option<ObjectId>,
 }
 
-/// [`merge_facts`], with the whole provenance a fact keeps.
+/// [`merge_facts`], with the whole provenance a fact keeps. A session's fact
+/// is [`STATUS_PROPOSED`] (P4-4-2), every other source's [`STATUS_ACTIVE`].
 pub fn merge_facts_from(
     current: &[Fact],
     changes: &[(String, Option<Bson>)],
@@ -576,15 +597,21 @@ pub fn merge_facts_from(
             (None, None) => {}
             (Some(v), Some(i)) if &facts[i].value == v && facts[i].status == STATUS_ACTIVE => {}
             (Some(v), at) => {
+                let status = if who.source == SOURCE_SESSION {
+                    STATUS_PROPOSED
+                } else {
+                    STATUS_ACTIVE
+                };
                 let fact = Fact {
                     path: path.clone(),
                     value: v.clone(),
                     source: who.source.into(),
                     by: who.by,
                     device: who.device,
+                    session: who.session,
                     observed_at: now,
                     verified_at: None,
-                    status: STATUS_ACTIVE.into(),
+                    status: status.into(),
                 };
                 match at {
                     Some(i) => facts[i] = fact,
@@ -740,10 +767,44 @@ mod tests {
             source: source.into(),
             by: None,
             device: None,
+            session: None,
             observed_at: DateTime::from_millis(1),
             verified_at: Some(DateTime::from_millis(2)),
             status: status.into(),
         }
+    }
+
+    /// P4-4-2 — a session's fact is a proposal, naming its session, and a
+    /// person's is believed: the same merge, told apart by its source.
+    #[test]
+    fn a_sessions_fact_is_proposed_and_names_its_session() {
+        let session = ObjectId::new();
+        let now = DateTime::from_millis(7);
+        let who = Provenance {
+            source: SOURCE_SESSION,
+            by: None,
+            device: None,
+            session: Some(session),
+        };
+        let (facts, changed) =
+            merge_facts_from(&[], &[("port".into(), Some(Bson::Int64(27017)))], who, now);
+        assert_eq!(changed, vec![doc! { "path": "port", "value": 27017_i64 }]);
+        let f = &facts[0];
+        assert_eq!(
+            (f.source.as_str(), f.status.as_str(), f.session, f.by),
+            (SOURCE_SESSION, STATUS_PROPOSED, Some(session), None)
+        );
+        let (facts, _) = merge_facts(
+            &[],
+            &[("port".into(), Some(Bson::Int64(27017)))],
+            SOURCE_PERSON,
+            Some(ObjectId::new()),
+            now,
+        );
+        assert_eq!(
+            (facts[0].status.as_str(), facts[0].session),
+            (STATUS_ACTIVE, None)
+        );
     }
 
     #[test]

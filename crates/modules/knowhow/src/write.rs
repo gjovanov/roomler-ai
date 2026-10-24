@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! What every write to the map shares, a person's (the routes) or the
-//! fleet's (the sync): the stamp its history row carries, the row appended
-//! after it, and an archive that takes an entity's links with it.
+//! What every write to the map shares, a person's (the routes), the fleet's
+//! (the sync), a device's (a scan) or a session's (a proposal): the stamp
+//! its history row carries, the row appended after it, and an archive that
+//! takes an entity's links with it.
 
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use roomler_ai_services::dao::base::DaoResult;
@@ -11,21 +12,24 @@ use tracing::error;
 use crate::KnowhowState;
 use crate::dao::MAX_EDGES;
 use crate::model::{
-    KnowhowHistory, OP_ARCHIVE, Provenance, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SYNC,
-    STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
+    KnowhowHistory, OP_ARCHIVE, Provenance, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SESSION,
+    SOURCE_SYNC, STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
 };
 
 /// The links an archive takes with it, per read.
 const ARCHIVE_BATCH: usize = 500;
 
 /// What every history row of one write shares: its organization, who wrote
-/// (a person, the device whose scan it was, or nobody for the sync), from
-/// which source, and when.
+/// (a person, the device whose scan it was, the session that proposed it, or
+/// nobody for the sync), from which source, and when.
 pub(crate) struct Stamp {
     pub tid: ObjectId,
     pub by: Option<ObjectId>,
     /// P4-3a-2 — the device, for a scan's write.
     pub device: Option<ObjectId>,
+    /// P4-4-2 — the session, for a session's proposal, and why it proposed.
+    pub session: Option<ObjectId>,
+    pub why: Option<String>,
     pub source: &'static str,
     pub at: DateTime,
 }
@@ -37,6 +41,8 @@ impl Stamp {
             tid,
             by: Some(by),
             device: None,
+            session: None,
+            why: None,
             source: SOURCE_PERSON,
             at: DateTime::now(),
         }
@@ -48,6 +54,8 @@ impl Stamp {
             tid,
             by: None,
             device: None,
+            session: None,
+            why: None,
             source: SOURCE_SYNC,
             at: DateTime::now(),
         }
@@ -59,7 +67,23 @@ impl Stamp {
             tid,
             by: None,
             device: Some(device),
+            session: None,
+            why: None,
             source: SOURCE_SCAN,
+            at: DateTime::now(),
+        }
+    }
+
+    /// A session's proposal (P4-4-2): the session said it, and why, and no
+    /// person.
+    pub(crate) fn session(tid: ObjectId, session: ObjectId, why: String) -> Self {
+        Self {
+            tid,
+            by: None,
+            device: None,
+            session: Some(session),
+            why: Some(why),
+            source: SOURCE_SESSION,
             at: DateTime::now(),
         }
     }
@@ -70,6 +94,7 @@ impl Stamp {
             source: self.source,
             by: self.by,
             device: self.device,
+            session: self.session,
         }
     }
 
@@ -95,6 +120,8 @@ impl Stamp {
             source: self.source.into(),
             by: self.by,
             device: self.device,
+            session: self.session,
+            why: self.why.clone(),
             at: self.at,
             set,
         }

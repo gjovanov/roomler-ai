@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! P4-4-1 — a session's questions, the server's half (the FR-90 spec, §3e
 //! "P4-4, a session's reads and proposals, as designed"): `rc:knowhow.search`
-//! and `rc:knowhow.get` from a session's toolbelt, carried by its device.
+//! and `rc:knowhow.get` from a session's toolbelt, carried by its device, and
+//! (P4-4-2) `rc:knowhow.propose`, answered by [`crate::propose`].
 //!
 //! A question names a session and its fence; the organization and the device
 //! come from the socket. The session is believed from its record, never from
@@ -16,6 +17,7 @@
 //! | who is asking | [`identify`] |
 //! | what it may read | [`may_read`] |
 //! | the answers, cut to their bounds | [`search`], [`get`], [`bounded`] |
+//! | a proposal, within the session's ceiling (decisions 50 and 51) | [`crate::propose`] |
 //! | the map is there for this device (decision 49) | [`served`] |
 //!
 //! ⚠️ Still a map, not a gate: an answer tells a session where things are, and
@@ -27,7 +29,9 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
-use roomler_ai_remote_control::knowhow::{SessionRefusal, TOOL_GET, TOOL_SEARCH, session_limits};
+use roomler_ai_remote_control::knowhow::{
+    SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, session_limits,
+};
 use roomler_ai_remote_control::models::{RpcCap, UpdateRefusal};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use roomler_ai_services::dao::base::DaoError;
@@ -64,12 +68,22 @@ pub(crate) enum Question {
         kind: String,
         key: String,
     },
+    /// P4-4-2 — a proposal ([`crate::propose`]).
+    Propose {
+        req_id: String,
+        session_id: ObjectId,
+        fence: u64,
+        proposal: Value,
+        why: String,
+    },
 }
 
 impl Question {
     fn req_id(&self) -> &str {
         match self {
-            Self::Search { req_id, .. } | Self::Get { req_id, .. } => req_id,
+            Self::Search { req_id, .. }
+            | Self::Get { req_id, .. }
+            | Self::Propose { req_id, .. } => req_id,
         }
     }
 }
@@ -123,6 +137,19 @@ impl Questions {
                 fence,
                 kind,
                 key,
+            },
+            ClientMsg::KnowhowPropose {
+                req_id,
+                session_id,
+                fence,
+                proposal,
+                why,
+            } => Question::Propose {
+                req_id,
+                session_id,
+                fence,
+                proposal,
+                why,
             },
             other => return Some(other),
         };
@@ -200,7 +227,11 @@ pub(crate) async fn served(state: &KnowhowState, conn: Conn) -> Option<ServerMsg
         return None;
     }
     Some(ServerMsg::KnowhowServed {
-        tools: vec![TOOL_SEARCH.to_string(), TOOL_GET.to_string()],
+        tools: vec![
+            TOOL_SEARCH.to_string(),
+            TOOL_GET.to_string(),
+            TOOL_PROPOSE.to_string(),
+        ],
     })
 }
 
@@ -261,6 +292,23 @@ pub(crate) async fn answer(state: &KnowhowState, conn: Conn, question: &Question
                     })
             }
             Err(why) => Err(why),
+        },
+        Question::Propose {
+            session_id,
+            fence,
+            proposal,
+            why,
+            ..
+        } => match identify(state, conn, *session_id, *fence).await {
+            Ok(_) => crate::propose::propose(state, conn.tenant_id, *session_id, proposal, why)
+                .await
+                .map(|p| ServerMsg::KnowhowProposed {
+                    req_id: req_id.to_string(),
+                    what: p.what.to_string(),
+                    id: p.id.to_hex(),
+                    left: p.left,
+                }),
+            Err(refusal) => Err(refusal),
         },
     };
     answered.unwrap_or_else(|why| refused(req_id, why))

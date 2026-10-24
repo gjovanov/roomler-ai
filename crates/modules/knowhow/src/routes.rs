@@ -222,7 +222,7 @@ fn scans_own(current: &KnowhowEntity) -> bool {
 
 /// Whether `path` is a scan's on `current`: one its scan owns there, or a
 /// fact a scan said.
-fn scans_path(current: &KnowhowEntity, path: &str) -> bool {
+pub(crate) fn scans_path(current: &KnowhowEntity, path: &str) -> bool {
     scans_own(current) && SCANNED_FACTS.contains(&path)
         || current.source == SOURCE_SYNC && SCANNED_MACHINE_FACTS.contains(&path)
         || current
@@ -232,7 +232,7 @@ fn scans_path(current: &KnowhowEntity, path: &str) -> bool {
 }
 
 /// Whether `path` is kept for the sync or a scan on `current`.
-fn reserved(current: &KnowhowEntity, path: &str) -> bool {
+pub(crate) fn reserved(current: &KnowhowEntity, path: &str) -> bool {
     if current.source == SOURCE_SYNC {
         SYNCED_FACTS.contains(&path) || SCANNED_MACHINE_FACTS.contains(&path)
     } else {
@@ -244,7 +244,7 @@ fn reserved(current: &KnowhowEntity, path: &str) -> bool {
 /// room for every fact the sync and its scans own (P4-3a-2), and a scan's
 /// own entity for every fact its scans own, so neither ever takes one past
 /// [`MAX_FACTS`]: a person's own are held to what is left.
-fn persons_room(current: &KnowhowEntity) -> usize {
+pub(crate) fn persons_room(current: &KnowhowEntity) -> usize {
     if current.source == SOURCE_SYNC {
         MAX_FACTS - SYNCED_FACTS.len() - SCANNED_MACHINE_FACTS.len()
     } else if scans_own(current) {
@@ -256,7 +256,7 @@ fn persons_room(current: &KnowhowEntity) -> usize {
 
 /// The facts of `facts` that count against a person's room: those at a path
 /// not kept for the sync or a scan.
-fn persons_facts(current: &KnowhowEntity, facts: &[Fact]) -> usize {
+pub(crate) fn persons_facts(current: &KnowhowEntity, facts: &[Fact]) -> usize {
     facts.iter().filter(|f| !reserved(current, &f.path)).count()
 }
 
@@ -646,6 +646,7 @@ pub async fn create_entity(
         status: STATUS_ACTIVE.into(),
         source: SOURCE_PERSON.into(),
         device: None,
+        session: None,
         rev: 1,
         created_by: Some(auth.user_id),
         created_at: now,
@@ -892,6 +893,7 @@ pub async fn create_edge(
         status: STATUS_ACTIVE.into(),
         source: SOURCE_PERSON.into(),
         device: None,
+        session: None,
         rev: 1,
         created_by: Some(auth.user_id),
         created_at: now,

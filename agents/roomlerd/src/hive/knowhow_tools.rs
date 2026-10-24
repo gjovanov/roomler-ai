@@ -345,6 +345,29 @@ pub(crate) fn refusal(word: &str) -> String {
         Some(SessionRefusal::Unavailable) => {
             "the map could not be read just now: ask again later".into()
         }
+        Some(SessionRefusal::Exists) => {
+            "that is on the map already: a proposal adds, it never changes what is there \
+             (knowhow_get shows it)"
+                .into()
+        }
+        Some(SessionRefusal::Reserved) => {
+            "that part of the map is a device's: the fleet and the device's own scans keep \
+             machines, their checkouts and listeners, and what they say of them"
+                .into()
+        }
+        Some(SessionRefusal::Refused) => {
+            "the proposal holds text in a credential's shape, so nothing of it was written: \
+             the map never keeps a secret"
+                .into()
+        }
+        Some(SessionRefusal::Full) => {
+            "the map, or that entity, holds its most entries: nothing more fits".into()
+        }
+        Some(SessionRefusal::Ceiling) => format!(
+            "this session has made its most proposals ({}); say what else it learned in its \
+             own words instead",
+            session_limits::MAX_PROPOSALS
+        ),
         None => format!("the map refused: {word}"),
     }
 }
@@ -594,7 +617,7 @@ mod tests {
                 "{r:?} has words"
             );
         }
-        assert_eq!(refusal("ceiling"), "the map refused: ceiling");
+        assert_eq!(refusal("teleported"), "the map refused: teleported");
     }
 
     struct Fake;

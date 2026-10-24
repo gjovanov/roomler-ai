@@ -1763,6 +1763,28 @@ pub enum ClientMsg {
         key: String,
     },
 
+    /// FR-90 P4-4-2 — a session on this device says what it learned, as a
+    /// proposal (decision 50): one new entity, one fact at a path no fact
+    /// holds, or one link between two live entities, written `proposed` and
+    /// naming the session, with its `why`. Believed and held as
+    /// [`ClientMsg::KnowhowSearch`] is, within the session's ceiling
+    /// (decision 51), and answered with [`ServerMsg::KnowhowProposed`] or
+    /// [`ServerMsg::KnowhowRefused`]. `proposal` is raw JSON holding one key,
+    /// `entity`, `fact` or `link`, read by the server. Absent, it and `why`
+    /// read as empty and are refused `bad_request`, so the frame is always
+    /// answered.
+    #[serde(rename = "rc:knowhow.propose")]
+    KnowhowPropose {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        #[serde(default)]
+        proposal: serde_json::Value,
+        #[serde(default)]
+        why: String,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2707,6 +2729,7 @@ impl ClientMsg {
             ClientMsg::KnowhowScanned { .. } => "rc:knowhow.scanned",
             ClientMsg::KnowhowSearch { .. } => "rc:knowhow.search",
             ClientMsg::KnowhowGet { .. } => "rc:knowhow.get",
+            ClientMsg::KnowhowPropose { .. } => "rc:knowhow.propose",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2838,7 +2861,8 @@ impl ClientMsg {
             | ClientMsg::VaultEgress { .. } => Owner::Vault,
             ClientMsg::KnowhowScanned { .. }
             | ClientMsg::KnowhowSearch { .. }
-            | ClientMsg::KnowhowGet { .. } => Owner::Knowhow,
+            | ClientMsg::KnowhowGet { .. }
+            | ClientMsg::KnowhowPropose { .. } => Owner::Knowhow,
         }
     }
 }
@@ -2895,6 +2919,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:knowhow.scanned", Owner::Knowhow),
     ("rc:knowhow.search", Owner::Knowhow),
     ("rc:knowhow.get", Owner::Knowhow),
+    ("rc:knowhow.propose", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -4998,6 +5023,18 @@ pub enum ServerMsg {
         card: serde_json::Value,
     },
 
+    /// FR-90 P4-4-2 — a session's proposal, written `proposed`: `what` it
+    /// was (`entity`, `fact` or `link`), the `id` of the entity or link it
+    /// wrote (for a fact, its entity's), and how many proposals the session
+    /// has `left` under its ceiling.
+    #[serde(rename = "rc:knowhow.proposed")]
+    KnowhowProposed {
+        req_id: String,
+        what: String,
+        id: String,
+        left: u32,
+    },
+
     /// FR-90 P4-4-1 — knowhow refused a session's question, in one word from
     /// [`crate::knowhow::SessionRefusal`].
     #[serde(rename = "rc:knowhow.refused")]
@@ -7061,8 +7098,9 @@ mod tests {
     /// FR-90 P4-4-1 — a session's questions and their answers: the session
     /// and its fence in the frame, never the organization or the device;
     /// empty filters left out; a `get` missing its name still decoding, so
-    /// it is answered `bad_request` instead of never; and `served` naming
-    /// the tools its server answers, read as none when it names nothing.
+    /// it is answered `bad_request` instead of never; `served` naming the
+    /// tools its server answers, read as none when it names nothing; and
+    /// (P4-4-2) a proposal and its answer, a bare one still decoding.
     #[test]
     fn knowhow_session_frames_wire_shape_is_locked() {
         let session = ObjectId::new();
@@ -7132,6 +7170,47 @@ mod tests {
             .unwrap(),
             serde_json::json!({"t": "rc:knowhow.refused", "req_id": "r2",
                                "reason": "stale_fence"})
+        );
+
+        // P4-4-2 — a proposal travels as the session wrote it, and one with
+        // neither its proposal nor its why still decodes, so it is answered
+        // `bad_request` instead of never.
+        let propose = ClientMsg::KnowhowPropose {
+            req_id: "p1".into(),
+            session_id: session,
+            fence: 3,
+            proposal: serde_json::json!({"fact": {"kind": "database", "key": "prod-mongo",
+                                                  "path": "port", "value": 27017}}),
+            why: "its connection string names the port".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&propose).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.propose", "req_id": "p1",
+                               "session_id": session.to_hex(), "fence": 3,
+                               "proposal": {"fact": {"kind": "database", "key": "prod-mongo",
+                                                     "path": "port", "value": 27017}},
+                               "why": "its connection string names the port"})
+        );
+        assert_eq!(propose.namespace(), Owner::Knowhow);
+        assert_eq!(propose.wire_tag(), "rc:knowhow.propose");
+        let bare = serde_json::json!({"t": "rc:knowhow.propose", "req_id": "p2",
+                                      "session_id": session.to_hex(), "fence": 3});
+        match serde_json::from_value::<ClientMsg>(bare).unwrap() {
+            ClientMsg::KnowhowPropose { proposal, why, .. } => {
+                assert!(proposal.is_null() && why.is_empty());
+            }
+            other => panic!("not a proposal: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowProposed {
+                req_id: "p1".into(),
+                what: "fact".into(),
+                id: session.to_hex(),
+                left: 49,
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.proposed", "req_id": "p1", "what": "fact",
+                               "id": session.to_hex(), "left": 49})
         );
     }
 
