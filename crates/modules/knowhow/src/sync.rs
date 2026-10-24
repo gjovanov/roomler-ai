@@ -410,6 +410,7 @@ async fn put(
                     source: SOURCE_SYNC.into(),
                     device: None,
                     session: None,
+                    confirmed: None,
                     rev: 1,
                     created_by: None,
                     created_at: stamp.at,

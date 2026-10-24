@@ -45,6 +45,11 @@ pub struct EntityView {
     /// P4-4-2 — the session whose proposal made it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// P4-4-3 — the person who confirmed the proposal, and when.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
     pub rev: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
@@ -69,6 +74,8 @@ impl EntityView {
             source: e.source.clone(),
             device: e.device.map(|d| d.to_hex()),
             session: e.session.map(|s| s.to_hex()),
+            confirmed_by: e.confirmed.map(|c| c.by.to_hex()),
+            confirmed_at: e.confirmed.map(|c| rfc3339(c.at)),
             rev: e.rev,
             created_by: e.created_by.map(|u| u.to_hex()),
             created_at: rfc3339(e.created_at),
@@ -91,6 +98,11 @@ pub struct FactView {
     /// P4-4-2 — the session that proposed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// P4-4-3 — the person who confirmed it, and when.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
     pub observed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,
@@ -106,6 +118,8 @@ impl FactView {
             by: f.by.map(|u| u.to_hex()),
             device: f.device.map(|d| d.to_hex()),
             session: f.session.map(|s| s.to_hex()),
+            confirmed_by: f.confirmed.map(|c| c.by.to_hex()),
+            confirmed_at: f.confirmed.map(|c| rfc3339(c.at)),
             observed_at: rfc3339(f.observed_at),
             verified_at: f.verified_at.map(rfc3339),
             status: f.status.clone(),
@@ -173,6 +187,11 @@ pub struct EdgeView {
     /// P4-4-2 — the session whose proposal made it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// P4-4-3 — the person who confirmed the proposal, and when.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
     pub rev: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
@@ -194,6 +213,8 @@ impl EdgeView {
             source: e.source.clone(),
             device: e.device.map(|d| d.to_hex()),
             session: e.session.map(|s| s.to_hex()),
+            confirmed_by: e.confirmed.map(|c| c.by.to_hex()),
+            confirmed_at: e.confirmed.map(|c| rfc3339(c.at)),
             rev: e.rev,
             created_by: e.created_by.map(|u| u.to_hex()),
             created_at: rfc3339(e.created_at),
