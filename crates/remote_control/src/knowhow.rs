@@ -417,6 +417,11 @@ pub mod session_limits {
     /// Questions one session may ask on its device a minute, the vault's
     /// rate. Past it the answer is `busy`.
     pub const RATE_PER_MINUTE: u32 = 120;
+    /// FR-90 P4-4-2 — the proposals one session makes over its whole life,
+    /// every fence counted (decision 51). Past it the answer is `ceiling`.
+    pub const MAX_PROPOSALS: u32 = 50;
+    /// A proposal's `why`, at most, in characters.
+    pub const MAX_WHY_CHARS: usize = 500;
 }
 
 /// FR-90 P4-4-1 — the toolbelt's knowhow tools, by the names a server lists
@@ -425,6 +430,9 @@ pub mod session_limits {
 /// leave unanswered.
 pub const TOOL_SEARCH: &str = "knowhow_search";
 pub const TOOL_GET: &str = "knowhow_get";
+/// FR-90 P4-4-2 — a session says what it learned, as a proposal (decisions
+/// 39 and 50).
+pub const TOOL_PROPOSE: &str = "knowhow_propose";
 
 /// FR-90 P4-4-1 — why knowhow refused a session's question. The words are a
 /// compatibility surface: a device decides from them whether asking again
@@ -452,6 +460,22 @@ pub enum SessionRefusal {
     Busy,
     /// What the answer needed could not be read; asking later may help.
     Unavailable,
+    /// FR-90 P4-4-2 — what a proposal names is already on the map: an
+    /// entity by that kind and key, a fact at that path, a link of that kind
+    /// between the two. A proposal adds; it never changes what is there.
+    Exists,
+    /// A proposal into a device's part of the map: a machine, a key a
+    /// device's scans keep, a fact the fleet or a scan keeps, a link a scan
+    /// makes.
+    Reserved,
+    /// Some text of a proposal holds a credential's shape; nothing of it was
+    /// written.
+    Refused,
+    /// The map holds its most entities or links, or the entity its most
+    /// facts.
+    Full,
+    /// The session made its most proposals (decision 51).
+    Ceiling,
 }
 
 impl SessionRefusal {
@@ -468,10 +492,15 @@ impl SessionRefusal {
             Self::NotFound => "not_found",
             Self::Busy => "busy",
             Self::Unavailable => "unavailable",
+            Self::Exists => "exists",
+            Self::Reserved => "reserved",
+            Self::Refused => "refused",
+            Self::Full => "full",
+            Self::Ceiling => "ceiling",
         }
     }
 
-    pub const ALL: [SessionRefusal; 9] = [
+    pub const ALL: [SessionRefusal; 14] = [
         Self::NotServed,
         Self::BadRequest,
         Self::NotLocated,
@@ -481,6 +510,11 @@ impl SessionRefusal {
         Self::NotFound,
         Self::Busy,
         Self::Unavailable,
+        Self::Exists,
+        Self::Reserved,
+        Self::Refused,
+        Self::Full,
+        Self::Ceiling,
     ];
 
     /// A word, read back: `None` for one this build does not know, which a
@@ -697,11 +731,16 @@ mod tests {
                 "not_found",
                 "busy",
                 "unavailable",
+                "exists",
+                "reserved",
+                "refused",
+                "full",
+                "ceiling",
             ]
         );
         for r in SessionRefusal::ALL {
             assert_eq!(SessionRefusal::from_wire(r.wire()), Some(r));
         }
-        assert_eq!(SessionRefusal::from_wire("ceiling"), None);
+        assert_eq!(SessionRefusal::from_wire("teleported"), None);
     }
 }

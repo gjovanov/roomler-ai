@@ -35,12 +35,13 @@ use axum::{
     routing::{get, patch, post},
 };
 use roomler_ai_config::Settings;
-use roomler_ai_db::indexes::{IndexSet, index, index_ttl, index_unique_partial};
+use roomler_ai_db::indexes::{IndexSet, index, index_partial, index_ttl, index_unique_partial};
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Job, Module, TenantCtx};
 
 pub mod dao;
 pub mod intake;
 pub mod model;
+pub mod propose;
 pub mod routes;
 pub mod scan;
 pub mod scope;
@@ -277,6 +278,12 @@ impl Module for KnowhowState {
                     // included (`entity_ids` holds an edge's two ends).
                     index(bson::doc! { "tenant_id": 1, "at": -1, "_id": -1 }),
                     index(bson::doc! { "tenant_id": 1, "entity_ids": 1, "at": -1, "_id": -1 }),
+                    // P4-4-2 — a session's proposals, counted against its
+                    // ceiling: only the rows a session wrote.
+                    index_partial(
+                        bson::doc! { "tenant_id": 1, "session": 1 },
+                        bson::doc! { "session": { "$type": "objectId" } },
+                    ),
                 ],
             },
             // P4-3a — the scans asked of devices.

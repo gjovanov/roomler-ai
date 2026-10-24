@@ -20,10 +20,11 @@ sessions read it too, through their toolbelt.
 > says so, the ports it listens on (§11.2); and P4-4-1, a session's
 > questions: the word that the map is there, a session's search and card,
 > believed from its record and held to its starter's `KNOWHOW_VIEW` (§12),
-> asked through the toolbelt's `knowhow_search` and `knowhow_get` (§12.1).**
-> People, the sync and scans fill the map. Windows (P4-3b-4), a session's
-> proposals (P4-4-2), probes (P4-5) and `roomler_connect` (P4-6) come with the
-> steps that build them (§13).
+> asked through the toolbelt's `knowhow_search` and `knowhow_get` (§12.1); and
+> P4-4-2a, a session's proposals, written `proposed` and naming the session
+> (§12.2).** People, the sync, scans and sessions' proposals fill the map.
+> Windows (P4-3b-4), the toolbelt's `knowhow_propose` (P4-4-2b), probes (P4-5)
+> and `roomler_connect` (P4-6) come with the steps that build them (§13).
 
 ## 1. A map, not a gate
 
@@ -65,15 +66,16 @@ An **entity** is one thing the organization has
 | `owner_id` | the member who answers for it, or none. A member of the organization, checked on every write |
 | `attrs` | a JSON object, up to 16 KiB stored: what describes it |
 | `facts` | what is known of it, each with its provenance (below), up to 64. A machine keeps 15 of them for the sync and its scans, a scan's own entity 9 for its scans (§10, §11.1) |
-| `status` | `active`; `archived` once tombstoned. `proposed` and `stale` come with P4-4 and P4-5 |
-| `source` | where it came from: `person`, `sync` (§10) or `scan` (§11.1); `session` later |
+| `status` | `active`; `proposed` for a session's (§12.2); `archived` once tombstoned. `stale` comes with P4-5 |
+| `source` | where it came from: `person`, `sync` (§10), `scan` (§11.1) or `session` (§12.2) |
 | `device` | for a scan's own entity, the device whose scans made it, keep it and retire it (§11.1); absent otherwise |
+| `session` | for a session's proposal, the session that made it (§12.2); absent otherwise |
 | `rev` | bumped by every write. A write names the rev it read (§3) |
 
 Kinds: `machine`, `repo`, `checkout`, `database`, `cluster`, `namespace`,
 `service`, `endpoint`, `bucket`, `cloud_account`, `domain`, `environment`,
 `team`, `doc`. An **edge** relates two entities, `from` `kind` `to`
-([`model.rs:181`](../crates/modules/knowhow/src/model.rs#L181)), its
+([`model.rs:188`](../crates/modules/knowhow/src/model.rs#L188)), its
 kind one of `runs_on`, `checked_out_at`, `deployed_to`, `depends_on`, `reads`,
 `writes`, `part_of`, `owned_by`, `documented_in`, `authenticates_with`,
 `reachable_via`, with attributes of its own (up to 4 KiB). No rule pairs an
@@ -89,19 +91,19 @@ flowchart LR
 ```
 
 A **fact** is a path, a value and where the value came from
-([`model.rs:159`](../crates/modules/knowhow/src/model.rs#L159)):
+([`model.rs:163`](../crates/modules/knowhow/src/model.rs#L163)):
 
 | Field | Meaning |
 |---|---|
 | `path` | `[a-z0-9]` then `[a-z0-9._-]`: `port`, `tls.fingerprint`. Stored beside the value, never as a key in the document, so a `.` is safe |
 | `value` | any JSON but null, up to 2 KiB |
-| `source`, `by`, `device` | `person` and who; `sync`, with nobody; or `scan` and its device (§11.1) |
+| `source`, `by`, `device`, `session` | `person` and who; `sync`, with nobody; `scan` and its device (§11.1); or `session` and the session that proposed it (§12.2) |
 | `observed_at`, `verified_at` | when it was said; when a probe last confirmed it (P4-5) |
-| `status` | `active` for a person's. A session's will be `proposed` until a probe or a person confirms it (decision 39) |
+| `status` | `active` for a person's, the sync's and a scan's. A session's is `proposed` until a probe or a person confirms it (decision 39, §12.2) |
 
 > [!IMPORTANT]
 > **A person's change to one fact never restamps another**
-> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L536)). An
+> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L553)). An
 > update names facts by path: a value sets that fact, as the caller's; null
 > removes it; a fact it does not name keeps who said it, from where and when,
 > and so does one set to the value it already holds while active. Restamping
@@ -128,7 +130,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Four collections, per organization
-([`lib.rs:233`](../crates/modules/knowhow/src/lib.rs#L233)):
+([`lib.rs:234`](../crates/modules/knowhow/src/lib.rs#L234)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -163,7 +165,7 @@ sequenceDiagram
 ```
 
 ⚠️ **The history is appended after the write it records, never before**
-([`write.rs:113`](../crates/modules/knowhow/src/write.rs#L113)).
+([`write.rs:140`](../crates/modules/knowhow/src/write.rs#L140)).
 Without a transaction, a row written first could name a write that then lost
 its compare-and-set. A row appended after can only go missing: the write
 stands, the failure is logged, and the entity still names who changed it last
@@ -172,7 +174,7 @@ stands, the failure is logged, and the entity still names who changed it last
 **Archiving an entity** tombstones it at the rev it was read, which frees its
 key, and archives every live link to it, each in the history with the cause
 `entity_archived`
-([`archive_links`](../crates/modules/knowhow/src/write.rs#L149)).
+([`archive_links`](../crates/modules/knowhow/src/write.rs#L176)).
 Nothing links to an archived entity: a link's ends are resolved live, within
 the organization, before it is made. A link the archive raced is invisible,
 because a card and a neighbourhood show only the links whose other end is live.
@@ -268,7 +270,7 @@ stops there.
 
 ## 8. History
 
-One row per write ([`model.rs:214`](../crates/modules/knowhow/src/model.rs#L214)):
+One row per write ([`model.rs:224`](../crates/modules/knowhow/src/model.rs#L224)):
 
 | Field | Meaning |
 |---|---|
@@ -285,9 +287,9 @@ years after it was written, so it has no TTL.
 
 | Collection | One row per | Indexes | Retention |
 |---|---|---|---|
-| `knowhow_entities` | entity: kind, key, name, env, owner, attributes, facts, status, source, device, rev | unique `(tenant_id, kind, key)` over live rows (partial on `deleted_at: {$type: "null"}`); `(tenant_id, deleted_at, kind, key)`; `(tenant_id, device, deleted_at)`, a device's scan part | tombstoned, kept |
-| `knowhow_edges` | link: from, to, kind, attributes, status, source, device, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`; `(tenant_id, device, deleted_at)` | tombstoned, kept |
-| `knowhow_history` | write | `(tenant_id, at desc, _id desc)`, `(tenant_id, entity_ids, at desc, _id desc)` | kept, no TTL |
+| `knowhow_entities` | entity: kind, key, name, env, owner, attributes, facts, status, source, device, session, rev | unique `(tenant_id, kind, key)` over live rows (partial on `deleted_at: {$type: "null"}`); `(tenant_id, deleted_at, kind, key)`; `(tenant_id, device, deleted_at)`, a device's scan part | tombstoned, kept |
+| `knowhow_edges` | link: from, to, kind, attributes, status, source, device, session, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`; `(tenant_id, device, deleted_at)` | tombstoned, kept |
+| `knowhow_history` | write (P4-4-2: a session's names it, with its why) | `(tenant_id, at desc, _id desc)`, `(tenant_id, entity_ids, at desc, _id desc)`; `(tenant_id, session)` over a session's rows (partial on `session: {$type: "objectId"}`), its ceiling's count | kept, no TTL |
 | `knowhow_scans` | scan asked of a device: who asked and when, its state, when delivered and answered, its counts and detail (§11) | unique `(tenant_id, device_id)` over pending rows (partial on `pending: true`); `(tenant_id, device_id, requested_at desc)`; `(device_id, state)` | 90 days (TTL on `requested_at`) |
 
 ## 10. Machines, from the fleet and the network (P4-2)
@@ -553,9 +555,9 @@ flowchart LR
 |---|---|---|
 | a checkout | a `checkout` named `<last segment> on <machine>`, owned by the device's owner: `path`, `remotes`, `root_commit`, `branch`, `services`; `checked_out_at` its machine; `part_of` the repository of each remote, the remote's name as the link's attribute | `<node id>/<16 hex of the path's SHA-256>` ([`checkout_key`](../crates/modules/knowhow/src/intake.rs#L81)), since a path is not a key (case, spaces, separators) |
 | a listener | an `endpoint`: `port`, `protocol`, `address`, `process`; `runs_on` its machine | `<node id>:<port>/<protocol>` |
-| a kube context | the `cluster` its server names, made bare; `reachable_via` its machine, the device's contexts for it (name, namespace, CA) as the link's attributes | its server's `host:port` ([`cluster_key`](../crates/modules/knowhow/src/intake.rs#L125)), the scheme's port when it names none |
+| a kube context | the `cluster` its server names, made bare; `reachable_via` its machine, the device's contexts for it (name, namespace, CA) as the link's attributes | its server's `host:port` ([`cluster_key`](../crates/modules/knowhow/src/intake.rs#L150)), the scheme's port when it names none |
 | a declared tunnel route | its machine's `tunnel.declared`, a list | — |
-| a remote | the `repo` it names, made bare | its host and path, lowercase, with no scheme, user, port or `.git` ([`repo_key`](../crates/modules/knowhow/src/intake.rs#L95)). A local path names none |
+| a remote | the `repo` it names, made bare | its host and path, lowercase, with no scheme, user, port or `.git` ([`repo_key`](../crates/modules/knowhow/src/intake.rs#L120)). A local path names none |
 
 Every fact and link a scan writes says so: source `scan`, and the device (`device`), with no
 person (`by`), as do its history rows. A shared repository or cluster is a scan's (source
@@ -569,7 +571,7 @@ person (`by`), as do its history rows. A shared repository or cluster is a scan'
 > a repository or a cluster that does not exist.
 
 **A later scan replaces its device's part**
-([`retire`](../crates/modules/knowhow/src/intake.rs#L650)):
+([`retire`](../crates/modules/knowhow/src/intake.rs#L678)):
 
 | The answer | Archives |
 |---|---|
@@ -775,17 +777,17 @@ sequenceDiagram
     K-->>D: rc:knowhow.card {req_id, card}, or rc:knowhow.refused {req_id, reason}
 ```
 
-**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L181)). At each hello the
+**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L208)). At each hello the
 pod's knowhow sends `rc:knowhow.served {tools}` to a device whose hello
 advertised `knowhow-tools`, on its primary enrollment's connection, when
 knowhow serves its organization. `tools` names what this server answers
-(`knowhow_search`, `knowhow_get`), so a newer agent offers a session no tool an
-older server would leave unanswered. No other device is sent it: an older
+(`knowhow_search`, `knowhow_get`, and since P4-4-2a `knowhow_propose`), so a
+newer agent offers a session no tool an older server would leave unanswered. No other device is sent it: an older
 agent would log a frame it cannot read. A device offers its sessions the
 tools only on this word, so where knowhow is switched off no session is shown
 a tool that no module would answer.
 
-**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L303)). A question names a session and
+**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L351)). A question names a session and
 its fence; the organization and the device come from the socket. Every
 question is checked, in this order:
 
@@ -795,14 +797,14 @@ question is checked, in this order:
 | the session's record, read through hive's own DAO, is this organization's and runs on this device | `not_located` |
 | at the frame's fence | `stale_fence` |
 | live: starting, idle, running or awaiting approval | `ended` |
-| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L350), decision 48) | `denied` |
+| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L398), decision 48) | `denied` |
 | 120 questions a minute for the session on its device | `busy` |
 
 Then the question itself: `bad_request` for one past its bounds, `not_found`
 for a name no live entity holds, `unavailable` when a read failed. Each
 connection's questions wait in one queue of 16, answered in order by one task,
 so a slow read never holds the socket and a flood is answered `busy` instead
-of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L88)).
+of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L102)).
 
 > [!IMPORTANT]
 > **A session reads what its starter may, now.** The vault holds a session's
@@ -816,7 +818,7 @@ of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L88)).
 | Question | Answer | Bounds |
 |---|---|---|
 | `rc:knowhow.search {q?, kind?, env?, limit?}` | `rc:knowhow.found {entities, truncated}`: the people's search (§6), each entity as a listing shows one, no attributes and no facts | at most 50, 20 by default; `q` at most 200 characters |
-| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use | at most 50 links, cut from the end until the card fits 64 KiB ([`bounded`](../crates/modules/knowhow/src/session.rs#L456)); the entity itself is never cut, its own bounds hold it |
+| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use | at most 50 links, cut from the end until the card fits 64 KiB ([`bounded`](../crates/modules/knowhow/src/session.rs#L504)); the entity itself is never cut, its own bounds hold it |
 
 Every entity, fact and link comes with its status and source, so a session
 sees what a person said, what the sync and scans said, and (with P4-4-2) what
@@ -862,12 +864,97 @@ Windows), apart from the scanner.
 > anyway, every call would wait out its 15 s. So a session is offered only what
 > its server named, and a call of anything else is refused before it is asked.
 
+### 12.2 A session's proposals (P4-4-2a)
+
+A session says what it learned as a proposal (decisions 39, 50 and 51),
+answered by [`propose`](../crates/modules/knowhow/src/propose.rs#L114). It
+travels as a question does, on the device's primary connection, and is believed
+as one is: the same checks, in the same order, and the same 120 a minute. The
+server's half is P4-4-2a. The toolbelt's `knowhow_propose` is P4-4-2b's.
+
+```mermaid
+sequenceDiagram
+    participant D as the device (the primary's connection)
+    participant K as knowhow, the pod holding it
+    participant M as the map
+    D->>K: rc:knowhow.propose {req_id, session_id, fence, proposal, why}
+    K->>K: believed as a question is (§12), then its shape and its text
+    K->>M: the session's proposals so far, from the history (decision 51)
+    K->>M: what it names: there already? a device's part? room for it?
+    K->>M: written proposed, naming the session, its why on the history row
+    K-->>D: rc:knowhow.proposed {req_id, what, id, left}, or rc:knowhow.refused {req_id, reason}
+```
+
+**What a session may propose** (decision 50): something new, never a change.
+`proposal` holds one key:
+
+| `proposal` | Writes |
+|---|---|
+| `{"entity": {kind, key, name, env?, attrs?, facts?}}` | a new entity, its facts with it |
+| `{"fact": {kind, key, path, value}}` | one fact of a live entity, at a path no fact of it holds |
+| `{"link": {from: {kind, key}, kind, to: {kind, key}, attrs?}}` | a link between two live entities |
+
+Each is held as a person's write is ([`model.rs`](../crates/modules/knowhow/src/model.rs)):
+the kinds, the key rules, the attributes' bounds, the map's 10,000 entities and
+50,000 links. What it writes is `proposed` with source `session`, the session
+named on the row, on each fact and on its history row. Its `why`, up to 500
+characters, rides the history row
+([`check_why`](../crates/modules/knowhow/src/propose.rs#L148)). No person
+wrote it, so `created_by` and the history row's `by` stay empty. A person's
+entity a session adds a fact to stays the person's, with that one fact
+`proposed`.
+
+| Check | Refused |
+|---|---|
+| one of the three, held as a person's write is, and a `why` | `bad_request` |
+| no text of it, a name or a value, in a credential's shape, nor its `why` ([`credential_in`](../crates/modules/knowhow/src/propose.rs#L170)) | `refused` |
+| fewer than 50 proposals by the session over its life, every fence counted, from the history (decision 51) | `ceiling` |
+| never a device's part of the map (below) | `reserved` |
+| nothing there already: an entity by that kind and key, a fact at that path, a link of that kind between the two | `exists` |
+| a fact's entity and a link's two ends, live | `not_found` |
+| room: the map's entities, its links, the entity's facts | `full` |
+
+Nothing of a refused proposal is written. An accepted one is answered with
+what it was (`entity`, `fact` or `link`), the id of the entity or link it wrote
+(for a fact, its entity's), and how many proposals the session has `left`.
+
+> [!IMPORTANT]
+> **A session never proposes into a device's part of the map.** The fleet and
+> the device's own scans keep it, and each leaves a key, a path or a link that
+> another source holds as it is. So a proposal parked there would hold it
+> against the device's next scan. Refused `reserved`:
+> - a `machine`;
+> - a key in a scan's shape, a node id then `/` or `:`
+>   ([`devices_key`](../crates/modules/knowhow/src/intake.rs#L97));
+> - a fact at a path the fleet keeps on a machine, or a scan keeps on its
+>   entities;
+> - a link a scan makes: from a scan's own checkout `checked_out_at` or
+>   `part_of`, from its own endpoint `runs_on`, or a cluster `reachable_via` a
+>   machine ([`scans_link`](../crates/modules/knowhow/src/intake.rs#L111)).
+>
+> A fact of a machine at a free path, and a link to a machine a scan never
+> makes (`service runs_on machine`), are proposals like any other.
+
+**The ceiling** is counted from the history: one row a proposal, found by its
+session through a partial index on `{tenant_id, session}`
+([`count_by_session`](../crates/modules/knowhow/src/dao.rs#L389)). A
+session's questions are answered in order on their connection, so its
+proposals are counted one at a time.
+
+| Refusal | Means | Proposing again |
+|---|---|---|
+| `exists` | it is on the map already; a proposal never changes it | will not help: read it with `knowhow_get` |
+| `reserved` | that part of the map is a device's | will not help |
+| `refused` | some of its text holds a credential's shape | not with that text |
+| `full` | the map, or the entity, has no room | once there is room |
+| `ceiling` | the session made its 50 | will not help |
+
 ## 13. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-4-2 | `knowhow_propose`: an entity, a fact or a link written `proposed`, naming its session, within a ceiling (decisions 39, 50, 51) |
+| P4-4-2b | the toolbelt's `knowhow_propose`, offered when the server names it (§12.2 is its server's half) |
 | P4-4-3 | a person's word on a proposal: confirmed with who and when, or rejected as the routes already archive (decision 52) |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
