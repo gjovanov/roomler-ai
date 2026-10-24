@@ -188,11 +188,17 @@ impl Module for KnowhowState {
                 get(routes::get_entity)
                     .patch(routes::update_entity)
                     .delete(routes::archive_entity),
-            );
-        let edge = Router::new().route("/", post(routes::create_edge)).route(
-            "/{edge_id}",
-            patch(routes::update_edge).delete(routes::archive_edge),
-        );
+            )
+            // P4-4-3 — a person's word on a session's proposal.
+            .route("/{entity_id}/confirm", post(routes::confirm_entity))
+            .route("/{entity_id}/fact/confirm", post(routes::confirm_fact));
+        let edge = Router::new()
+            .route("/", post(routes::create_edge))
+            .route(
+                "/{edge_id}",
+                patch(routes::update_edge).delete(routes::archive_edge),
+            )
+            .route("/{edge_id}/confirm", post(routes::confirm_edge));
         Router::new()
             .route("/tenant/{tenant_id}/knowhow", get(routes::status))
             .route("/tenant/{tenant_id}/knowhow/search", get(routes::search))

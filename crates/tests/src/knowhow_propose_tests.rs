@@ -458,3 +458,185 @@ async fn a_malformed_or_stale_proposal_writes_nothing() {
     assert!(written(&app, &sid).await.is_empty(), "nothing written");
     assert_eq!(card(&app, &t, "service", "billing").await.0, 404);
 }
+
+/// P4-4-3 — a person's word on a proposal (decision 52). One holding
+/// `KNOWHOW_EDIT` confirms a proposed entity, fact or link, each on its own
+/// and at its rev: it turns `active`, with who confirmed it and when kept
+/// beside the session that proposed it, and the history says `confirm`. A
+/// member who only reads the map cannot; what is no proposal is not
+/// confirmed, nor one read at an older rev; rejecting is what the routes
+/// already do.
+#[tokio::test]
+async fn a_person_confirms_or_rejects_a_proposal() {
+    let app = session_app().await;
+    let t = app.seed_tenant("knowhowconfirm").await;
+    entity(&app, &t, "database", "prod-mongo").await;
+    let (mut dev, sid, fence) = asking(&app, &t, "confirm-box").await;
+    let made = propose(
+        &mut dev.ws,
+        "c1",
+        &sid,
+        fence,
+        json!({"entity": {"kind": "service", "key": "payments", "name": "Payments",
+                          "facts": {"port": 8080}}}),
+        "the compose file names it",
+    )
+    .await;
+    let svc = proposed(&made)["id"].as_str().unwrap().to_string();
+    let fact = propose(
+        &mut dev.ws,
+        "c2",
+        &sid,
+        fence,
+        json!({"fact": {"kind": "database", "key": "prod-mongo", "path": "port",
+                        "value": 27017}}),
+        "its env file names the port",
+    )
+    .await;
+    let db = proposed(&fact)["id"].as_str().unwrap().to_string();
+    let linked = propose(
+        &mut dev.ws,
+        "c3",
+        &sid,
+        fence,
+        json!({"link": {"from": {"kind": "service", "key": "payments"}, "kind": "reads",
+                        "to": {"kind": "database", "key": "prod-mongo"}}}),
+        "it reads its orders there",
+    )
+    .await;
+    let edge = proposed(&linked)["id"].as_str().unwrap().to_string();
+    let post = |path: String, token: &str, body: Value| {
+        call(
+            app.auth_post(&kpath(&t.tenant_id, &path), token)
+                .json(&body),
+        )
+    };
+    let admin = t.admin.access_token.clone();
+    let rev_of = |card: &Value| card["entity"]["rev"].as_i64().unwrap();
+
+    // A member reads the map, and confirms nothing of it.
+    let (_, before) = card(&app, &t, "service", "payments").await;
+    let (code, _) = post(
+        format!("/entity/{svc}/confirm"),
+        &t.member.access_token,
+        json!({"rev": rev_of(&before)}),
+    )
+    .await;
+    assert_eq!(code, 403);
+
+    // An older rev is refused, then the entity is confirmed at its own.
+    let (code, _) = post(
+        format!("/entity/{svc}/confirm"),
+        &admin,
+        json!({"rev": rev_of(&before) - 1}),
+    )
+    .await;
+    assert_eq!(code, 409, "an older rev");
+    let (code, body) = post(
+        format!("/entity/{svc}/confirm"),
+        &admin,
+        json!({"rev": rev_of(&before)}),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (&body["status"], &body["session"], &body["confirmed_by"]),
+        (&json!("active"), &json!(sid), &json!(t.admin.id))
+    );
+    assert!(body["confirmed_at"].is_string(), "{body}");
+    assert_eq!(
+        body["facts"][0]["status"], "proposed",
+        "its facts are each confirmed on their own"
+    );
+    let (code, _) = post(
+        format!("/entity/{svc}/confirm"),
+        &admin,
+        json!({"rev": body["rev"]}),
+    )
+    .await;
+    assert_eq!(code, 409, "what is no proposal is not confirmed");
+
+    // One fact of the person's database, by its path.
+    let (_, dbc) = card(&app, &t, "database", "prod-mongo").await;
+    let (code, _) = post(
+        format!("/entity/{db}/fact/confirm"),
+        &admin,
+        json!({"rev": rev_of(&dbc), "path": "version"}),
+    )
+    .await;
+    assert_eq!(code, 404, "no fact at that path");
+    let (code, body) = post(
+        format!("/entity/{db}/fact/confirm"),
+        &admin,
+        json!({"rev": rev_of(&dbc), "path": "port"}),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    let port = &body["facts"][0];
+    assert_eq!(
+        (&port["status"], &port["session"], &port["confirmed_by"]),
+        (&json!("active"), &json!(sid), &json!(t.admin.id))
+    );
+    assert_eq!(body["source"], "person", "the entity stays the person's");
+
+    // The link, at its rev.
+    let l = &dbc["links"][0]["edge"];
+    assert_eq!(l["id"], json!(edge));
+    let (code, body) = post(
+        format!("/edge/{edge}/confirm"),
+        &admin,
+        json!({"rev": l["rev"]}),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (&body["status"], &body["confirmed_by"]),
+        (&json!("active"), &json!(t.admin.id))
+    );
+
+    // The history: three confirmations, each the admin's, none the session's.
+    let confirms = rows(
+        &app,
+        "knowhow_history",
+        doc! { "op": "confirm", "tenant_id": ObjectId::parse_str(&t.tenant_id).unwrap() },
+    )
+    .await;
+    assert_eq!(confirms.len(), 3);
+    for h in &confirms {
+        assert_eq!(h.get_str("source").unwrap(), "person", "{h}");
+        assert_eq!(h.get_object_id("by").unwrap().to_hex(), t.admin.id, "{h}");
+        assert!(h.get("session").is_none(), "{h}");
+    }
+
+    // Rejecting is what the routes already do: the session's other fact,
+    // removed; and a fresh proposal, archived.
+    let (_, svc_card) = card(&app, &t, "service", "payments").await;
+    let (code, body) = call(
+        patch(
+            &app,
+            &kpath(&t.tenant_id, &format!("/entity/{svc}")),
+            &admin,
+        )
+        .json(&json!({"rev": rev_of(&svc_card), "facts": {"port": null}})),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["facts"], json!([]));
+    let other = propose(
+        &mut dev.ws,
+        "c4",
+        &sid,
+        fence,
+        json!({"entity": {"kind": "service", "key": "billing", "name": "Billing"}}),
+        "it is in the compose file",
+    )
+    .await;
+    let billing = proposed(&other)["id"].as_str().unwrap().to_string();
+    let (code, _) = call(app.auth_delete(
+        &kpath(&t.tenant_id, &format!("/entity/{billing}?rev=1")),
+        &admin,
+    ))
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(card(&app, &t, "service", "billing").await.0, 404);
+}
