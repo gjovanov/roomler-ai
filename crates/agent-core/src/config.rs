@@ -1593,6 +1593,14 @@ pub struct AgentConfig {
     /// `encoder_cells_deny`: it only ever REMOVES rates.
     #[serde(default)]
     pub fps_deny: Option<String>,
+    /// FR-119 P2b-10 — how NVENC splits a frame across its engines above
+    /// 60 fps: `auto` (unset; the driver picks the number of strips), `off`
+    /// (never ask, as before P2b-10), or a strip count `2`–`4` (applied only
+    /// on a GPU with that many engines). Env `ROOMLERD_NVENC_SPLIT`, read at
+    /// every encoder open. Local only: the fleet's kill switch for a rate is
+    /// `fps_deny`.
+    #[serde(default)]
+    pub nvenc_split: Option<String>,
     /// FR-77 P4 — pin the VAAPI render node (`ROOMLERD_VAAPI_DEVICE`,
     /// e.g. `/dev/dri/renderD129`). Unset = the first node libva opens, in
     /// order `/dev/dri/renderD128`…`renderD135`. Read once per process at
@@ -2987,6 +2995,7 @@ pub fn test_fixture() -> AgentConfig {
         fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
+        nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,
@@ -3344,6 +3353,11 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     if let Some(v) = &cfg.fps_deny {
         fallbacks.insert("FPS_DENY".to_string(), v.clone());
     }
+    // FR-119 P2b-10 — NVENC's split-frame encoding above 60 fps, read at
+    // every encoder open.
+    if let Some(v) = &cfg.nvenc_split {
+        fallbacks.insert("NVENC_SPLIT".to_string(), v.clone());
+    }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
     if let Some(v) = &cfg.vaapi_device {
@@ -3686,9 +3700,11 @@ mod tests {
         cfg.overlay_pathmon = Some("shadow".into());
         cfg.encoder_cells_deny = Some("h264/nvenc".into());
         cfg.fps_deny = Some("hevc_qsv:120".into());
+        cfg.nvenc_split = Some("off".into());
         let m = env_fallbacks(&cfg);
         let get = |k: &str| m.get(k).map(String::as_str);
         assert_eq!(get("FPS_DENY"), Some("hevc_qsv:120"));
+        assert_eq!(get("NVENC_SPLIT"), Some("off"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),

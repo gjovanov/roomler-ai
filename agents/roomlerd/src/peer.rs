@@ -8217,8 +8217,8 @@ async fn media_pump_ffmpeg_dc(
                 let above = asked.filter(|&a| a > base_fps);
                 // The ceiling the asked rate would get here, by the chain the
                 // replacement opens at, against what the pipe pushed back.
-                let pipe_covers = above.is_none_or(|a| {
-                    let at = crate::encode::policy::rate_plan(
+                let ceiling_at_ask = above.map(|a| {
+                    crate::encode::policy::rate_plan(
                         enc_dims.0,
                         enc_dims.1,
                         cap_native_w,
@@ -8235,12 +8235,12 @@ async fn media_pump_ffmpeg_dc(
                         crate::encode::dial_rate_factor_pct(
                             priority.load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                    );
-                    crate::encode::frame_rate::pipe_covers(
-                        governor.belief_bps(std::time::Instant::now()).2,
-                        at.ceiling_bps,
                     )
+                    .ceiling_bps
                 });
+                let capacity_bps = governor.belief_bps(std::time::Instant::now()).2;
+                let pipe_covers = ceiling_at_ask
+                    .is_none_or(|c| crate::encode::frame_rate::pipe_covers(capacity_bps, c));
                 let class = crate::encode::frame_rate::ClassKey {
                     backend: capturer.backend().to_string(),
                     // P2b-3 — unknown is 0, and decides nothing.
@@ -8261,13 +8261,19 @@ async fn media_pump_ffmpeg_dc(
                     pipe_covers,
                 };
                 if state.decide(inputs, class) {
+                    // FR-119 P2b-12 — the decision's refusal, not the
+                    // viewer's answer (which holds it back until the stream
+                    // is down at the granted rate), and the two numbers the
+                    // pipe condition compared.
                     info!(
                         %session_id,
                         codec_label,
                         ?asked,
                         base_fps,
                         want = state.want(),
-                        refused = ?state.answer().refused,
+                        refused = ?state.decided_refusal(),
+                        ?capacity_bps,
+                        ?ceiling_at_ask,
                         backend = capturer.backend(),
                         encoder = enc.name(),
                         "FR-119: frame rate decided"
