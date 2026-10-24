@@ -493,6 +493,17 @@ impl RateState {
         }
     }
 
+    /// FR-119 P2b-12 — the decision's own refusal: what was asked and why it
+    /// was not granted, whatever the stream still runs at. [`Self::answer`]
+    /// holds a refusal back until the stream is down at the granted rate,
+    /// which is right for the viewer and wrong for the decision's log line:
+    /// that line is written before the swap down, so it read `refused=None`
+    /// beside `want=60` and hid the reason a 120 was taken back (field,
+    /// 2026-10-24: `pipe`, spec §4.12).
+    pub fn decided_refusal(&self) -> Option<(u32, Reason)> {
+        self.decided.as_ref().and_then(|(_, _, g)| g.answer.refused)
+    }
+
     /// The `rc:video-info` fields: [`video_info_fields`] for
     /// [`Self::answer`], plus `fps_trial` while a trial runs.
     pub fn video_info_fields(&self) -> String {
@@ -988,6 +999,29 @@ mod tests {
             }
         }
         None
+    }
+
+    /// P2b-12 — a 120 taken back on `pipe` is named by the decision at once,
+    /// while the viewer's answer still waits for the swap down (it would
+    /// contradict the 120 the stream still runs at). The log line reads the
+    /// first; before P2b-12 it read the second and printed `refused=None`.
+    #[test]
+    fn the_decision_names_its_refusal_before_the_swap_down() {
+        let k = class("hevc_nvenc", 2560, 120);
+        let mut s = RateState::new(60, Vec::new());
+        s.decide(ask(120), k.clone());
+        s.running_at(120);
+        assert_eq!(s.decided_refusal(), None);
+        let narrow = GrantInputs {
+            pipe_covers: false,
+            ..ask(120)
+        };
+        assert!(s.decide(narrow, k));
+        assert_eq!(s.want(), 60);
+        assert_eq!(s.decided_refusal(), Some((120, Reason::Pipe)));
+        assert_eq!(s.answer().refused, None, "still running at 120");
+        s.running_at(60);
+        assert_eq!(s.answer().refused, Some((120, Reason::Pipe)));
     }
 
     /// An unproven class is wanted at once, and the trial starts only when the
