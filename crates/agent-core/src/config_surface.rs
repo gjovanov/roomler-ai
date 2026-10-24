@@ -1745,6 +1745,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-119 - frame rates above 60 this device must not grant: comma-separated name:fps entries (e.g. hevc_qsv:120), `*` for every encoder (e.g. *:144). Empty or `none` = deny nothing. Env: ROOMLERD_FPS_DENY. Pushable through remote config. Restart required.",
     },
     KeyMeta {
+        key: "nvenc_split",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-119 - how NVENC splits an HEVC or AV1 frame across its engines above 60 fps: `auto` (empty; the driver picks the number of strips), `off` (never ask, as before), or a strip count 2-4 (applied only on a GPU with that many engines). Env: ROOMLERD_NVENC_SPLIT. Read at every encoder open.",
+    },
+    KeyMeta {
         key: "vaapi_device",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2164,6 +2172,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "fps_high" => cfg.fps_high.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "fps_deny" => cfg.fps_deny.clone(),
+        "nvenc_split" => cfg.nvenc_split.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
         "vulkan_device" => cfg.vulkan_device.clone(),
@@ -2833,6 +2842,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 Some(v) => {
                     validate_fps_denylist(v)?;
                     Some(v.to_string())
+                }
+            }
+        }
+        "nvenc_split" => {
+            cfg.nvenc_split = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() || v == "auto" => None,
+                Some(v) if matches!(v.as_str(), "off" | "2" | "3" | "4") => Some(v),
+                Some(v) => {
+                    return Err(format!(
+                        "nvenc_split must be auto, off, 2, 3 or 4 (got {v:?})"
+                    ));
                 }
             }
         }
@@ -5122,6 +5143,34 @@ mod tests {
         ] {
             assert!(
                 apply(&mut cfg, "encoder_cells_deny", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-119 P2b-10 — `nvenc_split`: `auto` and blank clear the key (the
+    /// default), `off` and a strip count are stored as given, anything else
+    /// is refused rather than stored and silently read as the default.
+    #[test]
+    fn nvenc_split_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "nvenc_split"), None);
+        apply(&mut cfg, "nvenc_split", Some(" OFF ")).unwrap();
+        assert_eq!(cfg.nvenc_split.as_deref(), Some("off"));
+        assert_eq!(
+            entry_for(&cfg, "nvenc_split").unwrap().value.as_deref(),
+            Some("off")
+        );
+        apply(&mut cfg, "nvenc_split", Some("3")).unwrap();
+        assert_eq!(cfg.nvenc_split.as_deref(), Some("3"));
+        apply(&mut cfg, "nvenc_split", Some("auto")).unwrap();
+        assert_eq!(cfg.nvenc_split, None);
+        apply(&mut cfg, "nvenc_split", Some("2")).unwrap();
+        apply(&mut cfg, "nvenc_split", Some("")).unwrap();
+        assert_eq!(cfg.nvenc_split, None, "blank clears to the default");
+        for bad in ["1", "5", "forced", "on"] {
+            assert!(
+                apply(&mut cfg, "nvenc_split", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

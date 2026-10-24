@@ -180,6 +180,11 @@ env-libvpx-sys = { version = "5.1", optional = true }
 # AVX2 BGRA→I444 colour convert for the VP9 4:4:4 encoder input.
 # Pure SIMD, no FFI, ships its own SSE2 fallback.
 dcv-color-primitives = { version = "0.6", optional = true }
+# FR-119 P2b-11 — the FFmpeg encoder's banded colour conversion runs on a
+# persistent pool instead of spawning its threads for every frame (at
+# 2560×1600 the spawns cost about 1 ms of an 8.3 ms 120 fps frame). Already
+# in the tree through `sysinfo`, so no new crate is built.
+rayon = { version = "1.12", optional = true }
 
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
@@ -835,7 +840,7 @@ synthetic-frame-source = []
 # Previously only `vp9-444` pulled the dep in, so the CI link-verify test
 # step that runs with `--features ffmpeg-encoder` alone hit
 # `error[E0432]: unresolved import dcv_color_primitives`.
-ffmpeg-encoder = ["dep:ffmpeg-next", "dep:dcv-color-primitives"]
+ffmpeg-encoder = ["dep:ffmpeg-next", "dep:dcv-color-primitives", "dep:rayon"]
 
 # M3 A1 — SYSTEM-context capture+input on the secure desktop. Lets
 # the perMachine MSI deployment drive the Windows lock screen / UAC

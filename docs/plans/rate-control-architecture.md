@@ -65,7 +65,7 @@ from scratchpad to `scripts/`.
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
 `4.5M 3M 2M 1.5M 1M 750k 550k 400k 300k 200k` down and back (20 changes via `set_bitrate`). Per
-rung: `applied_maxrate, set_bitrate_ms, key_packets` (`AV_PKT_FLAG_KEY`, encoder.rs:1491; size
+rung: `applied_maxrate, set_bitrate_ms, key_packets` (`AV_PKT_FLAG_KEY`, encoder.rs:1554; size
 heuristic as the second detector for vp9_qsv), `burst = first3_max/trailing_mean`, `ratio =
 mean_bytes/(rung/fps/8)`. **Pass** = 0 key packets after the opener, `set_bitrate_ms < 5`, ratio
 ±25 % by frame 10, burst ≤ 2×. Hosts: CORPLAP-1 (`hevc_qsv`, `low_power` 1 and 0), an
@@ -75,7 +75,7 @@ Arc/Meteor-Lake host (`av1_qsv`), the RTX box (`hevc/av1_nvenc`), one Apple Sili
 the coarsen gate (:1591–1594).
 
 **A1 — in-place applies, gated.** Replace `supports_dynamic_bitrate = name.contains("nvenc")`
-(encoder.rs:1062) with `rate_mode: RateReconfig::{InPlace, Rebuild}` resolved at open (InPlace for
+(encoder.rs:1126) with `rate_mode: RateReconfig::{InPlace, Rebuild}` resolved at open (InPlace for
 `*_nvenc`, `*_qsv`; Rebuild for `*_amf`, `*_videotoolbox`); keep `supports_dynamic_bitrate()` (:1471)
 = `InPlace` so no pump call site changes. QSV in-place arm writes **`bit_rate = target;
 rc_max_rate = target; rc_buffer_size = target × hrd_pct/100`** (CBR: TargetKbps must move with
@@ -112,7 +112,7 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 | PR | delete | anchors | precondition |
 |---|---|---|---|
 | A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:4912, 4856–4863, 6100–6147, 6158–6194, 6251–6256`; `mod.rs:417–474` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:4979–4991, 5022–5088`; `encoder.rs:1525–1546`; `aimd.rs:285–338`; `mod.rs:370–381` | VT measured or kept on the settle rule |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:4979–4991, 5022–5088`; `encoder.rs:1588–1546`; `aimd.rs:285–338`; `mod.rs:370–381` | VT measured or kept on the settle rule |
 | A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:731–699`; `peer.rs:3831` | — |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
