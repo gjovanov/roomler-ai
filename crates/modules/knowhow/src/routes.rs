@@ -375,7 +375,7 @@ pub async fn lookup(
         .find_live_by_key(tid, kind, key)
         .await?
         .ok_or_else(|| ApiError::NotFound("no such entity".into()))?;
-    Ok(Json(card(&state, tid, entity).await?))
+    Ok(Json(card(&state, tid, entity, MAX_LINKS).await?))
 }
 
 /// `GET /api/tenant/{tenant_id}/knowhow/entity/{entity_id}` — one live
@@ -388,25 +388,27 @@ pub async fn get_entity(
     let tid = reader(&state, &tenant_id, &auth).await?;
     let id = parse_id(&entity_id, "entity_id")?;
     let entity = live_entity(&state, tid, id).await?;
-    Ok(Json(card(&state, tid, entity).await?))
+    Ok(Json(card(&state, tid, entity, MAX_LINKS).await?))
 }
 
-/// An entity and its links to live entities — at most [`MAX_LINKS`]. A link
-/// whose other end is archived is not shown: it leads nowhere.
-async fn card(
+/// An entity and its links to live entities — at most `max_links`: a
+/// person's card [`MAX_LINKS`], a session's fewer (P4-4-1). A link whose
+/// other end is archived is not shown: it leads nowhere.
+pub(crate) async fn card(
     state: &KnowhowState,
     tid: ObjectId,
     entity: KnowhowEntity,
+    max_links: usize,
 ) -> Result<CardView, ApiError> {
     let Some(id) = entity.id else {
         return Err(ApiError::Internal("an entity read without its id".into()));
     };
     let mut edges = state
         .edges
-        .touching(tid, &[id], MAX_LINKS as i64 + 1)
+        .touching(tid, &[id], max_links as i64 + 1)
         .await?;
-    let truncated = edges.len() > MAX_LINKS;
-    edges.truncate(MAX_LINKS);
+    let truncated = edges.len() > max_links;
+    edges.truncate(max_links);
     let other = |e: &KnowhowEdge| if e.from == id { e.to } else { e.from };
     let ids: Vec<ObjectId> = edges
         .iter()

@@ -1721,6 +1721,48 @@ pub enum ClientMsg {
         findings: Vec<serde_json::Value>,
     },
 
+    /// FR-90 P4-4-1 — a session on this device searches the organization's
+    /// map: the live entities whose key or name holds `q`, of a `kind`, in an
+    /// `env`. Believed as a lease request is (the session's record, at its
+    /// fence, on this device), held to its starter's `KNOWHOW_VIEW` at every
+    /// question (decision 48), and answered with [`ServerMsg::KnowhowFound`]
+    /// or [`ServerMsg::KnowhowRefused`]. Empty text is no filter; a `limit`
+    /// of 0 or none is [`crate::knowhow::session_limits::DEFAULT_SEARCH`].
+    #[serde(rename = "rc:knowhow.search")]
+    KnowhowSearch {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        q: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        kind: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+
+    /// FR-90 P4-4-1 — a session on this device reads one entity's card, by
+    /// the name a chip and a session use for it: its kind and its key.
+    /// Believed and held as [`ClientMsg::KnowhowSearch`] is, and answered
+    /// with [`ServerMsg::KnowhowCard`] or [`ServerMsg::KnowhowRefused`].
+    /// Absent, `kind` and `key` read as empty and are refused `bad_request`:
+    /// a frame the server cannot decode is never answered, and the device
+    /// would wait on it.
+    #[serde(rename = "rc:knowhow.get")]
+    KnowhowGet {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        key: String,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2663,6 +2705,8 @@ impl ClientMsg {
             ClientMsg::VaultConnect { .. } => "rc:vault.connect",
             ClientMsg::VaultEgress { .. } => "rc:vault.egress",
             ClientMsg::KnowhowScanned { .. } => "rc:knowhow.scanned",
+            ClientMsg::KnowhowSearch { .. } => "rc:knowhow.search",
+            ClientMsg::KnowhowGet { .. } => "rc:knowhow.get",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2792,7 +2836,9 @@ impl ClientMsg {
             | ClientMsg::VaultSsh { .. }
             | ClientMsg::VaultConnect { .. }
             | ClientMsg::VaultEgress { .. } => Owner::Vault,
-            ClientMsg::KnowhowScanned { .. } => Owner::Knowhow,
+            ClientMsg::KnowhowScanned { .. }
+            | ClientMsg::KnowhowSearch { .. }
+            | ClientMsg::KnowhowGet { .. } => Owner::Knowhow,
         }
     }
 }
@@ -2847,6 +2893,8 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:vault.connect", Owner::Vault),
     ("rc:vault.egress", Owner::Vault),
     ("rc:knowhow.scanned", Owner::Knowhow),
+    ("rc:knowhow.search", Owner::Knowhow),
+    ("rc:knowhow.get", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -4904,6 +4952,49 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         scan_id: ObjectId,
     },
+
+    /// FR-90 P4-4-1 — the organization's map is there for this device's
+    /// sessions (decision 49), and these are the toolbelt tools the server
+    /// answers ([`crate::knowhow::TOOL_SEARCH`], [`crate::knowhow::TOOL_GET`]):
+    /// a device offers a session no other, and ignores a name it does not
+    /// know. Sent at a hello, on a primary enrollment's connection whose
+    /// device advertises [`crate::models::RpcCap::KnowhowTools`], when
+    /// knowhow serves its organization. The device forgets it at every
+    /// connection, so a server that stops serving stops it at the next.
+    #[serde(rename = "rc:knowhow.served")]
+    KnowhowServed {
+        #[serde(default)]
+        tools: Vec<String>,
+    },
+
+    /// FR-90 P4-4-1 — what a session's search found: at most
+    /// [`crate::knowhow::session_limits::MAX_SEARCH`] entities, each as a
+    /// listing shows one (no attributes, no facts), and `truncated` when
+    /// there were more. Raw JSON, as the people's search answers it: the
+    /// device hands it to the session as it is.
+    #[serde(rename = "rc:knowhow.found")]
+    KnowhowFound {
+        req_id: String,
+        entities: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+
+    /// FR-90 P4-4-1 — one entity's card for a session: itself with each fact
+    /// and where it came from, and at most
+    /// [`crate::knowhow::session_limits::MAX_CARD_LINKS`] of its links, the
+    /// whole within [`crate::knowhow::session_limits::MAX_CARD_BYTES`] (its
+    /// `truncated` set when cut). Raw JSON, as the people's card is.
+    #[serde(rename = "rc:knowhow.card")]
+    KnowhowCard {
+        req_id: String,
+        card: serde_json::Value,
+    },
+
+    /// FR-90 P4-4-1 — knowhow refused a session's question, in one word from
+    /// [`crate::knowhow::SessionRefusal`].
+    #[serde(rename = "rc:knowhow.refused")]
+    KnowhowRefused { req_id: String, reason: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -6958,6 +7049,83 @@ mod tests {
                 other => panic!("not an answer: {other:?}"),
             }
         }
+    }
+
+    /// FR-90 P4-4-1 — a session's questions and their answers: the session
+    /// and its fence in the frame, never the organization or the device;
+    /// empty filters left out; a `get` missing its name still decoding, so
+    /// it is answered `bad_request` instead of never; and `served` naming
+    /// the tools its server answers, read as none when it names nothing.
+    #[test]
+    fn knowhow_session_frames_wire_shape_is_locked() {
+        let session = ObjectId::new();
+        let search = ClientMsg::KnowhowSearch {
+            req_id: "r1".into(),
+            session_id: session,
+            fence: 2,
+            q: "mongo".into(),
+            kind: String::new(),
+            env: "prod".into(),
+            limit: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&search).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.search", "req_id": "r1",
+                               "session_id": session.to_hex(), "fence": 2,
+                               "q": "mongo", "env": "prod"})
+        );
+        assert_eq!(search.namespace(), Owner::Knowhow);
+        assert_eq!(search.wire_tag(), "rc:knowhow.search");
+        let short = serde_json::json!({"t": "rc:knowhow.get", "req_id": "r2",
+                                       "session_id": session.to_hex(), "fence": 1});
+        match serde_json::from_value::<ClientMsg>(short).unwrap() {
+            ClientMsg::KnowhowGet { kind, key, .. } => {
+                assert!(kind.is_empty() && key.is_empty());
+            }
+            other => panic!("not a get: {other:?}"),
+        }
+        let get = ClientMsg::KnowhowGet {
+            req_id: "r2".into(),
+            session_id: session,
+            fence: 1,
+            kind: "database".into(),
+            key: "prod-mongo".into(),
+        };
+        assert_eq!(get.namespace(), Owner::Knowhow);
+        assert_eq!(get.wire_tag(), "rc:knowhow.get");
+
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowServed {
+                tools: vec!["knowhow_search".into(), "knowhow_get".into()],
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.served",
+                               "tools": ["knowhow_search", "knowhow_get"]})
+        );
+        match serde_json::from_value::<ServerMsg>(serde_json::json!({"t": "rc:knowhow.served"}))
+            .unwrap()
+        {
+            ServerMsg::KnowhowServed { tools } => assert!(tools.is_empty()),
+            other => panic!("not served: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowFound {
+                req_id: "r1".into(),
+                entities: Vec::new(),
+                truncated: false,
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.found", "req_id": "r1", "entities": []})
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowRefused {
+                req_id: "r2".into(),
+                reason: "stale_fence".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.refused", "req_id": "r2",
+                               "reason": "stale_fence"})
+        );
     }
 
     /// FR-90 P2g — the purge and its acknowledgement: ids and words only, the

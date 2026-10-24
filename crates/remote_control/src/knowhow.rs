@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-90 P4-3 — knowhow's scan vocabulary: what a device says it found, and
 //! the words and bounds both ends read (the FR-90 spec, §3e "P4-3, scans, as
-//! designed").
+//! designed"); and P4-4's, a session's questions ([`session_limits`]).
 //!
 //! The frames (`crate::signaling`): the server's `rc:knowhow.scan` and the
 //! device's `rc:knowhow.scanned`. A finding is metadata about the device
@@ -391,6 +391,105 @@ fn jwt_shaped(word: &str) -> bool {
         })
 }
 
+// ─── a session's questions (P4-4) ───────────────────────────────────────────
+
+/// FR-90 P4-4-1 — bounds on a session's questions (`rc:knowhow.search`,
+/// `rc:knowhow.get`), read by both ends: the server refuses a question past
+/// them (`bad_request`) and cuts its answers to them, and a device never asks
+/// past them (the FR-90 spec, §3e "P4-4, a session's reads and proposals, as
+/// designed").
+pub mod session_limits {
+    /// The device's own id for a question, echoed in the answer.
+    pub const MAX_REQ_ID_LEN: usize = 64;
+    /// A search's text, at most, in characters: the people's search's bound.
+    pub const MAX_QUERY_CHARS: usize = 200;
+    /// The most entities one search answers, and how many when none is asked.
+    pub const MAX_SEARCH: u32 = 50;
+    pub const DEFAULT_SEARCH: u32 = 20;
+    /// The most links one card holds for a session, and the most bytes the
+    /// whole card holds, serialised. Past either it is cut from the end, its
+    /// `truncated` set, so one answer stays within what a tool hands a model.
+    pub const MAX_CARD_LINKS: usize = 50;
+    pub const MAX_CARD_BYTES: usize = 64 * 1024;
+    /// Questions one connection may have waiting for an answer. One more is
+    /// answered `busy`, so a device that floods the map queues nothing.
+    pub const QUEUE_PER_CONNECTION: usize = 16;
+    /// Questions one session may ask on its device a minute, the vault's
+    /// rate. Past it the answer is `busy`.
+    pub const RATE_PER_MINUTE: u32 = 120;
+}
+
+/// FR-90 P4-4-1 — the toolbelt's knowhow tools, by the names a server lists
+/// in `rc:knowhow.served`: a device offers a session only the tools its
+/// server answers, so a newer agent never offers one an older server would
+/// leave unanswered.
+pub const TOOL_SEARCH: &str = "knowhow_search";
+pub const TOOL_GET: &str = "knowhow_get";
+
+/// FR-90 P4-4-1 — why knowhow refused a session's question. The words are a
+/// compatibility surface: a device decides from them whether asking again
+/// could help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefusal {
+    /// Knowhow does not serve this organization (`knowhow.tenants`).
+    NotServed,
+    /// The question is malformed or past a bound.
+    BadRequest,
+    /// No session of this organization runs on this device by that id.
+    NotLocated,
+    /// The session runs here at a newer fence: this question is from a run
+    /// that no longer holds it.
+    StaleFence,
+    /// The session is over.
+    Ended,
+    /// Its starter may not read the map (decision 48): neither
+    /// `KNOWHOW_VIEW` nor `KNOWHOW_EDIT` in the organization, now.
+    Denied,
+    /// No live entity of the organization by that kind and key.
+    NotFound,
+    /// Too many of this connection's questions are waiting, or this session
+    /// asked too often this minute.
+    Busy,
+    /// What the answer needed could not be read; asking later may help.
+    Unavailable,
+}
+
+impl SessionRefusal {
+    /// Exactly what crosses the wire. ⚠️ A compatibility surface, locked by
+    /// test.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::NotServed => "not_served",
+            Self::BadRequest => "bad_request",
+            Self::NotLocated => "not_located",
+            Self::StaleFence => "stale_fence",
+            Self::Ended => "ended",
+            Self::Denied => "denied",
+            Self::NotFound => "not_found",
+            Self::Busy => "busy",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub const ALL: [SessionRefusal; 9] = [
+        Self::NotServed,
+        Self::BadRequest,
+        Self::NotLocated,
+        Self::StaleFence,
+        Self::Ended,
+        Self::Denied,
+        Self::NotFound,
+        Self::Busy,
+        Self::Unavailable,
+    ];
+
+    /// A word, read back: `None` for one this build does not know, which a
+    /// newer server may send.
+    pub fn from_wire(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.wire() == word)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +678,30 @@ mod tests {
         ] {
             assert!(!holds_credential(s), "{s}");
         }
+    }
+
+    /// P4-4-1 — the words a session's refusal travels as, each read back as
+    /// itself, and one a newer server sends read as none.
+    #[test]
+    fn a_session_refusal_is_spelled_once_and_read_back() {
+        let words: Vec<&str> = SessionRefusal::ALL.iter().map(|r| r.wire()).collect();
+        assert_eq!(
+            words,
+            [
+                "not_served",
+                "bad_request",
+                "not_located",
+                "stale_fence",
+                "ended",
+                "denied",
+                "not_found",
+                "busy",
+                "unavailable",
+            ]
+        );
+        for r in SessionRefusal::ALL {
+            assert_eq!(SessionRefusal::from_wire(r.wire()), Some(r));
+        }
+        assert_eq!(SessionRefusal::from_wire("ceiling"), None);
     }
 }

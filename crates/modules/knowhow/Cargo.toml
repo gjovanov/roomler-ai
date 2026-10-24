@@ -10,14 +10,15 @@ description = "FR-90 module: knowhow — the organization's map, the server side
 name = "roomler_ai_mod_knowhow"
 path = "src/lib.rs"
 
-# On core alone, and no module edge yet. P4-2 reads the fleet's devices and
-# the network's overlay through the shared DAOs (their models are
-# `roomler-ai-remote-control`'s) and hears of devices through core's hooks.
-# The edges come with the steps that call a module: `knowhow → fleet` (its
-# Hub) with P4-3a, `knowhow → hive` (a session's question believed from its
-# record) with P4-4.
+# P4-2 reads the fleet's devices and the network's overlay through the shared
+# DAOs (their models are `roomler-ai-remote-control`'s) and hears of devices
+# through core's hooks; P4-3a reaches a device on its connection's own sender,
+# so no `knowhow → fleet`. P4-4-1's `knowhow → hive`: a session's question is
+# believed from its record, read through hive's own stateless DAO, as the
+# vault reads it.
 [dependencies]
 roomler-core = { path = "../../core" }
+roomler-ai-mod-hive = { path = "../hive" }
 roomler-ai-config = { path = "../../config" }
 roomler-ai-db = { path = "../../db" }
 roomler-ai-services = { path = "../../services" }
@@ -28,6 +29,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bson.workspace = true
+# P4-4-1 — this pod's connections' question queues, as the vault keeps its.
+dashmap.workspace = true
 futures.workspace = true
 mongodb.workspace = true
 serde.workspace = true

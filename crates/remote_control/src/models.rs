@@ -1248,6 +1248,15 @@ pub enum RpcCap {
     /// A BUILD property: a device whose owner lists no root still advertises
     /// it, and answers `no_roots`.
     KnowhowScan,
+    /// FR-90 P4-4-1 — this build's agent sessions can ask the organization's
+    /// map (`rc:knowhow.search`, `rc:knowhow.get`) through their toolbelt.
+    /// The server tells such a device at each hello whether the map is there
+    /// for it (`rc:knowhow.served`, decision 49), and tells no other: an
+    /// older agent would log the frame it cannot read.
+    ///
+    /// A BUILD property, like `knowhow-scan`, which it is not a prefix of:
+    /// matching stays equality regardless.
+    KnowhowTools,
 }
 
 impl RpcCap {
@@ -1298,11 +1307,12 @@ impl RpcCap {
             Self::ExternalSession => "external-session",
             Self::PeerAuth => "peer-auth",
             Self::KnowhowScan => "knowhow-scan",
+            Self::KnowhowTools => "knowhow-tools",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 39] = [
+    pub const ALL: [RpcCap; 40] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1342,6 +1352,7 @@ impl RpcCap {
         Self::ExternalSession,
         Self::PeerAuth,
         Self::KnowhowScan,
+        Self::KnowhowTools,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -7577,6 +7588,21 @@ mod tests {
         assert_eq!(RpcCap::ExternalSession.wire(), "external-session");
         assert_eq!(RpcCap::PeerAuth.wire(), "peer-auth");
         assert_eq!(RpcCap::KnowhowScan.wire(), "knowhow-scan");
+        assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
+    }
+
+    /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
+    /// device that scans says nothing of its sessions' tools, and the reverse.
+    #[test]
+    fn knowhow_tools_and_knowhow_scan_are_matched_whole() {
+        let caps = |rpc: &[&str]| AgentCaps {
+            rpc: rpc.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert!(caps(&["knowhow-tools"]).has_rpc(RpcCap::KnowhowTools));
+        assert!(!caps(&["knowhow-tools"]).has_rpc(RpcCap::KnowhowScan));
+        assert!(!caps(&["knowhow-scan"]).has_rpc(RpcCap::KnowhowTools));
+        assert!(!caps(&["knowhow-tool", "knowhow"]).has_rpc(RpcCap::KnowhowTools));
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`
