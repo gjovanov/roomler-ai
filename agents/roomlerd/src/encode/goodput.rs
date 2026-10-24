@@ -142,6 +142,12 @@ pub fn measured_floor_bps(goodput_bps: u32, nominal_floor_bps: u32, hard_min_bps
 pub struct BlockedSend {
     pub bytes: u64,
     pub elapsed: Duration,
+    /// FR-119 P2b-13 — the frame was a keyframe. SCTP grows its congestion
+    /// window only while data is queued, so on a fast path the deltas leave
+    /// it about one frame's size, and a keyframe many times larger spends its
+    /// send growing the window again: its drain rate is the ramp, not the
+    /// path. The governor reads this to tell the two apart.
+    pub keyframe: bool,
 }
 
 /// The hand-off between the send task (which times each frame's
@@ -169,6 +175,12 @@ impl GoodputSink {
     /// because losing a telemetry sample must never take down the video
     /// path.
     pub fn record(&self, bytes: u64, elapsed: Duration) {
+        self.record_frame(bytes, elapsed, false);
+    }
+
+    /// FR-119 P2b-13 — [`Self::record`], saying whether the frame was a
+    /// keyframe (the send tasks read it from the frame's own header).
+    pub fn record_frame(&self, bytes: u64, elapsed: Duration, keyframe: bool) {
         if elapsed < MIN_BLOCKED_SEND || bytes == 0 {
             return;
         }
@@ -178,7 +190,11 @@ impl GoodputSink {
         if pending.len() >= MAX_PENDING {
             pending.remove(0);
         }
-        pending.push(BlockedSend { bytes, elapsed });
+        pending.push(BlockedSend {
+            bytes,
+            elapsed,
+            keyframe,
+        });
     }
 
     /// Called by the pump to take everything observed since last time.
@@ -275,7 +291,20 @@ mod tests {
         BlockedSend {
             bytes,
             elapsed: Duration::from_millis(ms),
+            keyframe: false,
         }
+    }
+
+    /// FR-119 P2b-13 — the flag reaches the window as recorded.
+    #[test]
+    fn a_keyframe_send_is_recorded_as_one() {
+        let sink = GoodputSink::new();
+        sink.record_frame(625_000, Duration::from_millis(72), true);
+        sink.record(30_000, Duration::from_millis(24));
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(drained[0].keyframe);
+        assert!(!drained[1].keyframe);
     }
 
     /// The whole design rests on this: a frame that serialised instantly
