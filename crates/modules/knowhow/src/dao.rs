@@ -384,6 +384,16 @@ impl HistoryDao {
         Ok(())
     }
 
+    /// P4-4-2 — how many proposals a session made, over its whole life and
+    /// every fence: its writes in the history, one a proposal (decision 51).
+    pub async fn count_by_session(&self, tenant_id: ObjectId, session: ObjectId) -> DaoResult<u64> {
+        Ok(self
+            .base
+            .collection()
+            .count_documents(doc! { "tenant_id": tenant_id, "session": session })
+            .await?)
+    }
+
     /// An organization's writes, newest first, at most `limit`; one
     /// entity's when it is named — its links' included.
     pub async fn list(

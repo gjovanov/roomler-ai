@@ -2007,6 +2007,17 @@
               "at": -1,
               "_id": -1
             }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session": 1
+            },
+            "partialFilterExpression": {
+              "session": {
+                "$type": "objectId"
+              }
+            }
           }
         ]
       },
@@ -4335,6 +4346,17 @@
               "at": -1,
               "_id": -1
             }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session": 1
+            },
+            "partialFilterExpression": {
+              "session": {
+                "$type": "objectId"
+              }
+            }
           }
         ]
       },
@@ -5820,6 +5842,7 @@
     "rc:knowhow.scanned",
     "rc:knowhow.search",
     "rc:knowhow.get",
+    "rc:knowhow.propose",
     "rc:sdp.answer",
     "rc:consent",
     "rc:consent.pending",
@@ -5948,6 +5971,7 @@
     "rc:knowhow.served",
     "rc:knowhow.found",
     "rc:knowhow.card",
+    "rc:knowhow.proposed",
     "rc:knowhow.refused",
     "rc:pong",
     "rc:error",
@@ -5988,6 +6012,7 @@
     "rc:hive.view.ice": "hive",
     "rc:ice": "remote",
     "rc:knowhow.get": "knowhow",
+    "rc:knowhow.propose": "knowhow",
     "rc:knowhow.scanned": "knowhow",
     "rc:knowhow.search": "knowhow",
     "rc:overlay.endpoints": "network",

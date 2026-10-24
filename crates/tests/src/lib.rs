@@ -177,6 +177,12 @@ mod knowhow_intake_tests;
 /// an evicted node's facts gone with it; a machine's room kept for the sync.
 #[cfg(test)]
 mod knowhow_network_sync_tests;
+/// FR-90 P4-4-2 — a session's proposals: each written `proposed` and naming
+/// its session, its why in the history; adding, never changing; never into
+/// a device's part of the map; a credential's shape refused whole; 50 a
+/// session; believed as a question is.
+#[cfg(test)]
+mod knowhow_propose_tests;
 /// FR-90 P4-3a-1 — a scan asked, delivered on the device's own connection
 /// and answered once; the refusals; no doubling; a hello's delivery and its
 /// repeat; a forged answer dropped; the sweep; expiry.

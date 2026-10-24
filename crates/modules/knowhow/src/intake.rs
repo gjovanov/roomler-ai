@@ -89,6 +89,31 @@ pub fn endpoint_key(device: ObjectId, l: &Listener) -> String {
     format!("{}:{}/{}", device.to_hex(), l.port, l.protocol)
 }
 
+/// P4-4-2 — whether `key` has the shape a device's scans key their own
+/// entities by ([`checkout_key`], [`endpoint_key`]): a node id, then `/` or
+/// `:`. A session never proposes one: parked there, a proposal would hold the
+/// key against the device's next scan, which leaves a key another source
+/// holds as it is.
+pub fn devices_key(key: &str) -> bool {
+    let b = key.as_bytes();
+    b.len() > 24
+        && b[..24]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        && matches!(b[24], b'/' | b':')
+}
+
+/// P4-4-2 — whether the link `from` `kind` `to` is one a device's scans make
+/// (this module's header): from a scan's own checkout `checked_out_at` or
+/// `part_of`, from its own endpoint `runs_on`, or a cluster `reachable_via` a
+/// machine. A scan leaves a link another source holds as it is, so a
+/// session's proposal of one would hold it against the device.
+pub fn scans_link(from: &KnowhowEntity, kind: &str, to: &KnowhowEntity) -> bool {
+    let own = from.source == SOURCE_SCAN && from.device.is_some();
+    own && matches!(kind, "checked_out_at" | "part_of" | "runs_on")
+        || kind == "reachable_via" && from.kind == CLUSTER && to.kind == MACHINE
+}
+
 /// A repository's key from a remote: its host and path, with no scheme,
 /// user, port or `.git`, in lowercase. `None` for a local path, and for one
 /// the key rules refuse.
@@ -394,6 +419,7 @@ async fn own(
                     status: STATUS_ACTIVE.into(),
                     source: SOURCE_SCAN.into(),
                     device: stamp.device,
+                    session: None,
                     rev: 1,
                     created_by: None,
                     created_at: stamp.at,
@@ -494,6 +520,7 @@ async fn shared(
             status: STATUS_ACTIVE.into(),
             source: SOURCE_SCAN.into(),
             device: None,
+            session: None,
             rev: 1,
             created_by: None,
             created_at: stamp.at,
@@ -554,6 +581,7 @@ async fn link(
                     status: STATUS_ACTIVE.into(),
                     source: SOURCE_SCAN.into(),
                     device: stamp.device,
+                    session: None,
                     rev: 1,
                     created_by: None,
                     created_at: stamp.at,
@@ -775,6 +803,89 @@ mod tests {
         let e = endpoint_key(device, &l);
         assert_eq!(e, format!("{}:5432/tcp", device.to_hex()));
         assert!(check_key(&e).is_ok(), "{e}");
+
+        // P4-4-2 — and either is told from a key a person or a session
+        // writes, so a session never proposes one.
+        assert!(devices_key(&a) && devices_key(&e));
+        let node = device.to_hex();
+        let replica = format!("{node}-replica");
+        let short = format!("{}/api", &node[..23]);
+        for other in [
+            "github.com/acme/api",
+            "prod-mongo",
+            "db-1:5432",
+            node.as_str(),
+            replica.as_str(),
+            short.as_str(),
+        ] {
+            assert!(!devices_key(other), "{other}");
+        }
+    }
+
+    fn entity(kind: &str, source: &str, device: Option<ObjectId>) -> KnowhowEntity {
+        let now = bson::DateTime::from_millis(1);
+        KnowhowEntity {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            kind: kind.into(),
+            key: "k".into(),
+            name: "n".into(),
+            env: None,
+            owner_id: None,
+            attrs: Document::new(),
+            facts: Vec::new(),
+            status: STATUS_ACTIVE.into(),
+            source: source.into(),
+            device,
+            session: None,
+            rev: 1,
+            created_by: None,
+            created_at: now,
+            updated_by: None,
+            updated_at: now,
+            deleted_at: None,
+        }
+    }
+
+    /// P4-4-2 — the links a scan makes, each told from one a person or a
+    /// session may make between the same kinds.
+    #[test]
+    fn the_links_a_scan_makes_are_told_apart() {
+        let device = Some(ObjectId::new());
+        let checkout = entity(CHECKOUT, SOURCE_SCAN, device);
+        let endpoint = entity(ENDPOINT, SOURCE_SCAN, device);
+        let machine = entity(MACHINE, crate::model::SOURCE_SYNC, None);
+        let repo = entity(REPO, SOURCE_SCAN, None);
+        let cluster = entity(CLUSTER, SOURCE_SCAN, None);
+        let service = entity("service", crate::model::SOURCE_SESSION, None);
+        let persons_checkout = entity(CHECKOUT, crate::model::SOURCE_PERSON, None);
+        for (from, kind, to) in [
+            (&checkout, "checked_out_at", &machine),
+            (&checkout, "part_of", &repo),
+            (&endpoint, "runs_on", &machine),
+            (&cluster, "reachable_via", &machine),
+        ] {
+            assert!(
+                scans_link(from, kind, to),
+                "{} {kind} {}",
+                from.kind,
+                to.kind
+            );
+        }
+        for (from, kind, to) in [
+            (&service, "runs_on", &machine),
+            (&persons_checkout, "checked_out_at", &machine),
+            (&checkout, "deployed_to", &cluster),
+            (&service, "depends_on", &endpoint),
+            (&cluster, "reachable_via", &endpoint),
+        ] {
+            assert!(
+                !scans_link(from, kind, to),
+                "{} {kind} {}",
+                from.kind,
+                to.kind
+            );
+        }
     }
 
     #[test]

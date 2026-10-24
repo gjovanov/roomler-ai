@@ -26,10 +26,10 @@ use crate::knowhow_tests::{entity, hold_only, link};
 use crate::vault_lease_tests::{Device, device, enroll, send, start};
 
 /// What a build whose sessions ask the map says in its hello.
-const ASKS: &[&str] = &["exec", "hive", "knowhow-tools"];
+pub(crate) const ASKS: &[&str] = &["exec", "hive", "knowhow-tools"];
 
 /// Hive and knowhow on.
-async fn session_app() -> TestApp {
+pub(crate) async fn session_app() -> TestApp {
     TestApp::spawn_with_settings(|s| {
         s.modules.hive = true;
         s.modules.knowhow = true;
@@ -40,7 +40,14 @@ async fn session_app() -> TestApp {
 }
 
 /// Ask a question as the session `sid` at `fence`: the server's answer to it.
-async fn ask(ws: &mut Ws, req_id: &str, t: &str, sid: &str, fence: u64, rest: Value) -> Value {
+pub(crate) async fn ask(
+    ws: &mut Ws,
+    req_id: &str,
+    t: &str,
+    sid: &str,
+    fence: u64,
+    rest: Value,
+) -> Value {
     let mut frame = rest;
     frame["t"] = json!(t);
     frame["req_id"] = json!(req_id);
@@ -60,7 +67,10 @@ async fn ask(ws: &mut Ws, req_id: &str, t: &str, sid: &str, fence: u64, rest: Va
             let kind = v["t"].as_str().unwrap_or_default();
             if matches!(
                 kind,
-                "rc:knowhow.found" | "rc:knowhow.card" | "rc:knowhow.refused"
+                "rc:knowhow.found"
+                    | "rc:knowhow.card"
+                    | "rc:knowhow.proposed"
+                    | "rc:knowhow.refused"
             ) && v["req_id"] == req_id
             {
                 return v;
@@ -69,13 +79,13 @@ async fn ask(ws: &mut Ws, req_id: &str, t: &str, sid: &str, fence: u64, rest: Va
     }
 }
 
-fn refused(answer: &Value) -> &str {
+pub(crate) fn refused(answer: &Value) -> &str {
     assert_eq!(answer["t"], "rc:knowhow.refused", "{answer}");
     answer["reason"].as_str().unwrap()
 }
 
 /// A device that asks, told the map is there; a session it runs, started.
-async fn asking(
+pub(crate) async fn asking(
     app: &TestApp,
     t: &crate::fixtures::seed::SeededTenant,
     machine: &str,
@@ -84,7 +94,10 @@ async fn asking(
     let served = recv_t(&mut dev.ws, "rc:knowhow.served", Duration::from_secs(10))
         .await
         .expect("a device whose sessions ask is told the map is there");
-    assert_eq!(served["tools"], json!(["knowhow_search", "knowhow_get"]));
+    assert_eq!(
+        served["tools"],
+        json!(["knowhow_search", "knowhow_get", "knowhow_propose"])
+    );
     let (sid, fence) = start(app, t, &mut dev, "/srv/api", None).await;
     (dev, sid, fence)
 }

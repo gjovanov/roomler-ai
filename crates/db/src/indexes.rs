@@ -601,6 +601,20 @@ pub fn index_unique_sparse(keys: bson::Document) -> IndexModel {
         .build()
 }
 
+/// An index of only the documents matching `filter`: a lookup by a field
+/// most rows never hold (FR-90 P4-4-2: a session's proposals in the map's
+/// history) costs nothing for the rest.
+pub fn index_partial(keys: bson::Document, filter: bson::Document) -> IndexModel {
+    IndexModel::builder()
+        .keys(keys)
+        .options(
+            IndexOptions::builder()
+                .partial_filter_expression(filter)
+                .build(),
+        )
+        .build()
+}
+
 /// Unique index scoped by a partial filter — uniqueness is enforced only for
 /// documents matching `filter` (e.g. non-empty `name`, so pre-Phase-0 rows with
 /// an empty name don't collide).
