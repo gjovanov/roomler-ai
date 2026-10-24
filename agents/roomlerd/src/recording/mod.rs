@@ -100,6 +100,8 @@ pub mod manager;
 /// FR-85 P5a — `roomlerd media probe|export`, the engine as its own process.
 #[cfg(feature = "openh264-encoder")]
 pub mod media;
+/// FR-97 P2f — whether a Mac's microphone would record silence.
+pub mod mic_permission;
 pub mod mp4;
 pub mod pacer;
 /// FR-85 P1d — drawing the pointer into a recording, where the backend does

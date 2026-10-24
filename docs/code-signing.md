@@ -96,6 +96,14 @@ SmartScreen reputation organically from download volume. What signing buys
 - The first run with real credentials was refused: notarisation returned
   `Invalid` for a self-signed bundle inside a signed `.pkg` (#1521, fixed).
   Nothing before real credentials could have exercised that path.
+- ⚠️ **The entitlements never shipped until FR-97 P2f.** The lane signed
+  `roomlerd` with `--entitlements`, then signed `roomlerd.app` without them,
+  and signing a bundle re-signs its main executable. Nobody noticed while
+  every key in `packaging/macos/entitlements.plist` was `false`. P2f's
+  candidate found it: a Developer-ID, hardened-runtime `roomlerd` with no
+  `device.audio-input`, the one entitlement a recording's microphone needs.
+  The bundle signature now carries them, and the lane asserts the key on the
+  final binary.
 - Field proof, on a real Mac, of the **published** `.pkg` with quarantine set —
   the path an end user's download actually takes:
   `spctl -a -vvv -t install` → `source=Notarized Developer ID`,

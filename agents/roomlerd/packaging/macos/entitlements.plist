@@ -18,5 +18,11 @@
     <!-- Needed if we ever bundle a JIT'd Python / Node runtime. Not today. -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <false/>
+
+    <!-- FR-97 P2f: a screen recording's microphone, opened only when the
+         person at this computer asks for it. Under the hardened runtime a
+         microphone without this entitlement is refused. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
 </dict>
 </plist>

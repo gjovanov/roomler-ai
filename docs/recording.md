@@ -30,8 +30,8 @@
 > `roomler record` (§6), by roomler-desktop (§7), by a remote controller
 > from the viewer's toolbar, over the session's `record` channel (§10), and
 > by `roomlerd media` for an export (§11), which touches only the files the
-> person hands it. Still to come: the microphone on macOS (FR-97 P2f, §9);
-> computer audio is recorded there since FR-97 P2a (agent 0.4.161).
+> person hands it. On macOS computer audio is recorded since FR-97 P2a (agent
+> 0.4.161) and the microphone since P2f (agent 0.4.163), §9.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -661,7 +661,7 @@ flowchart LR
 | **Linear, not nearest-neighbour** | A 44.1 kHz laptop microphone is common, and the live path's nearest-neighbour aliases audibly on speech. The live path keeps its own resampler, untouched. |
 | **Audio waits for the first video frame, and is cut to the sample** | The writer's audio decode time starts at the first packet pushed after its header. Mixed audio queues **as PCM** from the clock's start (bounded at a minute); when the first video frame is written, everything before its time is cut, mid-frame if need be, and only then encoded. Before P4 whole encoded 20 ms frames were dropped, which left the tracks up to ±10 ms apart, and a codec with its own frame size could not have been cut that way at all. |
 | **Soft clip, not wrap** | Two loud sources sum past full scale. Up to ¾ of full scale the sum is untouched; above it, a `tanh` knee compresses toward full scale, settling at it only far past it (never beyond, never wrapping). |
-| **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch), `audio_unavailable` (a build without the `audio` feature; macOS today). A recording that silently lacked the audio the person asked for would be worse. |
+| **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch, or on a Mac a microphone turned off or restricted in Privacy & Security, FR-97 P2f), `audio_unavailable` (a build without the `audio` feature). A recording that silently lacked the audio the person asked for would be worse. |
 | **A source lost mid-recording is not fatal** | The recording goes on with that source's silence. The sidecar records `audio_source_lost`, or `audio_failed` if the encoder failed and the rest is video-only. |
 
 ### The codec: AAC where FFmpeg has it, Opus everywhere else (P4)
@@ -700,13 +700,19 @@ to the default INPUT device. The recorder opens
 `cpal_backend::Source::SystemOnly`, which refuses instead
 (`system_audio_unavailable`).
 
-⚠️ **On macOS, computer audio since FR-97 P2a; the microphone not yet.**
+⚠️ **On macOS, computer audio since FR-97 P2a; the microphone since P2f.**
 Computer audio comes from ScreenCaptureKit (`crate::audio::open_mac_system_audio`,
 the live session's own capture), in the person's session the recorder runs
-in. The microphone needs cpal on macOS, plus `NSMicrophoneUsageDescription`
-and the `audio-input` entitlement in the bundle (FR-97 P2f). It is refused by
-name until then. Before P2a computer audio was refused there too — and it is **never
-offered** where it cannot be recorded (#1760):
+in. The microphone is cpal's, CoreAudio's default input, opened only after
+AVFoundation says the person has not turned it off (`recording::mic_permission`).
+⚠️ **macOS records silence from a refused microphone**: the stream opens and
+runs, and the file carries nothing. So *Denied* and *Restricted* refuse the
+start by name (`mic_unavailable`, the setting in `detail`), and an *undecided*
+microphone opens, which is when macOS asks the person (silence until they
+answer). The bundle carries `NSMicrophoneUsageDescription` (without it macOS
+ends the process at its first access) and the `audio-input` entitlement
+(without it the hardened runtime refuses the microphone). Computer audio is
+**never offered** where it cannot be recorded (#1760):
 
 | Computer audio | Windows | Linux | macOS (FR-97 P2a) | a build without `audio` |
 |---|---|---|---|---|
@@ -1074,12 +1080,12 @@ sequenceDiagram
   for the new console user and stops the old worker's process group, recorder
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
-  `child.rs:380`); a recording never follows a user switch.
-- ⚠️ **Not built on macOS yet: the microphone** (FR-97 P2f: cpal,
-  `NSMicrophoneUsageDescription`, the `audio-input` entitlement); it is
-  refused by name. Computer audio is, since FR-97 P2a (ScreenCaptureKit, in
-  the worker's session): the worker advertises `remote-audio` while the owner
-  allows it, as any host does (§9). The banner is not
+  `child.rs:399-407`); a recording never follows a user switch.
+- **Both audio sources are built on macOS**: computer audio since FR-97 P2a
+  (ScreenCaptureKit, in the worker's session: the worker advertises
+  `remote-audio` while the owner allows it, as any host does) and the
+  microphone since P2f (local only, as everywhere; macOS asks the person the
+  first time, §9). The banner is not
   capture-excluded there, so it appears in the recording.
 - **Unsupervised Mac** (the default): the per-user LaunchAgent is its own
   enrollment and records as the person, like any user install; the root row

@@ -2500,10 +2500,10 @@ hardware` produces 1 keyframe + 9 P-frames, total 4212 bytes over
 
 > 🗄️ **Two of these shipped, by another route.** VideoToolbox (H.264, HEVC)
 > and VAAPI are FFmpeg encoders in the hardware cascade, not a direct
-> `VTCompressionSession` or `libva` backend ([encoders.md](encoders.md)). And
-> no audio-input entitlement exists: `packaging/macos/entitlements.plist`
-> carries only three hardened-runtime keys, all false, and there is no
-> microphone usage string. The third item still stands.
+> `VTCompressionSession` or `libva` backend ([encoders.md](encoders.md)). The
+> audio-input entitlement arrived later, with FR-97 P2f, for a recording's
+> microphone (`packaging/macos/entitlements.plist`, beside the bundle's usage
+> string). The third item still stands.
 
 Deferred per platform (as written):
 

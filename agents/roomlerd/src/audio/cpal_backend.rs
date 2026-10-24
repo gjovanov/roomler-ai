@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! cpal-backed system-audio capture (Linux + Windows).
+//! cpal capture: system audio (Linux + Windows), a recording's mic (+ macOS).
 //!
 //! * **Windows** — WASAPI loopback. cpal 0.15 lets you open the default
 //!   *output* device with `build_input_stream`; the WASAPI backend
