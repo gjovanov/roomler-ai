@@ -6637,6 +6637,21 @@ async fn handle_server_msg(
                 crate::hive::knowhow_tools::on_proposed(&req_id, what, id, left);
             }
         }
+        // P4-5-2b — a verify's two answers: its probe, asked, and what the
+        // probe measured. The probe itself arrives as `KnowhowProbe`, before
+        // or after the first, and runs as any probe does.
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowVerifying { req_id, probe_id } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_verifying(&req_id, probe_id.to_hex());
+            }
+        }
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowVerified { probe_id, probe } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_verified(&probe_id.to_hex(), probe);
+            }
+        }
         #[cfg(hive_host)]
         ServerMsg::KnowhowRefused { req_id, reason } => {
             if ctx.is_primary {

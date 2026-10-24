@@ -5,31 +5,33 @@
 //! `docs/knowhow.md` §12).
 //!
 //! A session asks the organization's map through `knowhow_search` and
-//! `knowhow_get`, and (P4-4-2b) says what it learned through
-//! `knowhow_propose`. The daemon carries each question on its primary
-//! connection (`rc:knowhow.search`, `rc:knowhow.get`, `rc:knowhow.propose`),
-//! naming the session and the fence it runs at; the server believes the
-//! session from its record, answers what its starter may read, and writes a
-//! proposal `proposed`.
+//! `knowhow_get`, says what it learned through `knowhow_propose` (P4-4-2b),
+//! and has this device probe an entity through `knowhow_verify` (P4-5-2b).
+//! The daemon carries each question on its primary connection
+//! (`rc:knowhow.search`, `.get`, `.propose`, `.verify`), naming the session
+//! and the fence it runs at; the server believes the session from its record,
+//! answers what its starter may read, writes a proposal `proposed`, and asks
+//! a verify's probe of this device.
 //!
 //! | Piece | Where |
 //! |---|---|
 //! | the server's word that the map is there, and which tools it answers | [`on_served`] |
 //! | a question on the primary's connection, its answer matched to it | [`Client`] |
+//! | a verify's second answer, what its probe measured, matched by the probe | [`on_verified`] |
 //! | what a run's toolbelt offers, fixed at its launch | [`daemon_knowhow`] |
-//! | the tools, as a session sees them | [`tools`], [`call`] |
+//! | the tools, as a session sees them, and which ask a person | [`tools`], [`call`], [`allowed`], [`asked`] |
 //!
 //! ⚠️ Offered only on the server's word (decision 49): an unmounted knowhow
 //! never answers, so a tool shown without that word would wait out its
 //! deadline on every call. A device forgets the word at every connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::knowhow::{
-    SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, session_limits,
+    ProbeKind, SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY, session_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use serde_json::{Map, Value, json};
@@ -39,8 +41,19 @@ use tracing::debug;
 /// How long a question waits for its answer.
 pub(crate) const ANSWER_DEADLINE: Duration = Duration::from_secs(15);
 
+/// P4-5-2b — how long a verify waits for what its probe measured, once the
+/// probe was asked: this device's prober takes ten seconds at most
+/// (`probe_limits::TIMEOUT_SECS`), and the server records its answer before
+/// sending it back.
+pub(crate) const VERIFY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// P4-5-2b — the probes' results kept while no verify waits for them yet.
+/// A probe goes out as soon as it is asked, so what it measured can come
+/// back before its `rc:knowhow.verifying` has reached the waiting call.
+const RECENT_VERIFIED: usize = 16;
+
 /// Every knowhow tool this build knows, in the order a session is shown them.
-const KNOWN: [&str; 3] = [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE];
+const KNOWN: [&str; 4] = [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY];
 
 /// The three things a session may propose, by the key that names each.
 const PROPOSALS: [&str; 3] = ["entity", "fact", "link"];
@@ -59,6 +72,16 @@ pub(crate) enum Answer {
         what: String,
         id: String,
         left: u32,
+    },
+    /// P4-5-2b — a verify, asked: the probe this device is sent.
+    Verifying {
+        probe_id: String,
+    },
+    /// P4-5-2b — what that probe measured, the probe as the server records
+    /// it; `None` when it did not come back within [`VERIFY_DEADLINE`].
+    Measured {
+        probe_id: String,
+        probe: Option<Value>,
     },
     Refused(String),
 }
@@ -83,6 +106,17 @@ pub(crate) struct Client {
     /// (`rc:knowhow.served`); none until it says so.
     served: Mutex<Vec<&'static str>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Answer>>>,
+    /// P4-5-2b — what probes measured, by probe id.
+    verified: Mutex<Verified>,
+}
+
+/// P4-5-2b — the verifies waiting for what their probe measured, and what
+/// came back before any waited for it. One lock for both, so a result is
+/// either given to a waiter or kept for the next, never neither.
+#[derive(Default)]
+struct Verified {
+    waiting: HashMap<String, Vec<oneshot::Sender<Value>>>,
+    recent: VecDeque<(String, Value)>,
 }
 
 /// The daemon's.
@@ -104,6 +138,26 @@ impl Drop for Forget<'_> {
     }
 }
 
+/// P4-5-2b — lets go of a verify's wait for its probe when the wait ends,
+/// however it ends: only senders whose waiter is gone, so another verify
+/// waiting for the same probe keeps waiting.
+struct ForgetProbe<'a> {
+    client: &'a Client,
+    probe_id: &'a str,
+}
+
+impl Drop for ForgetProbe<'_> {
+    fn drop(&mut self) {
+        let mut v = lock(&self.client.verified);
+        if let Some(waiters) = v.waiting.get_mut(self.probe_id) {
+            waiters.retain(|w| !w.is_closed());
+            if waiters.is_empty() {
+                v.waiting.remove(self.probe_id);
+            }
+        }
+    }
+}
+
 fn new_req_id() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
@@ -117,6 +171,10 @@ impl Client {
         *lock(&self.outbound) = Some(tx);
         lock(&self.served).clear();
         lock(&self.pending).clear();
+        // A verify waiting for its probe ends too: it was asked on the
+        // connection that is gone, and its probe is recorded when the
+        // device answers it, whichever connection that is on.
+        *lock(&self.verified) = Verified::default();
     }
 
     /// The server's word (decision 49): the tools it answers, each kept
@@ -225,10 +283,89 @@ impl Client {
         self.ask(&req_id, frame).await
     }
 
+    /// P4-5-2b — `rc:knowhow.verify`, as `session` at `fence`: the server's
+    /// answer, and once it asked the probe ([`Answer::Verifying`]), what the
+    /// probe measured ([`Answer::Measured`]).
+    pub(crate) async fn verify(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+        probe: ProbeKind,
+    ) -> Result<Answer, AskError> {
+        let req_id = new_req_id();
+        let frame = ClientMsg::KnowhowVerify {
+            req_id: req_id.clone(),
+            session_id: session,
+            fence,
+            kind: kind.to_string(),
+            key: key.to_string(),
+            probe: probe.as_str().to_string(),
+        };
+        match self.ask(&req_id, frame).await? {
+            Answer::Verifying { probe_id } => {
+                let probe = self.measured(&probe_id).await;
+                Ok(Answer::Measured { probe_id, probe })
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// What a probe measured (`rc:knowhow.verified`): given to the verifies
+    /// waiting for it, or kept for the one about to, the oldest let go past
+    /// [`RECENT_VERIFIED`].
+    pub(crate) fn verified(&self, probe_id: &str, probe: Value) {
+        let mut v = lock(&self.verified);
+        match v.waiting.remove(probe_id) {
+            Some(waiters) => {
+                for w in waiters {
+                    let _ = w.send(probe.clone());
+                }
+            }
+            None => {
+                if v.recent.len() >= RECENT_VERIFIED {
+                    v.recent.pop_front();
+                }
+                v.recent.push_back((probe_id.to_string(), probe));
+            }
+        }
+    }
+
+    /// Wait for what the probe `probe_id` measured, at most
+    /// [`VERIFY_DEADLINE`]: at once when it came back already.
+    async fn measured(&self, probe_id: &str) -> Option<Value> {
+        // Declared first, so it is dropped after the receiver below: its
+        // sender is closed by then, and only closed ones are let go.
+        let _forget = ForgetProbe {
+            client: self,
+            probe_id,
+        };
+        let answer = {
+            let mut v = lock(&self.verified);
+            if let Some(at) = v.recent.iter().position(|(id, _)| id == probe_id) {
+                return v.recent.remove(at).map(|(_, probe)| probe);
+            }
+            let (tx, rx) = oneshot::channel();
+            v.waiting.entry(probe_id.to_string()).or_default().push(tx);
+            rx
+        };
+        // Bound first, so the receiver is gone before `_forget` looks.
+        let got = tokio::time::timeout(VERIFY_DEADLINE, answer).await;
+        got.ok().and_then(Result::ok)
+    }
+
     /// The questions waiting for an answer.
     #[cfg(test)]
     fn waiting(&self) -> usize {
         lock(&self.pending).len()
+    }
+
+    /// The verifies waiting for a probe, and the results kept for none.
+    #[cfg(test)]
+    fn verifies(&self) -> (usize, usize) {
+        let v = lock(&self.verified);
+        (v.waiting.values().map(Vec::len).sum(), v.recent.len())
     }
 }
 
@@ -263,6 +400,16 @@ pub fn on_card(req_id: &str, card: Value) {
 /// P4-4-2b — `rc:knowhow.proposed`.
 pub fn on_proposed(req_id: &str, what: String, id: String, left: u32) {
     CLIENT.answered(req_id, Answer::Proposed { what, id, left });
+}
+
+/// P4-5-2b — `rc:knowhow.verifying`: a verify's probe, asked.
+pub fn on_verifying(req_id: &str, probe_id: String) {
+    CLIENT.answered(req_id, Answer::Verifying { probe_id });
+}
+
+/// P4-5-2b — `rc:knowhow.verified`: what a verify's probe measured.
+pub fn on_verified(probe_id: &str, probe: Value) {
+    CLIENT.verified(probe_id, probe);
 }
 
 /// `rc:knowhow.refused`.
@@ -304,6 +451,15 @@ pub(crate) trait KnowhowTools: Send + Sync {
         fence: u64,
         proposal: &Value,
         why: &str,
+    ) -> Result<Value, String>;
+    /// P4-5-2b — probe the entity by `kind` and `key` from this device.
+    async fn verify(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+        probe: ProbeKind,
     ) -> Result<Value, String>;
 }
 
@@ -362,6 +518,26 @@ impl KnowhowTools for DaemonKnowhow {
             answer => read(answer),
         }
     }
+
+    async fn verify(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+        probe: ProbeKind,
+    ) -> Result<Value, String> {
+        match CLIENT.verify(session, fence, kind, key, probe).await {
+            // Asked, and never answered: the probe may have been asked all
+            // the same, and what it measured is recorded when it ends.
+            Err(AskError::NoAnswer) => Err(
+                "the organization's map did not answer: the probe may have been asked all the \
+                 same, and knowhow_get shows what it measured once it has"
+                    .into(),
+            ),
+            answer => read(answer),
+        }
+    }
 }
 
 /// An answer as the model reads it: what the map said, or why it said
@@ -379,10 +555,65 @@ fn read(answer: Result<Answer, AskError>) -> Result<Value, String> {
             "status": "proposed",
             "proposals_left": left,
         })),
+        Ok(Answer::Measured {
+            probe_id,
+            probe: Some(probe),
+        }) => Ok(measured(&probe_id, &probe)),
+        Ok(Answer::Measured {
+            probe_id,
+            probe: None,
+        })
+        | Ok(Answer::Verifying { probe_id }) => Ok(json!({
+            "probe_id": probe_id,
+            "state": "pending",
+            "means": format!(
+                "the probe was asked, and had not answered within {} s: what it measures is \
+                 recorded on the entity's facts when it does, and knowhow_get shows it",
+                VERIFY_DEADLINE.as_secs()
+            ),
+        })),
         Ok(Answer::Refused(word)) => Err(refusal(&word)),
         Err(AskError::NotConnected) => Err("this device is not connected to its server".into()),
         Err(AskError::NoAnswer) => Err("the organization's map did not answer".into()),
     }
+}
+
+/// P4-5-2b — what a probe measured, as the model reads it: its outcome and
+/// what that means, where it went, and what it found; none of the record's
+/// ids, which name things the model never asks for.
+fn measured(probe_id: &str, probe: &Value) -> Value {
+    let state = probe["state"].as_str().unwrap_or("unknown");
+    let means = match state {
+        "ok" => {
+            "it answered: each fact it measured is now marked verified, ok where the fact says \
+             what it found (a proposed one turned active), not ok where it differs"
+        }
+        "unreachable" => {
+            "nothing answered at that host and port from this device: the host and port facts \
+             are recorded not ok, their status kept"
+        }
+        "not_allowed" => {
+            "this device may not reach it: its owner has not listed it in knowhow_probe_reach, \
+             or it is an address never probed. Nothing was recorded on the entity's facts"
+        }
+        "failed" => {
+            "it could not be measured, as the detail says. Nothing was recorded on the entity's \
+             facts"
+        }
+        _ => "the probe ended without an answer",
+    };
+    let mut out = Map::new();
+    out.insert("probe_id".into(), json!(probe_id));
+    out.insert("state".into(), json!(state));
+    out.insert("means".into(), json!(means));
+    for key in [
+        "kind", "target", "rtt_ms", "address", "carrier", "tls", "detail", "measured",
+    ] {
+        if let Some(v) = probe.get(key).filter(|v| !v.is_null()) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 /// What the model is told for each refusal: what it means, and whether
@@ -450,14 +681,36 @@ pub(crate) fn refusal(word: &str) -> String {
     }
 }
 
-/// The tools a run offers, as its settings name them: allowed with no
-/// person's approval (decision 39), since they read, and the server holds
-/// each question to what the session's starter may read.
+/// The tools a run offers that its settings allow with no person's approval
+/// (decision 39): the reads and a proposal, which the server holds to what
+/// the session's starter may read and writes `proposed`. Never
+/// `knowhow_verify` ([`asked`]).
 pub(crate) fn allowed(offered: &[&'static str]) -> Vec<String> {
     offered
         .iter()
-        .map(|t| format!("mcp__{}__{t}", roomler_hive_node::launch::TOOLBELT_SERVER))
+        .filter(|t| **t != TOOL_VERIFY)
+        .map(|t| settings_name(t))
         .collect()
+}
+
+/// P4-5-2b — the tools a run offers that its settings ask a person for at
+/// each call (decision 54): `knowhow_verify`, which aims a connection from
+/// this device, as the session's egress and its commands on other devices
+/// ask (`net_socks`, `ssh_run`).
+pub(crate) fn asked(offered: &[&'static str]) -> Vec<String> {
+    offered
+        .iter()
+        .filter(|t| **t == TOOL_VERIFY)
+        .map(|t| settings_name(t))
+        .collect()
+}
+
+/// A tool as a session's settings name it.
+fn settings_name(tool: &str) -> String {
+    format!(
+        "mcp__{}__{tool}",
+        roomler_hive_node::launch::TOOLBELT_SERVER
+    )
 }
 
 /// The tools a run offers, as a session is shown them.
@@ -594,6 +847,37 @@ pub(crate) fn tools(offered: &[&'static str]) -> Vec<Value> {
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
         }));
     }
+    if offered.contains(&TOOL_VERIFY) {
+        out.push(json!({
+            "name": TOOL_VERIFY,
+            "description": "Check an entity of the organization's map (Roomler knowhow) from this \
+                            device, by its kind and key as knowhow_search lists them: `tcp` \
+                            connects to the host and port its facts say, then closes; `tls` also \
+                            reads the certificate the server presents. Nothing is sent past the \
+                            handshake and no credential is used. A person approves each call, and \
+                            this device's owner decides where its probes may go \
+                            (knowhow_probe_reach): outside it the answer is not_allowed. What it \
+                            measured is recorded on the entity's facts: a fact found as it says \
+                            is marked verified, and a proposed one turns active. The answer says \
+                            the outcome (ok, unreachable, not_allowed, failed), the round trip, \
+                            the address reached and how (direct, or over the organization's \
+                            mesh), and for tls the certificate's names and fingerprint.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "description": "the entity's kind, as knowhow_search shows it"},
+                    "key": {"type": "string", "description": "the entity's key, as knowhow_search shows it"},
+                    "probe": {
+                        "type": "string",
+                        "enum": ProbeKind::ALL.map(ProbeKind::as_str),
+                        "description": "tcp, a connect; tls, a connect and the certificate. tcp when absent",
+                    },
+                },
+                "required": ["kind", "key"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
+        }));
+    }
     out
 }
 
@@ -677,6 +961,17 @@ pub(crate) async fn call(
             knowhow
                 .propose(session, fence, &Value::Object(proposal), &why)
                 .await
+        }
+        TOOL_VERIFY => {
+            let (kind, key) = (text("kind")?, text("key")?);
+            if kind.is_empty() || key.is_empty() {
+                return Err("kind and key are required, as knowhow_search shows them".into());
+            }
+            let probe = match text("probe")?.as_str() {
+                "" => ProbeKind::Tcp,
+                word => ProbeKind::from_word(word).ok_or("probe is tcp or tls")?,
+            };
+            knowhow.verify(session, fence, &kind, &key, probe).await
         }
         other => Err(format!("no knowhow tool {other}")),
     }
@@ -769,6 +1064,13 @@ mod tests {
             [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE],
             "in this build's order, whatever the server's"
         );
+        c.served(&[
+            "knowhow_verify".into(),
+            "knowhow_search".into(),
+            "knowhow_get".into(),
+            "knowhow_propose".into(),
+        ]);
+        assert_eq!(c.offered(), KNOWN, "P4-5-2b's verify, where it is named");
         let (tx, _rx2) = mpsc::channel(1);
         c.connected(tx);
         assert!(
@@ -793,13 +1095,268 @@ mod tests {
         assert_eq!(names(&[TOOL_GET]), ["knowhow_get"]);
         assert_eq!(
             names(&KNOWN),
-            ["knowhow_search", "knowhow_get", "knowhow_propose"]
+            [
+                "knowhow_search",
+                "knowhow_get",
+                "knowhow_propose",
+                "knowhow_verify"
+            ]
         );
         assert_eq!(names(&[TOOL_PROPOSE]), ["knowhow_propose"]);
         assert!(names(&[]).is_empty());
         let propose = &tools(&[TOOL_PROPOSE])[0];
         assert_eq!(propose["inputSchema"]["required"], json!(["why"]));
         assert_eq!(propose["annotations"]["readOnlyHint"], false);
+        let verify = &tools(&[TOOL_VERIFY])[0];
+        assert_eq!(verify["inputSchema"]["required"], json!(["kind", "key"]));
+        assert_eq!(
+            verify["inputSchema"]["properties"]["probe"]["enum"],
+            json!(["tcp", "tls"])
+        );
+        assert_eq!(verify["annotations"]["openWorldHint"], true);
+    }
+
+    /// P4-5-2b — the reads and a proposal are allowed outright; a verify is
+    /// asked of a person at each call, and only where it is offered.
+    #[test]
+    fn a_verify_is_asked_and_never_allowed() {
+        assert_eq!(
+            allowed(&KNOWN),
+            [
+                "mcp__roomler__knowhow_search",
+                "mcp__roomler__knowhow_get",
+                "mcp__roomler__knowhow_propose"
+            ]
+        );
+        assert_eq!(asked(&KNOWN), ["mcp__roomler__knowhow_verify"]);
+        assert!(asked(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE]).is_empty());
+        assert!(allowed(&[TOOL_VERIFY]).is_empty());
+    }
+
+    /// P4-5-2b — a verify goes out naming its session, fence, entity and
+    /// probe; the server's first answer names the probe, and the call waits
+    /// for what that probe measured, matched by its id.
+    #[tokio::test]
+    async fn a_verify_waits_for_what_its_probe_measured() {
+        let (c, mut rx) = client();
+        let c = Arc::new(c);
+        let session = ObjectId::new();
+        let asking = {
+            let c = Arc::clone(&c);
+            tokio::spawn(
+                async move { c.verify(session, 4, "endpoint", "db", ProbeKind::Tls).await },
+            )
+        };
+        let frame = rx.recv().await.unwrap();
+        let ClientMsg::KnowhowVerify {
+            req_id,
+            session_id,
+            fence,
+            kind,
+            key,
+            probe,
+        } = frame
+        else {
+            panic!("not a verify: {frame:?}");
+        };
+        assert_eq!((session_id, fence), (session, 4));
+        assert_eq!(
+            (kind.as_str(), key.as_str(), probe.as_str()),
+            ("endpoint", "db", "tls")
+        );
+        c.answered(
+            &req_id,
+            Answer::Verifying {
+                probe_id: "p1".into(),
+            },
+        );
+        // Another probe's result reaches no one, and is kept for a while.
+        c.verified("p0", json!({"state": "ok"}));
+        while c.verifies().0 == 0 {
+            tokio::task::yield_now().await;
+        }
+        c.verified("p1", json!({"state": "unreachable"}));
+        assert_eq!(
+            asking.await.unwrap(),
+            Ok(Answer::Measured {
+                probe_id: "p1".into(),
+                probe: Some(json!({"state": "unreachable"})),
+            })
+        );
+        assert_eq!(c.verifies(), (0, 1), "p0's is kept, p1's was taken");
+    }
+
+    /// P4-5-2b — what a probe measured may come back before its verify
+    /// waits for it: kept, and given to the verify once it does; at most
+    /// [`RECENT_VERIFIED`] kept, the oldest let go.
+    #[tokio::test]
+    async fn what_a_probe_measured_before_its_verify_waited_is_kept() {
+        let (c, mut rx) = client();
+        let c = Arc::new(c);
+        let asking = {
+            let c = Arc::clone(&c);
+            tokio::spawn(async move {
+                c.verify(ObjectId::new(), 1, "endpoint", "db", ProbeKind::Tcp)
+                    .await
+            })
+        };
+        let ClientMsg::KnowhowVerify { req_id, .. } = rx.recv().await.unwrap() else {
+            panic!("not a verify");
+        };
+        c.verified("p1", json!({"state": "ok"}));
+        c.answered(
+            &req_id,
+            Answer::Verifying {
+                probe_id: "p1".into(),
+            },
+        );
+        assert_eq!(
+            asking.await.unwrap(),
+            Ok(Answer::Measured {
+                probe_id: "p1".into(),
+                probe: Some(json!({"state": "ok"})),
+            })
+        );
+        assert_eq!(c.verifies(), (0, 0));
+        for n in 0..=RECENT_VERIFIED {
+            c.verified(&format!("q{n}"), json!({"n": n}));
+        }
+        assert_eq!(c.verifies(), (0, RECENT_VERIFIED));
+        assert!(
+            lock(&c.verified).recent.iter().all(|(id, _)| id != "q0"),
+            "the oldest is let go"
+        );
+    }
+
+    /// P4-5-2b — a probe that never answers ends the wait pending, and a
+    /// new connection ends it at once; neither leaves a waiter behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_verify_whose_probe_never_answers_ends_pending() {
+        let (c, mut rx) = client();
+        let c = Arc::new(c);
+        for reconnect in [false, true] {
+            let asking = {
+                let c = Arc::clone(&c);
+                tokio::spawn(async move {
+                    c.verify(ObjectId::new(), 1, "endpoint", "db", ProbeKind::Tcp)
+                        .await
+                })
+            };
+            let ClientMsg::KnowhowVerify { req_id, .. } = rx.recv().await.unwrap() else {
+                panic!("not a verify");
+            };
+            c.answered(
+                &req_id,
+                Answer::Verifying {
+                    probe_id: "p1".into(),
+                },
+            );
+            while c.verifies().0 == 0 {
+                tokio::task::yield_now().await;
+            }
+            let waited_from = tokio::time::Instant::now();
+            if reconnect {
+                let (tx, next) = mpsc::channel(8);
+                c.connected(tx);
+                rx = next;
+            }
+            let answer = asking.await.unwrap();
+            // A new connection ends the wait at once; otherwise it is the
+            // deadline that does.
+            assert_eq!(
+                waited_from.elapsed() < VERIFY_DEADLINE,
+                reconnect,
+                "reconnect: {reconnect}"
+            );
+            assert_eq!(
+                answer,
+                Ok(Answer::Measured {
+                    probe_id: "p1".into(),
+                    probe: None,
+                }),
+                "reconnect: {reconnect}"
+            );
+            assert_eq!(c.verifies(), (0, 0), "reconnect: {reconnect}");
+            let read = read(answer).unwrap();
+            assert_eq!(read["state"], "pending");
+            assert_eq!(read["probe_id"], "p1");
+        }
+    }
+
+    /// P4-5-2b — a measured probe reads as its outcome, what that means,
+    /// where it went and what it found, without the record's ids.
+    #[test]
+    fn a_measured_probe_reads_as_its_outcome() {
+        let probe = json!({
+            "id": "p1", "entity_id": "e1", "device_id": "d1", "session": "s1",
+            "requested_at": "2026-10-24T17:00:00Z", "kind": "tls",
+            "target": {"host": "db.example.com", "from": "host", "port": 443, "sni": "db.example.com"},
+            "state": "ok", "rtt_ms": 12, "address": "10.0.4.12", "carrier": "direct",
+            "tls": {"names": ["db.example.com"], "fingerprint": "ab".repeat(32)},
+            "measured": [{"path": "host", "ok": true}, {"path": "port", "ok": true}],
+        });
+        let read = read(Ok(Answer::Measured {
+            probe_id: "p1".into(),
+            probe: Some(probe.clone()),
+        }))
+        .unwrap();
+        for key in [
+            "state", "kind", "target", "rtt_ms", "address", "carrier", "tls", "measured",
+        ] {
+            assert_eq!(read[key], probe[key], "{key}");
+        }
+        for gone in ["id", "entity_id", "device_id", "session", "requested_at"] {
+            assert!(read.get(gone).is_none(), "{gone}: {read}");
+        }
+        assert_eq!(read["probe_id"], "p1");
+        let mut means = Vec::new();
+        for state in ["ok", "unreachable", "not_allowed", "failed", "expired"] {
+            let one = measured("p1", &json!({ "state": state }));
+            assert_eq!(one["state"], state);
+            means.push(one["means"].as_str().unwrap().to_string());
+        }
+        means.sort();
+        means.dedup();
+        assert_eq!(means.len(), 5, "each outcome has its own words");
+    }
+
+    /// P4-5-2b — a verify's arguments are checked before anything is
+    /// asked: a kind and a key, and a probe that is tcp or tls, tcp when
+    /// absent.
+    #[tokio::test]
+    async fn a_verifys_arguments_are_checked_before_asking() {
+        let s = ObjectId::new();
+        let asked = call(
+            &Fake,
+            s,
+            1,
+            TOOL_VERIFY,
+            &json!({"kind": " endpoint ", "key": "db"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            asked,
+            json!({"kind": "endpoint", "key": "db", "probe": "tcp"})
+        );
+        let tls = call(
+            &Fake,
+            s,
+            1,
+            TOOL_VERIFY,
+            &json!({"kind": "endpoint", "key": "db", "probe": "tls"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tls["probe"], "tls");
+        for bad in [
+            json!({"key": "db"}),
+            json!({"kind": "endpoint"}),
+            json!({"kind": "endpoint", "key": "db", "probe": "http"}),
+            json!({"kind": "endpoint", "key": "db", "probe": 1}),
+        ] {
+            assert!(call(&Fake, s, 1, TOOL_VERIFY, &bad).await.is_err(), "{bad}");
+        }
     }
 
     /// P4-4-2b — a proposal goes out as the session wrote it, naming its
@@ -881,6 +1438,16 @@ mod tests {
             why: &str,
         ) -> Result<Value, String> {
             Ok(json!({ "proposal": proposal, "why": why }))
+        }
+        async fn verify(
+            &self,
+            _: ObjectId,
+            _: u64,
+            kind: &str,
+            key: &str,
+            probe: ProbeKind,
+        ) -> Result<Value, String> {
+            Ok(json!({ "kind": kind, "key": key, "probe": probe.as_str() }))
         }
     }
 

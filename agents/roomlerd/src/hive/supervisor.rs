@@ -4997,9 +4997,13 @@ fn write_settings(
             .collect(),
         // P3-4c — and each of its uses asks one, whatever a repository's
         // own settings allow; so does each egress listener (P3-7-3c), each
-        // command run on another device (P3-8-2b-2), and each placeholder
-        // (P3b-3c-2).
-        ask_tools: vault_use_tools(vault_tools, net_tools, ssh_tools, placeholder_tools),
+        // command run on another device (P3-8-2b-2), each placeholder
+        // (P3b-3c-2), and (FR-90 P4-5-2b) each probe the map's verify aims
+        // from this device, vault or none (decision 54).
+        ask_tools: vault_use_tools(vault_tools, net_tools, ssh_tools, placeholder_tools)
+            .into_iter()
+            .chain(super::knowhow_tools::asked(knowhow_tools))
+            .collect(),
     }
     .to_json();
     write_doc(&dir, "settings.json", &doc)
@@ -8088,6 +8092,72 @@ done
         assert!(
             !allow.contains(&"mcp__roomler__knowhow_search"),
             "only what is offered: {allow:?}"
+        );
+    }
+
+    /// FR-90 P4-5-2b — a verify aims a connection from this device, so a
+    /// session's settings ask a person for each one (decision 54), with or
+    /// without the vault, and never allow it outright; where it is not
+    /// offered, it is neither.
+    #[test]
+    fn the_settings_ask_a_person_for_each_verify() {
+        use roomler_ai_remote_control::knowhow::{
+            TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run");
+        let read = |sid: &str| -> serde_json::Value {
+            let path = runtime.join(sid).join("settings.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
+        };
+        let verify = "mcp__roomler__knowhow_verify".to_string();
+        let offered = [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY];
+        write_settings(&runtime, "verify", false, false, false, None, &offered).unwrap();
+        let doc = read("verify");
+        assert_eq!(
+            doc["permissions"]["allow"],
+            serde_json::json!([
+                "mcp__roomler__knowhow_search",
+                "mcp__roomler__knowhow_get",
+                "mcp__roomler__knowhow_propose"
+            ]),
+            "{doc}"
+        );
+        assert_eq!(
+            doc["permissions"]["ask"],
+            serde_json::json!([verify]),
+            "{doc}"
+        );
+        write_settings(&runtime, "verify-vault", true, false, false, None, &offered).unwrap();
+        let doc = read("verify-vault");
+        assert!(names(&doc["permissions"]["ask"]).contains(&verify), "{doc}");
+        assert!(
+            !names(&doc["permissions"]["allow"]).contains(&verify),
+            "{doc}"
+        );
+        write_settings(
+            &runtime,
+            "no-verify",
+            false,
+            false,
+            false,
+            None,
+            &offered[..3],
+        )
+        .unwrap();
+        let doc = read("no-verify");
+        assert!(
+            !names(&doc["permissions"]["ask"]).contains(&verify),
+            "{doc}"
+        );
+        assert!(
+            !names(&doc["permissions"]["allow"]).contains(&verify),
+            "{doc}"
         );
     }
 
