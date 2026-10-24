@@ -1,0 +1,67 @@
+name: apt-seed-install
+description: >-
+  FR-6 wave 28 (#773): install apt packages after restoring the .deb files a
+  rehearsal published to the rolling `seed-cache` release (apt-seed-save), so
+  the mirror serves only what changed since. Outside the Actions cache on
+  purpose: a cache-apt-pkgs-action entry used only by a release lane is the
+  first thing LRU evicts once a CI rotation pushes the 10 GB pool over, and
+  its key moves with every listed package's version. The calling step passes
+  `env: GH_TOKEN`; without it, or with no asset yet, apt downloads everything.
+
+# Why
+#
+#   release-setup.yml's Linux jobs restored a cached apt set in two of six tag
+#   runs on 2026-10-24. Master's entry was evicted twice that day, and
+#   ubuntu-latest's move to 26.04 changed its key. Every miss went to the
+#   mirror, and once that meant 61.2 MB in 19 min 34 s (52 kB/s) from
+#   azure.archive.ubuntu.com. apt checks a cached .deb against the index's
+#   checksum and uses it when the candidate version matches, so a restored
+#   archive is safe across package updates: only the changed packages download.
+#
+#   The asset is keyed by the runner's OS release and arch
+#   (`apt-<family>-<ID><VERSION_ID>-<arch>.tar.zst`), so a 24.04 and a 26.04
+#   runner of one job never share a set. Packages are installed by apt-get
+#   itself, so dpkg registers them and every postinst runs.
+
+inputs:
+  family:
+    description: Seed family name, unique per job (must match the apt-seed-save call)
+    required: true
+  packages:
+    description: Space-separated apt packages to install
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Restore the cached .debs, then install
+      shell: bash
+      env:
+        FAMILY: ${{ inputs.family }}
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -uo pipefail
+        . /etc/os-release
+        fam="apt-${FAMILY}-${ID}${VERSION_ID}-${RUNNER_ARCH}"
+        # mktemp, NOT $RUNNER_TEMP: seed-cache-restore's lesson, kept so the
+        # three seed actions stay alike.
+        dl="$(mktemp -d)"
+        if [ -n "${GH_TOKEN:-}" ] \
+           && gh release download seed-cache --repo "${GITHUB_REPOSITORY}" \
+                --pattern "${fam}.tar.zst" --dir "$dl" 2>/dev/null \
+           && [ -f "$dl/${fam}.tar.zst" ]; then
+          sudo tar --zstd -xf "$dl/${fam}.tar.zst" -C /var/cache/apt/archives \
+            && echo "restored $(find /var/cache/apt/archives -maxdepth 1 -name '*.deb' | wc -l) .debs from ${fam}" \
+            || echo "::warning title=apt seed::could not unpack ${fam}; apt downloads everything"
+        else
+          echo "no ${fam} on the seed-cache release yet; apt downloads everything (a rehearsal publishes it)"
+        fi
+        rm -rf "$dl"
+        echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries >/dev/null
+        sudo apt-get update -qq || { echo "::error::apt-get update failed"; exit 1; }
+        # Keep-Downloaded-Packages: whatever apt fetches here stays in the
+        # archive directory for apt-seed-save to publish.
+        # shellcheck disable=SC2086
+        sudo apt-get install -y --no-install-recommends \
+          -o APT::Keep-Downloaded-Packages=true $PACKAGES \
+          || { echo "::error::apt-get install failed"; exit 1; }

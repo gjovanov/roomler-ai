@@ -107,6 +107,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 25 | 10-20 | **A merge burst queues one run, not one per commit**: `ci.yml`, `integration-tests.yml` and `installer-smoke.yml` group master's runs by branch, so GitHub keeps one running (never cancelled) and one waiting, and a newer push cancels the waiting one. PR pushes cancel their superseded run; a dispatch gets a group of its own | #2624 |
 | 26 | 10-23 | **The setup wizard's release lane gets seeds**: `release-setup.yml`'s four build jobs restore from the `seed-cache` release (`seed-setup-<platform>`) instead of Swatinem, rehearsals publish, and a `reseed` job dispatches a master rehearsal after every published release. The macOS job builds both triples in one cargo invocation, and both Linux jobs install their Tauri deps from cached apt sets (wave 19's pattern) | #2778 |
 | 27 | 10-24 | **PR CI's two long poles.** The integration suite runs as four shards, not three. FR-90 P1i's Windows agent-session tests move out of `windows-overlay-clippy` into a parallel `windows-agent-sessions` job with its own seed family | #2844 |
+| 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 
 ## Acceptance criteria
 
@@ -717,3 +718,27 @@ itself on the affected run's page. Baseline when the program started: releases t
     0.4.163's and 0.4.165's x86_64 wizards need GLIBC_2.39, so nothing broke yet. But
     that job floats with the image, and the binary has never run on 22.04 or Debian 12,
     where the arm64 wizard and the agent `.deb` pin 22.04 for exactly that floor.
+- 2026-10-24, later: **wave 27 on its PR, and wave 28.**
+  - Wave 27's PR run (#2844): Windows overlay clippy 7.0 min (11.2 mean that day), the new
+    `windows-agent-sessions` 7.6 cold. The integration suite listed 973 tests (875 on
+    10-20); four shards were handed 244/243/243/243, each reported passed + ignored ==
+    handed, and the jobs took 10.8–11.9 min. Per-shard suites ran 5.6–6.9 min, so the build
+    (3.3–4.2) is now the larger part of a shard.
+  - **The double run.** Since 0.4.164 a `setup-v` tag was pushed with a token that
+    triggers workflows, so release-setup.yml started through `push: tags`. Then
+    release-agent.yml's lockstep job found the tag at the right commit, reused it, and
+    dispatched again: 0.4.164 at 15:51 (push) and 16:04 (dispatch), 0.4.165 at 17:37 and
+    18:02. The skip query against the real tags: `setup-v0.4.165` = 2 (in flight or green),
+    `setup-v0.4.163` = 1, an unknown tag = 0.
+  - **The apt cache.** Wave 26's cache-apt-pkgs-action entries hit in two of six tag runs
+    on 10-24. Master's copy of `cache-apt-pkgs_208e5ef8…` was gone by 10:14 (LRU), and
+    ubuntu-latest's 26.04 changed the key to `…7ae18ca6…`, whose master copy was gone
+    again before 17:37. 0.4.164's dispatch run missed and waited 1,154 s on the mirror.
+  - Apt rehearsal 1 (40123098836): no seed yet. x86_64 (ubuntu-26.04) fetched 72.5 MB in
+    17 s and published `apt-setup-linux-ubuntu26.04-X64` (181 .debs, 69 MiB); arm64
+    (22.04) fetched 51.6 MB in 4 s and published `apt-setup-linux-arm64-ubuntu22.04-ARM64`
+    (121 .debs, 49 MiB). apt kept its downloads, so the save step found them.
+  - Apt rehearsal 2 (40125690002): `restored 181 .debs` → `Need to get 0 B/72.5 MB` on
+    x86_64 (apt step 62 s, mostly unpack and configure), `restored 121 .debs` →
+    `Need to get 0 B/51.6 MB` on arm64 (25 s). A mirror stall can no longer reach a tag run
+    except through the packages Ubuntu changed since the last rehearsal.

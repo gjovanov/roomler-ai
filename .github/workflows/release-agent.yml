@@ -3836,6 +3836,21 @@ jobs:
               exit 1
             fi
             echo "${setup_tag} already exists at ${commit} — reusing it"
+            # FR-6 wave 28 (#773): a tag pushed with a token that triggers
+            # workflows (a person's, or a session's) has already started
+            # release-setup.yml on it through its `push: tags` trigger.
+            # Dispatching again built the wizard twice for every release from
+            # 0.4.164 on (the push run, then this one 13-25 min later). Skip
+            # when a run on the tag is in flight or green; a failed or
+            # cancelled one is still retried below.
+            runs=$(gh run list --workflow release-setup.yml --branch "${setup_tag}" --limit 20 \
+                     --json status,conclusion \
+                     --jq '[.[] | select(.status != "completed" or .conclusion == "success")] | length') || runs=""
+            if [ -n "$runs" ] && [ "$runs" -gt 0 ]; then
+              echo "release-setup.yml already has ${runs} run(s) in flight or green on ${setup_tag} — not dispatching another"
+              echo "verify: gh run list --workflow release-setup.yml --branch ${setup_tag} ; gh release view ${setup_tag} --json assets"
+              exit 0
+            fi
           else
             git tag "${setup_tag}" "${commit}"
             git push origin "refs/tags/${setup_tag}"
