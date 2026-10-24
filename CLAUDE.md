@@ -821,8 +821,9 @@ Fixed-and-shipped issues live in `git log` and the docs. Currently open:
   GNOME Wayland (2026-10-23), all five consent modes, two concurrent viewers
   through `free` ↔ `exclusive`, and the `exec` and `ssh` prompts on the same
   surface as an RC one (2026-10-24; two BROWSERS on one PC are enough).
-  ⚠️ `push` reaches the owner **in-app only** while prod has no push service
-  (`vapid_public_key` empty). The controller is told who is asked
+  `push` reaches the owner in-app AND by web push. Prod has had a push service
+  since 2026-10-24. Each browser opts in through the notification panel's
+  *Turn on* (#2817); a page load never prompts. The controller is told who is asked
   (`consent_asks` on `rc:session.created`, #2810) and words the wait and the
   outcome for that person. The X11 panel was field-verified through Xwayland in
   FR-93 AC10 (0.4.141). Still unverified: the macOS native panel.
