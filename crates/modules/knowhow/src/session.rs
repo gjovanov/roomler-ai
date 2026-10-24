@@ -30,7 +30,7 @@ use dashmap::DashMap;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
 use roomler_ai_remote_control::knowhow::{
-    SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, session_limits,
+    ProbeKind, SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY, session_limits,
 };
 use roomler_ai_remote_control::models::{RpcCap, UpdateRefusal};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
@@ -76,6 +76,16 @@ pub(crate) enum Question {
         proposal: Value,
         why: String,
     },
+    /// P4-5-2 — a probe of an entity, from the session's own device
+    /// ([`crate::probe::ask`]).
+    Verify {
+        req_id: String,
+        session_id: ObjectId,
+        fence: u64,
+        kind: String,
+        key: String,
+        probe: String,
+    },
 }
 
 impl Question {
@@ -83,7 +93,8 @@ impl Question {
         match self {
             Self::Search { req_id, .. }
             | Self::Get { req_id, .. }
-            | Self::Propose { req_id, .. } => req_id,
+            | Self::Propose { req_id, .. }
+            | Self::Verify { req_id, .. } => req_id,
         }
     }
 }
@@ -150,6 +161,21 @@ impl Questions {
                 fence,
                 proposal,
                 why,
+            },
+            ClientMsg::KnowhowVerify {
+                req_id,
+                session_id,
+                fence,
+                kind,
+                key,
+                probe,
+            } => Question::Verify {
+                req_id,
+                session_id,
+                fence,
+                kind,
+                key,
+                probe,
             },
             other => return Some(other),
         };
@@ -226,13 +252,17 @@ pub(crate) async fn served(state: &KnowhowState, conn: Conn) -> Option<ServerMsg
     {
         return None;
     }
-    Some(ServerMsg::KnowhowServed {
-        tools: vec![
-            TOOL_SEARCH.to_string(),
-            TOOL_GET.to_string(),
-            TOOL_PROPOSE.to_string(),
-        ],
-    })
+    let mut tools = vec![
+        TOOL_SEARCH.to_string(),
+        TOOL_GET.to_string(),
+        TOOL_PROPOSE.to_string(),
+    ];
+    // P4-5-2 — a verify runs on the session's own device's prober: offered
+    // only where that device can probe.
+    if agent.capabilities.has_rpc(RpcCap::KnowhowProbe) {
+        tools.push(TOOL_VERIFY.to_string());
+    }
+    Some(ServerMsg::KnowhowServed { tools })
 }
 
 /// Answer one connection's questions, in the order they came, until it goes.
@@ -310,8 +340,81 @@ pub(crate) async fn answer(state: &KnowhowState, conn: Conn, question: &Question
                 }),
             Err(refusal) => Err(refusal),
         },
+        Question::Verify {
+            session_id,
+            fence,
+            kind,
+            key,
+            probe,
+            ..
+        } => match identify(state, conn, *session_id, *fence).await {
+            Ok(session) => verify(state, conn, &session, kind, key, probe)
+                .await
+                .map(|probe_id| ServerMsg::KnowhowVerifying {
+                    req_id: req_id.to_string(),
+                    probe_id,
+                }),
+            Err(refusal) => Err(refusal),
+        },
     };
     answered.unwrap_or_else(|why| refused(req_id, why))
+}
+
+/// P4-5-2 — a session's verify (decision 54): the entity by its kind and
+/// key, probed as `probe` says by the session's own device, the device on
+/// `conn`, as a person's probe is asked ([`crate::probe::ask`]), while the
+/// session's starter may ask one ([`may_probe`]). The probe's id; what it
+/// measured follows as `rc:knowhow.verified`.
+async fn verify(
+    state: &KnowhowState,
+    conn: Conn,
+    session: &AgentSession,
+    kind: &str,
+    key: &str,
+    probe: &str,
+) -> Result<ObjectId, SessionRefusal> {
+    use crate::probe::{Asker, NotAsked};
+    let session_id = session.id.ok_or(SessionRefusal::Unavailable)?;
+    may_probe(state, conn.tenant_id, session.owner_id).await?;
+    let probe_kind = ProbeKind::from_word(probe.trim()).ok_or(SessionRefusal::BadRequest)?;
+    let kind = check_kind_word(kind.trim()).map_err(|_| SessionRefusal::BadRequest)?;
+    let key = check_key(key.trim()).map_err(|_| SessionRefusal::BadRequest)?;
+    let entity = match state
+        .entities
+        .find_live_by_key(conn.tenant_id, kind, key)
+        .await
+    {
+        Ok(Some(e)) => e,
+        Ok(None) => return Err(SessionRefusal::NotFound),
+        Err(e) => {
+            warn!(tenant = %conn.tenant_id, %e, "knowhow: a session's verify found no entity it could read");
+            return Err(SessionRefusal::Unavailable);
+        }
+    };
+    let asked = crate::probe::ask(
+        state,
+        conn.tenant_id,
+        &entity,
+        conn.device_id,
+        probe_kind,
+        Asker::Session(session_id),
+    )
+    .await;
+    match asked {
+        Ok(p) => p.id.ok_or(SessionRefusal::Unavailable),
+        Err(NotAsked::Unprobeable(why)) => {
+            debug!(session = %session_id, %why, "knowhow: a session's verify names an entity no probe reaches");
+            Err(SessionRefusal::Unprobeable)
+        }
+        Err(NotAsked::RateLimited | NotAsked::Busy | NotAsked::JustEnded) => {
+            Err(SessionRefusal::Busy)
+        }
+        Err(NotAsked::NoDevice | NotAsked::Refused(_)) => Err(SessionRefusal::Unavailable),
+        Err(NotAsked::Store(e)) => {
+            warn!(session = %session_id, %e, "knowhow: a session's verify was not asked");
+            Err(SessionRefusal::Unavailable)
+        }
+    }
 }
 
 fn refused(req_id: &str, why: SessionRefusal) -> ServerMsg {
@@ -411,6 +514,29 @@ pub(crate) async fn may_read(
         {
             Ok(())
         }
+        Ok(_) | Err(DaoError::NotAMember) => Err(SessionRefusal::Denied),
+        Err(e) => {
+            warn!(tenant = %tenant_id, %e, "knowhow: a session's starter's roles were not read");
+            Err(SessionRefusal::Unavailable)
+        }
+    }
+}
+
+/// P4-5-2 — whether the session's starter may ask a probe, now:
+/// `KNOWHOW_EDIT`, as a person's probe needs (decision 54), read at every
+/// verify. A probe writes what it measured onto the map, and a session asks
+/// only what its starter may ask.
+pub(crate) async fn may_probe(
+    state: &KnowhowState,
+    tenant_id: ObjectId,
+    starter: ObjectId,
+) -> Result<(), SessionRefusal> {
+    match state
+        .tenants
+        .get_member_permissions(tenant_id, starter)
+        .await
+    {
+        Ok(perms) if permissions::has(perms, permissions::KNOWHOW_EDIT) => Ok(()),
         Ok(_) | Err(DaoError::NotAMember) => Err(SessionRefusal::Denied),
         Err(e) => {
             warn!(tenant = %tenant_id, %e, "knowhow: a session's starter's roles were not read");

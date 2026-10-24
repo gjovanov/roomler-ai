@@ -70,6 +70,7 @@ pub(crate) async fn ask(
                 "rc:knowhow.found"
                     | "rc:knowhow.card"
                     | "rc:knowhow.proposed"
+                    | "rc:knowhow.verifying"
                     | "rc:knowhow.refused"
             ) && v["req_id"] == req_id
             {
