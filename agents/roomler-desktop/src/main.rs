@@ -146,6 +146,7 @@ fn main() {
             commands::cmd_consent_approve,
             commands::cmd_consent_deny,
             commands::cmd_get_pending_consents,
+            commands::cmd_consent_modal_needed,
             commands::cmd_rc_sessions,
             commands::cmd_rc_disconnect,
             commands::cmd_tunnels_view,

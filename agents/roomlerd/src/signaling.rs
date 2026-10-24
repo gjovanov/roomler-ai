@@ -3381,13 +3381,13 @@ async fn handle_server_msg(
             let asking_org: Option<String> = if external_consent.is_some() {
                 Some(crate::extauth::OUTSIDE_THE_ORG.to_string())
             } else {
-                multi_org
-                    .then(|| {
-                        tenant_name
-                            .clone()
-                            .or_else(|| (!ctx.is_primary).then(|| ctx.label.clone()))
-                    })
-                    .flatten()
+                // #2815 — the one rule, shared with the exec prompt.
+                prompt_org(
+                    multi_org,
+                    tenant_name.as_deref(),
+                    ctx.is_primary,
+                    &ctx.label,
+                )
             };
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
@@ -5051,6 +5051,7 @@ async fn handle_server_msg(
             consent_mode,
             via_service,
             run_as,
+            tenant_name,
         } => {
             // FR-94 — a command meant for the SYSTEM service. Only a Windows
             // build advertises `exec-system`, so a server should never send
@@ -5164,16 +5165,15 @@ async fn handle_server_msg(
             if matches!(consent_mode, crate::consent::Mode::Prompt { .. }) {
                 let shown = crate::exec::redactor().apply(&command);
                 let detail: String = shown.chars().take(512).collect();
-                // Same multi-org rule as the RC prompt: name the asking org
-                // only on a device that serves more than one, since on a
-                // single-org device there is nothing to disambiguate.
-                // `rc:rpc.exec` carries no tenant display name, so this
-                // loop's own label is the best available.
-                let org = if !ctx.is_primary || !agent_cfg.orgs.is_empty() {
-                    ctx.label.clone()
-                } else {
-                    String::new()
-                };
+                // The RC prompt's org rule (#2815): the server's name for the
+                // asking org, never the primary enrollment's label.
+                let org = prompt_org(
+                    !ctx.is_primary || !agent_cfg.orgs.is_empty(),
+                    tenant_name.as_deref(),
+                    ctx.is_primary,
+                    &ctx.label,
+                )
+                .unwrap_or_default();
                 // Native panel first, exactly as for a screen-control request
                 // — and with the command in front of whoever is deciding,
                 // because "approve SSH-ish access" and "approve `rm -rf`
@@ -7300,6 +7300,31 @@ pub(crate) fn urlencode(s: &str) -> String {
         .replace('=', "%3D")
 }
 
+/// Multi-org — the org line of a consent prompt, by ONE rule for every kind
+/// of request (#2815: exec had its own copy, and named the primary org
+/// `primary`).
+///
+/// Shown only on a daemon that serves more than one enrollment: the line is
+/// there to tell orgs apart, and a single-org device has nothing to tell
+/// apart. Then the server's display name for the asking org when it sent
+/// one. Otherwise a SECONDARY loop's own label, which at least tells
+/// secondaries apart. Never the PRIMARY's label: it is literally `primary`,
+/// a word nobody at the device recognises.
+pub(crate) fn prompt_org(
+    multi_org: bool,
+    tenant_name: Option<&str>,
+    is_primary: bool,
+    label: &str,
+) -> Option<String> {
+    if !multi_org {
+        return None;
+    }
+    match tenant_name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => Some(name.to_string()),
+        None => (!is_primary).then(|| label.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8106,5 +8131,40 @@ mod tests {
         let bare = std::io::Error::other("simple");
         let chain = error_chain(&bare);
         assert_eq!(chain, "simple");
+    }
+
+    // #2815 — the exec prompt said "On behalf of primary": its own copy of
+    // the org rule took the loop's label even on the primary enrollment.
+    #[test]
+    fn prompt_org_names_the_org_never_the_primary_label() {
+        // The server's name wins, on the primary as on a secondary.
+        assert_eq!(
+            prompt_org(true, Some("Grox"), true, "primary").as_deref(),
+            Some("Grox")
+        );
+        assert_eq!(
+            prompt_org(true, Some("Grox"), false, "acme").as_deref(),
+            Some("Grox")
+        );
+        // No name from the server: a secondary's label still tells it apart…
+        assert_eq!(
+            prompt_org(true, None, false, "acme").as_deref(),
+            Some("acme")
+        );
+        // …but the primary's label is the word `primary`, so no line at all.
+        assert_eq!(prompt_org(true, None, true, "primary"), None);
+        // A blank name is no name.
+        assert_eq!(prompt_org(true, Some("  "), true, "primary"), None);
+        assert_eq!(
+            prompt_org(true, Some(""), false, "acme").as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn prompt_org_is_silent_on_a_single_org_device() {
+        // Nothing to tell apart: one org asks every question.
+        assert_eq!(prompt_org(false, Some("Grox"), true, "primary"), None);
+        assert_eq!(prompt_org(false, None, true, "primary"), None);
     }
 }

@@ -65,6 +65,13 @@ a hung device. `AgentCaps.rpc` must contain `exec`, and the server answers
 `412` when it doesn't. **This is the rule for any new `ServerMsg` a caller
 awaits.**
 
+**The prompt names the asking org** (#2815). `rc:rpc.exec` carries the org's
+display name, `tenant_name`, as `rc:request` does for a session. `authorize`
+returns it from the tenant row that gate 1 already reads. On a multi-org
+device the exec prompt then says "On behalf of «org»" by the same rule as a
+screen-control prompt ([multi-org.md](multi-org.md) §8b). Before, it named the
+enrollment's label, which on the primary enrollment is literally `primary`.
+
 ## The four gates
 
 A command runs only if all four allow it. Each is owned by a different party,
@@ -337,8 +344,8 @@ run the command as root:
 
 | Where | What is checked | Source |
 |---|---|---|
-| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:960`](../crates/modules/fleet/src/agent_exec.rs#L960) |
-| Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:359`](../crates/modules/fleet/src/agent_exec.rs#L359) |
+| The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:965`](../crates/modules/fleet/src/agent_exec.rs#L965) |
+| Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:361`](../crates/modules/fleet/src/agent_exec.rs#L361) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3462`](../crates/modules/fleet/src/hub.rs#L3462) |
 | The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5033`](../agents/roomlerd/src/signaling.rs#L5033) |
 

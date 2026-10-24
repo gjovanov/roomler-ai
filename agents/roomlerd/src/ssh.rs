@@ -805,6 +805,13 @@ mod sshd {
         pub deadline: Option<tokio::time::Instant>,
         /// Who to attribute every action to, in every log line.
         pub caller: String,
+        /// #2815 — who the consent prompt says is asking: the grant's caller
+        /// as the server worded it, `«name» (via «device»)`, the way the
+        /// screen-control and exec prompts word theirs. [`Self::caller`]
+        /// stays the technical identity for the logs and activity reports;
+        /// its `ssh:` prefix, overlay address and port mean nothing to the
+        /// person deciding.
+        pub prompt_name: String,
         /// The grant this session redeemed, for P8 activity reports —
         /// correlating a reported action back to the server's own decision
         /// row in `ssh_audit`. `None` for a key-list session, which no grant
@@ -887,6 +894,7 @@ mod sshd {
                             session_secs,
                         )),
                 ),
+                prompt_name: caller.clone(),
                 caller: format!("ssh:{caller}@{peer}"),
                 one_command,
             }
@@ -912,6 +920,9 @@ mod sshd {
                 // All a key-list session can honestly claim: the username the
                 // client typed, and the overlay address WireGuard proved.
                 caller: format!("ssh:{user}@{peer} (key-list)"),
+                // Never shown: this path is exempt from consent. Were it ever
+                // asked about, the username the client typed is all it has.
+                prompt_name: user.to_string(),
                 // No grant, so nothing to correlate to. Its activity is still
                 // reported (it is the path most worth watching), just without
                 // a decision row to join against — the `(key-list)` suffix on
@@ -1210,6 +1221,7 @@ mod sshd {
             session.channel_success(channel)?;
             let handle = session.handle();
             let caller = policy.caller.clone();
+            let prompt_name = policy.prompt_name.clone();
             let consent = policy.consent_sentinel.clone();
             let asker = self.asker.clone();
 
@@ -1218,7 +1230,7 @@ mod sshd {
                     &asker,
                     &handle,
                     channel,
-                    &caller,
+                    &prompt_name,
                     &sentinel,
                     "transfer files over SFTP",
                 )
@@ -1487,6 +1499,7 @@ mod sshd {
             session.channel_success(channel)?;
             let handle = session.handle();
             let caller = policy.caller.clone();
+            let prompt_name = policy.prompt_name.clone();
             let consent = policy.consent_sentinel.clone();
             let asker = self.asker.clone();
 
@@ -1495,7 +1508,7 @@ mod sshd {
                     &asker,
                     &handle,
                     channel,
-                    &caller,
+                    &prompt_name,
                     &sentinel,
                     "open an interactive shell",
                 )
@@ -1897,6 +1910,7 @@ mod sshd {
                 }
             };
             let caller = policy.caller.clone();
+            let prompt_name = policy.prompt_name.clone();
             let consent = policy.consent_sentinel.clone();
             let asker = self.asker.clone();
             // Captured here, where the policy is still borrowed, and reported
@@ -1925,6 +1939,7 @@ mod sshd {
                 channel,
                 command,
                 caller,
+                prompt_name,
                 run_as,
                 consent,
                 asker,
@@ -2406,6 +2421,8 @@ mod sshd {
         channel: ChannelId,
         command: String,
         caller: String,
+        /// #2815 — who the prompt names; see `ResolvedSessionPolicy::prompt_name`.
+        prompt_name: String,
         run_as: crate::exec::RunAs,
         /// The consent sentinel to prompt on; `None` = no prompt.
         consent: Option<String>,
@@ -2461,6 +2478,7 @@ mod sshd {
             channel,
             command,
             caller,
+            prompt_name,
             run_as,
             consent,
             asker,
@@ -2479,7 +2497,7 @@ mod sshd {
                 &asker,
                 &handle,
                 channel,
-                &caller,
+                &prompt_name,
                 &sentinel,
                 "run a command",
             )
@@ -3951,6 +3969,24 @@ mod tests {
 
     fn test_peer() -> std::net::SocketAddr {
         "100.64.0.9:55555".parse().unwrap()
+    }
+
+    /// #2815 — the prompt read `ssh:«name» (via «device»)@«overlay ip»:«port»`.
+    /// The person deciding gets the grant's own wording, as the screen-control
+    /// and exec prompts word theirs; the logs and activity reports keep the
+    /// technical identity, overlay address included.
+    #[test]
+    fn the_prompt_names_the_caller_as_the_grant_words_it() {
+        let mut grant = test_grant(None, 0);
+        grant.caller = "Alice (via build-01)".into();
+        let resolved = super::sshd::ResolvedSessionPolicy::from_grant(grant, test_peer(), false);
+        assert_eq!(resolved.prompt_name, "Alice (via build-01)");
+        assert_eq!(resolved.caller, "ssh:Alice (via build-01)@100.64.0.9:55555");
+        assert!(
+            !resolved.prompt_name.contains("ssh:") && !resolved.prompt_name.contains("100.64."),
+            "the prompt must not show the technical identity: {}",
+            resolved.prompt_name
+        );
     }
 
     /// Only an explicit `Auto` skips the prompt. Everything else — including a

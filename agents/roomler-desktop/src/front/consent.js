@@ -134,6 +134,15 @@
     // panel-consent.js. Two Approve buttons for one decision is how someone
     // approves the wrong thing.
     if (Array.isArray(pending)) pending = pending.filter((p) => p.surface !== 'native')
+    // #2815 - the small prompt window (panel-consent.html) asks these. This
+    // modal is its fallback, for when that window could not be created:
+    // rendering both put each question up twice. An answer we cannot get
+    // reads as "needed", so a question is never left unasked.
+    let modalNeeded = true
+    try {
+      modalNeeded = await invoke('cmd_consent_modal_needed')
+    } catch (_) {}
+    if (!modalNeeded) pending = []
     if (Array.isArray(pending) && pending.length > 0) {
       // Keep showing the current one if it's still pending; otherwise show the
       // first outstanding request (an operator may have resolved one elsewhere).

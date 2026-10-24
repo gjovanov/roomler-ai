@@ -7670,6 +7670,7 @@ mod tests {
             consent_mode: Some(ConsentMode::Auto),
             via_service: false,
             run_as: None,
+            tenant_name: None,
         }
     }
 

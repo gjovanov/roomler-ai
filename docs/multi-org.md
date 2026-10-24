@@ -562,6 +562,13 @@ carries `org`, and the tray modal renders an "On behalf of …" row, hidden
 when the field is empty (an empty value is omitted from the JSON entirely, so
 no blank row can render).
 
+**One rule for every kind of prompt** (#2815). Exec kept its own copy, which
+named the loop's label even on the primary enrollment, so its prompt read "On
+behalf of **primary**" (field, 2026-10-24). `signaling::prompt_org` is now the
+rule for screen control and exec alike, and `rc:rpc.exec` carries `tenant_name`
+too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
+`rc:ssh.grant` names no org.
+
 ---
 
 ## 9. Failure modes

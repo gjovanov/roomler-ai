@@ -3712,6 +3712,10 @@ pub enum ServerMsg {
         /// command, not the whole frame, which a caller would wait out.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_as: Option<String>,
+        /// #2815 — the asking org's DISPLAY NAME for the prompt's org line, as
+        /// [`Self::Request`] carries it (the enrollment label read `primary`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant_name: Option<String>,
     },
 
     /// Kill an in-flight [`Self::RpcExec`] and its whole process tree. The
@@ -11230,9 +11234,15 @@ mod tests {
             consent_mode: Some(crate::models::ConsentMode::Auto),
             via_service: false,
             run_as: None,
+            tenant_name: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:rpc.exec""#));
+        // #2815 — and `tenant_name` when absent.
+        assert!(
+            !s.contains("tenant_name"),
+            "tenant_name must be omitted when None: {s}"
+        );
         assert!(s.contains(r#""consent_mode":"auto""#));
         // `cwd` omitted entirely when None — an older decoder must never see
         // a null it has to special-case.
@@ -11277,6 +11287,7 @@ mod tests {
                 consent_mode,
                 via_service,
                 run_as,
+                tenant_name,
                 ..
             } => {
                 assert_eq!(consent_mode, None);
@@ -11284,6 +11295,19 @@ mod tests {
                 assert!(!via_service);
                 // FR-97 P5a — and an absent `run_as` is the daemon.
                 assert_eq!(run_as, None);
+                // #2815 — an older server names no org; the agent falls back.
+                assert_eq!(tenant_name, None);
+            }
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+        // #2815 — the org's display name travels with the command, so the
+        // prompt can say who is asking instead of the enrollment's label.
+        let named = r#"{"t":"rc:rpc.exec","request_id":"r5","shell":"bash",
+            "command":"id","timeout_ms":1000,"max_output_bytes":1024,"caller":"x",
+            "tenant_name":"Grox"}"#;
+        match serde_json::from_str::<ServerMsg>(named).unwrap() {
+            ServerMsg::RpcExec { tenant_name, .. } => {
+                assert_eq!(tenant_name.as_deref(), Some("Grox"))
             }
             other => panic!("expected RpcExec, got {other:?}"),
         }

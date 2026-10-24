@@ -67,7 +67,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:2902`, `ssh.rs:2236` vs `git grep write_pending`
+   — `signaling.rs:2902`, `ssh.rs:2251` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
@@ -1128,6 +1128,11 @@ The same box (`native=false`: the companion is the surface). The operator approv
 - Each request appeared **twice**: in the companion's prompt window AND as a modal in its main window. Both close on one answer. On 10-23 the main window was centred, so its modal sat exactly under the prompt window and nobody saw two.
 - The exec prompt reads "On behalf of **primary**", where the RC prompt said the org's name.
 - The SSH prompt's requester line is a raw `ssh:…@ip:port`.
+
+The fix for all three, one PR across the companion, the agent and the server:
+- **The companion asks once.** Its main window's modal renders only when the prompt window could not be created (`panels::consent_modal_needed`); it was meant as that fallback all along.
+- **One org rule.** `signaling::prompt_org` serves screen control and exec, and `rc:rpc.exec` carries `tenant_name` from exec `authorize`'s tenant read. It never shows the primary's label.
+- **The SSH prompt names the caller as the grant words it** (`prompt_name`). The technical identity stays in the logs and activity reports.
 
 ### 2026-10-24 — `push` with its web-push card (API `hosted-20261024-9867bb4`)
 
