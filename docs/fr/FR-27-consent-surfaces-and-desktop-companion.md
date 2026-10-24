@@ -1151,3 +1151,17 @@ The same box (`native=false`: the companion is the surface). The operator approv
 - The fix (#2828) focuses a window already on that page and otherwise opens a new one, and never navigates an open window away.
 
 The device's access policy was restored and read back equal.
+
+### 2026-10-24 — the card's click, and the bell's (API `hosted-20261024-b78373e`)
+
+**#2827 GREEN, 18:58Z.** The controller's own viewer waited on a `push` request to the same box.
+- WNS accepted the push (`Push notification sent`) and never delivered it to the PC. Windows' `PushNotification-Platform/Operational` log has no `Raw Notification received` for it, while the 13:18Z push on the same channel had arrived in under a second. So the card was shown by the same service-worker registration, with the request's real link. A click on any of its cards runs the one `notificationclick` handler.
+- The operator clicked the card. The front proxy logged `GET /consent/<token>` with **`Referer: https://roomler.ai/sw.js`**: that is `clients.openWindow()`, a new window. The viewer's URL never changed.
+- The approval came from that page 2 s later. The device went `Connected` 0.26 s after it, with no hang-up.
+
+**Found, #2841, 18:29Z:** the bell had #2827's shape.
+- The operator was in a live remote session to a Windows laptop, viewing it from a Mac. The push for a request to another device was lost the same way, and the request reached them through the bell in that tab.
+- `handleClick` ran `router.push(notif.link)`. The viewer tab went to `/consent/<token>`, and the laptop logged `session terminated … reason=ControllerHangup` 3 s after the click.
+- The fix flags the pages that hold a live session (`meta.liveSession`: both remote viewers and the call). From those, `openInAppLink` opens a notification's link in a new tab. Anywhere else the bell navigates in place as before.
+
+The device's access policy was restored and read back equal after each run.
