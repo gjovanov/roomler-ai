@@ -45,8 +45,12 @@ fn urlencode(s: &str) -> String {
 }
 
 /// An agent socket's hello, advertising `rpc` and, when given, the
-/// `update_mode` a secondary enrollment says (`primary_org`).
+/// `update_mode` a secondary enrollment says (`primary_org`). Returned once
+/// the server has READ it, so a scan asked next finds what the hello
+/// advertised: asked before, it read the device's row as it was, and was
+/// refused 409 ("cannot scan") now and then (#2798's shard 3/3).
 pub(crate) async fn hello(app: &TestApp, token: &str, rpc: &[&str], update_mode: &str) -> Ws {
+    let sent = bson::DateTime::now();
     let url = format!("ws://{}/ws?token={}&role=agent", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("ws connect");
     let hello = json!({
@@ -66,7 +70,38 @@ pub(crate) async fn hello(app: &TestApp, token: &str, rpc: &[&str], update_mode:
     ws.send(Message::Text(hello.to_string().into()))
         .await
         .expect("send hello");
+    hello_read(app, token, sent).await;
     ws
+}
+
+/// Wait until the server has read a hello sent at `sent`: the device's row
+/// says `online` with a `last_seen_at` no older than it. The hello's caps and
+/// `online` are one write (`AgentDao::update_hello`), and an older
+/// `last_seen_at` is an earlier connection's, as in a test that dials again.
+/// The device is the token's subject (`AgentClaims::sub`).
+async fn hello_read(app: &TestApp, token: &str, sent: bson::DateTime) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let claims: Value = token
+        .split('.')
+        .nth(1)
+        .and_then(|p| URL_SAFE_NO_PAD.decode(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .expect("an agent token's claims");
+    let device = ObjectId::parse_str(claims["sub"].as_str().expect("its subject"))
+        .expect("the subject is a device id");
+    let agents = app.db.collection::<Document>("agents");
+    for _ in 0..400 {
+        let row = agents.find_one(doc! { "_id": device }).await.unwrap();
+        let read = row.is_some_and(|r| {
+            r.get_str("status").is_ok_and(|s| s == "online")
+                && r.get_datetime("last_seen_at").is_ok_and(|at| *at >= sent)
+        });
+        if read {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the server never read device {device}'s hello");
 }
 
 /// The next message of type `want`, or `None` after `wait`.
@@ -233,8 +268,6 @@ async fn who_is_asked_and_who_may_ask() {
     let (second, second_token) = enroll(&app, &t, "mach-knowscan-c", "linux").await;
     let _w1 = hello(&app, &old_token, &["exec"], "self").await;
     let _w2 = hello(&app, &second_token, &["knowhow-scan"], "primary_org").await;
-    // Each hello is recorded before its socket answers anything else.
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let (code, body) = ask(&app, &t, &t.admin.access_token, &old).await;
     assert_eq!(code, 409, "{body}");
@@ -269,7 +302,6 @@ async fn a_pending_scan_is_never_doubled() {
     let t = app.seed_tenant("knowscanonce").await;
     let (device, token) = enroll(&app, &t, "mach-knowscan-d", "linux").await;
     let ws = hello(&app, &token, &["knowhow-scan"], "self").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     drop(ws);
     let (c1, first) = ask(&app, &t, &t.admin.access_token, &device).await;
     let (c2, second) = ask(&app, &t, &t.admin.access_token, &device).await;
@@ -286,7 +318,6 @@ async fn an_offline_device_is_told_at_its_hello_and_again_after_a_dead_connectio
     let t = app.seed_tenant("knowscanhello").await;
     let (device, token) = enroll(&app, &t, "mach-knowscan-e", "linux").await;
     let ws = hello(&app, &token, &["knowhow-scan"], "self").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
     drop(ws);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
