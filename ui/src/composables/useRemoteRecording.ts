@@ -93,11 +93,11 @@ export const RECORD_REASONS: Record<string, string> = {
   unavailable: "this device can't record right now",
   login_screen: 'the device is at its sign-in screen; it can record once someone signs in',
   audio_not_allowed: "this device's owner hasn't allowed computer audio in a remote recording",
-  // #1760 — a fact about the device (a Mac, until ScreenCaptureKit; a build
-  // without audio), named ahead of the owner's gate because no setting fixes
-  // it. Also what greys the box out before any start (`audioUnavailable`).
+  // #1760 — a fact about the device (a Mac before agent 0.4.161, FR-97 P2a; a
+  // build without audio), named ahead of the owner's gate because no setting
+  // fixes it. Also what greys the box out before any start (`audioUnavailable`).
   audio_unsupported:
-    "this device can't record what the computer plays (Windows and Linux devices only, for now)",
+    "this device can't record what the computer plays (a Mac can, from agent 0.4.161)",
   busy: 'a recording is already running on this device',
   already_starting: 'a recording is already starting',
   consent_denied: 'the person at the device said no',
