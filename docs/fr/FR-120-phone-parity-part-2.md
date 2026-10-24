@@ -1,7 +1,8 @@
 # FR-120: Phone parity, part 2 — nothing a phone user needs is hover-only, clipped, or a page away
 
-**Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** proposed 2026-10-24 — spec and claim;
-nothing built yet · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
+**Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** in progress — P5 (#2843) and P2
+(#2845) on production since 2026-10-24 20:34Z (`hosted-20261024-fa90220`), P3 (#2848) since 20:47Z
+(`hosted-20261024-9ea48a1`); P1a (#2850) in review; P1b, P4, P6, P7 to come · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (#2561, closed 2026-10-23: the same facts and actions at every width, and
 the rules in `docs/ui.md` § Phones and tablets)
 
@@ -100,11 +101,11 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P1** | tap paths for hover-only facts; disabled reasons as text | revert: UI only | the sweep's hover-only count on the touched routes, red then green on production | M |
-| **P2** | hive on a phone | revert: UI only | the hive routes at 360 px in the vmtest org (hive is on there) | M |
-| **P3** | dialogs and rows | revert: UI only | each dialog opened at 360 px | M |
+| **P1** — P1a #2850 (the facts) · P1b (the viewer, Vault) | tap paths for hover-only facts; disabled reasons as text | revert: UI only | the sweep's hover-only count on the touched routes, red then green on production | M |
+| **P2** — #2845 | hive on a phone | revert: UI only | the hive routes at 360 px in the vmtest org (hive is on there) | M |
+| **P3** — #2848 | dialogs and rows | revert: UI only | each dialog opened at 360 px | M |
 | **P4** | long pages | revert: UI only | the sweep's heights, red then green | L |
-| **P5** | the bugs | revert: UI only | the tutorial at 360 and 1300 px; sign-in's `scrollWidth` | S |
+| **P5** — #2843 | the bugs | revert: UI only | the tutorial at 360 and 1300 px; sign-in's `scrollWidth` | S |
 | **P6** | touch targets | revert: CSS only | the sweep's small-target count on a coarse pointer; desktop pixel-identical | S |
 | **P7** | docs | — | CI | S |
 
@@ -119,8 +120,10 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
   clips its own text or button at 360 px.
 - [ ] **AC4**: Devices, the exec and SSH audits, Billing, Files, Members and Invites are each at most 2× their desktop
   height at 360 px for the same data (§2.1 is the baseline).
-- [ ] **AC5**: the tutorial's chapter navigation brings the chapter's top into view at 360 and 1300 px.
-- [ ] **AC6**: no page-level sideways scroll at 360 and 390 px on any public page (sign-in, sign-up, landing, legal).
+- [x] **AC5**: the tutorial's chapter navigation brings the chapter's top into view at 360 and 1300 px. *(Field-verified
+  on production 2026-10-24 20:45Z, `hosted-20261024-fa90220`: 486 → 76 px at 360, −1,080 → 76 px at 1300; §8.)*
+- [x] **AC6**: no page-level sideways scroll at 360 and 390 px on any public page (sign-in, sign-up, landing, legal).
+  *(Field-verified on production 2026-10-24 20:49Z: all five public pages 0 px at both widths; §8.)*
 - [ ] **AC7**: on a coarse pointer, every primary button and chip on the swept routes has a hit area of at least
   36 px, with desktop pixel-identical at 1300 px.
 - [ ] **AC8**: the operator tables (Observability, Growth, machine keys) keep their action on screen at 360 px.
@@ -147,6 +150,12 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 | date | build | host | result |
 |---|---|---|---|
 | 2026-10-24 18:17–18:30Z | production, `hosted-20261024-b78373e` (entry `index-4xvzWYX1.js`) | the vmtest org from mars (§2.1's instrument); a first run died at 18:06Z when mars's `roomlerd` updated to 0.4.165 under it, and this one ran in a transient systemd unit | 🔴 **the baseline**: §2.1's numbers. Sign-in scrolls sideways; Devices 3.7× and the audits 3.3–3.6× desktop; analytics 136 hover-only facts; 28 px buttons |
+| 2026-10-24 18:47–18:48Z | P5 (#2843) before merge: production (`index-4xvzWYX1.js`) vs the branch's `ui/dist` served at the production origin (`index-Mv5fx5ME.js`) | the vmtest org from mars | 🔴 → 🟢 **AC6**: sign-in and sign-up scroll 4 px sideways at 360 and 390 px on production; 0 on the branch. **AC5**: a chapter tap at 360 px leaves the chapter's top at 486 px on production and brings it to 76 px on the branch. At 1300 px, after scrolling the chapter to −1,080 px, a click leaves it at −992 px on production and brings it to 76 px on the branch. A click while the chapter is in view does not jump on either |
+| 2026-10-24 19:18–19:19Z | P2 (#2845) before merge: production (`index-4xvzWYX1.js`) vs the branch (`index-CDr5ZGBf.js`) | the vmtest org from mars: 42 agent sessions (refused or ended, some adopted), an empty memory | 🔴 → 🟢 **AC2**: a row's title and subtitle get 30–56 % of the 344 px row on production, 74 % on every row on the branch. The Start and People dialogs go from 312 px cards to full screen with a close. The transcript header's status chip goes from 46 px and its reason from 30 px to wrapping, both shown in full. Memory goes from three open cards (1,112 px, v-main scrolling 4 px sideways) to three closed panels (428 px, 0). Not reachable in this org, so covered by unit tests: the row menu (no live session) and the pager (42 sessions, fewer than 50) |
+| 2026-10-24 19:41–19:42Z | P3 (#2848) before merge: production (`index-4xvzWYX1.js`) vs the branch (`index-BUiW1ZBa.js`) | the vmtest org from mars; dialogs opened only, each closed with Escape; one throwaway room made and deleted | 🔴 → 🟢 **AC3**: the Devices page's evict, update-all, delete, add-to-an-org and routes dialogs, a member's roles and GIFs go from 312 px cards (only GIFs had a close) to full screen, each with a close. The evict question was clipped before the device's name began, and rotate-key's partway through it; both now wrap. Overlay routes' device chip goes from 58 px to 117 px. Roles' title row clips **New Role** at 320 px on production and wraps on the branch; it is one line at 360 px on both. A call's header was measured and left as is: before joining, the name gets 136 px beside a 136 px spacer, and a joined call's two extra 48 px buttons fit inside that spacer |
+| 2026-10-24 20:43–20:44Z | P1a (#2850) before merge: production after tonight's roll (`index-BALEqlEN.js`) vs the branch (`index-D2E_XMBH.js`) | the vmtest org from mars; read-only | 🔴 → 🟢 **AC1, the facts half**: the Devices page goes from 10 title-only status dots and 19 chips whose title neither opened nor acted to 0 and 0, and a tap on a chip opens its explanation. Analytics goes from 498 title-only uptime segments to 0; the bar goes from 118 to 312 px of its row, and a tap reads the period into the line below. The mesh graph goes from 320 px in a 312 px box with no hit line to 312 px with three hit lines, and a tap pins a carrier's line. Not caused by the graph: the dashboard's v-main scrolls 4 px sideways on both builds, recorded for P4/P5. The viewing windows have no data in this org, so unit tests cover them. A wrong turn, recorded: the first branch run clicked raw coordinates below the fold (`elementFromPoint` was null); a tap scrolled into view reads the period |
+| 2026-10-24 20:45–20:49Z | production, `hosted-20261024-fa90220` (entry `index-BALEqlEN.js`): P5 and P2 live (roomler-hive's roll; promote run 40130081897, pods on it since 20:34Z) | the vmtest org from mars; signed out for the public pages | 🟢 **AC5**: a chapter tap at 360 px brings the chapter's top from 486 to 76 px; at 1300 px, after scrolling it to −1,080 px, a click brings it to 76 px; no jump while it is in view. **AC6**: 0 px sideways at 360 and 390 px on the landing page, sign-in, sign-up, terms and privacy. That run was at 20:49Z, by then on 9ea48a1's build, but P3 changed no public page. **AC2**: rows give 74 % of the 344 px row to text; Start and People are full screen with a close; the transcript header wraps with every control on screen; memory shows three closed panels at 428 px; 1300 px is unchanged. Still unproven in the field: the row menu (no live session here), the pager (42 sessions, fewer than 50), and the Copies, Purge, Manage, Add-a-copy and Edit-a-fact dialogs (they need a copied org or a kept fact; their structure is unit-tested) |
+| 2026-10-24 20:59Z | production, `hosted-20261024-9ea48a1` (entry `index-I_6uz4_G.js`): P3 live (promote run 40131310876, pods on it since 20:47Z); `/health` ok at 0.4.166; the vmtest org had 4 devices online before and 4 after | the vmtest org from mars; dialogs opened only; one throwaway room made and deleted | 🟢 **AC3**, the same results as the branch before merge: the five Devices dialogs, a member's roles and GIFs are full screen with a close; the evict and rotate-key questions wrap with the device's name visible; the routes chip is shown whole; Roles is one line at 360 px and wraps at 320 px; at 1300 px the dialog is a centred card. Not field-run: the viewer's agent-log dialog, which needs a live session (`fr120P3Dialogs.spec.ts` locks its structure) |
 
 ## 9. Related
 
