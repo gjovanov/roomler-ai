@@ -155,3 +155,20 @@ runs:
             sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
           fi
           ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
+
+      # 2026-10-24: bindgen 0.68.1 makes libvpx's encoder config opaque under
+      # libclang 22, the newest on the ubuntu-26.04 image; see the action.
+      # Every caller runs this composite after its rust-cache restore, which
+      # the action needs, since it drops env-libvpx-sys's restored build.
+      - name: Point bindgen at the distro's libclang
+        uses: ./.github/actions/bindgen-libclang
+
+      # 2026-10-24: ubuntu-26.04's CMake is 4.x, which refuses a
+      # `cmake_minimum_required` below 3.5, and audiopus_sys's bundled libopus
+      # declares one (`full` carries `audio`). The release builds and the
+      # macOS check set the same variable. On Linux it stayed hidden while the
+      # lanes restored an audiopus build from their caches, until #2835's run
+      # built it again and rust-lint failed configuring Opus.
+      - name: Let CMake 4 configure audiopus_sys's bundled libopus
+        shell: bash
+        run: echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
