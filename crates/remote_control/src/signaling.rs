@@ -1785,6 +1785,39 @@ pub enum ClientMsg {
         why: String,
     },
 
+    /// FR-90 P4-5 — the device's answer to a [`ServerMsg::KnowhowProbe`]: how
+    /// the probe ended, the round trip of its connect, the address it
+    /// connected to (one it resolved and checked), and for `tls` what the
+    /// leaf certificate showed. Recorded only when this connection's device
+    /// is the one the probe was sent to, and only once.
+    ///
+    /// ⚠️ `tls` travels as raw JSON, read by
+    /// [`crate::knowhow::ProbeTls::read`]: one this build cannot read goes
+    /// unmeasured, and the answer around it is still recorded.
+    #[serde(rename = "rc:knowhow.probed")]
+    KnowhowProbed {
+        #[serde(with = "oid_hex")]
+        probe_id: ObjectId,
+        /// An unknown word, or none, is `failed`, never `ok`.
+        #[serde(
+            default = "crate::knowhow::probe_failed",
+            deserialize_with = "crate::knowhow::probe_outcome_lenient"
+        )]
+        outcome: crate::knowhow::ProbeOutcome,
+        /// The connect's round trip, in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<u32>,
+        /// The address the connect went to, as an IP literal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tls: Option<serde_json::Value>,
+        /// Why a probe was not measured, in a few words. Capped by the
+        /// device, re-clamped on receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2730,6 +2763,7 @@ impl ClientMsg {
             ClientMsg::KnowhowSearch { .. } => "rc:knowhow.search",
             ClientMsg::KnowhowGet { .. } => "rc:knowhow.get",
             ClientMsg::KnowhowPropose { .. } => "rc:knowhow.propose",
+            ClientMsg::KnowhowProbed { .. } => "rc:knowhow.probed",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2862,7 +2896,8 @@ impl ClientMsg {
             ClientMsg::KnowhowScanned { .. }
             | ClientMsg::KnowhowSearch { .. }
             | ClientMsg::KnowhowGet { .. }
-            | ClientMsg::KnowhowPropose { .. } => Owner::Knowhow,
+            | ClientMsg::KnowhowPropose { .. }
+            | ClientMsg::KnowhowProbed { .. } => Owner::Knowhow,
         }
     }
 }
@@ -2920,6 +2955,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:knowhow.search", Owner::Knowhow),
     ("rc:knowhow.get", Owner::Knowhow),
     ("rc:knowhow.propose", Owner::Knowhow),
+    ("rc:knowhow.probed", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -5039,6 +5075,29 @@ pub enum ServerMsg {
     /// [`crate::knowhow::SessionRefusal`].
     #[serde(rename = "rc:knowhow.refused")]
     KnowhowRefused { req_id: String, reason: String },
+
+    /// FR-90 P4-5 — a probe, asked of a device whose last hello advertised
+    /// [`crate::models::RpcCap::KnowhowProbe`]: reach `host` on `port` as
+    /// `kind` says ([`crate::knowhow::ProbeKind`], decision 55), but only when
+    /// the device's own `knowhow_probe_reach` allows it (decision 53), and
+    /// answer [`ClientMsg::KnowhowProbed`] naming `probe_id`. The server read
+    /// the target from the map's facts, never from a request, and the
+    /// device's list decides whether it is reached. Sent again at a hello
+    /// while unanswered, so a device runs a probe id once.
+    ///
+    /// `kind` is a word, not the enum: a kind a newer server sends reaches an
+    /// older device whole, which answers `failed` rather than never.
+    #[serde(rename = "rc:knowhow.probe")]
+    KnowhowProbe {
+        #[serde(with = "oid_hex")]
+        probe_id: ObjectId,
+        kind: String,
+        host: String,
+        port: u16,
+        /// The server name a `tls` probe sends, when the map names one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sni: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -7089,6 +7148,88 @@ mod tests {
                 } => {
                     assert_eq!(scan_id, scan);
                     assert_eq!(outcome, ScanOutcome::Failed, "{newer}");
+                }
+                other => panic!("not an answer: {other:?}"),
+            }
+        }
+    }
+
+    /// FR-90 P4-5 — a probe and its answer: the probe names its target as the
+    /// server read it, its kind a word and its server name only when there
+    /// is one; the answer's outcome is `failed` for a word this build does not
+    /// know, or none, and its `tls` travels as raw JSON.
+    #[test]
+    fn knowhow_probe_frames_wire_shape_is_locked() {
+        use crate::knowhow::ProbeOutcome;
+
+        let probe = ObjectId::new();
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowProbe {
+                probe_id: probe,
+                kind: "tcp".into(),
+                host: "10.0.4.12".into(),
+                port: 5432,
+                sni: None,
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.probe", "probe_id": probe.to_hex(),
+                               "kind": "tcp", "host": "10.0.4.12", "port": 5432})
+        );
+        let newer = serde_json::json!({"t": "rc:knowhow.probe", "probe_id": probe.to_hex(),
+                                       "kind": "http", "host": "api.example.com", "port": 443,
+                                       "sni": "api.example.com"});
+        match serde_json::from_value::<ServerMsg>(newer).unwrap() {
+            ServerMsg::KnowhowProbe { kind, sni, .. } => {
+                assert_eq!(
+                    kind, "http",
+                    "a kind this build does not know arrives whole"
+                );
+                assert_eq!(sni.as_deref(), Some("api.example.com"));
+            }
+            other => panic!("not a probe: {other:?}"),
+        }
+        let answer = ClientMsg::KnowhowProbed {
+            probe_id: probe,
+            outcome: ProbeOutcome::NotAllowed,
+            rtt_ms: None,
+            address: None,
+            tls: None,
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.probed", "probe_id": probe.to_hex(),
+                               "outcome": "not_allowed"}),
+            "an empty answer carries its id and its outcome alone"
+        );
+        assert_eq!(answer.namespace(), Owner::Knowhow);
+        assert_eq!(answer.wire_tag(), "rc:knowhow.probed");
+        let measured = serde_json::json!({"t": "rc:knowhow.probed", "probe_id": probe.to_hex(),
+                                          "outcome": "ok", "rtt_ms": 12, "address": "10.0.4.12",
+                                          "tls": {"names": ["db.example.com"], "fingerprint": "ab",
+                                                  "chain": "newer"}});
+        match serde_json::from_value::<ClientMsg>(measured).unwrap() {
+            ClientMsg::KnowhowProbed {
+                outcome,
+                rtt_ms,
+                address,
+                tls,
+                ..
+            } => {
+                assert_eq!((outcome, rtt_ms), (ProbeOutcome::Ok, Some(12)));
+                assert_eq!(address.as_deref(), Some("10.0.4.12"));
+                assert!(tls.is_some(), "a tls this build cannot read still decodes");
+            }
+            other => panic!("not an answer: {other:?}"),
+        }
+        for newer in [
+            serde_json::json!({"t": "rc:knowhow.probed", "probe_id": probe.to_hex(),
+                               "outcome": "half_open"}),
+            serde_json::json!({"t": "rc:knowhow.probed", "probe_id": probe.to_hex()}),
+        ] {
+            match serde_json::from_value::<ClientMsg>(newer.clone()).unwrap() {
+                ClientMsg::KnowhowProbed { outcome, .. } => {
+                    assert_eq!(outcome, ProbeOutcome::Failed, "{newer}");
                 }
                 other => panic!("not an answer: {other:?}"),
             }

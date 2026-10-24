@@ -194,10 +194,10 @@ sequenceDiagram
 ```
 
 - **The data is the viewer's own preset**, stored as it is: rows of buttons, d-pads and sticks
-  ([`models.rs:5716`](../crates/remote_control/src/models.rs#L5716) `TouchPreset`). P4 adds one action
+  ([`models.rs:5729`](../crates/remote_control/src/models.rs#L5729) `TouchPreset`). P4 adds one action
   beside a chord of keys and a mouse button: a **macro**, a list of steps, each a key or a mouse button
   pressed, released or tapped, then a wait
-  ([`models.rs:5834`](../crates/remote_control/src/models.rs#L5834) `MacroStep`).
+  ([`models.rs:5847`](../crates/remote_control/src/models.rs#L5847) `MacroStep`).
 - **Who:** any member reads them, since every viewer in the org offers them. Writing takes `MANAGE_TENANT`,
   like the org's session policy, because a stored preset runs on every member's viewer
   ([`touch_presets.rs:88`](../crates/modules/remote/src/touch_presets.rs#L88) `list`,
@@ -207,13 +207,13 @@ sequenceDiagram
   is a 404 that leaks nothing
   ([`touch_presets.rs:152`](../crates/modules/remote/src/touch_presets.rs#L152) `update`,
   [`touch_presets.rs:185`](../crates/modules/remote/src/touch_presets.rs#L185) `delete`).
-- **Read strictly** ([`models.rs:5888`](../crates/remote_control/src/models.rs#L5888) `validate`). Each
+- **Read strictly** ([`models.rs:5901`](../crates/remote_control/src/models.rs#L5901) `validate`). Each
   refusal is a 422 with a code, and nothing is stored:
 
   | Refused | Code |
   |---|---|
   | an unknown field at any level, a key past a byte, a malformed body | `invalid_json` |
-  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5863`](../crates/remote_control/src/models.rs#L5863) `touch_key_ok`) | `key_invalid` |
+  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5876`](../crates/remote_control/src/models.rs#L5876) `touch_key_ok`) | `key_invalid` |
   | a name empty, over 48 characters or with a control character | `name_empty`, `name_invalid` |
   | a label over 16 characters, an id over 32 or repeated within the preset | `label_invalid`, `id_invalid`, `id_duplicate` |
   | no controls or more than 24, an empty row or one of more than 12 buttons, a chord of more than 4 keys | `no_controls`, `too_many_controls`, `row_buttons`, `chord_keys` |

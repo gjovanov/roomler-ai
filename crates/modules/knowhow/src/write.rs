@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 //! What every write to the map shares, a person's (the routes), the fleet's
-//! (the sync), a device's (a scan) or a session's (a proposal): the stamp
-//! its history row carries, the row appended after it, and an archive that
-//! takes an entity's links with it.
+//! (the sync), a device's (a scan or a probe) or a session's (a proposal):
+//! the stamp its history row carries, the row appended after it, and an
+//! archive that takes an entity's links with it.
 
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use roomler_ai_services::dao::base::DaoResult;
@@ -12,8 +12,8 @@ use tracing::error;
 use crate::KnowhowState;
 use crate::dao::MAX_EDGES;
 use crate::model::{
-    KnowhowHistory, OP_ARCHIVE, Provenance, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SESSION,
-    SOURCE_SYNC, STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
+    KnowhowHistory, OP_ARCHIVE, Provenance, SOURCE_PERSON, SOURCE_PROBE, SOURCE_SCAN,
+    SOURCE_SESSION, SOURCE_SYNC, STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
 };
 
 /// The links an archive takes with it, per read.
@@ -84,6 +84,20 @@ impl Stamp {
             session: Some(session),
             why: Some(why),
             source: SOURCE_SESSION,
+            at: DateTime::now(),
+        }
+    }
+
+    /// A probe's record of what it measured (P4-5): the device that probed,
+    /// and no person. It sets no fact's value, so it is no fact's source.
+    pub(crate) fn probe(tid: ObjectId, device: ObjectId) -> Self {
+        Self {
+            tid,
+            by: None,
+            device: Some(device),
+            session: None,
+            why: None,
+            source: SOURCE_PROBE,
             at: DateTime::now(),
         }
     }

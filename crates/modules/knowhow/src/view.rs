@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use crate::dao::EntityNode;
 use crate::model::{
-    Fact, KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, ScanCounts, ScanWritten,
+    Fact, KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowProbe, KnowhowScan, Measured,
+    ProbeTlsSeen, ScanCounts, ScanWritten, Verified,
 };
 
 pub(crate) fn rfc3339(t: DateTime) -> String {
@@ -106,6 +107,9 @@ pub struct FactView {
     pub observed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<String>,
+    /// P4-5 — what the last probe that measured it found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<VerifiedView>,
     pub status: String,
 }
 
@@ -122,7 +126,34 @@ impl FactView {
             confirmed_at: f.confirmed.map(|c| rfc3339(c.at)),
             observed_at: rfc3339(f.observed_at),
             verified_at: f.verified_at.map(rfc3339),
+            verified: f.verified.as_ref().map(VerifiedView::of),
             status: f.status.clone(),
+        }
+    }
+}
+
+/// P4-5 — what one probe measured of a fact.
+#[derive(Serialize, Debug)]
+pub struct VerifiedView {
+    pub at: String,
+    pub probe: String,
+    pub from_device: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
+    pub ok: bool,
+}
+
+impl VerifiedView {
+    pub fn of(v: &Verified) -> Self {
+        Self {
+            at: rfc3339(v.at),
+            probe: v.probe.to_hex(),
+            from_device: v.from_device.to_hex(),
+            rtt_ms: v.rtt_ms,
+            carrier: v.carrier.clone(),
+            ok: v.ok,
         }
     }
 }
@@ -321,6 +352,80 @@ impl ScanView {
             truncated: s.truncated,
             detail: s.detail.clone(),
             written: s.written,
+        }
+    }
+}
+
+/// P4-5 — one probe asked of a device: its target as the server read it,
+/// where it is, and what it measured. "The device may not reach it"
+/// (`not_allowed`) and "it did not answer" (`unreachable`) are two states.
+#[derive(Serialize, Debug)]
+pub struct ProbeView {
+    pub id: String,
+    pub entity_id: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub requested_at: String,
+    pub kind: String,
+    pub target: TargetView,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ProbeTlsSeen>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub measured: Vec<Measured>,
+}
+
+/// A probe's target: the host, the fact it was read from, the port, and a
+/// `tls` probe's server name.
+#[derive(Serialize, Debug)]
+pub struct TargetView {
+    pub host: String,
+    pub from: String,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+}
+
+impl ProbeView {
+    pub fn of(p: &KnowhowProbe) -> Self {
+        Self {
+            id: hex(p.id),
+            entity_id: p.entity_id.to_hex(),
+            device_id: p.device_id.to_hex(),
+            requested_by: p.requested_by.map(|u| u.to_hex()),
+            session: p.session.map(|s| s.to_hex()),
+            requested_at: rfc3339(p.requested_at),
+            kind: p.kind.clone(),
+            target: TargetView {
+                host: p.target.host.clone(),
+                from: p.target.host_path.clone(),
+                port: p.target.port,
+                sni: p.target.sni.clone(),
+            },
+            state: p.state.clone(),
+            delivered_at: p.delivered_at.map(rfc3339),
+            answered_at: p.answered_at.map(rfc3339),
+            rtt_ms: p.rtt_ms,
+            address: p.address.clone(),
+            carrier: p.carrier.clone(),
+            tls: p.tls.clone(),
+            detail: p.detail.clone(),
+            measured: p.measured.clone(),
         }
     }
 }

@@ -20,8 +20,9 @@ use roomler_ai_services::dao::base::{BaseDao, DaoResult, escape_regex};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowScan, SCAN_DELIVERED, SCAN_EXPIRED,
-    SCAN_REQUESTED, SOURCE_SCAN, STATUS_ARCHIVED, ScanWritten,
+    KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowProbe, KnowhowScan, Measured,
+    PROBE_DELIVERED, PROBE_EXPIRED, PROBE_REQUESTED, SCAN_DELIVERED, SCAN_EXPIRED, SCAN_REQUESTED,
+    SOURCE_SCAN, STATUS_ARCHIVED, ScanWritten,
 };
 
 /// The most live entities an organization's map holds.
@@ -560,6 +561,152 @@ impl ScanDao {
             .base
             .collection()
             .find(doc! { "tenant_id": tenant_id, "device_id": device_id })
+            .sort(doc! { "requested_at": -1, "_id": -1 })
+            .limit(limit)
+            .await?;
+        Ok(cursor.try_collect().await?)
+    }
+}
+
+/// P4-5 — how long a probe waits for its answer before it is `expired`, in
+/// seconds: a probe's own deadline is ten seconds, so ten minutes is a
+/// device that was away.
+pub const PROBE_ANSWER_SECS: i64 = 10 * 60;
+/// How long a probe's record is kept, in seconds: 90 days.
+pub const PROBE_KEEP_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// P4-5 — the probes asked of devices: each step a compare-and-set on the
+/// row's state, as a scan's are, so a device whose connection moved between
+/// pods is told once and answered once.
+pub struct ProbeDao {
+    pub base: BaseDao<KnowhowProbe>,
+}
+
+impl ProbeDao {
+    pub fn new(db: &Database) -> Self {
+        Self {
+            base: BaseDao::new(db, KnowhowProbe::COLLECTION),
+        }
+    }
+
+    /// A new probe. `DuplicateKey` when the device already has one pending.
+    pub async fn create(&self, probe: &KnowhowProbe) -> DaoResult<ObjectId> {
+        self.base.insert_one(probe).await
+    }
+
+    /// The device's pending probe, requested or delivered.
+    pub async fn pending_for(
+        &self,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+    ) -> DaoResult<Option<KnowhowProbe>> {
+        self.base
+            .find_one(doc! { "tenant_id": tenant_id, "device_id": device_id, "pending": true })
+            .await
+    }
+
+    /// The probes asked of these devices and not yet delivered.
+    pub async fn requested_for(&self, devices: &[ObjectId]) -> DaoResult<Vec<KnowhowProbe>> {
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.base
+            .find_many(
+                doc! { "device_id": { "$in": devices.to_vec() }, "state": PROBE_REQUESTED },
+                Some(doc! { "requested_at": 1 }),
+            )
+            .await
+    }
+
+    /// Requested → delivered: `true` for the one caller that moved it, who
+    /// then sends it.
+    pub async fn deliver(&self, id: ObjectId, now: DateTime) -> DaoResult<bool> {
+        let r = self
+            .base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "state": PROBE_REQUESTED },
+                doc! { "$set": { "state": PROBE_DELIVERED, "delivered_at": now } },
+            )
+            .await?;
+        Ok(r.modified_count == 1)
+    }
+
+    /// Delivered → requested, for a probe that could not go out.
+    pub async fn undeliver(&self, id: ObjectId) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "state": PROBE_DELIVERED },
+                doc! { "$set": { "state": PROBE_REQUESTED }, "$unset": { "delivered_at": "" } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A delivered probe sent again (a hello, the connection it went to gone).
+    pub async fn redelivered(&self, id: ObjectId, now: DateTime) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id, "state": PROBE_DELIVERED },
+                doc! { "$set": { "delivered_at": now } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The device's answer, once: `None` when the probe is not this device's,
+    /// not pending, or answered already.
+    pub async fn answer(
+        &self,
+        id: ObjectId,
+        tenant_id: ObjectId,
+        device_id: ObjectId,
+        set: Document,
+    ) -> DaoResult<Option<KnowhowProbe>> {
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": id, "tenant_id": tenant_id, "device_id": device_id, "pending": true },
+                doc! { "$set": set, "$unset": { "pending": "" } },
+            )
+            .return_document(ReturnDocument::After)
+            .await?)
+    }
+
+    /// What an answered probe recorded on its entity's facts.
+    pub async fn measured(&self, id: ObjectId, measured: &[Measured]) -> DaoResult<()> {
+        self.base
+            .collection()
+            .update_one(
+                doc! { "_id": id },
+                doc! { "$set": { "measured": bson::to_bson(measured)? } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every pending probe asked before `cutoff`: expired.
+    pub async fn expire_before(&self, cutoff: DateTime) -> DaoResult<u64> {
+        let r = self
+            .base
+            .collection()
+            .update_many(
+                doc! { "pending": true, "requested_at": { "$lt": cutoff } },
+                doc! { "$set": { "state": PROBE_EXPIRED }, "$unset": { "pending": "" } },
+            )
+            .await?;
+        Ok(r.modified_count)
+    }
+
+    /// An entity's probes or a device's, newest first, at most `limit`.
+    pub async fn list(&self, filter: Document, limit: i64) -> DaoResult<Vec<KnowhowProbe>> {
+        let cursor = self
+            .base
+            .collection()
+            .find(filter)
             .sort(doc! { "requested_at": -1, "_id": -1 })
             .limit(limit)
             .await?;

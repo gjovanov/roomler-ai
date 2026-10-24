@@ -61,18 +61,19 @@ const SEND_WAIT: Duration = Duration::from_secs(2);
 
 // ─── this pod's connections ─────────────────────────────────────────────────
 
-/// The connections on this pod of devices that can scan, by device: a newer
-/// connection replaces an older one, and a closing one takes only its own.
+/// The connections on this pod of devices that can scan or probe (P4-5), by
+/// device: a newer connection replaces an older one, and a closing one takes
+/// only its own.
 #[derive(Default)]
 pub struct Links {
     by_device: Mutex<HashMap<ObjectId, Link>>,
 }
 
 #[derive(Clone)]
-struct Link {
+pub(crate) struct Link {
     conn_id: String,
     tenant_id: ObjectId,
-    tx: mpsc::Sender<ServerMsg>,
+    pub(crate) tx: mpsc::Sender<ServerMsg>,
 }
 
 impl Links {
@@ -89,7 +90,7 @@ impl Links {
 
     /// The device's connection on this pod, in `tenant_id`. A connection
     /// whose socket is gone is forgotten here.
-    fn get(&self, device: ObjectId, tenant_id: ObjectId) -> Option<Link> {
+    pub(crate) fn get(&self, device: ObjectId, tenant_id: ObjectId) -> Option<Link> {
         let mut map = self.lock();
         let link = map.get(&device)?.clone();
         if link.tx.is_closed() {
@@ -100,7 +101,7 @@ impl Links {
     }
 
     /// Every device connected here.
-    fn devices(&self) -> Vec<ObjectId> {
+    pub(crate) fn devices(&self) -> Vec<ObjectId> {
         let mut map = self.lock();
         map.retain(|_, l| !l.tx.is_closed());
         map.keys().copied().collect()
@@ -199,8 +200,9 @@ async fn deliver(state: &KnowhowState, scan: &KnowhowScan, link: &Link) {
     }
 }
 
-/// A device's hello on this pod: link its connection when it can scan, and
-/// send what was asked while it was away, or sent to a connection that died.
+/// A device's hello on this pod: link its connection when it can scan or
+/// probe, and send what was asked while it was away, or sent to a connection
+/// that died: its scan, and (P4-5) its probe.
 pub(crate) async fn hello(state: &KnowhowState, ctx: &AgentCtx) {
     let agent = match state
         .agents
@@ -210,11 +212,13 @@ pub(crate) async fn hello(state: &KnowhowState, ctx: &AgentCtx) {
         Ok(agent) => agent,
         Err(DaoError::NotFound) => return,
         Err(e) => {
-            warn!(device = %ctx.agent_id, %e, "knowhow: a hello's device was not read; its scans wait for the next");
+            warn!(device = %ctx.agent_id, %e, "knowhow: a hello's device was not read; its scans and probes wait for the next");
             return;
         }
     };
-    if refusal(&agent).is_some() {
+    let scans = refusal(&agent).is_none();
+    let probes = crate::probe::refusal(&agent).is_none();
+    if !scans && !probes {
         return;
     }
     let link = Link {
@@ -223,12 +227,17 @@ pub(crate) async fn hello(state: &KnowhowState, ctx: &AgentCtx) {
         tx: ctx.tx.clone(),
     };
     state.links.insert(ctx.agent_id, link.clone());
-    match state.scans.pending_for(ctx.tenant_id, ctx.agent_id).await {
-        Ok(Some(scan)) => deliver(state, &scan, &link).await,
-        Ok(None) => {}
-        Err(e) => {
-            warn!(device = %ctx.agent_id, %e, "knowhow: a hello's pending scan was not read; the sweep tries again")
+    if scans {
+        match state.scans.pending_for(ctx.tenant_id, ctx.agent_id).await {
+            Ok(Some(scan)) => deliver(state, &scan, &link).await,
+            Ok(None) => {}
+            Err(e) => {
+                warn!(device = %ctx.agent_id, %e, "knowhow: a hello's pending scan was not read; the sweep tries again")
+            }
         }
+    }
+    if probes {
+        crate::probe::hello(state, ctx, &link).await;
     }
 }
 
@@ -261,12 +270,14 @@ pub async fn sweep_once(state: &KnowhowState) {
     }
 }
 
-/// The sweep, every `secs` seconds on this pod, until the process ends.
+/// The sweep, every `secs` seconds on this pod, until the process ends: the
+/// scans, then (P4-5) the probes.
 pub fn spawn_sweeper(state: KnowhowState, secs: u64) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
             sweep_once(&state).await;
+            crate::probe::sweep_once(&state).await;
         }
     });
 }
