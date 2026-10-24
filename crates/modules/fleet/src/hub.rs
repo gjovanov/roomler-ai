@@ -1522,6 +1522,7 @@ impl Hub {
                     s.privacy_refused,
                     s.features_refused.clone(),
                     s.idle_secs,
+                    s.consent_mode,
                 )
             })
         });
@@ -1532,6 +1533,7 @@ impl Hub {
             existing_privacy_refused,
             existing_features_refused,
             existing_idle_secs,
+            existing_consent_mode,
         )) = existing
         {
             info!(
@@ -1565,6 +1567,8 @@ impl Hub {
                 features_refused: refusals_wire(&existing_features_refused),
                 // FR-101 P4b-2 — and the idle limit it runs under.
                 idle_secs: existing_idle_secs,
+                // #2810 — and who its consent asks.
+                consent_asks: existing_consent_mode.asks(),
             });
             return Ok(existing_id);
         }
@@ -1815,6 +1819,10 @@ impl Hub {
             privacy_refused: privacy_refused.map(str::to_string),
             features_refused: refusals_wire(&features_refused),
             idle_secs: idle_told,
+            // #2810 — who this session's consent asks, so the viewer words its
+            // wait and a timeout or a "no" for that person, not always for
+            // someone at the device.
+            consent_asks: consent_mode.asks(),
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -5404,6 +5412,76 @@ mod tests {
                     assert_eq!(record_refused.as_deref(), Some("device_not_opted_in"));
                 }
                 other => panic!("expected SessionCreated, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2810 — the hub tells the controller who the consent asks, from the
+    /// mode it resolved: nobody for `auto`, the host for `prompt`, the owner
+    /// for `email`/`push`, both for `prompt_then_email`. A duplicate request
+    /// coalesced onto the live session (#1045) must give the same answer, or
+    /// a viewer whose retry rode the same connection would lose its wording.
+    #[tokio::test]
+    async fn the_hub_tells_the_controller_who_the_consent_asks() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            8,
+            true,
+            false,
+        );
+        for mode in [
+            ConsentMode::Auto,
+            ConsentMode::Prompt,
+            ConsentMode::Email,
+            ConsentMode::Push,
+            ConsentMode::PromptThenEmail,
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let user = ObjectId::new();
+            let ask = |hub: &Hub| {
+                hub.create_session_full(
+                    agent_id,
+                    user,
+                    "ctl".into(),
+                    tx.clone(),
+                    Permissions::VIEW,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    false,
+                    mode,
+                    None,
+                    None,
+                    false, // rc_overlay
+                    None,
+                    None,
+                    false,
+                    OrgPolicy::Read(SessionPolicy::default()),
+                    None,
+                    None,
+                    None,
+                    None, // external (FR-52 P4)
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let first = ask(&hub);
+            let second = ask(&hub);
+            assert_eq!(first, second, "{mode:?}: the duplicate must coalesce");
+            for which in ["first", "coalesced"] {
+                match rx.try_recv().unwrap() {
+                    ServerMsg::SessionCreated { consent_asks, .. } => {
+                        assert_eq!(consent_asks, mode.asks(), "{mode:?}, {which}")
+                    }
+                    other => panic!("expected SessionCreated, got {other:?}"),
+                }
             }
         }
     }

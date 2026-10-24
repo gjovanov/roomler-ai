@@ -924,11 +924,11 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2029`](../crates/remote_control/src/signaling.rs#L2029)), `net_grant_id` on `rc:tunnel.opened` ([`:3782`](../crates/remote_control/src/signaling.rs#L3782)) |
+| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2029`](../crates/remote_control/src/signaling.rs#L2029)), `net_grant_id` on `rc:tunnel.opened` ([`:3789`](../crates/remote_control/src/signaling.rs#L3789)) |
 | the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
 | each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
 | the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
-| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:4652`](../crates/remote_control/src/models.rs#L4652)) |
+| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:4687`](../crates/remote_control/src/models.rs#L4687)) |
 | tests | `tunnel::tests` in the network module (3), `policy::tests::a_session_matches_no_subject_yet`, `signaling::tests::tunnel_open_carries_a_grant_and_opened_echoes_its_id`, and end to end [`tunnel_grant_tests.rs`](../crates/tests/src/tunnel_grant_tests.rs) (3) |
 
 #### The device's half: asking, and opening under the grant (P3-7-3a)
