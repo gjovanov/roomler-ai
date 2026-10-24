@@ -1416,30 +1416,8 @@ jobs:
         run: |
           cargo clippy -p roomler-localapi --all-targets -- -D warnings
           cargo test -p roomler-localapi --lib
-      # FR-90 P1i — a Windows session's launcher: a process started SUSPENDED
-      # into a Job Object, with the session's variables over the user's
-      # environment; ending or closing the job ending what it started; the
-      # console-user mapping, the harness and its command line, and
-      # `roomlerd hive-prep`. The whole `win_service::supervisor` suite runs
-      # here too: it ran in no lane before. P1i-2: `hive::` as Windows compiles
-      # it: the toolbelt over its named pipe, processes by creation time, the
-      # store's file in a DACL'd directory. (The supervisor's own tests drive a
-      # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
-      # #2010: `win_service::tests` — the SCM host's own (the STOP_PENDING
-      # report and its order against the supervisor), also in no lane before.
-      # #2465: `win_service::orphan` — which roomlerd is an earlier host's
-      # worker, and the reaper's reads through a real process handle.
-      # FR-90 P3-5b-1: `vault_proxy::` — the vault's proxy engines, against a
-      # fake upstream over real TLS. `proxy` is the only mode a session on
-      # Windows gets (decision 17), and `vault::` does not match the module.
-      # FR-90 P3-8-2a: `ssh_service::` — the SYSTEM service's claim and publish
-      # are `cfg(windows)`, so no other lane runs what they say of one command.
-      - name: Agent sessions on Windows — unit tests (FR-90 P1i)
-        if: ${{ !cancelled() }}
-        # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
-        # as a mapping, and then this whole file fails to parse.
-        run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy:: ssh_service::
+      # FR-90 P1i's agent-session tests run in their own job,
+      # windows-agent-sessions, below (FR-6 wave 27).
 
       # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
       # border and badge, the native consent panel, and the privacy curtain
@@ -1463,6 +1441,77 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           family: windows-clippy
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
+  windows-agent-sessions:
+    # FR-6 wave 27 (#773): FR-90 P1i's agent-session tests, out of
+    # windows-overlay-clippy and into a parallel job. With FR-99 P1b's step
+    # beside them that job had grown to the slowest in this file: 11.2 min on
+    # average over 13 master runs on 10-24 (max 13.3), 4.3-4.7 of it this one
+    # step. Its own cache family, since it builds a test binary whose
+    # dependencies the clippy job's check builds do not share.
+    name: Windows agent sessions (FR-90 P1i)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    # A master push publishes this job's cargo cache as a release asset
+    # (ci-seed-save), which needs `contents: write`.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Salt the cargo cache key with this job's definition
+        uses: ./.github/actions/cargo-cache-salt
+
+      - name: Restore the cargo cache (release-asset store)
+        id: seed
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-sessions
+
+      # FR-90 P1i — a Windows session's launcher: a process started SUSPENDED
+      # into a Job Object, with the session's variables over the user's
+      # environment; ending or closing the job ending what it started; the
+      # console-user mapping, the harness and its command line, and
+      # `roomlerd hive-prep`. The whole `win_service::supervisor` suite runs
+      # here too: it ran in no lane before. P1i-2: `hive::` as Windows compiles
+      # it: the toolbelt over its named pipe, processes by creation time, the
+      # store's file in a DACL'd directory. (The supervisor's own tests drive a
+      # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
+      # #2010: `win_service::tests` — the SCM host's own (the STOP_PENDING
+      # report and its order against the supervisor), also in no lane before.
+      # #2465: `win_service::orphan` — which roomlerd is an earlier host's
+      # worker, and the reaper's reads through a real process handle.
+      # FR-90 P3-5b-1: `vault_proxy::` — the vault's proxy engines, against a
+      # fake upstream over real TLS. `proxy` is the only mode a session on
+      # Windows gets (decision 17), and `vault::` does not match the module.
+      # FR-90 P3-8-2a: `ssh_service::` — the SYSTEM service's claim and publish
+      # are `cfg(windows)`, so no other lane runs what they say of one command.
+      - name: Agent sessions on Windows — unit tests (FR-90 P1i)
+        # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
+        # as a mapping, and then this whole file fails to parse.
+        run: |
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy:: ssh_service::
+
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-sessions
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
 
