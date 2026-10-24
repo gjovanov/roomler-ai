@@ -219,49 +219,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           shared-key: setup-linux
-      - name: Configure apt retries and refresh the index
-        # FR-6 wave 26: before the cached install, as release-agent.yml does.
-        # On a stale index the action resolves versions the mirror has
-        # dropped, installs nothing and still reports success.
-        run: |
-          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
-      - name: Install Tauri Linux system deps (cached apt)
+      - name: Install Tauri Linux system deps (apt seed)
         # webkit2gtk + libsoup + ayatana; librsvg2 for icon decode. Same
         # set as the legacy tunnel wizard (roomler-setup pulls the same
         # Tauri Linux runtime). roomlerd comes in with DEFAULT
         # features (signalling-only) — no vcpkg/FFmpeg/libvpx needed.
         #
-        # FR-6 wave 26 (#773): from the Actions cache, not the mirror. In
-        # rehearsal run 39958936515 the raw apt-get fetched 61.2 MB in
-        # 19 min 34 s (52 kB/s) from azure.archive.ubuntu.com, longer than
-        # the rest of the job together. A tag run restores the set a master
-        # rehearsal saved (the reseed job's). ⚠️ The action keys on the
-        # package list + `version` + CPU arch only, never the OS release:
-        # `u2404` is ubuntu-latest's today, so bump it when that moves.
-        uses: awalsh128/cache-apt-pkgs-action@v1
+        # FR-6 wave 28 (#773): apt-get with last rehearsal's .debs restored
+        # from the seed-cache release first, so the mirror serves only what
+        # changed. Wave 26's cache-apt-pkgs-action entry hit in two of six tag
+        # runs on 10-24 (LRU-evicted twice, its key moved with ubuntu-latest's
+        # 26.04), and one miss waited 19.2 min on azure.archive.ubuntu.com.
+        uses: ./.github/actions/apt-seed-install
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
+          family: setup-linux
           packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf
-          version: setup-linux-u2404-v1
-      - name: Verify the wizard's build deps landed (fallback to apt-get)
-        # Asks what the build consults, never the action's status: a restore
-        # untars files and registers nothing (release-agent.yml's guard).
-        run: |
-          set -euo pipefail
-          pkgs="libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf"
-          check() {
-            sudo ldconfig
-            for m in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 librsvg-2.0 ayatana-appindicator3-0.1; do
-              pkg-config --exists "$m" || { echo "missing: pkg-config module $m"; return 1; }
-            done
-            command -v patchelf >/dev/null || { echo "missing: patchelf"; return 1; }
-          }
-          if ! check; then
-            echo "::warning::the cached apt set did not deliver the wizard's build deps; installing directly"
-            # shellcheck disable=SC2086
-            sudo apt-get install -y --no-install-recommends $pkgs
-          fi
-          check || { echo "::error::the wizard's build deps are still missing after the fallback install"; exit 1; }
       - name: Build wizard (release)
         run: cargo build -p roomler-setup --release
       - name: Strip binary
@@ -298,6 +272,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           shared-key: setup-linux
+      - name: Publish apt seed (rehearsals only)
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/apt-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: setup-linux
 
   # ---------------------------------------------------------------------------
   # 1b. Linux aarch64 (FR-97 P7b) — the same wizard, built on the arm64 runner
@@ -326,36 +308,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           shared-key: setup-linux-arm64
-      - name: Configure apt retries and refresh the index
-        # FR-6 wave 26: see build-linux.
-        run: |
-          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
-      - name: Install Tauri Linux system deps (cached apt)
-        # FR-6 wave 26: see build-linux. Its own key (`u2204`, this runner's
-        # release): never share build-linux's 24.04 entry, or 24.04 libraries
-        # would unpack onto this 22.04 builder.
-        uses: awalsh128/cache-apt-pkgs-action@v1
+      - name: Install Tauri Linux system deps (apt seed)
+        # FR-6 wave 28: see build-linux. The asset is keyed by this runner's
+        # own release (ubuntu22.04), so build-linux's set never unpacks here.
+        uses: ./.github/actions/apt-seed-install
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
+          family: setup-linux-arm64
           packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf
-          version: setup-linux-arm64-u2204-v1
-      - name: Verify the wizard's build deps landed (fallback to apt-get)
-        run: |
-          set -euo pipefail
-          pkgs="libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf"
-          check() {
-            sudo ldconfig
-            for m in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 librsvg-2.0 ayatana-appindicator3-0.1; do
-              pkg-config --exists "$m" || { echo "missing: pkg-config module $m"; return 1; }
-            done
-            command -v patchelf >/dev/null || { echo "missing: patchelf"; return 1; }
-          }
-          if ! check; then
-            echo "::warning::the cached apt set did not deliver the wizard's build deps; installing directly"
-            # shellcheck disable=SC2086
-            sudo apt-get install -y --no-install-recommends $pkgs
-          fi
-          check || { echo "::error::the wizard's build deps are still missing after the fallback install"; exit 1; }
       - name: Build wizard (release)
         run: cargo build -p roomler-setup --release
       - name: Strip binary
@@ -399,6 +360,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           shared-key: setup-linux-arm64
+      - name: Publish apt seed (rehearsals only)
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/apt-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: setup-linux-arm64
 
   # ---------------------------------------------------------------------------
   # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball

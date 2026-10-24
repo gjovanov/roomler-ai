@@ -1,0 +1,56 @@
+name: apt-seed-save
+description: >-
+  FR-6 wave 28 (#773): publish the .deb files apt holds after
+  apt-seed-install as one asset on the rolling `seed-cache` release
+  (`apt-<family>-<ID><VERSION_ID>-<arch>.tar.zst`, clobbered in place). Call
+  it on rehearsals only, after the job's builds; a tag run restores what the
+  last rehearsal published. The calling step passes `env: GH_TOKEN`, and the
+  job needs `contents: write`. Never fails the job.
+
+inputs:
+  family:
+    description: Seed family name (must match the apt-seed-install call)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Pack + publish the .debs
+      shell: bash
+      env:
+        FAMILY: ${{ inputs.family }}
+      run: |
+        set -uo pipefail
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "GH_TOKEN not provided; skipping the apt seed"
+          exit 0
+        fi
+        . /etc/os-release
+        fam="apt-${FAMILY}-${ID}${VERSION_ID}-${RUNNER_ARCH}"
+        # Drop the .debs the index no longer offers (superseded versions), so
+        # the archive holds today's set, not every version ever fetched.
+        sudo apt-get autoclean -qq || true
+        n=$(find /var/cache/apt/archives -maxdepth 1 -name '*.deb' | wc -l)
+        if [ "$n" -eq 0 ]; then
+          echo "no .debs in /var/cache/apt/archives; nothing to publish"
+          exit 0
+        fi
+        pk="$(mktemp -d)"
+        if ! (cd /var/cache/apt/archives && tar --zstd -cf "$pk/${fam}.tar.zst" ./*.deb) \
+           || [ ! -s "$pk/${fam}.tar.zst" ]; then
+          echo "::warning title=apt seed::could not pack ${fam}; nothing published"
+          rm -rf "$pk"
+          exit 0
+        fi
+        echo "${fam}: $n .debs, $(du -h "$pk/${fam}.tar.zst" | cut -f1)"
+        ok=1
+        gh release upload seed-cache "$pk/${fam}.tar.zst" --repo "${GITHUB_REPOSITORY}" --clobber || ok=0
+        rm -rf "$pk"
+        have="$(gh release view seed-cache --repo "${GITHUB_REPOSITORY}" --json assets \
+                 --jq "[.assets[].name] | map(select(. == \"${fam}.tar.zst\")) | length" 2>/dev/null || echo 0)"
+        if [ "$ok" = "1" ] && [ "${have:-0}" -ge 1 ]; then
+          echo "apt seed published: ${fam}"
+        else
+          echo "::warning title=apt seed did not publish::'${fam}' is not on the seed-cache release (upload ok=${ok}); the next tag run downloads from the mirror"
+        fi
+        exit 0
