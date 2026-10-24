@@ -204,6 +204,16 @@ The fix is route meta, not per-view watchers: `meta.remountOn: '<param>'`
 that one param. Every other route stays unkeyed on purpose — several views rewrite
 `route.query` in place and must not remount — so never key by `fullPath`.
 
+**A link clicked inside the app never takes a tab away from a live session (#2841).** A
+page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,
+`connect-session`) and the call (`room-call`). `openInAppLink` (`utils/inAppLink.ts`) opens
+a link from such a page in a new tab. Anywhere else it navigates in place, and a link to
+the page already showing does nothing. The bell (`components/layout/NotificationPanel.vue`)
+goes through it. It is the in-app half of #2827's rule for a push card's click. Measured on
+2026-10-24: a consent request clicked in the bell moved a live viewer to the consent page,
+and the device hung that session up 3 s later. ⚠️ A new view that owns a live session needs
+the flag, or the bell will navigate it away. `inAppLink.spec.ts` locks the three records.
+
 **Stores** use the Pinia setup pattern: `defineStore('name', () => { … })`.
 
 **Vuetify** runs light + dark themes with auto-import tree-shaking via

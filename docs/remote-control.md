@@ -1098,7 +1098,11 @@ no push service, and the owner approved through the bell (the FR-27 log).
 roomler.ai has had a push service since 2026-10-24, and a browser **opts in**
 through the notification panel's *Turn on* (#2817); a page load never prompts.
 A card's click opens its `/consent/<token>` page in a window of its own (#2827):
-the first roomler window may be the very viewer waiting on that answer.
+the first roomler window may be the very viewer waiting on that answer. The bell
+follows the same rule (#2841). From a page that holds a live session, a remote
+viewer or a call, a notification's link opens in a new tab
+([`inAppLink.ts:26`](../ui/src/utils/inAppLink.ts#L26)). A bell click once moved a
+live viewer to the consent page, and the device hung its session up.
 
 **The controller is told who is asked (#2810).** `rc:session.created` carries
 `consent_asks` from the mode the hub resolved:
