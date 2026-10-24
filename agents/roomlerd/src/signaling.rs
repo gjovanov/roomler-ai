@@ -6563,6 +6563,18 @@ async fn handle_server_msg(
                 crate::hive::knowhow_tools::on_card(&req_id, card);
             }
         }
+        // P4-4-2b — a proposal, written.
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowProposed {
+            req_id,
+            what,
+            id,
+            left,
+        } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_proposed(&req_id, what, id, left);
+            }
+        }
         #[cfg(hive_host)]
         ServerMsg::KnowhowRefused { req_id, reason } => {
             if ctx.is_primary {

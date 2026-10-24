@@ -21,10 +21,11 @@ sessions read it too, through their toolbelt.
 > questions: the word that the map is there, a session's search and card,
 > believed from its record and held to its starter's `KNOWHOW_VIEW` (§12),
 > asked through the toolbelt's `knowhow_search` and `knowhow_get` (§12.1); and
-> P4-4-2a, a session's proposals, written `proposed` and naming the session
-> (§12.2).** People, the sync, scans and sessions' proposals fill the map.
-> Windows (P4-3b-4), the toolbelt's `knowhow_propose` (P4-4-2b), probes (P4-5)
-> and `roomler_connect` (P4-6) come with the steps that build them (§13).
+> P4-4-2, a session's proposals, made through the toolbelt's
+> `knowhow_propose`, written `proposed` and naming the session (§12.2).**
+> People, the sync, scans and sessions' proposals fill the map. Windows
+> (P4-3b-4), a person's word on a proposal (P4-4-3), probes (P4-5) and
+> `roomler_connect` (P4-6) come with the steps that build them (§13).
 
 ## 1. A map, not a gate
 
@@ -843,20 +844,22 @@ a session proposed, each for what it is.
 > on, so a knowhow mounted without hive finds no session and refuses every
 > question `not_located`; the `knowhow` build feature implies `hive`.
 
-### 12.1 The toolbelt's tools (P4-4-1b)
+### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b)
 
 The device's half ([`knowhow_tools.rs`](../agents/roomlerd/src/hive/knowhow_tools.rs)):
-two tools in a session's toolbelt, `mcp__roomler__knowhow_search` and
-`mcp__roomler__knowhow_get`, compiled wherever agent sessions are (Linux, macOS,
-Windows), apart from the scanner.
+three tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
+`mcp__roomler__knowhow_get` and (P4-4-2b) `mcp__roomler__knowhow_propose`,
+compiled wherever agent sessions are (Linux, macOS, Windows), apart from the
+scanner.
 
 | Piece | Design |
 |---|---|
 | the verb | every build that runs sessions advertises `knowhow-tools`, so its server tells it whether the map is there |
 | the word | the device forgets `rc:knowhow.served` at every primary connection and keeps the tools it names from that frame on, each only when this build knows it |
-| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment, and its settings allow exactly those (`permissions.allow`), since a read asks no person (decision 39) |
+| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment, and its settings allow exactly those (`permissions.allow`), since neither a read nor a proposal asks a person (decision 39) |
 | the questions | on the primary's connection, a `req_id` each, the session and its fence attached by the daemon, never by the model; each answer matched to its question, 15 s each |
-| the tools | `knowhow_search {q?, kind?, env?, limit?}` and `knowhow_get {kind, key}`, each argument checked before anything is asked; the answer is the map's JSON as text, a refusal an error in words the model can act on |
+| the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on |
+| a proposal unanswered | asked and never answered within its 15 s, it may have been written all the same. The model is told so, and that `knowhow_get` shows whether it was: proposing it again is safe, since one already there is refused `exists` |
 
 > [!WARNING]
 > **A tool the server did not name is an unknown tool.** A newer agent may know
@@ -870,7 +873,8 @@ A session says what it learned as a proposal (decisions 39, 50 and 51),
 answered by [`propose`](../crates/modules/knowhow/src/propose.rs#L114). It
 travels as a question does, on the device's primary connection, and is believed
 as one is: the same checks, in the same order, and the same 120 a minute. The
-server's half is P4-4-2a. The toolbelt's `knowhow_propose` is P4-4-2b's.
+server's half is P4-4-2a. The toolbelt's `knowhow_propose`, which carries it,
+is P4-4-2b's (§12.1).
 
 ```mermaid
 sequenceDiagram
@@ -954,7 +958,6 @@ proposals are counted one at a time.
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-4-2b | the toolbelt's `knowhow_propose`, offered when the server names it (§12.2 is its server's half) |
 | P4-4-3 | a person's word on a proposal: confirmed with who and when, or rejected as the routes already archive (decision 52) |
 | P4-5 | verification: `rc:knowhow.probe`, `knowhow_verify`, a proposal a probe confirms, staleness as decision 40 says |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |

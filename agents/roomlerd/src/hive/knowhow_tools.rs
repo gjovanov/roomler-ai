@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-90 P4-4-1b — the toolbelt's knowhow reads, the device's half (the FR-90
+//! FR-90 P4-4-1b — the toolbelt's knowhow tools, the device's half (the FR-90
 //! spec, §3e "P4-4, a session's reads and proposals, as designed";
 //! `docs/knowhow.md` §12).
 //!
-//! A session asks the organization's map through two tools, `knowhow_search`
-//! and `knowhow_get`. The daemon carries each question on its primary
-//! connection (`rc:knowhow.search`, `rc:knowhow.get`), naming the session and
-//! the fence it runs at; the server believes the session from its record and
-//! answers what its starter may read.
+//! A session asks the organization's map through `knowhow_search` and
+//! `knowhow_get`, and (P4-4-2b) says what it learned through
+//! `knowhow_propose`. The daemon carries each question on its primary
+//! connection (`rc:knowhow.search`, `rc:knowhow.get`, `rc:knowhow.propose`),
+//! naming the session and the fence it runs at; the server believes the
+//! session from its record, answers what its starter may read, and writes a
+//! proposal `proposed`.
 //!
 //! | Piece | Where |
 //! |---|---|
@@ -26,9 +28,11 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::knowhow::{SessionRefusal, TOOL_GET, TOOL_SEARCH, session_limits};
+use roomler_ai_remote_control::knowhow::{
+    SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, session_limits,
+};
 use roomler_ai_remote_control::signaling::ClientMsg;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -36,7 +40,10 @@ use tracing::debug;
 pub(crate) const ANSWER_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Every knowhow tool this build knows, in the order a session is shown them.
-const KNOWN: [&str; 2] = [TOOL_SEARCH, TOOL_GET];
+const KNOWN: [&str; 3] = [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE];
+
+/// The three things a session may propose, by the key that names each.
+const PROPOSALS: [&str; 3] = ["entity", "fact", "link"];
 
 /// What the map answered one question.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +53,13 @@ pub(crate) enum Answer {
         truncated: bool,
     },
     Card(Value),
+    /// P4-4-2b — a proposal, written: what it was, the entity or link it
+    /// wrote, and the proposals the session has left.
+    Proposed {
+        what: String,
+        id: String,
+        left: u32,
+    },
     Refused(String),
 }
 
@@ -192,6 +206,25 @@ impl Client {
         self.ask(&req_id, frame).await
     }
 
+    /// P4-4-2b — `rc:knowhow.propose`, as `session` at `fence`.
+    pub(crate) async fn propose(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        proposal: &Value,
+        why: &str,
+    ) -> Result<Answer, AskError> {
+        let req_id = new_req_id();
+        let frame = ClientMsg::KnowhowPropose {
+            req_id: req_id.clone(),
+            session_id: session,
+            fence,
+            proposal: proposal.clone(),
+            why: why.to_string(),
+        };
+        self.ask(&req_id, frame).await
+    }
+
     /// The questions waiting for an answer.
     #[cfg(test)]
     fn waiting(&self) -> usize {
@@ -227,6 +260,11 @@ pub fn on_card(req_id: &str, card: Value) {
     CLIENT.answered(req_id, Answer::Card(card));
 }
 
+/// P4-4-2b — `rc:knowhow.proposed`.
+pub fn on_proposed(req_id: &str, what: String, id: String, left: u32) {
+    CLIENT.answered(req_id, Answer::Proposed { what, id, left });
+}
+
 /// `rc:knowhow.refused`.
 pub fn on_refused(req_id: &str, reason: String) {
     CLIENT.answered(req_id, Answer::Refused(reason));
@@ -258,6 +296,14 @@ pub(crate) trait KnowhowTools: Send + Sync {
         fence: u64,
         kind: &str,
         key: &str,
+    ) -> Result<Value, String>;
+    /// P4-4-2b — `proposal` holds one key: `entity`, `fact` or `link`.
+    async fn propose(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        proposal: &Value,
+        why: &str,
     ) -> Result<Value, String>;
 }
 
@@ -296,6 +342,26 @@ impl KnowhowTools for DaemonKnowhow {
     ) -> Result<Value, String> {
         read(CLIENT.get(session, fence, kind, key).await)
     }
+
+    async fn propose(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        proposal: &Value,
+        why: &str,
+    ) -> Result<Value, String> {
+        match CLIENT.propose(session, fence, proposal, why).await {
+            // Asked, and never answered: the server may have written it all
+            // the same, and asking again is safe, since one already there is
+            // refused `exists`.
+            Err(AskError::NoAnswer) => Err(
+                "the organization's map did not answer: the proposal may have been written all \
+                 the same, and knowhow_get shows whether it was"
+                    .into(),
+            ),
+            answer => read(answer),
+        }
+    }
 }
 
 /// An answer as the model reads it: what the map said, or why it said
@@ -307,6 +373,12 @@ fn read(answer: Result<Answer, AskError>) -> Result<Value, String> {
             truncated,
         }) => Ok(json!({ "entities": entities, "truncated": truncated })),
         Ok(Answer::Card(card)) => Ok(card),
+        Ok(Answer::Proposed { what, id, left }) => Ok(json!({
+            "proposed": what,
+            "id": id,
+            "status": "proposed",
+            "proposals_left": left,
+        })),
         Ok(Answer::Refused(word)) => Err(refusal(&word)),
         Err(AskError::NotConnected) => Err("this device is not connected to its server".into()),
         Err(AskError::NoAnswer) => Err("the organization's map did not answer".into()),
@@ -443,6 +515,79 @@ pub(crate) fn tools(offered: &[&'static str]) -> Vec<Value> {
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
         }));
     }
+    if offered.contains(&TOOL_PROPOSE) {
+        let named = json!({
+            "type": "object",
+            "description": "an entity on the map, by its kind and key as knowhow_search shows them",
+            "properties": {
+                "kind": {"type": "string"},
+                "key": {"type": "string"},
+            },
+            "required": ["kind", "key"],
+        });
+        out.push(json!({
+            "name": TOOL_PROPOSE,
+            "description": format!(
+                "Propose what this session learned for the organization's map (Roomler knowhow): \
+                 exactly one of a new `entity`, a `fact` of an entity on the map at a path it does \
+                 not hold yet, or a `link` between two entities on the map, with `why` this session \
+                 believes it, in words a person reviewing it can check. It is written `proposed`, \
+                 naming this session, until a person confirms it, and it never changes what is \
+                 there. Machines, a device's own checkouts and listeners, and what the fleet or a \
+                 device's scans say of them are theirs, never a session's. Never put a secret in \
+                 a proposal: one holding a credential's shape is refused whole. At most {} \
+                 proposals a session.",
+                session_limits::MAX_PROPOSALS
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "object",
+                        "description": "a new entity: its kind, a key no entity of that kind holds, and a name; its environment, attributes and facts when known",
+                        "properties": {
+                            "kind": {"type": "string", "description": "repo, checkout, database, cluster, namespace, service, endpoint, bucket, cloud_account, domain, environment, team or doc"},
+                            "key": {"type": "string", "description": "lowercase segments of a-z 0-9 . _ : @ - joined by /, as github.com/acme/api or prod/payments"},
+                            "name": {"type": "string"},
+                            "env": {"type": "string", "description": "one lowercase word, as prod or staging"},
+                            "attrs": {"type": "object"},
+                            "facts": {"type": "object", "description": "path to value, as port or tls.fingerprint"},
+                        },
+                        "required": ["kind", "key", "name"],
+                    },
+                    "fact": {
+                        "type": "object",
+                        "description": "one fact of an entity on the map, at a path it does not hold",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "key": {"type": "string"},
+                            "path": {"type": "string", "description": "a-z 0-9 . _ -, as port or tls.fingerprint"},
+                            "value": {"description": "any JSON but null"},
+                        },
+                        "required": ["kind", "key", "path", "value"],
+                    },
+                    "link": {
+                        "type": "object",
+                        "description": "a link `from` `kind` `to` between two entities on the map",
+                        "properties": {
+                            "from": named.clone(),
+                            "kind": {"type": "string", "description": "runs_on, checked_out_at, deployed_to, depends_on, reads, writes, part_of, owned_by, documented_in, authenticates_with or reachable_via"},
+                            "to": named,
+                            "attrs": {"type": "object"},
+                        },
+                        "required": ["from", "kind", "to"],
+                    },
+                    "why": {
+                        "type": "string",
+                        "description": "why this session believes it: where it saw it",
+                        "maxLength": session_limits::MAX_WHY_CHARS,
+                    },
+                },
+                "required": ["why"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+        }));
+    }
     out
 }
 
@@ -498,6 +643,34 @@ pub(crate) async fn call(
                 return Err("kind and key are required, as knowhow_search shows them".into());
             }
             knowhow.get(session, fence, &kind, &key).await
+        }
+        TOOL_PROPOSE => {
+            let given: Vec<&str> = PROPOSALS
+                .into_iter()
+                .filter(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+                .collect();
+            let what = match given.as_slice() {
+                [one] => *one,
+                _ => return Err("propose exactly one of entity, fact or link".into()),
+            };
+            let Some(body) = args.get(what).filter(|v| v.is_object()) else {
+                return Err(format!("{what} is an object"));
+            };
+            let why = text("why")?;
+            if why.is_empty() {
+                return Err("why is required: where this session saw it".into());
+            }
+            if why.chars().count() > session_limits::MAX_WHY_CHARS {
+                return Err(format!(
+                    "why is at most {} characters",
+                    session_limits::MAX_WHY_CHARS
+                ));
+            }
+            let mut proposal = Map::new();
+            proposal.insert(what.to_string(), body.clone());
+            knowhow
+                .propose(session, fence, &Value::Object(proposal), &why)
+                .await
         }
         other => Err(format!("no knowhow tool {other}")),
     }
@@ -580,6 +753,16 @@ mod tests {
         assert_eq!(c.offered(), [TOOL_GET]);
         c.served(&["knowhow_search".into(), "knowhow_get".into()]);
         assert_eq!(c.offered(), [TOOL_SEARCH, TOOL_GET]);
+        c.served(&[
+            "knowhow_propose".into(),
+            "knowhow_search".into(),
+            "knowhow_get".into(),
+        ]);
+        assert_eq!(
+            c.offered(),
+            [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE],
+            "in this build's order, whatever the server's"
+        );
         let (tx, _rx2) = mpsc::channel(1);
         c.connected(tx);
         assert!(
@@ -602,7 +785,58 @@ mod tests {
             ["knowhow_search", "knowhow_get"]
         );
         assert_eq!(names(&[TOOL_GET]), ["knowhow_get"]);
+        assert_eq!(
+            names(&KNOWN),
+            ["knowhow_search", "knowhow_get", "knowhow_propose"]
+        );
+        assert_eq!(names(&[TOOL_PROPOSE]), ["knowhow_propose"]);
         assert!(names(&[]).is_empty());
+        let propose = &tools(&[TOOL_PROPOSE])[0];
+        assert_eq!(propose["inputSchema"]["required"], json!(["why"]));
+        assert_eq!(propose["annotations"]["readOnlyHint"], false);
+    }
+
+    /// P4-4-2b — a proposal goes out as the session wrote it, naming its
+    /// session and fence; its answer reads as what was written.
+    #[tokio::test]
+    async fn a_proposal_goes_out_whole_and_reads_back_as_written() {
+        let (c, mut rx) = client();
+        let c = Arc::new(c);
+        let session = ObjectId::new();
+        let proposal = json!({"fact": {"kind": "database", "key": "prod-mongo",
+                                       "path": "port", "value": 27017}});
+        let asking = {
+            let (c, p) = (Arc::clone(&c), proposal.clone());
+            tokio::spawn(async move { c.propose(session, 5, &p, "the env file names it").await })
+        };
+        let frame = rx.recv().await.unwrap();
+        let ClientMsg::KnowhowPropose {
+            req_id,
+            session_id,
+            fence,
+            proposal: sent,
+            why,
+        } = frame
+        else {
+            panic!("not a proposal: {frame:?}");
+        };
+        assert_eq!((session_id, fence), (session, 5));
+        assert_eq!((sent, why.as_str()), (proposal, "the env file names it"));
+        let id = ObjectId::new().to_hex();
+        c.answered(
+            &req_id,
+            Answer::Proposed {
+                what: "fact".into(),
+                id: id.clone(),
+                left: 41,
+            },
+        );
+        let answer = asking.await.unwrap();
+        assert_eq!(
+            read(answer),
+            Ok(json!({"proposed": "fact", "id": id, "status": "proposed",
+                      "proposals_left": 41}))
+        );
     }
 
     /// Every refusal word reads as words a model can act on, and one this
@@ -632,6 +866,51 @@ mod tests {
         }
         async fn get(&self, _: ObjectId, _: u64, kind: &str, key: &str) -> Result<Value, String> {
             Ok(json!({ "kind": kind, "key": key }))
+        }
+        async fn propose(
+            &self,
+            _: ObjectId,
+            _: u64,
+            proposal: &Value,
+            why: &str,
+        ) -> Result<Value, String> {
+            Ok(json!({ "proposal": proposal, "why": why }))
+        }
+    }
+
+    /// P4-4-2b — a proposal's arguments are checked before anything is
+    /// asked: exactly one of entity, fact or link, an object, and a why
+    /// within its bound; what goes out is that one, as the session wrote it.
+    #[tokio::test]
+    async fn a_proposals_arguments_are_checked_before_asking() {
+        let s = ObjectId::new();
+        let fact = || json!({"kind": "database", "key": "prod-mongo", "path": "port", "value": 1});
+        let asked = call(
+            &Fake,
+            s,
+            1,
+            TOOL_PROPOSE,
+            &json!({"fact": fact(), "entity": null, "why": "  its env file  "}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            asked,
+            json!({"proposal": {"fact": fact()}, "why": "its env file"})
+        );
+        for bad in [
+            json!({"why": "x"}),
+            json!({"fact": fact(), "link": {"kind": "reads"}, "why": "x"}),
+            json!({"fact": "port 1", "why": "x"}),
+            json!({"fact": fact()}),
+            json!({"fact": fact(), "why": "  "}),
+            json!({"fact": fact(), "why": 7}),
+            json!({"fact": fact(), "why": "w".repeat(session_limits::MAX_WHY_CHARS + 1)}),
+        ] {
+            assert!(
+                call(&Fake, s, 1, TOOL_PROPOSE, &bad).await.is_err(),
+                "{bad}"
+            );
         }
     }
 

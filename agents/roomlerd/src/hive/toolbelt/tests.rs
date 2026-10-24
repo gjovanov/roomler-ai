@@ -5139,6 +5139,27 @@ impl super::super::knowhow_tools::KnowhowTools for FakeKnowhow {
         }
         Ok(json!({"entity": {"kind": kind, "key": key}, "links": [], "truncated": false}))
     }
+
+    async fn propose(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        proposal: &Value,
+        why: &str,
+    ) -> Result<Value, String> {
+        let what = proposal
+            .as_object()
+            .and_then(|m| m.keys().next().cloned())
+            .unwrap_or_default();
+        self.asked
+            .lock()
+            .unwrap()
+            .push((session, fence, format!("propose {what}: {why}")));
+        Ok(
+            json!({"proposed": what, "id": "6adc000000000000000000aa", "status": "proposed",
+                  "proposals_left": 49}),
+        )
+    }
 }
 
 fn knowhow_run(session: ObjectId, knowhow: Option<Arc<FakeKnowhow>>) -> Run {
@@ -5256,5 +5277,72 @@ async fn a_knowhow_tool_answers_what_the_map_says_for_the_sessions_run() {
     assert!(
         b.events.try_recv().is_err(),
         "no person is asked for a read"
+    );
+}
+
+/// FR-90 P4-4-2b — `knowhow_propose` is offered only where the server names
+/// it, carries the session's proposal as its run's session at its fence,
+/// and asks no person (decision 39): a person reviews it afterwards.
+#[tokio::test]
+async fn a_proposal_is_offered_on_the_servers_word_and_asks_no_person() {
+    use roomler_ai_remote_control::knowhow::{TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH};
+    let port = || {
+        json!({"fact": {"kind": "database", "key": "prod-mongo", "path": "port",
+                        "value": 27017}, "why": "its env file names it"})
+    };
+    let reads = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET]);
+    let r = belt_running(
+        me(),
+        knowhow_run(ObjectId::new(), Some(reads.clone())),
+        quick(),
+    );
+    let mut c = Client::connect(&r).await;
+    assert_eq!(
+        listed(&mut c).await,
+        ["approve", "knowhow_search", "knowhow_get"]
+    );
+    c.send(tool_call(1, "knowhow_propose", port())).await;
+    assert_eq!(
+        c.recv().await["error"]["code"],
+        -32602,
+        "a server that did not name it has no such tool"
+    );
+    assert!(reads.asked().is_empty(), "and asked nobody");
+
+    let map = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE]);
+    let sid = ObjectId::new();
+    let mut b = belt_running(me(), knowhow_run(sid, Some(map.clone())), quick());
+    let mut c = Client::connect(&b).await;
+    assert_eq!(
+        listed(&mut c).await,
+        [
+            "approve",
+            "knowhow_search",
+            "knowhow_get",
+            "knowhow_propose"
+        ]
+    );
+    c.send(tool_call(2, "knowhow_propose", port())).await;
+    let made = c.recv().await;
+    assert!(made["result"].get("isError").is_none(), "{made}");
+    let text: Value =
+        serde_json::from_str(made["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["status"], "proposed");
+    c.send(tool_call(
+        3,
+        "knowhow_propose",
+        json!({"why": "nothing named"}),
+    ))
+    .await;
+    let none = c.recv().await;
+    assert_eq!(none["result"]["isError"], true, "{none}");
+    assert_eq!(
+        map.asked(),
+        [(sid, 4, "propose fact: its env file names it".to_string())],
+        "the run's own session and fence; one naming nothing asks nothing"
+    );
+    assert!(
+        b.events.try_recv().is_err(),
+        "no person is asked for a proposal"
     );
 }
