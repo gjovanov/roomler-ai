@@ -258,7 +258,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | Server | Agent | Result |
 |---|---|---|
-| Older (no field) | New | Absent reads **off** (`signaling.rs:3293`, `serde(default)`) |
+| Older (no field) | New | Absent reads **off** (`signaling.rs:3329`, `serde(default)`) |
 | New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
 | Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
 
@@ -1108,7 +1108,7 @@ the first roomler window may be the very viewer waiting on that answer.
 - absent for `auto`.
 
 The mapping is `ConsentMode::asks`
-([`models.rs:1513`](../crates/remote_control/src/models.rs#L1513)), sent at
+([`models.rs:1526`](../crates/remote_control/src/models.rs#L1526)), sent at
 [`hub.rs:1825`](../crates/modules/fleet/src/hub.rs#L1825). A duplicate request
 coalesced onto a live session gets the same value (`:1571`).
 

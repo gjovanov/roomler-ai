@@ -23,9 +23,13 @@ sessions read it too, through their toolbelt.
 > asked through the toolbelt's `knowhow_search` and `knowhow_get` (§12.1); and
 > P4-4-2, a session's proposals, made through the toolbelt's
 > `knowhow_propose`, written `proposed` and naming the session (§12.2); and
-> P4-4-3, a person's word on a proposal (§12.3).** People, the sync, scans
-> and sessions' proposals fill the map. Windows (P4-3b-4), probes (P4-5) and
-> `roomler_connect` (P4-6) come with the steps that build them (§13).
+> P4-4-3, a person's word on a proposal (§12.3); and P4-5-1a, a probe's
+> server half: a person asks a device to probe an entity, the target read from
+> the entity's own facts, and what it measured recorded on them (§13).**
+> People, the sync, scans and sessions' proposals fill the map, and probes
+> verify it. Windows (P4-3b-4), the device's half of a probe (P4-5-1b),
+> `knowhow_verify` (P4-5-2), staleness (P4-5-3) and `roomler_connect` (P4-6)
+> come with the steps that build them (§14).
 
 ## 1. A map, not a gate
 
@@ -56,7 +60,7 @@ flowchart LR
 ## 2. The model
 
 An **entity** is one thing the organization has
-([`model.rs:111`](../crates/modules/knowhow/src/model.rs#L111)):
+([`model.rs:114`](../crates/modules/knowhow/src/model.rs#L114)):
 
 | Field | Meaning |
 |---|---|
@@ -67,7 +71,7 @@ An **entity** is one thing the organization has
 | `owner_id` | the member who answers for it, or none. A member of the organization, checked on every write |
 | `attrs` | a JSON object, up to 16 KiB stored: what describes it |
 | `facts` | what is known of it, each with its provenance (below), up to 64. A machine keeps 15 of them for the sync and its scans, a scan's own entity 9 for its scans (§10, §11.1) |
-| `status` | `active`; `proposed` for a session's (§12.2); `archived` once tombstoned. `stale` comes with P4-5 |
+| `status` | `active`; `proposed` for a session's (§12.2); `archived` once tombstoned. `stale` comes with P4-5-3 |
 | `source` | where it came from: `person`, `sync` (§10), `scan` (§11.1) or `session` (§12.2) |
 | `device` | for a scan's own entity, the device whose scans made it, keep it and retire it (§11.1); absent otherwise |
 | `session` | for a session's proposal, the session that made it (§12.2); absent otherwise |
@@ -77,7 +81,7 @@ An **entity** is one thing the organization has
 Kinds: `machine`, `repo`, `checkout`, `database`, `cluster`, `namespace`,
 `service`, `endpoint`, `bucket`, `cloud_account`, `domain`, `environment`,
 `team`, `doc`. An **edge** relates two entities, `from` `kind` `to`
-([`model.rs:194`](../crates/modules/knowhow/src/model.rs#L194)), its
+([`model.rs:225`](../crates/modules/knowhow/src/model.rs#L225)), its
 kind one of `runs_on`, `checked_out_at`, `deployed_to`, `depends_on`, `reads`,
 `writes`, `part_of`, `owned_by`, `documented_in`, `authenticates_with`,
 `reachable_via`, with attributes of its own (up to 4 KiB). No rule pairs an
@@ -93,7 +97,7 @@ flowchart LR
 ```
 
 A **fact** is a path, a value and where the value came from
-([`model.rs:166`](../crates/modules/knowhow/src/model.rs#L166)):
+([`model.rs:169`](../crates/modules/knowhow/src/model.rs#L169)):
 
 | Field | Meaning |
 |---|---|
@@ -101,12 +105,13 @@ A **fact** is a path, a value and where the value came from
 | `value` | any JSON but null, up to 2 KiB |
 | `source`, `by`, `device`, `session` | `person` and who; `sync`, with nobody; `scan` and its device (§11.1); or `session` and the session that proposed it (§12.2) |
 | `confirmed` | for a proposed fact a person confirmed: who, and when (§12.3) |
-| `observed_at`, `verified_at` | when it was said; when a probe last confirmed it (P4-5) |
+| `observed_at`, `verified_at` | when it was said; when a probe last found it as it says (§13.1) |
+| `verified` | P4-5: what the last probe that measured it found, `{at, probe, from_device, rtt_ms, carrier, ok}`, as it says or not (§13.1) |
 | `status` | `active` for a person's, the sync's and a scan's. A session's is `proposed` until a probe or a person confirms it (decision 39, §12.2) |
 
 > [!IMPORTANT]
 > **A person's change to one fact never restamps another**
-> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L572)). An
+> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L696)). An
 > update names facts by path: a value sets that fact, as the caller's; null
 > removes it; a fact it does not name keeps who said it, from where and when,
 > and so does one set to the value it already holds while active. Restamping
@@ -132,8 +137,8 @@ that is no device is an `endpoint`.
 
 ## 3. The store
 
-Four collections, per organization
-([`lib.rs:240`](../crates/modules/knowhow/src/lib.rs#L240)):
+Five collections, per organization
+([`lib.rs:257`](../crates/modules/knowhow/src/lib.rs#L257)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -142,13 +147,14 @@ Four collections, per organization
   so a kind of link between two entities exists once.
 - **`knowhow_history`**, every write appended.
 - **`knowhow_scans`**, the scans asked of devices (§11).
+- **`knowhow_probes`**, the probes asked of devices (§13).
 
 An organization's map holds at most 10,000 live entities and 50,000 live links
-([`dao.rs:28`](../crates/modules/knowhow/src/dao.rs#L28)); a write past
+([`dao.rs:29`](../crates/modules/knowhow/src/dao.rs#L29)); a write past
 either is **409**.
 
 **A write is a compare-and-set on `rev`**
-([`dao.rs:207`](../crates/modules/knowhow/src/dao.rs#L207)): its filter
+([`dao.rs:208`](../crates/modules/knowhow/src/dao.rs#L208)): its filter
 names the rev the writer read, its update `$inc`s it, and the row after is
 returned. A writer that lost the race matches nothing and is told so, rather
 than overwriting what it never saw.
@@ -168,7 +174,7 @@ sequenceDiagram
 ```
 
 ⚠️ **The history is appended after the write it records, never before**
-([`write.rs:140`](../crates/modules/knowhow/src/write.rs#L140)).
+([`write.rs:154`](../crates/modules/knowhow/src/write.rs#L154)).
 Without a transaction, a row written first could name a write that then lost
 its compare-and-set. A row appended after can only go missing: the write
 stands, the failure is logged, and the entity still names who changed it last
@@ -177,7 +183,7 @@ stands, the failure is logged, and the entity still names who changed it last
 **Archiving an entity** tombstones it at the rev it was read, which frees its
 key, and archives every live link to it, each in the history with the cause
 `entity_archived`
-([`archive_links`](../crates/modules/knowhow/src/write.rs#L176)).
+([`archive_links`](../crates/modules/knowhow/src/write.rs#L190)).
 Nothing links to an archived entity: a link's ends are resolved live, within
 the organization, before it is made. A link the archive raced is invisible,
 because a card and a neighbourhood show only the links whose other end is live.
@@ -249,13 +255,15 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | POST | `/edge/{id}/confirm` | `{rev}`: a proposed link → **200**, as an entity's | `KNOWHOW_EDIT` |
 | POST | `/scan` | `{device}`: ask a device to scan (§11) → **202** with the scan, or the device's pending one. **409** for a device that cannot scan or is a secondary enrollment; **404** for one that is not the organization's | `KNOWHOW_EDIT` |
 | GET | `/scan?device=…` | a device's scans, newest first: `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts, truncated?, detail?}]}`; `?limit=` 1–200 | `KNOWHOW_VIEW` |
+| POST | `/probe` | P4-5-1a, `{entity, device, kind}`: ask a device to probe an entity, `tcp` or `tls` (§13) → **202** with the probe, or the device's pending one when it is this same probe. **400** for an entity whose facts say nowhere a probe reaches, or a kind not known; **409** for a device that cannot probe, is a secondary enrollment, or is running another probe; **429** past 30 a minute for the device; **404** for an entity or a device that is not the organization's | `KNOWHOW_EDIT` |
+| GET | `/probe?entity=…` or `?device=…` | an entity's probes or a device's, newest first: `{probes[{id, entity_id, device_id, requested_by, requested_at, kind, target{host, from, port, sni?}, state, delivered_at?, answered_at?, rtt_ms?, address?, carrier?, tls?, detail?, measured?}]}`; `?limit=` 1–200. One of the two, never both | `KNOWHOW_VIEW` |
 
 ## 7. A neighbourhood
 
 The map route walks the links both ways, one step at a time
 ([`routes.rs:465`](../crates/modules/knowhow/src/routes.rs#L465)). Each step
 is one indexed read of the live links from or to the step's entities, at most
-500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L265)), each way on
+500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L266)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
 The entities they lead to are read live, and filtered by `kind` and `env`; the
 centre is always shown. A filtered entity is not walked through. A link is
@@ -276,14 +284,14 @@ stops there.
 
 ## 8. History
 
-One row per write ([`model.rs:241`](../crates/modules/knowhow/src/model.rs#L241)):
+One row per write ([`model.rs:272`](../crates/modules/knowhow/src/model.rs#L272)):
 
 | Field | Meaning |
 |---|---|
 | `target`, `target_id` | `entity` or `edge`, and which |
 | `entity_ids` | the entity, or the link's two ends: an entity's history is read by it, so a link made or archived shows in the history of both its ends |
-| `rev`, `op` | the rev the write made; `create`, `update`, `archive`, or (P4-4-3) `confirm`, a person's word on a proposal |
-| `source`, `by`, `at` | `person` and who, in P4-1; when |
+| `rev`, `op` | the rev the write made; `create`, `update`, `archive`, (P4-4-3) `confirm`, a person's word on a proposal, or (P4-5) `verify`, what a probe measured (§13.1) |
+| `source`, `by`, `at` | `person` and who, in P4-1; `probe` and the probing `device` for a `verify`; when |
 | `session`, `why` | P4-4-2: the session whose proposal wrote, and why it proposed (§12.2); absent otherwise |
 | `set` | what the write set: a create's whole body, an update's changed fields (facts as `{path, value}` rows, a null value for one removed), an archive's status and, for a link an entity's archive took, `cause: entity_archived` |
 
@@ -298,6 +306,7 @@ years after it was written, so it has no TTL.
 | `knowhow_edges` | link: from, to, kind, attributes, status, source, device, session, rev | unique `(tenant_id, from, kind, to)` over live rows; `(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`; `(tenant_id, device, deleted_at)` | tombstoned, kept |
 | `knowhow_history` | write (P4-4-2: a session's names it, with its why) | `(tenant_id, at desc, _id desc)`, `(tenant_id, entity_ids, at desc, _id desc)`; `(tenant_id, session)` over a session's rows (partial on `session: {$type: "objectId"}`), its ceiling's count | kept, no TTL |
 | `knowhow_scans` | scan asked of a device: who asked and when, its state, when delivered and answered, its counts and detail (§11) | unique `(tenant_id, device_id)` over pending rows (partial on `pending: true`); `(tenant_id, device_id, requested_at desc)`; `(device_id, state)` | 90 days (TTL on `requested_at`) |
+| `knowhow_probes` | probe asked of a device: the entity, who asked, the kind and the target as read, its state, what the device said, what it measured (§13) | unique `(tenant_id, device_id)` over pending rows (partial on `pending: true`): one at a time; `(tenant_id, entity_id, requested_at desc)`, `(tenant_id, device_id, requested_at desc)`; `(device_id, state)` | 90 days (TTL on `requested_at`) |
 
 ## 10. Machines, from the fleet and the network (P4-2)
 
@@ -382,7 +391,7 @@ the device row as the fleet keeps it.
 | `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
 | `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
 | `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L222)) | while the organization has a MagicDNS domain |
-| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6611)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6624)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
 | `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
 | `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
 | `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
@@ -468,17 +477,17 @@ sequenceDiagram
     H->>M: answered, once, by the device it was sent to
 ```
 
-**Who asks, and which devices** ([`request`](../crates/modules/knowhow/src/scan.rs#L483)).
+**Who asks, and which devices** ([`request`](../crates/modules/knowhow/src/scan.rs#L494)).
 A person with `KNOWHOW_EDIT` (decision 41) asks for a live device of the organization: **202**
 with the scan, or with the device's pending scan when it has one, since a scan is never doubled
 (a partial unique index on `pending`). A device is refused **409** up front
-([`refusal`](../crates/modules/knowhow/src/scan.rs#L145)) when its last hello did not
+([`refusal`](../crates/modules/knowhow/src/scan.rs#L146)) when its last hello did not
 advertise `knowhow-scan`, since an agent that cannot scan would never answer, and when it is a
 secondary enrollment (its caps' `update_mode` is `primary_org`), since its roots are one
 device-owned list, scanned for its primary organization alone (decision 43). That is how fleet
 refuses an update push a device would ignore (FR-67).
 
-**The delivery: the row is the bus** ([`deliver`](../crates/modules/knowhow/src/scan.rs#L163)).
+**The delivery: the row is the bus** ([`deliver`](../crates/modules/knowhow/src/scan.rs#L164)).
 The pod holding the device's connection tells it, the vault's way, so knowhow needs no edge to
 fleet's Hub, which is pod-local:
 
@@ -486,7 +495,7 @@ fleet's Hub, which is pod-local:
 |---|---|
 | the request lands on the pod holding the device | that pod, at once |
 | it landed on another pod | the holding pod's next sweep, every `knowhow.scan_sweep_secs` (5 s) |
-| the device was offline | the pod its next hello reaches ([`hello`](../crates/modules/knowhow/src/scan.rs#L204)) |
+| the device was offline | the pod its next hello reaches ([`hello`](../crates/modules/knowhow/src/scan.rs#L206)) |
 | it was sent to a connection that died unanswered | the next hello's pod, again |
 
 Each first send is a compare-and-set from `requested` to `delivered`, so one connection is told
@@ -509,11 +518,11 @@ connection is linked at its hello when the device can scan, and unlinked when it
 | `failed` | the device could not scan; why is `detail` | the detail's |
 | `expired` | 24 h without an answer | ask again |
 
-**The answer** ([`read_answer`](../crates/modules/knowhow/src/scan.rs#L280)).
+**The answer** ([`read_answer`](../crates/modules/knowhow/src/scan.rs#L291)).
 Recorded once, and only from the device the scan was sent to: an answer for another device's scan,
 one already answered, or a made-up id is dropped and logged. Only a `done` answer's findings are
 read, each on its own by the wire's rules
-([`Finding::read`](../crates/remote_control/src/knowhow.rs#L224)), and counted:
+([`Finding::read`](../crates/remote_control/src/knowhow.rs#L227)), and counted:
 `checkouts`, `contexts`, `listeners`, `tunnel_routes`, `unknown` (a kind this build does not
 know: skipped, so a newer device's answer is never lost whole) and `refused`. An answer past
 2,000 findings or 1 MiB is recorded `failed`. A `detail` is clamped to 200 characters.
@@ -522,7 +531,7 @@ know: skipped, so a newer device's answer is never lost whole) and `refused`. An
 > **A finding is closed, and never holds a credential.** A known kind with a field this build
 > does not know is refused, since an open shape is where a token would ride along unseen. Every
 > string is checked for a credential's shape
-> ([`holds_credential`](../crates/remote_control/src/knowhow.rs#L334)): a URL's
+> ([`holds_credential`](../crates/remote_control/src/knowhow.rs#L337)): a URL's
 > password, a token by a prefix it knows, an AWS access key, a PEM block, a JWT. A finding that
 > holds one is refused whole, and a `detail` that holds one is withheld. Only the findings
 > read are written (§11.1); what was refused is counted, never stored.
@@ -637,7 +646,7 @@ flowchart TD
 | the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L544)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
 | live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L523)): an edit takes the next scan, with no restart |
-| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9254)) |
+| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9274)) |
 | the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L554)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
 
 **Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
@@ -947,7 +956,7 @@ what it was (`entity`, `fact` or `link`), the id of the entity or link it wrote
 
 **The ceiling** is counted from the history: one row a proposal, found by its
 session through a partial index on `{tenant_id, session}`
-([`count_by_session`](../crates/modules/knowhow/src/dao.rs#L389)). A
+([`count_by_session`](../crates/modules/knowhow/src/dao.rs#L390)). A
 session's questions are answered in order on their connection, so its
 proposals are counted one at a time.
 
@@ -994,12 +1003,160 @@ proposal is confirmed: anything else is **409**, as a rev already gone is.
 > gate (§1): a confirmed fact tells the next session where to look, and the
 > vault, the network and each device decide every reach as before.
 
-## 13. What comes next
+## 13. Probes (P4-5-1a)
+
+A probe is the server's request and a device's answer, as a scan is (§11): a
+device tries to reach one thing the map says is there, and what it measured is
+recorded on the facts it measured
+([`probe.rs`](../crates/modules/knowhow/src/probe.rs)). Decisions 53–56 as
+recommended, designed in the FR-90 spec's §3e "P4-5, verification, as
+designed". P4-5-1a is the server's half; the device's (its
+`knowhow_probe_reach`, the connect) is P4-5-1b's, and a session's
+`knowhow_verify` P4-5-2's.
+
+```mermaid
+sequenceDiagram
+    participant P as a person (KNOWHOW_EDIT)
+    participant K as knowhow, any pod
+    participant M as knowhow_probes
+    participant H as knowhow, the pod holding the device
+    participant D as the device
+    P->>K: POST knowhow/probe {entity, device, kind}
+    K->>K: the target from the entity's own facts (400 if they say nowhere)
+    K->>M: a probe, requested (409 if the device cannot probe, is secondary or busy)
+    K-->>P: 202 {probe}
+    H->>M: requested to delivered, a compare-and-set (at once, a sweep, a hello)
+    H->>D: rc:knowhow.probe {probe_id, kind, host, port, sni?}
+    D->>D: within knowhow_probe_reach? resolve, check every address, connect (P4-5-1b)
+    D->>H: rc:knowhow.probed {probe_id, outcome, rtt_ms?, address?, tls?}
+    H->>M: answered, once, by the device it was sent to
+    H->>H: verified {at, probe, from_device, rtt_ms, carrier, ok} on each fact measured
+```
+
+**Who asks, and which devices**
+([`request`](../crates/modules/knowhow/src/probe.rs#L742)). A person with
+`KNOWHOW_EDIT` (decision 54) asks a live device of the organization to probe a
+live entity, as `tcp` or `tls` (decision 55). **202** with the probe, or with
+the device's pending one when it is this same probe. One probe runs at a time a
+device (a partial unique index on `pending`): another is **409**. A device is
+refused **409** up front
+([`refusal`](../crates/modules/knowhow/src/probe.rs#L112)) when its last hello
+did not advertise `knowhow-probe`, and when it is a secondary enrollment, as a
+scan's is. A device is asked at most 30 a minute, by anyone: past that, **429**
+`rate_limited`, counted after every other gate so a refusal says which.
+
+**The target is the map's, never the request's**
+([`target`](../crates/modules/knowhow/src/probe.rs#L183)). The request names an
+entity, and the server reads where it is from that entity's facts:
+
+| Fact | Read as |
+|---|---|
+| `address`, else `host` | the host: an IP address or a DNS name, in one spelling ([`probe_host`](../crates/remote_control/src/knowhow.rs#L687)). `host` is read when there is no `address` a probe reaches, as when a scan's listener says `0.0.0.0` |
+| `port` | a number from 1 to 65535, or one written as text |
+| `sni` | for `tls`, the server name: else the `host` fact or the host when it is a name, and none for an address alone |
+
+An entity that says nowhere a probe reaches is **400**, and the message says
+why: no address, host or port; a value that is no host (a URL, a path, a port
+written into it); a listener's bind address; or an address never probed.
+
+> [!WARNING]
+> **Some addresses are never probed, whatever any list says**
+> ([`never_probed`](../crates/remote_control/src/knowhow.rs#L729)). Link-local
+> (`169.254.0.0/16`, `fe80::/10`), where every major cloud's metadata service
+> answers, and the two metadata addresses outside it: AWS's IPv6
+> `fd00:ec2::254`, and Alibaba's `100.100.100.200`, which sits inside
+> `100.64.0.0/10`, the range an overlay's own addresses come from. So a list
+> that allows the mesh still never reaches it, at the cost of one host of that
+> range. Also `0.0.0.0/8` and `::`, where a connect may reach the device itself,
+> multicast and broadcast, and any of these carried in IPv6 (`::ffff:a.b.c.d`,
+> `64:ff9b::/96`). The server refuses such a target, and the device checks
+> every address a name resolves to before it connects (P4-5-1b).
+
+⚠️ **A loopback address is the device itself.** `127.0.0.1`, `::1` and
+`localhost` reach whichever device probes, so such a target is probed only from
+the device whose scan found it (the entity's `device`, §11.1). From any other it
+would test that other device's own port, and is **400**. An answer that says it
+connected to a loopback address measures nothing on another device's entity.
+
+**The delivery** is a scan's
+([`deliver`](../crates/modules/knowhow/src/probe.rs#L259)): the row is the bus,
+on the same link a scan goes out on. A connection is linked at its hello when the
+device can scan or probe. A probe goes out at once from the pod holding the
+device, at that pod's sweep when it landed on another, at the device's next hello
+when it was away, and again at a hello after a connection died unanswered. The
+device runs a probe id once.
+
+**The record.** `knowhow_probes`, one row per request, kept 90 days. The probe
+row holds what was asked: the entity, the device, who asked, the kind and the
+target as the server read it. It also holds what the device said: the round
+trip, the address it connected to, how it reached it, what TLS showed, and
+which facts it measured (`measured`).
+
+| State | Means | Its fix |
+|---|---|---|
+| `requested` | asked, not yet sent | the device comes online, or this pod's sweep runs |
+| `delivered` | sent, not yet answered | the device answers, or is sent it again at its next hello |
+| `ok` | it connected, and for `tls` read the leaf certificate | — |
+| `unreachable` | no connection: refused, timed out, no route, a name that did not resolve | the map's fact, or the network |
+| `not_allowed` | the device may not reach it: outside its owner's `knowhow_probe_reach`, or never probed | the device's owner lists it (P4-5-1b) |
+| `failed` | not measured: a handshake that failed past the connect, a certificate the server could not read, or a probe the device could not run; why is `detail` | the detail's |
+| `expired` | 10 minutes without an answer | ask again |
+
+**The answer** ([`read_answer`](../crates/modules/knowhow/src/probe.rs#L355)).
+It is recorded once, and only from the device the probe was sent to. A round
+trip past 11 s is dropped, and an address is kept only as an IP literal. A
+`tls` answer's certificate is read by the wire's rules (names lowercase, the
+fingerprint 64 lowercase hex, a credential's shape refused). An `ok` from a
+`tls` probe that showed no certificate the server can read is recorded
+`failed`, and so is any answer saying it reached an address never probed. A
+`detail` is clamped to 200 characters, and withheld if it holds a credential's
+shape.
+
+### 13.1 What a probe confirms (decision 56)
+
+Only what it measured ([`measure`](../crates/modules/knowhow/src/probe.rs#L439)).
+On each fact it measured, `verified {at, probe, from_device, rtt_ms, carrier,
+ok}`, the card's view of the last probe that measured it:
+
+| The answer | Measures | `ok` |
+|---|---|---|
+| `ok` | the host's fact and `port`, each while it still says what the probe was aimed at | `true` |
+| `ok`, `tls` | and `tls.fingerprint` (in any of its spellings) and `tls.names` (every name it lists among the certificate's), when the entity has them | whether the certificate says the same |
+| `unreachable` | the host's fact and `port` | `false` |
+| `not_allowed`, `failed` | nothing: "the device may not reach it" is not "it did not answer" | — |
+
+A fact found as it says (`ok: true`) gets `verified_at`. When it is `proposed`
+(or `stale`), it turns `active`. A fact found otherwise keeps its status, and
+`verified` records `ok: false`. The probe's write is a compare-and-set at the
+entity's rev, read again when a person's write came between, with a history row
+`op: verify`, `source: probe` and the probing `device`, whose `set` names the
+probe and each fact's `{path, ok, status}`.
+
+| Carrier | When |
+|---|---|
+| `overlay` | the address the device connected to is in the organization's overlay network (§10.2) |
+| `direct` | any other address the device reached |
+| absent | the device named no address |
+
+> [!IMPORTANT]
+> **A probe confirms facts, never an entity.** A proposed entity whose facts all
+> verify still waits for a person's word on the entity itself (§12.3), and
+> `confirmed` stays a person's: `verified` names the probe instead. A probe never
+> writes a fact it found that the map did not hold, either. What it found is
+> kept on the probe (`tls`, `address`), and the map's fact keeps its value.
+
+| Setting | Effect |
+|---|---|
+| `knowhow.scan_sweep_secs` | the same sweep: each pod looks for scans and probes asked of the devices connected to it |
+
+## 14. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-5 | verification, as the FR-90 spec's §3e "P4-5, verification, as designed" says (decisions 53–56): a probe asked of a device, which reaches only what its owner lists in `knowhow_probe_reach`, `tcp` and `tls` alone; `verified` on the facts it measured, a proposed fact it found as it says turned `active`; `knowhow_verify` asking a person each call; staleness as decision 40 says |
+| P4-5-1b | the device's half of a probe: `knowhow_probe_reach` (device-owned, empty by default, so nowhere), a name resolved and every address checked before the connect, `tcp` and `tls` as decision 55 says, the verb `knowhow-probe` |
+| P4-5-2 | `knowhow_verify` in the toolbelt: a probe from the session's own device, the settings asking a person each call (decision 54) |
+| P4-5-3 | staleness, decision 40: a fact no probe or person confirmed for `knowhow.stale_days` turns `stale` |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |

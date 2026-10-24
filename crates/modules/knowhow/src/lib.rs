@@ -41,6 +41,7 @@ use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Job, Module, Ten
 pub mod dao;
 pub mod intake;
 pub mod model;
+pub mod probe;
 pub mod propose;
 pub mod routes;
 pub mod scan;
@@ -69,6 +70,10 @@ pub struct KnowhowState {
     /// devices that can scan, each told what was asked of it.
     pub scans: Arc<dao::ScanDao>,
     pub links: Arc<scan::Links>,
+    /// P4-5 — the probes asked of devices, told on the same links, and each
+    /// device's per-minute ceiling.
+    pub probes: Arc<dao::ProbeDao>,
+    pub probe_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
     /// P4-4-1 — a session's question is believed from its record, read
     /// through hive's own stateless DAO (`knowhow → hive`, as the vault reads
     /// it); this pod's connections' question queues; and each session's
@@ -126,6 +131,8 @@ impl Module for KnowhowState {
             ),
             scans: Arc::new(dao::ScanDao::new(db)),
             links: Arc::new(scan::Links::default()),
+            probes: Arc::new(dao::ProbeDao::new(db)),
+            probe_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             sessions: Arc::new(roomler_ai_mod_hive::dao::AgentSessionDao::new(db)),
             questions: Arc::new(session::Questions::default()),
             session_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
@@ -137,13 +144,17 @@ impl Module for KnowhowState {
         // P4-3a — and links its connection for scans, whose answers
         // (`rc:knowhow.scanned`) `ClientMsg::namespace()` dispatches here.
         // P4-4-1 — and opens its sessions' questions' queue, and tells it the
-        // map is there. One handler and one lifecycle a module, so
-        // [`socket`]'s answer for both.
+        // map is there. P4-5 — a probe goes out on the scans' link, and its
+        // answer (`rc:knowhow.probed`) comes here too. One handler and one
+        // lifecycle a module, so [`socket`]'s answer for all of them.
         state.core.agent_socket.register(
             Self::ID,
             AgentSocketHooks {
                 handler: Some(Arc::new(socket::Frames {
                     scans: scan::ScanAnswers {
+                        state: state.clone(),
+                    },
+                    probes: probe::ProbeAnswers {
                         state: state.clone(),
                     },
                     state: state.clone(),
@@ -162,7 +173,8 @@ impl Module for KnowhowState {
             secs => secs,
         };
         sync::spawn_reconciler(state.clone(), secs);
-        // P4-3a — and sweeps for the scans asked of its devices.
+        // P4-3a — and sweeps for the scans asked of its devices; P4-5 — and
+        // their probes, in the same sweep.
         let sweep = match settings.knowhow.scan_sweep_secs {
             0 => scan::DEFAULT_SCAN_SWEEP_SECS,
             secs => secs,
@@ -210,6 +222,11 @@ impl Module for KnowhowState {
             .route(
                 "/tenant/{tenant_id}/knowhow/scan",
                 get(scan::list).post(scan::request),
+            )
+            // P4-5 — a person asks a device to probe an entity.
+            .route(
+                "/tenant/{tenant_id}/knowhow/probe",
+                get(probe::list).post(probe::request),
             )
             .nest("/tenant/{tenant_id}/knowhow/entity", entity)
             .nest("/tenant/{tenant_id}/knowhow/edge", edge)
@@ -308,6 +325,25 @@ impl Module for KnowhowState {
                     index(bson::doc! { "device_id": 1, "state": 1 }),
                     // Kept 90 days.
                     index_ttl(bson::doc! { "requested_at": 1 }, dao::SCAN_KEEP_SECS),
+                ],
+            },
+            // P4-5 — the probes asked of devices.
+            IndexSet {
+                collection: model::KnowhowProbe::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    // One probe at a time a device: a second request finds it.
+                    index_unique_partial(
+                        bson::doc! { "tenant_id": 1, "device_id": 1 },
+                        bson::doc! { "pending": true },
+                    ),
+                    // An entity's probes, and a device's, newest first.
+                    index(bson::doc! { "tenant_id": 1, "entity_id": 1, "requested_at": -1 }),
+                    index(bson::doc! { "tenant_id": 1, "device_id": 1, "requested_at": -1 }),
+                    // A sweep: what was asked of the devices connected here.
+                    index(bson::doc! { "device_id": 1, "state": 1 }),
+                    // Kept 90 days.
+                    index_ttl(bson::doc! { "requested_at": 1 }, dao::PROBE_KEEP_SECS),
                 ],
             },
         ]

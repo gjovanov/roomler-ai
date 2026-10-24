@@ -1257,6 +1257,17 @@ pub enum RpcCap {
     /// A BUILD property, like `knowhow-scan`, which it is not a prefix of:
     /// matching stays equality regardless.
     KnowhowTools,
+    /// FR-90 P4-5 — this build answers `rc:knowhow.probe`: it reaches the
+    /// target the server read from the map only when its owner's
+    /// `knowhow_probe_reach` allows it (decision 53), connects and never
+    /// converses (decision 55), and answers `rc:knowhow.probed`. The server
+    /// asks no device that does not advertise it, since one that cannot probe
+    /// would never answer.
+    ///
+    /// A BUILD property: a device whose owner lists nothing still advertises
+    /// it, and answers `not_allowed`. Not a prefix of another verb, nor
+    /// another of it, and matching stays equality regardless.
+    KnowhowProbe,
 }
 
 impl RpcCap {
@@ -1308,11 +1319,12 @@ impl RpcCap {
             Self::PeerAuth => "peer-auth",
             Self::KnowhowScan => "knowhow-scan",
             Self::KnowhowTools => "knowhow-tools",
+            Self::KnowhowProbe => "knowhow-probe",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 40] = [
+    pub const ALL: [RpcCap; 41] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1353,6 +1365,7 @@ impl RpcCap {
         Self::PeerAuth,
         Self::KnowhowScan,
         Self::KnowhowTools,
+        Self::KnowhowProbe,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -7624,6 +7637,7 @@ mod tests {
         assert_eq!(RpcCap::PeerAuth.wire(), "peer-auth");
         assert_eq!(RpcCap::KnowhowScan.wire(), "knowhow-scan");
         assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
+        assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
@@ -7638,6 +7652,12 @@ mod tests {
         assert!(!caps(&["knowhow-tools"]).has_rpc(RpcCap::KnowhowScan));
         assert!(!caps(&["knowhow-scan"]).has_rpc(RpcCap::KnowhowTools));
         assert!(!caps(&["knowhow-tool", "knowhow"]).has_rpc(RpcCap::KnowhowTools));
+        // P4-5 — and `knowhow-probe` a third: scanning or offering a session
+        // the map says nothing of probing, and the reverse.
+        assert!(caps(&["knowhow-probe"]).has_rpc(RpcCap::KnowhowProbe));
+        assert!(!caps(&["knowhow-scan", "knowhow-tools"]).has_rpc(RpcCap::KnowhowProbe));
+        assert!(!caps(&["knowhow-probe"]).has_rpc(RpcCap::KnowhowScan));
+        assert!(!caps(&["knowhow-probes", "knowhow-prob"]).has_rpc(RpcCap::KnowhowProbe));
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`

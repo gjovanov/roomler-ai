@@ -177,6 +177,13 @@ mod knowhow_intake_tests;
 /// an evicted node's facts gone with it; a machine's room kept for the sync.
 #[cfg(test)]
 mod knowhow_network_sync_tests;
+/// FR-90 P4-5-1a — a probe asked, sent the target the entity's facts say,
+/// answered once, and recorded on the facts it measured: a proposal it found
+/// as it says confirmed, anything else recorded and changing nothing; the
+/// refusals; one at a time, 30 a minute; a hello's delivery; the sweep;
+/// expiry.
+#[cfg(test)]
+mod knowhow_probe_tests;
 /// FR-90 P4-4-2 — a session's proposals: each written `proposed` and naming
 /// its session, its why in the history; adding, never changing; never into
 /// a device's part of the map; a credential's shape refused whole; 50 a

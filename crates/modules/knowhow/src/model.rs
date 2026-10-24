@@ -78,6 +78,9 @@ pub const SOURCE_SYNC: &str = "sync";
 pub const SOURCE_SCAN: &str = "scan";
 /// A session's proposal (P4-4).
 pub const SOURCE_SESSION: &str = "session";
+/// P4-5 — a probe's write, as its history row names it. Never a fact's
+/// source: a probe records what it measured of facts others said.
+pub const SOURCE_PROBE: &str = "probe";
 
 /// The longest key, in bytes.
 pub const MAX_KEY_LEN: usize = 255;
@@ -181,13 +184,41 @@ pub struct Fact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed: Option<Confirmed>,
     pub observed_at: DateTime,
-    /// When a probe last confirmed it (P4-5).
+    /// When a probe last found it as it says (P4-5).
     #[serde(default)]
     pub verified_at: Option<DateTime>,
+    /// P4-5 — what the last probe that measured it found, as it says or
+    /// not: a failed or different probe is recorded here and changes nothing
+    /// else (decision 56).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Verified>,
     /// [`STATUS_ACTIVE`] for a person's; a session's is
     /// [`STATUS_PROPOSED`] until a probe or a person confirms it (P4-4).
     pub status: String,
 }
+
+/// P4-5 — what one probe measured of one fact (the FR-90 spec, §3e "P4-5,
+/// verification, as designed"): when, which probe from which device, the
+/// connect's round trip, how the device reached it, and whether it found the
+/// fact as it says.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Verified {
+    pub at: DateTime,
+    pub probe: ObjectId,
+    pub from_device: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    /// [`CARRIER_DIRECT`], or [`CARRIER_OVERLAY`] for an address in the
+    /// organization's mesh; absent when the device named no address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
+    pub ok: bool,
+}
+
+/// P4-5 — the device reached it on its own network.
+pub const CARRIER_DIRECT: &str = "direct";
+/// P4-5 — the device reached it at an address in the organization's mesh.
+pub const CARRIER_OVERLAY: &str = "overlay";
 
 /// How two entities are related: `from` `kind` `to`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -284,6 +315,8 @@ pub const OP_UPDATE: &str = "update";
 pub const OP_ARCHIVE: &str = "archive";
 /// P4-4-3 — a person confirmed a proposal: it is believed from then on.
 pub const OP_CONFIRM: &str = "confirm";
+/// P4-5 — a probe recorded what it measured on facts (decision 56).
+pub const OP_VERIFY: &str = "verify";
 
 /// P4-3a — one scan asked of a device (the FR-90 spec, §3e "P4-3, scans, as
 /// designed"): who asked and when, where it is, and how it ended. The row is
@@ -374,6 +407,97 @@ pub const SCAN_DONE: &str = "done";
 pub const SCAN_NO_ROOTS: &str = "no_roots";
 pub const SCAN_FAILED: &str = "failed";
 pub const SCAN_EXPIRED: &str = "expired";
+
+/// P4-5 — one probe asked of a device (the FR-90 spec, §3e "P4-5,
+/// verification, as designed"): of which entity, who asked, the target as
+/// the server read it from the entity's facts, where it is, and what it
+/// measured. The row is the bus, as a scan's is.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KnowhowProbe {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub entity_id: ObjectId,
+    pub device_id: ObjectId,
+    /// The person who asked (decision 54).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<ObjectId>,
+    /// P4-5-2 — the session whose `knowhow_verify` asked, from its device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ObjectId>,
+    pub requested_at: DateTime,
+    /// `tcp` or `tls` (`roomler_ai_remote_control::knowhow::ProbeKind`).
+    pub kind: String,
+    pub target: ProbeTarget,
+    /// [`PROBE_REQUESTED`] → [`PROBE_DELIVERED`] → `ok`, `unreachable`,
+    /// `not_allowed` or `failed` (the device's outcome); or
+    /// [`PROBE_EXPIRED`].
+    pub state: String,
+    /// `true` while requested or delivered, absent once it ended: a device's
+    /// one probe at a time, held unique by a partial index on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
+    #[serde(default)]
+    pub delivered_at: Option<DateTime>,
+    #[serde(default)]
+    pub answered_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    /// The address the device connected to, as it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// [`CARRIER_DIRECT`] or [`CARRIER_OVERLAY`], read from `address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
+    /// What a `tls` probe's certificate showed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ProbeTlsSeen>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// What it recorded on the entity's facts, once recorded: each fact it
+    /// measured, found as it says or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measured: Vec<Measured>,
+}
+
+impl KnowhowProbe {
+    pub const COLLECTION: &'static str = "knowhow_probes";
+}
+
+/// P4-5 — a probe's target, as the server read it from the entity's facts
+/// when it was asked, never from the request: the host and the fact it came
+/// from, the port, and for `tls` the server name.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ProbeTarget {
+    pub host: String,
+    /// `address` or `host`: the fact the host was read from, and its value
+    /// as it was, so an answer is recorded only on a fact still saying it.
+    pub host_path: String,
+    pub host_value: Bson,
+    pub port: u16,
+    pub port_value: Bson,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+}
+
+/// P4-5 — what a `tls` probe's leaf certificate showed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProbeTlsSeen {
+    #[serde(default)]
+    pub names: Vec<String>,
+    pub fingerprint: String,
+}
+
+/// P4-5 — one fact a probe measured, and whether it found it as it says.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Measured {
+    pub path: String,
+    pub ok: bool,
+}
+
+pub const PROBE_REQUESTED: &str = "requested";
+pub const PROBE_DELIVERED: &str = "delivered";
+pub const PROBE_EXPIRED: &str = "expired";
 
 // ─── the rules a write is held to ───────────────────────────────────────────
 
@@ -631,6 +755,7 @@ pub fn merge_facts_from(
                     confirmed: None,
                     observed_at: now,
                     verified_at: None,
+                    verified: None,
                     status: status.into(),
                 };
                 match at {
@@ -791,6 +916,7 @@ mod tests {
             confirmed: None,
             observed_at: DateTime::from_millis(1),
             verified_at: Some(DateTime::from_millis(2)),
+            verified: None,
             status: status.into(),
         }
     }
