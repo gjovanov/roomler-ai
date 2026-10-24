@@ -44,6 +44,8 @@ pub mod model;
 pub mod routes;
 pub mod scan;
 pub mod scope;
+pub mod session;
+mod socket;
 pub mod sync;
 pub mod view;
 mod write;
@@ -66,6 +68,13 @@ pub struct KnowhowState {
     /// devices that can scan, each told what was asked of it.
     pub scans: Arc<dao::ScanDao>,
     pub links: Arc<scan::Links>,
+    /// P4-4-1 — a session's question is believed from its record, read
+    /// through hive's own stateless DAO (`knowhow → hive`, as the vault reads
+    /// it); this pod's connections' question queues; and each session's
+    /// per-minute ceiling.
+    pub sessions: Arc<roomler_ai_mod_hive::dao::AgentSessionDao>,
+    pub questions: Arc<session::Questions>,
+    pub session_limiter: Arc<roomler_core::rate_limit::RateLimiter>,
     /// The organizations whose map it keeps (`knowhow.tenants`).
     pub scope: Arc<scope::TenantScope>,
 }
@@ -88,14 +97,15 @@ impl FromRef<KnowhowState> for Core {
 impl Module for KnowhowState {
     const ID: &'static str = "knowhow";
 
-    /// No module state, and no module edge yet. P4-2 reads the fleet's
-    /// devices and the network's overlay through the shared stateless DAOs
-    /// and hears of devices through core's hooks and agent socket, so it
-    /// calls no module (FR-69 rule 5: a stateless dependency is no edge).
-    /// `knowhow → fleet` comes with the first use of fleet's Hub (P4-3a,
-    /// asking a device to scan), and `knowhow → hive` with P4-4's session
-    /// reads; `knowhow → network` only with a step that needs the network's
-    /// live state.
+    /// No module state. P4-2 reads the fleet's devices and the network's
+    /// overlay through the shared stateless DAOs and hears of devices through
+    /// core's hooks and agent socket, and P4-3a reaches a device on its
+    /// connection's own sender, so neither calls fleet. P4-4-1's
+    /// `knowhow → hive` reads session records through hive's own DAO, a
+    /// stateless dependency (FR-69 rule 5), as the vault's `vault → hive`
+    /// does: a knowhow mounted without hive finds no session, and refuses
+    /// every question. `knowhow → network` only with a step that needs the
+    /// network's live state.
     type Deps = ();
 
     async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
@@ -115,6 +125,9 @@ impl Module for KnowhowState {
             ),
             scans: Arc::new(dao::ScanDao::new(db)),
             links: Arc::new(scan::Links::default()),
+            sessions: Arc::new(roomler_ai_mod_hive::dao::AgentSessionDao::new(db)),
+            questions: Arc::new(session::Questions::default()),
+            session_limiter: Arc::new(roomler_core::rate_limit::RateLimiter::new()),
             scope: Arc::new(scope),
             core,
         };
@@ -122,13 +135,22 @@ impl Module for KnowhowState {
         // reconnect); the agent socket is fleet's, the registry core's.
         // P4-3a — and links its connection for scans, whose answers
         // (`rc:knowhow.scanned`) `ClientMsg::namespace()` dispatches here.
+        // P4-4-1 — and opens its sessions' questions' queue, and tells it the
+        // map is there. One handler and one lifecycle a module, so
+        // [`socket`]'s answer for both.
         state.core.agent_socket.register(
             Self::ID,
             AgentSocketHooks {
-                handler: Some(Arc::new(scan::ScanAnswers {
+                handler: Some(Arc::new(socket::Frames {
+                    scans: scan::ScanAnswers {
+                        state: state.clone(),
+                    },
                     state: state.clone(),
                 })),
-                lifecycle: Some(Arc::new(scan::SocketHooks {
+                lifecycle: Some(Arc::new(socket::Lifecycle {
+                    scans: scan::SocketHooks {
+                        state: state.clone(),
+                    },
                     state: state.clone(),
                 })),
             },

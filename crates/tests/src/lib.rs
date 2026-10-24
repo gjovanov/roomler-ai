@@ -182,6 +182,12 @@ mod knowhow_network_sync_tests;
 /// repeat; a forged answer dropped; the sweep; expiry.
 #[cfg(test)]
 mod knowhow_scan_tests;
+/// FR-90 P4-4-1 — a session's questions about the map: the word that the map
+/// is there, given only where it is; the people's search and card, bounded;
+/// a question believed only from the session's device and fence while it is
+/// live, and only while its starter may read the map.
+#[cfg(test)]
+mod knowhow_session_tests;
 /// FR-90 P4-2a — the fleet's devices mirrored onto the map: a hello's
 /// machine, the fleet's changes, the fleet's facts kept the fleet's, a
 /// removal's archive, and the reconcile that retires what is gone.

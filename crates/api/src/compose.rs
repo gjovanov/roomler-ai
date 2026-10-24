@@ -228,8 +228,12 @@ impl Modules {
         }
         #[cfg(feature = "knowhow")]
         {
-            // On core alone: the map's store, the people's routes, and (P4-2a)
-            // the fleet's devices heard through core. Defaults off, like the vault.
+            // The map's store, the people's routes, and (P4-2a) the fleet's
+            // devices heard through core. No module state as a dependency: its
+            // `knowhow → hive` edge (P4-4-1) reads session records through
+            // hive's stateless DAO, as the vault's does, so a knowhow mounted
+            // without hive finds no session to answer. Defaults off, like the
+            // vault.
             modules.knowhow =
                 init_one::<roomler_ai_mod_knowhow::KnowhowState>(core.clone(), settings, ())
                     .await?;
