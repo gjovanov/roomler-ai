@@ -1,0 +1,61 @@
+name: bindgen-libclang
+description: >-
+  Points bindgen at the libclang the job's own libclang-dev install provides,
+  never the newest one on the runner image, and drops env-libvpx-sys's cached
+  build output so its FFI is generated again under that libclang. Run it after
+  the step that installs libclang-dev, and after the rust-cache restore.
+# Why this exists (2026-10-24)
+#
+#   bindgen 0.68.1, the newest env-libvpx-sys 5.1.3 allows (`^0.68.1`), makes
+#   `vpx_codec_enc_cfg` opaque under libclang 22: every field becomes
+#   `_address`, and roomlerd's `vp9-444` code fails with E0609 (no field
+#   `rc_overshoot_pct`, `rc_end_usage`, …). clang-sys loads the NEWEST libclang
+#   it can find, and the ubuntu-26.04 runner image ships clang 20.1.8, 21.1.8
+#   and 22.1.2, so a plain `libclang-dev` install still hands bindgen 22.
+#   Measured in an ubuntu:26.04 container, env-libvpx-sys with `generate`:
+#   LIBCLANG_PATH=/usr/lib/llvm-20/lib and /usr/lib/llvm-21/lib generate the
+#   struct whole; /usr/lib/llvm-22/lib, and no LIBCLANG_PATH, opaque. (The
+#   Windows release lane met the same opaque struct and skips bindgen there:
+#   release-agent.yml, "Fetch vendored libvpx".)
+#
+# Why the build output is dropped
+#
+#   env-libvpx-sys's build script prints `cargo:rerun-if-env-changed=
+#   VPX_VERSION` (and a `rerun-if-changed=` without its `cargo:` prefix, which
+#   cargo ignores), so cargo runs it again only when VPX_VERSION changes. A
+#   restored target dir keeps whatever FFI an earlier run generated, under
+#   whichever libclang that run had: the lanes stayed green on 26.04 on
+#   bindings generated before, and broke only when ci-ffmpeg-encoder's cache
+#   was evicted (2026-10-24, a full-match hit at 16:45Z, "No cache found" for
+#   the same key at 17:32Z).
+#   master's failing run then saved the opaque bindings under the same key
+#   (`cache-on-failure`), so every run after it would have failed whatever the
+#   libclang. Generating them again costs seconds and makes a libclang
+#   regression fail on the run that meets it.
+#
+# Which libclang
+#
+#   The unversioned `/usr/lib/llvm-N/lib/libclang.so` ships with
+#   libclang-N-dev, which the job's apt step installs through libclang-dev
+#   (llvm-defaults: 21 on resolute, measured; 18 on noble); a preinstalled
+#   clang-N brings no such link, which is how bindgen met 22 though only 21's
+#   -dev was installed. The lowest such N is taken, should the image carry
+#   more than one -dev: bindgen 0.68.1 predates every one of them. The step
+#   prints the one it chose.
+runs:
+  using: composite
+  steps:
+    - name: Point bindgen at the distro's libclang; regenerate libvpx's FFI
+      shell: bash
+      run: |
+        set -euo pipefail
+        dev=$(ls -d /usr/lib/llvm-*/lib/libclang.so 2>/dev/null | sort -V | head -1 || true)
+        if [ -z "$dev" ]; then
+          echo "::error::no /usr/lib/llvm-*/lib/libclang.so: install libclang-dev before this step"
+          exit 1
+        fi
+        dir=$(dirname "$dev")
+        echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
+        echo "bindgen's libclang: $dir ($(readlink -f "$dev"))"
+        t=${CARGO_TARGET_DIR:-target}
+        rm -rf "$t"/*/build/env-libvpx-sys-* "$t"/*/.fingerprint/env-libvpx-sys-*

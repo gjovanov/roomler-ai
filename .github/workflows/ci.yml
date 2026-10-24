@@ -1627,6 +1627,11 @@ jobs:
             sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libvpx-dev
           fi
           ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
+      # 2026-10-24: this lane's cache was evicted, bindgen ran fresh under the
+      # image's libclang 22 and made libvpx's encoder config opaque, and the
+      # failed run saved those bindings (see the action).
+      - name: Point bindgen at the distro's libclang
+        uses: ./.github/actions/bindgen-libclang
       - name: Fetch vendored FFmpeg 9.0.1
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1750,6 +1755,10 @@ jobs:
         # action — a handful of packages do not pay for a cache key that can
         # silently restore nothing.
         run: sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libasound2-dev cmake libvpx-dev
+      # 2026-10-24: `vp9-444-bindgen` under the image's newest libclang (22)
+      # makes libvpx's encoder config opaque (see the action).
+      - name: Point bindgen at the distro's libclang
+        uses: ./.github/actions/bindgen-libclang
       - name: Fetch the vendored FFmpeg with the AAC encoder + H.264 decoder
         env:
           GH_TOKEN: ${{ github.token }}
