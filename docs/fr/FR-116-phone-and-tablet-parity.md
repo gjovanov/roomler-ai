@@ -151,7 +151,7 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | message actions are hover-only, and the invisible buttons still take taps (pin for the whole room) | `MessageBubble.vue:30-58`, `:309-316` | a ⋮ menu on touch; `pointer-events: none` while hidden |
 | rich-text mode clips Send, attach, emoji and GIF off-screen | `MessageEditor.vue:12-141` | the formatting row scrolls on its own; Send stays outside it |
 | the default composer has no Send button, and no line break on a soft keyboard | `MessageEditor.vue:129-140`, `:376-384` | Send in both modes |
-| an agent-session transcript covers the room on a phone and cannot be closed | `ChatView.vue:111`, `:233`, `:526-537`; `HiveTranscript.vue:16-39` | a close button; closed by default below 960 px |
+| an agent-session transcript covers the room on a phone and cannot be closed | `ChatView.vue:111`, `:233`, `:526-537`; `HiveTranscript.vue:18-41` | a close button; closed by default below 960 px |
 | the call's chat and files are fixed 320 px columns that squeeze or clip the video | `ConferenceView.vue:109-158`, `:671-677` | overlays below 960 px, one at a time |
 | a screen share gets ~72 px of width on a phone (Auto picks the sidebar layout) | `useConferenceLayout.ts:92`, `SidebarLayout.vue:91-99` | spotlight on narrow containers |
 | the mini-conference names people by a 6-character user-id prefix (desktop too) | `MiniConference.vue:45` | the participant's display name |
@@ -177,7 +177,7 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | the org-timeline drawer cannot be closed on a phone | `GrowthView.vue:409` | a close button; full screen on `xs` |
 | per-user usage: the timeline track is 36 px wide | `UsagePanel.vue:34`, `UsageTimeline.vue:215-270` | full screen on `xs`; stacked rows |
 | devices named by machine name because the **server** sends only `name` | `crates/api/src/routes/stats.rs:592`, `:727`; `crates/api/src/routes/usage.rs:610-614`; hive's frozen `device_name` | send `display_name` (D4) |
-| agent-session rows squeeze the title to ~40 px | `HiveSessionsView.vue:108-164` | the row's actions in a menu on `xs` |
+| agent-session rows squeeze the title to ~40 px | `HiveSessionsView.vue:108-201` | the row's actions in a menu on `xs` |
 | Growth's tabs and Analytics' 4th tab hidden without arrows | `GrowthView.vue:23-35`, `AnalyticsView.vue:24-29` | `show-arrows` |
 | Growth's headline number hidden at 360 px | `GrowthView.vue:49-54` | the number into `v-card-text` |
 
