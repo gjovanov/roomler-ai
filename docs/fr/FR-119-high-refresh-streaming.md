@@ -23,10 +23,10 @@ latency side; this FR is the cadence side.
 | What | Where | Consequence |
 |---|---|---|
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9843`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10261` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9849`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10267` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts were whole milliseconds (**fixed in P2a**, §4.2) | master `c636c6e8c` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
-| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1717`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2289`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2312`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
+| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1772`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2278`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2301`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
 | The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
 | The default capture gate's period is whole milliseconds; the microsecond gate is opt-in | `capture/gate.rs` (the legacy rule caps `1000/144` at 166 fps and can phase-lock); the slot-first gate keeps µs (`:103`) behind `ROOMLERD_CAPTURE_GATE`, field A/B owed (FR-98 P1) | Above 60, the slot-first gate should be the one in use |
 | WGC and `CGDisplayStream` deliver at the panel's refresh | WGC is compositor-driven; scrap's quartz stream is unthrottled (`throttle: 0.0`, `crates/vendored/scrap/src/quartz/config.rs:69`) | A 60 Hz panel cannot produce 120 fps. A 120 Hz MacBook already can |
@@ -99,7 +99,7 @@ and as with encoder cells, the probe proves an open and only a session proves th
 ### 3.4 The encoder and the rate law
 
 - **pts in microseconds:** `TIME_BASE_DEN = 1_000_000`, `pts = monotonic_us`. The recorder keeps its own
-  counter clock (`recording_pts`, `encoder.rs:738`), which already never repeats; P2a moved it to the
+  counter clock (`recording_pts`, `encoder.rs:802`), which already never repeats; P2a moved it to the
   microsecond base with the live pts.
 - **An fps change is a make-before-break swap.** `rebuild_spec_at` takes the dims and the rate (it was
   `rebuild_spec_at_dims`), and an fps move rides FR-70 M2's dims swap: the same pending slot, the same adoption
@@ -149,7 +149,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. **P2b-9 built** (§4.11): the macOS daemon's launchd job is Interactive, so the session worker it spawns no longer runs throttled; found on AC4's fourth attempt. P2 is built; its field proof is P3 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. **P2b-9 built** (§4.11): the macOS daemon's launchd job is Interactive, so the session worker it spawns no longer runs throttled; found on AC4's fourth attempt. **P2b-10 to P2b-12 built** (§4.12): NVENC splits a frame across its engines above 60 fps, the conversion writes straight into a pooled frame on a persistent pool, and the decision's log line names its refusal; found on the first Windows run. P2b-13 is next: a keyframe into an idle transport is not a capacity measurement (§4.12). Its field proof is P3 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155). **Run 2, 2026-10-23** (§8): #2758 verified on 0.4.155. AC4 attempt 2, direct from Edge at the Mac's native size, was granted 120 and then taken back by the pipe; it found P2b-4 and P2b-5. **Run 3** (§8): AC4 attempt 3 on 0.4.158 found P2b-7 and P2b-8. **Run 4, 2026-10-23/24** (§8): on 0.4.160 the grant held 120 for 15 minutes, but read at the viewer (§8.1) the cadence missed (p99 19–20 ms). A launchd experiment found P2b-9; with it, 65 of 76 windows passed both clauses. **Run 5, 2026-10-24** (§8): on 0.4.162, which ships P2b-9, **AC4 met**: 120 fps in every 60 s window, p99 at the viewer 14.4–17.3 ms, 65 of 104 windows under 16.7 |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -560,7 +560,7 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
   ramping, blocked sends for 43–82 ms, and the drain rate folded as a capacity of 14–22 Mbps against the 104 Mbps
   ceiling at 120. `Reason::Opening` rejects any window a pass of which fell inside FR-35's opener window: at least
   2 s from the first keyframe and until the send ledger drains, at most 3 s, now kept for every session
-  (`peer.rs:8823`). FR-35 already declined to cut for that burst, so it is not congestion either. Its counter is
+  (`peer.rs:8829`). FR-35 already declined to cut for that burst, so it is not congestion either. Its counter is
   appended to `evidence_rejected` (fifth), so the first four positions keep their meaning.
 - **The window was one pass long.** The pump hands its sender facts to the governor on every pass, as deltas since
   the previous pass, and each call overwrote the last. A stalled pass anywhere but in a window's last iteration
@@ -604,12 +604,79 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
   P2b-6's bucket paces the asks. A simulation of that loop against a regular 120 Hz source shows neither bunching
   frames by itself, and with the job Interactive both stayed as they are.
 - ⚠️ **What the two timestamps mean.** The trial's is the capture worker's receipt (`frame.monotonic_us`). The wire
-  header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9422`). So a trial that
+  header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9428`). So a trial that
   passes at p99 16.4 ms says the host CAN keep up; it says nothing about the cadence the viewer gets.
 - **Guards.** CI's macOS packaging lint (`ci.yml:1304`) fails if the daemon, agent or desktop job loses
   `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1168`) asserts that launchd loaded the
   daemon as `spawn type = interactive (4)`, after an enabled install and after a plain re-install (the self-update
   path). Both checks were run red against the shipped job on the MacBook, which reads `daemon (3)`.
+
+### 4.12 P2b-10 to P2b-12 — the Windows NVENC cell fits a 120 fps period, and the decision says why, as built (2026-10-25)
+
+Found on the first Windows run (§8, 2026-10-24). The MacBook's Chrome viewed neo16, the Windows 11 laptop:
+2560×1600 at 240 Hz, the panel on the Radeon 610M, HEVC 4:4:4 on the RTX 5090's NVENC, WGC capture. Twice the
+grant took 120 and handed it back about 5 s later, and the log read `want=60 refused=None`. Two things were wrong,
+and either alone keeps the session at 60.
+
+**The encode stage did not fit the period.** The heartbeat split it (FR-118 P0): 3.65 ms of conversion and 7.42 ms
+of `send_frame`, 11 ms a frame against the 7.5 ms (90 % of 8.3) the trial fails at. A bench on the same host
+reproduces it with the session's own cascade and options: `stage_bench`, an ignored test in
+`encode/ffmpeg/encoder.rs`, which opens `new_*_adaptive` at a geometry and rate and reports `StageTimes` and the
+p50/p90/p99 of the whole call. It measured 3.48 + 7.86 ms, p90 13.2 ms.
+
+- **P2b-10, NVENC's engines** (`throughput_options`, `encoder.rs`). One NVENC engine encodes a frame whole. The
+  RTX 5090 laptop GPU has more than one, and above 60 fps `hevc_nvenc` and `av1_nvenc` now open with
+  `split_encode_mode=forced`: the driver splits each picture into horizontal strips, one engine each, coded as slices
+  of one picture. Measured first with the FFmpeg CLI on neo16 at the session's settings: 7.05 ms whole, 4.47 ms in
+  the driver's two strips, 3.45 ms in three. The clips were the same size (24.06 MB both) at the same PSNR (42.510
+  against 42.516 dB), and they decoded clean under `-err_detect explode` with two slice segments per picture. The
+  option sits in an open tier of its own above the low-latency one, so a driver that refuses it keeps `delay=0` (a
+  refused low-latency tier would have cost the typing-latency fix). At 60 fps and below nothing is added: a 60 fps
+  session's bitstream is unchanged. `h264_nvenc` has no such mode. The knob `nvenc_split` (config and
+  `ROOMLERD_NVENC_SPLIT`, read at every open) is `auto`, `off` (as before) or a strip count 2–4. An explicit count
+  applies only on a GPU with that many engines, and encodes the frame whole otherwise. That is why the default leaves
+  the count to the driver, which picks two strips on neo16. `fps_deny` stays the fleet's kill switch for a rate, and
+  `nvenc_split` is local only.
+- **P2b-11, the conversion** (`take_frame`, `convert_into`, `convert_bgra_planes`). It wrote into scratch planes, then
+  every frame allocated a fresh AVFrame and copied the planes in: 12 MB of first-touch pages and a 12 MB copy per
+  frame at 2560×1600 4:4:4. Now it writes straight into the frame's padded planes, and the frame goes back to a pool.
+  It is reused only once `av_frame_is_writable` says the encoder let go of it, because QSV holds its input until the
+  surface is encoded. The row bands (FR-1 P5) run on one persistent rayon pool instead of four threads spawned and
+  joined per frame, which cost about 1 ms at this size. rayon was already in the tree through `sysinfo`. A test pins
+  the output to dcv's single call into tight planes, byte for byte on every row, at a width whose stride is padded.
+  Found while moving it: on the packed 4:4:4 path (QSV, VAAPI), the single-call branch returned before packing, so a
+  frame under 2 Mpixel would have encoded stale memory. No session reached it, because every packed cell is on the
+  built-in denylist. Both branches pack now.
+- **P2b-12, the decision's own words** (`RateState::decided_refusal`, `peer.rs`). The decision line logged the
+  viewer's answer, which holds a refusal back until the stream is down at the granted rate. Correct for the viewer,
+  but it hid the reason in the one line written before the swap down. The line now carries the decision's refusal,
+  and the two numbers the pipe condition compared: `capacity_bps` and `ceiling_at_ask`.
+
+The stage after the change, on neo16 (`stage_bench`, 600 frames, release build, ms per frame):
+
+| Cell | Convert | Submit | p50 | p90 | Fails at p90 ≥ |
+|---|---|---|---|---|---|
+| HEVC 4:4:4 at 120, before | 3.48 | 7.86 | 11.85 | 13.25 | 7.50 |
+| HEVC 4:4:4 at 120 | 1.10 | 4.81 | 5.91 | **6.43** | 7.50 |
+| HEVC 4:4:4 at 144 | 1.11 | 4.81 | 5.92 | 6.53 | 6.25 |
+| HEVC 4:4:4 at 144, `nvenc_split=3` | 1.08 | 3.72 | 4.79 | **5.29** | 6.25 |
+| HEVC 4:2:0 at 144 | 0.89 | 4.70 | 5.65 | **6.08** | 6.25 |
+| AV1 4:2:0 at 144 | 0.86 | 3.23 | 4.08 | **4.40** | 6.25 |
+| HEVC 4:4:4 at 60 (no split) | 1.07 | 8.20 | 9.15 | 10.47 | 15.00 |
+| H.264 4:2:0 at 120 (no split mode) | 0.89 | 6.35 | 6.93 | 9.24 | 7.50 |
+
+So with the defaults, 120 fits on this cell in every codec but H.264, and so does 144 in AV1 and, just, HEVC 4:2:0. HEVC
+4:4:4 at 144 needs the third strip (`nvenc_split=3` on this host). At 60 the conversion alone takes 2.4 ms off the
+frame's latency. Learning a GPU's engine count would let `auto` pick the third strip; the caps probe is where it
+would be measured.
+
+**The take-back was the pipe, and the pipe claim was wrong.** With P2b-12's numbers in hand, the 5 s take-back reads
+as `pipe`. One keyframe of about 625 KB blocked its send for 71.6 ms (`send_wait_max_ms`), and the goodput fold took
+it as 69.9 Mbit/s of capacity, against a ceiling of 156 Mbit/s at 120. A second keyframe 2 s later read 79.7. The
+path is the MacBook's loopback-TURN relay over the mesh, and the mesh carries 311 Mbit/s: 256 MiB over TCP from neo16
+to the MacBook's overlay address in 6.9 s, every byte received. A keyframe handed to a data channel that sat idle
+meets an SCTP congestion window that has to reopen, so its drain rate is the ramp, not the path. That is the
+opening's defect (P2b-8) at another moment of the session. P2b-13 owns it.
 
 ## 5. Acceptance criteria
 
@@ -681,6 +748,8 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
 | 2026-10-23 | agent 0.4.160 (P2b-8), viewer `hosted-20261023-c680ec9` (P2b-7) | **AC4, attempt 4.** The MacBook direct to Edge on neo16, 1662×1078 (a 1080p target), 120 fps, the viewer's shipped defaults, no other viewer, 15 minutes. Also read at the viewer (§8.1) | **The rate holds; the cadence does not. AC4 not met.** Granted once and never taken back: three opening windows were rejected (`evidence_rejected=[1, 0, 0, 0, 3]`), and no capacity was folded (`pipe_belief_n=(898, 0)`). The viewer-rate cap fired 0 times in 445 windows, against every ~30 s on 0.4.158, and 2 of the 445 windows fell below 108 fps. The trial was Proven (112.5 fps, p99 16.397 ms). At the viewer, every 60 s window delivered 112.8–113.2 fps, but the p99 between arrivals was 19.1–20.3 ms, and 17.5 ms already at the agent's hand-off. A second motion source and keep-busy's cursor were each ruled out in the same session: **P2b-9** |
 | 2026-10-24 | agent 0.4.160, the daemon's launchd job edited by hand, then restored | **The P2b-9 experiment.** The same pair and content. First `taskpolicy -l 0 -t 0` and `renice -20` on the worker; then `ProcessType = Interactive` in `com.roomler.daemon.plist`, reloaded through a one-shot launchd job of its own (a script under the daemon's job dies at its bootout) | **Throttling was the cause.** The tiers and the renice changed nothing (32% short intervals, hand-off p99 17.7 ms). With Interactive, both halves scheduled at 37 instead of 20: 119.1 fps, no hand-off interval under 4.5 ms, hand-off p99 10.65 ms, arrival p99 at the viewer 13.4 ms. 65 of 76 sliding 60 s windows met both of AC4's clauses; the 11 that did not contain the first 5 s, before 120 ran. Not an AC4 tick: the plist was restored byte for byte at 00:10 UTC, and the tick waits for the release that ships it |
 | 2026-10-24 | agent 0.4.162 (P2b-9), viewer `hosted-20261023-c680ec9` | **AC4, run 5.** The MacBook, updated through its own helper (01:47 UTC), direct to Edge on neo16; 1662×1078, 120 fps, the shipped defaults, no other viewer; 164 s untouched, read at the viewer (§8.1). Before the update, on 0.4.161: no `ProcessType`, launchd `spawn type = daemon (3)`, every thread at priority 20 | **AC4 met.** After the update the installed plist reads `ProcessType: Interactive`, launchd `interactive (4)`, and the daemon and worker run at 37 (the worker's threads mostly at 31, none left in the utility band but one). 120 was granted once and held (`refused=None`, carrier direct host to host). All 92 heartbeat windows ran at 119.6–120.2 fps, the viewer-rate cap fired 0 times, and `evidence_rejected=[0, 0, 0, 0, 3]`. The trial was Proven at 119.7 fps, p99 11.572 ms (16.397 on 0.4.160). At the viewer: 19,655 frames, every sliding 60 s window 119.8–120.1 fps, 65 of 104 with a p99 between arrivals under 16.7 ms (14.4–16.6); the rest at 16.8–17.3. At the agent's hand-off, p99 11.8 ms and 1.2–1.6% of intervals under 4.5 ms (32% on 0.4.160), so the remaining tail is the network's and the viewer's |
+| 2026-10-24 | agent 0.4.165 on neo16, the MacBook's Chrome as the viewer | **The first Windows run.** The MacBook viewing neo16: 2560×1600 (240 Hz panel on the Radeon 610M), HEVC 4:4:4 on `hevc_nvenc` (RTX 5090), WGC. The path is the MacBook's loopback-TURN relay over the mesh (`carrier="overlay_direct"`, `relay=false`), once the device's `rc_overlay` was on and Chrome's local-network permission granted. Two sessions | **120 granted, then taken back twice, 5 s in.** `want=120` at 21:32:43, `want=60 refused=None` at 21:32:48; the second session the same, 21:33:16 to 21:33:21. At 120 the heartbeat read 3.65 ms of conversion and 7.42 ms of `send_frame` a frame, so the trial would have failed too, and the HW-relief pacer held 85 fps. The `refused=None` hid the reason: **P2b-10 to P2b-12** |
+| 2026-10-25 | the P2b-10/11 build, release profile, on neo16 (no session) | **The stage, measured, and the path, measured.** `stage_bench` at the session's settings (§4.12's table). Then 256 MiB over TCP from neo16 to the MacBook's overlay address, while the session's keyframe had folded as 69.9 Mbit/s of capacity | **The stage fits 120; the pipe claim does not hold.** HEVC 4:4:4 at 120: p90 13.25 → 6.43 ms (convert 3.48 → 1.10, submit 7.86 → 4.81). The FFmpeg CLI on the same GPU: one engine 7.05 ms a frame, two strips 4.47, three 3.45; the clips the same size, PSNR 42.510 against 42.516 dB, two slice segments per picture, clean under `-err_detect explode`. The mesh: 311.4 Mbit/s, all 268,435,456 bytes received. The 69.9 was one ~625 KB keyframe whose send blocked 71.6 ms in an idle data channel: **P2b-13** |
 
 ### 8.1 How AC4 is read
 

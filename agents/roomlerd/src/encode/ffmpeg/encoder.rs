@@ -550,6 +550,71 @@ fn encoder_options(
     (base, lowlat, summary)
 }
 
+/// FR-119 P2b-10 — how NVENC splits a frame across its engines above 60 fps:
+/// the `nvenc_split` knob (`ROOMLERD_NVENC_SPLIT`), read once per open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NvencSplit {
+    /// The default: above 60 fps, the driver picks the number of strips
+    /// (FFmpeg's `split_encode_mode=forced`).
+    Auto,
+    /// Leave the option unset at every rate, exactly as before P2b-10. FFmpeg's
+    /// own default then applies, under which the driver splits only frames it
+    /// considers large (none at 2560×1600 on neo16).
+    Off,
+    /// Above 60 fps, this many strips. NVENC applies a count only on a GPU with
+    /// at least that many engines, and encodes the frame whole otherwise.
+    Strips(u8),
+}
+
+impl NvencSplit {
+    /// `auto` (or unset, or anything unrecognised), `off`, or a strip count
+    /// 2–4. Validated where it is set (`config_surface`); a value that reaches
+    /// here unvalidated (an env var) falls back to the default rather than
+    /// switching anything on.
+    pub(crate) fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("off" | "0" | "false" | "no" | "disabled") => Self::Off,
+            Some("2") => Self::Strips(2),
+            Some("3") => Self::Strips(3),
+            Some("4") => Self::Strips(4),
+            _ => Self::Auto,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::parse(node_env("NVENC_SPLIT").as_deref())
+    }
+}
+
+/// FR-119 P2b-10 — the options that buy THROUGHPUT, opened in a tier of their
+/// own above the low-latency one (`build_encoder`), so a driver that rejects
+/// one costs only this group: a rejected low-latency tier would also drop
+/// `delay=0`, the typing-latency fix.
+///
+/// Today that is NVENC's split-frame encoding, above 60 fps, for HEVC and AV1
+/// (`h264_nvenc` has no such mode). One engine encodes a 2560×1600 4:4:4 HEVC
+/// frame in 7.05 ms at the session's settings, measured with the FFmpeg CLI on
+/// neo16's RTX 5090: under the 8.3 ms a 120 fps frame gets, but not with the
+/// conversion in front of it. Split across the engines the same frame took
+/// 4.47 ms (the driver's choice, two strips) or 3.45 ms (three), at the same
+/// size and PSNR, and the strips decode as two slices of one picture (spec
+/// §4.12). At 60 fps and below nothing is added, so a 60 fps session's
+/// bitstream does not change.
+///
+/// Pure: the knob is passed in.
+pub(crate) fn throughput_options(name: &str, fps: i32, split: NvencSplit) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let splits = matches!(name, "hevc_nvenc" | "av1_nvenc");
+    if splits && fps > 60 {
+        match split {
+            NvencSplit::Auto => out.push(("split_encode_mode".into(), "forced".into())),
+            NvencSplit::Strips(n) => out.push(("split_encode_mode".into(), n.to_string())),
+            NvencSplit::Off => {}
+        }
+    }
+    out
+}
+
 /// Build an ffmpeg option `Dictionary` from owned key/value pairs. `av_dict`
 /// copies the strings, so the returned dict owns its data (`'static`).
 fn dict_from_pairs(pairs: &[(String, String)]) -> ffmpeg_next::Dictionary<'static> {
@@ -602,13 +667,12 @@ pub struct FfmpegEncoder {
     /// + `frame.set_pict_type(I)` to force IDR on HEVC encoders.
     force_keyframe: bool,
 
-    /// Scratch buffer for the Y plane (NV12 and I444 alike). Reused across
-    /// frames.
+    /// FR-77 P3b — the planar I444 scratch a packed (VUYX) frame is
+    /// interleaved from: Y, U and V at full resolution, sized on first use.
+    /// Empty on every other path, which converts straight into the frame
+    /// (FR-119 P2b-11).
     plane_y: Vec<u8>,
-    /// NV12: the interleaved UV plane (pixels/2 bytes). I444 (P7 HEVC Rext):
-    /// the full-resolution U plane (pixels bytes). Reused across frames.
     plane_u: Vec<u8>,
-    /// I444 only: the full-resolution V plane. Empty on NV12.
     plane_v: Vec<u8>,
     /// P7 — true when this encoder runs HEVC Rext 4:4:4 (`yuv444p` +
     /// `profile=rext`, hevc_nvenc only). Drives the convert/build format
@@ -619,9 +683,9 @@ pub struct FfmpegEncoder {
     /// encoder name; `adopt_rebuilt` only swaps in an encoder of the same
     /// name and chroma, so it never changes underneath a session.
     packed444: bool,
-    /// The VUYX buffer (`w × h × 4`), filled from the I444 planes per frame
-    /// when `packed444`; empty otherwise.
-    packed: Vec<u8>,
+    /// FR-119 P2b-11 — the converted frames, reused once the encoder has let
+    /// go of them (`take_frame`), at most [`FRAME_POOL_MAX`].
+    frame_pool: Vec<frame::Video>,
     /// FR-77 P4 — the VAAPI frame pool of a `*_vaapi` encoder (`None` for
     /// every other backend); replaced together with the encoder on a rebuild.
     hw: Option<hwframes::Frames>,
@@ -822,8 +886,8 @@ pub struct RateStats {
 /// much of a frame is the CPU round trip FR-118 would remove and how much is
 /// the hardware encode. The four parts, in call order:
 ///
-/// - `convert`: `convert_bgra` and the `AVFrame` build (CPU colour conversion
-///   and a plane copy);
+/// - `convert`: `take_frame` and `convert_into` (the CPU colour conversion,
+///   straight into the frame since FR-119 P2b-11, which removed a plane copy);
 /// - `upload`: the hardware-frame upload, VAAPI / D3D12 / Vulkan only (zero
 ///   elsewhere);
 /// - `submit`: `send_frame`, where NVENC, QSV and AMF upload a software frame
@@ -1314,7 +1378,6 @@ impl FfmpegEncoder {
         let (encoder, hw) = Self::build_encoder(
             "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false, false, None,
         )?;
-        let plane_pixels = (width as usize) * (height as usize);
         Ok(Self {
             encoder_name: "vp9_qsv",
             width,
@@ -1322,12 +1385,12 @@ impl FfmpegEncoder {
             encoder,
             frame_count: 0,
             force_keyframe: false,
-            plane_y: vec![0u8; plane_pixels],
-            plane_u: vec![0u8; plane_pixels / 2],
+            plane_y: Vec::new(),
+            plane_u: Vec::new(),
             plane_v: Vec::new(),
             chroma444: false,
             packed444: false,
-            packed: Vec::new(),
+            frame_pool: Vec::new(),
             hw,
             fps: 30,
             cq,
@@ -1570,7 +1633,6 @@ impl FfmpegEncoder {
                         recording = recording.is_some(),
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
-                    let plane_pixels = (width as usize) * (height as usize);
                     return Ok(Self {
                         encoder_name: name,
                         width,
@@ -1578,21 +1640,12 @@ impl FfmpegEncoder {
                         encoder,
                         frame_count: 0,
                         force_keyframe: false,
-                        plane_y: vec![0u8; plane_pixels],
-                        // NV12: UV is half-width × half-height × 2 channels
-                        // = pixels / 2. I444: full-resolution U plane.
-                        plane_u: vec![
-                            0u8;
-                            if chroma444 {
-                                plane_pixels
-                            } else {
-                                plane_pixels / 2
-                            }
-                        ],
-                        plane_v: vec![0u8; if chroma444 { plane_pixels } else { 0 }],
+                        plane_y: Vec::new(),
+                        plane_u: Vec::new(),
+                        plane_v: Vec::new(),
                         chroma444,
                         packed444: chroma444 && packed444_name(name),
-                        packed: Vec::new(),
+                        frame_pool: Vec::new(),
                         hw,
                         fps,
                         cq,
@@ -1649,6 +1702,8 @@ impl FfmpegEncoder {
 
         let (base, lowlat, opt_summary) =
             encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
+        // FR-119 P2b-10 — empty except on NVENC HEVC / AV1 above 60 fps.
+        let throughput = throughput_options(name, fps, NvencSplit::from_env());
 
         // FR-77 P4 / FR-78 P1 — a `*_vaapi` / `*_d3d12va` / `*_vulkan`
         // encoder takes HARDWARE frames from a pool on one of the kind's
@@ -1739,12 +1794,44 @@ impl FfmpegEncoder {
         // driver rejects any single private option, the WHOLE dict is
         // dropped. So the low-latency knobs (`delay`/`async_depth`/…) get
         // their own tier:
+        //   0. throughput + quality + low-latency (FR-119 P2b-10: only when
+        //      `throughput_options` has something, NVENC above 60 fps),
         //   1. quality + low-latency,
         //   2. quality ALONE (keeps `forced-idr` etc. if only a lowlat knob
         //      was rejected — a full revert to defaults would lose
         //      `forced-idr` → the NVENC black-screen IDR bug),
         //   3. plain defaults (blurry-but-working beats a black screen).
         let opened = 'open: {
+            if !throughput.is_empty() {
+                let mut full = dict_from_pairs(&base);
+                for (k, v) in lowlat.iter().chain(throughput.iter()) {
+                    full.set(k.as_str(), v.as_str());
+                }
+                let throughput_summary = throughput
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let enc = configure()?;
+                match enc.open_as_with(codec, full) {
+                    Ok(encoder) => {
+                        tracing::info!(
+                            encoder = name,
+                            options = %format!("{opt_summary} {throughput_summary}"),
+                            "ffmpeg encoder opened with throughput + quality + low-latency options"
+                        );
+                        break 'open encoder;
+                    }
+                    Err(open_err) => {
+                        tracing::warn!(
+                            encoder = name,
+                            %open_err,
+                            rejected = throughput_summary,
+                            "ffmpeg open rejected the throughput knobs — retrying without them"
+                        );
+                    }
+                }
+            }
             if !lowlat.is_empty() {
                 let mut full = dict_from_pairs(&base);
                 for (k, v) in &lowlat {
@@ -1811,7 +1898,66 @@ impl FfmpegEncoder {
         }
     }
 
-    fn convert_bgra(&mut self, frame: &Frame) -> Result<()> {
+    /// The layout of the frames this encoder takes: NV12 for 4:2:0, planar
+    /// I444 (NVENC, software) or packed VUYX (QSV, VAAPI) for 4:4:4.
+    fn av_format(&self) -> format::Pixel {
+        if self.chroma444 {
+            if self.packed444 {
+                format::Pixel::VUYX
+            } else {
+                format::Pixel::YUV444P
+            }
+        } else {
+            format::Pixel::NV12
+        }
+    }
+
+    /// FR-119 P2b-11 — a frame to convert into: one of the pool's that the
+    /// encoder has let go of, or a new one.
+    ///
+    /// `avcodec_send_frame` takes a reference to a refcounted frame rather
+    /// than a copy, and an encoder may keep it past the call (QSV holds its
+    /// input until the surface is encoded). `av_frame_is_writable` is FFmpeg's
+    /// own answer to "does anyone else hold this buffer", so a frame is reused
+    /// only once it is ours alone; while one is still held, the next frame
+    /// takes another, or a new one.
+    fn take_frame(&mut self) -> Result<frame::Video> {
+        let (format, w, h) = (self.av_format(), self.width, self.height);
+        // A dims swap (`adopt_rebuilt`) leaves frames of the old size behind.
+        self.frame_pool
+            .retain(|f| f.format() == format && f.width() == w && f.height() == h);
+        let free = self.frame_pool.iter_mut().position(|f| {
+            // SAFETY: `f` is a valid AVFrame this encoder owns.
+            unsafe { ffmpeg_next::ffi::av_frame_is_writable(f.as_mut_ptr()) != 0 }
+        });
+        if let Some(i) = free {
+            return Ok(self.frame_pool.swap_remove(i));
+        }
+        let mut av = frame::Video::new(format, w, h);
+        // `frame::Video::new` ignores `av_frame_get_buffer`'s result; a frame
+        // without a buffer must never reach the plane slices below.
+        // SAFETY: reading a field of a valid AVFrame.
+        if unsafe { (*av.as_mut_ptr()).data[0].is_null() } {
+            return Err(anyhow!("could not allocate a {w}x{h} {format:?} frame"));
+        }
+        Ok(av)
+    }
+
+    /// FR-119 P2b-11 — return a frame to the pool, up to [`FRAME_POOL_MAX`].
+    fn give_back(&mut self, av: frame::Video) {
+        if self.frame_pool.len() < FRAME_POOL_MAX {
+            self.frame_pool.push(av);
+        }
+    }
+
+    /// BGRA → the encoder's layout, written straight into `av`'s planes.
+    ///
+    /// FR-119 P2b-11 — before, the conversion wrote into scratch planes and
+    /// every frame then allocated a fresh AVFrame and copied the planes into
+    /// it. At 2560×1600 4:4:4 that is 12 MB of first-touch pages and a 12 MB
+    /// copy per frame, and the encode stage that has to fit an 8.3 ms period
+    /// at 120 fps measured 3.48 ms of conversion on neo16 (spec §4.12).
+    fn convert_into(&mut self, frame: &Frame, av: &mut frame::Video) -> Result<()> {
         if frame.pixel_format != PixelFormat::Bgra {
             // Capture layer already produced NV12 — copy planes directly.
             // WGC + DXGI on Windows can emit NV12 in some configurations.
@@ -1827,176 +1973,63 @@ impl FfmpegEncoder {
         // already a dep for the libvpx VP9 4:4:4 path; both conversions use
         // the same SIMD primitives (and the same BT.601 matrix, so the P7
         // Rext path renders identically to the libvpx 4:4:4 path).
-        //
-        // P5 (FR-1, 2026-08-27) — big frames convert in ROW BANDS across
-        // scoped threads. dcv's convert_image is single-threaded SIMD; at
-        // 2880×1800 it was a large share of the 20-30 ms "encode" time
-        // that capped the pump at ~40 fps. Bands split on EVEN row starts
-        // (NV12's vertically-subsampled chroma pairs never straddle a cut;
-        // BT.601 is pointwise per 2×2 block), so the banded output is
-        // byte-identical to the full-frame call. Source slices read the
-        // tail from the band start (immutable borrows may overlap);
-        // destination slices are disjoint via split_at_mut. Sub-2 MPix
-        // frames and the `par_convert` hatch keep the single-call path.
-        use dcv_color_primitives::{
-            ColorSpace, ImageFormat, PixelFormat as DcvPixelFormat, convert_image,
-        };
+        use dcv_color_primitives::{ColorSpace, ImageFormat, PixelFormat as DcvPixelFormat};
 
         let w = self.width as usize;
         let h = self.height as usize;
-        let stride = frame.stride as usize;
-        let plane_pixels = w * h;
-        let src_format = ImageFormat {
-            pixel_format: DcvPixelFormat::Bgra,
-            color_space: ColorSpace::Rgb,
-            num_planes: 1,
+        let bands = Self::convert_bands(w * h);
+        let i444 = ImageFormat {
+            pixel_format: DcvPixelFormat::I444,
+            color_space: ColorSpace::Bt601,
+            num_planes: 3,
         };
-        let bands = Self::convert_bands(plane_pixels);
 
-        if self.chroma444 {
+        if self.chroma444 && self.packed444 {
+            // FR-77 P3b — packed VUYX (QSV / VAAPI): planar I444 into the
+            // scratch planes, then interleaved into the frame's one plane.
+            // (Before P2b-11 the single-call path returned before packing;
+            // every packed cell is on the built-in denylist, so no session
+            // reached it.)
+            let plane_pixels = w * h;
             if self.plane_y.len() != plane_pixels {
                 self.plane_y.resize(plane_pixels, 0);
                 self.plane_u.resize(plane_pixels, 0);
                 self.plane_v.resize(plane_pixels, 0);
             }
-            let dst_format = ImageFormat {
-                pixel_format: DcvPixelFormat::I444,
-                color_space: ColorSpace::Bt601,
-                num_planes: 3,
-            };
-            let dst_strides = [w, w, w];
-            if bands <= 1 {
-                let mut dst_planes: [&mut [u8]; 3] = {
-                    let (y, rest) = (
-                        &mut self.plane_y[..],
-                        (&mut self.plane_u[..], &mut self.plane_v[..]),
-                    );
-                    [y, rest.0, rest.1]
-                };
-                convert_image(
-                    self.width,
-                    self.height,
-                    &src_format,
-                    Some(&[stride]),
-                    &[&frame.data],
-                    &dst_format,
-                    Some(&dst_strides),
-                    &mut dst_planes,
-                )
-                .map_err(|e| anyhow!("dcv BGRA→I444 convert failed: {:?}", e))?;
-                return Ok(());
-            }
-            let cuts = Self::band_cuts(h, bands);
-            let mut y_rest: &mut [u8] = &mut self.plane_y[..];
-            let mut u_rest: &mut [u8] = &mut self.plane_u[..];
-            let mut v_rest: &mut [u8] = &mut self.plane_v[..];
-            std::thread::scope(|s| -> Result<()> {
-                let mut handles = Vec::with_capacity(cuts.len());
-                for &(r0, bh) in &cuts {
-                    let (y_band, yr) = std::mem::take(&mut y_rest).split_at_mut(bh * w);
-                    let (u_band, ur) = std::mem::take(&mut u_rest).split_at_mut(bh * w);
-                    let (v_band, vr) = std::mem::take(&mut v_rest).split_at_mut(bh * w);
-                    y_rest = yr;
-                    u_rest = ur;
-                    v_rest = vr;
-                    let src = &frame.data[r0 * stride..];
-                    let sf = &src_format;
-                    let df = &dst_format;
-                    let ds = &dst_strides;
-                    handles.push(s.spawn(move || {
-                        let mut dst: [&mut [u8]; 3] = [y_band, u_band, v_band];
-                        convert_image(
-                            w as u32,
-                            bh as u32,
-                            sf,
-                            Some(&[stride]),
-                            &[src],
-                            df,
-                            Some(ds),
-                            &mut dst,
-                        )
-                    }));
-                }
-                for hnd in handles {
-                    hnd.join()
-                        .map_err(|_| anyhow!("convert band thread panicked"))?
-                        .map_err(|e| anyhow!("dcv BGRA→I444 band convert failed: {:?}", e))?;
-                }
-                Ok(())
-            })?;
-            self.pack_if_needed();
+            convert_bgra_planes(
+                frame,
+                w,
+                h,
+                &i444,
+                [&mut self.plane_y, &mut self.plane_u, &mut self.plane_v],
+                [w, w, w],
+                [0, 0, 0],
+                bands,
+            )?;
+            let ([dst], [dst_stride]) = av_planes_mut::<1>(av);
+            pack_vuyx_into(
+                &self.plane_y,
+                &self.plane_u,
+                &self.plane_v,
+                w,
+                h,
+                dst,
+                dst_stride,
+            );
             return Ok(());
         }
-
-        if self.plane_y.len() != plane_pixels {
-            self.plane_y.resize(plane_pixels, 0);
-            self.plane_u.resize(plane_pixels / 2, 0);
+        if self.chroma444 {
+            let (planes, strides) = av_planes_mut::<3>(av);
+            return convert_bgra_planes(frame, w, h, &i444, planes, strides, [0, 0, 0], bands);
         }
-        let dst_format = ImageFormat {
+        let nv12 = ImageFormat {
             pixel_format: DcvPixelFormat::Nv12,
             color_space: ColorSpace::Bt601,
             num_planes: 2,
         };
-        // Two-plane NV12: Y is width × height; UV is interleaved
-        // width × (height / 2) bytes (== plane_pixels / 2 in interleaved form).
-        let dst_strides = [w, w];
-
-        if bands <= 1 {
-            let mut dst_planes: [&mut [u8]; 2] = {
-                let (y, uv) = (&mut self.plane_y[..], &mut self.plane_u[..]);
-                [y, uv]
-            };
-            convert_image(
-                self.width,
-                self.height,
-                &src_format,
-                Some(&[stride]),
-                &[&frame.data],
-                &dst_format,
-                Some(&dst_strides),
-                &mut dst_planes,
-            )
-            .map_err(|e| anyhow!("dcv BGRA→NV12 convert failed: {:?}", e))?;
-            self.pack_if_needed();
-            return Ok(());
-        }
-
-        let cuts = Self::band_cuts(h, bands);
-        let mut y_rest: &mut [u8] = &mut self.plane_y[..];
-        let mut uv_rest: &mut [u8] = &mut self.plane_u[..];
-        std::thread::scope(|s| -> Result<()> {
-            let mut handles = Vec::with_capacity(cuts.len());
-            for &(r0, bh) in &cuts {
-                let (y_band, yr) = std::mem::take(&mut y_rest).split_at_mut(bh * w);
-                let (uv_band, uvr) = std::mem::take(&mut uv_rest).split_at_mut((bh / 2) * w);
-                y_rest = yr;
-                uv_rest = uvr;
-                let src = &frame.data[r0 * stride..];
-                let sf = &src_format;
-                let df = &dst_format;
-                let ds = &dst_strides;
-                handles.push(s.spawn(move || {
-                    let mut dst: [&mut [u8]; 2] = [y_band, uv_band];
-                    convert_image(
-                        w as u32,
-                        bh as u32,
-                        sf,
-                        Some(&[stride]),
-                        &[src],
-                        df,
-                        Some(ds),
-                        &mut dst,
-                    )
-                }));
-            }
-            for hnd in handles {
-                hnd.join()
-                    .map_err(|_| anyhow!("convert band thread panicked"))?
-                    .map_err(|e| anyhow!("dcv BGRA→NV12 band convert failed: {:?}", e))?;
-            }
-            Ok(())
-        })?;
-        Ok(())
+        // Two-plane NV12: Y at full height, interleaved UV at half height.
+        let (planes, strides) = av_planes_mut::<2>(av);
+        convert_bgra_planes(frame, w, h, &nv12, planes, strides, [0, 1], bands)
     }
 
     /// P5 — band count for the threaded convert: single-call under 2 MPix
@@ -2007,6 +2040,12 @@ impl FfmpegEncoder {
         if plane_pixels < 2_000_000 || !crate::encode::par_convert_enabled() {
             return 1;
         }
+        Self::max_bands()
+    }
+
+    /// The band count of a big frame: min(4, cores). Also the size of the
+    /// conversion pool (FR-119 P2b-11).
+    fn max_bands() -> usize {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -2028,32 +2067,11 @@ impl FfmpegEncoder {
         cuts
     }
 
-    /// FR-77 P3b — for a packed-4:4:4 backend, interleave the I444 planes
-    /// into the VUYX buffer the frame is built from. A no-op on every other
-    /// path.
-    fn pack_if_needed(&mut self) {
-        if self.packed444 {
-            pack_vuyx(
-                &self.plane_y,
-                &self.plane_u,
-                &self.plane_v,
-                &mut self.packed,
-            );
-        }
-    }
-
-    fn build_av_frame(&self, monotonic_us: u64) -> Result<frame::Video> {
-        let format = if self.chroma444 {
-            if self.packed444 {
-                format::Pixel::VUYX
-            } else {
-                format::Pixel::YUV444P
-            }
-        } else {
-            format::Pixel::NV12
-        };
-        let mut av = frame::Video::new(format, self.width, self.height);
-
+    /// The frame's timestamp and, when one is due, the forced keyframe.
+    /// FR-119 P2b-11 — a pooled frame carries the last use's picture type, so
+    /// the type is set on every frame: `I` when forcing, otherwise `None`
+    /// (the encoder's choice), which is what a fresh frame always had.
+    fn stamp_frame(&self, av: &mut frame::Video, monotonic_us: u64) {
         // FR-85 P1b — a recording encoder times frames by its own counter: it
         // is fed the same frame again on a still screen, and a repeated frame
         // must not repeat a timestamp. Every live encoder keeps the capture
@@ -2065,42 +2083,13 @@ impl FfmpegEncoder {
         };
         av.set_pts(Some(pts));
 
-        if self.force_keyframe || self.frame_count == 0 {
-            av.set_kind(util::picture::Type::I);
-            // Note: set_key_frame doesn't exist on Video in ffmpeg-next 8.x;
-            // set_kind(I) is the supported way to force IDR.
-        }
-
-        // Copy our converted planes into the AVFrame's plane buffers.
-        // FFmpeg's allocator gives us width/height-aligned buffers; we
-        // copy row-by-row to handle stride differences.
-        //
-        // rc.73 borrow-checker fix: capture strides before the mutable
-        // borrow from data_mut(). `av.stride(N)` takes &self while
-        // `av.data_mut(N)` takes &mut self — calling them on the same
-        // expression triggers E0502.
-        let w = self.width as usize;
-        let rows = self.height as usize;
-        let y_stride = av.stride(0);
-        if self.chroma444 && self.packed444 {
-            // FR-77 P3b — VUYX: ONE packed plane, four bytes per pixel.
-            copy_plane_into_av(av.data_mut(0), y_stride, &self.packed, w * 4, rows);
+        // Note: set_key_frame doesn't exist on Video in ffmpeg-next 8.x;
+        // set_kind(I) is the supported way to force IDR.
+        av.set_kind(if self.force_keyframe || self.frame_count == 0 {
+            util::picture::Type::I
         } else {
-            copy_plane_into_av(av.data_mut(0), y_stride, &self.plane_y, w, rows);
-            if self.chroma444 {
-                // P7 — planar I444: three full-resolution planes.
-                let u_stride = av.stride(1);
-                copy_plane_into_av(av.data_mut(1), u_stride, &self.plane_u, w, rows);
-                let v_stride = av.stride(2);
-                copy_plane_into_av(av.data_mut(2), v_stride, &self.plane_v, w, rows);
-            } else {
-                // NV12: interleaved UV at half height.
-                let uv_stride = av.stride(1);
-                copy_plane_into_av(av.data_mut(1), uv_stride, &self.plane_u, w, rows / 2);
-            }
-        }
-
-        Ok(av)
+            util::picture::Type::None
+        });
     }
 
     /// P7 — whether this encoder runs HEVC Rext 4:4:4. The pump reads it
@@ -2397,19 +2386,32 @@ impl FfmpegEncoder {
         // FR-118 P0 — each step timed apart (`StageTimes`). A frame that fails
         // part-way is not counted: it is not a frame the stage carried.
         let t0 = std::time::Instant::now();
-        self.convert_bgra(frame)?;
-        let av = self.build_av_frame(frame.monotonic_us)?;
+        // FR-119 P2b-11 — converted straight into a pooled frame, which goes
+        // back to the pool once sent (`take_frame` reuses it only after the
+        // encoder has let go of it).
+        let mut av = self.take_frame()?;
+        if let Err(e) = self.convert_into(frame, &mut av) {
+            self.give_back(av);
+            return Err(e);
+        }
+        self.stamp_frame(&mut av, frame.monotonic_us);
         let t1 = std::time::Instant::now();
         // FR-77 P4 — a VAAPI encoder takes the pool's hardware frame, not the
         // software one it was built from.
-        let av = match &self.hw {
-            Some(frames) => frames.upload(&av)?,
-            None => av,
+        let hw_frame = match &self.hw {
+            Some(frames) => match frames.upload(&av) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    self.give_back(av);
+                    return Err(e);
+                }
+            },
+            None => None,
         };
         let t2 = std::time::Instant::now();
-        self.encoder
-            .send_frame(&av)
-            .map_err(|e| anyhow!("ffmpeg send_frame failed: {}", e))?;
+        let sent = self.encoder.send_frame(hw_frame.as_ref().unwrap_or(&av));
+        self.give_back(av);
+        sent.map_err(|e| anyhow!("ffmpeg send_frame failed: {}", e))?;
         let t3 = std::time::Instant::now();
 
         self.force_keyframe = false;
@@ -2658,32 +2660,187 @@ fn packed444_name(name: &str) -> bool {
 /// FFmpeg's `AV_PIX_FMT_VUYX` byte order; X is undefined and written 0xFF.
 /// The BT.601 I444 planes dcv produced are the source, so the packed path
 /// renders identically to the planar one.
-fn pack_vuyx(y: &[u8], u: &[u8], v: &[u8], packed: &mut Vec<u8>) {
-    let n = y.len().min(u.len()).min(v.len());
-    packed.resize(n * 4, 0xFF);
-    for (i, px) in packed.chunks_exact_mut(4).enumerate().take(n) {
-        px[0] = v[i];
-        px[1] = u[i];
-        px[2] = y[i];
-        px[3] = 0xFF;
+/// FR-77 P3b — interleave `w × h` planar I444 into VUYX rows of `dst`, one
+/// every `dst_stride` bytes: V, U, Y, X per pixel (FFmpeg's `AV_PIX_FMT_VUYX`),
+/// X written 0xFF. Rows the planes or `dst` do not cover are left alone.
+fn pack_vuyx_into(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    w: usize,
+    h: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+) {
+    for row in 0..h {
+        let (s, d) = (row * w, row * dst_stride);
+        let (Some(ys), Some(us), Some(vs), Some(out)) = (
+            y.get(s..s + w),
+            u.get(s..s + w),
+            v.get(s..s + w),
+            dst.get_mut(d..d + w * 4),
+        ) else {
+            break;
+        };
+        for (i, px) in out.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[vs[i], us[i], ys[i], 0xFF]);
+        }
     }
 }
 
-fn copy_plane_into_av(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_width: usize,
-    rows: usize,
-) {
-    for y in 0..rows {
-        let dst_off = y * dst_stride;
-        let src_off = y * src_width;
-        if dst_off + src_width > dst.len() || src_off + src_width > src.len() {
-            break;
-        }
-        dst[dst_off..dst_off + src_width].copy_from_slice(&src[src_off..src_off + src_width]);
+/// FR-119 P2b-11 — how many converted frames an encoder keeps for reuse. One
+/// is enough for an encoder that copies its input before `send_frame` returns
+/// (NVENC, AMF); the rest cover one that holds its input until the surface is
+/// encoded (QSV). Past this, a frame still held is dropped instead of kept.
+const FRAME_POOL_MAX: usize = 3;
+
+/// FR-119 P2b-11 — the first `N` planes of `av` as disjoint mutable slices of
+/// `stride × plane_height` bytes each (the length `frame::Video::data_mut`
+/// gives one plane), with their strides.
+fn av_planes_mut<const N: usize>(av: &mut frame::Video) -> ([&mut [u8]; N], [usize; N]) {
+    assert!(
+        N <= av.planes(),
+        "{N} planes asked of a {:?} frame",
+        av.format()
+    );
+    let lens: [(usize, usize); N] =
+        std::array::from_fn(|i| (av.stride(i), av.stride(i) * av.plane_height(i) as usize));
+    // SAFETY: `take_frame` gave `av` a buffer (`av_frame_get_buffer`), whose
+    // planes are disjoint ranges of it, plane `i` at least `stride(i) ×
+    // plane_height(i)` bytes long (ffmpeg-next's `data_mut` builds the same
+    // slice). The slices borrow `av` mutably, so nothing else reaches the
+    // buffer while they live.
+    let ptr = unsafe { av.as_mut_ptr() };
+    let planes = std::array::from_fn(|i| unsafe {
+        std::slice::from_raw_parts_mut((*ptr).data[i], lens[i].1)
+    });
+    (planes, lens.map(|(stride, _)| stride))
+}
+
+/// BGRA → `N` destination planes, in one call or, for a big frame, in row bands
+/// across scoped threads.
+///
+/// P5 (FR-1, 2026-08-27) — dcv's `convert_image` is single-threaded SIMD; at
+/// 2880×1800 it was a large share of the 20–30 ms "encode" time that capped the
+/// pump at ~40 fps. Bands start on EVEN rows (`band_cuts`), so NV12's
+/// vertically subsampled chroma pairs never straddle a cut (BT.601 is pointwise
+/// per 2×2 block) and the banded output is byte-identical to the single call.
+/// Each band reads the source from its first row on (shared borrows may
+/// overlap) and writes disjoint destination slices (`split_at_mut`).
+/// `shifts[i]` is plane `i`'s vertical subsampling: 1 for NV12's UV plane,
+/// 0 otherwise.
+#[allow(clippy::too_many_arguments)]
+fn convert_bgra_planes<const N: usize>(
+    frame: &Frame,
+    w: usize,
+    h: usize,
+    dst_format: &dcv_color_primitives::ImageFormat,
+    planes: [&mut [u8]; N],
+    strides: [usize; N],
+    shifts: [u32; N],
+    bands: usize,
+) -> Result<()> {
+    use dcv_color_primitives::{
+        ColorSpace, ImageFormat, PixelFormat as DcvPixelFormat, convert_image,
+    };
+    let src_format = ImageFormat {
+        pixel_format: DcvPixelFormat::Bgra,
+        color_space: ColorSpace::Rgb,
+        num_planes: 1,
+    };
+    let stride = frame.stride as usize;
+    let what = dst_format.pixel_format;
+    // The bands below slice the source by rows; a short buffer is an error,
+    // never a panic on an encoder thread.
+    if stride < w * 4 || frame.data.len() < stride * h {
+        return Err(anyhow!(
+            "BGRA frame of {} bytes, stride {stride}, cannot hold {w}x{h}",
+            frame.data.len()
+        ));
     }
+    if bands <= 1 {
+        let mut planes = planes;
+        return convert_image(
+            w as u32,
+            h as u32,
+            &src_format,
+            Some(&[stride]),
+            &[&frame.data],
+            dst_format,
+            Some(&strides),
+            &mut planes,
+        )
+        .map_err(|e| anyhow!("dcv BGRA→{what:?} convert failed: {e:?}"));
+    }
+    let mut rest = planes;
+    let jobs: Vec<(usize, usize, [&mut [u8]; N])> = FfmpegEncoder::band_cuts(h, bands)
+        .into_iter()
+        .map(|(r0, bh)| {
+            let band = std::array::from_fn(|i| {
+                let rows = bh >> shifts[i];
+                let (head, tail) = std::mem::take(&mut rest[i]).split_at_mut(rows * strides[i]);
+                rest[i] = tail;
+                head
+            });
+            (r0, bh, band)
+        })
+        .collect();
+    let run = |(r0, bh, mut band): (usize, usize, [&mut [u8]; N])| -> Result<()> {
+        convert_image(
+            w as u32,
+            bh as u32,
+            &src_format,
+            Some(&[stride]),
+            &[&frame.data[r0 * stride..]],
+            dst_format,
+            Some(&strides),
+            &mut band,
+        )
+        .map_err(|e| anyhow!("dcv BGRA→{what:?} band convert failed: {e:?}"))
+    };
+    // FR-119 P2b-11 — on the persistent pool. A panic in a band is caught and
+    // reported like the scoped threads' was, not carried onto the encoder
+    // thread.
+    if let Some(pool) = convert_pool() {
+        use rayon::prelude::*;
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install(|| jobs.into_par_iter().try_for_each(run))
+        }))
+        .unwrap_or_else(|_| Err(anyhow!("convert band panicked")));
+    }
+    let run = &run;
+    std::thread::scope(|s| -> Result<()> {
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|job| s.spawn(move || run(job)))
+            .collect();
+        for hnd in handles {
+            hnd.join()
+                .map_err(|_| anyhow!("convert band thread panicked"))??;
+        }
+        Ok(())
+    })
+}
+
+/// FR-119 P2b-11 — the pool the banded conversion runs on: one per process,
+/// one thread per band ([`FfmpegEncoder::max_bands`]), started on first use.
+/// Before, every frame spawned and joined its band threads, which at
+/// 2560×1600 cost about 1 ms of the conversion (spec §4.12). `None` when the
+/// threads could not be started; the conversion then spawns its own per
+/// frame, as before.
+fn convert_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(FfmpegEncoder::max_bands())
+            .thread_name(|i| format!("roomler-convert-{i}"))
+            .build()
+            .map_err(|e| {
+                tracing::warn!(%e, "colour-conversion pool not started — each frame starts its own threads");
+            })
+            .ok()
+    })
+    .as_ref()
 }
 
 #[cfg(test)]
@@ -3276,22 +3433,25 @@ mod tests {
     }
 
     /// FR-77 P3b — VUYX byte order (FFmpeg's `AV_PIX_FMT_VUYX`): V, U, Y, X per
-    /// pixel, X written 0xFF; the buffer is resized to the plane length and
-    /// a stale larger buffer is shrunk.
+    /// pixel, X written 0xFF. FR-119 P2b-11 — packed straight into a frame's
+    /// rows, so a row's padding past `w × 4` is left alone, and rows the
+    /// planes do not cover are not written.
     #[test]
-    fn vuyx_packing_layout_and_sizing() {
-        let y = [10u8, 11, 12];
-        let u = [20u8, 21, 22];
-        let v = [30u8, 31, 32];
-        let mut packed = vec![0u8; 64];
-        pack_vuyx(&y, &u, &v, &mut packed);
-        assert_eq!(packed.len(), 12);
-        assert_eq!(&packed[..4], &[30, 20, 10, 0xFF]);
-        assert_eq!(&packed[4..8], &[31, 21, 11, 0xFF]);
-        assert_eq!(&packed[8..], &[32, 22, 12, 0xFF]);
-        // Mismatched plane lengths pack the common prefix only.
-        pack_vuyx(&y[..2], &u, &v, &mut packed);
-        assert_eq!(packed.len(), 8);
+    fn vuyx_packing_layout_and_stride() {
+        let (w, h, stride) = (2usize, 2usize, 12usize);
+        let y = [10u8, 11, 12, 13];
+        let u = [20u8, 21, 22, 23];
+        let v = [30u8, 31, 32, 33];
+        let mut dst = vec![0xAAu8; stride * h];
+        pack_vuyx_into(&y, &u, &v, w, h, &mut dst, stride);
+        assert_eq!(&dst[..8], &[30, 20, 10, 0xFF, 31, 21, 11, 0xFF]);
+        assert_eq!(&dst[8..12], &[0xAA; 4], "padding untouched");
+        assert_eq!(&dst[12..20], &[32, 22, 12, 0xFF, 33, 23, 13, 0xFF]);
+        // Planes one row short: the second row is not written.
+        let mut dst = vec![0xAAu8; stride * h];
+        pack_vuyx_into(&y[..2], &u, &v, w, h, &mut dst, stride);
+        assert_eq!(&dst[..8], &[30, 20, 10, 0xFF, 31, 21, 11, 0xFF]);
+        assert_eq!(&dst[12..20], &[0xAA; 8]);
     }
 
     /// FR-77 P3b — QSV's 4:4:4 profile keys appear exactly when 4:4:4 is
@@ -3415,5 +3575,243 @@ mod tests {
             assert_eq!(FfmpegEncoder::static_name(name), Some(name));
         }
         assert!(HwKind::of("hevc_nvenc").is_none() && HwKind::of("vp9_qsv").is_none());
+    }
+
+    /// FR-119 P2b-11 — converting straight into an AVFrame's padded planes,
+    /// in one call or in bands, is byte-identical (on every row's first `w`
+    /// bytes) to dcv's single call into tightly packed planes: the output the
+    /// encoder got before, when the planes were copied in afterwards. 1366 is
+    /// not a multiple of FFmpeg's alignment, so every plane's stride is larger
+    /// than its width and a stride mistake shows up as shifted rows.
+    #[test]
+    fn convert_into_frame_planes_matches_a_tight_reference() {
+        use dcv_color_primitives::{
+            ColorSpace, ImageFormat, PixelFormat as DcvPixelFormat, convert_image,
+        };
+        let (w, h) = (1366usize, 768usize);
+        let data: Vec<u8> = (0..w * h * 4)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let frame = Frame {
+            width: w as u32,
+            height: h as u32,
+            stride: (w * 4) as u32,
+            pixel_format: PixelFormat::Bgra,
+            data,
+            monotonic_us: 0,
+            monitor: 0,
+            damage: crate::capture::Damage::Unknown,
+            source: None,
+        };
+        let src_format = ImageFormat {
+            pixel_format: DcvPixelFormat::Bgra,
+            color_space: ColorSpace::Rgb,
+            num_planes: 1,
+        };
+        let reference = |dst_format: &ImageFormat, sizes: &[usize]| -> Vec<Vec<u8>> {
+            let mut planes: Vec<Vec<u8>> = sizes.iter().map(|&n| vec![0u8; n]).collect();
+            let mut slices: Vec<&mut [u8]> = planes.iter_mut().map(|p| &mut p[..]).collect();
+            let strides = vec![w; sizes.len()];
+            convert_image(
+                w as u32,
+                h as u32,
+                &src_format,
+                Some(&[w * 4]),
+                &[&frame.data],
+                dst_format,
+                Some(&strides),
+                &mut slices,
+            )
+            .unwrap();
+            planes
+        };
+        let same_rows = |av: &frame::Video, plane: usize, tight: &[u8], rows: usize| {
+            let (stride, data) = (av.stride(plane), av.data(plane));
+            assert!(stride > w, "the test needs padded rows (stride {stride})");
+            for r in 0..rows {
+                assert_eq!(
+                    &data[r * stride..r * stride + w],
+                    &tight[r * w..(r + 1) * w],
+                    "plane {plane} row {r}"
+                );
+            }
+        };
+        let nv12 = ImageFormat {
+            pixel_format: DcvPixelFormat::Nv12,
+            color_space: ColorSpace::Bt601,
+            num_planes: 2,
+        };
+        let i444 = ImageFormat {
+            pixel_format: DcvPixelFormat::I444,
+            color_space: ColorSpace::Bt601,
+            num_planes: 3,
+        };
+        let nv12_ref = reference(&nv12, &[w * h, w * h / 2]);
+        let i444_ref = reference(&i444, &[w * h; 3]);
+        for bands in [1, 4] {
+            let mut av = frame::Video::new(format::Pixel::NV12, w as u32, h as u32);
+            let (planes, strides) = av_planes_mut::<2>(&mut av);
+            convert_bgra_planes(&frame, w, h, &nv12, planes, strides, [0, 1], bands).unwrap();
+            same_rows(&av, 0, &nv12_ref[0], h);
+            same_rows(&av, 1, &nv12_ref[1], h / 2);
+
+            let mut av = frame::Video::new(format::Pixel::YUV444P, w as u32, h as u32);
+            let (planes, strides) = av_planes_mut::<3>(&mut av);
+            convert_bgra_planes(&frame, w, h, &i444, planes, strides, [0, 0, 0], bands).unwrap();
+            for (p, tight) in i444_ref.iter().enumerate() {
+                same_rows(&av, p, tight, h);
+            }
+        }
+    }
+
+    /// FR-119 P2b-10 — split-frame encoding is asked for only where it exists
+    /// and only above 60 fps, so a 60 fps session's bitstream is unchanged and
+    /// `h264_nvenc` (no such mode) is never handed the option.
+    #[test]
+    fn throughput_options_split_nvenc_hevc_and_av1_above_60_only() {
+        let split = |name, fps, mode| throughput_options(name, fps, mode);
+        let forced = vec![("split_encode_mode".to_string(), "forced".to_string())];
+        assert_eq!(split("hevc_nvenc", 120, NvencSplit::Auto), forced);
+        assert_eq!(split("av1_nvenc", 144, NvencSplit::Auto), forced);
+        for fps in [30, 60] {
+            assert!(
+                split("hevc_nvenc", fps, NvencSplit::Auto).is_empty(),
+                "{fps}"
+            );
+            assert!(
+                split("hevc_nvenc", fps, NvencSplit::Strips(3)).is_empty(),
+                "{fps}"
+            );
+        }
+        for name in [
+            "h264_nvenc",
+            "hevc_qsv",
+            "hevc_amf",
+            "hevc_videotoolbox",
+            "hevc_vaapi",
+        ] {
+            assert!(split(name, 120, NvencSplit::Auto).is_empty(), "{name}");
+        }
+        assert!(split("hevc_nvenc", 120, NvencSplit::Off).is_empty());
+        assert_eq!(
+            split("hevc_nvenc", 120, NvencSplit::Strips(3)),
+            vec![("split_encode_mode".to_string(), "3".to_string())]
+        );
+    }
+
+    /// The knob: `off` restores the pre-P2b-10 behaviour, a strip count is
+    /// taken as given, and anything unrecognised is the default, never a
+    /// strip count nobody asked for.
+    #[test]
+    fn nvenc_split_parse() {
+        assert_eq!(NvencSplit::parse(None), NvencSplit::Auto);
+        assert_eq!(NvencSplit::parse(Some("auto")), NvencSplit::Auto);
+        assert_eq!(NvencSplit::parse(Some(" OFF ")), NvencSplit::Off);
+        assert_eq!(NvencSplit::parse(Some("0")), NvencSplit::Off);
+        assert_eq!(NvencSplit::parse(Some("2")), NvencSplit::Strips(2));
+        assert_eq!(NvencSplit::parse(Some("4")), NvencSplit::Strips(4));
+        assert_eq!(NvencSplit::parse(Some("5")), NvencSplit::Auto);
+        assert_eq!(NvencSplit::parse(Some("forced")), NvencSplit::Auto);
+    }
+
+    /// FR-119 P2b-10 — the encode stage on THIS host's silicon, step by step.
+    ///
+    /// Opens the session's own cascade (`new_*_adaptive`, the options a
+    /// session opens with) at a geometry and rate, feeds it moving BGRA
+    /// content back to back, and prints [`StageTimes`] per frame with the
+    /// p50 / p90 / p99 of the whole call: the number the FR-119 trial fails on
+    /// (p90 at 90 % of a period). Needs the GPU, so it is no CI test. On a
+    /// field host, in release (the conversion is SIMD; debug says nothing):
+    ///
+    /// ```text
+    /// ROOMLER_STAGE_BENCH=hevc,2560x1600@120:444 cargo test -p roomlerd --lib --release \
+    ///   --features ffmpeg-encoder -- --ignored stage_bench --nocapture
+    /// ```
+    ///
+    /// `ROOMLER_STAGE_BENCH_FRAMES` sets how many frames are counted (default
+    /// 600, after 60 of warm-up, which lifts the GPU out of its idle clocks).
+    #[test]
+    #[ignore = "needs a hardware encoder; run on a field host"]
+    fn stage_bench() {
+        let spec = std::env::var("ROOMLER_STAGE_BENCH")
+            .unwrap_or_else(|_| "hevc,2560x1600@120:444".to_string());
+        let (codec, rest) = spec.split_once(',').unwrap_or(("hevc", spec.as_str()));
+        let (geometry, chroma) = rest.split_once(':').unwrap_or((rest, "420"));
+        let (dims, fps) = geometry.split_once('@').expect("WxH@FPS");
+        let (w, h) = dims.split_once('x').expect("WxH");
+        let (w, h, fps): (u32, u32, u32) = (
+            w.parse().expect("width"),
+            h.parse().expect("height"),
+            fps.parse().expect("fps"),
+        );
+        let chroma444 = chroma == "444";
+        let counted: usize = std::env::var("ROOMLER_STAGE_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        let maxrate = ffmpeg_maxrate_bps(w, h, fps, false);
+        let mut enc = match codec {
+            "av1" => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate, 0, false),
+            "h264" => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate, 0, chroma444, false),
+            _ => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate, 0, chroma444, false),
+        }
+        .expect("open");
+        // Moving content: vertical bars that slide, over a fine checker that
+        // shifts, so every frame has real inter-frame work (a static frame
+        // encodes in no time and would flatter every number).
+        let stride = w as usize * 4;
+        let frames: Vec<Vec<u8>> = (0..8u32)
+            .map(|i| {
+                let mut data = vec![0u8; stride * h as usize];
+                for (y, row) in data.chunks_exact_mut(stride).enumerate() {
+                    for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                        let bar = ((x as u32 + i * 37) / 64).is_multiple_of(2);
+                        let check = ((x as u32 + i) ^ (y as u32 * 3)) & 4 != 0;
+                        let v = if bar { 200u8 } else { 40 } ^ if check { 24 } else { 0 };
+                        px.copy_from_slice(&[v, v.wrapping_add(i as u8 * 9), v ^ 0x55, 255]);
+                    }
+                }
+                data
+            })
+            .collect();
+        let period_us = 1_000_000 / u64::from(fps.max(1));
+        let mut total_us = Vec::with_capacity(counted);
+        let mut base = StageTimes::default();
+        for n in 0..(60 + counted) {
+            if n == 60 {
+                base = enc.stage;
+            }
+            let frame = Frame {
+                width: w,
+                height: h,
+                stride: stride as u32,
+                pixel_format: PixelFormat::Bgra,
+                data: frames[n % frames.len()].clone(),
+                monotonic_us: n as u64 * period_us,
+                monitor: 0,
+                damage: crate::capture::Damage::Unknown,
+                source: None,
+            };
+            let t = std::time::Instant::now();
+            enc.encode_sync(&frame).expect("encode");
+            if n >= 60 {
+                total_us.push(t.elapsed().as_micros() as u64);
+            }
+        }
+        let [convert, upload, submit, drain] = enc.stage.window_ms_since(&base).unwrap_or([0.0; 4]);
+        total_us.sort_unstable();
+        let pct =
+            |q: usize| total_us[(total_us.len() * q / 100).min(total_us.len() - 1)] as f64 / 1000.0;
+        let budget_ms = period_us as f64 * 0.9 / 1000.0;
+        println!(
+            "stage_bench {spec}: encoder={} chroma444={} frames={counted} \
+             convert={convert:.3} upload={upload:.3} submit={submit:.3} drain={drain:.3} ms/frame; \
+             call p50={:.3} p90={:.3} p99={:.3} ms; the trial fails at p90 >= {budget_ms:.3} ms",
+            enc.encoder_name,
+            enc.chroma444,
+            pct(50),
+            pct(90),
+            pct(99),
+        );
     }
 }

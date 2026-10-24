@@ -37,7 +37,7 @@ what it costs in installer size and ships with integration and e2e tests.
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
   consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1151`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
-  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:11025`); `.roomler-partial` staging (`files.rs`).
+  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:11031`); `.roomler-partial` staging (`files.rs`).
 
 ## Decisions taken with the operator (2026-09-25)
 
@@ -90,7 +90,7 @@ what it costs in installer size and ships with integration and e2e tests.
   it is wall-clock. A lock screen or `ACCESS_LOST` re-acquires and inserts a black gap; it never aborts. A fast user
   switch terminates the worker, so the recording ends `session_changed` — a recording never follows a user switch.
 - **Recording encoder profile.** A new `RateMode { ConstantQuality { q }, Vbr { … } }` and an explicit GOP are threaded
-  through `build_encoder` (`encode/ffmpeg/encoder.rs:1507`) and `encoder_options` (`:258`); today both force
+  through `build_encoder` (`encode/ffmpeg/encoder.rs:1570`) and `encoder_options` (`:258`); today both force
   maxrate/bufsize and a 64 800-frame GOP (`:51`).
 
   | Backend | Recording options |
