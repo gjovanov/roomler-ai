@@ -587,7 +587,7 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
 
 - **Cause: launchd throttled the whole session pipeline.** `com.roomler.daemon.plist` set no `ProcessType`, and
   launchd gives such a job "light resource limits", throttling its CPU usage and I/O bandwidth. FR-43's worker, which
-  runs every session (capture, encode, send), is spawned inside the daemon's job (`macos_supervisor.rs:392`) and
+  runs every session (capture, encode, send), is spawned inside the daemon's job (`macos_supervisor.rs:396`) and
   inherits them. On the MacBook every thread of both halves scheduled at priority 20, the utility band, under
   WindowServer (79), coreaudiod (63) and the apps (47). The per-user LaunchAgent, which captured before FR-43, and
   the desktop companion have carried `ProcessType = Interactive` from their first installers. So the session
@@ -606,7 +606,7 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
 - ⚠️ **What the two timestamps mean.** The trial's is the capture worker's receipt (`frame.monotonic_us`). The wire
   header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9422`). So a trial that
   passes at p99 16.4 ms says the host CAN keep up; it says nothing about the cadence the viewer gets.
-- **Guards.** CI's macOS packaging lint (`ci.yml:1301`) fails if the daemon, agent or desktop job loses
+- **Guards.** CI's macOS packaging lint (`ci.yml:1304`) fails if the daemon, agent or desktop job loses
   `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1168`) asserts that launchd loaded the
   daemon as `spawn type = interactive (4)`, after an enabled install and after a plain re-install (the self-update
   path). Both checks were run red against the shipped job on the MacBook, which reads `daemon (3)`.

@@ -341,6 +341,54 @@ pub enum Child {
     Tokio(Box<tokio::process::Child>),
     #[cfg(windows)]
     Win(std::sync::Arc<crate::win_service::supervisor::OwnedProcess>),
+    /// FR-97 P2f-2 — started as its own responsible process
+    /// ([`crate::macos_spawn`]), so reaped here by pid.
+    #[cfg(target_os = "macos")]
+    Disclaimed(DisclaimedChild),
+}
+
+/// FR-97 P2f-2 — a recorder `posix_spawn`ed by pid, which nothing else reaps.
+#[cfg(target_os = "macos")]
+pub struct DisclaimedChild {
+    pid: libc::pid_t,
+    reaped: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DisclaimedChild {
+    async fn wait(&mut self) {
+        while !self.reaped {
+            if crate::macos_spawn::try_reap(self.pid) {
+                self.reaped = true;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn kill(&mut self) {
+        if !self.reaped {
+            // SAFETY: a signal to our own child, not yet reaped, so the pid is
+            // still the one we started.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DisclaimedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // Nothing else reaps it, so wait for it off-thread rather than
+            // leave a zombie behind every recording.
+            let pid = self.pid;
+            std::thread::spawn(move || {
+                let mut status = 0;
+                // SAFETY: a blocking waitpid on our own child.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+            });
+        }
+    }
 }
 
 impl Child {
@@ -360,6 +408,8 @@ impl Child {
                     _ => return,
                 }
             },
+            #[cfg(target_os = "macos")]
+            Self::Disclaimed(c) => c.wait().await,
         }
     }
 
@@ -371,7 +421,28 @@ impl Child {
             }
             #[cfg(windows)]
             Self::Win(p) => p.terminate(),
+            #[cfg(target_os = "macos")]
+            Self::Disclaimed(c) => c.kill(),
         }
+    }
+}
+
+/// FR-97 P2f-2 — whether this process starts its recorders as their own
+/// responsible process. True on a supervised Mac's GUI worker, whose own
+/// responsible process is the root daemon (macOS never asks the person about
+/// a microphone for root), where the private call exists, unless
+/// `ROOMLERD_RECORDER_DISCLAIM=0`. The manager reads the same answer, so a
+/// recorder that still answers to root is told to refuse the microphone.
+pub fn recorder_owns_its_permissions() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::supervision::current() == Some(crate::supervision::Supervision::MacosSupervisor)
+            && tunnel_core::env::flag("RECORDER_DISCLAIM", true)
+            && crate::macos_spawn::available()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
@@ -405,6 +476,10 @@ fn spawn_inherit(
     args: &[OsString],
     env: &[(String, String)],
 ) -> std::io::Result<Launched> {
+    #[cfg(target_os = "macos")]
+    if recorder_owns_its_permissions() {
+        return spawn_disclaimed(exe, args, env);
+    }
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -414,6 +489,41 @@ fn spawn_inherit(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     launch_piped(cmd)
+}
+
+/// FR-97 P2f-2 — `exe args` as its own responsible process, with the same
+/// pipes [`launch_piped`] gives (stdin and stdout piped, stderr inherited).
+#[cfg(target_os = "macos")]
+fn spawn_disclaimed(
+    exe: &Path,
+    args: &[OsString],
+    env: &[(String, String)],
+) -> std::io::Result<Launched> {
+    let s = crate::macos_spawn::spawn_disclaimed(exe, args, env)?;
+    // Own the pid first, so a failure below still kills and reaps it.
+    let mut child = DisclaimedChild {
+        pid: s.pid,
+        reaped: false,
+    };
+    let pipes = tokio::net::unix::pipe::Sender::from_owned_fd(s.stdin).and_then(|stdin| {
+        tokio::net::unix::pipe::Receiver::from_owned_fd(s.stdout).map(|stdout| (stdin, stdout))
+    });
+    let (stdin, stdout) = match pipes {
+        Ok(p) => p,
+        Err(e) => {
+            child.kill();
+            return Err(e);
+        }
+    };
+    tracing::info!(
+        pid = s.pid,
+        "recording: the recorder is its own responsible process (FR-97 P2f-2)"
+    );
+    Ok(Launched {
+        stdin: Some(Box::new(stdin)),
+        stdout: Box::new(stdout),
+        child: Child::Disclaimed(child),
+    })
 }
 
 /// Start `cmd` with stdin and stdout piped (stderr into the daemon's own).
