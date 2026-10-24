@@ -2065,14 +2065,17 @@
       </v-card>
     </v-dialog>
 
-    <v-dialog v-model="agentLogDialog" max-width="980" scrollable>
+    <!-- FR-120 P3 — full screen on a phone. There the line count and the
+         log's path ride the toolbar's second row: in one row the select and
+         three buttons left the title 0 px. -->
+    <v-dialog v-model="agentLogDialog" max-width="980" scrollable :fullscreen="dialogFullscreen">
       <v-card>
-        <v-toolbar density="compact" color="primary">
+        <v-toolbar density="compact" color="primary" :extended="dialogFullscreen">
           <v-icon class="ml-4">mdi-file-document-outline</v-icon>
           <v-toolbar-title>
             Agent log
             <span
-              v-if="rc.agentLogs.value?.path"
+              v-if="!dialogFullscreen && rc.agentLogs.value?.path"
               class="ml-2 text-caption text-truncate"
               :title="rc.agentLogs.value.path"
             >
@@ -2081,8 +2084,9 @@
           </v-toolbar-title>
           <v-spacer />
           <v-select
+            v-if="!dialogFullscreen"
             v-model="agentLogLines"
-            :items="[100, 200, 500, 1000, 2000, 5000]"
+            :items="AGENT_LOG_LINE_CHOICES"
             density="compact"
             hide-details
             variant="outlined"
@@ -2096,6 +2100,7 @@
             variant="text"
             :loading="rc.agentLogsLoading.value"
             title="Refresh"
+            aria-label="Refresh"
             @click="refreshAgentLog"
           >
             <v-icon>mdi-refresh</v-icon>
@@ -2104,6 +2109,7 @@
             icon
             variant="text"
             title="Copy to clipboard"
+            aria-label="Copy to clipboard"
             :disabled="!rc.agentLogs.value?.lines?.length"
             @click="copyAgentLog"
           >
@@ -2113,12 +2119,33 @@
             icon
             variant="text"
             title="Close"
+            aria-label="Close"
             @click="agentLogDialog = false"
           >
             <v-icon>mdi-close</v-icon>
           </v-btn>
+          <template v-if="dialogFullscreen" #extension>
+            <div class="d-flex align-center ga-3 px-4 w-100" style="min-width: 0">
+              <v-select
+                v-model="agentLogLines"
+                :items="AGENT_LOG_LINE_CHOICES"
+                density="compact"
+                hide-details
+                variant="outlined"
+                style="max-width: 120px; flex: none;"
+                label="Lines"
+                @update:model-value="refreshAgentLog"
+              />
+              <span
+                v-if="rc.agentLogs.value?.path"
+                class="text-caption text-truncate"
+                style="min-width: 0"
+                data-testid="rc-agent-log-path"
+              >{{ rc.agentLogs.value.path }}</span>
+            </div>
+          </template>
         </v-toolbar>
-        <v-card-text class="pa-0" style="max-height: 70vh; overflow: auto;">
+        <v-card-text class="pa-0" :style="dialogFullscreen ? 'overflow: auto;' : 'max-height: 70vh; overflow: auto;'">
           <div
             v-if="rc.agentLogs.value?.ok === false"
             class="pa-3 text-error text-caption"
@@ -2360,6 +2387,7 @@ import {
 } from '@/composables/videoCells'
 import { useI18n } from 'vue-i18n'
 import { useSnackbar } from '@/composables/useSnackbar'
+import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import {
   describeRecordReason,
   showsRecordRefusal,
@@ -2442,6 +2470,9 @@ const { showSuccess, showError, showSnackbar } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
 const { mobile, xs, width: displayWidth } = useDisplay()
+// FR-120 P3 — the agent log dialog covers the screen below 600 px. (Not the
+// stage's fullscreen: that is `isFullscreen`.)
+const { fullscreen: dialogFullscreen } = useResponsiveDialog()
 // FR-116 P5c — while a session runs, its state chips and tools move to their
 // own row (#rc-tb-strip), at every width: in the toolbar's one row they
 // overflowed it, which pinned the device's name at its 96 px minimum on a
@@ -2825,6 +2856,8 @@ const agentLogDialog = ref(false)
 // composable default; keeps the reply payload well under
 // webrtc-rs's SCTP max_message_size (~64 KiB).
 const agentLogLines = ref(200)
+/** The counts offered: in the toolbar from 600 px, in its second row below. */
+const AGENT_LOG_LINE_CHOICES = [100, 200, 500, 1000, 2000, 5000]
 const agentLogPreEl = ref<HTMLElement | null>(null)
 
 // rc.NEXT — remote app selection & launch (virtual-desktop hosts).

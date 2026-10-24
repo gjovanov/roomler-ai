@@ -150,7 +150,7 @@ config push, which drive machine-wide state and are therefore primary-only
 ⚠️ **Immediate and disruptive, by design.** A key that leaked must not wait for the
 holder's session to end, so the rotation ends every remote-control, overlay-SSH and
 tunnel session the device carries on that org and reconnects. The confirm dialog says
-so (`ui/src/components/admin/AgentsSection.vue:1225-1226`). A corp-VPN host may come
+so (`ui/src/components/admin/AgentsSection.vue:1246-1247`). A corp-VPN host may come
 back relay-locked after the cycle (the renumber caveat in `multi-org.md`).
 
 `overlay_wg_secret_key` stays **unwritable over LocalAPI** (`config_surface.rs:13-14`,
@@ -184,7 +184,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 
 Resolved **once, server-side**, from the order, the claim and the proof
 (`crates/modules/fleet/src/agent.rs:601-676`); the grid only names the states
-(`AgentsSection.vue:1995-2096`). The device row also carries `overlay_public_key` and
+(`AgentsSection.vue:2023-2124`). The device row also carries `overlay_public_key` and
 `overlay_key_epoch` straight from the proof (`agent.rs:1449-1457`), so an operator
 can *see* the key change instead of trusting a chip.
 
@@ -319,7 +319,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6152-6294`, `:3041-3083`, `:3085-3106`, `:1146-1170` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1612`, `:1613-1615`; `config_surface.rs:1096-1069` |
-| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1199-1226`, `:1995-2096`; `ui/src/stores/agents.ts:948-902` |
+| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1220-1247`, `:2023-2124`; `ui/src/stores/agents.ts:948-902` |
 
 ## Not built
 
