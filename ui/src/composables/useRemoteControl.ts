@@ -3743,6 +3743,9 @@ export interface LocalRelayDescriptor {
   overlay_ip: string
   username: string
   credential: string
+  /** FR-121 — the device whose relay this is (newer agents only), so a
+   *  browser that probed once can remember which device it runs on. */
+  agent_id?: string
 }
 
 /** Primary loopback port the agent serves its descriptor + clipboard
@@ -3781,7 +3784,65 @@ export function parseLocalRelayDescriptor(raw: unknown): LocalRelayDescriptor | 
   ) {
     return null
   }
-  return { turn_port, overlay_ip, username, credential }
+  const agentId = o.agent_id
+  return typeof agentId === 'string' && /^[0-9a-f]{24}$/.test(agentId)
+    ? { turn_port, overlay_ip, username, credential, agent_id: agentId }
+    : { turn_port, overlay_ip, username, credential }
+}
+
+/** FR-121 — which of the signed-in person's own devices this browser runs on,
+ *  per browser: an agent id, `'none'` (it is none of them), or unset (never
+ *  said; a successful probe may suggest one). */
+const THIS_DEVICE_STORAGE_KEY = 'roomler-rc-this-device'
+
+export function readStoredThisDevice(): string | null {
+  try {
+    const v = globalThis.localStorage?.getItem(THIS_DEVICE_STORAGE_KEY) ?? null
+    return v === 'none' || (v !== null && /^[0-9a-f]{24}$/.test(v)) ? v : null
+  } catch {
+    return null
+  }
+}
+
+function persistThisDevice(v: string | null) {
+  try {
+    if (v === null) globalThis.localStorage?.removeItem(THIS_DEVICE_STORAGE_KEY)
+    else globalThis.localStorage?.setItem(THIS_DEVICE_STORAGE_KEY, v)
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** FR-121 — how a connect finds the relay of the device this browser runs on.
+ *  `from`: name the device and let the server hand its relay over, so the
+ *  browser never fetches 127.0.0.1 (which Chrome gates behind its
+ *  local-network permission). `probe`: the loopback probe, as before FR-121,
+ *  while no device is named. `none`: switched off, an external session, a
+ *  browser that is on none of its owner's devices, or one looking at the very
+ *  device it runs on. Pure + exported for tests. */
+export function localRelayPlan(opts: {
+  enabled: boolean
+  external: boolean
+  thisDevice: string | null
+  target: string
+}): { kind: 'from'; device: string } | { kind: 'probe' } | { kind: 'none' } {
+  if (!opts.enabled || opts.external || opts.thisDevice === 'none') return { kind: 'none' }
+  if (opts.thisDevice === null) return { kind: 'probe' }
+  if (opts.thisDevice === opts.target) return { kind: 'none' }
+  return { kind: 'from', device: opts.thisDevice }
+}
+
+/** FR-121 — `cfg` with the handed-over relay as its first ICE server; every
+ *  other setting kept, because `setConfiguration` refuses to change them.
+ *  Pure + exported for tests. */
+export function withLocalRelay(
+  cfg: RTCConfiguration,
+  desc: LocalRelayDescriptor,
+): RTCConfiguration {
+  return {
+    ...cfg,
+    iceServers: [localRelayIceServer(desc) as RTCIceServer, ...(cfg.iceServers ?? [])],
+  }
 }
 
 /** 2026-07-24 decode-stall A/B Ã¢ÂÂ experimental override for the DC decode
@@ -5195,6 +5256,12 @@ export function useRemoteControl(
    *  `connect()` probes the local agent's loopback TURN and relays through it
    *  if present Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
   const localRelayEnabled = ref<boolean>(readStoredLocalRelay())
+  /** FR-121 — the device this browser runs on (see `readStoredThisDevice`). */
+  const thisDeviceId = ref<string | null>(readStoredThisDevice())
+  /** FR-121 — why the last session got no relay from the server, in the
+   *  server's word (`not_your_device`, `rc_overlay_off`, …); `null` when it got
+   *  one or did not ask. */
+  const localRelayRefused = ref<string | null>(null)
   /** Optional codec override. `null` = let the agent pick from the full
    *  intersection; `'h265'` = only advertise H.265 + H.264 fallback to
    *  the agent so AV1 can't win. Useful for A/B comparisons
@@ -7190,6 +7257,14 @@ export function useRemoteControl(
     persistLocalRelay(on)
   }
 
+  /** FR-121 — say which of its owner's devices this browser runs on (an agent
+   *  id), that it is none of them (`'none'`), or forget (`null`). Takes effect
+   *  on the next `connect()`. */
+  function setThisDevice(v: string | null) {
+    thisDeviceId.value = v
+    persistThisDevice(v)
+  }
+
   /** Probe the local enrolled agent's loopback TURN endpoint. Returns its
    *  descriptor, or `null` on any failure (no local agent, feature off,
    *  Private-Network-Access blocked, non-2xx, timeout) Ã¢ÂÂ all graceful, so a
@@ -8305,6 +8380,20 @@ export function useRemoteControl(
       // #2810 — and who its consent asks, so the wait and a consent end are
       // worded for the person actually asked.
       consentAsks.value = parseConsentAsks(msg.consent_asks)
+      // FR-121 — the relay of the device this browser runs on, handed over
+      // because the request named it. Added before the offer, which waits for
+      // `rc:ready`, so the first gathering already includes it.
+      localRelayRefused.value =
+        typeof msg.local_relay_refused === 'string' ? msg.local_relay_refused : null
+      const handed = parseLocalRelayDescriptor(msg.local_relay)
+      if (handed && pc) {
+        try {
+          pc.setConfiguration(withLocalRelay(pc.getConfiguration(), handed))
+          console.info('[rc] local-relay TURN handed over by the server', handed.overlay_ip)
+        } catch (e) {
+          console.warn('[rc] could not add the handed-over local relay', e)
+        }
+      }
       phase.value = 'awaiting_consent'
       // Consent is human-paced on Prompt-mode devices; the SERVER owns
       // that timeout (consent_timeout). Ours only covers requesting/
@@ -9164,7 +9253,19 @@ export function useRemoteControl(
     // FR-52 P4e — never for an external session: its frame cannot carry a
     // relay descriptor (F4), and a relay on THIS host's mesh could not reach a
     // device in someone else's organization anyway.
-    if (localRelayEnabled.value && !externalMode) {
+    // FR-121 — and once this browser knows which of its owner's devices it
+    // runs on, it names the device and the server hands the relay over on
+    // `rc:session.created`: no request to 127.0.0.1, so nothing for Chrome's
+    // local-network permission to prompt for or refuse.
+    const relayPlan = localRelayPlan({
+      enabled: localRelayEnabled.value,
+      external: externalMode,
+      thisDevice: thisDeviceId.value,
+      target: agentId,
+    })
+    const localRelayFrom = relayPlan.kind === 'from' ? relayPlan.device : null
+    localRelayRefused.value = null
+    if (relayPlan.kind === 'probe') {
       localRelay = await probeLocalRelay()
       if (localRelay) {
         iceServers = [localRelayIceServer(localRelay), ...iceServers]
@@ -9172,6 +9273,11 @@ export function useRemoteControl(
           '[rc] local-relay TURN discovered on this host Ã¢ÂÂ relaying via local agent overlay',
           localRelay.overlay_ip,
         )
+      }
+      // FR-121 — a probe that named its device answers the question for
+      // good: the next connect names the device and does not probe.
+      if (localRelay?.agent_id && thisDeviceId.value === null) {
+        setThisDevice(localRelay.agent_id)
       }
     }
     // #1631 - the last suspension before the peer exists. A disconnect()
@@ -10618,6 +10724,10 @@ export function useRemoteControl(
     // pushes nothing extra, so old servers/agents are unaffected.
     if (localRelay) {
       requestPayload.local_relay = localRelay
+    } else if (localRelayFrom && !externalMode) {
+      // FR-121 — or name this browser's device; the server answers on
+      // `rc:session.created`. An older server ignores the field.
+      requestPayload.local_relay_from = localRelayFrom
     }
     sessionDcTransport = preferredTransport
     // FR-77 — which chroma cell this session runs in (mirrors the chroma_pref
@@ -13344,6 +13454,9 @@ export function useRemoteControl(
      *  through it Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
     localRelayEnabled,
     setLocalRelayEnabled,
+    thisDeviceId,
+    setThisDevice,
+    localRelayRefused,
     vp9_444Supported,
     vp9_444Active,
     vp9_444FramesDecoded,

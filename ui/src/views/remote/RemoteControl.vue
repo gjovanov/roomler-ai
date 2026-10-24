@@ -1866,6 +1866,28 @@
           >
             {{ localRelayTooltip }}
           </div>
+          <!-- FR-121 — which of your devices this browser runs on, so the
+               server hands its relay over and the browser never asks for the
+               local-network permission. Next Connect, like the switch. -->
+          <v-select
+            v-if="localRelayOn"
+            v-model="thisDevice"
+            :items="thisDeviceItems"
+            :disabled="sessionLive"
+            label="This browser runs on"
+            density="compact"
+            variant="outlined"
+            hide-details
+            class="mb-2"
+            data-testid="rc-this-device"
+          />
+          <div
+            v-if="localRelayRefusedText"
+            class="text-caption text-medium-emphasis mt-n1 mb-2 ml-1"
+            data-testid="rc-local-relay-refused"
+          >
+            {{ localRelayRefusedText }}
+          </div>
           <!-- Clipboard auto-sync (v2). Live-effective (not gated on
                sessionLive) — the composable subscribes/unsubscribes on
                flip. Old agents: local→remote still auto-pushes; the
@@ -3501,6 +3523,42 @@ const localRelayTooltip = computed<string>(() => {
 function toggleLocalRelay() {
   rc.setLocalRelayEnabled(!localRelayOn.value)
 }
+
+// FR-121 — "This browser runs on": one of the signed-in person's own devices
+// that report their loopback relay (`local-relay`), or none of them. Named, the
+// server hands that device's relay over and the browser never fetches
+// 127.0.0.1, so Chrome's local-network permission is never asked. Per browser,
+// and like the switch above it takes effect on the next Connect. A probe that
+// finds a relay naming its device fills it in by itself.
+const thisDeviceItems = computed(() => {
+  const me = authStore.user?.id
+  const own = agentStore.agents
+    .filter(
+      (a) => a.owner_user_id === me && (a.capabilities?.rpc ?? []).includes('local-relay'),
+    )
+    .map((a) => ({ title: a.display_name || a.name, value: a.id }))
+  return [
+    { title: 'Not set — look for a relay on this computer', value: '' },
+    { title: 'None of my devices', value: 'none' },
+    ...own,
+  ]
+})
+const thisDevice = computed<string>({
+  get: () => rc.thisDeviceId.value ?? '',
+  set: (v) => rc.setThisDevice(v === '' ? null : v),
+})
+const localRelayRefusedText = computed<string | null>(() => {
+  const why = rc.localRelayRefused.value
+  if (why === null) return null
+  const reasons: Record<string, string> = {
+    not_your_device: 'that device is not yours',
+    other_network: 'that device is in another organization',
+    device_offline: 'that device is offline, or reports no relay',
+    rc_overlay_off: 'this device does not let remote desktop use the mesh (rc_overlay)',
+    same_device: 'you are viewing the device this browser runs on',
+  }
+  return `The local relay was not used: ${reasons[why] ?? why}.`
+})
 
 // ── Clipboard auto-sync (v2) — Settings toggle + blocked-permission hint ──
 // Live-effective (no reconnect needed): the composable's watcher
