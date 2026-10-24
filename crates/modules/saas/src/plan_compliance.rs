@@ -343,7 +343,9 @@ mod tests {
             Some(0),
             "an excluded capability must read as a zero cap so the report flags it"
         );
-        assert_eq!(quota::Limit::ExitNodes.describe(&free).0, Some(0));
+        // FR-115 P4d — Free has exit nodes, so a Free org holding one is
+        // within its plan and must not be flagged.
+        assert_eq!(quota::Limit::ExitNodes.describe(&free).0, None);
 
         // A plan that includes them must not be flagged.
         let biz = Plan::Business.limits();

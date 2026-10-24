@@ -214,7 +214,7 @@ test.describe('Billing & Subscription', () => {
     expect(free.limits.max_devices).toBe(100)
     expect(free.limits.max_tunnel_clients).toBe(100)
     expect(free.limits.overlay_mesh).toBe(true)
-    expect(free.limits.exit_nodes).toBe(false)
+    expect(free.limits.exit_nodes).toBe(true)
     expect(free.limits.magic_dns).toBe(true)
     expect(free.limits.max_concurrent_sessions).toBe(1)
     expect(free.limits.relay_bytes_per_month).toBe(10 * GB)
