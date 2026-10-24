@@ -77,10 +77,10 @@ Its **behaviour is correct**: `.ok()` + `unwrap_or(false)` means "absent ⇒ the
 flag is off", which is right, and `overlay_netd` gates a scaffold that (per its
 own doc comment) *hosts nothing yet*.
 
-The defect is that `config::load` (`crates/agent-core/src/config.rs:2653`) is
+The defect is that `config::load` (`crates/agent-core/src/config.rs:3476`) is
 not a neutral reader. On the both-copies-missing arm it logs
 `tracing::error!(… "the host must be re-enrolled")`
-(`crates/agent-core/src/config.rs:2628-2425`) before returning `Err`.
+(`crates/agent-core/src/config.rs:3507-3513`) before returning `Err`.
 
 That severity is right for its *original* caller — the 2026-08-12 self-heal for
 an all-NUL config, where the worker really was exit-1'ing every 60 s and
