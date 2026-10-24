@@ -1298,6 +1298,17 @@ jobs:
           # never starts, which reads as "the overlay is down", not as a typo.
           grep -q '/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd' \
             agents/roomlerd/packaging/macos/com.roomler.daemon.plist
+          # FR-119 P2b-9 — the jobs a person waits on must be Interactive.
+          # Without a ProcessType, launchd throttles the job, and the daemon
+          # shipped that way from FR-43 on: the worker that runs every session
+          # is spawned inside it, so capture and encode ran in the utility band
+          # (priority 20) and a 120 fps stream bunched. The update helper is
+          # deliberately absent: it is background work.
+          for job in com.roomler.daemon com.roomler.agent com.roomler.desktop; do
+            pt=$(plutil -extract ProcessType raw "agents/roomlerd/packaging/macos/$job.plist" 2>/dev/null || true)
+            [ "$pt" = "Interactive" ] \
+              || { echo "::error::$job.plist must set ProcessType=Interactive (found '${pt:-none}')"; exit 1; }
+          done
 
       - name: macOS overlay against a real utun
         # The macOS arms of add_address_sync / add_peer_route /

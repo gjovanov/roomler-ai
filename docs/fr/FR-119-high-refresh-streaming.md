@@ -149,8 +149,8 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. P2 is built; its field proof is P3 |
-| P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155). **Run 2, 2026-10-23** (§8): #2758 verified on 0.4.155. AC4 attempt 2, direct from Edge at the Mac's native size, was granted 120 and then taken back by the pipe; it found P2b-4 and P2b-5 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. **P2b-9 built** (§4.11): the macOS daemon's launchd job is Interactive, so the session worker it spawns no longer runs throttled; found on AC4's fourth attempt. P2 is built; its field proof is P3 |
+| P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155). **Run 2, 2026-10-23** (§8): #2758 verified on 0.4.155. AC4 attempt 2, direct from Edge at the Mac's native size, was granted 120 and then taken back by the pipe; it found P2b-4 and P2b-5. **Run 3** (§8): AC4 attempt 3 on 0.4.158 found P2b-7 and P2b-8. **Run 4, 2026-10-23/24** (§8): on 0.4.160 the grant held 120 for 15 minutes, but read at the viewer (§8.1) the cadence missed (p99 19–20 ms). A launchd experiment found P2b-9; with it, 65 of 76 windows passed both clauses |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
 
@@ -578,6 +578,39 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
   negative controls, each alone, fail exactly their test. CI's `ffmpeg-encoder` clippy lane compiles the pump change,
   proven with a planted fault.
 
+### 4.11 P2b-9 — the macOS daemon's launchd job is Interactive, as built (2026-10-24)
+
+Found on AC4's fourth attempt (§8, 0.4.160). With P2b-7 and P2b-8 shipped, 120 held for 15 minutes and the viewer
+never struggled. But read at the viewer (§8.1), the cadence missed AC4's bound: p99 19–20 ms between frame arrivals.
+The agent already handed frames to the send task bunched. A third of the intervals were under 4.5 ms and a quarter
+over 11, and two thirds of the long ones were followed by a short one. A frame was taken late, the next on time.
+
+- **Cause: launchd throttled the whole session pipeline.** `com.roomler.daemon.plist` set no `ProcessType`, and
+  launchd gives such a job "light resource limits", throttling its CPU usage and I/O bandwidth. FR-43's worker, which
+  runs every session (capture, encode, send), is spawned inside the daemon's job (`macos_supervisor.rs:392`) and
+  inherits them. On the MacBook every thread of both halves scheduled at priority 20, the utility band, under
+  WindowServer (79), coreaudiod (63) and the apps (47). The per-user LaunchAgent, which captured before FR-43, and
+  the desktop companion have carried `ProcessType = Interactive` from their first installers. So the session
+  pipeline lost it when it moved.
+- **The fix** (`com.roomler.daemon.plist:66`): `ProcessType = Interactive`. A session pipeline is the person's
+  experience, not background work. The update helper keeps the default: it is background work.
+- **Measured before shipping** (§8, the same pair and content, with the plist edited by hand and then restored).
+  Both halves scheduled at 37. Hand-off intervals under 4.5 ms went from 32% to 0, hand-off p99 from 17.5 to
+  10.65 ms, the viewer's arrival p99 from 19–21 to 13.4 ms, and the rate from 113 to 119 fps. 65 of 76 sliding
+  60 s windows met both of AC4's clauses; the 11 that did not contain the session's first 5 s.
+- **Two levers that did not move it**, tried first: `taskpolicy -l 0 -t 0` on the worker (the latency and
+  throughput tiers, which govern timer coalescing) and `renice -20`. Neither changed the band or the cadence.
+- **What it is not.** The capture worker polls the CoreGraphics slot every 2 ms (`scrap_backend.rs:568`), and
+  P2b-6's bucket paces the asks. A simulation of that loop against a regular 120 Hz source shows neither bunching
+  frames by itself, and with the job Interactive both stayed as they are.
+- ⚠️ **What the two timestamps mean.** The trial's is the capture worker's receipt (`frame.monotonic_us`). The wire
+  header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9422`). So a trial that
+  passes at p99 16.4 ms says the host CAN keep up; it says nothing about the cadence the viewer gets.
+- **Guards.** CI's macOS packaging lint (`ci.yml:1301`) fails if the daemon, agent or desktop job loses
+  `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1168`) asserts that launchd loaded the
+  daemon as `spawn type = interactive (4)`, after an enabled install and after a plain re-install (the self-update
+  path). Both checks were run red against the shipped job on the MacBook, which reads `daemon (3)`.
+
 ## 5. Acceptance criteria
 
 - [ ] **AC1 — P0 measured.** The pts test is red on master and green after P2. L0's 120 and 144 cells hold their
@@ -592,7 +625,8 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
   `refused=Some((120, Constrained))`; the viewer read "120 fps not granted: the connection is relayed, and a
   relay stays at its current rate". The grant's unit tests are P2b-1's (§4.3).
 - [ ] **AC4 — D1 in the field.** One direct pair delivers ≥ 0.9 × 120 fps for 60 s, with p99 inter-frame time
-  under 16.7 ms, on a 120 Hz-or-faster viewer. The red run is the same pair on today's build, at ≤ 60.
+  under 16.7 ms, on a 120 Hz-or-faster viewer. The red run is the same pair on today's build, at ≤ 60. Read at the
+  viewer, from the arrival of every frame (§8.1); the agent's 10 s trial proves the host, not the delivery.
 - [ ] **AC5 — the rate law.** At 60 fps the ceiling is byte-identical to today's at every geometry (a table
   test). At 120 and 144 it follows the measured α and the class band top.
 - [ ] **AC6 — trial and denial.** A host that cannot sustain 120 falls back to 60 once its trial has seen 10 s of
@@ -638,6 +672,47 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
 | 2026-10-23 | agent 0.4.158 (P2b-4 to P2b-6) | **Why the viewer relayed, twice.** Edge on neo16, which had gone direct that morning | **Two field traps, neither ours.** (1) A **PureVPN Proxy** extension in that Edge profile set `webrtc.ip_handling_policy = disable_non_proxied_udp`, its WebRTC leak protection. The profile then gathered no candidate at all, not even with a STUN server, so every session went through a TURN relay over TCP and ran at a relay's 30. Found in the profile's `Secure Preferences`, not in any policy; removing the extension restored host and server-reflexive candidates. (2) A second viewer **joins the first viewer's pipeline** (`media_share: joined shared encoder pipeline as follower`): a direct Edge session behind a relayed Chrome tab ran at that tab's 30. Close every other viewer of the host before a rate test |
 | 2026-10-23 | agent 0.4.158, the viewer's shipped defaults | **AC4, attempt 3.** The MacBook direct to Edge (no VPN extension), 1662×1080 (a 1080p target) and native 3024×1964, at 120, then 60 | **The host holds 120; the viewer and the opening do not, yet. AC4 not met.** Captured and encoded 109–116 fps in every 2 s window. The trial was **Proven** twice: native, 1,129 frames in 10.0 s of activity, 112.8 fps, p99 interval 16.593 ms, p90 encode 3.9 ms; 1080p, 112.1 fps, p99 16.583 ms. But about every 30 s the viewer flagged `struggling` and the agent shed frames for 4–8 s, delivering 13–60 fps. The session's IDR counter jumped exactly there (9→10, 10→12, 12→13→16, 16→18→21): one keyframe, then the viewer's own frame-count sheds asking for more. No contiguous 60 s at 108 or more: **P2b-7**. In two of four direct sessions, 120 was taken back one second in on `pipe` and held for 60 s: the opening window's blocked sends (43–82 ms) had folded as 14–22 Mbps of capacity against a 104 Mbps ceiling: **P2b-8**. The negative arm at 60 delivered a steady 57.6–58.2 fps, from 54 on 0.4.155 (P2b-5) |
 | 2026-10-23 | agent 0.4.158, P2b-7's rules set by hand | **The design check for P2b-7.** The same cell, with the viewer's two thresholds set to what P6's counts mean in time at 120 fps (8 and 4 frames, i.e. 67 and 33 ms) | **64 s at 108.4–115.5 fps, no struggle, no new IDR.** From the moment 120 was granted, 32 windows in a row at 108 or more; the viewer-rate cap did not fire once, and the IDR counter stayed at 10. The trial was Proven again at p99 16.583 ms. The 120 came only after 60 s at 60: the opening's capacity claim again (P2b-8). AC4 needs this with the shipped defaults, after P2b-7 and P2b-8 ship |
+| 2026-10-23 | agent 0.4.160 (P2b-8), viewer `hosted-20261023-c680ec9` (P2b-7) | **AC4, attempt 4.** The MacBook direct to Edge on neo16, 1662×1078 (a 1080p target), 120 fps, the viewer's shipped defaults, no other viewer, 15 minutes. Also read at the viewer (§8.1) | **The rate holds; the cadence does not. AC4 not met.** Granted once and never taken back: three opening windows were rejected (`evidence_rejected=[1, 0, 0, 0, 3]`), and no capacity was folded (`pipe_belief_n=(898, 0)`). The viewer-rate cap fired 0 times in 445 windows, against every ~30 s on 0.4.158, and 2 of the 445 windows fell below 108 fps. The trial was Proven (112.5 fps, p99 16.397 ms). At the viewer, every 60 s window delivered 112.8–113.2 fps, but the p99 between arrivals was 19.1–20.3 ms, and 17.5 ms already at the agent's hand-off. A second motion source and keep-busy's cursor were each ruled out in the same session: **P2b-9** |
+| 2026-10-24 | agent 0.4.160, the daemon's launchd job edited by hand, then restored | **The P2b-9 experiment.** The same pair and content. First `taskpolicy -l 0 -t 0` and `renice -20` on the worker; then `ProcessType = Interactive` in `com.roomler.daemon.plist`, reloaded through a one-shot launchd job of its own (a script under the daemon's job dies at its bootout) | **Throttling was the cause.** The tiers and the renice changed nothing (32% short intervals, hand-off p99 17.7 ms). With Interactive, both halves scheduled at 37 instead of 20: 119.1 fps, no hand-off interval under 4.5 ms, hand-off p99 10.65 ms, arrival p99 at the viewer 13.4 ms. 65 of 76 sliding 60 s windows met both of AC4's clauses; the 11 that did not contain the first 5 s, before 120 ran. Not an AC4 tick: the plist was restored byte for byte at 00:10 UTC, and the tick waits for the release that ships it |
+
+### 8.1 How AC4 is read
+
+"Delivers" is read where the frames arrive. Paste this into the viewer page's console **before** pressing Connect.
+It wraps `createDataChannel`, so it sees the session's `video-bytes` channel, and its listener runs before the page's
+own, which hands the buffer to the decode worker. It times the arrival of every frame's last FR-17 chunk on the
+page's main thread, and keeps the agent's header timestamp, stamped at hand-off after encode (§4.11), not at capture.
+
+```js
+(() => {
+  const N = 1 << 18, st = { N, arr: new Float64Array(N), cap: new Float64Array(N), n: 0, pending: new Map() }
+  window.__ac4 = st
+  const orig = RTCPeerConnection.prototype.createDataChannel
+  RTCPeerConnection.prototype.createDataChannel = function (label, opts) {
+    const dc = orig.call(this, label, opts)
+    if (label === 'video-bytes') dc.addEventListener('message', (ev) => {
+      if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 8) return
+      const v = new DataView(ev.data) // FR-17 prefix: frame_seq u32, chunk_idx u16, chunk_count u16
+      const seq = v.getUint32(0, true), idx = v.getUint16(4, true), cnt = v.getUint16(6, true)
+      let p = st.pending.get(seq)
+      if (!p) st.pending.set(seq, (p = { seen: 0, cnt, cap: 0 }))
+      if (idx === 0 && ev.data.byteLength >= 21) p.cap = Number(v.getBigUint64(13, true)) // header timestamp_us
+      if (++p.seen >= p.cnt) {
+        st.pending.delete(seq)
+        const i = st.n++ % N
+        st.arr[i] = performance.now()
+        st.cap[i] = p.cap
+      }
+    })
+    return dc
+  }
+})()
+```
+
+Run at least 90 s untouched (no screenshots: they cost the viewer frames), then judge sliding 60 s windows stepped
+by 1 s. A window passes when it holds at least 108 × 60 frames and the 99th percentile of its arrival intervals is
+under 16.7 ms. The same windows over the header timestamps give the agent's hand-off cadence, which tells a host
+problem from a transport one. A window that touches the first seconds includes the swap up from 60 and the opening,
+so AC4 asks for one passing window, not for every window.
 
 ## 9. Related
 

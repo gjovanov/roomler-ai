@@ -52,6 +52,20 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
+    <!-- FR-119 P2b-9: Interactive, like the LaunchAgent and the desktop job.
+         Without a ProcessType, launchd applies "light resource limits" and
+         throttles the job's CPU and I/O. Since FR-43 the worker that runs
+         every session (capture, encode, send) is spawned INSIDE this job, so
+         it inherits them. Measured on a MacBook (2026-10-24): every thread of
+         the daemon and the worker scheduled at priority 20, the utility band,
+         under WindowServer (79) and the apps (47). At 120 fps a frame was
+         taken late a third of the time: hand-off p99 17.5 ms, 113 fps. With
+         this key both halves ran at 37 and the cadence went flat (p99
+         10.65 ms, 119 fps). A session pipeline is the person's experience, not
+         background work. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
     <!-- FR-97 P6e (#1538): stdout carries only tracing's console copy of the
          rotating log, and here it grew unrotated (42 MB on one Mac). stderr
          keeps the file, for the lines a daemon prints before its log exists. -->

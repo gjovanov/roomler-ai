@@ -387,6 +387,14 @@ processes**, and it is worth knowing why before you install:
 | LaunchDaemon `com.roomler.daemon` | root, from boot | overlay mesh, tunnels | creating a `utun` and installing routes require root |
 | LaunchDaemon `com.roomler.update` | root, on a 6 h timer + on demand | self-update: check, verify, `installer -pkg … -target /` | `installer -target /` needs root, and neither agent half should ever exec its own replacement (the exit-to-update dance is what used to knock Macs offline). Installed by DEFAULT; opt out with `sudo touch /etc/roomler/disable-auto-update` + re-run the installer |
 
+⚠️ The jobs a person waits on run as `ProcessType = Interactive`: the agent, the desktop companion
+and, since FR-119 P2b-9, the daemon. Without the key, launchd throttles a job's CPU and I/O. Since
+FR-43, the worker that runs every session is spawned inside the daemon's job. So on a MacBook every
+thread of both halves scheduled in the utility band, under WindowServer and the apps, and a 120 fps
+stream bunched ([FR-119 §4.11](fr/FR-119-high-refresh-streaming.md)).
+`sudo launchctl print system/com.roomler.daemon` reads `spawn type = interactive (4)` on a fixed
+install, and `daemon (3)` on an older one. The update helper keeps the default: it is background work.
+
 They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
 second control-WS connection displaces the first. **Each half is its own
 enrollment, so a Mac appears as two devices** — the second named
