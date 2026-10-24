@@ -30,10 +30,11 @@ sessions read it too, through their toolbelt.
 > `knowhow_probe_reach`, a connect and a close, and for TLS the certificate it
 > is shown (§13.2); and P4-5-2a, a session's verify, the server's half: a
 > session asks its own device to probe an entity, while its starter holds
-> `KNOWHOW_EDIT`, and is sent what it measured (§13.3).** People, the sync,
-> scans and sessions' proposals fill the map, and probes verify it. Windows
-> (P4-3b-4), the toolbelt's `knowhow_verify` (P4-5-2b), staleness (P4-5-3) and
-> `roomler_connect` (P4-6) come with the steps that build them (§14).
+> `KNOWHOW_EDIT`, and is sent what it measured (§13.3); and P4-5-2b, the
+> toolbelt's `knowhow_verify`, which asks a person at each call (§12.1).**
+> People, the sync, scans and sessions' proposals fill the map, and probes
+> verify it. Windows (P4-3b-4), staleness (P4-5-3) and `roomler_connect`
+> (P4-6) come with the steps that build them (§14).
 
 ## 1. A map, not a gate
 
@@ -864,22 +865,23 @@ a session proposed, each for what it is.
 > on, so a knowhow mounted without hive finds no session and refuses every
 > question `not_located`; the `knowhow` build feature implies `hive`.
 
-### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b)
+### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b, P4-5-2b)
 
 The device's half ([`knowhow_tools.rs`](../agents/roomlerd/src/hive/knowhow_tools.rs)):
-three tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
-`mcp__roomler__knowhow_get` and (P4-4-2b) `mcp__roomler__knowhow_propose`,
-compiled wherever agent sessions are (Linux, macOS, Windows), apart from the
-scanner.
+four tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
+`mcp__roomler__knowhow_get`, (P4-4-2b) `mcp__roomler__knowhow_propose` and
+(P4-5-2b) `mcp__roomler__knowhow_verify`, compiled wherever agent sessions are
+(Linux, macOS, Windows), apart from the scanner.
 
 | Piece | Design |
 |---|---|
 | the verb | every build that runs sessions advertises `knowhow-tools`, so its server tells it whether the map is there |
 | the word | the device forgets `rc:knowhow.served` at every primary connection and keeps the tools it names from that frame on, each only when this build knows it |
-| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment, and its settings allow exactly those (`permissions.allow`), since neither a read nor a proposal asks a person (decision 39) |
+| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment. Its settings allow the reads and a proposal outright (`permissions.allow`), since neither asks a person (decision 39), and ask a person for each verify (`permissions.ask`, decision 54), since it aims a connection from this device |
 | the questions | on the primary's connection, a `req_id` each, the session and its fence attached by the daemon, never by the model; each answer matched to its question, 15 s each |
 | the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on |
 | a proposal unanswered | asked and never answered within its 15 s, it may have been written all the same. The model is told so, and that `knowhow_get` shows whether it was: proposing it again is safe, since one already there is refused `exists` |
+| a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L289)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L584)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
 
 > [!WARNING]
 > **A tool the server did not name is an unknown tool.** A newer agent may know
@@ -1230,7 +1232,7 @@ probe is then asked as a person's is
 ([`ask`](../crates/modules/knowhow/src/probe.rs#L782)), and what it
 measured is recorded as a person's probe's is (§13.1). P4-5-2a is the server's
 half. The toolbelt's `knowhow_verify`, which carries it and asks a person at
-each call, is P4-5-2b's.
+each call, is P4-5-2b's (§12.1).
 
 ```mermaid
 sequenceDiagram
@@ -1281,7 +1283,6 @@ sequenceDiagram
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-5-2b | `knowhow_verify` in the toolbelt: the device's half of §13.3, offered when the server names it, the settings asking a person each call (decision 54) |
 | P4-5-3 | staleness, decision 40: a fact no probe or person confirmed for `knowhow.stale_days` turns `stale` |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
