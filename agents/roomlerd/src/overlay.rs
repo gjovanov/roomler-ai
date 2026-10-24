@@ -788,7 +788,6 @@ fn netstack_tun_factory(
     view_rx: watch::Receiver<OverlayView>,
     org_key: &str,
 ) -> Option<TunFactory> {
-    use std::net::Ipv4Addr;
     use tunnel_core::overlay::netstack::Netstack;
     use tunnel_core::overlay::netstack_socks::serve_socks5;
 
@@ -818,19 +817,9 @@ fn netstack_tun_factory(
         let handle_rx = handle_tx.subscribe();
         let org = org_key.to_string();
         tokio::spawn(async move {
-            match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, socks_port)).await {
-                Ok(l) => {
-                    info!(
-                        port = socks_port, %org,
-                        "overlay netstack: SOCKS5 front on 127.0.0.1"
-                    );
-                    serve_socks5(handle_rx, view_rx, l).await;
-                }
-                Err(e) => {
-                    warn!(port = socks_port, %org, error = %e,
-                        "overlay netstack: SOCKS bind failed")
-                }
-            }
+            let l = bind_socks_front(socks_port, &org, SOCKS_BIND_FIRST_WAIT, SOCKS_BIND_MAX_WAIT)
+                .await;
+            serve_socks5(handle_rx, view_rx, l).await;
         });
     }
 
@@ -838,15 +827,104 @@ fn netstack_tun_factory(
     Some(Box::new(move |ip, nm, mtu| {
         let ns = Netstack::start(ip, netmask_to_prefix(nm), mtu);
         let _ = handle_tx.send(Some(ns.handle.clone()));
-        info!(%ip, socks_port, %org, "overlay netstack: userspace stack up (OS-free)");
+        let socks_front = if socks_front_listening(socks_port) {
+            "listening"
+        } else {
+            "not bound yet"
+        };
+        info!(%ip, socks_port, socks_front, %org, "overlay netstack: userspace stack up (OS-free)");
         Ok(ns.tun as Arc<dyn TunIo>)
     }))
 }
 
-/// Ports whose SOCKS front task is already running.
+/// Ports whose SOCKS front task is already running — from its first bind
+/// attempt on, so a reconnect never starts a second one.
 #[cfg(feature = "overlay-netstack")]
 static SOCKS_BOUND: std::sync::Mutex<Option<std::collections::BTreeSet<u16>>> =
     std::sync::Mutex::new(None);
+
+/// Ports whose SOCKS front is LISTENING. [`SOCKS_BOUND`] holds a port from
+/// the moment its task starts trying; this one only once the bind succeeded.
+#[cfg(feature = "overlay-netstack")]
+static SOCKS_LISTENING: std::sync::Mutex<Option<std::collections::BTreeSet<u16>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "overlay-netstack")]
+fn socks_front_listening(port: u16) -> bool {
+    let set = SOCKS_LISTENING.lock().unwrap_or_else(|e| e.into_inner());
+    set.as_ref().is_some_and(|s| s.contains(&port))
+}
+
+/// #2836 — the SOCKS front's wait after a failed bind, doubling up to
+/// [`SOCKS_BIND_MAX_WAIT`].
+#[cfg(feature = "overlay-netstack")]
+const SOCKS_BIND_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(feature = "overlay-netstack")]
+const SOCKS_BIND_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// At the cap, a WARN every 10 attempts is one every 5 minutes.
+#[cfg(feature = "overlay-netstack")]
+const SOCKS_BIND_WARN_EVERY: u32 = 10;
+
+/// #2836 — bind an org's loopback SOCKS front, waiting out a busy port.
+///
+/// A front is bound once per port for the life of the process, so this used
+/// to be ONE attempt: a busy port left the org with no front until the next
+/// daemon restart, while every reconnect skipped the bind and the stack
+/// logged itself up on a port nothing listened on.
+///
+/// A busy port is usually transient. Measured on a Windows laptop across a
+/// self-update: the post-install watcher, spawned by the old daemon and
+/// outliving it by design, held the old front's socket 0.8 s past the new
+/// daemon's one attempt. It had inherited that socket — mio before 1.2.1
+/// created inheritable sockets on Windows — so this retry is the second
+/// half of that fix, and covers whatever else holds a port for a while.
+#[cfg(feature = "overlay-netstack")]
+async fn bind_socks_front(
+    port: u16,
+    org: &str,
+    first_wait: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> tokio::net::TcpListener {
+    let mut wait = first_wait;
+    let mut attempt: u32 = 1;
+    loop {
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Ok(l) => {
+                if attempt == 1 {
+                    info!(port, %org, "overlay netstack: SOCKS5 front on 127.0.0.1");
+                } else {
+                    info!(
+                        port, %org, attempt,
+                        "overlay netstack: SOCKS5 front on 127.0.0.1 (the port came free)"
+                    );
+                }
+                SOCKS_LISTENING
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .insert(port);
+                return l;
+            }
+            Err(e) => {
+                if attempt == 1 || attempt.is_multiple_of(SOCKS_BIND_WARN_EVERY) {
+                    warn!(
+                        port, %org, attempt, error = %e, retry_in_ms = wait.as_millis() as u64,
+                        "overlay netstack: SOCKS bind failed; the org has no SOCKS front \
+                         until it binds, retrying"
+                    );
+                } else {
+                    tracing::debug!(
+                        port, %org, attempt, error = %e,
+                        "overlay netstack: SOCKS bind failed, retrying"
+                    );
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(max_wait);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
 
 /// The netstack ICMP backend for the `roomler ping` LocalAPI verb, watching the
 /// shared handle channel. `None` unless this node is in netstack mode
@@ -1245,6 +1323,105 @@ mod netstack_claim_tests {
 
         release_netstack("org-a");
         release_netstack("org-c");
+    }
+}
+
+#[cfg(all(test, feature = "overlay-netstack"))]
+mod netstack_front_bind_tests {
+    use super::{bind_socks_front, socks_front_listening};
+    use std::time::Duration;
+
+    /// #2836 — a busy port is waited out, not given up on.
+    ///
+    /// The front used to make ONE bind attempt for the life of the process,
+    /// so a port that something else still held for a second at daemon start
+    /// left the org with no SOCKS front until the next restart.
+    #[tokio::test]
+    async fn a_busy_port_is_waited_out_not_given_up_on() {
+        // Hold a port the way the old daemon's inherited socket did.
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a holder");
+        let port = holder.local_addr().expect("the holder's address").port();
+
+        let front = tokio::spawn(bind_socks_front(
+            port,
+            "org-2836",
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !front.is_finished(),
+            "the front must still be trying while the port is held"
+        );
+        assert!(
+            !socks_front_listening(port),
+            "and must not claim to listen while it is held"
+        );
+
+        drop(holder);
+        let l = tokio::time::timeout(Duration::from_secs(5), front)
+            .await
+            .expect("the front binds within a few retries of the port coming free")
+            .expect("the bind task does not panic");
+        assert_eq!(l.local_addr().expect("the front's address").port(), port);
+        assert!(socks_front_listening(port), "and then says it is listening");
+    }
+}
+
+/// #2836 — a child process never holds a socket this daemon opened.
+///
+/// mio before 1.2.1 created Windows sockets with a plain `socket()`, which is
+/// inheritable, and std's `Command` always spawns with `bInheritHandles =
+/// TRUE`: every child got a copy of every socket open at spawn time, and with
+/// it the port. The post-install watcher outlives the daemon by design, so it
+/// held the old SOCKS front's port into the new daemon's start. mio 1.2.1 sets
+/// `WSA_FLAG_NO_HANDLE_INHERIT`. This locks the flag on what the daemon opens
+/// (tokio TCP and UDP), and the behaviour that matters: with a child alive, a
+/// port the daemon closed is free again.
+#[cfg(all(test, windows))]
+mod socket_inherit_tests {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+
+    #[tokio::test]
+    async fn a_child_never_holds_a_daemon_socket() {
+        let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind a tokio TCP listener");
+        let udp = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind a tokio UDP socket");
+        for (what, raw) in [
+            ("a tokio TCP listener", tcp.as_raw_socket()),
+            ("a tokio UDP socket", udp.as_raw_socket()),
+        ] {
+            let mut flags = 0u32;
+            // SAFETY: `raw` is a socket this test owns and keeps open across
+            // the call; a SOCKET is a kernel handle.
+            let ok = unsafe { GetHandleInformation(raw as HANDLE, &mut flags) };
+            assert_ne!(ok, 0, "GetHandleInformation failed for {what}");
+            assert_eq!(
+                flags & HANDLE_FLAG_INHERIT,
+                0,
+                "{what} is inheritable: every child spawned while it is open holds its port"
+            );
+        }
+
+        let port = tcp.local_addr().expect("the listener's address").port();
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "5", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child while the listener is open");
+        drop(tcp);
+        let rebind = std::net::TcpListener::bind(("127.0.0.1", port));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            rebind.is_ok(),
+            "a child spawned while the daemon listened still holds the port: {:?}",
+            rebind.err()
+        );
     }
 }
 
