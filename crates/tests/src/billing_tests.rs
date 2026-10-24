@@ -57,11 +57,12 @@ async fn get_plans_free_plan_has_correct_data() {
     assert_eq!(free["limits"]["cloud_integrations"], false);
     assert_eq!(free["limits"]["recordings"], false);
     assert_eq!(free["limits"]["storage_bytes"], 1024_u64 * 1024 * 1024);
-    // FR-115 — the network is given away: 100 devices, MagicDNS.
+    // FR-115 — the network is given away: 100 devices, MagicDNS, and exit
+    // nodes once the relay allowance holds what they relay (P4d).
     assert_eq!(free["limits"]["max_devices"], 100);
     assert_eq!(free["limits"]["max_tunnel_clients"], 100);
     assert_eq!(free["limits"]["overlay_mesh"], true);
-    assert_eq!(free["limits"]["exit_nodes"], false);
+    assert_eq!(free["limits"]["exit_nodes"], true);
     assert_eq!(free["limits"]["magic_dns"], true);
     assert_eq!(free["limits"]["max_concurrent_sessions"], 1);
     assert_eq!(free["limits"]["relay_bytes_per_month"], 10_000_000_000_u64);

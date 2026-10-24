@@ -570,9 +570,11 @@ mod tests {
         assert!(
             require_feature(Plan::Business, PlanEnforcement::Enforce, Limit::Recordings).is_ok()
         );
-        // FR-115 — MagicDNS is on Free; exit nodes wait for the relay throttle.
+        // FR-115 — MagicDNS is on Free, and exit nodes since the relay throttle
+        // holds what they relay (P4d); recordings are not.
         assert!(require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::MagicDns).is_ok());
-        assert!(require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::ExitNodes).is_err());
+        assert!(require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::ExitNodes).is_ok());
+        assert!(require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::Recordings).is_err());
         // ...and Warn never refuses, even for a feature the plan lacks.
         assert!(require_feature(Plan::Free, PlanEnforcement::Warn, Limit::Recordings).is_ok());
     }
