@@ -534,8 +534,8 @@ fn cmp_rows(a: &DeviceRow, b: &DeviceRow, key: &str) -> std::cmp::Ordering {
         "magic_dns" => {
             none_last(a.magic_dns_fqdn.as_deref()).cmp(&none_last(b.magic_dns_fqdn.as_deref()))
         }
-        "last_seen_at" => a.last_seen_at.cmp(&b.last_seen_at),
-        "created_at" => a.created_at.cmp(&b.created_at),
+        "last_seen_at" => super::grid::cmp_instants(&a.last_seen_at, &b.last_seen_at),
+        "created_at" => super::grid::cmp_instants(&a.created_at, &b.created_at),
         // Default + "name".
         _ => effective_name(a).cmp(&effective_name(b)),
     }

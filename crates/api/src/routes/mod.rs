@@ -10,6 +10,8 @@ pub mod background_task;
 pub mod capabilities;
 pub mod cluster;
 pub mod cost;
+// What the in-memory grid feeds (`user`'s members, `device`'s listing) share.
+pub(crate) mod grid;
 // The unified device listing joins agents (fleet, required) with tunnel
 // clients and overlay nodes (network, optional): a composition view over two
 // modules, which is the host's to hold — a `remote` profile has no network
