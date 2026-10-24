@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
-| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; open before the close: a real pair that rides TURN, measured on the floor (*P4c, as built*), O3's usability items and O4's measurement |
+| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; still open, and the FR waits on them: the issue #2820 (P4c-1 moves a live TURN carrier only when the pair re-establishes; the real-pair test is done, *P4c, as built*), O3's usability items and O4's measurement |
 | **Arc** | P3 of the pricing sequence in [`../business-model.md`](../business-model.md) §5 (enforce → meter → **reshape** → keys) |
 | **Related** | [FR-32](FR-32-plan-limit-enforcement.md) (the one decision point), [FR-20](FR-20-per-tenant-relay-cost-metering.md) (the ledger), [FR-19](FR-19-peer-relays.md) (org relays), [FR-52](FR-52-cross-org-remote-access.md) (support sessions to other orgs), [FR-102](FR-102-growth-observability.md) (revenue view) |
 | **Private annex** | `roomler-ai-docs/gtm/pricing/FR-115-annex-census-2026-10-19.md` — per-org census, account counts, competitor detail |
@@ -640,10 +640,21 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:404`,
   P4c-0: a throwaway org put over by TURN bytes alone entered the set, the operator's org with
   the same bytes did not, and no real org did. P4c-1, on simulated agents: over, the pair's
   verdict was DERP with no TURN grant, and the older node was pinned. Back under, the re-stamp
-  turned the verdict back to single-relay unasked, and TURN was granted again. **Still owed
-  from the planned field test:** a real pair that rides TURN, to measure it on the floor at the
-  plan's rate and to storm its handshakes. Simulated agents carry no traffic, and AC7 measured
-  the rate on a DERP pair.
+  turned the verdict back to single-relay unasked, and TURN was granted again.
+- **The real-pair field test, 2026-10-24** (the field log), on real agents behind an egress
+  firewall that lets UDP out only to the relay fleet:
+  - **No mesh pair in the fleet rides TURN.** Every pair gets a DERP floor at birth, and when
+    the first end sends over it the other follows (demote-follow). Upward probing covers only
+    the direct tiers. So P4c-1 has almost nothing to move today, and the throttle that holds mesh
+    traffic is P4a's.
+  - **A real TURN pair needed the floor off and a host off the cluster.** Over the allowance it
+    did **not** move while live: it re-formed on DERP only when one end restarted (#2820). On
+    DERP it ran at the plan's rate, 0.89–0.90 Mbit/s.
+  - **A handshake storm on the throttled floor was not held:** re-establishment took 1.2–1.4 s
+    while the relay dropped ~540 bulk frames, against 1.0–1.2 s unthrottled.
+  - **Found on the way:** an MTU black hole on 1280-MTU uplinks (#2819).
+  - **Not run:** CORPLAP-2 as a netstack secondary on the throttled floor, which needs the
+    operator's session to push the join.
 
 ### P4d, as built: exit nodes on Free
 
@@ -829,3 +840,5 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-23 | **P4c-1 back under, on fresh pods** (`hosted-20261023-c680ec9`, a peer's promote at 23:29Z, so no pod held a P7 pin) | Over (23:36:04Z): `derp`, no grant, c pinned for 1,800,000 ms. The rows were removed (23:36:09Z), and the probe asked nothing. **At 23:40:31Z, a's verdict for b flipped `derp` → `single-relay-anchor`,** pushed by the re-stamp, not asked for. **At 23:40:36Z both were granted TURN** (2 servers to a), and nobody was pinned. Cleanup: the 3 simulated devices deleted, the synthetic rows gone (0 left), the set empty. The throwaway org stays for P4d's green |
 | 2026-10-24 | **Promoted `hosted-20261024-6a327b8`** (08:31Z, the operator's go), carrying P4d (#2803) with peers' merged work (FR-97 P2a and records, the 0.4.161 and 0.4.162 bumps, the grid sort fix #2804, FR-119 P2b-9). It was held overnight for a member's remote session on a live device, which re-attached seconds after every roll, until the operator's go. The session had ended by the time of the roll | Pods up at 08:31:31Z and 08:31:53Z, 0 restarts, `/health` 200 on 0.4.162. P4c's three keys are still in both pods' env. **Fleet:** every agent seen in the 30 minutes before the roll was seen after it (0 missing) |
 | 2026-10-24 | **P4d's green**, against its red of 2026-10-23 (the old deploy), on the same throwaway Free org | **Plans list:** `/api/stripe/plans` reads `exit_nodes: true` for Free (it read `false`), and Free's network line is *"Private network with MagicDNS and exit nodes"*. Pro no longer lists exit nodes, on the API or on the static home's Pro card. **The gate:** in `enforce`, enabling an exit node on an id that names no node now reaches the lookup, **404** (it was **403**, *"Exit nodes are not available on the Free plan"*). In `warn`, still 404. **The full flow, in `enforce`:** a simulated node that advertised `0.0.0.0/0` (`can_be_exit_node: true`) was made an exit node, 200 with `is_exit_node: true`, and un-made, 200. **Collisions:** the org's exit-node quota collisions read 2 for 2026-10-23, the red's two calls, which is the positive control. None were counted for any of today's three calls. Cleanup: the 3 simulated devices deleted, the org back in `warn`, then archived |
+| 2026-10-24 | **The real-pair test, setup.** A new throwaway Free org (growth-excluded) and seven agents on 0.4.162 in containers. Each sat behind an egress firewall that lets UDP out **only to the relay fleet**, so no direct tier can work and TURN can. Five nodes ran on a build host that carries a cluster coturn, two behind a home NAT. Census first: the peer tables of two fleet hosts | **Census:** 0 TURN pairs; every relayed pair is `relay:derp/tcp`. CORPLAP-2 holds a live UDP warm allocation, yet rides DERP: without a srflx it gets the anchor role, and its TURN-over-TCP:443 leg doesn't survive Check Point's TLS inspection. Its DERP registration was refused three times before it took. **On the build host**, single-relay failed every time. Its own coturn hairpins and the host is dual-homed, so the NAT reads symmetric. The QUIC rendezvous timed out, the attempts churned, and P7 pinned the pairs to DERP. **Behind the home NAT**, two nodes with their DERP floor off formed a real **QUIC-over-TURN** pair: 64 MiB at **21.5 Mbit/s** |
+| 2026-10-24 | **The real-pair test, the cycle.** The synthetic 11 GB `turn_bytes` row put the org over (the set took it at 09:51:37Z). Then a third node's restarts stormed the throttled floor, and the row was removed | **Over, live:** both pods re-stamped the pairs at 09:51:37 and 09:51:56Z, but the TURN pair **did not move**. It stayed on TURN, unthrottled, for 6+ minutes (#2820). **Re-established** (one end restarted): it came up on DERP at **0.89–0.90 Mbit/s**, three 4 MiB samples. **Storm:** three restarts of a peer while a bulk pull saturated the bucket. The relay's allowance-drop counter rose by ~540 frames during it, and re-establishment took 1.4 / 1.2 / 1.2 s, against 1.0 / 1.2 / 1.0 s unthrottled on TURN: handshakes not held. **Back under:** the pair stayed on DERP (one TURN sample, then demote-follow). **Found:** on the home NAT's 1280-MTU uplink, the QUIC-over-TURN carrier dropped every full-size packet (pings ≤1128 B passed, ≥1228 B didn't) while reading healthy (#2819). **Cleanup:** the containers and images removed, the seven devices deleted, the org's ledger rows deleted (0 synthetic left), the set empty, the org archived |
