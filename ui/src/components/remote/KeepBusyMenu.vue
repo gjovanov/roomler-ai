@@ -39,7 +39,9 @@
         <v-icon>mdi-cursor-default-gesture-outline</v-icon>
       </v-btn>
     </template>
-    <v-card min-width="340" max-width="420" data-testid="rc-keep-busy-menu">
+    <!-- FR-120 P5 — never wider than a phone: 340 px ran 4 px past a 360 px
+         screen once the menu's own inset was added. -->
+    <v-card min-width="min(340px, calc(100vw - 24px))" max-width="420" data-testid="rc-keep-busy-menu">
       <v-card-title class="d-flex align-center text-subtitle-1">
         Keep busy
         <v-spacer />
