@@ -455,11 +455,14 @@ impl RecordingManager {
         let mut env = tunnel_core::env::config_fallbacks_for_child();
         env.extend(self.child_env.iter().cloned());
         // FR-97 P2f-1b — a supervised Mac's GUI worker was started by the ROOT
-        // daemon, which stays its recorder's responsible process, and macOS
-        // never asks the person about a microphone for root: tell the
-        // recorder, so its microphone refuses by name instead of recording
-        // silence (`super::mic_permission`).
-        if crate::supervision::current() == Some(crate::supervision::Supervision::MacosSupervisor) {
+        // daemon, which stays its recorder's responsible process unless the
+        // recorder is started as its own (P2f-2, `launch`), and macOS never
+        // asks the person about a microphone for root: tell such a recorder,
+        // so its microphone refuses by name instead of recording silence
+        // (`super::mic_permission`).
+        if crate::supervision::current() == Some(crate::supervision::Supervision::MacosSupervisor)
+            && !launch::recorder_owns_its_permissions()
+        {
             env.push((super::mic_permission::SUPERVISED_ENV.into(), "1".into()));
         }
         env

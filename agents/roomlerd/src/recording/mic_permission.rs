@@ -19,9 +19,12 @@
 //! stays the responsible process of everything the worker starts, and macOS
 //! never asks the person about a microphone for root. The question answered
 //! "not determined", the real microphone opened, no prompt ever appeared, and
-//! three minutes of recording were silence. There, every answer refuses by
-//! name (the manager tells the recorder, [`SUPERVISED_ENV`]) until the worker
-//! is its own responsible process (P2f-2).
+//! three minutes of recording were silence. P2f-2 starts that worker's
+//! recorder as its OWN responsible process (`launch::recorder_owns_its_permissions`,
+//! [`crate::macos_spawn`]), so macOS asks the person and the plain verdict
+//! applies. Where that cannot be done (the private call is missing, or
+//! `ROOMLERD_RECORDER_DISCLAIM=0`), every answer refuses by name instead (the
+//! manager tells the recorder, [`SUPERVISED_ENV`]).
 //!
 //! The decision is plain data so it is tested on every OS (FR-43's practice);
 //! only the question itself is macOS's.
