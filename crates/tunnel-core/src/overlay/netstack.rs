@@ -1433,8 +1433,9 @@ mod tests {
     }
 
     /// Cross-link two stacks packet for packet, through one shared [`policed`]
-    /// bucket when `rate` is set.
-    fn link(a: &Netstack, b: &Netstack, rate: Option<f64>) {
+    /// bucket when `rate` is set, each packet arriving `one_way` after it left.
+    /// The bucket sits where the packet enters, as the relay does.
+    fn link(a: &Netstack, b: &Netstack, rate: Option<f64>, one_way: Duration) {
         let bucket = Arc::new(std::sync::Mutex::new((
             rate.unwrap_or(0.0).max(64.0 * 1024.0),
             std::time::Instant::now(),
@@ -1444,11 +1445,24 @@ mod tests {
             (b.tun.clone(), a.tun.clone()),
         ] {
             let bucket = bucket.clone();
+            // In order and unbounded: a delay line, never a second bottleneck.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
                 while let Ok(pkt) = from.read_packet().await {
                     if rate.is_some_and(|r| !policed(&bucket, r, pkt.len())) {
                         continue;
                     }
+                    if tx
+                        .send((tokio::time::Instant::now() + one_way, pkt))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((at, pkt)) = rx.recv().await {
+                    tokio::time::sleep_until(at).await;
                     if to.write_packet(&pkt).await.is_err() {
                         break;
                     }
@@ -1459,18 +1473,24 @@ mod tests {
 
     /// #2876 — a policed path must not collapse a netstack sender.
     ///
-    /// Without a congestion controller smoltcp pushed its whole window into the
-    /// bucket and recovered by 1 s RTOs: roomler SSH held 48.5 kbit/s against a
-    /// 1 Mbit/s bucket in the field, where kernel TCP held 0.86 Mbit/s.
+    /// Two collapses, one test. Without a congestion controller smoltcp pushed its
+    /// whole window into the bucket and recovered by RTOs: roomler SSH held 48.5 kbit/s
+    /// against a 1 Mbit/s bucket in the field, where kernel TCP held 0.86 Mbit/s. With
+    /// Reno on smoltcp 0.13 every fast retransmit also doubled the RTO, and only an RTT
+    /// sample from never-sent data collapsed it, which a policed path rarely lets
+    /// through: the timer climbed to its 60 s ceiling and the same scp held 33 kbit/s.
+    /// A zero-RTT link hid that one (it passed here at 0.97 Mbit/s), hence the delay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_policed_path_keeps_most_of_its_rate() {
-        const RATE: f64 = 250_000.0;
+        // Free's rate (`relay_allowance`), over a 30 ms round trip.
+        const RATE: f64 = 125_000.0;
         const SIZE: usize = 512 * 1024;
+        const ONE_WAY: Duration = Duration::from_millis(15);
         let a_ip = Ipv4Addr::new(10, 9, 1, 1);
         let b_ip = Ipv4Addr::new(10, 9, 1, 2);
         let a = Netstack::start(a_ip, 24, 1280);
         let b = Netstack::start(b_ip, 24, 1280);
-        link(&a, &b, Some(RATE));
+        link(&a, &b, Some(RATE), ONE_WAY);
 
         // B sends SIZE bytes to whoever connects, then closes.
         let mut listener = b.handle.listen(9100).await.unwrap();
@@ -1501,7 +1521,7 @@ mod tests {
         assert!(
             secs < ideal * 3.0 + 1.0,
             "{SIZE} B took {secs:.1} s through a {RATE} B/s bucket (ideal {ideal:.1} s): \
-             the sender is not backing off to the rate"
+             the sender is not backing off to the rate, or its retransmission timer is"
         );
     }
 
@@ -1516,7 +1536,7 @@ mod tests {
         let b_ip = Ipv4Addr::new(10, 9, 3, 2);
         let a = Netstack::start(a_ip, 24, 1280);
         let b = Netstack::start(b_ip, 24, 1280);
-        link(&a, &b, Some(250_000.0));
+        link(&a, &b, Some(250_000.0), Duration::ZERO);
 
         let mut listener = b.handle.listen(9300).await.unwrap();
         tokio::spawn(async move {
@@ -1554,7 +1574,7 @@ mod tests {
         let b_ip = Ipv4Addr::new(10, 9, 4, 2);
         let a = Netstack::start(a_ip, 24, 1280);
         let b = Netstack::start(b_ip, 24, 1280);
-        link(&a, &b, None);
+        link(&a, &b, None, Duration::ZERO);
 
         let mut listener = b.handle.listen(9400).await.unwrap();
         tokio::spawn(async move {
