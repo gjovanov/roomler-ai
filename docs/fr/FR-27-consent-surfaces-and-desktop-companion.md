@@ -413,7 +413,12 @@ Ticked only where a run is recorded in the field log below.
       Xwayland, on 0.4.135. It showed and took the click, then stayed on screen
       after it, frozen: its unmap was never flushed; fixed in FR-93 P6a. The
       banner half of this criterion is the companion's, and still untested on
-      X11.)*
+      X11.)* **The Linux X11 half: GREEN, 2026-10-25, agent and companion
+      0.4.169** on Ubuntu 24.04 with GNOME 46 on Xorg (the log). The banner tucked
+      away and came back on a top-edge rest, and one click on its Disconnect ended
+      the session for good. **Left:** the Windows badge's *text*. Its Disconnect
+      is proven (10-09), but the badge is capture-excluded by design, so only a
+      look at a Windows device's own screen during a session can show it.
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.
@@ -424,6 +429,10 @@ Ticked only where a run is recorded in the field log below.
       apply** (the Mac is on the latest release), so its success cannot be shown
       here; the macOS update MECHANISM itself was proven end to end by the 0.4.109
       canary install (the FR-85 log). Left unticked until an update is pending.
+      *(2026-10-25: every Mac in the fleet was already on 0.4.169, daemon and
+      companion. The window is between a release publishing and the fleet roll:
+      at the next release, leave one Mac out of the roll and click "Apply update"
+      in its companion.)*
 - [~] The Devices grid shows the companion version alongside the agent version.
       (Implemented in #877; deployed since API `v20260829-0d5078f44e42` + 0.4.18.)
       **Half met, 2026-09-25 on the live grid (API 0.4.101, 21 devices):** the
@@ -1189,3 +1198,17 @@ The device's access policy was restored and read back equal after each run.
 - both policies back to their defaults, read back as absent;
 - `exec_enabled` and `ssh_enabled` back to `false`, and the daemon restarted;
 - re-proven closed: exec says "not enabled", SSH says "its policy is off".
+
+### 2026-10-25 — the "Being viewed by" banner on a Linux X11 desktop (agent and companion 0.4.169)
+
+**What ran.** A kept vmtest cell, `ubuntu/installer/system@zeus`: Ubuntu 24.04 with GNOME 46, the release `.deb`s (0.4.169), and a root daemon. Every lane check passed, including the companion's autostart. GDM was then switched to **Xorg**, giving an active `x11` user session on seat0. The companion autostarted in it and read "Connected" to its system daemon (#1911 has been fixed since 0.4.124). The viewer was the harness's lifecycle spec in the pinned Playwright container on mars. The screen was read with root screenshots and `xdotool`, both in the person's own X session.
+
+| check | evidence |
+|---|---|
+| the banner shows | the daemon: `being viewed: the companion's banner says so` at session start. The window (360×76) sat at the top centre, (460,48) on a 1280×800 screen |
+| X11 behaviour (P9) | the pointer is readable on X11, so the banner tucked away after its first 4 s. A rest at the top edge brought it back: *"● Being viewed by vmtest admin · keyboard + mouse · 37s"* with **Disconnect** |
+| one click → the device's word, first | a real X11 click on its Disconnect. The daemon: `viewee requested disconnect via overlay badge` 11:13:25.7417Z, then `host disconnect: told the server … reason="host_disconnect" grace_ms=1000` **+0.17 ms**, then `session terminated … reason=HostDisconnect` +1.4 ms, then `Closed` after the grace |
+| the viewer is told | `status: disconnected` |
+| stays disconnected ≥ 60 s | **79 s**: 0 `incoming session request` on the daemon after the click, and every viewer poll after it read disconnected (153 of them, against 96 connected before) |
+
+The cell's daemon was stopped first, so its ephemeral device unenrolled, then that cell alone was destroyed. With the macOS banner (10-08) and the Linux banner on Wayland (10-09), the companion's banner now has field evidence on every desktop it serves. The Windows half of the criterion is the native badge, not the companion. Its Disconnect is proven (10-09), and its text still needs a look at a Windows device's own screen.
