@@ -416,12 +416,22 @@ which the daemon still refuses on the same terms as a local request.
    config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3034`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
-   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:722`;
+   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;
    [installation.md](installation.md), "Two configurations") instead of
    showing a switch that changes nothing. Letting the console user flip the
    root daemon's gate 4 from the app would be a **new authorization path on the
    person socket** — Linux system installs included — and that decision is
    open on #2871, not taken here.
+
+   ⚠️ **On a Linux system install the pane reaches the root daemon over its
+   person socket (#2891)**, which refuses `ConfigGet` / `ConfigSet` outright,
+   so there was no switch to flip at all — the pane said "Could not load the
+   configuration" after falling back to a per-user file a system install does
+   not have. It now says whose configuration it is and gives the same command,
+   `sudo roomler config set exec_enabled true`, in place of rows
+   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`). Gate 4 on a
+   root daemon is an administrator's on both OSes; nothing was admitted on the
+   person socket for it.
 
 ## 9. Not built, on purpose
 

@@ -769,11 +769,13 @@
           </p>
           <!-- #2871: on a Mac running both halves (FR-43) this page edits the
                per-user half's file while the Overview shows the root half's
-               network. Filled by settings.js from cmd_config_target; hidden
-               everywhere else. -->
+               network. #2891: on a Linux system install (or a Mac with a root
+               half alone) the daemon's configuration is root's, and the card
+               shows the administrator's path in place of rows. Filled by
+               settings.js from cmd_config_target; hidden everywhere else. -->
           <div id="cfg-target-banner" class="banner banner-warn" hidden>
             <div>
-              <strong>This page edits the per-user half of this Mac</strong>
+              <strong id="cfg-target-title">This page edits the per-user half of this Mac</strong>
               <p id="cfg-target-text" class="muted small" style="margin: 4px 0 0"></p>
             </div>
           </div>

@@ -180,18 +180,36 @@ compile.
   through P2. Meanwhile the Overview's network lines are the root half's (§6), so the two
   pages described different daemons and nothing said so: a person switching `ssh_enabled`
   on here changed a file the mesh node never reads (measured on 0.4.169). The card now
-  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:722`)
+  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`)
   naming the file it edits and the root half's (`/etc/roomler/config.toml`), with the
   administrator's command for the root half's switches: `sudo roomler config set <key>
   <value>`. It is shown only when the reached daemon says it runs unprivileged AND a root
   daemon of another identity answers `Status` over the person socket (`two_halves`,
-  `:658`) — one daemon behind both sockets, a root daemon's legacy per-user bind, is not
+  `:687`) — one daemon behind both sockets, a root daemon's legacy per-user bind, is not
   two halves. ⚠️ The banner reads the root half's **status** and nothing else: the person
   socket refuses every config verb (`localapi::person_may`), so the root half's
   device-owned gates stay root's to set. Admitting them is the decision open on #2871.
+- **A Linux system install, and a Mac with a root half alone (#2891).** There the daemon the
+  page reaches runs as root and this app does not: `connect()`'s first candidate on Linux,
+  `$XDG_RUNTIME_DIR/roomler.sock`, IS the root daemon's person socket (§12), which serves
+  `Status` and refuses every config verb. Until #2891 the page took that refusal for a daemon
+  that was down, fell back to the per-user config file — a path a system install does not
+  have — and showed "Could not load the configuration" with a Retry that never helped; with a
+  stale per-user file left by an earlier per-user install it would have read, and
+  `cmd_config_set` written, a file no daemon reads (#2871's failure, on Linux). Now
+  `cmd_config_target` (`agents/roomler-desktop/src/commands.rs:828`) reports `root_only`
+  (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`, pure: the reached daemon
+  says it runs as root, this process does not, and the OS is not Windows, whose pipe admits
+  interactive users to those verbs) and the card shows the daemon, its file
+  (`Status.config_path`: `/etc/roomler/config.toml`) and the administrator's commands —
+  `sudo roomler config ls`, `sudo roomler config set <key> <value>` — in place of rows. A
+  refusal from a root daemon is final for `cmd_config_entries`, `cmd_config_set` and
+  `cmd_set_device_name`: none falls back to the file (`refused_by_root_daemon`,
+  `agents/roomler-desktop/src/commands.rs:783`). ⚠️ No new authorization path: `person_may`
+  is unchanged, and #2879's test still pins `ConfigSet` of the gate keys as refused there.
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:2830`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:2954`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
