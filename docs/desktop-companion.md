@@ -174,6 +174,27 @@ compile.
   re-seeds them through `adopt_local`). Every other key is read once at startup.
 - **"Modified"** compares a value with the key's built-in default, computed from a config
   that contains nothing but the identity fields (`builtin_default`, `:1481`).
+- **Which daemon it edits (#2871).** `cmd_config_entries` / `cmd_config_set` go to the
+  daemon `localapi::connect()` resolves — on a Mac running both halves (FR-43), the
+  per-user GUI worker, whose `config.toml` is its own: FR-43 keeps the worker enrolled
+  through P2. Meanwhile the Overview's network lines are the root half's (§6), so the two
+  pages described different daemons and nothing said so: a person switching `ssh_enabled`
+  on here changed a file the mesh node never reads (measured on 0.4.169). The card now
+  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:722`)
+  naming the file it edits and the root half's (`/etc/roomler/config.toml`), with the
+  administrator's command for the root half's switches: `sudo roomler config set <key>
+  <value>`. It is shown only when the reached daemon says it runs unprivileged AND a root
+  daemon of another identity answers `Status` over the person socket (`two_halves`,
+  `:658`) — one daemon behind both sockets, a root daemon's legacy per-user bind, is not
+  two halves. ⚠️ The banner reads the root half's **status** and nothing else: the person
+  socket refuses every config verb (`localapi::person_may`), so the root half's
+  device-owned gates stay root's to set. Admitting them is the decision open on #2871.
+- **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
+  daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
+  `roomlerd.service: active, enabled` (`system_answer`, `:2830`) — as
+  `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
+  read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
+  boots out, said "not installed" while its root daemon served the mesh.
 - A daemon that predates the grouping sends entries without `group`; the page falls back to
   the flat list.
 - Every new agent knob is registered here (the standing rule): the `config.rs` field, the
@@ -302,6 +323,13 @@ sequenceDiagram
 
   A root half that is slow to answer (1.5 s) leaves the half's own answer on screen for that
   poll.
+- **What the per-user half does NOT borrow: configuration (#2871).** `ConfigGet` /
+  `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
+  file — and says so (§5). The same socket does tell the companion, and the CLI's
+  `config ls` / `config set` note (`localapi::other_daemon_socket`,
+  `crates/localapi/src/lib.rs:4525`), that a root half exists: `/var/run/roomler` is
+  `0700`, so the console user's `stat` of the root socket fails and that note had been
+  silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
   [security baseline](security-baseline.md) §4.
 

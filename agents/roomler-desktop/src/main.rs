@@ -157,6 +157,8 @@ fn main() {
             commands::cmd_config_cleanup,
             commands::cmd_config_entries,
             commands::cmd_config_set,
+            // #2871 — which daemon the configuration page edits (a two-half Mac).
+            commands::cmd_config_target,
             commands::cmd_encoder_caps,
             commands::cmd_files_dir_view,
             commands::cmd_pick_files_dir,

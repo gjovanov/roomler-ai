@@ -46,7 +46,7 @@ pub async fn status(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         print_status(&status);
-        print_other_daemon_hint().await;
+        print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
     }
     Ok(())
 }
@@ -61,17 +61,36 @@ pub async fn status(json: bool) -> Result<()> {
 ///
 /// Only printed in human mode: `--json` output is parsed, and a stray line
 /// would be a breaking change for anything consuming it.
-async fn print_other_daemon_hint() {
+///
+/// `what` says what the per-user half's answer leaves out, per command: the
+/// overlay for `status` / `peers` / `why`, the root half's configuration for
+/// `config ls` / `config set` (#2871).
+async fn print_other_daemon_hint(what: &str) {
     if let Some(other) = localapi::other_daemon_socket().await {
         eprintln!();
         eprintln!(
             "note: a second roomler daemon is running on this host ({}).",
             other.display()
         );
-        eprintln!("      This is the per-user half; the overlay runs in the privileged one.");
+        eprintln!("      This is the per-user half; {what}");
         eprintln!("      Use `sudo roomler …` to ask that one instead.");
     }
 }
+
+/// The hint's second line for the network commands.
+const OVERLAY_IS_THE_ROOT_HALFS: &str = "the overlay runs in the privileged one.";
+
+/// #2871 — the hint's second line for `config ls` / `config set`. On a
+/// supervised Mac (FR-43) the per-user half the unprivileged CLI reaches has a
+/// configuration of its own, and the device-owned gates that matter to an
+/// administrator — the overlay, Roomler SSH, remote commands — are read from
+/// the ROOT half's `/etc/roomler/config.toml`. Before this line the command
+/// listed, and changed, the per-user half's file with no word that another
+/// existed; the Mac in #2871 showed `ssh_enabled = false` here while the root
+/// half served SSH.
+const CONFIG_IS_THE_PER_USER_HALFS: &str = "this is ITS configuration. The root daemon's keys \
+     (the overlay, SSH, exec) live in its own file: `sudo roomler config ls` / `sudo roomler \
+     config set <key> <value>`.";
 
 /// `roomler logs` — surface the S2 `TailLog` verb on the CLI.
 ///
@@ -275,7 +294,7 @@ pub async fn peers(args: PeersArgs) -> Result<()> {
     if names.is_empty() {
         print_dark_orgs(&orgs, &peers);
     }
-    print_other_daemon_hint().await;
+    print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
     Ok(())
 }
 
@@ -629,7 +648,7 @@ pub async fn why(peer: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     print_why(p);
-    print_other_daemon_hint().await;
+    print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
     Ok(())
 }
 
@@ -1544,6 +1563,7 @@ pub async fn config_ls(json: bool) -> Result<()> {
         "\n`restart` keys take effect on the next daemon restart, `live` keys at once — \
          `roomler config set <key> <value>`"
     );
+    print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
     Ok(())
 }
 
@@ -1573,6 +1593,8 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
     } else {
         println!("in effect now — no restart needed");
     }
+    // #2871 — and WHICH daemon's file just changed, when this host runs two.
+    print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
     Ok(())
 }
 

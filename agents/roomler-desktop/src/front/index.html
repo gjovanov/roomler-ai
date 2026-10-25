@@ -767,6 +767,16 @@
             Changes are saved to this device's configuration; each key says
             whether it takes effect at once or after the service restarts.
           </p>
+          <!-- #2871: on a Mac running both halves (FR-43) this page edits the
+               per-user half's file while the Overview shows the root half's
+               network. Filled by settings.js from cmd_config_target; hidden
+               everywhere else. -->
+          <div id="cfg-target-banner" class="banner banner-warn" hidden>
+            <div>
+              <strong>This page edits the per-user half of this Mac</strong>
+              <p id="cfg-target-text" class="muted small" style="margin: 4px 0 0"></p>
+            </div>
+          </div>
           <div id="cfg-search-wrap" class="cfg-search" hidden>
             <input
               type="text"

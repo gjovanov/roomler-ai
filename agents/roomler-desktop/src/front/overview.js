@@ -44,9 +44,13 @@
       'ov-service',
       s.service_kind === 'scmService'
         ? 'System service' + (s.service_running ? ' · running' : ' · stopped')
-        : s.service_kind === 'scheduledTask'
-          ? 'Per-user auto-start' + (s.service_running ? ' · running' : '')
-          : 'not installed',
+        : s.service_kind === 'systemDaemon'
+          // #2871: a Linux or macOS root daemon (launchd / systemd). Before
+          // this branch a supervised Mac read "not installed" here.
+          ? 'System daemon (root)' + (s.service_running ? ' · running' : ' · stopped')
+          : s.service_kind === 'scheduledTask'
+            ? 'Per-user auto-start' + (s.service_running ? ' · running' : '')
+            : 'not installed',
     );
     // Config-file identity is a fallback for the fields the live daemon
     // fills in below when it's reachable.

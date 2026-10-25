@@ -785,3 +785,22 @@ worker keeps its own enrollment and that layout has none; why no worker appeared
 diagnosed further. The root served the session
 itself, and no push arrived at all, not even text, because a root daemon outside the
 console session cannot reach the pasteboard.
+
+### 2026-10-25 — #2871: the P2 layout's second configuration surfaced in the companion
+
+On the operator's MacBook (0.4.169, supervised), read-only: the GUI worker runs on the
+console user's own enrollment and `~/Library/Application Support/live.roomler.roomler/
+config.toml`, as P2 requires (the fallback), and the companion's Device configuration
+edits THAT file while its Overview shows the root half's overlay address (FR-97 P2h). The
+two files disagreed on `overlay_enabled` and `ssh_enabled` (worker `false`, root `true`),
+so a person switching SSH on in the app changed nothing the mesh node reads. The CLI's
+"second daemon" note had been silent for the console user as well: `/var/run/roomler` is
+`0700`, so `exists()` on the root socket is `false` to them. #2871 labels both surfaces —
+the app's banner and the CLI note on `config ls` / `config set`, each reading the root
+half's presence off its person socket — and makes the Overview's Service line read the
+LaunchDaemon, which it called "not installed" once P2d had booted the LaunchAgent out.
+
+The underlying fix is **P3**: one enrollment, one file, the worker's session knobs handed
+down as `WORKER_ENV_FORWARD` already does. Whether the console user may set the root
+half's device-owned gates from the app *before* P3 — a new authorization path on the
+person socket — is the decision open on #2871.
