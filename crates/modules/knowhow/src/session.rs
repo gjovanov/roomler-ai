@@ -596,8 +596,9 @@ fn given(s: &str) -> Option<&str> {
 }
 
 /// The people's card, for a session: one live entity by its kind and key,
-/// with at most [`session_limits::MAX_CARD_LINKS`] of its links, cut until
-/// the whole fits [`session_limits::MAX_CARD_BYTES`].
+/// with at most [`session_limits::MAX_CARD_LINKS`] of its links and what each
+/// device last found of it (P4-5-4), cut until the whole fits
+/// [`session_limits::MAX_CARD_BYTES`].
 pub(crate) async fn get(
     state: &KnowhowState,
     tenant_id: ObjectId,
@@ -624,11 +625,23 @@ pub(crate) async fn get(
     Ok(bounded(card, session_limits::MAX_CARD_BYTES))
 }
 
-/// A card cut to `max` bytes, serialised: its links dropped from the end, and
-/// `truncated` set, until it fits or none is left. The entity itself is never
-/// cut: its own bounds (16 KiB of attributes, 64 facts of 2 KiB) hold it.
+/// A card cut to `max` bytes, serialised: the devices' findings dropped from
+/// the oldest, and `probes_truncated` set, then its links from the end, and
+/// `truncated` set, until it fits or none is left. P4-5-4 — the findings go
+/// first, so a card a session was given whole before them still is: they
+/// take only the room its links leave. The entity itself is never cut: its
+/// own bounds (16 KiB of attributes, 64 facts of 2 KiB) hold it.
 pub(crate) fn bounded(mut card: Value, max: usize) -> Value {
     let size = |v: &Value| serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX);
+    while size(&card) > max {
+        let Some(probes) = card.get_mut("probes").and_then(Value::as_array_mut) else {
+            break;
+        };
+        if probes.pop().is_none() {
+            break;
+        }
+        card["probes_truncated"] = Value::Bool(true);
+    }
     while size(&card) > max {
         let Some(links) = card.get_mut("links").and_then(Value::as_array_mut) else {
             break;
@@ -669,6 +682,34 @@ mod tests {
         assert_eq!(links[0]["n"], 0, "cut from the end");
         assert_eq!(big["truncated"], true);
         assert!(serde_json::to_vec(&big).unwrap().len() <= 64 * 1024);
+    }
+
+    /// P4-5-4 — the devices' findings go before any link: a card past its
+    /// bound loses them from the oldest and says so, and loses links only
+    /// once no finding is left.
+    #[test]
+    fn a_cards_findings_are_cut_before_its_links() {
+        let mut c = card(3, 10);
+        c["probes"] = (0..16)
+            .map(|i| json!({"device_id": i, "pad": "p".repeat(1024)}))
+            .collect::<Vec<_>>()
+            .into();
+        c["probes_truncated"] = json!(false);
+        let whole = serde_json::to_vec(&c).unwrap().len();
+
+        let cut = bounded(c.clone(), whole - 4 * 1024);
+        let probes = cut["probes"].as_array().unwrap();
+        assert!(probes.len() < 16 && !probes.is_empty(), "{}", probes.len());
+        assert_eq!(probes[0]["device_id"], 0, "the newest kept");
+        assert_eq!(cut["probes_truncated"], true);
+        assert_eq!(cut["links"].as_array().unwrap().len(), 3, "no link cut");
+        assert_eq!(cut["truncated"], false);
+        assert!(serde_json::to_vec(&cut).unwrap().len() <= whole - 4 * 1024);
+
+        let tight = bounded(c, 200);
+        assert!(tight["probes"].as_array().unwrap().is_empty());
+        assert_eq!(tight["probes_truncated"], true);
+        assert_eq!(tight["truncated"], true, "then the links");
     }
 
     /// An entity too large for the bound on its own keeps itself whole: only

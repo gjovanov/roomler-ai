@@ -16,6 +16,7 @@
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use futures::TryStreamExt;
 use mongodb::{Collection, Database, options::ReturnDocument};
+use roomler_ai_remote_control::knowhow::ProbeOutcome;
 use roomler_ai_services::dao::base::{BaseDao, DaoResult, escape_regex};
 use serde::{Deserialize, Serialize};
 
@@ -748,5 +749,50 @@ impl ProbeDao {
             .limit(limit)
             .await?;
         Ok(cursor.try_collect().await?)
+    }
+
+    /// FR-90 P4-5-4 — each device's last probe of an entity that found
+    /// something, `ok` or `unreachable`, newest first and at most `devices`
+    /// (decision 58). They are read from the entity's newest `findings` such
+    /// probes, so a device whose last one lies further back is not among them.
+    /// The entity's probe index serves the read; a probe that asked nothing
+    /// of the target (`not_allowed`, `failed`), and one never answered, is no
+    /// device's finding.
+    pub async fn last_per_device(
+        &self,
+        tenant_id: ObjectId,
+        entity_id: ObjectId,
+        findings: i64,
+        devices: i64,
+    ) -> DaoResult<Vec<KnowhowProbe>> {
+        let found = [
+            ProbeOutcome::Ok.as_str(),
+            ProbeOutcome::Unreachable.as_str(),
+        ];
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "entity_id": entity_id,
+                "state": { "$in": found.to_vec() },
+            } },
+            doc! { "$sort": { "requested_at": -1, "_id": -1 } },
+            doc! { "$limit": findings },
+            doc! { "$group": { "_id": "$device_id", "last": { "$first": "$$ROOT" } } },
+            doc! { "$replaceWith": "$last" },
+            doc! { "$sort": { "requested_at": -1, "_id": -1 } },
+            doc! { "$limit": devices },
+        ];
+        let rows: Vec<Document> = self
+            .base
+            .collection()
+            .clone_with_type::<Document>()
+            .aggregate(pipeline)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(bson::from_document)
+            .collect::<Result<_, _>>()?)
     }
 }
