@@ -41,6 +41,10 @@ pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
 pub mod firewall;
+/// #2886 — test support: whether a child holds a handle of ours, read from
+/// its own handle table rather than timed on a pipe's EOF.
+#[cfg(test)]
+pub(crate) mod inherited_handle;
 /// #2465 — the worker an earlier host of this service left running: found
 /// and ended before this host spawns its own.
 pub mod orphan;

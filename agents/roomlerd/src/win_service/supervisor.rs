@@ -3491,17 +3491,23 @@ mod tests {
 
     /// #1908 — a console-user command holds no handle it was not given. The
     /// inheritable pipe end this test keeps stands in for another command's,
-    /// made at the same moment in a busy daemon: its reader sees end-of-file
-    /// the moment this process lets go of it, not when the command started
-    /// meanwhile exits.
+    /// made at the same moment in a busy daemon.
+    ///
+    /// Asked of the child's own handle table, not of the pipe's end-of-file
+    /// (#2886, [`inherited_handle`](super::super::inherited_handle)): timing
+    /// the EOF blamed this spawn for any sibling spawn in the suite that
+    /// inherited the decoy. One such sibling is spawned here on purpose, as
+    /// the control: the same question, asked of it, must say yes.
     #[test]
     fn a_captured_child_inherits_its_own_three_handles_and_nothing_else() {
+        use super::super::inherited_handle::{held_by, unbounded_sibling};
+        use std::os::windows::io::AsRawHandle;
         let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
         sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
         sa.bInheritHandle = TRUE;
         // `make_pipe` de-inherits the read end; the write end stays inheritable,
         // as another spawn's child ends are until that spawn drops them.
-        let (other_r, other_w) = unsafe { make_pipe(&mut sa) }.unwrap();
+        let (_other_r, other_w) = unsafe { make_pipe(&mut sa) }.unwrap();
         // A token this (non-SYSTEM) process may start a process with: the
         // restricted, Medium copy of its own.
         let token = crate::win_token::restricted_medium_copy().unwrap();
@@ -3510,17 +3516,16 @@ mod tests {
             spawn_in_session_captured(token.raw(), &cmd("ping -n 6 127.0.0.1 >NUL"), None, false)
         }
         .unwrap();
-        drop(other_w);
-        let started = Instant::now();
-        let budget = std::sync::atomic::AtomicU64::new(1024);
-        let _ = read_pipe_to_end(&other_r, &budget);
-        let waited = started.elapsed();
-        let still_running = child.process.try_wait().unwrap().is_none();
+        let mut sibling = unbounded_sibling();
+        let bounded = held_by(child.process.process.raw(), other_w.raw());
+        let unbounded = held_by(sibling.as_raw_handle() as HANDLE, other_w.raw());
         child.process.terminate();
+        let _ = sibling.kill();
+        let _ = sibling.wait();
         assert!(
-            waited < Duration::from_secs(2),
-            "the command kept another's pipe open for {waited:?}"
+            unbounded,
+            "the control: a spawn with no handle list must be seen holding the decoy"
         );
-        assert!(still_running, "and it was still running then");
+        assert!(!bounded, "the command holds a pipe end it was not given");
     }
 }
