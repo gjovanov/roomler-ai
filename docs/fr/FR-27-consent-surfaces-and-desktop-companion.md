@@ -438,7 +438,7 @@ Ticked only where a run is recorded in the field log below.
       companion. The window is between a release publishing and the fleet roll:
       at the next release, leave one Mac out of the roll and click "Apply update"
       in its companion.)*
-- [~] The Devices grid shows the companion version alongside the agent version.
+- [x] The Devices grid shows the companion version alongside the agent version.
       (Implemented in #877; deployed since API `v20260829-0d5078f44e42` + 0.4.18.)
       **Half met, 2026-09-25 on the live grid (API 0.4.101, 21 devices):** the
       value is on the wire for every row — 10 companion hosts (Windows, macOS)
@@ -452,6 +452,13 @@ Ticked only where a run is recorded in the field log below.
       the caption has not been seen on a real row — and per #1617 the value is
       the *installed* version, so the one skew that actually happened (a 0.4.92
       companion still RUNNING under a 0.4.101 daemon) was invisible to it.
+      **Seen on a real row, 2026-10-25, agent 0.4.170** (the log): the lab's
+      Fedora box with its companion package one release behind its daemon. The
+      live grid read `v0.4.170 · desktop v0.4.169` in warning amber, with the
+      tooltip; every other row showed nothing. The running-versus-installed gap
+      closed meanwhile: #1617 restarts a running companion after a macOS update,
+      and FR-117's sync on Linux restarts it when it moves the package
+      (`restarted=1`).
 - [x] `free` ↔ `exclusive` verified with two concurrent viewers; the device policy
       re-applies after every session ends. **Second half done** (re-seed proven on
       one daemon process, no restart). **Two-viewer half done 2026-10-24**, on the
@@ -1234,3 +1241,22 @@ The cell's daemon was stopped first, so its ephemeral device unenrolled, then th
 | afterwards | the framebuffer: no badge and no red frame |
 
 The cell was shut down gracefully (the service stops and the ephemeral device unenrolls), then that cell alone was destroyed. With the macOS banner (10-08) and the Linux X11 banner (above), the criterion is met on all three platforms.
+
+### 2026-10-25 — the companion-version caption on a real row (agent 0.4.170)
+
+**What ran.** The lab's Fedora box, a root daemon on agent 0.4.170 with its companion package (`.rpm`, aarch64). The box's companion was put one release behind its daemon: the 0.4.169 `.rpm`, its `.sha256` checked, installed as a downgrade.
+
+**Getting a skew that holds took two tries, and the first is a finding.**
+
+| try | at the daemon's start | outcome |
+|---|---|---|
+| 1 | the opt-out marker `/etc/roomler/disable-auto-update`, `auto_update = true` | `auto-updater armed`. FR-117's sync moved the companion back before the first heartbeat (`.asc` verified, `companion: package installed tool="dnf"`, `… from=0.4.169 to=0.4.170 restarted=1`, 5 s after the start). On a system install the marker is not this daemon's opt-out: filed as **#2901** |
+| 2 | `auto_update = false` | `auto-update disabled`, and the skew held |
+
+| check | evidence |
+|---|---|
+| the device reports it | the agent row: `agent_version` 0.4.170, `companion_version` **0.4.169**, on the first heartbeat after the start |
+| the grid shows it | the live Devices grid, the box's row: `v0.4.170 · desktop v0.4.169`, the caption in warning amber, and the tooltip *"roomler-desktop is on v0.4.169 while the daemon is on v0.4.170 — the companion updates separately …"*. The other 20 rows, with no skew, showed nothing |
+| it clears | `auto_update` back to `true` (as found) and the marker removed (it was absent before). At the next start FR-117 repaired the skew in **2.5 s** (`from=0.4.169 to=0.4.170 restarted=1`). The agent row then read 0.4.170, and the grid carried no caption anywhere |
+
+The lab lock was held throughout and released after.
