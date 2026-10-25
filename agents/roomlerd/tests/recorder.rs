@@ -1118,6 +1118,96 @@ mod process {
         assert_eq!(written, 0, "no recording was written");
     }
 
+    /// The manager for the P2f-3 tests: a synthetic recorder whose microphone
+    /// "asks the person" and is answered after `answer_ms`.
+    #[cfg(feature = "audio")]
+    fn asking_manager(
+        dir: &std::path::Path,
+        answer_ms: &'static str,
+    ) -> roomlerd::recording::manager::RecordingManager {
+        let out = dir.join("Recordings");
+        let cfg_path = dir.join("config.toml");
+        let mut cfg = roomler_node_core::config::test_fixture();
+        cfg.record_dir = Some(out.to_string_lossy().into_owned());
+        roomler_node_core::config::save(&cfg_path, &cfg).unwrap();
+        roomlerd::recording::manager::RecordingManager::new(
+            PathBuf::from(env!("CARGO_BIN_EXE_roomlerd")),
+            cfg_path,
+        )
+        .with_service_identity(false)
+        .with_child_env([
+            ("ROOMLERD_SYNTHETIC_FRAMES", "1"),
+            ("ROOMLERD_SYNTHETIC_AUDIO", "1"),
+            ("ROOMLERD_SYNTHETIC_MIC_QUESTION_MS", answer_ms),
+        ])
+    }
+
+    /// FR-97 P2f-3 — a recorder that says it is asking the person a question
+    /// (macOS's microphone question, measured on the operator's MacBook) gets
+    /// past the start deadline: the start waits for the answer instead of
+    /// killing the recorder while the person reads it.
+    #[cfg(feature = "audio")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_question_to_the_person_outlasts_the_start_deadline() {
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+
+        let _serial = MANAGER_TESTS.lock().await;
+        let dir = scratch();
+        // The person answers after 9 s; the plain deadline is 5 s.
+        let m = asking_manager(dir.path(), "9000")
+            .with_start_timeout(Duration::from_secs(5))
+            .with_ask_timeout(Duration::from_secs(60));
+        let opts = RecordStartOpts {
+            encoder: Some("software".into()),
+            microphone: true,
+            ..Default::default()
+        };
+        let st = match m.start(opts).await {
+            Response::Recording(s) => s,
+            other => panic!("the question must not end the start: {other:?}"),
+        };
+        assert!(st.active, "{st:?}");
+        assert!(
+            st.microphone,
+            "it records the microphone it asked about: {st:?}"
+        );
+        let _ = m.stop().await;
+    }
+
+    /// …and the wait it buys is bounded: a question nobody answers still ends
+    /// the start, and the recorder is stopped rather than left to begin later,
+    /// unseen.
+    #[cfg(feature = "audio")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_question_still_ends_the_start() {
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+
+        let _serial = MANAGER_TESTS.lock().await;
+        let dir = scratch();
+        let m = asking_manager(dir.path(), "60000")
+            .with_start_timeout(Duration::from_secs(5))
+            .with_ask_timeout(Duration::from_secs(4));
+        let opts = RecordStartOpts {
+            encoder: Some("software".into()),
+            microphone: true,
+            ..Default::default()
+        };
+        match m.start(opts).await {
+            Response::Error { message } => assert!(
+                message.contains("of asking the person a question"),
+                "{message}"
+            ),
+            other => panic!("an unanswered question must end the start: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let st = match m.status() {
+            Response::Recording(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert!(!st.active, "the recorder was left running: {st:?}");
+        assert_eq!(st.last.map(|l| l.reason).as_deref(), Some("start_timeout"));
+    }
+
     /// FR-85 P1c — `--system-audio` through the real process, the synthetic
     /// tone standing in for the device: `started` says so, and the finished
     /// file carries an audio track.

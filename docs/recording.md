@@ -364,7 +364,7 @@ sequenceDiagram
 
 | Verb | Caller | Answers |
 |---|---|---|
-| `RecordStart {opts}` | console user | `Recording` once the child reports `started` (≤ 20 s), or an error naming why it did not start |
+| `RecordStart {opts}` | console user | `Recording` once the child reports `started` (≤ 20 s, or ≤ 150 s after it asks the person a question, P2f-3), or an error naming why it did not start |
 | `RecordStop` | console user | `Recording` once the file is final (the remux copies every byte once; ≤ 5 min) |
 | `RecordStatus` | any LocalAPI client | `Recording`: active, file, length, size, frames, encoder, and how the last one ended |
 | `RecordingsList` | any LocalAPI client | `Recordings`: the folder, why it is that one, and each file with its sidecar facts, newest first |
@@ -398,6 +398,16 @@ sequenceDiagram
   it is recording. `a_recorder_that_misses_the_start_deadline_is_stopped_not_left_recording`
   is red without the kill: the child reported `started` after its caller had
   been told no.
+- **A question to the person extends the deadline, once** (FR-97 P2f-3). A
+  recorder that has to ask the person something first says so
+  (`{"ev":"asking"}`, today only macOS's microphone question). The start then
+  waits up to `manager::ASK_TIMEOUT` (150 s) from that moment, instead of
+  killing the recorder while they read. The recorder's own window is shorter
+  (`mic_permission::ASK_WINDOW`, 120 s, asserted by a test), so a question
+  nobody answers ends in the recorder's words, not a bare timeout. Nothing else
+  extends the deadline. `a_question_to_the_person_outlasts_the_start_deadline`
+  fails when the event is ignored, and `an_unanswered_question_still_ends_the_start`
+  shows the extension is bounded and the recorder is still stopped.
 - **Updates wait for a recording** (`updater.rs`, `active_work`). An active
   recording counts as in-flight work, like a file transfer, with the same defer
   budget. An operator-forced update proceeds anyway and says so. The mark
@@ -708,9 +718,16 @@ in. The microphone is cpal's, CoreAudio's default input, opened only after
 AVFoundation says the person has not turned it off (`recording::mic_permission`).
 ⚠️ **macOS records silence from a refused microphone**: the stream opens and
 runs, and the file carries nothing. So *Denied* and *Restricted* refuse the
-start by name (`mic_unavailable`, the setting in `detail`), and an *undecided*
-microphone opens, which is when macOS asks the person (silence until they
-answer). ⚠️ **Not on a supervised Mac** (P2f-1b): its GUI worker is started by
+start by name (`mic_unavailable`, the setting in `detail`). An *undecided*
+microphone is asked about explicitly (P2f-3,
+`requestAccessForMediaType:completionHandler:`). The recorder first tells the
+daemon it is asking, so the start waits for the person (see the start-deadline
+rule above). Allow opens it, and *Don't Allow* refuses with the "turned off"
+words. No answer within two minutes refuses with words saying the question is
+still waiting. Before P2f-3, CoreAudio's open blocked on the same question, and
+the daemon's 20 s start deadline killed the recorder while the person was
+reading it. Their Allow stuck, but that first recording had already failed
+(measured on the operator's MacBook, FR-97 §8). ⚠️ **Not on a supervised Mac** (P2f-1b): its GUI worker is started by
 the root daemon, which stays the recorder's responsible process, and macOS never
 asks the person about a microphone for root. Measured on the operator's MacBook
 (FR-97 §8): "not determined", the real microphone opened, no prompt, three
@@ -1090,7 +1107,7 @@ sequenceDiagram
   for the new console user and stops the old worker's process group, recorder
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
-  `child.rs:399-407`); a recording never follows a user switch.
+  `child.rs:409-417`); a recording never follows a user switch.
 - **Both audio sources on a supervised Mac.** Computer audio since FR-97 P2a
   (ScreenCaptureKit, in the worker's session: the worker advertises
   `remote-audio` while the owner allows it, as any host does). The microphone

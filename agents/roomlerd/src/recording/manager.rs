@@ -37,6 +37,12 @@ use super::sidecar::{Initiator, SIDECAR_SUFFIX, Sidecar};
 /// (the first frame, the encoder open, a folder probe). The child's own
 /// first-frame timeout is 10 s, so a healthy refusal always arrives first.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
+/// FR-97 P2f-3 — how long `start` keeps waiting once the recorder says macOS
+/// is asking the person about the microphone (`{"ev":"asking"}`). It is the
+/// recorder's own window ([`super::mic_permission::ASK_WINDOW`]) plus the
+/// first frame after an answer, so the recorder's own words (allowed, refused
+/// or unanswered) always arrive before this deadline.
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(150);
 /// How long `stop` waits for the file to be final — the remux of a long
 /// recording copies every byte once.
 const STOP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -132,6 +138,8 @@ pub struct RecordingManager {
     child_env: Vec<(String, String)>,
     /// [`START_TIMEOUT`], unless a test shortens it.
     start_timeout: Duration,
+    /// [`ASK_TIMEOUT`], unless a test shortens it (FR-97 P2f-3).
+    ask_timeout: Duration,
     /// FR-85 P3 — the initiator of the most recent start when it was REMOTE
     /// (`None` for a local one). Meaningful only while the state is active.
     remote: StdMutex<Option<RemoteInitiator>>,
@@ -169,6 +177,7 @@ impl RecordingManager {
             where_cache: StdMutex::new(None),
             child_env: Vec::new(),
             start_timeout: START_TIMEOUT,
+            ask_timeout: ASK_TIMEOUT,
             remote: StdMutex::new(None),
             unattended_dir: None,
             reattach_grace: REATTACH_GRACE,
@@ -376,6 +385,13 @@ impl RecordingManager {
     /// missing it is stopped rather than left to start later, unseen.
     pub fn with_start_timeout(mut self, start_timeout: Duration) -> Self {
         self.start_timeout = start_timeout;
+        self
+    }
+
+    /// Shorten the deadline that follows a microphone question — for the
+    /// test that proves even a question nobody answers ends the start.
+    pub fn with_ask_timeout(mut self, ask_timeout: Duration) -> Self {
+        self.ask_timeout = ask_timeout;
         self
     }
 
@@ -616,6 +632,8 @@ impl RecordingManager {
         }
         let (ended_tx, ended_rx) = watch::channel(false);
         let (started_tx, mut started_rx) = watch::channel(false);
+        // FR-97 P2f-3 — the recorder says a person is being asked a question.
+        let (asking_tx, mut asking_rx) = watch::channel(false);
         let state = self.state.clone();
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -629,6 +647,13 @@ impl RecordingManager {
                 let mut finished = false;
                 if let Ok(mut s) = state.lock() {
                     finished = apply_event(&mut s, &ev);
+                }
+                if ev["ev"] == "asking" {
+                    tracing::info!(
+                        what = ev["what"].as_str().unwrap_or("?"),
+                        "recording: the recorder is asking the person; the start waits for the answer"
+                    );
+                    let _ = asking_tx.send(true);
                 }
                 if ev["ev"] == "started" && !counted {
                     counted = true;
@@ -678,13 +703,33 @@ impl RecordingManager {
         drop(guard);
 
         let mut ended_rx = ended_rx;
-        let outcome = tokio::time::timeout(self.start_timeout, async {
+        // FR-97 P2f-3 — a question the recorder puts to the person (macOS's
+        // microphone question) extends the deadline ONCE, to `ask_timeout`
+        // from the moment it was asked. Nothing else extends it: a recorder
+        // stuck in an encoder open is still stopped at `start_timeout`.
+        let first = tokio::time::timeout(self.start_timeout, async {
             tokio::select! {
-                _ = started_rx.wait_for(|s| *s) => {}
-                _ = ended_rx.wait_for(|e| *e) => {}
+                _ = started_rx.wait_for(|s| *s) => false,
+                _ = ended_rx.wait_for(|e| *e) => false,
+                // `Err` = the reader is gone (the child exited): not a question.
+                asked = asking_rx.wait_for(|a| *a) => asked.is_ok(),
             }
         })
         .await;
+        let asked = matches!(first, Ok(true));
+        let outcome = match first {
+            Ok(true) => {
+                tokio::time::timeout(self.ask_timeout, async {
+                    tokio::select! {
+                        _ = started_rx.wait_for(|s| *s) => {}
+                        _ = ended_rx.wait_for(|e| *e) => {}
+                    }
+                })
+                .await
+            }
+            Ok(false) => Ok(()),
+            Err(elapsed) => Err(elapsed),
+        };
         let snap = self.snapshot();
         match outcome {
             Ok(()) if snap.active => {
@@ -735,6 +780,14 @@ impl RecordingManager {
                 // (Its RECORDING mark, if it got that far, went with its
                 // reader task when the kill closed its stdout.)
                 *guard = None;
+                let waited = if asked {
+                    format!(
+                        "within {} s of asking the person a question",
+                        self.ask_timeout.as_secs_f32()
+                    )
+                } else {
+                    format!("within {} s", self.start_timeout.as_secs_f32())
+                };
                 if let Ok(mut s) = self.state.lock() {
                     s.active = false;
                     s.remote_controller = None;
@@ -744,14 +797,12 @@ impl RecordingManager {
                         bytes: 0,
                         duration_ms: 0,
                         detail: Some(format!(
-                            "the recorder did not start within {} s and was stopped",
-                            self.start_timeout.as_secs_f32()
+                            "the recorder did not start {waited} and was stopped"
                         )),
                     });
                 }
                 Err(StartError::Failed(format!(
-                    "the recorder did not start within {} s — it was stopped",
-                    self.start_timeout.as_secs_f32()
+                    "the recorder did not start {waited} — it was stopped"
                 )))
             }
         }
