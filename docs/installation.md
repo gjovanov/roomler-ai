@@ -349,6 +349,24 @@ login screen. Turn it off with `ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service
 drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
 [security baseline](security-baseline.md) §4.
 
+### The companion's Device configuration on a system install (#2891)
+
+The companion reaches the root daemon over that same person socket, which serves
+no configuration, so its Settings → Device configuration card cannot list or
+change the daemon's settings — they are root's: `/etc/roomler/config.toml`, read
+by `sudo roomler config ls` and changed by `sudo roomler config set <key>
+<value>`. Since #2891 the card **says so**, naming the daemon, its file and
+both commands. Before it, the card took the refusal for a daemon that was down,
+fell back to the per-user config path a system install does not have, and showed
+"Could not load the configuration" with a Retry that never helped; had a stale
+per-user file been left behind by an earlier per-user install, it would have read
+— and written — a file no daemon reads. Nothing was admitted on the person socket
+for this: the device-owned gates (`exec_enabled`, `ssh_enabled`,
+`remote_config_enabled`) stay an administrator's on a system install, as on a
+root-mode Mac ("Two configurations", below). A Linux **per-user** install and a
+Windows machine-wide install are unaffected: there the daemon's socket admits the
+signed-in user to those verbs, and the card edits as before.
+
 ## macOS
 
 > **Requires macOS 15 (Sequoia) or later, on Apple silicon (arm64).** The
@@ -498,7 +516,7 @@ unprivileged `roomler config set`, changes the per-user half's file and nothing
 the mesh node reads — measured on 0.4.169: the app showed `ssh_enabled = off`
 while the root half served SSH. Since #2871 both surfaces say so. The app's
 Device configuration card carries a banner naming both files
-(`agents/roomler-desktop/src/commands.rs:722`), and `roomler config ls` /
+(`agents/roomler-desktop/src/commands.rs:828`), and `roomler config ls` /
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
