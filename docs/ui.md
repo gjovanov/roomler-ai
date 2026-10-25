@@ -109,7 +109,15 @@ flowchart TB
   files drawer's path field, a dialog's field — reaches it first and it steps
   aside (`isViewerOwnInput`, #2869); the stage and the soft keyboard's
   textarea (`MobileKeyboard.vue`, `data-rc-capture`) are the host's and keep
-  forwarding.
+  forwarding — and for the textarea every key has ONE owner (#2888): a HID
+  frame is the listener's, forwarded with its default prevented and its
+  propagation stopped; a printable character is the textarea's, typed through
+  its `input` handler, where the toolbar's sticky Ctrl / Alt / Win become a
+  chord; what the listener drops (an IME keydown, the OS keyboard's own
+  code-less keys) the component's `input` / `compositionend` / `keydown` path
+  carries — so a hardware keyboard beside an open soft keyboard types once
+  (`routeKeyEvent` / `applyKeyRoute` / `routeDeferredPaste`, pure; proven in a
+  real Chromium by `ui/e2e-harness/`, [testing.md](testing.md)).
 - **Clipboard bridge**: text / HTML / image / native formats, chunked over a DC,
   hash + echo-gate dedupe, auto-sync on focus; optional local-agent loopback
   bridge for full-fidelity RTF.

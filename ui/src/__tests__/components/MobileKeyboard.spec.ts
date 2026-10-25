@@ -3,7 +3,13 @@
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
-import { isViewerOwnInput } from '@/composables/useRemoteControl'
+import {
+  applyKeyRoute,
+  isViewerOwnInput,
+  routeKeyEvent,
+  type KeyRouteEffects,
+  type KeyRouteState,
+} from '@/composables/useRemoteControl'
 
 beforeAll(() => {
   // jsdom-friendly stubs the component reaches for during focus.
@@ -210,6 +216,201 @@ describe('MobileKeyboard', () => {
       // No HID emit — `a` flows through the textarea's own input
       // event path which we test separately.
       expect(w.emitted('key')).toBeFalsy()
+    })
+
+    it('a keydown someone already handled (defaultPrevented) is not the component\'s', async () => {
+      // The second lock behind #2888: the viewer's listener prevents the
+      // default of every key it forwards. Should it ever forward one without
+      // stopping propagation, this handler must still not press it again.
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const ev = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true })
+      ev.preventDefault()
+      ta.dispatchEvent(ev)
+      await flushPromises()
+      expect(w.emitted('key')).toBeFalsy()
+      w.unmount()
+    })
+  })
+
+  describe("one owner per key, with the viewer's listener in front (#2888)", () => {
+    // The listener as `attachInput` registers it — window, CAPTURE phase —
+    // running the real `routeKeyEvent` / `applyKeyRoute` with recording
+    // effects, ahead of the component's own handlers.
+    function withListener(run: () => void, state: Partial<KeyRouteState> = {}): Record<string, unknown>[] {
+      const sent: Record<string, unknown>[] = []
+      const fx: KeyRouteEffects = {
+        send: (m) => {
+          sent.push(m)
+        },
+        hostKeyCode: (code) => code,
+        held: () => {},
+        heldCount: () => 0,
+        releaseHeld: () => {},
+        sendCtrlAltDel: () => {},
+        deferPaste: () => {},
+        mirrorClipboard: () => {},
+      }
+      const base: KeyRouteState = {
+        pointerInside: false,
+        keyboardLocked: false,
+        keyboardPaused: false,
+        surface: null,
+        ...state,
+      }
+      const kd = (e: Event) => applyKeyRoute(routeKeyEvent(e as KeyboardEvent, true, base), e as KeyboardEvent, fx)
+      const ku = (e: Event) => applyKeyRoute(routeKeyEvent(e as KeyboardEvent, false, base), e as KeyboardEvent, fx)
+      window.addEventListener('keydown', kd, { capture: true })
+      window.addEventListener('keyup', ku, { capture: true })
+      try {
+        run()
+      } finally {
+        window.removeEventListener('keydown', kd, { capture: true })
+        window.removeEventListener('keyup', ku, { capture: true })
+      }
+      return sent
+    }
+    const press = (el: Element, init: KeyboardEventInit) => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }))
+      el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, ...init }))
+    }
+
+    it("a hardware keyboard's Enter, Tab, Escape and arrows: the listener sends one press each, the component never sees them", async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const keys = [
+        ['Enter', 0x28],
+        ['Tab', 0x2b],
+        ['Escape', 0x29],
+        ['ArrowLeft', 0x50],
+        ['ArrowDown', 0x51],
+      ] as const
+      const sent = withListener(() => {
+        for (const [key] of keys) press(ta, { key, code: key })
+      })
+      await flushPromises()
+      // Before #2888 the component emitted a down + up pair for each of these
+      // on top of the listener's frames: two presses per key on the host.
+      expect(w.emitted('key')).toBeUndefined()
+      expect(sent.filter((m) => m.down === true).map((m) => m.code)).toEqual(keys.map(([, code]) => code))
+      expect(sent.filter((m) => m.down === false).map((m) => m.code)).toEqual(keys.map(([, code]) => code))
+      w.unmount()
+    })
+
+    it("a hardware keyboard's Backspace and Ctrl+C: the listener's, as before (#2878)", async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        press(ta, { key: 'Backspace', code: 'Backspace' })
+        press(ta, { key: 'c', code: 'KeyC', ctrlKey: true })
+      })
+      await flushPromises()
+      expect(w.emitted('key')).toBeUndefined()
+      expect(sent).toEqual([
+        { t: 'key', code: 0x2a, down: true, mods: 0 },
+        { t: 'key', code: 0x2a, down: false, mods: 0 },
+        { t: 'key', code: 0x06, down: true, mods: 1 },
+        { t: 'key', code: 0x06, down: false, mods: 1 },
+      ])
+      w.unmount()
+    })
+
+    it("a hardware letter: the listener leaves it, and the textarea's input path types it once", async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        const kd = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true, cancelable: true })
+        ta.dispatchEvent(kd)
+        // Untouched: the browser may insert it. jsdom has no default actions,
+        // so the insertion is done by hand, as the browser would.
+        expect(kd.defaultPrevented).toBe(false)
+        ta.value = 'a'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', code: 'KeyA', bubbles: true, cancelable: true }))
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('keyText')).toEqual([['a']])
+      expect(ta.value).toBe('')
+      w.unmount()
+    })
+
+    it("the toolbar's sticky Ctrl, then a hardware c: Ctrl+C once, from the component, and the modifier cleared", async () => {
+      // `consumeModBits` in the `input` handler is the only code that turns an
+      // armed toolbar modifier into a chord — the one chord mechanism a phone
+      // has. A listener that owned printable keys would type the "c" and leave
+      // Ctrl armed for the next toolbar key.
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ctrlBtn = w.findAll('.mkb-btn').find((b) => b.text() === 'Ctrl')
+      await ctrlBtn!.trigger('pointerdown')
+      expect(ctrlBtn!.classes()).toContain('mkb-btn-mod-active')
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        const kd = new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', bubbles: true, cancelable: true })
+        ta.dispatchEvent(kd)
+        expect(kd.defaultPrevented).toBe(false)
+        ta.value = 'c'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'c', code: 'KeyC', bubbles: true, cancelable: true }))
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('key')).toEqual([
+        [0x06, true, 0x01],
+        [0x06, false, 0x01],
+      ])
+      expect(ctrlBtn!.classes()).not.toContain('mkb-btn-mod-active')
+      // Sticky-once: the next letter is plain text.
+      ta.value = 'a'
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+      await flushPromises()
+      expect(w.emitted('keyText')).toEqual([['a']])
+      w.unmount()
+    })
+
+    it("the OS keyboard's own Enter (no physical code) is the component's alone", async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => press(ta, { key: 'Enter', code: '' }))
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('key')).toEqual([
+        [0x28, true, 0],
+        [0x28, false, 0],
+      ])
+      w.unmount()
+    })
+
+    it("text the OS keyboard types (an input event, no keydown) is the component's alone", async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        ta.value = 'hello'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('keyText')).toEqual([['hello']])
+      expect(ta.value).toBe('')
+      w.unmount()
+    })
+
+    it('an IME composition: the listener drops its keydowns, the component emits the composed string once', async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+        press(ta, { key: 'n', code: 'KeyN', isComposing: true })
+        ta.value = 'に'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        press(ta, { key: 'Enter', code: 'Enter', isComposing: true })
+        ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '日本' }))
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('keyText')).toEqual([['日本']])
+      expect(w.emitted('key')).toBeUndefined()
+      w.unmount()
     })
   })
 })

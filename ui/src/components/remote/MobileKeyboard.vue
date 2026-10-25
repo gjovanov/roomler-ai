@@ -18,8 +18,19 @@
       drawer's path field typed into the host) but keeps forwarding
       keydowns aimed here — a Backspace on this always-empty textarea
       raises no `input` event, so the keydown is the only way it
-      reaches the host. `isViewerOwnInput` in `useRemoteControl.ts`
-      reads the attribute; its spec locks the pairing.
+      reaches the host. And one owner per key (#2888): every HID key it
+      can map — a named key, a chord, a modifier — it forwards with the
+      browser's default prevented and propagation stopped, so neither
+      this textarea nor `onKeyDown` below sees it; a printable character
+      with no chord, or a dead key, it leaves to THIS textarea, whose
+      `onInput` types it and applies the toolbar's sticky Ctrl / Alt / Win
+      (the only chord mechanism a phone has) and whose composition events
+      carry a dead key's composed character; what it drops — an IME keydown, the OS
+      keyboard's own code-less keys — is this component's too, through
+      `onInput` / `onCompositionEnd` / `onKeyDown`. `isViewerOwnInput`
+      and `isSoftKeyboardTarget` in `useRemoteControl.ts` read the
+      attribute; their specs lock the pairing, and `ui/e2e-harness/`
+      proves it in a real browser.
     -->
     <textarea
       ref="captureRef"
@@ -280,13 +291,20 @@ function onCompositionEnd(ev: CompositionEvent) {
   flushInputBuffer()
 }
 
-/** Some browsers (mobile Safari with hardware keyboard attached)
- *  bypass `input` and emit `keydown` for special keys. Catch the
- *  obvious ones here so the operator isn't left without a Tab key
- *  in that edge case. Most production traffic goes through the
- *  toolbar buttons. */
+/** A special key the OS soft keyboard sends as a `keydown` with no
+ *  physical `code` (Enter; Tab and the arrows on keyboards that have
+ *  them): the viewer's window listener cannot map it and leaves it
+ *  alone, so it is this component's. ⚠️ A hardware keyboard's Enter /
+ *  Tab / Escape / arrows never get here (#2888): the listener owns every
+ *  key it can map — it forwards the frame, prevents the default and
+ *  stops propagation before this handler runs. The `defaultPrevented`
+ *  check is the second lock on that: a keydown someone already handled
+ *  is not ours. Measured in `ui/e2e-harness/` before the fix: with the
+ *  soft keyboard open and the pointer off the stage, every hardware
+ *  Enter, Tab, Escape and arrow reached the host twice — once from the
+ *  listener, once from here. */
 function onKeyDown(ev: KeyboardEvent) {
-  if (isComposing.value) return
+  if (isComposing.value || ev.defaultPrevented) return
   const passthrough = ((): number | null => {
     switch (ev.key) {
       case 'Tab':
