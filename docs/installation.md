@@ -217,7 +217,12 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
     for it (`roomlerd update-helper --capabilities` lists `step-aside`).
   - `--system` turns it off: that root daemon installs its own updates, and two
     updaters must never race.
-  - Opt out with `/etc/roomler/disable-auto-update`.
+  - Opt out with `/etc/roomler/disable-auto-update`, on a per-user and a
+    system install alike. The update helper reads it on every run, and a
+    system install's root daemon reads it at its start (#2901: before that
+    it read only `auto_update`, so a system install frozen this way kept
+    updating itself). `auto_update = false` also turns one daemon's own
+    updater off.
   - A re-run of `install.sh` restarts the running daemon only when nothing
     else will: when it is too old to restart itself onto a new version, or
     when the re-run just turned the helper on, since the daemon decides at its
