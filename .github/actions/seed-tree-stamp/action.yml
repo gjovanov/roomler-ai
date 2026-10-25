@@ -1,0 +1,62 @@
+name: seed-tree-stamp
+description: >-
+  Record inside the seed's target dir which source tree this job just
+  compiled, and which job compiled it, so that the next run of the SAME job
+  on the SAME tree reuses the build instead of recompiling it. In practice
+  that next run is a tag after its rehearsal, or a master reseed after a tag;
+  the reuse itself is seed-cache-restore's "Reuse a build of this exact source
+  tree". Place this step right AFTER the job's last cargo build and give it no
+  `if:`. The default success() is the point: a failed or skipped build must
+  never stamp. Kill switch: repository variable SEED_REUSE_SAME_TREE=off.
+  FR-6 wave 29.
+inputs:
+  binary:
+    description: >-
+      Optional: the daemon binary this job built. When cargo reused the
+      seed's build, `<binary> --version` must report expect-version, or the
+      job fails.
+    required: false
+    default: ''
+  expect-version:
+    description: The version the binary must report (validate-version's output).
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Check a reused build, then stamp the tree this build compiled
+      shell: bash
+      env:
+        BIN: ${{ inputs.binary }}
+        WANT: ${{ inputs.expect-version }}
+      run: |
+        set -uo pipefail
+        if [ -n "${ROOMLER_SEED_REUSED_TREE:-}" ]; then
+          # Cargo reused the seed's build. Check the one outcome that must
+          # never ship: an older daemon under a new tag.
+          if [ -n "$BIN" ] && [ -n "$WANT" ]; then
+            got="$("$BIN" --version 2>&1 | head -n 1)" || true
+            case "$got" in
+              *" $WANT"|*" $WANT "*) echo "reused build reports '${got}' (want ${WANT}): OK" ;;
+              *)
+                echo "::error title=Reused build is not ${WANT}::'${BIN} --version' printed '${got}'. The seed is not what its stamp claims. Set the repository variable SEED_REUSE_SAME_TREE=off and re-run, which rebuilds from source."
+                exit 1
+                ;;
+            esac
+          fi
+          # Packaging after this step should see ordinary timestamps again,
+          # exactly as when nothing was reused.
+          git ls-files -z | xargs -0 touch -c -h || true
+        fi
+        tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        if [ -z "$tree" ] || [ ! -d target ]; then
+          echo "no stamp: tree '${tree}', target dir $( [ -d target ] && echo present || echo missing )"
+          exit 0
+        fi
+        if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null || echo unknown)" ]; then
+          rm -f target/.seed-source-tree
+          echo "no stamp: tracked files differ from HEAD, so this build is not HEAD's tree"
+          exit 0
+        fi
+        printf 'tree=%s job=%s/%s\n' "$tree" "$GITHUB_WORKFLOW" "$GITHUB_JOB" > target/.seed-source-tree
+        echo "seed stamp: $(cat target/.seed-source-tree)"

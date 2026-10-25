@@ -12,7 +12,9 @@ description: >-
   keep-newest-1 we always wanted); the pattern is field-proven here since
   July by the vendored-ffmpeg releases. Pair with seed-cache-save; the
   calling step must pass `env: GH_TOKEN` (soft-fallback to cold without
-  it).
+  it). A seed stamped by seed-tree-stamp for THIS tree and THIS job is
+  reused outright: the checkout is marked unchanged, so cargo recompiles
+  nothing (FR-6 wave 29).
 inputs:
   shared-key:
     description: Seed family name (unique per job)
@@ -86,3 +88,9 @@ runs:
         else
           echo "target is ${TARGET_MB} MB — kept intact"
         fi
+
+    # FR-6 wave 29: a seed this job built from this very tree (a rehearsal,
+    # then its tag) is reused outright instead of recompiled. The reasoning
+    # and the guards live in seed-tree-reuse.
+    - name: Reuse a build of this exact source tree
+      uses: ./.github/actions/seed-tree-reuse

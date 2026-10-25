@@ -1,0 +1,65 @@
+name: seed-tree-reuse
+description: >-
+  When the restored target dir was built from THIS source tree by THIS job,
+  as recorded by seed-tree-stamp, mark the checkout unchanged so that cargo
+  reuses that build instead of recompiling our crates. Any other case changes
+  nothing. seed-cache-restore runs this right after unpacking a seed. Kill
+  switch: SEED_REUSE_SAME_TREE=off in the environment (release-agent.yml maps
+  the repository variable of that name). FR-6 wave 29.
+runs:
+  using: composite
+  steps:
+    - name: Reuse a build of this exact source tree
+      shell: bash
+      run: |
+        # A tag run builds the very tree its rehearsal built minutes earlier
+        # (all six releases checked, 0.4.163 to 0.4.171), and used to
+        # recompile ALL of our crates anyway. Cargo calls a path crate stale
+        # when any of its files is newer than its last build, and a fresh
+        # checkout makes every file new. seed-tree-stamp records the tree and
+        # the job that built this target. When both are THIS tree and THIS
+        # job, the checkout's timestamps carry no information, so they are set
+        # to 2000-01-01 and cargo reuses the build. Anything else changes
+        # nothing: today's full rebuild of our crates.
+        #
+        # ⚠️ Only an identical tree makes this correct: cargo would just as
+        # happily "reuse" a crate whose file CHANGED if its mtime said old.
+        # Hence the exact tree, a clean worktree, and the JOB in the stamp.
+        # Families can be shared by jobs that build different crates, and
+        # units another job left behind from an older tree must never look
+        # fresh. The stamp is deleted whatever happens here; only a build that
+        # succeeds in this job writes the next one.
+        set -uo pipefail
+        stamp=target/.seed-source-tree
+        if [ ! -f "$stamp" ]; then
+          echo "seed carries no source-tree stamp: cargo rebuilds our crates as usual"
+          exit 0
+        fi
+        built="$(cat "$stamp")"
+        rm -f "$stamp"
+        if [ "${SEED_REUSE_SAME_TREE:-on}" = "off" ]; then
+          echo "SEED_REUSE_SAME_TREE=off: cargo rebuilds our crates as usual"
+          exit 0
+        fi
+        tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        want="tree=${tree} job=${GITHUB_WORKFLOW}/${GITHUB_JOB}"
+        if [ -z "$tree" ] || [ "$built" != "$want" ]; then
+          echo "seed stamp is '${built}', this job is '${want}': cargo rebuilds our crates as usual"
+          exit 0
+        fi
+        if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null || echo unknown)" ]; then
+          echo "same tree, but tracked files differ from HEAD: cargo rebuilds our crates as usual"
+          exit 0
+        fi
+        # Files AND directories (cargo also reads a watched directory's own
+        # mtime). -c: never create a path; -h: a link's own time. A partial
+        # failure is still correct: every file here is identical to the one
+        # the seed was built from, so any subset may be marked old.
+        old=200001010000
+        if git ls-files -z | xargs -0 touch -c -h -t "$old" \
+           && git ls-tree -r -d -z --name-only HEAD | xargs -0 touch -c -h -t "$old"; then
+          echo "ROOMLER_SEED_REUSED_TREE=${tree}" >> "$GITHUB_ENV"
+          echo "::notice title=Reusing a same-tree build::the seed was built from tree ${tree:0:12} by this job; sources are marked unchanged, so cargo reuses that build"
+        else
+          echo "::warning title=Same-tree reuse incomplete::could not reset every source timestamp; cargo rebuilds whatever still looks new"
+        fi
