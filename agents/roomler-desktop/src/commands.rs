@@ -514,26 +514,70 @@ pub async fn cmd_config_cleanup() -> Result<String, String> {
     }
 }
 
+/// #2871 — what [`cmd_config_entries`] answers: the rows, and whether a
+/// two-half Mac's root half contributed its machine-side rows over the person
+/// socket it serves this account ([`merge_two_halves`]), so the page's banner
+/// can say what changes here and what an administrator changes.
+#[derive(Debug, Serialize, Default)]
+pub struct ConfigListing {
+    pub entries: Vec<localapi::ConfigEntry>,
+    pub machine_merged: bool,
+}
+
 /// S2 — the editable config surface (key + current value + editor
 /// metadata). Daemon-verb first (the daemon reads its OWN config, which
 /// is profile-correct under SCM/SystemContext); direct-file fallback
 /// reads the tray's active config so the editor still renders when the
 /// daemon is down.
+///
+/// #2871 (design A) — on a two-half Mac (FR-43 through P2) the daemon
+/// `connect()` reaches is the per-user half, whose listing is the SESSION's
+/// truth; the machine-side rows (`config_surface::owner_for`) are taken from
+/// the root half over the person socket it serves this account, which lists
+/// every key, marks the ones it will not set `read_only`
+/// (`localapi::person_view`) and sets the ones that are the person's own
+/// call. On a Mac with a root half alone (#2891) that socket serves the whole
+/// listing. A root half older than design A refuses the listing; the per-user
+/// rows then stand alone, as before, and the banner says so.
 #[tauri::command]
-pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> {
-    if let Ok(mut client) = localapi::connect().await {
-        match client.config_entries().await {
-            Ok(entries) => return Ok(entries),
+pub async fn cmd_config_entries() -> Result<ConfigListing, String> {
+    match localapi::connect().await {
+        Ok(mut client) => match client.config_entries().await {
+            Ok(entries) => {
+                return Ok(match machine_half_rows(&mut client).await {
+                    Some(machine) => ConfigListing {
+                        entries: merge_two_halves(entries, machine),
+                        machine_merged: true,
+                    },
+                    None => ConfigListing {
+                        entries,
+                        machine_merged: false,
+                    },
+                });
+            }
             // #2891 — a refusal from a ROOT daemon this unprivileged app
-            // reached (a Linux system install's person socket) is an answer,
-            // not an outage: the file the fallback below reads is not that
-            // daemon's — a per-user path a system install does not have, or a
-            // stale per-user copy no daemon reads — so the daemon's words
-            // stand, and the page explains them (`cmd_config_target`).
+            // reached (a Linux system install's person socket, from a daemon
+            // older than design A) is an answer, not an outage: the file the
+            // fallback below reads is not that daemon's — a per-user path a
+            // system install does not have, or a stale per-user copy no daemon
+            // reads — so the daemon's words stand, and the page explains them
+            // (`cmd_config_target`).
             Err(e) => {
                 if refused_by_root_daemon(&mut client).await {
                     return Err(daemon_message(&e.to_string()));
                 }
+            }
+        },
+        // #2871 — nothing per-user answers: a Mac with a root half alone
+        // (#2891) serves this person its person socket, and the listing over
+        // it. A refusal there is an older root half's, and final: the per-user
+        // file below is not its.
+        Err(_) => {
+            if let Some(answer) = root_half_alone_entries().await {
+                return answer.map(|entries| ConfigListing {
+                    entries,
+                    machine_merged: false,
+                });
             }
         }
     }
@@ -541,10 +585,210 @@ pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> 
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
         let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        Ok(roomler_node_core::config_surface::entries(&cfg))
+        Ok(ConfigListing {
+            entries: roomler_node_core::config_surface::entries(&cfg),
+            machine_merged: false,
+        })
     })
     .await
     .map_err(|e| format!("task join: {e}"))?
+}
+
+/// #2871 — is `key` the root half's on a two-half Mac
+/// (`config_surface::owner_for`)? By this build's registry — the companion
+/// and the daemon move together (FR-117) — and a key it does not know is the
+/// session half's, as the page always treated every key.
+fn is_machine_side(key: &str) -> bool {
+    use roomler_node_core::config_surface::{Owner, owner_for};
+    owner_for(key, "") == Owner::Machine
+}
+
+/// #2871 — pure: a two-half Mac's rows. The per-user (session) half's
+/// listing, with every MACHINE-side key's row taken from the root half's —
+/// which carries the root half's value and its `read_only` mark — in the
+/// per-user listing's order; a machine-side key only the root half lists is
+/// appended, in the root half's order; a session-side key only the root half
+/// lists is dropped, because the session half's listing is the session's
+/// truth. Which side a key is on: `config_surface::owner_for`, by the key,
+/// else by the group the daemon sent with it.
+fn merge_two_halves(
+    reached: Vec<localapi::ConfigEntry>,
+    machine: Vec<localapi::ConfigEntry>,
+) -> Vec<localapi::ConfigEntry> {
+    use roomler_node_core::config_surface::{Owner, owner_for};
+    use std::collections::{HashMap, HashSet};
+    let machine_side = |e: &localapi::ConfigEntry| owner_for(&e.key, &e.group) == Owner::Machine;
+    let by_key: HashMap<&str, &localapi::ConfigEntry> = machine
+        .iter()
+        .filter(|e| machine_side(e))
+        .map(|e| (e.key.as_str(), e))
+        .collect();
+    let reached_keys: HashSet<String> = reached.iter().map(|e| e.key.clone()).collect();
+    let mut out: Vec<localapi::ConfigEntry> = reached
+        .into_iter()
+        .map(|e| {
+            if machine_side(&e) {
+                by_key
+                    .get(e.key.as_str())
+                    .map(|m| (*m).clone())
+                    .unwrap_or(e)
+            } else {
+                e
+            }
+        })
+        .collect();
+    out.extend(
+        machine
+            .iter()
+            .filter(|e| machine_side(e) && !reached_keys.contains(&e.key))
+            .cloned(),
+    );
+    out
+}
+
+/// How long the root half has for an answer over its person socket: as the
+/// per-user half's own reads of it (FR-97 P2h). A slow root half leaves the
+/// per-user rows standing for this load.
+#[cfg(target_os = "macos")]
+const ROOT_HALF_READ: Duration = Duration::from_millis(1500);
+
+/// …and for a `ConfigSet`, which the person clicked for: long enough for a
+/// config load → validate → save on the root half, short enough that a
+/// wedged root half answers the click with an error, not a hang.
+#[cfg(target_os = "macos")]
+const ROOT_HALF_WRITE: Duration = Duration::from_secs(5);
+
+/// #2871 — a client on the root half's person socket for this account
+/// (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g), kept only when ROOT
+/// serves it (`connect_unix_served_by_root`). `None` when no root half serves
+/// this person one.
+#[cfg(target_os = "macos")]
+async fn root_half_client() -> Option<localapi::Client> {
+    let path = localapi::own_person_socket_path()?;
+    if !path.exists() {
+        return None;
+    }
+    tokio::time::timeout(ROOT_HALF_READ, localapi::connect_unix_served_by_root(path))
+        .await
+        .ok()?
+        .ok()
+}
+
+/// #2871 — the root half's listing, when `reached` is the per-user half of a
+/// two-half Mac ([`two_halves`], from both halves' `Status`) and the root half
+/// serves it over its person socket (design A). `None` keeps the per-user rows
+/// alone: no root half, a root half older than design A (it refuses the
+/// listing), or one that does not answer in time.
+#[cfg(target_os = "macos")]
+async fn machine_half_rows(reached: &mut localapi::Client) -> Option<Vec<localapi::ConfigEntry>> {
+    let mut root = root_half_client().await?;
+    let ask = async {
+        let reached_brief = DaemonBrief::from(&reached.status().await.ok()?);
+        let machine_brief = DaemonBrief::from(&root.status().await.ok()?);
+        if !two_halves(&reached_brief, Some(&machine_brief)) {
+            return None;
+        }
+        root.config_entries().await.ok()
+    };
+    tokio::time::timeout(ROOT_HALF_READ, ask)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Off macOS one daemon lists every key: Windows runs one, and a Linux
+/// system install's companion reaches the root daemon itself (its person
+/// socket is the first path `connect()` tries), whose listing arrives marked.
+#[cfg(not(target_os = "macos"))]
+async fn machine_half_rows(_reached: &mut localapi::Client) -> Option<Vec<localapi::ConfigEntry>> {
+    None
+}
+
+/// #2871 — a Mac with a root half alone (#2891): the listing over its person
+/// socket. `Some(Err)` is that half's refusal — a root half older than design
+/// A — and final; `None` = no root half serves this person one, or it did not
+/// answer in time.
+#[cfg(target_os = "macos")]
+async fn root_half_alone_entries() -> Option<Result<Vec<localapi::ConfigEntry>, String>> {
+    let mut root = root_half_client().await?;
+    match tokio::time::timeout(ROOT_HALF_READ, root.config_entries()).await {
+        Ok(Ok(entries)) => Some(Ok(entries)),
+        Ok(Err(e)) => Some(Err(daemon_message(&e.to_string()))),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn root_half_alone_entries() -> Option<Result<Vec<localapi::ConfigEntry>, String>> {
+    None
+}
+
+/// #2871 — on a two-half Mac, a `ConfigSet` of a machine-side key, answered
+/// by the root half over its person socket: it sets the keys that are the
+/// person's own call (`external_*`) and refuses the rest by name with the
+/// administrator's command. Either answer is FINAL — the per-user half's copy
+/// is a file the Mac's device never reads. `None` = not that layout: the
+/// caller's own path.
+#[cfg(target_os = "macos")]
+async fn root_half_config_set_beside(
+    reached: &mut localapi::Client,
+    key: &str,
+    value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    let mut root = root_half_client().await?;
+    let reached_brief = DaemonBrief::from(&reached.status().await.ok()?);
+    let machine_brief = DaemonBrief::from(&root.status().await.ok()?);
+    if !two_halves(&reached_brief, Some(&machine_brief)) {
+        return None;
+    }
+    Some(root_half_set(&mut root, key, value).await)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn root_half_config_set_beside(
+    _reached: &mut localapi::Client,
+    _key: &str,
+    _value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    None
+}
+
+/// #2871 — a Mac with a root half alone (#2891): a `ConfigSet` over its
+/// person socket, for any key; its answer is final. `None` = no root half
+/// serves this person one.
+#[cfg(target_os = "macos")]
+async fn root_half_config_set_alone(
+    key: &str,
+    value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    let mut root = root_half_client().await?;
+    Some(root_half_set(&mut root, key, value).await)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn root_half_config_set_alone(
+    _key: &str,
+    _value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    None
+}
+
+/// #2871 — the `ConfigSet` itself, bounded: the root half's answer in its
+/// own words, or a timeout the person can read.
+#[cfg(target_os = "macos")]
+async fn root_half_set(
+    root: &mut localapi::Client,
+    key: &str,
+    value: Option<&str>,
+) -> Result<localapi::ConfigEntry, String> {
+    match tokio::time::timeout(ROOT_HALF_WRITE, root.config_set(key, value)).await {
+        Ok(Ok(entry)) => Ok(entry),
+        Ok(Err(e)) => Err(daemon_message(&e.to_string())),
+        Err(_) => Err(format!(
+            "the root daemon did not answer within {} s; nothing was changed here",
+            ROOT_HALF_WRITE.as_secs()
+        )),
+    }
 }
 
 /// S2 — set (`value` present) or clear (`value` null) one editable
@@ -561,26 +805,49 @@ pub async fn cmd_config_set(
     value: Option<String>,
 ) -> Result<localapi::ConfigEntry, String> {
     let mut daemon_err: Option<String> = None;
-    if let Ok(mut client) = localapi::connect().await {
-        match client.config_set(&key, value.as_deref()).await {
-            Ok(entry) => return Ok(entry),
-            // FR-85 — where recordings go is the DAEMON's to accept: its
-            // listener refuses a `record_*` change from anyone but the
-            // console user. When it answered, its answer stands; writing the
-            // file behind its back would report a success it refused.
-            // FR-84 D4 — the same for `files_dir` (see `is_daemon_owned_key`).
-            Err(e) if is_daemon_owned_key(&key) => {
-                return Err(explain_daemon_owned_error(&key, &e.to_string()));
+    match localapi::connect().await {
+        Ok(mut client) => {
+            // #2871 (design A) — on a two-half Mac a machine-side key is the
+            // root half's (`is_machine_side`): it goes to the root half over
+            // the person socket, whose answer is final — set, or refused by
+            // name with the administrator's command. The per-user half's copy
+            // of such a key is a file the Mac's device never reads (#2871's
+            // failure), so it is not written.
+            if is_machine_side(&key)
+                && let Some(answer) =
+                    root_half_config_set_beside(&mut client, &key, value.as_deref()).await
+            {
+                return answer;
             }
-            Err(e) => {
-                // #2891 — the same for EVERY key when a ROOT daemon refused
-                // this unprivileged app (a Linux system install's person
-                // socket): the per-user file below is not its, and writing it
-                // would report a success the daemon refused.
-                if refused_by_root_daemon(&mut client).await {
-                    return Err(daemon_message(&e.to_string()));
+            match client.config_set(&key, value.as_deref()).await {
+                Ok(entry) => return Ok(entry),
+                // FR-85 — where recordings go is the DAEMON's to accept: its
+                // listener refuses a `record_*` change from anyone but the
+                // console user. When it answered, its answer stands; writing
+                // the file behind its back would report a success it refused.
+                // FR-84 D4 — the same for `files_dir` (see
+                // `is_daemon_owned_key`).
+                Err(e) if is_daemon_owned_key(&key) => {
+                    return Err(explain_daemon_owned_error(&key, &e.to_string()));
                 }
-                daemon_err = Some(e.to_string());
+                Err(e) => {
+                    // #2891 — the same for EVERY key when a ROOT daemon
+                    // refused this unprivileged app (a Linux system install's
+                    // person socket): the per-user file below is not its, and
+                    // writing it would report a success the daemon refused.
+                    if refused_by_root_daemon(&mut client).await {
+                        return Err(daemon_message(&e.to_string()));
+                    }
+                    daemon_err = Some(e.to_string());
+                }
+            }
+        }
+        // #2871 — nothing per-user answers: a Mac with a root half alone
+        // (#2891) takes the change over its person socket, for any key, and
+        // its answer is final.
+        Err(_) => {
+            if let Some(answer) = root_half_config_set_alone(&key, value.as_deref()).await {
+                return answer;
             }
         }
     }
@@ -631,26 +898,35 @@ pub struct ConfigTarget {
     /// `localapi::connect()` resolves, which on a Mac is the per-user half.
     pub reached: Option<DaemonBrief>,
     /// macOS only: the root half, read over the person socket it serves this
-    /// account. `Status` is on that socket's allowlist; its config verbs are
-    /// not (`localapi::person_may`), so this is a label, not a second editor.
-    /// `None` on every other OS, when the reached daemon is itself
+    /// account. `Status` is on that socket's allowlist; since design A
+    /// (#2871) so are the listing and `ConfigSet` of the keys that are the
+    /// person's own call (`localapi::person_may`), so [`cmd_config_entries`]
+    /// takes the machine-side rows from it and [`cmd_config_set`] sends them
+    /// there. `None` on every other OS, when the reached daemon is itself
     /// privileged, and when no root half answers. Asked for beside a
     /// per-user daemon (a two-half Mac) and when nothing was reached (#2891:
     /// a Mac with a root half alone).
     pub machine: Option<DaemonBrief>,
     /// `reached` is an unprivileged daemon and `machine` a root one of another
-    /// identity: the page edits the first and must say so ([`two_halves`]).
+    /// identity: the page shows both halves and must say so ([`two_halves`]).
     pub two_halves: bool,
-    /// #2891 — the daemon whose configuration this page would show runs as
-    /// root and this app does not: a Linux system install's root daemon,
-    /// reached over its person socket, or a Mac with a root half alone. Its
-    /// config verbs are refused there, so the page shows the administrator's
-    /// path in place of rows ([`root_daemon_only`]). Never on Windows, whose
-    /// pipe admits every interactive user to those verbs.
+    /// #2891 — the daemon whose configuration this page shows runs as root
+    /// and this app does not: a Linux system install's root daemon, reached
+    /// over its person socket, or a Mac with a root half alone
+    /// ([`root_daemon_only`]). Since design A that socket serves the listing,
+    /// marked per key; a daemon older than it refuses, and the page shows the
+    /// administrator's path in place of rows. Never on Windows, whose pipe
+    /// admits every interactive user to those verbs.
     pub root_only: bool,
-    /// What the page shows when `two_halves` ([`two_halves_note`]) or
-    /// `root_only` ([`root_only_note`]).
+    /// What the banner says when `two_halves` ([`two_halves_note`]) or
+    /// `root_only` ([`root_only_note`]) and the root daemon served its rows:
+    /// what changes here, what an administrator changes.
     pub note: Option<String>,
+    /// What it says instead when the root daemon predates design A and
+    /// refused its listing ([`two_halves_legacy_note`],
+    /// [`root_only_legacy_note`]): the rows are the per-user half's alone, or
+    /// there are none, and the root daemon's switches are an administrator's.
+    pub legacy_note: Option<String>,
 }
 
 /// How a daemon names itself for [`ConfigTarget`]: the fields of its `Status`
@@ -689,16 +965,40 @@ fn two_halves(reached: &DaemonBrief, machine: Option<&DaemonBrief>) -> bool {
         && machine.is_some_and(|m| m.privileged == Some(true) && m.node_id != reached.node_id)
 }
 
-/// #2871 — the banner's text. It names both files, so a person can tell which
-/// one a `roomler config ls` printed, and gives the administrator's command for
-/// the root half: the person socket serves that half's status and never its
-/// configuration, so there is no in-app path to those switches today.
+/// The file a daemon names for itself, or a stand-in from an older one.
+fn config_file_of(d: &DaemonBrief) -> String {
+    d.config_path
+        .clone()
+        .unwrap_or_else(|| "its own config.toml".to_string())
+}
+
+/// #2871 (design A) — the banner's text on a two-half Mac whose root half
+/// serves its listing over the person socket: which half each kind of row
+/// comes from and goes to ([`merge_two_halves`]), both files, so a person can
+/// tell which one a `roomler config ls` printed, and the administrator's
+/// command for the rows marked.
 fn two_halves_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
-    let file = |d: &DaemonBrief| {
-        d.config_path
-            .clone()
-            .unwrap_or_else(|| "its own config.toml".to_string())
-    };
+    format!(
+        "This Mac runs two Roomler daemons, and this page shows both. Remote desktop, capture, \
+         video and file settings are the per-user half's ({}, {}), which serves the session, \
+         and change there. The private network, Roomler SSH, remote commands, access and the \
+         service itself are the root half's ({}, {}) — the device that `roomler ssh` and \
+         `roomler exec` reach — and are shown from its file: the ones that are the person at \
+         this Mac's own call (external access) change here; the rest, marked administrator's \
+         (overlay_enabled, ssh_enabled, exec_enabled, remote_config_enabled, …), are changed in \
+         a terminal: `sudo roomler config set <key> <value>`.",
+        reached.name,
+        config_file_of(reached),
+        machine.name,
+        config_file_of(machine)
+    )
+}
+
+/// #2871 — the banner's text on a two-half Mac whose root half predates
+/// design A and refuses the listing over its person socket: the rows are the
+/// per-user half's alone, and the root half's switches are an administrator's
+/// — the words the banner carried from #2879.
+fn two_halves_legacy_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
     format!(
         "This Mac runs two Roomler daemons. The switches on this page change the per-user half \
          ({}, {}), which captures the screen for remote desktop. The private network, Roomler SSH \
@@ -707,9 +1007,9 @@ fn two_halves_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
          remote_config_enabled, …) are changed by an administrator in a terminal: \
          `sudo roomler config set <key> <value>`.",
         reached.name,
-        file(reached),
+        config_file_of(reached),
         machine.name,
-        file(machine)
+        config_file_of(machine)
     )
 }
 
@@ -738,25 +1038,53 @@ fn root_daemon_only<'a>(
     }
 }
 
-/// #2891 — the card's text when [`root_daemon_only`] names a daemon: which
-/// daemon runs, which file its settings are read from, and the administrator's
-/// commands — in place of the "Could not load the configuration" the page
-/// showed when the person socket refused `ConfigGet` and the fallback read a
-/// per-user file a system install does not have.
-fn root_only_note(daemon: &DaemonBrief) -> String {
-    let file = daemon.config_path.clone().unwrap_or_else(|| {
+/// The file a root daemon names for itself, or the packaged install's.
+fn root_config_file_of(daemon: &DaemonBrief) -> String {
+    daemon.config_path.clone().unwrap_or_else(|| {
         "its own config.toml (/etc/roomler/config.toml on a packaged install)".to_string()
-    });
+    })
+}
+
+/// #2871 (design A) — the banner's text when [`root_daemon_only`] names a
+/// daemon and it served its listing over the person socket (a Linux system
+/// install; a Mac with a root half alone, #2891): which file, which rows
+/// change here — the keys that are the person at the device's own call — and
+/// the administrator's command for the rows marked.
+fn root_only_note(daemon: &DaemonBrief) -> String {
+    format!(
+        "This computer's Roomler service runs as root ({}, {}) — a machine-wide install — and \
+         its settings are read from {}. The ones that are the person at this computer's own \
+         call change here: where incoming files and recordings land, what a remote session may \
+         use (clipboard, files, audio), privacy mode, lock on end, display match, the browser \
+         check, external access. The rest — the device-owned switches (exec_enabled, \
+         ssh_enabled, remote_config_enabled), the private network, Roomler SSH, the updater — \
+         are marked administrator's and are changed in a terminal: `sudo roomler config set \
+         <key> <value>`.",
+        daemon.name,
+        daemon.version,
+        root_config_file_of(daemon)
+    )
+}
+
+/// #2891 — the card's text when [`root_daemon_only`] names a daemon that
+/// REFUSED its listing over the person socket (one older than design A on
+/// #2871): which daemon runs, which file its settings are read from, and the
+/// administrator's commands — in place of the "Could not load the
+/// configuration" the page showed when the fallback read a per-user file a
+/// system install does not have.
+fn root_only_legacy_note(daemon: &DaemonBrief) -> String {
     format!(
         "This computer's Roomler service runs as root ({}, {}) — a machine-wide install — and \
          its settings are read from {}. They are an administrator's to change, in a terminal: \
          `sudo roomler config ls` lists them, `sudo roomler config set <key> <value>` changes \
          one. This app reaches that service through the person-at-the-device socket, which \
          shows who is viewing this screen, ends a session, answers consent prompts and lists \
-         the devices this machine's private network reaches; it serves no configuration, so \
-         the device-owned switches (exec_enabled, ssh_enabled, remote_config_enabled, …) have \
-         no in-app path here.",
-        daemon.name, daemon.version, file
+         the devices this machine's private network reaches; this version of the service serves \
+         no configuration over it, so the device-owned switches (exec_enabled, ssh_enabled, \
+         remote_config_enabled, …) have no in-app path here.",
+        daemon.name,
+        daemon.version,
+        root_config_file_of(daemon)
     )
 }
 
@@ -844,10 +1172,13 @@ pub async fn cmd_config_target() -> ConfigTarget {
         process_is_root(),
         cfg!(windows),
     );
-    let note = match (&reached, &machine, root) {
-        (Some(r), Some(m), _) if two => Some(two_halves_note(r, m)),
-        (_, _, Some(d)) => Some(root_only_note(d)),
-        _ => None,
+    let (note, legacy_note) = match (&reached, &machine, root) {
+        (Some(r), Some(m), _) if two => (
+            Some(two_halves_note(r, m)),
+            Some(two_halves_legacy_note(r, m)),
+        ),
+        (_, _, Some(d)) => (Some(root_only_note(d)), Some(root_only_legacy_note(d))),
+        _ => (None, None),
     };
     ConfigTarget {
         root_only: root.is_some(),
@@ -855,6 +1186,7 @@ pub async fn cmd_config_target() -> ConfigTarget {
         machine,
         two_halves: two,
         note,
+        legacy_note,
     }
 }
 
@@ -3401,15 +3733,16 @@ mod tests {
         ));
     }
 
-    /// #2871 — the note names both files, so a person can tell which one
+    /// #2871 — both notes name both files, so a person can tell which one
     /// `roomler config ls` printed, and the administrator's command for the
-    /// root half's switches, which this app has no path to.
+    /// root half's switches. Design A's note says the page shows both halves
+    /// and which rows change here; the legacy note (a root half that refuses
+    /// its listing) says the rows are the per-user half's alone.
     #[test]
-    fn the_two_halves_note_names_both_files_and_the_root_command() {
+    fn the_two_halves_notes_name_both_files_and_the_root_command() {
         let user = brief("u", Some(false), USER_FILE);
         let root = brief("d", Some(true), ROOT_FILE);
-        let note = two_halves_note(&user, &root);
-        for must in [
+        let common = [
             "per-user half",
             "root half",
             USER_FILE,
@@ -3420,9 +3753,22 @@ mod tests {
             "exec_enabled",
             "ssh_enabled",
             "remote_config_enabled",
-        ] {
+        ];
+        let note = two_halves_note(&user, &root);
+        for must in common
+            .iter()
+            .chain(&["shows both", "change here", "external access"])
+        {
             assert!(note.contains(must), "the note must say {must:?}: {note}");
         }
+        let legacy = two_halves_legacy_note(&user, &root);
+        for must in common {
+            assert!(
+                legacy.contains(must),
+                "the legacy note must say {must:?}: {legacy}"
+            );
+        }
+        assert!(!legacy.contains("change here"), "{legacy}");
         // An older daemon without `config_path` still gets a sentence, not a
         // hole where the file name was.
         let old = brief("u", Some(false), USER_FILE);
@@ -3431,6 +3777,7 @@ mod tests {
             ..old
         };
         assert!(two_halves_note(&old, &root).contains("its own config.toml"));
+        assert!(two_halves_legacy_note(&old, &root).contains("its own config.toml"));
     }
 
     /// #2891 — the root-only layouts, and everything that is NOT one. The
@@ -3479,13 +3826,29 @@ mod tests {
         );
     }
 
-    /// #2891 — the note names the daemon, its file and both administrator
-    /// commands, and says why the app has no path: the person socket serves
-    /// no configuration.
+    /// #2891 — the notes name the daemon, its file and the administrator's
+    /// command. #2871 (design A): the note for a daemon that served its rows
+    /// says what changes here and which rows are marked; the legacy note, for
+    /// a daemon that refused them, says why the app has no path.
     #[test]
-    fn the_root_only_note_names_the_file_and_the_sudo_commands() {
+    fn the_root_only_notes_name_the_file_and_the_sudo_commands() {
         let root = brief("d", Some(true), ROOT_FILE);
         let note = root_only_note(&root);
+        for must in [
+            "mac-d",
+            "0.4.169",
+            ROOT_FILE,
+            "sudo roomler config set <key> <value>",
+            "change here",
+            "external access",
+            "marked administrator's",
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+        ] {
+            assert!(note.contains(must), "the note must say {must:?}: {note}");
+        }
+        let legacy = root_only_legacy_note(&root);
         for must in [
             "mac-d",
             "0.4.169",
@@ -3493,18 +3856,129 @@ mod tests {
             "sudo roomler config ls",
             "sudo roomler config set <key> <value>",
             "person-at-the-device socket",
+            "no configuration",
             "exec_enabled",
             "ssh_enabled",
             "remote_config_enabled",
         ] {
-            assert!(note.contains(must), "the note must say {must:?}: {note}");
+            assert!(
+                legacy.contains(must),
+                "the legacy note must say {must:?}: {legacy}"
+            );
         }
+        assert!(!legacy.contains("change here"), "{legacy}");
         // An older daemon without `config_path` still names a file.
         let old = DaemonBrief {
             config_path: None,
             ..root
         };
         assert!(root_only_note(&old).contains("/etc/roomler/config.toml"));
+        assert!(root_only_legacy_note(&old).contains("/etc/roomler/config.toml"));
+    }
+
+    /// #2871 (design A) — which half of a two-half Mac a key is sent to, by
+    /// this build's registry: the machine-side groups to the root half, the
+    /// session-side ones (and a key this build has never heard of) to the
+    /// per-user half, as the page always did.
+    #[test]
+    fn a_machine_side_key_goes_to_the_root_half_and_a_session_side_key_to_the_worker() {
+        for key in [
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            "overlay_enabled",
+            "external_access_enabled",
+            "external_consent_mode",
+            "auto_grant_session",
+            "auto_update",
+        ] {
+            assert!(is_machine_side(key), "{key} is the root half's");
+        }
+        for key in [
+            "record_dir",
+            "files_dir",
+            "rc_clipboard",
+            "privacy_mode_allowed",
+            "lock_on_end",
+            "display_match",
+            "peer_auth",
+            "keep_busy_enabled",
+            "encoder_preference",
+            "brand_new_key",
+        ] {
+            assert!(!is_machine_side(key), "{key} is the session half's");
+        }
+    }
+
+    /// #2871 (design A) — a two-half Mac's rows: machine-side keys from the
+    /// root half (its value, its `read_only` mark), session-side keys from the
+    /// per-user half, in the per-user listing's order; a machine-side key only
+    /// the root half lists is appended; a session-side key only the root half
+    /// lists is dropped.
+    #[test]
+    fn a_two_half_listing_takes_machine_rows_from_the_root_half_and_session_rows_from_the_worker() {
+        let entry = |key: &str, group: &str, value: &str, read_only: Option<&str>| {
+            serde_json::from_value::<localapi::ConfigEntry>(serde_json::json!({
+                "key": key, "value": value, "kind": "bool", "restart_required": false,
+                "description": "", "group": group, "read_only": read_only,
+            }))
+            .unwrap()
+        };
+        // The per-user half's file, as #2871 measured it: `exec_enabled` on,
+        // `ssh_enabled` off — while the root half served SSH.
+        let worker = vec![
+            entry("exec_enabled", "access", "true", None),
+            entry("rc_clipboard", "remote_desktop", "false", None),
+            entry("ssh_enabled", "ssh", "false", None),
+            entry("record_dir", "files", "/Users/a/Movies", None),
+        ];
+        let root = vec![
+            entry("exec_enabled", "access", "false", Some("root_only")),
+            entry("rc_clipboard", "remote_desktop", "true", None),
+            entry("ssh_enabled", "ssh", "true", Some("root_only")),
+            entry("external_access_enabled", "access", "false", None),
+            entry("record_dir", "files", "/var/root/Movies", None),
+        ];
+        let merged = merge_two_halves(worker, root);
+        let keys: Vec<&str> = merged.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "exec_enabled",
+                "rc_clipboard",
+                "ssh_enabled",
+                "record_dir",
+                "external_access_enabled"
+            ]
+        );
+        let by_key = |k: &str| merged.iter().find(|e| e.key == k).unwrap();
+        // The root half's switches, as the root half has them, marked.
+        assert_eq!(by_key("exec_enabled").value.as_deref(), Some("false"));
+        assert_eq!(
+            by_key("exec_enabled").read_only.as_deref(),
+            Some("root_only")
+        );
+        assert_eq!(by_key("ssh_enabled").value.as_deref(), Some("true"));
+        assert_eq!(
+            by_key("ssh_enabled").read_only.as_deref(),
+            Some("root_only")
+        );
+        // The external-access surface: the root half's, and editable there.
+        assert_eq!(
+            by_key("external_access_enabled").value.as_deref(),
+            Some("false")
+        );
+        assert_eq!(by_key("external_access_enabled").read_only, None);
+        // The session's keys stay the per-user half's, whatever the root has.
+        assert_eq!(by_key("rc_clipboard").value.as_deref(), Some("false"));
+        assert_eq!(
+            by_key("record_dir").value.as_deref(),
+            Some("/Users/a/Movies")
+        );
+        // No root half's rows (an older root half): the listing is the
+        // per-user half's, untouched.
+        let worker = vec![entry("exec_enabled", "access", "true", None)];
+        assert_eq!(merge_two_halves(worker.clone(), Vec::new()), worker);
     }
 
     /// FR-85 — the page hands the companion a NAME to open, never a path.

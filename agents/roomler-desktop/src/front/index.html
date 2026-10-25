@@ -767,15 +767,19 @@
             Changes are saved to this device's configuration; each key says
             whether it takes effect at once or after the service restarts.
           </p>
-          <!-- #2871: on a Mac running both halves (FR-43) this page edits the
-               per-user half's file while the Overview shows the root half's
-               network. #2891: on a Linux system install (or a Mac with a root
-               half alone) the daemon's configuration is root's, and the card
-               shows the administrator's path in place of rows. Filled by
-               settings.js from cmd_config_target; hidden everywhere else. -->
+          <!-- #2871: on a Mac running both halves (FR-43) this page shows
+               session settings from the per-user half and machine settings
+               from the root half (over its person-at-the-device socket, which
+               serves the keys that are the person's own call and marks the
+               rest read-only). #2891: on a Linux system install (or a Mac with
+               a root half alone) the daemon's configuration is root's: the
+               same socket serves it, marked, or — from a daemon older than
+               that — the card shows the administrator's path in place of rows.
+               Filled by settings.js from cmd_config_target; hidden everywhere
+               else. -->
           <div id="cfg-target-banner" class="banner banner-warn" hidden>
             <div>
-              <strong id="cfg-target-title">This page edits the per-user half of this Mac</strong>
+              <strong id="cfg-target-title">This Mac runs two Roomler daemons</strong>
               <p id="cfg-target-text" class="muted small" style="margin: 4px 0 0"></p>
             </div>
           </div>

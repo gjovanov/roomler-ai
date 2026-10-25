@@ -346,29 +346,45 @@ Disconnect and its consent prompt. As that user:
 - `roomler devices` answers too (FR-97 P2g): the devices this machine's private
   network reaches, as the companion's Devices page shows them. So does `roomler
   peers` (P2h), the links to them, without any endpoint (`sudo roomler peers` has those);
-- anything administrative (`flows`, routes, `config`, …) is refused with a pointer
-  to `sudo roomler …`.
+- `roomler config ls` answers too (#2871, design A): every key, the ones the daemon
+  will not set over this socket marked `(an administrator's)`; and `roomler config set`
+  changes exactly the keys that are the person at the device's own call — where files
+  and recordings land, what a remote session may use, privacy mode, lock on end,
+  display match, the browser check, external access (`localapi::CONSOLE_PERSON_KEYS`,
+  `crates/localapi/src/lib.rs:3163`). The device-owned switches — `exec_enabled`,
+  `ssh_enabled`, `remote_config_enabled` — the overlay, SSH and the updater are
+  refused by name: `sudo roomler config set <key> <value>`. The companion's Device
+  configuration page shows the same rows, the refused ones read-only;
+- anything else administrative (`flows`, routes, `rc password`, …) is refused with a
+  pointer to `sudo roomler …`.
 
 The socket follows the active graphical session, so there is none over SSH or at the
 login screen. Turn it off with `ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service`
 drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
 [security baseline](security-baseline.md) §4.
 
-### The companion's Device configuration on a system install (#2891)
+### The companion's Device configuration on a system install (#2891, #2871)
 
-The companion reaches the root daemon over that same person socket, which serves
-no configuration, so its Settings → Device configuration card cannot list or
-change the daemon's settings — they are root's: `/etc/roomler/config.toml`, read
-by `sudo roomler config ls` and changed by `sudo roomler config set <key>
-<value>`. Since #2891 the card **says so**, naming the daemon, its file and
-both commands. Before it, the card took the refusal for a daemon that was down,
-fell back to the per-user config path a system install does not have, and showed
-"Could not load the configuration" with a Retry that never helped; had a stale
-per-user file been left behind by an earlier per-user install, it would have read
-— and written — a file no daemon reads. Nothing was admitted on the person socket
-for this: the device-owned gates (`exec_enabled`, `ssh_enabled`,
-`remote_config_enabled`) stay an administrator's on a system install, as on a
-root-mode Mac ("Two configurations", below). A Linux **per-user** install and a
+The companion reaches the root daemon over that same person socket. Before #2871's
+design A it served no configuration, so the Settings → Device configuration card
+could neither list nor change the daemon's settings; #2891 made the card **say
+so**, naming the daemon, its file (`/etc/roomler/config.toml`) and the
+administrator's commands, where before it had taken the refusal for a daemon that
+was down, fallen back to the per-user config path a system install does not have,
+and shown "Could not load the configuration" with a Retry that never helped — and,
+with a stale per-user file left by an earlier per-user install, would have read and
+written a file no daemon reads. Since design A the socket serves the listing, and
+the card shows the daemon's own rows: the ones that are the person at the
+device's call — where files and recordings land, what a remote session may use,
+privacy mode, lock on end, display match, the browser check, external access
+(`localapi::CONSOLE_PERSON_KEYS`) — are editable here, and the rest — the
+device-owned gates (`exec_enabled`, `ssh_enabled`, `remote_config_enabled`), the
+overlay, SSH, the updater — show the daemon's value read-only, marked
+"administrator's", with `sudo roomler config set <key> <value>`
+([desktop-companion.md](desktop-companion.md) §5). Nothing on the person socket
+sets those gates on a system install, as on a root-mode Mac ("Two configurations",
+below). A daemon older than design A still refuses the listing, and the card still
+shows the administrator's path in place of rows. A Linux **per-user** install and a
 Windows machine-wide install are unaffected: there the daemon's socket admits the
 signed-in user to those verbs, and the card edits as before.
 
@@ -519,28 +535,33 @@ fallback; P3, one enrollment, has not shipped). So a supervised Mac has:
 
 | Half | Config file | Edited by | Owns |
 |---|---|---|---|
-| per-user — the GUI worker, `roomlerd run --supervised` | `~/Library/Application Support/live.roomler.roomler/config.toml` | the companion's Settings → Device configuration; `roomler config …` as the signed-in user | screen capture, input, clipboard: the session knobs |
-| root — `com.roomler.daemon` | `/etc/roomler/config.toml` | an administrator: `sudo roomler config ls` · `sudo roomler config set <key> <value>` | the overlay, Roomler SSH, remote commands, the updater: `overlay_enabled`, `ssh_enabled`, `exec_enabled`, `remote_config_enabled`, … |
+| per-user — the GUI worker, `roomlerd run --supervised` | `~/Library/Application Support/live.roomler.roomler/config.toml` | the companion's Settings → Device configuration (the **session** rows); `roomler config …` as the signed-in user (every key of this file) | the session it serves: remote desktop, capture and input, video, files — `rc_*`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, the encoder keys |
+| root — `com.roomler.daemon` | `/etc/roomler/config.toml` | the companion's Settings → Device configuration (the **machine** rows, over the root half's person socket: editable for the keys that are the person's own call, `external_*`; read-only otherwise); an administrator: `sudo roomler config ls` · `sudo roomler config set <key> <value>` | the overlay, Roomler SSH, remote commands, access and consent, the updater, the supervisor: `overlay_enabled`, `ssh_enabled`, `exec_enabled`, `remote_config_enabled`, `auto_grant_session`, `external_*`, … |
 
 ⚠️ **The root half is the device `roomler ssh` and `roomler exec` reach**, and
-its switches are read from *its* file. A switch flipped in the app, or with an
-unprivileged `roomler config set`, changes the per-user half's file and nothing
-the mesh node reads — measured on 0.4.169: the app showed `ssh_enabled = off`
-while the root half served SSH. Since #2871 both surfaces say so. The app's
-Device configuration card carries a banner naming both files
-(`agents/roomler-desktop/src/commands.rs:828`), and `roomler config ls` /
-`config set` print the "a second roomler daemon is running" note that `status`
-and `peers` already printed — a note that had gone silent for the console user,
-because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4548`).
+its switches are read from *its* file. Before #2871 a switch flipped in the app
+changed the per-user half's file and nothing the mesh node reads — measured on
+0.4.169: the app showed `ssh_enabled = off` while the root half served SSH.
+Since #2871 (design A) the app shows the Mac as one device: each row comes from,
+and a change goes to, the half that reads the key, by the key's group
+(`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`; the
+table in [desktop-companion.md](desktop-companion.md) §5), and its banner names
+both files. `roomler config ls` / `config set` as the signed-in user still reach
+the per-user half, every key of its file, and print the "a second roomler daemon
+is running" note that `status` and `peers` already printed — a note that had
+gone silent for the console user, because the root socket's `0700` directory
+refuses their `stat`; the root half's person socket is the evidence now
+(`crates/localapi/src/lib.rs:4806`).
 
-The root half's switches are **root's to set by design**, not by omission: its
-LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
-serves the console user admits the safety surface only — status, sessions,
-consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3057`). Whether the console user should flip the
-root half's gates from the app is the decision left open on #2871; until it is
-taken, the gate stays with `sudo`.
+The root half's device-owned switches are **root's to set by design**, not by
+omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
+socket it serves the console user admits, besides the safety surface, exactly
+the configuration keys that are the person's own call
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3163`) — never
+`exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
+read-only and refuses to set by name (`localapi::person_may`, `:3338`). Whether
+the console user should flip those from the app is the decision left open on
+#2871; until it is taken, they stay with `sudo`.
 
 The Overview's **Service** line reads the root daemon too (`System daemon
 (root) · running`). Before #2871 the companion understood only Windows' answers,

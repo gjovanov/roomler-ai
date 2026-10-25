@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:1996`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2009`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -110,7 +110,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2089`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2102`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -160,7 +160,7 @@ state word it does not know (a newer daemon) as that word, never as an error
 ## 5. Settings, grouped
 
 The config surface (`crates/agent-core/src/config_surface.rs`) is one table of
-`KeyMeta { key, kind, group, tier, live, description }` (`:181`) — adding a key without
+`KeyMeta { key, kind, group, tier, live, description }` (`:268`) — adding a key without
 saying which group and tier it belongs to, and whether the daemon applies it live, does not
 compile.
 
@@ -179,37 +179,61 @@ compile.
   per-user GUI worker, whose `config.toml` is its own: FR-43 keeps the worker enrolled
   through P2. Meanwhile the Overview's network lines are the root half's (§6), so the two
   pages described different daemons and nothing said so: a person switching `ssh_enabled`
-  on here changed a file the mesh node never reads (measured on 0.4.169). The card now
-  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`)
-  naming the file it edits and the root half's (`/etc/roomler/config.toml`), with the
-  administrator's command for the root half's switches: `sudo roomler config set <key>
-  <value>`. It is shown only when the reached daemon says it runs unprivileged AND a root
-  daemon of another identity answers `Status` over the person socket (`two_halves`,
-  `:687`) — one daemon behind both sockets, a root daemon's legacy per-user bind, is not
-  two halves. ⚠️ The banner reads the root half's **status** and nothing else: the person
-  socket refuses every config verb (`localapi::person_may`), so the root half's
-  device-owned gates stay root's to set. Admitting them is the decision open on #2871.
-- **A Linux system install, and a Mac with a root half alone (#2891).** There the daemon the
-  page reaches runs as root and this app does not: `connect()`'s first candidate on Linux,
-  `$XDG_RUNTIME_DIR/roomler.sock`, IS the root daemon's person socket (§12), which serves
-  `Status` and refuses every config verb. Until #2891 the page took that refusal for a daemon
-  that was down, fell back to the per-user config file — a path a system install does not
-  have — and showed "Could not load the configuration" with a Retry that never helped; with a
-  stale per-user file left by an earlier per-user install it would have read, and
-  `cmd_config_set` written, a file no daemon reads (#2871's failure, on Linux). Now
-  `cmd_config_target` (`agents/roomler-desktop/src/commands.rs:828`) reports `root_only`
-  (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`, pure: the reached daemon
-  says it runs as root, this process does not, and the OS is not Windows, whose pipe admits
-  interactive users to those verbs) and the card shows the daemon, its file
-  (`Status.config_path`: `/etc/roomler/config.toml`) and the administrator's commands —
-  `sudo roomler config ls`, `sudo roomler config set <key> <value>` — in place of rows. A
-  refusal from a root daemon is final for `cmd_config_entries`, `cmd_config_set` and
-  `cmd_set_device_name`: none falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:783`). ⚠️ No new authorization path: `person_may`
-  is unchanged, and #2879's test still pins `ConfigSet` of the gate keys as refused there.
+  on here changed a file the mesh node never reads (measured on 0.4.169). **Design A
+  (#2871, the operator, 2026-10-25):** the root half's person socket now serves the
+  configuration — the listing, with every key it will not set marked
+  `read_only = "root_only"`, and `ConfigSet` of exactly the keys that are the console
+  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3163`;
+  the device-owned gates are not among them) — and the page shows the Mac as one device:
+  each row comes from, and a change goes to, the half that READS the key. The split is the
+  key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`):
+
+  | Owner | Groups | On a two-half Mac | Examples |
+  |---|---|---|---|
+  | **session** — the per-user half, which serves the remote-desktop session | Remote desktop · Capture & input · Video encoding · Video rate · Files | the worker's row, edited on the worker as before | `rc_clipboard`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, `encoder_preference` |
+  | **machine** — the root half, the device `roomler ssh` / `roomler exec` reach | Access & consent · Private network · Carriers · Routing · Tunnels · Roomler SSH · Device & service | the root half's row, over its person socket: editable where that socket sets the key (`external_*`), otherwise read-only with the administrator's command | `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `overlay_enabled`, `auto_grant_session`, `auto_update`, `external_access_enabled` |
+
+  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:614`) builds the rows —
+  machine-side keys from the root half's listing, in the worker's order — and
+  `cmd_config_set` (`:803`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:733`), whose answer is final: the worker's copy of
+  such a key is a file the Mac's device never reads, so it is not written. The worker's
+  own copies of machine keys stay reachable with `roomler config …` in a terminal, and
+  the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
+  the root half forwards its own value of a few session knobs to the worker as a floor
+  (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
+  halves' configs, so the worker's copy — the one this edits — can only tighten the
+  root's. The banner (`cmd_config_target`, `:1156`; `two_halves_note`, `:980`) names both
+  halves' files and says which rows change here. It is shown only when the reached daemon
+  says it runs unprivileged AND a root daemon of another identity answers `Status` over the
+  person socket (`two_halves`, `:963`) — one daemon behind both sockets, a root daemon's
+  legacy per-user bind, is not two halves. A root half older than design A still refuses
+  the listing; the rows are then the worker's alone and the banner carries the #2879 words
+  (`two_halves_legacy_note`, `:1001`): the root half's switches are
+  `sudo roomler config set <key> <value>`.
+- **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
+  daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
+  on Linux, `$XDG_RUNTIME_DIR/roomler.sock`, IS the root daemon's person socket (§12). Until
+  #2891 the page took that socket's refusal of `ConfigGet` for a daemon that was down, fell
+  back to the per-user config file — a path a system install does not have — and showed
+  "Could not load the configuration" with a Retry that never helped; with a stale per-user
+  file left by an earlier per-user install it would have read, and `cmd_config_set`
+  written, a file no daemon reads (#2871's failure, on Linux). #2891 made a root daemon's
+  refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
+  falls back to the file (`refused_by_root_daemon`,
+  `agents/roomler-desktop/src/commands.rs:1111`). Since design A the same socket serves the
+  listing, marked: `cmd_config_target` (`:1156`) reports `root_only` (`root_daemon_only`,
+  `:1026`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
+  are editable, and the rest — the device-owned gates, the network, SSH, the updater — show
+  the root daemon's value with "administrator's" and `sudo roomler config set <key> <value>`
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1053`). From a daemon older than
+  design A the card still shows the daemon, its file (`Status.config_path`:
+  `/etc/roomler/config.toml`) and the administrator's commands in place of rows
+  (`root_only_legacy_note`, `:1075`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:2954`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:3286`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
@@ -349,11 +373,13 @@ sequenceDiagram
 
   A root half that is slow to answer (1.5 s) leaves the half's own answer on screen for that
   poll.
-- **What the per-user half does NOT borrow: configuration (#2871).** `ConfigGet` /
-  `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
-  file — and says so (§5). The same socket does tell the companion, and the CLI's
-  `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4548`), that a root half exists: `/var/run/roomler` is
+- **What the per-user half does NOT borrow: configuration (#2871).** The per-user half
+  never forwards a config verb to the root half. Since design A the COMPANION asks the root
+  half's person socket itself for the machine-side rows and sends their changes there
+  (§5), so the person always knows which daemon answered; the per-user half's own
+  `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
+  the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
+  `crates/localapi/src/lib.rs:4806`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -655,10 +681,15 @@ tries first:
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
-  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`).
+  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`);
+  and since #2871 (design A) the configuration — the listing, with every key the socket will
+  not set marked `read_only`, and `ConfigSet` of exactly the keys that are the person's own
+  call (`localapi::CONSOLE_PERSON_KEYS`, §5), never the device-owned gates.
 
-Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
-views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
+Everything else on it — a config key that is not the person's own included, refused by name
+with the `sudo` command — is refused with a pointer to `sudo roomler …`, so the companion's
+other views show that refusal on a system install. The kill switch is
+`ROOMLERD_PERSON_SOCKET=0`.
 
 A Mac's root half serves its console user one as well (FR-97 P2g), at
 `/var/run/roomler-person/<uid>.sock` in a directory only root writes: there the per-user half
