@@ -66,8 +66,9 @@ pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 /// The most links one card shows.
 pub const MAX_LINKS: usize = 200;
-/// FR-90 P4-5-4 — the most devices one card shows the last finding of
-/// (decision 58), and the newest findings of the entity they are read from.
+/// FR-90 P4-5-4 — the most devices one card shows the last findings of
+/// (decision 58), a row of each probe kind each (P4-5-4b), and the newest
+/// findings of the entity they are read from.
 pub const MAX_CARD_DEVICES: usize = 16;
 pub const CARD_FINDINGS: i64 = 512;
 /// The most edges one neighbourhood holds.
@@ -440,19 +441,18 @@ pub(crate) async fn card(
             })
         })
         .collect();
-    // P4-5-4 — what each device last found of it, beside the facts' last
-    // word (decision 58). One more than shown says whether there were more.
-    let mut found = state
+    // P4-5-4 — what each device last found of it, of each kind (P4-5-4b),
+    // beside the facts' last word (decision 58).
+    let found = state
         .probes
-        .last_per_device(tid, id, CARD_FINDINGS, MAX_CARD_DEVICES as i64 + 1)
+        .last_per_device_and_kind(tid, id, CARD_FINDINGS)
         .await?;
-    let probes_truncated = found.len() > MAX_CARD_DEVICES;
-    found.truncate(MAX_CARD_DEVICES);
+    let (shown, probes_truncated) = crate::probe::card_rows(found, MAX_CARD_DEVICES);
     Ok(CardView {
         entity: EntityView::of(&entity),
         links,
         truncated,
-        probes: found.iter().map(ProbeView::of).collect(),
+        probes: shown.iter().map(ProbeView::of).collect(),
         probes_truncated,
     })
 }

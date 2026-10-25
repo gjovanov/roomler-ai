@@ -655,13 +655,14 @@ async fn probed(
     id
 }
 
-/// P4-5-4 — a card shows each device's last probe that found something,
-/// newest first, beside each fact's `verified`, which stays the last word
-/// (decision 58). One device finds the certificate the map says, another a
-/// different key under the same name (a network that inspects TLS), a third
-/// the target unreachable; the first device's later probe that measured
-/// nothing (`not_allowed`) leaves its finding standing, and a probe still
-/// waiting for its answer is no one's finding.
+/// P4-5-4 — a card shows each device's last probe that found something, of
+/// each kind (P4-5-4b), newest first, beside each fact's `verified`, which
+/// stays the last word (decision 58). One device finds the certificate the
+/// map says, another a different key under the same name (a network that
+/// inspects TLS), a third the target unreachable; the first device's later
+/// `tcp` probe takes a row of its own and leaves its certificate on the
+/// card, its probe after that which measured nothing (`not_allowed`) takes
+/// none, and a probe still waiting for its answer is no one's finding.
 #[tokio::test]
 async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
     let app = scan_app().await;
@@ -688,7 +689,7 @@ async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
         json!({ "outcome": "ok", "rtt_ms": 5, "address": "10.0.0.5",
                 "tls": { "names": ["web.example.com"], "fingerprint": fingerprint } })
     };
-    let pa = probed(&app, &t, &web, &a, &mut wa, "tls", seen("ab".repeat(32))).await;
+    let pa_tls = probed(&app, &t, &web, &a, &mut wa, "tls", seen("ab".repeat(32))).await;
     let pb = probed(&app, &t, &web, &b, &mut wb, "tls", seen("cd".repeat(32))).await;
     let pc = probed(
         &app,
@@ -698,6 +699,16 @@ async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
         &mut wc,
         "tcp",
         json!({ "outcome": "unreachable", "detail": "timed out" }),
+    )
+    .await;
+    let pa_tcp = probed(
+        &app,
+        &t,
+        &web,
+        &a,
+        &mut wa,
+        "tcp",
+        json!({ "outcome": "ok", "rtt_ms": 3, "address": "10.0.0.5" }),
     )
     .await;
     probed(
@@ -723,34 +734,40 @@ async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
     };
     assert_eq!(
         by("device_id"),
-        [c.clone(), b.clone(), a.clone()],
-        "each device's last finding, the newest first: {rows:?}"
+        [a.clone(), c.clone(), b.clone(), a.clone()],
+        "each device's last finding of each kind, the newest first: {rows:?}"
     );
     assert_eq!(
         by("id"),
-        [pc.clone(), pb.clone(), pa.clone()],
+        [pa_tcp.clone(), pc.clone(), pb.clone(), pa_tls.clone()],
         "a probe that measured nothing, and one never answered, is no finding"
     );
+    assert_eq!(by("kind"), ["tcp", "tcp", "tls", "tls"]);
     assert_eq!(card["probes_truncated"], json!(false));
     assert_eq!(
-        (rows[0]["state"].clone(), rows[0]["detail"].clone()),
+        rows[0]["measured"],
+        json!([{ "path": "host", "ok": true }, { "path": "port", "ok": true }])
+    );
+    assert_eq!(
+        (rows[1]["state"].clone(), rows[1]["detail"].clone()),
         (json!("unreachable"), json!("timed out"))
     );
     assert_eq!(
-        rows[0]["measured"],
+        rows[1]["measured"],
         json!([{ "path": "host", "ok": false }, { "path": "port", "ok": false }])
     );
-    assert_eq!(rows[1]["tls"]["fingerprint"], json!("cd".repeat(32)));
-    assert_eq!(
-        rows[1]["measured"],
-        json!([{ "path": "host", "ok": true }, { "path": "port", "ok": true },
-               { "path": "tls.fingerprint", "ok": false }, { "path": "tls.names", "ok": true }])
-    );
+    assert_eq!(rows[2]["tls"]["fingerprint"], json!("cd".repeat(32)));
     assert_eq!(
         rows[2]["measured"],
         json!([{ "path": "host", "ok": true }, { "path": "port", "ok": true },
+               { "path": "tls.fingerprint", "ok": false }, { "path": "tls.names", "ok": true }])
+    );
+    assert_eq!(rows[3]["tls"]["fingerprint"], json!("ab".repeat(32)));
+    assert_eq!(
+        rows[3]["measured"],
+        json!([{ "path": "host", "ok": true }, { "path": "port", "ok": true },
                { "path": "tls.fingerprint", "ok": true }, { "path": "tls.names", "ok": true }]),
-        "the device that found it as the map says still says so"
+        "its later tcp probe leaves the device's certificate on the card"
     );
 
     // Beside it, each fact's last word, whichever device said it.
@@ -762,8 +779,8 @@ async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
         );
     }
     for (path, probe, ok) in [
-        ("host", &pc, false),
-        ("port", &pc, false),
+        ("host", &pa_tcp, true),
+        ("port", &pa_tcp, true),
         ("tls.fingerprint", &pb, false),
         ("tls.names", &pb, true),
     ] {
@@ -777,9 +794,11 @@ async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
 }
 
 /// P4-5-4 — at most sixteen devices, the newest first, and the card says
-/// there were more; each device's row is its newest finding, never an older
-/// one, nor a later probe that found nothing, nor another entity's, nor
-/// another organization's.
+/// there were more; each device's row of a kind is its newest finding of it,
+/// never an older one, nor a later probe that found nothing, nor another
+/// entity's, nor another organization's. P4-5-4b: a device shown by its
+/// newest finding brings its other kind's row along, however old, while a
+/// device left out shows none.
 #[tokio::test]
 async fn a_card_shows_sixteen_devices_and_says_there_were_more() {
     let app = scan_app().await;
@@ -828,6 +847,10 @@ async fn a_card_shows_sixteen_devices_and_says_there_were_more() {
     let mut foreign = row(web_id, ObjectId::new(), 3000, "ok");
     foreign.insert("tenant_id", ObjectId::new());
     rows.push(foreign);
+    // Device 13's tls finding is older than device 0's, which is left out.
+    let mut tls = row(web_id, devices[13], 5, "ok");
+    tls.insert("kind", "tls");
+    rows.push(tls);
     coll(&app).insert_many(rows).await.unwrap();
 
     let card = card(&app, &t, &web).await;
@@ -836,9 +859,18 @@ async fn a_card_shows_sixteen_devices_and_says_there_were_more() {
         .iter()
         .map(|r| r["device_id"].as_str().unwrap().to_string())
         .collect();
-    let newest: Vec<String> = devices[1..].iter().rev().map(|d| d.to_hex()).collect();
-    assert_eq!(ids, newest, "the sixteen newest devices, the newest first");
+    let mut newest: Vec<String> = devices[1..].iter().rev().map(|d| d.to_hex()).collect();
+    newest.push(devices[13].to_hex());
+    assert_eq!(
+        ids, newest,
+        "the sixteen newest devices, the newest first, device 13's tls row last"
+    );
     assert_eq!(card["probes_truncated"], json!(true), "and there were more");
+    assert_eq!(
+        (shown[16]["kind"].clone(), shown[16]["rtt_ms"].clone()),
+        (json!("tls"), json!(5)),
+        "a shown device's other kind comes along, however old"
+    );
     assert_eq!(
         (shown[0]["rtt_ms"].clone(), shown[0]["state"].clone()),
         (json!(170), json!("ok")),

@@ -961,6 +961,32 @@ pub async fn list(
     Ok(Json(json!({ "probes": views })))
 }
 
+/// FR-90 P4-5-4b — the rows a card shows of `found`, each device's last
+/// finding of each kind, the newest first
+/// ([`ProbeDao::last_per_device_and_kind`]): every row of the `max_devices`
+/// devices whose findings are the newest, in the order they came, and
+/// whether a device was left out. A device counts once whatever it found,
+/// so a card shows at most `max_devices` devices, and a row of each kind of
+/// each.
+///
+/// [`ProbeDao::last_per_device_and_kind`]: crate::dao::ProbeDao::last_per_device_and_kind
+pub(crate) fn card_rows(found: Vec<KnowhowProbe>, max_devices: usize) -> (Vec<KnowhowProbe>, bool) {
+    let mut devices: Vec<ObjectId> = Vec::with_capacity(max_devices);
+    let mut rows = Vec::with_capacity(found.len());
+    let mut truncated = false;
+    for probe in found {
+        if !devices.contains(&probe.device_id) {
+            if devices.len() == max_devices {
+                truncated = true;
+                continue;
+            }
+            devices.push(probe.device_id);
+        }
+        rows.push(probe);
+    }
+    (rows, truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1417,5 +1443,47 @@ mod tests {
         .unwrap();
         assert_eq!(d.chars().count(), MAX_DETAIL);
         assert!(!d.contains('\u{7}'));
+    }
+
+    /// One finding of `device`, of `kind`, asked at `at`: a card's row.
+    fn finding(device: ObjectId, kind: ProbeKind, at: i64) -> KnowhowProbe {
+        let e = entity(vec![
+            fact("host", Bson::String("db.example.com".into()), STATUS_ACTIVE),
+            fact("port", Bson::Int32(5432), STATUS_ACTIVE),
+        ]);
+        let mut p = probe_of(&e, kind, device);
+        p.requested_at = DateTime::from_millis(at);
+        p.state = ProbeOutcome::Ok.as_str().into();
+        p.pending = None;
+        p
+    }
+
+    /// P4-5-4b — a card shows every row of the devices whose findings are
+    /// the newest, a row of each kind of each, in the order they came; at
+    /// most `max_devices` devices whatever each found, and it says when one
+    /// was left out.
+    #[test]
+    fn a_card_shows_each_devices_rows_up_to_its_devices() {
+        let (a, b, c) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let found = vec![
+            finding(a, ProbeKind::Tcp, 50),
+            finding(b, ProbeKind::Tls, 40),
+            finding(a, ProbeKind::Tls, 30),
+            finding(c, ProbeKind::Tcp, 20),
+            finding(b, ProbeKind::Tcp, 10),
+        ];
+        let at = |rows: &[KnowhowProbe]| {
+            rows.iter()
+                .map(|p| p.requested_at.timestamp_millis())
+                .collect::<Vec<_>>()
+        };
+        let (rows, truncated) = card_rows(found.clone(), 2);
+        assert_eq!(at(&rows), [50, 40, 30, 10], "a's and b's, both kinds each");
+        assert!(truncated, "c was left out");
+        let (rows, truncated) = card_rows(found, 3);
+        assert_eq!(at(&rows), [50, 40, 30, 20, 10]);
+        assert!(!truncated);
+        let (rows, truncated) = card_rows(Vec::new(), 16);
+        assert!(rows.is_empty() && !truncated);
     }
 }

@@ -752,18 +752,20 @@ impl ProbeDao {
     }
 
     /// FR-90 P4-5-4 — each device's last probe of an entity that found
-    /// something, `ok` or `unreachable`, newest first and at most `devices`
-    /// (decision 58). They are read from the entity's newest `findings` such
-    /// probes, so a device whose last one lies further back is not among them.
-    /// The entity's probe index serves the read; a probe that asked nothing
-    /// of the target (`not_allowed`, `failed`), and one never answered, is no
-    /// device's finding.
-    pub async fn last_per_device(
+    /// something, `ok` or `unreachable`, of each kind, the newest first
+    /// (decision 58). P4-5-4b, the operator's "2 rows per device": a `tcp`
+    /// probe after a `tls` one leaves that device's certificate on the card.
+    /// They are read from the entity's newest `findings` such probes, so a
+    /// device whose last one lies further back is not among them, and there
+    /// are at most `findings` of them. The entity's probe index serves the
+    /// read; a probe that asked nothing of the target (`not_allowed`,
+    /// `failed`), and one never answered, is no device's finding. Which
+    /// devices a card shows is [`crate::probe::card_rows`]'s.
+    pub async fn last_per_device_and_kind(
         &self,
         tenant_id: ObjectId,
         entity_id: ObjectId,
         findings: i64,
-        devices: i64,
     ) -> DaoResult<Vec<KnowhowProbe>> {
         let found = [
             ProbeOutcome::Ok.as_str(),
@@ -777,10 +779,12 @@ impl ProbeDao {
             } },
             doc! { "$sort": { "requested_at": -1, "_id": -1 } },
             doc! { "$limit": findings },
-            doc! { "$group": { "_id": "$device_id", "last": { "$first": "$$ROOT" } } },
+            doc! { "$group": {
+                "_id": { "device": "$device_id", "kind": "$kind" },
+                "last": { "$first": "$$ROOT" },
+            } },
             doc! { "$replaceWith": "$last" },
             doc! { "$sort": { "requested_at": -1, "_id": -1 } },
-            doc! { "$limit": devices },
         ];
         let rows: Vec<Document> = self
             .base
