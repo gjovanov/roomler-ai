@@ -52,7 +52,7 @@ behaviour too. Adding a transport behind the existing `RelayConn` seam (`OrgRela
 changed none of the send path, the router or the carrier plane.
 
 Which relay a pair uses is decided in this order
-([`relay_link.rs:1052`](../crates/tunnel-core/src/overlay/relay_link.rs#L1052)):
+([`relay_link.rs:1096`](../crates/tunnel-core/src/overlay/relay_link.rs#L1096)):
 
 | priority | source | why it sits there |
 |---|---|---|
@@ -394,7 +394,7 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 | the relay's session table (pure) | [`orgrelay/session.rs`](../crates/tunnel-core/src/overlay/orgrelay/session.rs) |
 | the relay server + counters | [`orgrelay/server.rs`](../crates/tunnel-core/src/overlay/orgrelay/server.rs), [`agents/roomlerd/src/relay_server.rs`](../agents/roomlerd/src/relay_server.rs) |
 | the member: bind + `OrgRelayConn` | [`orgrelay/client.rs`](../crates/tunnel-core/src/overlay/orgrelay/client.rs) |
-| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1052`, `org_request_bind` `:1946`, `commit_org_bind` `:1972` |
+| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1096`, `org_request_bind` `:1990`, `commit_org_bind` `:2016` |
 | pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:62`](../crates/api/src/cluster/metrics.rs#L62) |
 
 ## Not built

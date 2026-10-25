@@ -222,7 +222,7 @@ Four requirements, all in P0:
 3. The variant stays a **unit variant**. The session is pushed **out-of-band** as its own
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
    **`Copy`** (`:1985`); a `session` payload would break that derive and ripple through
-   `netmap.rs:92`, `relay_link.rs:1039-1042` and three by-value returns at
+   `netmap.rs:92`, `relay_link.rs:1083-1086` and three by-value returns at
    `overlay.rs:1931/1952/2030` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
 
@@ -372,7 +372,7 @@ Verdict machinery to extend, verified against master:
 | …delegating to the pure decision | `overlay.rs:2020` `relay_verdict_core` |
 | Measured caps supersede presence | `overlay.rs:1969-1978` (in `verdict_from_nodes`, `:1948`) |
 | Wire verdict enum | `crates/remote_control/src/signaling.rs:3260` `RelayStrategyWire` |
-| Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1016` `relay_strategy` |
+| Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1060` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
 
@@ -619,7 +619,7 @@ So the design is:
   peer off a shared connection — and there are already **three** production impls
   (`DerpConn`, `TurnRelayConn` `transport/relay.rs:348`, `UdpRelayConn` `:491`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
-- **`relay_strategy` (`relay_link.rs:1016`) gains a branch**; the server verdict picks Org
+- **`relay_strategy` (`relay_link.rs:1060`) gains a branch**; the server verdict picks Org
   over Turn/Derp when a session exists.
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
@@ -636,10 +636,10 @@ A new tier would additionally have required navigating four hazards, three of th
 
 | hazard | anchor | why it fails silently |
 |---|---|---|
-| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2596` makes **both ends initiate** the WG handshake, `:2562` books a direct-tier failure on demote-follow |
+| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2665` makes **both ends initiate** the WG handshake, `:2631` books a direct-tier failure on demote-follow |
 | `is_sticky` `_ =>` catch-all | `path.rs:825` | silently inherits LAN/public's 2-strike escalation |
 | `suppression_half_life` `_ =>` catch-all | `path.rs:285` | same |
-| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1312`, `:1400`, `:1472`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
+| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1364`, `:1452`, `:1524`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
@@ -714,7 +714,7 @@ Verified against `origin/master`, 2026-08-28.
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:152` `RelayKind` |
 | **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:296` (`impl RelayConn for DerpConn`) and `derp.rs:458` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
-| Client cascade branch | `relay_link.rs:1016` `relay_strategy` |
+| Client cascade branch | `relay_link.rs:1060` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |

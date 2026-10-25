@@ -944,6 +944,58 @@ impl OverlayRuntime {
         removed
     }
 
+    /// #2820 — move a peer off an installed **TURN** carrier once the server
+    /// stamps its pair DERP. FR-115 P4c-1 re-stamps an org's pairs DERP when
+    /// the org crosses its relay allowance, and TURN is not throttled, so a
+    /// pair left on TURN kept the unmetered tier until it happened to churn.
+    ///
+    /// The mirror of [`Self::maybe_regrade_derp`] (DERP → TURN), called from
+    /// the same keep-the-relay paths of [`Self::install_peers`], so a direct
+    /// upgrade always wins first. Unlike the regrade it is
+    /// **make-before-break**: the DERP carrier is built on the live mux and
+    /// installed over the TURN one, the same path demote-follow takes, so the
+    /// pair never drops while it moves. The peer follows either way: its own
+    /// copy of the stamp moves it too, and failing that, our frames arriving
+    /// over `/derp` trigger its demote-follow.
+    /// `RelayCoordinator::stamp_to_derp` owns the decision.
+    ///
+    /// Returns whether the carrier moved.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn maybe_follow_stamp_to_derp(
+        &self,
+        node_id: ObjectId,
+        cfg: &PeerConfig,
+        pk: &[u8; 32],
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+    ) -> bool {
+        // Only an installed TURN carrier is in scope (DERP is the target,
+        // direct beats both, an org relay is the tenant's own and unmetered),
+        // and never while a make-before-break direct probe is in flight: that
+        // probe may be about to retire the relay altogether.
+        if by_node.get(&node_id).and_then(|e| e.relay_kind)
+            != Some(crate::overlay::relay_link::RelayKind::Turn)
+            || wg.has_direct_probe(pk)
+        {
+            return false;
+        }
+        let Some(link) = relay
+            .as_mut()
+            .and_then(|r| r.stamp_to_derp(node_id, cfg.clone()))
+        else {
+            return false;
+        };
+        info!(
+            peer = %node_id,
+            "overlay relay: the server now stamps this pair DERP (an org past its relay allowance moves off unmetered TURN) — moving its live TURN carrier onto DERP"
+        );
+        self.install_ready(wg, by_node, tun, link, relay_bq).await;
+        true
+    }
+
     /// Re-establish a peer stuck on an **established DERP** carrier whose
     /// strategy inputs have since improved (the peer's — or our own — srflx
     /// arrived after the link was built), so the pair moves DERP → TURN.
@@ -1517,22 +1569,32 @@ impl OverlayRuntime {
                             // the relay; record the decision.
                             record("install_peers:upgrade", path::PathAction::Keep);
                             // …but "keep the relay" must not mean "keep the
-                            // WRONG relay tier": a DERP carrier built while the
-                            // pair looked both-UDP-blocked is re-graded here
-                            // once srflx says otherwise.
-                            self.maybe_regrade_derp(
-                                np.node_id,
-                                &cfg,
-                                &pk,
-                                wg,
-                                by_node,
-                                tun,
-                                relay,
-                                relay_bq,
-                                upgrade_probes,
-                                now,
-                            )
-                            .await;
+                            // WRONG relay tier": a TURN carrier the server now
+                            // stamps DERP moves onto DERP (#2820), and a DERP
+                            // carrier built while the pair looked
+                            // both-UDP-blocked is re-graded here once srflx
+                            // says otherwise. Different carrier kinds, so at
+                            // most one of the two acts.
+                            if !self
+                                .maybe_follow_stamp_to_derp(
+                                    np.node_id, &cfg, &pk, wg, by_node, tun, relay, relay_bq,
+                                )
+                                .await
+                            {
+                                self.maybe_regrade_derp(
+                                    np.node_id,
+                                    &cfg,
+                                    &pk,
+                                    wg,
+                                    by_node,
+                                    tun,
+                                    relay,
+                                    relay_bq,
+                                    upgrade_probes,
+                                    now,
+                                )
+                                .await;
+                            }
                         }
                         continue;
                     }
@@ -1590,19 +1652,26 @@ impl OverlayRuntime {
                         // the make-before-break arm above — the relay staying
                         // still leaves the DERP-vs-TURN question to re-ask.
                         record("install_peers:upgrade", path::PathAction::Keep);
-                        self.maybe_regrade_derp(
-                            np.node_id,
-                            &cfg,
-                            &pk,
-                            wg,
-                            by_node,
-                            tun,
-                            relay,
-                            relay_bq,
-                            upgrade_probes,
-                            now,
-                        )
-                        .await;
+                        if !self
+                            .maybe_follow_stamp_to_derp(
+                                np.node_id, &cfg, &pk, wg, by_node, tun, relay, relay_bq,
+                            )
+                            .await
+                        {
+                            self.maybe_regrade_derp(
+                                np.node_id,
+                                &cfg,
+                                &pk,
+                                wg,
+                                by_node,
+                                tun,
+                                relay,
+                                relay_bq,
+                                upgrade_probes,
+                                now,
+                            )
+                            .await;
+                        }
                     }
                     continue;
                 }

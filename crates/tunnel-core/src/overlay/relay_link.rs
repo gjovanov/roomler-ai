@@ -1007,6 +1007,50 @@ impl RelayCoordinator {
         self.try_build_derp(&node_id)
     }
 
+    /// #2820 — the SERVER now stamps this pair DERP, but the pair still rides
+    /// the TURN carrier it was built on.
+    ///
+    /// The stamp is read when a link is built (`relay_strategy`), so a healthy
+    /// link never asked again. FR-115 P4c-1 depends on asking: when an org
+    /// crosses its relay allowance the server re-stamps its pairs DERP, because
+    /// TURN is not throttled. Field 2026-10-24: a pair on `relay:turn` stayed
+    /// there for 6+ minutes after both pods re-stamped it, and moved only when
+    /// one end restarted.
+    ///
+    /// The DERP carrier is built the way demote-follow builds one
+    /// ([`follow_peer_to_derp`](Self::follow_peer_to_derp): on the live mux,
+    /// for a peer holding no relay slot), and `Derp` becomes the pair's
+    /// established strategy. That last part is what makes the way back work:
+    /// when the stamp turns again (the org back under), [`derp_regrade_due`](
+    /// Self::derp_regrade_due) sees a DERP-established pair and regrades it
+    /// under its own cooldown and evidence gates, as for any other DERP pair.
+    ///
+    /// Only the server's stamp moves a pair here, never a local derivation, and
+    /// only one that [`relay_strategy`](Self::relay_strategy) agrees with — so a
+    /// live org-relay session or a force-DERP pin still decides first. A peer
+    /// mid-establishment is left to `maybe_complete`'s recompute. `None` = no
+    /// move: not stamped DERP, the peer can't speak DERP, or no live mux serves
+    /// it (`follow_peer_to_derp` decides that before touching anything).
+    pub fn stamp_to_derp(&mut self, node_id: ObjectId, peer: PeerConfig) -> Option<ReadyLink> {
+        if !self.server_strategy || peer.relay_strategy != Some(RelayStrategyWire::Derp) {
+            return None;
+        }
+        if !matches!(self.relay_strategy(&node_id, &peer), RelayStrategy::Derp)
+            || self.is_tracking(&node_id)
+        {
+            return None;
+        }
+        let link = self.follow_peer_to_derp(node_id, peer)?;
+        self.roles.insert(node_id, RelayStrategy::Derp);
+        // The TURN carrier this link replaces takes its allocation with it when
+        // the runtime installs over it, so the relay address we advertised for
+        // this pair (if we were its anchor) is dead. Left in the set, every
+        // later `endpoints` trickle would hand the peer that dead address
+        // again: the rc.125→126 failure the per-peer keying exists to prevent.
+        self.advertised.remove(&node_id);
+        Some(link)
+    }
+
     /// v1 single-relay role for this peer, or `None` for the both-allocate path:
     /// single-relay is off on our side, the peer didn't advertise support, or
     /// neither end can be the raw-UDP dialer.
@@ -4159,6 +4203,113 @@ mod tests {
         assert!(
             !coord.is_tracking(&other),
             "a withheld follow must not park the peer in a tracking slot"
+        );
+    }
+
+    /// #2820 — `stamp_to_derp` moves an INSTALLED pair (it holds no relay slot)
+    /// off TURN only when the SERVER's stamp says DERP. It adopts `Derp` as
+    /// the pair's established strategy, so the ordinary regrade brings it back
+    /// once the stamp turns again, and prunes the TURN relay address we
+    /// advertised. On every precondition it declines without touching anything.
+    #[tokio::test]
+    async fn stamp_to_derp_moves_a_live_turn_pair_and_the_regrade_brings_it_back() {
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], Some(Arc::clone(&mux)));
+        coord.single_relay = true;
+        coord.derp = true;
+        coord.server_strategy = true;
+        let node = ObjectId::new();
+        let turn_peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            relay_strategy: Some(RelayStrategyWire::SingleRelayAnchor),
+            ..base_peer()
+        };
+        let derp_peer = PeerConfig {
+            relay_strategy: Some(RelayStrategyWire::Derp),
+            ..turn_peer.clone()
+        };
+        // The pair was established on TURN (single-relay, ours the anchor),
+        // and we advertised the relay address we allocated for it.
+        coord.roles.insert(node, RelayStrategy::SingleRelay(true));
+        coord.advertised.insert(node, "203.0.113.1:3478".into());
+        let untouched = |c: &RelayCoordinator| {
+            c.roles.get(&node) == Some(&RelayStrategy::SingleRelay(true))
+                && c.advertised.contains_key(&node)
+                && !c.is_tracking(&node)
+        };
+
+        // Still stamped TURN ⇒ nothing moves.
+        assert!(coord.stamp_to_derp(node, turn_peer.clone()).is_none());
+        assert!(untouched(&coord));
+
+        // A host that does not take the server's verdict ignores its stamp.
+        coord.server_strategy = false;
+        assert!(coord.stamp_to_derp(node, derp_peer.clone()).is_none());
+        assert!(untouched(&coord));
+        coord.server_strategy = true;
+
+        // The peer cannot speak DERP ⇒ declined.
+        let no_derp = PeerConfig {
+            supports_derp: false,
+            ..derp_peer.clone()
+        };
+        assert!(coord.stamp_to_derp(node, no_derp).is_none());
+        assert!(untouched(&coord));
+
+        // A peer mid-establishment belongs to `maybe_complete`'s recompute.
+        let other = ObjectId::new();
+        coord.dialing.insert(other, derp_peer.clone());
+        assert!(coord.stamp_to_derp(other, derp_peer.clone()).is_none());
+        assert!(
+            coord.dialing.contains_key(&other),
+            "a tracked peer keeps its slot"
+        );
+
+        // The mux is down ⇒ withheld (a DERP carrier on a dead WS is born dead).
+        mux.mark_down();
+        assert!(coord.stamp_to_derp(node, derp_peer.clone()).is_none());
+        assert!(
+            untouched(&coord),
+            "a withheld move leaves no slot and no role change"
+        );
+        mux.mark_up();
+
+        // The real case: stamped DERP, installed (no slot) ⇒ moves.
+        let link = coord
+            .stamp_to_derp(node, derp_peer.clone())
+            .expect("a live TURN pair stamped DERP moves onto DERP");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert_eq!(link.node_id, node);
+        assert_eq!(
+            coord.roles.get(&node),
+            Some(&RelayStrategy::Derp),
+            "DERP is now the pair's established strategy"
+        );
+        assert!(
+            !coord.advertised.contains_key(&node),
+            "the TURN relay address dies with the carrier, so it leaves the trickle set"
+        );
+        assert!(
+            !coord.forced_derp_active(&node),
+            "a stamp is not a force-DERP pin: no TTL outlives the verdict"
+        );
+        assert!(
+            !coord.is_tracking(&node),
+            "the build leaves no tracking slot behind"
+        );
+
+        // While the stamp still says DERP, the regrade leaves it there…
+        let now = Instant::now();
+        assert!(!coord.derp_regrade_due(&node, &derp_peer, now));
+        // …and once it turns back (the org under its allowance again), the
+        // ordinary DERP → TURN regrade is due.
+        assert!(
+            coord.derp_regrade_due(&node, &turn_peer, now),
+            "the way back: a DERP-established pair regrades when the stamp turns"
         );
     }
 

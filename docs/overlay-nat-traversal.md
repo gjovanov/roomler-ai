@@ -480,6 +480,32 @@ carrier itself: relay-to-relay hairpin and full WG over two same-worker
 allocations both verify green. Single-relay avoids it by using one allocation;
 DERP avoids coturn entirely.
 
+**A DERP stamp moves a live TURN carrier (#2820).** A pair's relay strategy is
+the server's per-edge stamp in its netmap row (`relay_strategy`), and the
+coordinator reads it when it **builds** a link. A healthy link never asked again,
+so a pair on TURN kept TURN after the server re-stamped it DERP, until it happened
+to churn. Two stamps make that wrong: FR-115 P4c-1's, when an org crosses its relay
+allowance (TURN is not throttled, DERP is), and P7's churn pin, which rides the
+same verdict (`fan_pair_verdicts`). `RelayCoordinator::stamp_to_derp`
+(`crates/tunnel-core/src/overlay/relay_link.rs:1034`), asked from the
+keep-the-relay paths of `install_peers`
+(`crates/tunnel-core/src/overlay/runtime/establish.rs:964`), builds the DERP
+carrier on the live mux and installs it over the TURN one: **make-before-break**,
+the path demote-follow takes. The peer moves on its own copy of the stamp, and an
+older agent by demote-follow, because our frames now arrive over `/derp`.
+⚠️ Only an installed **TURN** carrier moves, and only on the server's stamp, never
+on a local derivation. A direct carrier, an org relay, a pair with a
+make-before-break direct probe in flight and a pair still being established are
+left alone: DERP is a fallback tier, not a destination.
+⚠️ Unlike a follow, the move records `Derp` as the pair's established strategy
+(`roles`), so when the stamp turns again (the org back under, the pin lapsed) the
+ordinary DERP regrade (`derp_regrade_due`) takes the pair back to TURN. That way
+back is break-before-make and only as good as the regrade: an end that reached
+DERP by demote-follow keeps its old strategy and never regrades, and frames a busy
+peer still sends over `/derp` pull a regrading end back by the same follow (field
+2026-10-24: one TURN sample, then DERP). A pair left there sits on DERP, the floor
+every fleet pair is born on.
+
 ## Worker co-location — one pick, everywhere (invariant I6)
 
 Any two ends that must meet on a coturn worker MUST select that worker with
