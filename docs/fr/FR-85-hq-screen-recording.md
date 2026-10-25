@@ -156,7 +156,7 @@ what it costs in installer size and ships with integration and e2e tests.
 - LocalAPI verbs (`crates/localapi/src/lib.rs:1026`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
   `RecordStop`, `RecordStatus`, `RecordingsList`, `RecordingDelete`.
   ⚠️ **They need a peer check the pipe does not have.** The pipe's DACL admits every Interactive User, RDP sessions
-  included (`lib.rs:1657`), and there is no peer-credential check, so a guest in an RDP session could start a local
+  included (`lib.rs:1680`), and there is no peer-credential check, so a guest in an RDP session could start a local
   recording of the console user's desktop. The new verbs, and `ConfigSet` of any `record_*` key, require
   `GetNamedPipeClientProcessId` → `ProcessIdToSessionId` to equal the worker's session (`SO_PEERCRED` on unix).
 - CLI: `roomler record start | stop | status | ls`.

@@ -882,7 +882,7 @@ starts) over a **per-session endpoint**: a Unix socket owned by the mapped accou
 (`0600` under a `0700` directory) or a named pipe whose DACL names only that account's
 SID. It can't be the main LocalAPI endpoint: on a root daemon that socket is root-only
 (`crates/localapi/src/lib.rs:4082-4100`), and on Windows the pipe admits every
-interactive user and most verbs trust the pipe alone (`lib.rs:1081-1083`).
+interactive user and most verbs trust the pipe alone (`lib.rs:1104-1106`).
 
 | Tool or resource | Does | Gate |
 |---|---|---|
