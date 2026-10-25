@@ -2368,6 +2368,52 @@ fn mode_label(mode: DaemonMode, privileged: Option<bool>) -> &'static str {
     }
 }
 
+/// #2892 — the suffix on a network line whose value is NOT this daemon's: a
+/// Mac's per-user half answers `overlay ip` / `overlay ip6` with the root
+/// half's (FR-97 P2h lends them), and the daemon names that half in
+/// `network_from`. Empty when the fields are the daemon's own, so every other
+/// host's output is byte-identical to before.
+fn lent_mark(from: Option<&tunnel_core::localapi::NetworkOrigin>) -> &'static str {
+    if from.is_some() {
+        "  (the root daemon's)"
+    } else {
+        ""
+    }
+}
+
+/// #2892 — the `network` line under the lent addresses: which daemon serves
+/// the machine's network, which lines of this status are its, and how to ask
+/// it directly.
+fn network_from_line(from: &tunnel_core::localapi::NetworkOrigin) -> String {
+    format!(
+        "the machine's, served by the root daemon \"{}\" (node {}): the overlay addresses, \
+         the exit node and the MagicDNS lines here are that daemon's. This per-user daemon \
+         runs no overlay of its own; `sudo roomler status` asks the root one.",
+        from.name,
+        short_id(&from.node_id)
+    )
+}
+
+/// FR-49's closing line of the enrollments block, and #2892's reading of it
+/// on a two-half Mac: a per-user half beside a root half is off the mesh BY
+/// DESIGN (FR-43) — the machine's mesh is the root half's — so the netstack
+/// advice would put a second node on a Mac that has one. Byte-identical to
+/// before for every daemon that carries its own network.
+fn dark_orgs_line(dark: &[&str], from: Option<&tunnel_core::localapi::NetworkOrigin>) -> String {
+    match from {
+        Some(from) => format!(
+            "not on the mesh itself: {} — this machine's mesh is the root daemon's (\"{}\"); \
+             a per-user half stays off it by design (FR-43)",
+            dark.join(", "),
+            from.name
+        ),
+        None => format!(
+            "⚠️ enrolled but NOT on the mesh: {} (`roomlerd org overlay <label> netstack`)",
+            dark.join(", ")
+        ),
+    }
+}
+
 fn print_status(s: &NodeStatus) {
     let mode = mode_label(s.mode, s.privileged);
     println!("{} {}", up_glyph(s.connected), s.name);
@@ -2379,8 +2425,23 @@ fn print_status(s: &NodeStatus) {
         println!("  ephemeral   yes — removes itself after inactivity, or on clean stop");
     }
     println!("  tenant      {}", opt(s.tenant_id.as_deref()));
-    println!("  overlay ip  {}", opt(s.overlay_ip.as_deref()));
-    println!("  overlay ip6 {}", opt(s.overlay_ip6.as_deref()));
+    // #2892 — on a Mac's per-user half these are the ROOT half's (FR-97 P2h
+    // lends them) and the daemon says so: label them, or they read as this
+    // daemon's own, right above its "overlay OFF" enrollments.
+    let lent = s.network_from.as_ref();
+    println!(
+        "  overlay ip  {}{}",
+        opt(s.overlay_ip.as_deref()),
+        lent_mark(lent)
+    );
+    println!(
+        "  overlay ip6 {}{}",
+        opt(s.overlay_ip6.as_deref()),
+        lent_mark(lent)
+    );
+    if let Some(from) = lent {
+        println!("  network     {}", network_from_line(from));
+    }
     println!(
         "  server      {}",
         if s.connected {
@@ -2399,7 +2460,7 @@ fn print_status(s: &NodeStatus) {
     {
         println!("  credential  {}", credential_expiry(exp, unix_now()));
     }
-    print_orgs(&s.orgs);
+    print_orgs(&s.orgs, lent);
     // P5/S4 — exit-node routing (only when this node is configured as a client).
     // S3b — when active, also report whether global IPv6 rides the exit or is
     // fail-closed (Windows exit / no v6 uplink). S4b — and whether DNS is steered
@@ -2802,7 +2863,14 @@ fn unix_now() -> i64 {
 /// by NOTHING but `--json`, so on a device in two orgs the human output said
 /// nothing about the second at all. Skipped entirely for a single-org daemon,
 /// keeping that output byte-identical.
-fn print_orgs(orgs: &[tunnel_core::localapi::OrgStatus]) {
+///
+/// `network_from` (#2892): the root daemon whose network this status carries,
+/// on a two-half Mac's per-user half — its enrollments are off the mesh by
+/// design, and the closing line says so instead of prescribing netstack.
+fn print_orgs(
+    orgs: &[tunnel_core::localapi::OrgStatus],
+    network_from: Option<&tunnel_core::localapi::NetworkOrigin>,
+) {
     if orgs.len() < 2 {
         return;
     }
@@ -2843,11 +2911,7 @@ fn print_orgs(orgs: &[tunnel_core::localapi::OrgStatus]) {
         .map(|o| o.label.as_str())
         .collect();
     if !dark.is_empty() {
-        println!(
-            "                   ⚠️ enrolled but NOT on the mesh: {} \
-             (`roomlerd org overlay <label> netstack`)",
-            dark.join(", ")
-        );
+        println!("                   {}", dark_orgs_line(&dark, network_from));
     }
 }
 
@@ -3267,6 +3331,46 @@ mod tests {
         };
         assert_eq!(mode_label(DaemonMode::Service, Some(true)), privileged);
         assert_eq!(mode_label(DaemonMode::User, Some(false)), "user");
+    }
+
+    /// #2892 — a lent network is labelled as the root daemon's, with a line
+    /// naming that daemon and how to ask it; a daemon's own network gets no
+    /// mark at all, so every other host's output is byte-identical.
+    #[test]
+    fn a_lent_network_is_labelled_as_the_root_daemons() {
+        let from = tunnel_core::localapi::NetworkOrigin {
+            node_id: "d1d2d3d4e5f6a7b8c9d0".into(),
+            name: "mac-d".into(),
+        };
+        assert_eq!(lent_mark(None), "");
+        assert!(lent_mark(Some(&from)).contains("the root daemon's"));
+        let line = network_from_line(&from);
+        for must in [
+            "mac-d",
+            short_id("d1d2d3d4e5f6a7b8c9d0").as_str(),
+            "root daemon",
+            "sudo roomler status",
+            "no overlay of its own",
+        ] {
+            assert!(
+                line.contains(must),
+                "the network line must say {must:?}: {line}"
+            );
+        }
+        // The enrollments' closing line: FR-49's advice for a daemon that
+        // carries its own network (unchanged), #2892's reading for a per-user
+        // half beside a root half — no netstack prescription for it.
+        assert_eq!(
+            dark_orgs_line(&["primary", "acme"], None),
+            "⚠️ enrolled but NOT on the mesh: primary, acme (`roomlerd org overlay <label> netstack`)"
+        );
+        let lent = dark_orgs_line(&["primary"], Some(&from));
+        assert!(lent.contains("primary") && lent.contains("mac-d"), "{lent}");
+        assert!(
+            lent.contains("root daemon") && lent.contains("FR-43"),
+            "{lent}"
+        );
+        assert!(!lent.contains("netstack"), "{lent}");
     }
 
     /// FR-92 — the line uses the agent's own sentence and never a paraphrase;

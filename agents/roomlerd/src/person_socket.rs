@@ -205,12 +205,21 @@ pub fn network_view_wanted(own_overlay_ip: Option<&str>, euid: u32) -> bool {
 /// addresses, its exit status and its MagicDNS. Everything else stays the
 /// per-user half's: its name, version, mode, and its own link to the server.
 /// A machine view that holds no overlay address lends nothing.
+///
+/// #2892 — and the answer SAYS whose network it carries (`network_from`):
+/// without that, `roomler status` as the console user printed the root half's
+/// address as this half's, right above this half's own "overlay OFF"
+/// enrollments, and the companion's Overview showed it as the device's own.
 pub fn with_machine_network(mut own: NodeStatus, machine: &NodeStatus) -> NodeStatus {
     if machine.overlay_ip.is_some() {
         own.overlay_ip = machine.overlay_ip.clone();
         own.overlay_ip6 = machine.overlay_ip6.clone();
         own.exit_node = machine.exit_node.clone();
         own.dns = machine.dns.clone();
+        own.network_from = Some(tunnel_core::localapi::NetworkOrigin {
+            node_id: machine.node_id.clone(),
+            name: machine.name.clone(),
+        });
     }
     own
 }
@@ -499,6 +508,14 @@ mod tests {
         assert_eq!(merged.overlay_ip6.as_deref(), Some("fd7a:115c:a1e0::9"));
         assert!(merged.dns.is_some());
         assert_eq!(merged.dns, machine.dns);
+        // #2892 — and the answer names the daemon those fields belong to.
+        assert_eq!(
+            merged.network_from,
+            Some(tunnel_core::localapi::NetworkOrigin {
+                node_id: "d".into(),
+                name: "mac-d".into(),
+            })
+        );
         // Its own identity and its own link to the server stay its own.
         assert_eq!(
             (
@@ -510,10 +527,12 @@ mod tests {
         );
         assert_eq!(merged.mode, own.mode);
         assert!(!merged.connected);
-        // A machine view off the network lends nothing.
+        // A machine view off the network lends nothing — and names nothing
+        // (#2892): `own` carries no `network_from`, and neither does this.
         let off = status(
             r#"{"node_id":"d","name":"mac-d","version":"0.4.149","mode":"service","connected":true}"#,
         );
         assert_eq!(with_machine_network(own.clone(), &off), own);
+        assert_eq!(own.network_from, None);
     }
 }

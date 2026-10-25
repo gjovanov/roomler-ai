@@ -2662,7 +2662,7 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3066`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3034`) |
+| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3089`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3057`) |
 | who it acts as | **the device's owner** (decision 23, decided). The vault reads the owner from the device's row, never from the frame, as `rc:ssh.request` does (`crates/modules/network/src/agent_arms.rs:161`, `:211`). A device whose row is gone or removed has no principal and gets nothing |
 | which organization | the device's primary enrollment's, where the lease client lives, as for every vault ask. A secondary organization's secrets are out of reach this way |
 | the call | `roomler connect <handle> --engine <e> --upstream <u> [--ca <handle>] [--ttl <s>]`, the arguments a session's `vault_connect` takes (`docs/vault.md` §19): a structured secret by its path or this organization's RRN, an engine, and the upstream exactly as the secret's `audiences` names it |
@@ -2688,7 +2688,7 @@ sequenceDiagram
   names, and a new action would escape it. So P3-9-1 seeds its twin for `secret:connect`, in
   the same change as the action.
 - ⚠️ **Never on the person socket.** A system install's person socket serves whoever sits at the
-  screen (`crates/localapi/src/lib.rs:3013`), who need not be the device's owner. Serving
+  screen (`crates/localapi/src/lib.rs:3036`), who need not be the device's owner. Serving
   `roomler connect` there would lend the owner's vault to anyone at the seat. On a system install
   it takes the daemon's own endpoint: an administrator, or root.
 - ⚠️ **The owner from the row, never from the frame.** A compromised device can ask for what its
@@ -2745,7 +2745,7 @@ design above:
   (`HiveUpdateHold`). `roomler connect`'s foreground is that connection, so Ctrl-C, a killed
   command or a closed terminal ends the endpoint with no verb of its own. The command asks every
   5 s on the same connection where its endpoint stands, and only that connection may ask
-  (`crates/localapi/src/lib.rs:3496`).
+  (`crates/localapi/src/lib.rs:3519`).
 - **Who may ask is decision 26**, found writing P3-9-2a. The design's "an administrator, or root"
   does not hold on Windows, where the daemon's pipe admits every interactive user. Built as
   recommended, pending the operator's word.
@@ -3155,7 +3155,7 @@ sequenceDiagram
 | the delivery | the vault's way (`crates/modules/vault/src/revoke.rs:506`): the row is the bus, and each pod tells the devices connected to it. The pod that took the request pushes at once when the device is connected there; any other pod finds the row at its next sweep (`knowhow.scan_sweep_secs`, 5 s by default), and an offline device is told at its next hello. Each push is preceded by a compare-and-set from `requested` to `delivered`, so a device whose connection moved between pods is told once; a scan delivered and still unanswered is delivered again at the device's next hello, since its connection may have died with it (the device runs a scan id once, and the server keeps the first answer). A module answers a device on the connection's own sender (`crates/core/src/agent_socket.rs:63`), so no `knowhow → fleet` edge is needed: the Hub is pod-local (`crates/modules/fleet/src/hub.rs:2737`), and reaching it from another pod would mean a cluster control frame of fleet's for every knowhow request (`crates/modules/hive/src/purge.rs:871`) |
 | the record | `knowhow_scans`, one row per request: the device, who asked and when, `requested` → `delivered` → `done` · `no_roots` · `failed`, or `expired` 24 h after the request when no answer came; when it was delivered and answered; its counts (`repos`, `checkouts`, `clusters`, `endpoints`, `retired`) and a `detail`. A person reads a device's scans (`GET …/knowhow/scan?device=`), so "asked, never delivered", "delivered, never answered", "answered: nothing listed" and "answered: failed" are four states on screen, each with its own fix. Kept 90 days |
 | the answer | `outcome` `done`, `no_roots` (the owner lists nothing: an answer, and the only one a device with an empty list gives) or `failed` with a `detail`. An answer for a scan this connection was not sent (another device's, one already answered, a made-up id) is dropped and logged |
-| the findings | a typed list, each closed (unknown fields refused), bounded in count (2,000) and size (1 MiB per frame, under the socket's 8 MiB, `crates/core/src/ws/upgrade.rs:28`), strings bounded: a `checkout` (its path, remotes, root commit, branch, and the services its compose and Kubernetes manifests name, each a name and an image), a kube `context` (its name, server, namespace and the CA's SHA-256), a `listener` (port, protocol, bound address, process name) and a declared `tunnel_route` (its id, its `flow` (the descriptor's kind, renamed since `kind` names the finding), local port, the node and `host:port` it reaches, and whether it is enabled: `RouteDescriptor`'s fields less its transport and organization, `crates/localapi/src/lib.rs:905`). No field holds a credential, and a finding whose strings hold one's shape is refused whole |
+| the findings | a typed list, each closed (unknown fields refused), bounded in count (2,000) and size (1 MiB per frame, under the socket's 8 MiB, `crates/core/src/ws/upgrade.rs:28`), strings bounded: a `checkout` (its path, remotes, root commit, branch, and the services its compose and Kubernetes manifests name, each a name and an image), a kube `context` (its name, server, namespace and the CA's SHA-256), a `listener` (port, protocol, bound address, process name) and a declared `tunnel_route` (its id, its `flow` (the descriptor's kind, renamed since `kind` names the finding), local port, the node and `host:port` it reaches, and whether it is enabled: `RouteDescriptor`'s fields less its transport and organization, `crates/localapi/src/lib.rs:928`). No field holds a credential, and a finding whose strings hold one's shape is refused whole |
 | what a scan writes | decision 42: what lives on its device, and nothing else. Its **checkouts** (`checkout`, keyed `<node id>/<16 hex of the path's SHA-256>`, since a path is not a key: case, spaces, separators; the path is a fact), its **listeners** (`endpoint`, keyed `<node id>:<port>/<protocol>`), and its declared tunnel routes (a fact of its own machine, `tunnel.declared`). Shared entities, a **repository** (`repo`, keyed by its remote normalized: `github.com/acme/api`, no scheme, user, port or `.git`) and a **cluster** (`cluster`, keyed by its server's `host:port`), are made bare (kind, key, name) when absent and never changed once there; the device's own entities link to them (`checkout part_of repo`, `cluster reachable_via machine` with the context's name, namespace and CA as the link's attributes) and to its machine (`checkout checked_out_at machine`, `endpoint runs_on machine`) |
 | provenance | source `scan`, and the device, on every entity, link and fact a scan writes, and on its history rows: a new `device` field beside `by`, which stays a person's (`crates/modules/knowhow/src/model.rs:174`) |
 | a later scan | replaces its device's part: what it no longer reports is archived (its own entities and links, never a shared entity), and an unchanged finding writes nothing. A device removed from the fleet takes its scan entities with its machine |
@@ -3218,7 +3218,7 @@ sequenceDiagram
 | manifests (P4-3b-2) | in a checkout, three levels down at most: compose files (`compose.yaml`, `docker-compose.yml` and their kin) and Kubernetes manifests (the documents of a workload kind), each service's name and image; 256 KiB a file, 200 files a checkout. Read through `yaml-rust2`'s event parser (already in the lockfile, by `config`), never its loader, which copies an anchor's whole subtree at every alias, so a file of a few lines can grow without bound: here an alias counts as its anchor's size against 100,000 nodes a document, and a file past it is skipped. Helm templates are not YAML until rendered, and are skipped |
 | kube contexts (P4-3b-2) | from a file the owner lists as a root (decision 46), read as the account that owns it: each context's name, server and namespace, and its cluster's CA as the SHA-256 of its certificate, the fingerprint `openssl x509 -noout -fingerprint -sha256` prints, so a person can check it by hand. The reader skips `users` without keeping a byte of it |
 | listeners (P4-3b-3) | when the owner switches on `knowhow_scan_listeners` (decision 47): the machine's TCP listeners from the system's own table, read by the daemon, since no account's file is opened. The readers `port_holder` has for one port (`agents/roomlerd/src/tunnel/port_holder.rs:148`, `:251`, `:315`), widened to every port; the daemon's own left out |
-| declared tunnel routes | the daemon's own `[[tunnel_routes]]` (`crates/agent-core/src/config.rs:1972`), read again with the roots: each route's id, kind (as `flow`), local port, node, remote and whether it is enabled (`crates/localapi/src/lib.rs:905`). The primary's only (`org` absent or `primary`): a secondary's route names another organization's node |
+| declared tunnel routes | the daemon's own `[[tunnel_routes]]` (`crates/agent-core/src/config.rs:1972`), read again with the roots: each route's id, kind (as `flow`), local port, node, remote and whether it is enabled (`crates/localapi/src/lib.rs:928`). The primary's only (`org` absent or `primary`): a secondary's route names another organization's node |
 | the answer | each finding checked as the server will check it (`Finding::check`, `crates/remote_control/src/knowhow.rs:252`) and dropped, counted, when refused, so the device never sends what the intake would refuse; a finding two roots share sent once; cut at 2,000 findings or 1 MiB (`:27`, `:29`). `done`, and `truncated` as well when a root was refused, unreadable, cut at a bound or killed at its deadline; `failed` when no root could be read. `detail` names the roots not read, and why |
 | Windows (P4-3b-4) | decision 45: every root read as the console user, through the console-user spawn exec and SSH use (`agents/roomlerd/src/exec.rs:3391`; who that is, `agents/roomlerd/src/hive_win.rs:135`). Nobody signed in is `failed` (`no_console_user`), never a read as SYSTEM |
 | the kill switches | the device's `knowhow_scan_roots` empty (nothing read: `no_roots`); its `knowhow_scan_listeners` off (no listener) |
@@ -4514,13 +4514,13 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     the daemon's own endpoint: an administrator, or root" (§3e "P3-9, `roomler connect`, as
     designed"), holds where the system daemon's socket is root's, as on Linux and macOS. It does
     not hold on Windows. There the daemon's pipe admits every interactive user, an RDP session's
-    included (`crates/localapi/src/lib.rs:3660`, `(A;;GA;;;IU)`), and `roomler exec`,
+    included (`crates/localapi/src/lib.rs:3683`, `(A;;GA;;;IU)`), and `roomler exec`,
     `roomler ssh` and `config set` act for them today. Nothing in P3-9-2a depends on the answer;
     P3-9-2b's verb does.
     - *Recommended: hold `roomler connect` to what the design said.* On Windows that is SYSTEM, an
       elevated administrator, or the account the daemon itself runs as (a per-user install). On
       Unix it is root, or the daemon's own account. The listener already reads the caller's token
-      at accept time (`pipe_client_peer`, `:2400`), and would read its SID and its elevation
+      at accept time (`pipe_client_peer`, `:2423`), and would read its SID and its elevation
       beside its session.
       - What it costs: a standard user of a machine-wide install cannot connect. An endpoint is
         served to the account that asked, so an administrator's serves no one else.
@@ -4528,11 +4528,11 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: on a shared or RDP-served machine, anyone signed in reaches the owner's
         grants.
     - *Or: the person at the console*, as keep busy's start is held
-      (`peer_may_start_keep_busy`, `:2330`): never SYSTEM, never another session.
+      (`peer_may_start_keep_busy`, `:2353`): never SYSTEM, never another session.
       - What it costs: an administrator over RDP cannot, and whoever sits at a shared machine's
         screen can.
     - *Built in P3-9-2b as recommended, pending the operator's word.* A wider answer changes one
-      gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2280`), and its test.
+      gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2303`), and its test.
 27. **What a session's egress proxy allows, before knowhow** (P3b-1), for the operator to confirm
     (P3b-0, §3e "P3b, `placeholder` egress, as designed"). The design's §7.2 takes the allowlist
     from the session's role and the knowhow audiences it may reach, and knowhow is P4. Nothing in

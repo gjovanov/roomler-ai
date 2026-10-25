@@ -502,6 +502,13 @@ the **root** half, because the two listen on different LocalAPI sockets
 (`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`). If a
 command reports "daemon not running", you are probably asking the wrong half.
 
+`roomler status` as the signed-in user carries the **root** half's overlay
+address, exit node and MagicDNS (FR-97 P2h lends them to the per-user half, which
+runs no overlay of its own) and, since #2892, says so: the address lines read
+`(the root daemon's)` and a `network` line names that daemon. The per-user
+half's own enrollments stay "overlay OFF" — they are off the mesh by design, and
+the line under them says that instead of prescribing netstack.
+
 ### Two configurations — which one the app and the CLI edit (#2871)
 
 The two halves are **two enrollments with two configuration files**, and that
@@ -525,13 +532,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4525`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4548`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3034`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3057`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 

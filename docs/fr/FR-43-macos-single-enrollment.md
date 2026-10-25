@@ -126,7 +126,7 @@ session setup and then nothing.
 ### The transport problem, stated honestly
 
 LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
-answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1718`); `TailLog`'s
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1741`); `TailLog`'s
 own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1051`). There is no server
 push, and delegation needs it in both directions — trickle ICE arrives whenever the network
 decides, not when someone asks.

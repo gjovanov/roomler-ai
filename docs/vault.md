@@ -2414,10 +2414,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the wire | `Request::Connect` and `ConnectStatus` ([`localapi/src/lib.rs:1539`](../crates/localapi/src/lib.rs#L1539)), `ConnectArgs` ([`:1550`](../crates/localapi/src/lib.rs#L1550)) and `EndpointState` ([`:1579`](../crates/localapi/src/lib.rs#L1579)); `Response::Connected` and `ConnectState` ([`:1907`](../crates/localapi/src/lib.rs#L1907)) |
-| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2280`](../crates/localapi/src/lib.rs#L2280)); the account, `ClientPeer::asker` ([`:2240`](../crates/localapi/src/lib.rs#L2240)); both read from one opening of the token, `token_facts` ([`:2506`](../crates/localapi/src/lib.rs#L2506)) |
-| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3496`](../crates/localapi/src/lib.rs#L3496)); each id kept before its answer is written ([`:3527`](../crates/localapi/src/lib.rs#L3527)), and let go at the connection's end ([`:3558`](../crates/localapi/src/lib.rs#L3558)) |
-| the daemon | `open` ([`person_connect.rs:33`](../agents/roomlerd/src/hive/person_connect.rs#L33)), `state` and `release` ([`:93`](../agents/roomlerd/src/hive/person_connect.rs#L93)); `DaemonState::connect` ([`localapi_state.rs:1726`](../agents/roomlerd/src/localapi_state.rs#L1726)) |
+| the wire | `Request::Connect` and `ConnectStatus` ([`localapi/src/lib.rs:1562`](../crates/localapi/src/lib.rs#L1562)), `ConnectArgs` ([`:1573`](../crates/localapi/src/lib.rs#L1573)) and `EndpointState` ([`:1602`](../crates/localapi/src/lib.rs#L1602)); `Response::Connected` and `ConnectState` ([`:1930`](../crates/localapi/src/lib.rs#L1930)) |
+| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2303`](../crates/localapi/src/lib.rs#L2303)); the account, `ClientPeer::asker` ([`:2263`](../crates/localapi/src/lib.rs#L2263)); both read from one opening of the token, `token_facts` ([`:2529`](../crates/localapi/src/lib.rs#L2529)) |
+| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3519`](../crates/localapi/src/lib.rs#L3519)); each id kept before its answer is written ([`:3550`](../crates/localapi/src/lib.rs#L3550)), and let go at the connection's end ([`:3581`](../crates/localapi/src/lib.rs#L3581)) |
+| the daemon | `open` ([`person_connect.rs:33`](../agents/roomlerd/src/hive/person_connect.rs#L33)), `state` and `release` ([`:93`](../agents/roomlerd/src/hive/person_connect.rs#L93)); `DaemonState::connect` ([`localapi_state.rs:1729`](../agents/roomlerd/src/localapi_state.rs#L1729)) |
 | the command | `Command::Connect` ([`cli.rs:478`](../agents/roomler-cli/src/cli.rs#L478)); `run` ([`connectcmd.rs:30`](../agents/roomler-cli/src/connectcmd.rs#L30)) and `hold` ([`:71`](../agents/roomler-cli/src/connectcmd.rs#L71)) |
 
 ## 24. A session's egress allowlist: `rc:vault.egress` (P3b-1a)

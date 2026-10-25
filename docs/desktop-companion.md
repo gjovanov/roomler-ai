@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:1973`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:1996`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -110,13 +110,13 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2066`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2089`)
    binds the first instance (retrying while another process holds the name), then runs a
-   pool of accept tasks (`accept_pipe`, `:1953`), each owning one listening instance and
+   pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
-   (`DEFAULT_PIPE_POOL`, `:1702`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
+   (`DEFAULT_PIPE_POOL`, `:1725`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
    switch** and reproduces the old single-instance behaviour.
-3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:2276`) retries a
+3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:2299`) retries a
    busy pipe at 5, 10, 20, 40, 80, 160 ms (≤ 315 ms in total); any other error (the daemon
    is not running) returns at once.
 
@@ -337,7 +337,15 @@ sequenceDiagram
   - `Peers` with the root half's peers, as the person socket serves them: the link (online,
     direct or relayed and over what, round trip) without any endpoint;
   - `Status` with its own name, version and server link, plus the root half's overlay
-    addresses, exit status and MagicDNS (`person_socket::with_machine_network`).
+    addresses, exit status and MagicDNS (`person_socket::with_machine_network`) — and, since
+    #2892, **`network_from`** (`crates/localapi/src/lib.rs:186`): the root half's node id and
+    name, set only when those fields were lent. Nothing on the wire said so before, and `roomler status` as the console user
+    printed the root half's address as this half's, right above this half's own "overlay OFF"
+    enrollments. The CLI now marks `overlay ip` / `overlay ip6` "(the root daemon's)", adds a
+    `network` line naming that daemon (`sudo roomler status` asks it), and its "not on the
+    mesh" line stops prescribing netstack to a half that is off the mesh by design (FR-43);
+    Overview's address reads "· the root daemon's (<name>)". The field is additive and absent
+    unless lent, so every other host's JSON and output are byte-identical.
 
   A root half that is slow to answer (1.5 s) leaves the half's own answer on screen for that
   poll.
@@ -345,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4525`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4548`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -356,7 +364,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1361`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1384`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -678,7 +686,7 @@ dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat 
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
 dialog is the wait (`agents/roomlerd/src/peer.rs:5590`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1140`), and the banner comes up only for a session that sees the
+`crates/localapi/src/lib.rs:1163`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
