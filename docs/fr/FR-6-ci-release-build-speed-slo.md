@@ -777,5 +777,34 @@ itself on the affected run's page. Baseline when the program started: releases t
     - 0.4.171's tag (40219775103) then compiled for another 13.6 min (MSI), 14.0 (pkg) and
       9.7 (.deb), and the whole run took 20.4 min.
     - Why: cargo judges a path crate by mtime, and a checkout makes every file new.
-  - Wave 29 probe (40228482936, a temporary push-triggered workflow on
-    `exp/fr6-w29-probe`, restore-only): PROBE-RESULTS.
+  - **Wave 29 probe** (40228482936). It is a temporary push-triggered workflow on
+    `exp/fr6-w29-probe` that restores seeds but never saves one. Each job ran the real
+    release setup and build, then the tag run's case on the same runner: stamp, make every
+    file new, two negative controls, the positive case, and a rebuild.
+    - Windows:
+      - A modified tracked file blocked reuse, and so did another job's stamp.
+      - The same tree and job reused the build. The rebuild took **1 s**, against 565 s
+        for the release build before it, and rewrote no artifact.
+      - The reused `roomlerd.exe` reported `roomlerd 0.4.171`.
+    - macOS:
+      - The same four results; the rebuild took 4 s, against 861 s.
+      - The second libvpx pass found the same Cellar (`/opt/homebrew/Cellar/libvpx/1.17.0`)
+        and kept its build.
+      - The version check then failed: the `roomlerd` in `target/` links
+        `@rpath/libavcodec.63.dylib`, which only the staged `.app` resolves
+        (`dyld: Library not loaded`). Fixed in #2914: the check now gets the vendored FFmpeg
+        dir as its library path, and falls back to the version string compiled into the
+        binary. The fix was re-probed in run 40230929108; its result goes in the next
+        entry, with 0.4.172's field run.
+    - **codegen-units for our crates only** (dependencies stay at 1), Windows, all three
+      builds on one runner:
+
+      | codegen-units | build | `roomlerd` lib + bin | `roomlerd.exe` bytes | gzip -9 |
+      |---|---|---|---|---|
+      | 1 (shipped) | 565 s | 322 + 172 s | 64,755,712 | 22,479,787 |
+      | 4 | 426 s | 231 + 122 s | 75,412,480 (+16.5%) | 25,548,333 (+13.7%) |
+      | 16 | 463 s | 250 + 140 s | 80,180,736 (+23.8%) | 26,865,851 (+19.5%) |
+
+      On four cores, 4 units beat 16. The macOS release build spent 564 s in the
+      `roomlerd` lib and 229 s in its bin (`main.rs`) of 858 s. The two run one after the
+      other, and each is a single crate.
