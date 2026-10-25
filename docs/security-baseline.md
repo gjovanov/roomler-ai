@@ -324,7 +324,16 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
   `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
-  `Devices` and `Mesh`; and since P2h, `Peers`, served through `person_view`.
+  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; and
+  since #2871 (design A, the operator's decision) `ConfigGet` — the listing, no
+  secret being on that surface, with every key the socket will not set marked
+  `read_only = "root_only"` — and `ConfigSet` of exactly the keys that are the
+  console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
+  `crates/localapi/src/lib.rs:3163`): the keys the daemon's own endpoint already
+  gated to that person because Windows' pipe admits every interactive user.
+  Never the device-owned gates `exec_enabled`, `ssh_enabled` and
+  `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
+  administrator's command (`not_on_the_person_socket_for_key`, `:3479`).
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -363,7 +372,15 @@ the directory is not the person's:
 
 The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
 new verb cannot reach it by default. Widening it is a security change and needs
-review like one. The root socket itself is unchanged. Kill switch:
+review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
+for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
+`exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
+install pending a separate policy call. The dispatcher gates the peer again
+(`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2431`): on this socket a known
+uid IS the seat's person, because the listener matched it to that person or root before
+a byte was read, and an unknown peer is refused; the server reaches none of it (the
+socket is local, and `remote_config_enabled` stays structurally outside
+`DesiredConfig`). The root socket itself is unchanged. Kill switch:
 `ROOMLERD_PERSON_SOCKET=0`.
 
 **A remote-desktop session's media transport is hardened past webrtc-rs' defaults**

@@ -406,32 +406,38 @@ which the daemon still refuses on the same terms as a local request.
    the same moment a pushed one would. See §7b — option C created that
    asymmetry, and leaving it would have made gate 4 the slower of the two.
 
-   ⚠️ **On a root-mode Mac the pane edits the GUI worker, not the daemon
-   (#2871).** The companion's LocalAPI client reaches the per-user half, which
-   under FR-43 (through P2) is a second enrollment with a file of its own, so
-   `exec_enabled` / `ssh_enabled` flipped there never reach the root daemon
-   that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
-   worker's file read `ssh_enabled = false` while the root half served SSH.
-   The root daemon's socket is root-only and its person socket refuses every
-   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3057`), so
-   gate 4 on that daemon is an administrator's: `sudo roomler config set
-   exec_enabled true`. The pane now says which file it edits and gives that
-   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;
-   [installation.md](installation.md), "Two configurations") instead of
-   showing a switch that changes nothing. Letting the console user flip the
-   root daemon's gate 4 from the app would be a **new authorization path on the
-   person socket** — Linux system installs included — and that decision is
-   open on #2871, not taken here.
-
-   ⚠️ **On a Linux system install the pane reaches the root daemon over its
-   person socket (#2891)**, which refuses `ConfigGet` / `ConfigSet` outright,
-   so there was no switch to flip at all — the pane said "Could not load the
-   configuration" after falling back to a per-user file a system install does
-   not have. It now says whose configuration it is and gives the same command,
-   `sudo roomler config set exec_enabled true`, in place of rows
-   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`). Gate 4 on a
-   root daemon is an administrator's on both OSes; nothing was admitted on the
-   person socket for it.
+   ⚠️ **On a root-mode install the pane reaches the root daemon over its
+   person socket (#2871, design A).** Through FR-43 P2 a supervised Mac is two
+   enrollments with two files, and the companion's LocalAPI client reaches the
+   per-user half, so `exec_enabled` / `ssh_enabled` flipped in the pane changed
+   a file the root daemon — the one `roomler exec` and `roomler ssh` talk to —
+   never reads (measured on 0.4.169: the worker's file read `ssh_enabled =
+   false` while the root half served SSH). The root daemon's own socket is
+   root-only, and its person socket admitted no config verb at all, on a Mac's
+   root half and on a Linux system install alike (#2891: there the pane read
+   "Could not load the configuration" and fell back to a per-user file a system
+   install does not have). Design A (the operator, 2026-10-25) admits two: the
+   listing, and `ConfigSet` of exactly the keys that are the console person's
+   own call — the table `localapi::CONSOLE_PERSON_KEYS`
+   (`crates/localapi/src/lib.rs:3163`): where files and recordings land, keep
+   busy, privacy mode, lock on end, display match, the browser check, what a
+   session may use, external access. **Gate 4 is not among them.**
+   `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
+   read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
+   `:3437`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3479`): on a
+   root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
+   on both OSes. The pane shows the root daemon's value of the switch, marked,
+   instead of another daemon's — on a two-half Mac the machine-side rows come
+   from the root half and the session rows from the worker
+   (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`;
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:614`; the table
+   in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
+   than design A, which still refuses the listing, gets the administrator's
+   path in place of rows (`root_daemon_only`,
+   `agents/roomler-desktop/src/commands.rs:1026`). Whether the person at the
+   seat may switch gate 4 on a root-mode install — Windows' pipe lets every
+   interactive user — is the policy call still open on #2871.
 
 ## 9. Not built, on purpose
 

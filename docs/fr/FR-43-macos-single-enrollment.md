@@ -126,7 +126,7 @@ session setup and then nothing.
 ### The transport problem, stated honestly
 
 LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
-answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1741`); `TailLog`'s
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1754`); `TailLog`'s
 own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1074`). There is no server
 push, and delegation needs it in both directions — trickle ICE arrives whenever the network
 decides, not when someone asks.
@@ -154,7 +154,7 @@ screen appears".
 ⚠️ `RcAttach` must be **daemon-only**, not something any local process can call: it would
 otherwise let any user-session process on the box volunteer to serve remote-control
 sessions. The socket's own ACL is the trust boundary today
-(`lib.rs:1841-1851` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
+(`lib.rs:1854-1864` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
 because the worker is an ordinary user process and so is an attacker's. The attach must
 carry the one-shot secret the daemon passed to the worker in its spawn environment, and the
 daemon must accept exactly one attached worker at a time.
@@ -804,3 +804,17 @@ The underlying fix is **P3**: one enrollment, one file, the worker's session kno
 down as `WORKER_ENV_FORWARD` already does. Whether the console user may set the root
 half's device-owned gates from the app *before* P3 — a new authorization path on the
 person socket — is the decision open on #2871.
+
+**Design A shipped (#2871, the operator's decision, 2026-10-25).** The root half's person
+socket now serves the configuration — the listing, marked per key, and `ConfigSet` of
+exactly the console person's own keys (`localapi::CONSOLE_PERSON_KEYS`,
+`crates/localapi/src/lib.rs:3163`) — and the companion shows the Mac as one device, each
+row from the half that reads the key, by its group (`config_surface::Owner`,
+`crates/agent-core/src/config_surface.rs:210`): the session groups to the worker, the
+rest to the root half ([desktop-companion.md](../desktop-companion.md) §5). The
+device-owned gates stay root's; P3 remains the home. Two P2 facts the split records for
+P3: the root half forwards a few session knobs to the worker as a floor
+(`WORKER_ENV_FORWARD`), and a delegated session's policies are judged against both halves'
+configs — the root's signalling first (the browser check, the session-policy mask,
+consent), then the worker's as it serves the delegated `SessionCreated` through the same
+code — so the worker's copy, the one the app edits, only ever tightens the root's.

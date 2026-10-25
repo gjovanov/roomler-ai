@@ -94,8 +94,9 @@
 
   async function loadEntries() {
     try {
-      const list = await invoke('cmd_config_entries');
-      entries = new Map(list.map((e) => [e.key, e]));
+      // #2871 — `{ entries, machine_merged }`; the Welcome flow reads values.
+      const listing = await invoke('cmd_config_entries');
+      entries = new Map(listing.entries.map((e) => [e.key, e]));
     } catch (e) {
       console.warn('welcome: config entries unavailable', e);
     }
