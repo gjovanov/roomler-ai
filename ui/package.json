@@ -14,7 +14,8 @@
     "test:unit:coverage": "vitest run --coverage",
     "e2e": "playwright test --config=playwright.config.cjs",
     "e2e:ui": "playwright test --config=playwright.config.cjs --ui",
-    "test:phone": "vite build && playwright test -c playwright.phone.config.ts"
+    "test:phone": "vite build && playwright test -c playwright.phone.config.ts",
+    "test:harness": "playwright test -c playwright.harness.config.ts"
   },
   "dependencies": {
     "@emoji-mart/data": "^1.2.1",

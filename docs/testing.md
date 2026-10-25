@@ -29,6 +29,7 @@ flowchart TB
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
+| Soft-keyboard harness | `cd ui && bun run test:harness` | nothing — one harness page on the Vite dev server, in a real Chromium (`ui/e2e-harness/`, #2888) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
 | Encoder smoke | `roomlerd encoder-smoke --encoder hardware [--codec hevc]` | the host's GPU — 10 synthetic frames, prints the cascade's decisions |
 
@@ -131,6 +132,41 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
       PW --> C0{"page scrolls<br/>sideways?"}
       PW --> C1{"visible content<br/>past the edge?"}
       PW --> C2{"primary action<br/>on screen?"}
+  ```
+- **The soft-keyboard harness** (`ui/e2e-harness/`, #2888): the viewer's key
+  path in a REAL Chromium. The composable cannot be instantiated outside the
+  app, and jsdom has no default actions — a keydown there never inserts a
+  character, so the `input` event the soft keyboard types through never fires
+  and a key's second owner is invisible. `softkbd.html` mounts the real
+  `MobileKeyboard.vue` and a window-level capture listener running the real
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14164`,
+  `:14236`), both recording what the host would get and WHO sent it.
+  `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
+  OS keyboard does (`insertText`: an `input` event and no keydown), composes
+  through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
+  owner per key in every viewer state: the soft keyboard open with the pointer
+  outside the stage, inside it, or under keyboard lock; closed with the stage
+  or the body focused; one of the viewer's own inputs focused. The Vite DEV
+  server serves the page (`playwright.harness.config.ts`); `vite build` never
+  includes it. CI runs it beside the phone smoke on any PR that touches `ui/`
+  (`ui-phone-smoke.yml`, job `soft-keyboard-harness`).
+
+  Its first run, on the code before the fix, measured the bug: with the soft
+  keyboard open and the pointer off the stage, `a`, `Shift+A`, Space, Enter,
+  Tab, Escape and the arrows reached the host twice, and Ctrl+V pasted on the
+  host AND typed the browser's clipboard; Backspace, Delete, Home, F2 and
+  Ctrl+C arrived once. ⚠️ The recorder keeps who sent each frame on purpose:
+  a count that happens to add up to one is not the same as one owner.
+
+  ```mermaid
+  flowchart LR
+      D["vite dev :4174<br/>e2e-harness/softkbd.html"] --> PW["Playwright<br/>Chromium · hasTouch"]
+      PW --> K["press · insertText · IME · paste"]
+      K --> L["window capture listener<br/>routeKeyEvent → applyKeyRoute"]
+      K --> M["MobileKeyboard.vue<br/>input · compositionend · keydown"]
+      L --> R["recorder: the frame + who sent it"]
+      M --> R
+      R --> A{"one owner<br/>per key?"}
   ```
 
 ## In-crate Rust unit tests

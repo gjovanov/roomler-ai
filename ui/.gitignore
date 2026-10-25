@@ -38,5 +38,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 /playwright-report/
 /test-results-phone/
 /playwright-report-phone/
+/test-results-harness/
+/playwright-report-harness/
 /blob-report/
 /playwright/.cache/

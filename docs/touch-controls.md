@@ -293,7 +293,7 @@ layout:
   every event to the page
   ([`useRemoteControl.ts:11652`](../ui/src/composables/useRemoteControl.ts#L11652)), and pausing first lets go
   of whatever the keyboard held on the host
-  ([`useRemoteControl.ts:12015`](../ui/src/composables/useRemoteControl.ts#L12015)).
+  ([`useRemoteControl.ts:11912`](../ui/src/composables/useRemoteControl.ts#L11912)).
 - **A live preview** runs the draft through the real overlay on a sink that sends nothing, so a button can
   be tried, a macro included, without pressing anything on the host.
 

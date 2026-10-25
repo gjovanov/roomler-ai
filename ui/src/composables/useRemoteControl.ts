@@ -11664,47 +11664,6 @@ export function useRemoteControl(
       sendInput({ t: 'key', code: KEY_V_HID, down: false, mods })
     }
 
-    function isCtrlVOverViewer(ev: KeyboardEvent): boolean {
-      // Locked fullscreen counts as "over the viewer": pointerInside
-      // is driven by pointerenter/leave on the surface and can be
-      // stale right after entering fullscreen via the toolbar button
-      // (which sits OUTSIDE the fullscreen target). Without this, the
-      // locked-mode preventDefault-everything policy would suppress
-      // the paste event and degrade Ctrl+V to a stale-clipboard flush.
-      if (!pointerInside && !keyboardLockActive.value) return false
-      if (ev.code !== 'KeyV') return false
-      if (!(ev.ctrlKey || ev.metaKey)) return false
-      // If focus is in an INPUT / TEXTAREA / contenteditable element,
-      // the operator is editing a page text field Ã¢ÂÂ let the native
-      // paste flow happen there; don't intercept.
-      const target = ev.target as Element | null
-      if (target) {
-        const tag = target.tagName
-        if (tag === 'INPUT' || tag === 'TEXTAREA') return false
-        const editable = (target as HTMLElement).isContentEditable
-        if (editable) return false
-      }
-      return true
-    }
-
-    /** Ctrl+C over viewer (rc.18 P5). Mirrors the Ctrl+V helper's
-     *  carve-out for page-text-field focus so the operator's normal
-     *  copy-from-form-field doesn't get hijacked. */
-    function isCtrlCOverViewer(ev: KeyboardEvent): boolean {
-      // Same locked-fullscreen carve-out as isCtrlVOverViewer.
-      if (!pointerInside && !keyboardLockActive.value) return false
-      if (ev.code !== 'KeyC') return false
-      if (!(ev.ctrlKey || ev.metaKey)) return false
-      const target = ev.target as Element | null
-      if (target) {
-        const tag = target.tagName
-        if (tag === 'INPUT' || tag === 'TEXTAREA') return false
-        const editable = (target as HTMLElement).isContentEditable
-        if (editable) return false
-      }
-      return true
-    }
-
     /** Schedule a 25 ms-delayed read of the host's clipboard + mirror
      *  to the browser's `navigator.clipboard`. 25 ms is enough for
      *  the remote app to finish its copy (well under human perception)
@@ -11756,123 +11715,54 @@ export function useRemoteControl(
       }, delayMs)
     }
 
+    // The key path's EFFECTS, applied by `applyKeyRoute` to the verdict of
+    // `routeKeyEvent` — both pure, at the end of this file, where the spec's
+    // matrix and the soft-keyboard harness (`ui/e2e-harness/`) lock them.
+    const keyEffects: KeyRouteEffects = {
+      send: sendInput,
+      // FR-13 (#789): on a mac host, rewrite Ctrl→Cmd (0xe0/0xe4→0xe3) unless
+      // the operator disabled translation. The held tracker records the
+      // SUBSTITUTED code so focus-loss release matches what the host believes
+      // is down.
+      hostKeyCode: (code, down) =>
+        translateModifierForHost(code, down, hostIsMac.value && ctrlAsCmd.value, ctrlSubState),
+      held: (code, down) => heldInputs.key(code, down),
+      heldCount: () => heldInputs.size(),
+      releaseHeld: releaseHeldInputs,
+      sendCtrlAltDel,
+      // Phase 5 (file-DC v2) — the deferred Ctrl+V: the keystroke waits for the
+      // `paste` event (`onPaste` below decides: files → upload, text → mirror
+      // to the host's clipboard then flush, nothing → flush). The 50 ms timer
+      // flushes it as a plain Ctrl+V when no paste event comes (an empty
+      // clipboard, a denied read).
+      deferPaste(mods) {
+        if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
+        const timer = setTimeout(() => {
+          flushPendingCtrlV()
+        }, 50)
+        pendingCtrlV = { mods, timer }
+      },
+      // rc.18: after a Ctrl+C aimed at the host, mirror its clipboard back to
+      // the browser.
+      mirrorClipboard: scheduleClipboardMirror,
+    }
+
     function onKey(ev: KeyboardEvent, down: boolean) {
-      // FR-111 P4b-2 — a dialog is taking the typing: leave the event to it,
-      // untouched (no preventDefault, no stopPropagation).
-      if (keyboardPaused.value) return
-      // #2869 — the key is typed into one of the viewer's OWN inputs (the
-      // files drawer's path field, a dialog's field): it belongs to that
-      // input. Leave it untouched, as above. This listener is on the window
-      // in the capture phase, so without this it forwarded the key BEFORE
-      // the field saw it. The stage and the soft keyboard's textarea are
-      // the host's and are exempt inside `isViewerOwnInput`. A chord begun
-      // over the stage and finished in a field must not leave its modifier
-      // down on the host: let go of what is still held first.
-      if (isViewerOwnInput(ev.target, surface)) {
-        if (heldInputs.size() > 0) releaseHeldInputs()
-        return
-      }
-      // Ctrl+Alt+End (RDP convention) / literal Ctrl+Alt+Del Ã¢ÂÂ
-      // canonical SAS sequence via sendCtrlAltDel(). Swallow BOTH key
-      // directions so no stray End/Delete HID events reach the host;
-      // `ev.repeat` guard fires the SAS exactly once per held chord.
-      // Gated on driving intent: pointer over the viewer OR locked
-      // fullscreen (where pointerInside can be stale until the first
-      // boundary event). Must run BEFORE the Ctrl+V deferral Ã¢ÂÂ the
-      // chords are disjoint but the ordering keeps this hot path
-      // first-match.
-      if (
-        isRemoteSasChord(ev, (k) => ev.getModifierState(k)) &&
-        (pointerInside || keyboardLockActive.value)
-      ) {
-        ev.preventDefault()
-        ev.stopPropagation()
-        if (down && !ev.repeat) sendCtrlAltDel()
-        return
-      }
-
-      // Ctrl+V deferral path. Keep preventDefault on keydown so the
-      // subsequent `paste` event fires (and so the browser doesn't
-      // run a default for the V key). Skip the normal sendInput path
-      // Ã¢ÂÂ flushPendingCtrlV / paste handler will emit the keystroke
-      // if the clipboard didn't have files.
-      if (isCtrlVOverViewer(ev)) {
-        // CRITICAL: do NOT call ev.preventDefault() on this keydown.
-        // Per HTML spec, preventDefault on a keydown that would
-        // trigger paste suppresses the subsequent `paste` event
-        // entirely Ã¢ÂÂ `clipboardData` is never delivered to our
-        // listener and the deferred-keystroke design degenerates
-        // into "always flush as plain Ctrl+V" (rc.12-rc.15 bug).
-        // Field repro rc.15 2026-05-07: Ctrl+V never uploads files.
-        //
-        // Instead: stash pendingCtrlV (skip the sendInput keystroke
-        // forwarding) and let the browser's natural paste pipeline
-        // fire. The window-level `paste` listener decides Ã¢ÂÂ files Ã¢ÂÂ
-        // upload, text Ã¢ÂÂ clipboard:write + flush keystroke, empty
-        // clipboard Ã¢ÂÂ 50 ms timer flushes as normal Ctrl+V.
-        //
-        // Keystroke forwarding is suppressed by the `return` below
-        // (we exit before `sendInput`); the host won't see Ctrl+V
-        // until the paste handler explicitly flushes it.
-        if (down) {
-          if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
-          const mods =
-            (ev.ctrlKey ? 1 : 0) |
-            (ev.shiftKey ? 2 : 0) |
-            (ev.altKey ? 4 : 0) |
-            (ev.metaKey ? 8 : 0)
-          const timer = setTimeout(() => {
-            // Paste didn't fire (empty clipboard / browser denied
-            // the read) Ã¢ÂÂ flush as a normal Ctrl+V keystroke so
-            // the operator's chord still reaches the remote app.
-            flushPendingCtrlV()
-          }, 50)
-          pendingCtrlV = { mods, timer }
-        }
-        // rc.18: stop propagation so a focused nav-drawer item
-        // doesn't ALSO see the Ctrl+V and trigger its own
-        // keyboard-activation. Capture-phase keydown means we run
-        // before the focused element's bubble-phase handlers.
-        if (pointerInside || keyboardLockActive.value) ev.stopPropagation()
-        // keyup with a pending deferral: don't emit a stray V-up.
-        // The flush path emits both down + up together.
-        return
-      }
-
-      const action = decideKeyAction(ev, down, (k) => ev.getModifierState(k))
-      if (action.kind === 'drop') return
-      if (shouldPreventDefault(ev, pointerInside, keyboardLockActive.value)) ev.preventDefault()
-      // rc.18: stop propagation when pointer is over viewer so a
-      // focused page button / nav-drawer item doesn't ALSO see this
-      // keystroke and fire its own keyboard-activation `@click`. The
-      // capture-phase registration of this listener (see below) means
-      // stopPropagation here cuts the bubble path before any focused
-      // descendant runs its handler. Locked fullscreen counts too.
-      if (pointerInside || keyboardLockActive.value) ev.stopPropagation()
-      if (action.kind === 'text') {
-        sendInput({ t: 'key_text', text: action.text })
-      } else {
-        // FR-13 (#789): on a mac host, rewrite Ctrl→Cmd (0xe0/0xe4→0xe3)
-        // unless the operator disabled translation. The held tracker
-        // records the SUBSTITUTED code so focus-loss release matches what
-        // the host believes is down.
-        const code = translateModifierForHost(
-          action.code,
-          action.down,
-          hostIsMac.value && ctrlAsCmd.value,
-          ctrlSubState,
-        )
-        sendInput({ t: 'key', code, down: action.down, mods: action.mods })
-        heldInputs.key(code, action.down)
-      }
-      // rc.18: after a Ctrl+C-over-viewer is forwarded to the host,
-      // schedule the auto-mirror of the host's clipboard back to the
-      // browser. Only fire on `down` (Ctrl+C produces a down event;
-      // we don't want to fire twice on up). Carve-outs (focus inside
-      // INPUT/TEXTAREA/contenteditable) live in isCtrlCOverViewer.
-      if (down && isCtrlCOverViewer(ev)) {
-        scheduleClipboardMirror()
-      }
+      applyKeyRoute(
+        routeKeyEvent(
+          ev,
+          down,
+          {
+            pointerInside,
+            keyboardLocked: keyboardLockActive.value,
+            keyboardPaused: keyboardPaused.value,
+            surface,
+          },
+          (k) => ev.getModifierState(k),
+        ),
+        ev,
+        keyEffects,
+      )
     }
 
     function onPaste(ev: ClipboardEvent) {
@@ -11880,6 +11770,13 @@ export function useRemoteControl(
       // events that come from elsewhere (e.g. an editable field
       // outside the deferral path) keep their default handling.
       if (!pendingCtrlV) return
+      // #2888 — the deferral has this paste: consume it. With the soft
+      // keyboard's textarea focused (a hardware Ctrl+V on a tablet) the
+      // browser would otherwise also insert the clipboard text there, and
+      // `MobileKeyboard.vue`'s `input` handler would type it on the host on
+      // top of the Ctrl+V flushed below. With nothing editable focused the
+      // default does nothing anyway.
+      ev.preventDefault()
       const dt = ev.clipboardData
       if (!dt) {
         flushPendingCtrlV()
@@ -13695,7 +13592,7 @@ function browserButton(n: number): 'left' | 'right' | 'middle' | 'back' | 'forwa
  *  RDP-convention Ctrl+Alt+End chord (see [`isRemoteSasChord`]).
  *  Exported so unit tests can lock the policy. */
 export function shouldPreventDefault(
-  ev: KeyboardEvent,
+  ev: Pick<KeyboardEvent, 'code' | 'ctrlKey' | 'altKey' | 'metaKey'>,
   pointerInside: boolean,
   keyboardLocked = false,
 ): boolean {
@@ -13756,18 +13653,21 @@ export function isRemoteSasChord(
  *  blanket "skip editable targets" would break phones:
  *   - anything inside the stage (`surface`) — the remote picture itself;
  *   - the soft keyboard's off-screen textarea (`MobileKeyboard.vue`,
- *     marked `data-rc-capture`). Its typed text reaches the host through
- *     its own `input` handler, but its KEYDOWNS are forwarded by this
- *     listener on purpose: a Backspace on an always-empty textarea raises
- *     no `input` event, and a hardware keyboard's chords (Ctrl+C) never
- *     do — the keydown is the only way either reaches the host.
+ *     marked `data-rc-capture`, `isSoftKeyboardTarget`). Its typed text
+ *     reaches the host through its own `input` handler, but its KEYDOWNS
+ *     are forwarded by this listener on purpose: a Backspace on an
+ *     always-empty textarea raises no `input` event, and a hardware
+ *     keyboard's chords (Ctrl+C) never do — the keydown is the only way
+ *     either reaches the host. And for every keydown it forwards, the
+ *     listener is the ONE owner (#2888, `routeKeyEvent`): default
+ *     prevented, propagation stopped, so the textarea never also types it.
  *
  *  Pure and exported for vitest (the composable itself cannot be
  *  instantiated in a spec). */
 export function isViewerOwnInput(target: EventTarget | null, surface: Element | null): boolean {
   if (!(target instanceof Element)) return false
   if (surface && surface.contains(target)) return false
-  if (target.closest('[data-rc-capture]')) return false
+  if (target.closest(RC_CAPTURE_SELECTOR)) return false
   const tag = target.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
   // `isContentEditable` is the browser's answer (inherits from the editing
@@ -14095,6 +13995,286 @@ export function translateModifierForHost(
     return 0xe3
   }
   return code
+}
+
+/** The attribute that marks an editable element as a capture surface of the
+ *  HOST's — the soft keyboard's off-screen textarea (`MobileKeyboard.vue`).
+ *  `isViewerOwnInput` and `isSoftKeyboardTarget` both read it, so the two
+ *  cannot disagree about one element. */
+export const RC_CAPTURE_SELECTOR = '[data-rc-capture]'
+
+/** Is this key event's target the soft keyboard's capture textarea (anything
+ *  marked `data-rc-capture`)? Such a key is the HOST's, and the window
+ *  listener is its ONE owner (#2888) — see `routeKeyEvent`. */
+export function isSoftKeyboardTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(RC_CAPTURE_SELECTOR) !== null
+}
+
+/** The fields of a `KeyboardEvent` that `routeKeyEvent` reads — a Pick, so a
+ *  spec can route a real jsdom event and the harness a real browser one. */
+export type RoutableKeyEvent = Pick<
+  KeyboardEvent,
+  | 'key'
+  | 'code'
+  | 'ctrlKey'
+  | 'altKey'
+  | 'metaKey'
+  | 'shiftKey'
+  | 'isComposing'
+  | 'keyCode'
+  | 'repeat'
+  | 'target'
+>
+
+/** What the viewer knows when a key arrives, besides the event itself. */
+export interface KeyRouteState {
+  /** The pointer is over the stage (`pointerenter` / `pointerleave`). On a
+   *  touch screen this is false between taps: a finger leaves when it lifts. */
+  pointerInside: boolean
+  /** Keyboard Lock is active (locked fullscreen, Chromium). */
+  keyboardLocked: boolean
+  /** A dialog has taken over the typing (FR-111 P4b-2, `keyboardPaused`). */
+  keyboardPaused: boolean
+  /** The stage the input is attached to; `null` in a bare spec. */
+  surface: Element | null
+}
+
+/** `onKey`'s verdict on one key event, as data: what reaches the host, and
+ *  whether the browser's default and the event's propagation are stopped.
+ *  `applyKeyRoute` carries it out; `routeKeyEvent` decides it. Both are pure
+ *  and exported, so the spec's matrix and the soft-keyboard harness
+ *  (`ui/e2e-harness/`) run the production decision, not a copy of it. */
+export type KeyRoute =
+  /** Left to whoever else wants it: nothing sent, no `preventDefault`, no
+   *  `stopPropagation`. `paused`: a dialog has the typing (FR-111 P4b-2).
+   *  `viewer-own`: one of the viewer's own inputs has it (#2869) — and what
+   *  the host still holds is let go. `drop`: nothing to send (an IME keydown,
+   *  a printable key's release, a `code` with no HID usage). */
+  | { kind: 'untouched'; why: 'paused' | 'viewer-own' | 'drop' }
+  /** Ctrl+Alt+End (RDP convention) / a literal Ctrl+Alt+Del: both key
+   *  directions are swallowed so no stray End or Delete reaches the host;
+   *  `fire` is true once per held chord (the first, non-repeat keydown). */
+  | { kind: 'sas'; fire: boolean }
+  /** Ctrl+V / Cmd+V aimed at the host — DEFERRED (file-DC v2, Phase 5). The
+   *  keydown stashes `mods` and waits for the `paste` event; the keyup is
+   *  swallowed (the flush emits down + up together). ⚠️ Never
+   *  `preventDefault` this keydown: per the HTML spec that suppresses the
+   *  `paste` event entirely, and the deferral degenerates into "always flush
+   *  a plain Ctrl+V" (rc.12–rc.15; field repro rc.15, 2026-05-07: Ctrl+V
+   *  never uploaded files). */
+  | { kind: 'ctrl-v'; down: boolean; mods: number; stopPropagation: boolean }
+  /** A printable character with no real chord: `InputMsg::KeyText`. */
+  | {
+      kind: 'text'
+      text: string
+      preventDefault: boolean
+      stopPropagation: boolean
+      mirrorClipboard: boolean
+    }
+  /** A HID key frame: a chord, a named key, Tab, a modifier. `code` is the
+   *  usage BEFORE the mac Ctrl→Cmd substitution (`KeyRouteEffects.hostKeyCode`). */
+  | {
+      kind: 'key'
+      code: number
+      down: boolean
+      mods: number
+      preventDefault: boolean
+      stopPropagation: boolean
+      mirrorClipboard: boolean
+    }
+
+/** Ctrl+V / Cmd+V aimed at the host: the chord the viewer DEFERS until the
+ *  `paste` event says what the clipboard holds (files → upload, text →
+ *  mirror then paste, nothing → a plain Ctrl+V). `driving` is "the operator
+ *  is driving the host": the pointer over the stage, a locked fullscreen
+ *  (where `pointerInside` can be stale right after entering fullscreen via
+ *  the toolbar button, which sits OUTSIDE the fullscreen target — without
+ *  it the locked-mode preventDefault-everything policy would suppress the
+ *  paste event and degrade Ctrl+V to a stale-clipboard flush), or the soft
+ *  keyboard's textarea as the target (#2888).
+ *
+ *  A page text field's own Ctrl+V never reaches this: `routeKeyEvent`
+ *  stepped aside for the viewer's own inputs first (#2869). The soft
+ *  keyboard's textarea does reach it and is the host's — its paste is the
+ *  deferral's, and `onPaste` consumes the event so the textarea never also
+ *  types the clipboard. Until #2888 an editable target was carved out here,
+ *  which sent the textarea's Ctrl+V as a plain keystroke AND let the paste
+ *  land in it: the host pasted, then typed the browser's clipboard too. */
+export function isDeferredPasteChord(
+  ev: Pick<KeyboardEvent, 'code' | 'ctrlKey' | 'metaKey'>,
+  driving: boolean,
+): boolean {
+  if (!driving) return false
+  if (ev.code !== 'KeyV') return false
+  return ev.ctrlKey || ev.metaKey
+}
+
+/** Ctrl+C / Cmd+C aimed at the host (rc.18): forwarded like any chord, and
+ *  the host's clipboard is then mirrored back to the browser. The same
+ *  `driving` as the paste chord, with the same reasoning about editable
+ *  targets. */
+export function isCopyChord(
+  ev: Pick<KeyboardEvent, 'code' | 'ctrlKey' | 'metaKey'>,
+  driving: boolean,
+): boolean {
+  if (!driving) return false
+  if (ev.code !== 'KeyC') return false
+  return ev.ctrlKey || ev.metaKey
+}
+
+/** The modifier bitfield of the wire's `Key` frame: 0x01 Ctrl, 0x02 Shift,
+ *  0x04 Alt, 0x08 Meta. */
+function modifierBits(ev: Pick<KeyboardEvent, 'ctrlKey' | 'shiftKey' | 'altKey' | 'metaKey'>): number {
+  return (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
+}
+
+/**
+ * Decide what one key event does — the whole of `onKey`'s policy, pure.
+ *
+ * In order:
+ *  1. a paused keyboard (a dialog has the typing) leaves the event alone;
+ *  2. a key typed into one of the viewer's OWN inputs is that input's
+ *     (`isViewerOwnInput`, #2869);
+ *  3. the SAS chord, when the operator is driving the host;
+ *  4. the deferred Ctrl+V, when driving (`isDeferredPasteChord`);
+ *  5. `decideKeyAction`: IME and unmapped keys are dropped, a printable
+ *     character becomes text, everything else a HID frame;
+ *  6. `shouldPreventDefault` says whether the browser's own handling of the
+ *     key is suppressed; propagation is stopped whenever the operator is
+ *     driving (rc.18: a focused page button must not ALSO see the key).
+ *
+ * "Driving" is the pointer over the stage, a locked fullscreen, or — #2888 —
+ * the soft keyboard's textarea as the target: the one place where a key the
+ * listener forwards must ALSO have its default prevented, whatever the key,
+ * or the textarea receives it as well and `MobileKeyboard.vue` types it a
+ * second time. One owner per key:
+ *
+ *  | the listener…                         | the textarea's own path carries |
+ *  |---------------------------------------|---------------------------------|
+ *  | forwards (text or HID): default       | nothing — no `input` event, and |
+ *  | prevented, propagation stopped        | `onKeyDown` never runs          |
+ *  | drops (IME, `keyCode` 229, a `code`   | the typed text, the composition,|
+ *  | it cannot map): untouched             | the code-less Enter / Tab       |
+ *  | defers Ctrl+V: default NOT prevented  | nothing — `onPaste` consumes    |
+ *  | (the paste event must fire)           | the paste event                 |
+ *
+ * The `getModifierState` parameter is split out so a spec can drive
+ * `AltGraph` without a real DOM event (`KeyboardEventInit` has no such field).
+ */
+export function routeKeyEvent(
+  ev: RoutableKeyEvent,
+  down: boolean,
+  state: KeyRouteState,
+  getModifierState: (key: string) => boolean = () => false,
+): KeyRoute {
+  if (state.keyboardPaused) return { kind: 'untouched', why: 'paused' }
+  if (isViewerOwnInput(ev.target, state.surface)) return { kind: 'untouched', why: 'viewer-own' }
+  // #2888 — a key aimed at the soft keyboard's textarea is the host's, with
+  // this listener as its ONE owner: driving, like a key over the stage, and
+  // its browser default prevented whatever the key (below), so the textarea
+  // never ALSO receives the character, the newline or the pasted text that
+  // `MobileKeyboard.vue`'s `input` handler would type a second time.
+  const softKeyboard = isSoftKeyboardTarget(ev.target)
+  const driving = state.pointerInside || state.keyboardLocked || softKeyboard
+  // Before the Ctrl+V deferral: the chords are disjoint, the ordering keeps
+  // this hot path first-match.
+  if (driving && isRemoteSasChord(ev, getModifierState)) {
+    return { kind: 'sas', fire: down && !ev.repeat }
+  }
+  if (isDeferredPasteChord(ev, driving)) {
+    return { kind: 'ctrl-v', down, mods: modifierBits(ev), stopPropagation: driving }
+  }
+  const action = decideKeyAction(ev, down, getModifierState)
+  // Dropped BEFORE any preventDefault: what this listener does not send, the
+  // soft keyboard's own `input` / `compositionend` path still carries.
+  if (action.kind === 'drop') return { kind: 'untouched', why: 'drop' }
+  const preventDefault =
+    softKeyboard || shouldPreventDefault(ev, state.pointerInside, state.keyboardLocked)
+  // Only on the down: a chord produces one keydown, and the mirror must not
+  // fire twice on the up.
+  const mirrorClipboard = down && isCopyChord(ev, driving)
+  if (action.kind === 'text') {
+    return { kind: 'text', text: action.text, preventDefault, stopPropagation: driving, mirrorClipboard }
+  }
+  return {
+    kind: 'key',
+    code: action.code,
+    down: action.down,
+    mods: action.mods,
+    preventDefault,
+    stopPropagation: driving,
+    mirrorClipboard,
+  }
+}
+
+/** What `applyKeyRoute` reaches for — the viewer's side effects, as the
+ *  composable wires them in `attachInput`, or as a spec or the harness
+ *  records them. */
+export interface KeyRouteEffects {
+  /** `sendInput`: one frame to the input data channel. */
+  send(msg: Record<string, unknown>): void
+  /** The usage the host should see for this one — FR-13's Ctrl→Cmd
+   *  substitution on a mac host (`translateModifierForHost`). */
+  hostKeyCode(code: number, down: boolean): number
+  /** The held-input tracker: what is down on the host, for a blur to let go. */
+  held(code: number, down: boolean): void
+  heldCount(): number
+  /** `releaseHeldInputs`: let go of everything the host still holds. */
+  releaseHeld(): void
+  sendCtrlAltDel(): void
+  /** Stash the deferred Ctrl+V with its modifier bits and arm the 50 ms
+   *  fallback flush. */
+  deferPaste(mods: number): void
+  /** `scheduleClipboardMirror`: read the host's clipboard back after a copy. */
+  mirrorClipboard(): void
+}
+
+/** Carry out a `KeyRoute` on the event and the host. This is the one place
+ *  the verdict becomes `preventDefault` / `stopPropagation` / a frame — the
+ *  composable's `onKey` and the harness both call it, so neither can drift
+ *  from the other. */
+export function applyKeyRoute(
+  route: KeyRoute,
+  ev: Pick<KeyboardEvent, 'preventDefault' | 'stopPropagation'>,
+  fx: KeyRouteEffects,
+): void {
+  switch (route.kind) {
+    case 'untouched':
+      // #2869 — a chord begun over the stage and finished in one of the
+      // viewer's own fields must not leave its modifier down on the host. (A
+      // pause let go when it began: the watch on `keyboardPaused`.)
+      if (route.why === 'viewer-own' && fx.heldCount() > 0) fx.releaseHeld()
+      return
+    case 'sas':
+      ev.preventDefault()
+      ev.stopPropagation()
+      if (route.fire) fx.sendCtrlAltDel()
+      return
+    case 'ctrl-v':
+      // CRITICAL: no `ev.preventDefault()` here — see `KeyRoute`. The host sees
+      // no Ctrl+V until the paste handler (or the fallback timer) flushes it.
+      if (route.down) fx.deferPaste(route.mods)
+      // rc.18: a focused nav-drawer item must not ALSO see the chord and fire
+      // its own keyboard activation; the capture-phase registration puts this
+      // listener first.
+      if (route.stopPropagation) ev.stopPropagation()
+      return
+    case 'text':
+    case 'key':
+      if (route.preventDefault) ev.preventDefault()
+      // rc.18: the capture-phase registration means stopping here cuts the
+      // bubble path before any focused descendant runs its handler.
+      if (route.stopPropagation) ev.stopPropagation()
+      if (route.kind === 'text') {
+        fx.send({ t: 'key_text', text: route.text })
+      } else {
+        const code = fx.hostKeyCode(route.code, route.down)
+        fx.send({ t: 'key', code, down: route.down, mods: route.mods })
+        fx.held(code, route.down)
+      }
+      if (route.mirrorClipboard) fx.mirrorClipboard()
+      return
+  }
 }
 
 export { browserButton, kbdCodeToHid }

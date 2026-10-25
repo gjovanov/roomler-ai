@@ -94,6 +94,15 @@ import {
   nextDirPath,
   isRootsRequest,
   isViewerOwnInput,
+  isSoftKeyboardTarget,
+  isDeferredPasteChord,
+  isCopyChord,
+  routeKeyEvent,
+  applyKeyRoute,
+  RC_CAPTURE_SELECTOR,
+  type KeyRoute,
+  type KeyRouteState,
+  type KeyRouteEffects,
   parseControlInbound,
   hostLockedChipTitle,
   idleSecondsLeft,
@@ -2983,6 +2992,366 @@ describe('isViewerOwnInput (#2869)', () => {
     expect(isViewerOwnInput(seen[0], stage)).toBe(true) // the path field: not sent
     expect(isViewerOwnInput(seen[1], stage)).toBe(false) // the stage: sent
     expect(isViewerOwnInput(seen[2], stage)).toBe(false) // the soft keyboard: sent
+  })
+})
+
+describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
+  // The page as the viewer builds it: the stage, the files drawer's path
+  // field (one of the viewer's own inputs, #2869) and the soft keyboard's
+  // capture textarea (the host's, `data-rc-capture`).
+  function page() {
+    document.body.innerHTML = `
+      <div id="stage" tabindex="-1"><video id="video"></video></div>
+      <input id="path" type="text" placeholder="Path (Enter to go)" />
+      <div class="mobile-keyboard-shell">
+        <textarea id="soft" class="mobile-keyboard-capture" data-rc-capture="soft-keyboard"></textarea>
+        <button id="soft-esc" class="mkb-btn">Esc</button>
+      </div>
+    `
+    const q = (id: string) => document.getElementById(id) as HTMLElement
+    return { stage: q('stage'), soft: q('soft'), path: q('path'), body: document.body }
+  }
+  afterEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  const idle: Omit<KeyRouteState, 'surface'> = {
+    pointerInside: false,
+    keyboardLocked: false,
+    keyboardPaused: false,
+  }
+
+  /** Route a REAL key event dispatched on `target`, read by a window-level
+   *  CAPTURE listener exactly as `attachInput` registers it — so `ev.target`
+   *  is what production sees. */
+  function route(
+    target: EventTarget,
+    init: KeyboardEventInit,
+    down = true,
+    state: Partial<Omit<KeyRouteState, 'surface'>> = {},
+    getModifierState: (k: string) => boolean = () => false,
+  ): KeyRoute {
+    let out: KeyRoute | null = null
+    const type = down ? 'keydown' : 'keyup'
+    const listener = (e: Event) => {
+      out = routeKeyEvent(
+        e as KeyboardEvent,
+        down,
+        { ...idle, ...state, surface: document.getElementById('stage') },
+        getModifierState,
+      )
+    }
+    window.addEventListener(type, listener, { capture: true })
+    try {
+      target.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init }))
+    } finally {
+      window.removeEventListener(type, listener, { capture: true })
+    }
+    if (out === null) throw new Error('the capture listener did not run')
+    return out
+  }
+
+  const K = {
+    a: { key: 'a', code: 'KeyA' },
+    A: { key: 'A', code: 'KeyA', shiftKey: true },
+    space: { key: ' ', code: 'Space' },
+    enter: { key: 'Enter', code: 'Enter' },
+    tab: { key: 'Tab', code: 'Tab' },
+    esc: { key: 'Escape', code: 'Escape' },
+    left: { key: 'ArrowLeft', code: 'ArrowLeft' },
+    backspace: { key: 'Backspace', code: 'Backspace' },
+    del: { key: 'Delete', code: 'Delete' },
+    home: { key: 'Home', code: 'Home' },
+    f2: { key: 'F2', code: 'F2' },
+    shift: { key: 'Shift', code: 'ShiftLeft' },
+    ctrlC: { key: 'c', code: 'KeyC', ctrlKey: true },
+    ctrlV: { key: 'v', code: 'KeyV', ctrlKey: true },
+    ctrlAltEnd: { key: 'End', code: 'End', ctrlKey: true, altKey: true },
+  } as const satisfies Record<string, KeyboardEventInit>
+
+  describe("the soft keyboard's textarea: the listener is the ONE owner", () => {
+    it('isSoftKeyboardTarget pairs with isViewerOwnInput on the one attribute', () => {
+      const { soft, path, stage, body } = page()
+      expect(RC_CAPTURE_SELECTOR).toBe('[data-rc-capture]')
+      expect(soft.matches(RC_CAPTURE_SELECTOR)).toBe(true)
+      expect(isSoftKeyboardTarget(soft)).toBe(true)
+      expect(isViewerOwnInput(soft, stage)).toBe(false)
+      for (const el of [path, stage, body, document.getElementById('soft-esc')]) {
+        expect(isSoftKeyboardTarget(el), el?.id ?? 'body').toBe(false)
+      }
+      expect(isSoftKeyboardTarget(null)).toBe(false)
+      expect(isSoftKeyboardTarget(window)).toBe(false)
+    })
+
+    it('a printable character is forwarded as text, default prevented, propagation stopped — the textarea never types it too', () => {
+      const { soft } = page()
+      for (const init of [K.a, K.A, K.space]) {
+        const r = route(soft, init)
+        expect(r).toEqual({
+          kind: 'text',
+          text: init.key,
+          preventDefault: true,
+          stopPropagation: true,
+          mirrorClipboard: false,
+        })
+      }
+    })
+
+    it('Enter, Tab, Escape, the arrows, Backspace, Delete, Home, F2, a modifier: one HID frame, default prevented, propagation stopped', () => {
+      const { soft } = page()
+      const expected: [KeyboardEventInit, number][] = [
+        [K.enter, 0x28],
+        [K.tab, 0x2b],
+        [K.esc, 0x29],
+        [K.left, 0x50],
+        [K.backspace, 0x2a],
+        [K.del, 0x4c],
+        [K.home, 0x4a],
+        [K.f2, 0x3b],
+        [K.shift, 0xe1],
+      ]
+      for (const [init, code] of expected) {
+        for (const down of [true, false]) {
+          const r = route(soft, init, down)
+          expect(r, `${init.code} ${down ? 'down' : 'up'}`).toEqual({
+            kind: 'key',
+            code,
+            down,
+            mods: 0,
+            preventDefault: true,
+            stopPropagation: true,
+            mirrorClipboard: false,
+          })
+        }
+      }
+    })
+
+    it('Ctrl+C: one chord frame, and the host clipboard is mirrored once (on the down)', () => {
+      const { soft } = page()
+      expect(route(soft, K.ctrlC)).toEqual({
+        kind: 'key',
+        code: 0x06,
+        down: true,
+        mods: 1,
+        preventDefault: true,
+        stopPropagation: true,
+        mirrorClipboard: true,
+      })
+      expect(route(soft, K.ctrlC, false)).toMatchObject({ kind: 'key', down: false, mirrorClipboard: false })
+    })
+
+    it('Ctrl+V is the deferral\'s — never preventDefault (the paste event must fire), propagation stopped, the up swallowed', () => {
+      const { soft } = page()
+      expect(route(soft, K.ctrlV)).toEqual({ kind: 'ctrl-v', down: true, mods: 1, stopPropagation: true })
+      expect(route(soft, K.ctrlV, false)).toEqual({ kind: 'ctrl-v', down: false, mods: 1, stopPropagation: true })
+    })
+
+    it('Ctrl+Alt+End is the SAS, fired once per held chord, nothing forwarded', () => {
+      const { soft } = page()
+      expect(route(soft, K.ctrlAltEnd)).toEqual({ kind: 'sas', fire: true })
+      expect(route(soft, { ...K.ctrlAltEnd, repeat: true })).toEqual({ kind: 'sas', fire: false })
+      expect(route(soft, K.ctrlAltEnd, false)).toEqual({ kind: 'sas', fire: false })
+      // AltGr+End on a German layout is typing, not a SAS: forwarded as End.
+      expect(route(soft, K.ctrlAltEnd, true, {}, (k) => k === 'AltGraph')).toMatchObject({ kind: 'key', code: 0x4d })
+    })
+
+    it("what the listener drops is left untouched, so the textarea's own path carries it: IME, keyCode 229, a code-less key, a printable's keyup", () => {
+      const { soft } = page()
+      const untouched = { kind: 'untouched', why: 'drop' }
+      // An IME keydown (Pinyin, Kana, Hangul — and Gboard's letters).
+      expect(route(soft, { ...K.a, isComposing: true })).toEqual(untouched)
+      expect(
+        routeKeyEvent(
+          { ...K.a, key: 'Unidentified', code: '', keyCode: 229, isComposing: false, altKey: false, metaKey: false, ctrlKey: false, shiftKey: false, repeat: false, target: soft },
+          true,
+          { ...idle, surface: null },
+        ),
+      ).toEqual(untouched)
+      // The OS soft keyboard's own Enter carries no physical code: the
+      // component's `onKeyDown` (or the textarea's `insertLineBreak`) has it.
+      expect(route(soft, { key: 'Enter', code: '' })).toEqual(untouched)
+      // A printable key's release: the text frame was press+release.
+      expect(route(soft, K.a, false)).toEqual(untouched)
+    })
+
+    it('the invariant behind one owner: forwarded ⇒ default prevented AND propagation stopped; deferred ⇒ propagation stopped; dropped ⇒ untouched', () => {
+      const { soft } = page()
+      const every: KeyboardEventInit[] = [
+        ...Object.values(K),
+        { ...K.a, isComposing: true },
+        { key: 'Enter', code: '' },
+        { key: 'Dead', code: 'Backquote' },
+      ]
+      for (const init of every) {
+        for (const down of [true, false]) {
+          for (const state of [{}, { pointerInside: true }, { keyboardLocked: true }]) {
+            const r = route(soft, init, down, state)
+            const label = `${init.code || init.key} ${down ? 'down' : 'up'} ${JSON.stringify(state)}`
+            if (r.kind === 'text' || r.kind === 'key') {
+              expect(r.preventDefault && r.stopPropagation, label).toBe(true)
+            } else if (r.kind === 'ctrl-v') {
+              expect(r.stopPropagation, label).toBe(true)
+            } else {
+              expect(r.kind === 'untouched' || r.kind === 'sas', label).toBe(true)
+            }
+          }
+        }
+      }
+    })
+
+    it('a paused keyboard (a dialog has the typing) still wins over the soft keyboard', () => {
+      const { soft } = page()
+      expect(route(soft, K.enter, true, { keyboardPaused: true })).toEqual({ kind: 'untouched', why: 'paused' })
+    })
+  })
+
+  describe('everywhere else the policy is what it was (rc.18, #2869)', () => {
+    it('pointer OUTSIDE, nothing editable focused: forwarded, default kept, propagation kept — except Tab and Backspace', () => {
+      const { body } = page()
+      expect(route(body, K.a)).toEqual({ kind: 'text', text: 'a', preventDefault: false, stopPropagation: false, mirrorClipboard: false })
+      expect(route(body, K.enter)).toMatchObject({ kind: 'key', code: 0x28, preventDefault: false, stopPropagation: false })
+      expect(route(body, K.tab)).toMatchObject({ kind: 'key', code: 0x2b, preventDefault: true, stopPropagation: false })
+      expect(route(body, K.backspace)).toMatchObject({ kind: 'key', code: 0x2a, preventDefault: true, stopPropagation: false })
+      // Browser shortcuts stay the browser's with the pointer away.
+      expect(route(body, K.ctrlC)).toMatchObject({ kind: 'key', code: 0x06, mods: 1, preventDefault: false, mirrorClipboard: false })
+      expect(route(body, K.ctrlV)).toMatchObject({ kind: 'key', code: 0x19, mods: 1, preventDefault: false })
+      expect(route(body, K.ctrlAltEnd)).toMatchObject({ kind: 'key', code: 0x4d })
+    })
+
+    it('pointer INSIDE the stage: the browser-eaten chords are prevented, propagation stopped, Ctrl+V deferred, Ctrl+C mirrored, the SAS armed', () => {
+      const { stage } = page()
+      const inside = { pointerInside: true }
+      expect(route(stage, K.a, true, inside)).toMatchObject({ kind: 'text', preventDefault: false, stopPropagation: true })
+      expect(route(stage, K.enter, true, inside)).toMatchObject({ kind: 'key', preventDefault: false, stopPropagation: true })
+      expect(route(stage, K.ctrlC, true, inside)).toMatchObject({ kind: 'key', preventDefault: true, stopPropagation: true, mirrorClipboard: true })
+      expect(route(stage, K.ctrlV, true, inside)).toEqual({ kind: 'ctrl-v', down: true, mods: 1, stopPropagation: true })
+      expect(route(stage, K.ctrlAltEnd, true, inside)).toEqual({ kind: 'sas', fire: true })
+    })
+
+    it('keyboard lock: everything prevented and stopped, the pointer stale or not', () => {
+      const { body } = page()
+      const locked = { keyboardLocked: true }
+      for (const init of [K.a, K.enter, K.esc, K.f2]) {
+        expect(route(body, init, true, locked)).toMatchObject({ preventDefault: true, stopPropagation: true })
+      }
+      expect(route(body, K.ctrlV, true, locked)).toMatchObject({ kind: 'ctrl-v', stopPropagation: true })
+    })
+
+    it("the files drawer's path field keeps every key, chords and the SAS included, in every state", () => {
+      const { path } = page()
+      for (const init of Object.values(K)) {
+        for (const state of [{}, { pointerInside: true }, { keyboardLocked: true }]) {
+          expect(route(path, init, true, state), init.code).toEqual({ kind: 'untouched', why: 'viewer-own' })
+        }
+      }
+    })
+
+    it('isDeferredPasteChord / isCopyChord: the chord, when driving — the viewer-own carve-out lives upstream now', () => {
+      const v = { code: 'KeyV', ctrlKey: true, metaKey: false }
+      expect(isDeferredPasteChord(v, true)).toBe(true)
+      expect(isDeferredPasteChord(v, false)).toBe(false)
+      expect(isDeferredPasteChord({ ...v, ctrlKey: false, metaKey: true }, true)).toBe(true)
+      expect(isDeferredPasteChord({ ...v, ctrlKey: false }, true)).toBe(false)
+      expect(isDeferredPasteChord({ ...v, code: 'KeyC' }, true)).toBe(false)
+      const c = { code: 'KeyC', ctrlKey: true, metaKey: false }
+      expect(isCopyChord(c, true)).toBe(true)
+      expect(isCopyChord(c, false)).toBe(false)
+      expect(isCopyChord({ ...c, code: 'KeyV' }, true)).toBe(false)
+    })
+  })
+
+  describe('applyKeyRoute carries the verdict out — the one apply layer production and the harness share', () => {
+    function recorder(held = 0) {
+      const calls: string[] = []
+      const sent: Record<string, unknown>[] = []
+      const fx: KeyRouteEffects = {
+        send: (m) => {
+          sent.push(m)
+        },
+        hostKeyCode: (code, down) => {
+          calls.push(`hostKeyCode(${code},${down})`)
+          return code === 0xe0 ? 0xe3 : code
+        },
+        held: (code, down) => {
+          calls.push(`held(${code},${down})`)
+        },
+        heldCount: () => held,
+        releaseHeld: () => {
+          calls.push('releaseHeld')
+        },
+        sendCtrlAltDel: () => {
+          calls.push('sas')
+        },
+        deferPaste: (mods) => {
+          calls.push(`deferPaste(${mods})`)
+        },
+        mirrorClipboard: () => {
+          calls.push('mirror')
+        },
+      }
+      const ev = {
+        prevented: false,
+        stopped: false,
+        preventDefault() {
+          this.prevented = true
+        },
+        stopPropagation() {
+          this.stopped = true
+        },
+      }
+      return { calls, sent, fx, ev }
+    }
+
+    it('untouched: nothing sent, nothing prevented or stopped; viewer-own lets go of what is held, and only then', () => {
+      for (const why of ['paused', 'drop'] as const) {
+        const r = recorder(2)
+        applyKeyRoute({ kind: 'untouched', why }, r.ev, r.fx)
+        expect([r.calls, r.sent, r.ev.prevented, r.ev.stopped]).toEqual([[], [], false, false])
+      }
+      const held = recorder(1)
+      applyKeyRoute({ kind: 'untouched', why: 'viewer-own' }, held.ev, held.fx)
+      expect(held.calls).toEqual(['releaseHeld'])
+      expect([held.ev.prevented, held.ev.stopped]).toEqual([false, false])
+      const idleHands = recorder(0)
+      applyKeyRoute({ kind: 'untouched', why: 'viewer-own' }, idleHands.ev, idleHands.fx)
+      expect(idleHands.calls).toEqual([])
+    })
+
+    it('sas: prevented, stopped, fired once', () => {
+      const r = recorder()
+      applyKeyRoute({ kind: 'sas', fire: true }, r.ev, r.fx)
+      expect([r.ev.prevented, r.ev.stopped, r.calls]).toEqual([true, true, ['sas']])
+      const held = recorder()
+      applyKeyRoute({ kind: 'sas', fire: false }, held.ev, held.fx)
+      expect([held.ev.prevented, held.ev.stopped, held.calls]).toEqual([true, true, []])
+    })
+
+    it('ctrl-v: the down defers with its mods, the up defers nothing, and the default is NEVER prevented', () => {
+      const down = recorder()
+      applyKeyRoute({ kind: 'ctrl-v', down: true, mods: 1, stopPropagation: true }, down.ev, down.fx)
+      expect([down.calls, down.sent, down.ev.prevented, down.ev.stopped]).toEqual([['deferPaste(1)'], [], false, true])
+      const up = recorder()
+      applyKeyRoute({ kind: 'ctrl-v', down: false, mods: 1, stopPropagation: false }, up.ev, up.fx)
+      expect([up.calls, up.sent, up.ev.prevented, up.ev.stopped]).toEqual([[], [], false, false])
+    })
+
+    it('text: one key_text frame; key: one HID frame with the host\'s code (Ctrl→Cmd), tracked as held', () => {
+      const t = recorder()
+      applyKeyRoute({ kind: 'text', text: 'ä', preventDefault: true, stopPropagation: true, mirrorClipboard: false }, t.ev, t.fx)
+      expect(t.sent).toEqual([{ t: 'key_text', text: 'ä' }])
+      expect([t.ev.prevented, t.ev.stopped, t.calls]).toEqual([true, true, []])
+      const k = recorder()
+      applyKeyRoute({ kind: 'key', code: 0xe0, down: true, mods: 1, preventDefault: false, stopPropagation: false, mirrorClipboard: false }, k.ev, k.fx)
+      expect(k.sent).toEqual([{ t: 'key', code: 0xe3, down: true, mods: 1 }])
+      expect(k.calls).toEqual(['hostKeyCode(224,true)', 'held(227,true)'])
+      expect([k.ev.prevented, k.ev.stopped]).toEqual([false, false])
+    })
+
+    it('mirrorClipboard schedules the mirror after the frame', () => {
+      const r = recorder()
+      applyKeyRoute({ kind: 'key', code: 0x06, down: true, mods: 1, preventDefault: true, stopPropagation: true, mirrorClipboard: true }, r.ev, r.fx)
+      expect(r.calls).toEqual(['hostKeyCode(6,true)', 'held(6,true)', 'mirror'])
+    })
   })
 })
 
