@@ -270,7 +270,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 The loopback relay the Hub appends is the viewer's OWN device's: a TURN server its agent hosts on loopback and on its
 overlay address. The viewer learns of it one of two ways, chosen per connect by `localRelayPlan`
-(`ui/src/composables/useRemoteControl.ts:3823`):
+(`ui/src/composables/useRemoteControl.ts:3849`):
 
 | | how | needs |
 |---|---|---|
@@ -553,7 +553,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
 at [`useRemoteControl.ts:1544`](../ui/src/composables/useRemoteControl.ts#L1544)
 and puts it on the toggle's title
-([`RemoteControl.vue:3376`](../ui/src/views/remote/RemoteControl.vue#L3376)).
+([`RemoteControl.vue:3382`](../ui/src/views/remote/RemoteControl.vue#L3382)).
 
 | `code` | Means |
 |---|---|
@@ -756,6 +756,28 @@ Key design choices:
   `close-mid-drag` oracle). The agent's release-all is the path for a page that
   cannot run any code at all (a crash, `crash-mid-drag`).
 - **Mouse coalescing on the controller**, not the agent. The browser fires `pointermove` at up to display refresh rate; we coalesce to one msg per RAF (~16 ms), preserving the *last* position but dropping intermediate samples. Click/key events are never coalesced.
+- **The viewer's own inputs keep their keys** (#2869). The key listener sits
+  on the `window` in the **capture** phase (rc.18: a focused page button must
+  not see Enter while the operator drives the host), so it also sees a key
+  typed into the files drawer's path field before the field does — and it
+  forwarded it: Ctrl+A, a path and Enter typed into the drawer replaced the
+  text of the note open on a Mac host. `isViewerOwnInput`
+  (`useRemoteControl.ts`) makes `onKey` step aside, untouched — not
+  forwarded, no `preventDefault`, no `stopPropagation` — for a key whose
+  target is one of the viewer's own controls: an `input`, a `textarea`, a
+  `select`, a contenteditable, or a `role` of textbox / searchbox / combobox /
+  spinbutton / slider. What the host still held is let go first, so a chord
+  begun over the stage and finished in a field leaves no modifier down.
+  Buttons, list rows and the body are not the viewer's own: a key with one of
+  those focused is the host's, as it always was. ⚠️ Two editable targets are
+  the **host's**, and a blanket "skip editable targets" would break phones:
+  anything inside the stage, and the soft keyboard's off-screen textarea
+  (`MobileKeyboard.vue`, marked `data-rc-capture`) — its typed text arrives
+  through its own `input` handler, but a Backspace on that always-empty
+  textarea raises no `input` event, so the keydown this listener forwards is
+  the only way it reaches the host. A dialog that takes over the typing
+  entirely (the touch-layout editor) uses the other mechanism,
+  `keyboardPaused` (FR-111 P4b-2).
 - **`enigo` is the default**, with OS-specific direct backends behind a feature flag for performance and edge cases (UIPI on Windows, IME composition on macOS, `uinput` on Wayland because XTest doesn't exist there).
 
 ### 6.1 The Wayland problem
@@ -1999,7 +2021,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8678`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8704`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2102,7 +2124,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4524`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4550`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -2135,7 +2157,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4182`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4208`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 
@@ -2737,6 +2759,20 @@ to-activate, so the browser never sees a bait-and-switch.
   default and a device with browse disabled advertised it on every
   cache-miss boot (#1672 — the same hole [`remote-apps.md`](remote-apps.md)
   §4.3 closed for `apps`).
+  **Browse** (`files:dir` → `files:dir-list`): the **roots view** is the
+  EMPTY path (or the legacy `~`) — the logical drives on Windows, a single
+  `/` on Unix; the reply's `path` reads `Drives` / `/` with `parent: null`.
+  Every other path, `/` included, is a directory to list. ⚠️ The drawer's
+  `isRootsView` is set from the REQUEST (`isRootsRequest` in
+  `useRemoteControl.ts`), never from `parent === null`, which a verbatim
+  drive root `\\?\C:\` and `/` itself also report; in the roots view a
+  double-click drives into the entry's name verbatim (`C:\`, `/`), anywhere
+  else it appends the name to the current path (`nextDirPath`). Until #2870
+  both sides read `/` as a roots request — the agent's `list_dir` answered
+  it with the roots again and the viewer labelled it a roots view — so on a
+  Mac or Linux host the roots view's one entry led nowhere; with an agent
+  from before that fix the hosted viewer still shows `/` as a one-entry
+  list, and a typed path works.
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in

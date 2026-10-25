@@ -991,9 +991,12 @@ pub(crate) enum FilesIncoming {
     /// 24h orphan sweep.
     #[serde(rename = "files:cancel")]
     Cancel { id: String },
-    /// Browser → Agent: list a directory. `path` is empty / `~` to
-    /// list logical drives (Win) or `/` (Unix). `req_id` echoes back
-    /// in the `dir-list` reply so the browser can match concurrent
+    /// Browser → Agent: list a directory. An EMPTY `path` (or the legacy
+    /// `~`) lists the roots — the logical drives on Windows, a single `/`
+    /// on Unix. Every other path, `/` included, is a directory to list:
+    /// `/` used to answer with the roots again, so the roots view's one
+    /// entry on a Mac or Linux host led nowhere (#2870). `req_id` echoes
+    /// back in the `dir-list` reply so the browser can match concurrent
     /// requests.
     #[serde(rename = "files:dir")]
     Dir { req_id: String, path: String },
@@ -2251,13 +2254,21 @@ const DIR_LIST_TIMEOUT_SECS: u64 = 3;
 /// literal — it is removing the caller's ability to hold one.
 pub const STAGING_SENTINEL: &str = "<staging>";
 
-/// List a directory. Empty / `~` / `/` enumerates roots (logical
-/// drives on Windows; `/` on Unix); [`STAGING_SENTINEL`] resolves to this
-/// host's staging root. Returns at most 10000 entries — a directory with more
-/// is a degenerate case (deeply nested `node_modules` on a dev box) that we'd
+/// List a directory. Empty / `~` enumerates the roots (logical drives on
+/// Windows; a single `/` on Unix); [`STAGING_SENTINEL`] resolves to this
+/// host's staging root; anything else is canonicalised and read, `/`
+/// included. Returns at most 10000 entries — a directory with more is a
+/// degenerate case (deeply nested `node_modules` on a dev box) that we'd
 /// rather refuse than stream a 1 MiB JSON listing.
+///
+/// ⚠️ `/` is a DIRECTORY, not a roots request (#2870). Until this change the
+/// roots arm also matched `/`, so on a Unix host the roots view listed one
+/// entry, `/`, and opening it asked for `/` — which came back as the roots
+/// view again. The viewer's `isRootsRequest` mirrors this arm: the two must
+/// agree on which spellings mean "the roots", or the drawer labels a real
+/// listing a roots view and drives into bare entry names.
 pub async fn list_dir(path: &str) -> Result<DirListing> {
-    if path.is_empty() || path == "~" || path == "/" {
+    if path.is_empty() || path == "~" {
         return Ok(DirListing {
             path: roots_label(),
             parent: None,
@@ -3887,14 +3898,71 @@ mod tests {
 
     #[tokio::test]
     async fn list_dir_roots_returns_drives_or_root() {
-        let listing = list_dir("").await.expect("list_dir empty");
-        assert!(!listing.entries.is_empty(), "roots view must have entries");
-        // Every entry must be a directory (drive root or "/").
-        for e in &listing.entries {
-            assert!(e.is_dir, "root entry should be a dir: {:?}", e);
+        // The empty path and the legacy `~` are the two spellings of "the
+        // roots"; the viewer's `isRootsRequest` names the same two.
+        for request in ["", "~"] {
+            let listing = list_dir(request).await.expect("list_dir roots");
+            assert!(
+                !listing.entries.is_empty(),
+                "roots view for {request:?} must have entries"
+            );
+            // Every entry must be a directory (drive root or "/").
+            for e in &listing.entries {
+                assert!(e.is_dir, "root entry should be a dir: {:?}", e);
+            }
+            // Parent must be None for the roots view.
+            assert!(listing.parent.is_none());
+            assert_eq!(listing.path, roots_label());
         }
-        // Parent must be None for the roots view.
+    }
+
+    /// #2870 — `/` is a directory, not the roots view. On a Unix host the
+    /// roots view holds one entry, `/`; opening it must list the real root
+    /// (`Users`, `usr`, ...), not the roots view again. Locks the arm the
+    /// viewer's `isRootsRequest` mirrors.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn list_dir_slash_lists_the_real_root_not_the_roots_view() {
+        let listing = list_dir("/").await.expect("list_dir /");
+        assert_eq!(listing.path, "/");
+        // `Path::parent()` of `/` is None — the drawer must not take that
+        // for a roots view (it keys on the REQUEST, see `isRootsRequest`).
         assert!(listing.parent.is_none());
+        assert!(!listing.entries.is_empty(), "/ is never empty");
+        // Real children carry bare names; the roots view's one entry was `/`
+        // itself — a directory never lists itself.
+        for e in &listing.entries {
+            assert_ne!(e.name, "/", "the roots view leaked into a listing of /");
+            assert!(
+                !e.name.contains('/'),
+                "a child of / must be a bare name, got {:?}",
+                e.name
+            );
+        }
+        // The roots view is still reachable by its own spelling.
+        let roots = list_dir("").await.expect("list_dir roots");
+        assert_eq!(roots.entries.len(), 1);
+        assert_eq!(roots.entries[0].name, "/");
+    }
+
+    /// #2870 on Windows — `/` is a path there too (the current drive's root,
+    /// `\\?\C:\` once canonicalised), never the drives view: that is the empty
+    /// path's, and stays so.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn list_dir_slash_is_a_directory_not_the_drives_view() {
+        let listing = list_dir("/").await.expect("list_dir /");
+        assert_ne!(listing.path, roots_label());
+        for e in &listing.entries {
+            assert!(
+                !e.name.ends_with(":\\"),
+                "a drive root in a listing of /: {:?}",
+                e.name
+            );
+        }
+        let roots = list_dir("").await.expect("list_dir roots");
+        assert_eq!(roots.path, roots_label());
+        assert!(roots.entries.iter().all(|e| e.name.ends_with(":\\")));
     }
 
     #[tokio::test]

@@ -1942,10 +1942,18 @@ export function nextReconnectDelayMs(attempt: number): number {
  *     in the agent returns `None`, so a `currentParent === null`
  *     proxy mis-classifies the verbatim drive root as roots-view.
  *     The drawer must use an EXPLICIT `isRootsView` flag, set only
- *     when the navigateTo request was for empty/`/`/`~`. This helper
+ *     when the navigateTo request was a roots request (`isRootsRequest`:
+ *     empty / `~` — NOT `/`, see invariant 3). This helper
  *     takes that flag as input rather than re-deriving it
  *     (regression bug 2026-05-09: dbl-click `dev` after `C:\` shipped
  *     just `dev` to the agent Ã¢ÂÂ "canonicalising dev").
+ *
+ *  3. **`/` is a directory, not the roots view** (#2870). The roots view
+ *     on a Unix host holds one entry, `/`, and this helper returns it
+ *     verbatim; the drawer then lists `/` as a REAL directory
+ *     (`isRootsView` false), so the next dbl-click builds `/Users`.
+ *     While both this side and the agent read `/` as "the roots", that
+ *     dbl-click asked for the roots again and the list never changed.
  *
  *  Path-separator heuristic: any drive-letter prefix or backslash in
  *  the current path Ã¢ÂÂ Windows; otherwise Unix. Trailing separator on
@@ -1973,6 +1981,24 @@ export function nextDirPath(
     /^[A-Za-z]:[\\\/]/.test(currentDirPath) || currentDirPath.includes('\\')
   const sep = trailingSep ? '' : isWindows ? '\\' : '/'
   return currentDirPath + sep + entry.name
+}
+
+/** Pure helper: is this `files:dir` request for the ROOTS view — the
+ *  logical drives on Windows, a single `/` on Unix — rather than for a
+ *  directory? Only the empty path and the legacy `~` are. The agent's
+ *  `list_dir` (`agents/roomlerd/src/files.rs`) keys its roots arm on the
+ *  same two spellings; the two must agree, because the drawer's
+ *  `isRootsView` is set from THIS answer and decides whether a dbl-click
+ *  drives into `entry.name` verbatim (a root such as `C:\` or `/`) or
+ *  appends it to the current path.
+ *
+ *  ⚠️ `/` is deliberately NOT a roots request (#2870): it is the Unix
+ *  root directory. Until this helper existed, `navigateTo` counted `/` as
+ *  roots and the agent answered it with the roots list, so on a Mac or
+ *  Linux host the roots view's one entry led nowhere. Exported for the
+ *  roots → `/` → child sequence test. */
+export function isRootsRequest(path: string): boolean {
+  return path === '' || path === '~'
 }
 
 /** Controller's quality preference. `auto` lets the agent follow TWCC; `low`
@@ -11734,6 +11760,18 @@ export function useRemoteControl(
       // FR-111 P4b-2 — a dialog is taking the typing: leave the event to it,
       // untouched (no preventDefault, no stopPropagation).
       if (keyboardPaused.value) return
+      // #2869 — the key is typed into one of the viewer's OWN inputs (the
+      // files drawer's path field, a dialog's field): it belongs to that
+      // input. Leave it untouched, as above. This listener is on the window
+      // in the capture phase, so without this it forwarded the key BEFORE
+      // the field saw it. The stage and the soft keyboard's textarea are
+      // the host's and are exempt inside `isViewerOwnInput`. A chord begun
+      // over the stage and finished in a field must not leave its modifier
+      // down on the host: let go of what is still held first.
+      if (isViewerOwnInput(ev.target, surface)) {
+        if (heldInputs.size() > 0) releaseHeldInputs()
+        return
+      }
       // Ctrl+Alt+End (RDP convention) / literal Ctrl+Alt+Del Ã¢ÂÂ
       // canonical SAS sequence via sendCtrlAltDel(). Swallow BOTH key
       // directions so no stray End/Delete HID events reach the host;
@@ -12079,7 +12117,10 @@ export function useRemoteControl(
     // nav-drawer item from receiving Enter/Space/etc. while the
     // operator is driving the remote. Outside the viewer the
     // stopPropagation is gated off, so normal browser shortcuts
-    // (Tab navigation, Esc closing dialogs) still work.
+    // (Tab navigation, Esc closing dialogs) still work. The price of
+    // the capture phase is that a key typed into one of the page's own
+    // inputs arrives here first too — `onKey` steps aside for those
+    // (`isViewerOwnInput`, #2869).
     window.addEventListener('keydown', onKeyDown, { capture: true })
     window.addEventListener('keyup', onKeyUp, { capture: true })
     // FR-111 P4b-2 — pausing the keyboard lets go of what it holds on the
@@ -13083,9 +13124,10 @@ export function useRemoteControl(
   }
 
   /** List a directory on the host. `path` is the absolute host path;
-   *  empty string / "~" / "/" enumerates roots (logical drives on
-   *  Windows; "/" on Unix). Resolves with the listing or rejects on
-   *  timeout / dir-error. */
+   *  the empty string / "~" enumerate the roots (logical drives on
+   *  Windows; a single "/" on Unix) — see `isRootsRequest`. "/" itself
+   *  is a directory and lists the Unix root (#2870). Resolves with the
+   *  listing or rejects on timeout / dir-error. */
   function listDir(path: string): Promise<DirListing> {
     const ch = channels.files
     if (!ch || ch.readyState !== 'open') {
@@ -13689,6 +13731,65 @@ export function isRemoteSasChord(
   if (!ev.ctrlKey || !ev.altKey || ev.metaKey) return false
   if (getModifierState('AltGraph')) return false
   return ev.code === 'End' || ev.code === 'Delete'
+}
+
+/** Is this key event's target one of the viewer's OWN inputs — the files
+ *  drawer's path field, a dialog's text field, a select, a slider — so
+ *  that the key belongs to that control and never to the host (#2869)?
+ *
+ *  The key listener sits on `window` in the CAPTURE phase (rc.18: a
+ *  focused page button must not see Enter while the operator drives the
+ *  host), so it also sees a key typed into the drawer's path field before
+ *  the field does — and forwarded it: Ctrl+A, a path and Enter typed into
+ *  the drawer replaced the text of the note focused on a Mac host. When
+ *  this returns true the listener steps aside entirely: no forward, no
+ *  `preventDefault`, no `stopPropagation`.
+ *
+ *  What counts as the viewer's own: an `input` (any type), a `textarea`,
+ *  a `select`, anything contenteditable, and the ARIA widgets that take
+ *  typing or arrow keys (`textbox`, `searchbox`, `combobox`, `spinbutton`,
+ *  `slider`). Buttons, list items and the page body are NOT — a key with
+ *  one of those focused is the host's, as it always was (the stage takes
+ *  the focus back on pointer-enter anyway).
+ *
+ *  ⚠️ Two editable targets are the HOST's, never the viewer's own, and a
+ *  blanket "skip editable targets" would break phones:
+ *   - anything inside the stage (`surface`) — the remote picture itself;
+ *   - the soft keyboard's off-screen textarea (`MobileKeyboard.vue`,
+ *     marked `data-rc-capture`). Its typed text reaches the host through
+ *     its own `input` handler, but its KEYDOWNS are forwarded by this
+ *     listener on purpose: a Backspace on an always-empty textarea raises
+ *     no `input` event, and a hardware keyboard's chords (Ctrl+C) never
+ *     do — the keydown is the only way either reaches the host.
+ *
+ *  Pure and exported for vitest (the composable itself cannot be
+ *  instantiated in a spec). */
+export function isViewerOwnInput(target: EventTarget | null, surface: Element | null): boolean {
+  if (!(target instanceof Element)) return false
+  if (surface && surface.contains(target)) return false
+  if (target.closest('[data-rc-capture]')) return false
+  const tag = target.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  // `isContentEditable` is the browser's answer (inherits from the editing
+  // host); the attribute walk is for jsdom, which never implements it.
+  if ((target as HTMLElement).isContentEditable === true) return true
+  if (
+    target.closest(
+      '[contenteditable=""],[contenteditable="true"],[contenteditable="plaintext-only"]',
+    )
+  ) {
+    return true
+  }
+  switch (target.getAttribute('role')) {
+    case 'textbox':
+    case 'searchbox':
+    case 'combobox':
+    case 'spinbutton':
+    case 'slider':
+      return true
+    default:
+      return false
+  }
 }
 
 /** Structural shape of the (Chromium-only) Keyboard Lock API Ã¢ÂÂ

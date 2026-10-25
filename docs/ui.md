@@ -104,12 +104,19 @@ flowchart TB
   paths on the same LAN.
 - **Input**: HID-mapped keyboard (keyboard-lock, Ctrl-Alt-Del / SAS chord),
   letterboxed + direct coordinate normalization, multi-monitor layout + display
-  match, resolution/scale control.
+  match, resolution/scale control. The key listener is on the `window` in the
+  capture phase, so a key typed into one of the viewer's **own** inputs — the
+  files drawer's path field, a dialog's field — reaches it first and it steps
+  aside (`isViewerOwnInput`, #2869); the stage and the soft keyboard's
+  textarea (`MobileKeyboard.vue`, `data-rc-capture`) are the host's and keep
+  forwarding.
 - **Clipboard bridge**: text / HTML / image / native formats, chunked over a DC,
   hash + echo-gate dedupe, auto-sync on focus; optional local-agent loopback
   bridge for full-fidelity RTF.
 - **File transfer**: chunked uploads/downloads, folder download (streamed zip),
-  resumable, cancellable.
+  resumable, cancellable; the Remote files drawer browses the host — its roots
+  view is the empty path (the drives on Windows, a single `/` on Unix), and `/`
+  itself is a directory (`isRootsRequest`, #2870).
 - **Recording** (FR-85): Record, the REC chip and the device's recordings,
   over a `record` channel opened only when the grant kept `RECORD`; a stripped
   grant shows a disabled control that says why

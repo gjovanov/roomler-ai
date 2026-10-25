@@ -3,6 +3,7 @@
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
+import { isViewerOwnInput } from '@/composables/useRemoteControl'
 
 beforeAll(() => {
   // jsdom-friendly stubs the component reaches for during focus.
@@ -40,6 +41,24 @@ describe('MobileKeyboard', () => {
     expect(w.find('[data-testid="mobile-keyboard"]').exists()).toBe(true)
     expect(w.find('textarea').exists()).toBe(true)
     expect(w.findAll('.mkb-btn').length).toBeGreaterThan(5)
+  })
+
+  it("marks its capture textarea as the HOST's surface, so the viewer's key listener keeps forwarding it (#2869)", () => {
+    // The pairing with `isViewerOwnInput`: the window-level key listener
+    // steps aside for every other editable element on the page (the files
+    // drawer's path field typed into the host), but a keydown aimed at this
+    // textarea must still reach the host — a Backspace on its always-empty
+    // textarea raises no `input` event, so the keydown is the only way.
+    const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+    const ta = w.find('textarea').element as HTMLTextAreaElement
+    expect(ta.getAttribute('data-rc-capture')).toBe('soft-keyboard')
+    expect(isViewerOwnInput(ta, null)).toBe(false)
+    // Control: the same textarea without the mark would be the viewer's own.
+    const plain = document.createElement('textarea')
+    document.body.appendChild(plain)
+    expect(isViewerOwnInput(plain, null)).toBe(true)
+    plain.remove()
+    w.unmount()
   })
 
   it('emits keyText on plain text typed (after composition skip)', async () => {
