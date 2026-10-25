@@ -215,7 +215,7 @@ limit and ends the session itself. The hub's part is to tell it the limit and to
 | Piece | Where |
 |---|---|
 | **The viewer's countdown.** The viewer reads `rc:idle`: a duration turned into a deadline on this browser's clock at receipt, as `rc:media-waiting` is. `null` withdraws the warning, and anything malformed is no message. A banner counts the seconds down while it stands. Any input sent from here withdraws it at once, because it is activity, and the device withdraws its own on its next look. A viewer older than P4b-2b ignores the message, and its session ends without a countdown | `ui/src/composables/useRemoteControl.ts:1557` (the parser), `:5083` (`idleEndsAt`), `:6518` (cleared by input), `:806` (`idleSecondsLeft`); `ui/src/views/remote/RemoteControl.vue:879` |
-| **The device's own limit**, on its row in the device list. "Org limit only" (stored as `null`), or 5 minutes to 2 hours; a value set through the API outside the presets still shows. The shorter of it and the org's applies, so it can only tighten. Applies to the next session | `ui/src/components/admin/AgentsSection.vue:2099` (`idleMinuteItems`), `:2116` (`onIdleMinutesChange`) |
+| **The device's own limit**, on its row in the device list. "Org limit only" (stored as `null`), or 5 minutes to 2 hours; a value set through the API outside the presets still shows. The shorter of it and the org's applies, so it can only tighten. Applies to the next session | `ui/src/components/admin/AgentsSection.vue:2165` (`idleMinuteItems`), `:2182` (`onIdleMinutesChange`) |
 
 ### 3d. The transport
 
