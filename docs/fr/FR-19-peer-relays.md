@@ -605,7 +605,7 @@ there'."*
 `base(Relay) = B_RELAY` for **both TURN and DERP** — so `roomler why` *already* cannot
 distinguish a 52 ms coturn hop from a 175 ms DERP hop. That distinction has never lived in
 the tier ladder; it lives in `PeerInfo.relay_kind` + `relay_transport`, rendered by
-`relay_qualified_label` (`localclient.rs:1028`) as `relay:{kind}/{transport}`.
+`relay_qualified_label` (`localclient.rs:1047`) as `relay:{kind}/{transport}`.
 
 So the design is:
 
@@ -692,7 +692,7 @@ the counter was added without a reader"*. Still true: `stale_drops()`
 
 | surface | addition |
 |---|---|
-| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`localclient.rs:1028`) |
+| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`localclient.rs:1047`) |
 | `roomler peers --json` | `relay_kind: "org"`, `relay_via`, `relay_endpoint` (`PeerInfo`, `crates/localapi/src/lib.rs:393`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
 | `roomler netcheck` | relay node: `relay server: listening :3478, N sessions` |
@@ -727,7 +727,7 @@ Verified against `origin/master`, 2026-08-28.
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
 | Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
-| CLI surfaces | `agents/roomler-cli/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
+| CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
@@ -999,7 +999,7 @@ Then take mars's relay down and assert re-selection to zeus without a DERP round
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
 startup, so the whole surface is `restart_required = true`"* (hardcoded `:604`, `:618`,
 asserted by `every_key_gets_and_applies` `:3184`), and the CLI's live-apply allowlist is
-exactly `exec_enabled | remote_config_enabled` (`localclient.rs:969`). A bound UDP socket
+exactly `exec_enabled | remote_config_enabled` (`localclient.rs:988`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`
 → `rc:relay.revoke`) — which also exercises §7's revocation path.

@@ -479,6 +479,44 @@ the **root** half, because the two listen on different LocalAPI sockets
 (`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`). If a
 command reports "daemon not running", you are probably asking the wrong half.
 
+### Two configurations — which one the app and the CLI edit (#2871)
+
+The two halves are **two enrollments with two configuration files**, and that
+stays true with the FR-43 supervisor on (`macos_supervise_gui_worker = true`):
+the root daemon spawns the GUI worker as the console user, but the worker still
+runs on *that person's* enrollment and file (FR-43 keeps it through P2 as the
+fallback; P3, one enrollment, has not shipped). So a supervised Mac has:
+
+| Half | Config file | Edited by | Owns |
+|---|---|---|---|
+| per-user — the GUI worker, `roomlerd run --supervised` | `~/Library/Application Support/live.roomler.roomler/config.toml` | the companion's Settings → Device configuration; `roomler config …` as the signed-in user | screen capture, input, clipboard: the session knobs |
+| root — `com.roomler.daemon` | `/etc/roomler/config.toml` | an administrator: `sudo roomler config ls` · `sudo roomler config set <key> <value>` | the overlay, Roomler SSH, remote commands, the updater: `overlay_enabled`, `ssh_enabled`, `exec_enabled`, `remote_config_enabled`, … |
+
+⚠️ **The root half is the device `roomler ssh` and `roomler exec` reach**, and
+its switches are read from *its* file. A switch flipped in the app, or with an
+unprivileged `roomler config set`, changes the per-user half's file and nothing
+the mesh node reads — measured on 0.4.169: the app showed `ssh_enabled = off`
+while the root half served SSH. Since #2871 both surfaces say so. The app's
+Device configuration card carries a banner naming both files
+(`agents/roomler-desktop/src/commands.rs:722`), and `roomler config ls` /
+`config set` print the "a second roomler daemon is running" note that `status`
+and `peers` already printed — a note that had gone silent for the console user,
+because the root socket's `0700` directory refuses their `stat`; the root half's
+person socket is the evidence now (`crates/localapi/src/lib.rs:4525`).
+
+The root half's switches are **root's to set by design**, not by omission: its
+LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
+serves the console user admits the safety surface only — status, sessions,
+consent, the Devices view — never a config verb (`localapi::person_may`,
+`crates/localapi/src/lib.rs:3034`). Whether the console user should flip the
+root half's gates from the app is the decision left open on #2871; until it is
+taken, the gate stays with `sudo`.
+
+The Overview's **Service** line reads the root daemon too (`System daemon
+(root) · running`). Before #2871 the companion understood only Windows' answers,
+and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — read
+"not installed".
+
 ### Paths, logs, limits
 
 | | Path |

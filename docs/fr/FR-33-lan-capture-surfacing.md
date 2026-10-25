@@ -45,7 +45,7 @@ stays out of scope (operator's standing rule).
    snapshot. Onset and clear each produce ONE `NetDelta` with a one-line `summary`
    (`netstate.rs:160`) — the "LOG every silent drop" rule — never a per-snapshot line.
 2. **`roomler status`** gains a line next to `srflx`, using the same shape
-   (`agents/roomler-cli/src/localclient.rs:1237`):
+   (`agents/roomler-cli/src/localclient.rs:1256`):
    `lan         CAPTURED — 192.168.68.0/24 leaves via "Ethernet 3" (Check Point Virtual
    Network Adapter For Endpoint VPN Client); direct on the LAN is impossible while it does`
    and `lan         clear` otherwise. Wire: `NodeStatus.lan_capture: Option<LanCaptureStatus>`
