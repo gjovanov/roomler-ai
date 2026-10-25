@@ -27,9 +27,12 @@
       'st-service',
       s.service_kind === 'scmService'
         ? 'System service' + (s.service_running ? ' · running' : ' · stopped')
-        : s.service_kind === 'scheduledTask'
-          ? 'Per-user auto-start' + (s.service_running ? ' · running' : '')
-          : 'not installed',
+        : s.service_kind === 'systemDaemon'
+          // #2871: a Linux or macOS root daemon (launchd / systemd).
+          ? 'System daemon (root)' + (s.service_running ? ' · running' : ' · stopped')
+          : s.service_kind === 'scheduledTask'
+            ? 'Per-user auto-start' + (s.service_running ? ' · running' : '')
+            : 'not installed',
     );
     setText('st-log-dir', s.log_dir);
     setText('st-config-dir', s.config_dir);
@@ -570,6 +573,29 @@
     );
   }
 
+  /* #2871: on a Mac running both halves (FR-43) the rows above come from the
+   * per-user half — the GUI worker's own file — while the Overview shows the
+   * root half's network. Say which file this page changes, and how the root
+   * half's switches are changed. The text is the daemon-side `note`
+   * (commands.rs `two_halves_note`), rendered as text; hidden on every other
+   * layout, and on any failure (the rows stand on their own). */
+  async function paintConfigTarget() {
+    const banner = $('cfg-target-banner');
+    if (!banner) return;
+    try {
+      const t = await invoke('cmd_config_target');
+      if (t && t.two_halves && t.note) {
+        setText('cfg-target-text', t.note);
+        show(banner);
+      } else {
+        hide(banner);
+      }
+    } catch (e) {
+      console.warn('settings: config target unavailable', e);
+      hide(banner);
+    }
+  }
+
   async function loadCfg(force) {
     if (cfgLoaded && !force) return;
     const container = $('cfg-rows');
@@ -578,6 +604,7 @@
       const entries = await invoke('cmd_config_entries');
       renderCfg(entries);
       cfgLoaded = true;
+      void paintConfigTarget();
     } catch (e) {
       container.replaceChildren();
       const p = document.createElement('p');

@@ -32,7 +32,11 @@ pub struct StatusReport {
     pub agent_version: String,
     pub config_schema_version: Option<String>,
     pub service_running: bool,
-    pub service_kind: String, // "scheduledTask" | "scmService" | "none"
+    /// `"scmService"` (Windows' SCM service) · `"scheduledTask"` (a per-user
+    /// Scheduled Task, or a Mac's LaunchAgent) · `"systemDaemon"` (#2871: a
+    /// Linux `roomlerd.service` or a Mac's `com.roomler.daemon` root daemon)
+    /// · `"none"`.
+    pub service_kind: String,
     pub attention: Option<String>,
     /// S1b — the sentinel's human message + machine reason, so the
     /// Overview can say WHAT needs attention (and offer a re-enroll
@@ -584,6 +588,157 @@ fn config_set_blocking(
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     roomler_node_core::config_surface::entry_for(&cfg, &key)
         .ok_or_else(|| format!("unknown config key {key:?}"))
+}
+
+// ─── #2871 — which daemon the Device configuration page edits ──────────
+
+/// #2871 — the daemon the Device configuration page reads and writes, as it
+/// names itself, and, on a Mac running both halves (FR-43), the ROOT half it
+/// does NOT edit. Returned from [`cmd_config_target`]. Never rejects: with no
+/// daemon reachable `reached` is empty, and the page already says so.
+///
+/// Why the page needs this at all: `localapi::connect()` prefers the per-user
+/// socket, so on a supervised Mac the companion edits the GUI worker's own
+/// `config.toml` — a second enrollment with a config of its own (FR-43 keeps
+/// it through P2) — while the Overview shows the ROOT half's overlay address
+/// (FR-97 P2h lends it). A person flipping `ssh_enabled` or `exec_enabled`
+/// here changed a file the mesh node never reads, and nothing said so
+/// (measured on 0.4.169: the worker's file read `ssh_enabled = false` while
+/// the root half served SSH).
+#[derive(Debug, Serialize, Default)]
+pub struct ConfigTarget {
+    /// The daemon [`cmd_config_entries`] / [`cmd_config_set`] reach — the one
+    /// `localapi::connect()` resolves, which on a Mac is the per-user half.
+    pub reached: Option<DaemonBrief>,
+    /// macOS only: the root half, read over the person socket it serves this
+    /// account. `Status` is on that socket's allowlist; its config verbs are
+    /// not (`localapi::person_may`), so this is a label, not a second editor.
+    /// `None` on every other OS, when the reached daemon is itself
+    /// privileged, and when no root half answers.
+    pub machine: Option<DaemonBrief>,
+    /// `reached` is an unprivileged daemon and `machine` a root one of another
+    /// identity: the page edits the first and must say so ([`two_halves`]).
+    pub two_halves: bool,
+    /// What the page shows when `two_halves`: which file its switches change,
+    /// and how the root half's are changed ([`two_halves_note`]).
+    pub note: Option<String>,
+}
+
+/// How a daemon names itself for [`ConfigTarget`]: the fields of its `Status`
+/// the page renders. No token, no address.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct DaemonBrief {
+    pub name: String,
+    pub node_id: String,
+    pub version: String,
+    /// The config file it loaded (S1b); `None` from an older daemon.
+    pub config_path: Option<String>,
+    /// `Some(true)` = root or SYSTEM, `Some(false)` = the signed-in user,
+    /// `None` = a daemon too old to say.
+    pub privileged: Option<bool>,
+}
+
+impl From<&NodeStatus> for DaemonBrief {
+    fn from(s: &NodeStatus) -> Self {
+        Self {
+            name: s.name.clone(),
+            node_id: s.node_id.clone(),
+            version: s.version.clone(),
+            config_path: s.config_path.clone(),
+            privileged: s.privileged,
+        }
+    }
+}
+
+/// #2871 — pure: is this the two-half Mac the banner is for? The reached
+/// daemon must SAY it runs unprivileged (an older daemon says nothing, and
+/// nothing is claimed for it), and the machine daemon must be root AND another
+/// node: a root daemon's legacy per-user bind answers for the SAME process
+/// (`localapi::serve_unix`), and one daemon is not two halves.
+fn two_halves(reached: &DaemonBrief, machine: Option<&DaemonBrief>) -> bool {
+    reached.privileged == Some(false)
+        && machine.is_some_and(|m| m.privileged == Some(true) && m.node_id != reached.node_id)
+}
+
+/// #2871 — the banner's text. It names both files, so a person can tell which
+/// one a `roomler config ls` printed, and gives the administrator's command for
+/// the root half: the person socket serves that half's status and never its
+/// configuration, so there is no in-app path to those switches today.
+fn two_halves_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
+    let file = |d: &DaemonBrief| {
+        d.config_path
+            .clone()
+            .unwrap_or_else(|| "its own config.toml".to_string())
+    };
+    format!(
+        "This Mac runs two Roomler daemons. The switches on this page change the per-user half \
+         ({}, {}), which captures the screen for remote desktop. The private network, Roomler SSH \
+         and remote commands are served by the root half ({}, {}) — the device that `roomler ssh` \
+         and `roomler exec` reach — and its switches (overlay_enabled, ssh_enabled, exec_enabled, \
+         remote_config_enabled, …) are changed by an administrator in a terminal: \
+         `sudo roomler config set <key> <value>`.",
+        reached.name,
+        file(reached),
+        machine.name,
+        file(machine)
+    )
+}
+
+/// #2871 — the root half's `Status`, over the person socket it serves this
+/// account (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g). macOS only.
+/// Kept only when ROOT serves the socket (`connect_unix_served_by_root`), and
+/// bounded like the per-user half's own reads of it: a root half that does
+/// not answer in 1.5 s is not named.
+#[cfg(target_os = "macos")]
+async fn machine_half_brief() -> Option<DaemonBrief> {
+    let path = localapi::own_person_socket_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let ask = async {
+        let mut client = localapi::connect_unix_served_by_root(path).await.ok()?;
+        client.status().await.ok()
+    };
+    tokio::time::timeout(Duration::from_millis(1500), ask)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| DaemonBrief::from(&s))
+}
+
+/// Off macOS there is no second half to name: Windows runs one daemon, and a
+/// Linux system install's companion reaches the root daemon itself (its
+/// person socket is the first path `connect()` tries).
+#[cfg(not(target_os = "macos"))]
+async fn machine_half_brief() -> Option<DaemonBrief> {
+    None
+}
+
+/// #2871 — which daemon the Settings page's Device configuration edits, for
+/// the banner it shows on a two-half Mac. Read-only: one `Status` from the
+/// daemon the page edits, and on a Mac one from the root half's person
+/// socket, which admits nothing else this needs.
+#[tauri::command]
+pub async fn cmd_config_target() -> ConfigTarget {
+    let Some(reached) = daemon_node_status().await.map(|s| DaemonBrief::from(&s)) else {
+        return ConfigTarget::default();
+    };
+    let machine = if reached.privileged == Some(false) {
+        machine_half_brief().await
+    } else {
+        None
+    };
+    let two = two_halves(&reached, machine.as_ref());
+    let note = match (&machine, two) {
+        (Some(m), true) => Some(two_halves_note(&reached, m)),
+        _ => None,
+    };
+    ConfigTarget {
+        reached: Some(reached),
+        machine,
+        two_halves: two,
+        note,
+    }
 }
 
 /// The LocalAPI client wraps a daemon's own `Error { message }` as
@@ -2589,7 +2744,8 @@ pub(crate) fn no_window_command(program: impl AsRef<std::ffi::OsStr>) -> Command
 
 /// Probe service state via the agent's own `service status` CLI.
 /// Returns (kind, running). `kind` is "scheduledTask" on perUser and
-/// "scmService" on perMachine. "none" when neither is registered.
+/// "scmService" on perMachine; "systemDaemon" for a Linux or macOS root
+/// daemon (#2871). "none" when nothing is registered.
 fn probe_service_state() -> (String, bool) {
     let Ok(exe) = agent_exe_path() else {
         return ("none".to_string(), false);
@@ -2651,20 +2807,66 @@ fn scm_answer(stdout: &str) -> Option<ScmAnswer> {
     })
 }
 
+/// #2871 — what `roomlerd service status --as-service` answered on Linux or
+/// macOS: the root daemon's own line, `roomlerd.service: <active>, <enabled>`
+/// or `com.roomler.daemon: <state>, <enabled>` (`service::system::status_line`
+/// in roomlerd). ⚠️ Never a `Roomler:` line — that is Windows' SCM service,
+/// and the daemon pins the distinction with a test of its own.
+///
+/// Until this was read, a Mac whose per-user LaunchAgent the FR-43 supervisor
+/// had booted out (P2d) showed **"Service: not installed"** on the Overview
+/// while its root daemon ran and served the mesh (measured on 0.4.169), and
+/// every Linux system install read the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemAnswer {
+    Running,
+    /// Registered but not running: `not loaded, enabled` after a
+    /// `service stop --as-service` on a Mac, `inactive, enabled` on Linux.
+    Registered,
+    /// Neither loaded nor enabled: no root daemon here.
+    NotInstalled,
+}
+
+fn system_answer(stdout: &str) -> Option<SystemAnswer> {
+    let rest = answer_line(stdout, "com.roomler.daemon:")
+        .or_else(|| answer_line(stdout, "roomlerd.service:"))?;
+    let (state, enabled) = match rest.split_once(',') {
+        Some((s, e)) => (s.trim(), e.trim()),
+        None => (rest.trim(), ""),
+    };
+    Some(match state {
+        // launchd's `state = running`; systemd's `is-active` = active.
+        "running" | "active" => SystemAnswer::Running,
+        // Not even registered — the only answer a Mac with the LaunchAgent
+        // alone (the pre-FR-43 layout) ever gives for the root daemon.
+        "not loaded" | "not-found" if enabled != "enabled" => SystemAnswer::NotInstalled,
+        _ => SystemAnswer::Registered,
+    })
+}
+
 /// `service status` prints `Auto-start: installed | not installed | unknown`
 /// (`AutostartStatus`'s Display) — it never says "running". Whether the
 /// task's daemon runs is not in its answer, so it is not claimed.
 fn classify_service_state(task: Option<&str>, scm: Option<&str>) -> (String, bool) {
+    // One `--as-service` answer, read for both shapes: `Roomler:` is Windows'
+    // SCM service, the unit line is a Unix root daemon (#2871). A host prints
+    // one or the other, never both.
+    let system = scm.and_then(system_answer);
     let scm = scm.and_then(scm_answer);
     let task_installed =
         task.and_then(|t| answer_line(t, "auto-start:")).as_deref() == Some("installed");
-    let (kind, running) = match (scm, task_installed) {
+    let (kind, running) = match (scm, system, task_installed) {
         // A running machine-wide service IS this machine's daemon.
-        (Some(ScmAnswer::Running), _) => ("scmService", true),
+        (Some(ScmAnswer::Running), _, _) => ("scmService", true),
+        // #2871 — and so is a running root daemon: on a supervised Mac it also
+        // owns the GUI worker the companion talks to, and the LaunchAgent that
+        // the per-user probe looks for is gone by design (FR-43 P2d).
+        (_, Some(SystemAnswer::Running), _) => ("systemDaemon", true),
         // Otherwise a registered per-user task is (a stopped SCM service
         // beside it is a cross-flavour leftover).
-        (_, true) => ("scheduledTask", false),
-        (Some(ScmAnswer::Registered), false) => ("scmService", false),
+        (_, _, true) => ("scheduledTask", false),
+        (Some(ScmAnswer::Registered), _, false) => ("scmService", false),
+        (_, Some(SystemAnswer::Registered), false) => ("systemDaemon", false),
         _ => ("none", false),
     };
     (kind.to_string(), running)
@@ -2964,6 +3166,147 @@ mod tests {
             ),
             ("scmService".to_string(), true)
         );
+    }
+
+    /// #2871 — a Mac's or a Linux host's root daemon answers `--as-service`
+    /// with its OWN unit's line, never `Roomler:`, and the companion read that
+    /// as no service at all: a supervised Mac, whose LaunchAgent FR-43 P2d
+    /// booted out, showed "Service: not installed" while its root daemon ran
+    /// (0.4.169). The answers below are the daemon's `status_line` shapes.
+    #[test]
+    fn a_running_root_daemon_is_the_machines_daemon_on_unix() {
+        let none = out("Auto-start: not installed");
+        for running in [
+            "com.roomler.daemon: running, enabled",
+            "com.roomler.daemon: running, not enabled",
+            "roomlerd.service: active, enabled",
+        ] {
+            assert_eq!(
+                classify_service_state(Some(&none), Some(&out(running))),
+                ("systemDaemon".to_string(), true),
+                "{running}"
+            );
+        }
+        // Registered but stopped (`service stop --as-service`): the daemon,
+        // not running.
+        for stopped in [
+            "com.roomler.daemon: not loaded, enabled",
+            "roomlerd.service: inactive, enabled",
+            "roomlerd.service: failed, enabled",
+        ] {
+            assert_eq!(
+                classify_service_state(Some(&none), Some(&out(stopped))),
+                ("systemDaemon".to_string(), false),
+                "{stopped}"
+            );
+        }
+        // Neither loaded nor enabled: no root daemon — the only answer a Mac
+        // with the LaunchAgent alone ever gives, and the pre-#2871 reading.
+        for absent in [
+            "com.roomler.daemon: not loaded, not enabled",
+            "roomlerd.service: not-found, not-found",
+        ] {
+            assert_eq!(
+                classify_service_state(Some(&none), Some(&out(absent))),
+                ("none".to_string(), false),
+                "{absent}"
+            );
+        }
+        // An unsupervised two-half Mac: the LaunchAgent beside a RUNNING root
+        // daemon is the running daemon's machine; beside a stopped one, the
+        // LaunchAgent is what runs.
+        let agent = out("Auto-start: installed");
+        assert_eq!(
+            classify_service_state(
+                Some(&agent),
+                Some(&out("com.roomler.daemon: running, enabled"))
+            ),
+            ("systemDaemon".to_string(), true)
+        );
+        assert_eq!(
+            classify_service_state(
+                Some(&agent),
+                Some(&out("com.roomler.daemon: not loaded, enabled"))
+            ),
+            ("scheduledTask".to_string(), false)
+        );
+        // The unit line is never mistaken for Windows' SCM service, nor the
+        // reverse: each shape reaches its own reader only.
+        assert_eq!(
+            scm_answer(&out("com.roomler.daemon: running, enabled")),
+            None
+        );
+        assert_eq!(system_answer(&out("Roomler: Running")), None);
+    }
+
+    fn brief(node_id: &str, privileged: Option<bool>, config_path: &str) -> DaemonBrief {
+        DaemonBrief {
+            name: format!("mac-{node_id}"),
+            node_id: node_id.to_string(),
+            version: "0.4.169".to_string(),
+            config_path: Some(config_path.to_string()),
+            privileged,
+        }
+    }
+
+    const USER_FILE: &str =
+        "/Users/someone/Library/Application Support/live.roomler.roomler/config.toml";
+    const ROOT_FILE: &str = "/etc/roomler/config.toml";
+
+    /// #2871 — the banner is for exactly one layout: an UNPRIVILEGED daemon
+    /// reached, and a ROOT daemon of another identity behind the person socket.
+    #[test]
+    fn only_a_per_user_half_beside_a_root_half_is_two_halves() {
+        let user = brief("u", Some(false), USER_FILE);
+        let root = brief("d", Some(true), ROOT_FILE);
+        assert!(two_halves(&user, Some(&root)), "FR-43's P2 layout");
+        // A per-user install: no root half answers, nothing to say.
+        assert!(!two_halves(&user, None));
+        // The reached daemon IS root (a Linux system install's person socket,
+        // a companion run under sudo): it edits the machine's own file.
+        assert!(!two_halves(&root, Some(&root)));
+        // The same node behind both sockets is one daemon (the root daemon's
+        // legacy per-user bind), not two halves.
+        assert!(!two_halves(&user, Some(&brief("u", Some(true), ROOT_FILE))));
+        // A daemon too old to say which account it runs as claims nothing.
+        assert!(!two_halves(&brief("u", None, USER_FILE), Some(&root)));
+        // A "machine" daemon that is not root is not the root half.
+        assert!(!two_halves(
+            &user,
+            Some(&brief("d", Some(false), USER_FILE))
+        ));
+    }
+
+    /// #2871 — the note names both files, so a person can tell which one
+    /// `roomler config ls` printed, and the administrator's command for the
+    /// root half's switches, which this app has no path to.
+    #[test]
+    fn the_two_halves_note_names_both_files_and_the_root_command() {
+        let user = brief("u", Some(false), USER_FILE);
+        let root = brief("d", Some(true), ROOT_FILE);
+        let note = two_halves_note(&user, &root);
+        for must in [
+            "per-user half",
+            "root half",
+            USER_FILE,
+            ROOT_FILE,
+            "mac-u",
+            "mac-d",
+            "sudo roomler config set",
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+        ] {
+            assert!(note.contains(must), "the note must say {must:?}: {note}");
+        }
+        // An older daemon without `config_path` still gets a sentence, not a
+        // hole where the file name was.
+        let old = brief("u", Some(false), USER_FILE);
+        let old = DaemonBrief {
+            config_path: None,
+            ..old
+        };
+        assert!(two_halves_note(&old, &root).contains("its own config.toml"));
     }
 
     /// FR-85 — the page hands the companion a NAME to open, never a path.

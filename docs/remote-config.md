@@ -406,6 +406,23 @@ which the daemon still refuses on the same terms as a local request.
    the same moment a pushed one would. See §7b — option C created that
    asymmetry, and leaving it would have made gate 4 the slower of the two.
 
+   ⚠️ **On a root-mode Mac the pane edits the GUI worker, not the daemon
+   (#2871).** The companion's LocalAPI client reaches the per-user half, which
+   under FR-43 (through P2) is a second enrollment with a file of its own, so
+   `exec_enabled` / `ssh_enabled` flipped there never reach the root daemon
+   that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
+   worker's file read `ssh_enabled = false` while the root half served SSH.
+   The root daemon's socket is root-only and its person socket refuses every
+   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3034`), so
+   gate 4 on that daemon is an administrator's: `sudo roomler config set
+   exec_enabled true`. The pane now says which file it edits and gives that
+   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:722`;
+   [installation.md](installation.md), "Two configurations") instead of
+   showing a switch that changes nothing. Letting the console user flip the
+   root daemon's gate 4 from the app would be a **new authorization path on the
+   person socket** — Linux system installs included — and that decision is
+   open on #2871, not taken here.
+
 ## 9. Not built, on purpose
 
 - **Option A on the remote path** (§7b). Supervisor-detected exit-to-restart

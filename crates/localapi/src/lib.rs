@@ -4512,10 +4512,20 @@ pub async fn connect() -> std::io::Result<Client> {
 /// status`. Each socket is now asked who answers it, by the peer's PID. A PID
 /// that cannot be read keeps the note, because staying silent would hide a
 /// real second daemon.
+///
+/// #2871 — `exists()` on the system socket answers **false to the very caller
+/// this note is for**: its directory is `0700 root` ([`prepare_unix_listener`]),
+/// so the console user's `stat` fails with `EACCES`, and on a supervised Mac
+/// (FR-43) the note never printed — `roomler status`, `peers` and `config ls`
+/// answered for the per-user half with no word that a root half existed
+/// (measured on 0.4.169). On a Mac the root half's presence IS visible to that
+/// person, through the person socket it serves them ([`person_socket_path`],
+/// FR-97 P2g), so that is read as the root half's evidence too.
 #[cfg(unix)]
 pub async fn other_daemon_socket() -> Option<std::path::PathBuf> {
     let [user, system] = unix_socket_candidates();
-    let (user_exists, system_exists) = (user.exists(), system.exists());
+    let user_exists = user.exists();
+    let system_exists = system.exists() || macos_root_half_serves_me().await;
     let same_process = if user_exists && system_exists {
         match (socket_peer_pid(&user).await, socket_peer_pid(&system).await) {
             (Some(a), Some(b)) => Some(a == b),
@@ -4532,6 +4542,50 @@ pub async fn other_daemon_socket() -> Option<std::path::PathBuf> {
 #[cfg(unix)]
 fn second_daemon(user_exists: bool, system_exists: bool, same_process: Option<bool>) -> bool {
     user_exists && system_exists && same_process != Some(true)
+}
+
+/// #2871 — the person socket a Mac's ROOT half serves THIS process's account
+/// ([`person_socket_path`], FR-97 P2g): `None` as root, who reaches the
+/// daemon's own socket, and `None` off macOS, where the person socket is the
+/// person's own `$XDG_RUNTIME_DIR` path that [`connect`] tries first anyway.
+///
+/// Only root can make an entry in [`MACOS_PERSON_SOCKET_DIR`], and a caller
+/// keeps what it finds there only after [`connect_unix_served_by_root`]'s uid
+/// check, so a path from here is evidence of a root half, never a claim.
+#[cfg(target_os = "macos")]
+pub fn own_person_socket_path() -> Option<std::path::PathBuf> {
+    // SAFETY: geteuid never fails.
+    let uid = unsafe { libc::geteuid() };
+    (uid != 0).then(|| person_socket_path(uid))
+}
+
+/// #2871 — is a root half serving this (non-root) process's account its
+/// person socket right now? The one evidence of a root daemon that a console
+/// user on a Mac can read ([`other_daemon_socket`]): the system socket's
+/// directory refuses their `stat`. Bounded, so a wedged root half costs a
+/// CLI call half a second, not a hang.
+#[cfg(target_os = "macos")]
+async fn macos_root_half_serves_me() -> bool {
+    let Some(path) = own_person_socket_path() else {
+        return false;
+    };
+    if !path.exists() {
+        return false;
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        connect_unix_served_by_root(path),
+    )
+    .await
+    .is_ok_and(|connected| connected.is_ok())
+}
+
+/// Off macOS the person socket, where there is one, is the person's own
+/// `$XDG_RUNTIME_DIR/roomler.sock` — [`connect`]'s first candidate — so it
+/// says nothing about a SECOND daemon.
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn macos_root_half_serves_me() -> bool {
+    false
 }
 
 /// The PID of whoever answers `path`, from its peer credentials (Linux's
@@ -7454,6 +7508,25 @@ mod tests {
             Request::Flows,
             Request::RouteList,
             Request::ConfigGet,
+            // #2871 — the companion's "two halves" banner reads the root
+            // half's `Status` over this socket and NOTHING else: on a
+            // root-mode Mac the device-owned gates (`exec_enabled`,
+            // `ssh_enabled`, `remote_config_enabled`) stay root's to set
+            // (`sudo roomler config set …`). Admitting a config verb here
+            // would hand them to whoever sits at the seat, and is a design
+            // decision (#2871), not a bug fix.
+            Request::ConfigSet {
+                key: "exec_enabled".into(),
+                value: Some("true".into()),
+            },
+            Request::ConfigSet {
+                key: "ssh_enabled".into(),
+                value: Some("true".into()),
+            },
+            Request::ConfigSet {
+                key: "remote_config_enabled".into(),
+                value: Some("true".into()),
+            },
             Request::ConfigCleanupStale,
             Request::RecordStop,
             Request::RecordingsList,
