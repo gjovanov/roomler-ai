@@ -398,7 +398,7 @@ Ticked only where a run is recorded in the field log below.
       banner on-screen through a recording with the pointer away; the red frame on
       every frame of the session and gone from the census afterwards; and the next
       click into TextEdit after a fresh banner landed its keystrokes.
-- [ ] A live session shows "Being viewed by «name»" with a working Disconnect on
+- [x] A live session shows "Being viewed by «name»" with a working Disconnect on
       Windows, macOS and a Linux X11 desktop. (Windows border confirmed visible +
       capture-excluded during a session; **the macOS half is done — the Mac,
       0.4.117, 2026-10-08**: the banner reads "Being viewed by «owner name»" and
@@ -416,9 +416,14 @@ Ticked only where a run is recorded in the field log below.
       X11.)* **The Linux X11 half: GREEN, 2026-10-25, agent and companion
       0.4.169** on Ubuntu 24.04 with GNOME 46 on Xorg (the log). The banner tucked
       away and came back on a top-edge rest, and one click on its Disconnect ended
-      the session for good. **Left:** the Windows badge's *text*. Its Disconnect
-      is proven (10-09), but the badge is capture-excluded by design, so only a
-      look at a Windows device's own screen during a session can show it.
+      the session for good. **The Windows badge's text: GREEN, 2026-10-25,
+      0.4.169** (the log). It is capture-excluded by design, so it was read from
+      the screen itself: a Win11 VM's framebuffer through the hypervisor
+      (`virsh screenshot`), with the pointer moved on the VM's tablet. After a
+      top-edge rest the badge read "Being viewed by" / "vmtest admin", with a
+      Disconnect. One click on it ended the session for good, re-proving 10-09's
+      hardware click. **Met on all three: macOS 10-08, Linux X11 and Windows
+      2026-10-25.**
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.
@@ -1212,3 +1217,20 @@ The device's access policy was restored and read back equal after each run.
 | stays disconnected ≥ 60 s | **79 s**: 0 `incoming session request` on the daemon after the click, and every viewer poll after it read disconnected (153 of them, against 96 connected before) |
 
 The cell's daemon was stopped first, so its ephemeral device unenrolled, then that cell alone was destroyed. With the macOS banner (10-08) and the Linux banner on Wayland (10-09), the companion's banner now has field evidence on every desktop it serves. The Windows half of the criterion is the native badge, not the companion. Its Disconnect is proven (10-09), and its text still needs a look at a Windows device's own screen.
+
+### 2026-10-25 — the Windows badge, read from the screen itself (agent and companion 0.4.169)
+
+**Why this way.** The native badge (`indicator/win.rs`) is capture-excluded by design (`WDA_EXCLUDEFROMCAPTURE`): no viewer, no in-OS screenshot API and no recording can show it. That is the point of it, and also why its text had never been seen. A VM's framebuffer, read by the **hypervisor** (`virsh screenshot`), is what a person at the device sees, and no in-OS capture flag reaches it. The pointer was moved as a real one is: QMP `input-send-event` on the VM's USB tablet.
+
+**What ran.** A kept vmtest cell, `win11/installer/attended@zeus`, on the release MSI (0.4.169), with every lane check passing. The viewer was the harness's lifecycle spec in the pinned Playwright container on mars.
+
+| check | evidence |
+|---|---|
+| hidden until asked | the framebuffer during the session showed the thin red frame round the screen, and no badge |
+| the reveal (1.2 s at the top edge) | after a 1.8 s rest the framebuffer showed the badge at the top centre: a red **"VA"** initials chip, **"Being viewed by" / "vmtest admin"**, and a red **Disconnect** |
+| one click → the device's word, first | a tablet move onto the button, then a real left button down and up. The device: `viewee requested disconnect via overlay badge` 11:31:26.6586Z, then `host disconnect: told the server … reason="host_disconnect" grace_ms=1000` **+0.38 ms**, then `session terminated … reason=HostDisconnect` +1.7 ms |
+| the viewer is told | `status: disconnected` |
+| stays disconnected ≥ 60 s | ~78 s: no session request after the click, and every viewer poll after it disconnected (151 of them, against 73 connected before) |
+| afterwards | the framebuffer: no badge and no red frame |
+
+The cell was shut down gracefully (the service stops and the ephemeral device unenrolls), then that cell alone was destroyed. With the macOS banner (10-08) and the Linux X11 banner (above), the criterion is met on all three platforms.
