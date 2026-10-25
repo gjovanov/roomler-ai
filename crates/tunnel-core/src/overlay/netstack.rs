@@ -53,6 +53,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,14 @@ const SLEEP_BACKSTOP: Duration = Duration::from_millis(50);
 /// Default connect timeout — smoltcp will retransmit SYNs for far longer, but
 /// an app expects a bounded failure when the peer is unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// #2882 — how long a dropped stream's close may go without progress (no byte of
+/// its queue acknowledged) before the stack gives up and resets it. A socket
+/// `close()` lingers too; this one is bounded so a peer that takes nothing in
+/// costs nothing, while a close that is merely slow always finishes.
+#[cfg(not(test))]
+const LINGER: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const LINGER: Duration = Duration::from_secs(2);
 /// Per-UDP-socket payload ring (each direction). A UDP association funnels every
 /// datagram the app addresses through one socket, so give it a healthy buffer;
 /// datagrams past it are dropped at the IP layer (UDP is lossy).
@@ -385,11 +394,17 @@ impl NsUdpSocket {
 /// One established TCP connection inside the netstack, as an
 /// [`AsyncRead`]+[`AsyncWrite`] handle. Bytes shuttle to/from the poll loop over
 /// bounded channels: reads pull chunks the stack delivered; writes push chunks
-/// the stack will segment onto the wire. Dropping the stream aborts the socket;
-/// [`poll_shutdown`](AsyncWrite::poll_shutdown) half-closes it (FIN).
+/// the stack will segment onto the wire.
+/// [`poll_shutdown`](AsyncWrite::poll_shutdown) half-closes it (FIN once the
+/// queue drains). Dropping the stream closes it like a socket `close()`: what it
+/// queued still goes out, then a FIN, and the stack resets it only if that close
+/// has not finished within [`LINGER`]. A read past the peer's FIN is EOF; a read
+/// past a reset is [`io::ErrorKind::ConnectionReset`], never EOF (#2882).
 pub struct NsTcpStream {
-    /// Stack → app. `None`/closed ⇒ EOF (peer FIN or socket gone).
+    /// Stack → app. Closed ⇒ EOF after a peer FIN, or an error if `reset`.
     from_stack: mpsc::Receiver<Vec<u8>>,
+    /// Set by the stack when the connection ended without a FIN from the peer.
+    reset: Arc<AtomicBool>,
     /// Leftover of a delivered chunk not yet fully copied into a read buffer.
     read_rem: Vec<u8>,
     read_off: usize,
@@ -436,10 +451,24 @@ impl AsyncRead for NsTcpStream {
                 this.wake.notify_one();
                 Poll::Ready(Ok(()))
             }
-            // Channel closed ⇒ clean EOF (0 bytes filled).
+            // Channel closed ⇒ EOF (0 bytes filled) after a FIN; an error after a
+            // reset, so a cut-short stream never reads as a complete one.
+            Poll::Ready(None) if this.reset.load(Ordering::Acquire) => {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
+            }
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Drop for NsTcpStream {
+    fn drop(&mut self) {
+        // Close both channels now and wake the loop, so the close starts at once
+        // rather than at the loop's next backstop tick.
+        self.to_stack = None;
+        self.from_stack.close();
+        self.wake.notify_one();
     }
 }
 
@@ -501,6 +530,17 @@ struct Conn {
     write_waker: Arc<AtomicWaker>,
     app_write_closed: bool,
     fin_sent: bool,
+    /// Since the app dropped both halves: when its close last made progress. It
+    /// must not stall for longer than [`LINGER`].
+    gone_at: Option<Instant>,
+    /// Bytes handed to smoltcp so far, and how many of them were acknowledged at
+    /// the last progress mark (`queued - send_queue()` is the acknowledged count).
+    queued: u64,
+    acked_mark: u64,
+    /// The peer sent a FIN at some point, so the end of its data is EOF, not a reset.
+    fin_seen: bool,
+    /// Shared with the app's [`NsTcpStream`]: the connection ended without a FIN.
+    reset: Arc<AtomicBool>,
 }
 
 /// A connect awaiting its handshake; fires `resp` on Established / failure.
@@ -570,11 +610,25 @@ impl PollLoop {
         p
     }
 
+    /// Every TCP socket the netstack opens, the connects and the listeners alike.
+    ///
+    /// #2876: Reno, explicitly. With no controller smoltcp sends the peer's whole
+    /// window at line rate and repairs losses by retransmission timer, whose floor
+    /// is 1 s. A path that polices instead of queueing (the relay allowance drops
+    /// a network's frames past its bucket, FR-115) then collapses the flow: roomler
+    /// SSH's sends held 48.5 kbit/s against a 1 Mbit/s bucket, where kernel TCP on
+    /// the same path held 0.86 Mbit/s. A congestion window backs off to the rate.
+    ///
+    /// Not smoltcp 0.13's Cubic: it evaluates RFC 8312's curve in bytes rather
+    /// than segments, so after each update the window sits at its 2 KiB floor for
+    /// about 11 s, and a socket's first send stalled under it in our tests.
     fn new_tcp_socket() -> tcp::Socket<'static> {
-        tcp::Socket::new(
+        let mut sock = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
             tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
-        )
+        );
+        sock.set_congestion_control(tcp::CongestionControl::Reno);
+        sock
     }
 
     fn do_connect(&mut self, dst: SocketAddr, resp: oneshot::Sender<io::Result<NsTcpStream>>) {
@@ -729,6 +783,7 @@ impl PollLoop {
         let (to_app, from_stack) = mpsc::channel(CHAN_CAP);
         let (to_stack, from_app) = mpsc::channel(CHAN_CAP);
         let write_waker = Arc::new(AtomicWaker::new());
+        let reset = Arc::new(AtomicBool::new(false));
         let conn = Conn {
             to_app: Some(to_app),
             from_app,
@@ -737,9 +792,15 @@ impl PollLoop {
             write_waker: write_waker.clone(),
             app_write_closed: false,
             fin_sent: false,
+            gone_at: None,
+            queued: 0,
+            acked_mark: 0,
+            fin_seen: false,
+            reset: reset.clone(),
         };
         let stream = NsTcpStream {
             from_stack,
+            reset,
             read_rem: Vec::new(),
             read_off: 0,
             to_stack: Some(to_stack),
@@ -825,12 +886,34 @@ impl PollLoop {
             let sock = self.sockets.get_mut::<tcp::Socket>(h);
             let conn = self.conns.get_mut(&h).unwrap();
 
-            // App dropped the whole stream (both halves gone) ⇒ abort.
+            // App dropped the whole stream (both halves gone). That closes it like
+            // a socket close(): what the app queued still goes out, then a FIN (the
+            // app → stack loop below drains the queue, the FIN branch closes).
+            // #2882: this used to abort at once, while chunks were still queued or
+            // unacknowledged, so a writer that shut down and dropped lost its tail
+            // and the reader saw a clean EOF. Reset only a close that has stalled:
+            // the clock restarts whenever the peer acknowledges more, so a slow
+            // close finishes and a peer that takes nothing in costs LINGER.
             let app_gone = conn.to_app.as_ref().is_none_or(mpsc::Sender::is_closed)
-                && conn.from_app.is_closed()
-                && conn.pending.is_none();
+                && conn.from_app.is_closed();
             if app_gone && sock.is_open() {
-                sock.abort();
+                let acked = conn.queued - sock.send_queue() as u64;
+                if conn.gone_at.is_none() || acked > conn.acked_mark {
+                    conn.gone_at = Some(Instant::now());
+                    conn.acked_mark = acked;
+                } else if conn.gone_at.is_some_and(|t| t.elapsed() > LINGER) {
+                    sock.abort();
+                }
+            }
+            // The peer sent a FIN at some point: the end of its data is EOF.
+            if matches!(
+                sock.state(),
+                tcp::State::CloseWait
+                    | tcp::State::LastAck
+                    | tcp::State::Closing
+                    | tcp::State::TimeWait
+            ) {
+                conn.fin_seen = true;
             }
 
             // Stack → app.
@@ -838,6 +921,13 @@ impl PollLoop {
                 let Some(tx) = conn.to_app.as_ref() else {
                     break;
                 };
+                if tx.is_closed() {
+                    // The app is gone: discard, so the window stays open while the
+                    // close finishes.
+                    let _ = sock.recv(|data| (data.len(), ()));
+                    progressed = true;
+                    continue;
+                }
                 let Ok(permit) = tx.try_reserve() else { break }; // app slow ⇒ window closes
                 let chunk = sock
                     .recv(|data| {
@@ -851,9 +941,13 @@ impl PollLoop {
                 permit.send(chunk);
                 progressed = true;
             }
-            // Peer half-closed and the buffer is drained ⇒ signal EOF to the app.
+            // Nothing more will arrive and the buffer is drained ⇒ end the app's
+            // reads: EOF after the peer's FIN, an error if it ended without one.
             if conn.to_app.is_some() && !sock.may_recv() && !sock.can_recv() {
-                conn.to_app = None; // dropping the sender = EOF for the reader
+                if !conn.fin_seen {
+                    conn.reset.store(true, Ordering::Release);
+                }
+                conn.to_app = None; // dropping the sender ends the reader's stream
                 progressed = true;
             }
 
@@ -881,6 +975,7 @@ impl PollLoop {
                 match sock.send_slice(&chunk[conn.pending_off..]) {
                     Ok(0) => break, // no room
                     Ok(sent) => {
+                        conn.queued += sent as u64;
                         conn.pending_off += sent;
                         progressed = true;
                         if conn.pending_off >= chunk.len() {
@@ -897,8 +992,16 @@ impl PollLoop {
             // A drained queue may unblock a backpressured writer.
             conn.write_waker.wake();
 
-            // App finished writing and we've flushed everything ⇒ FIN.
-            if conn.app_write_closed && conn.pending.is_none() && !conn.fin_sent && sock.may_send()
+            // App finished writing and the peer has acknowledged everything ⇒ FIN.
+            // #2882: not before the send queue is empty. smoltcp's close() with
+            // data still unacknowledged wedged the socket under loss: it stopped
+            // retransmitting in FinWait1, with an open window, and the tail never
+            // came. A FIN after the last ACK costs at most one round trip.
+            if conn.app_write_closed
+                && conn.pending.is_none()
+                && !conn.fin_sent
+                && sock.may_send()
+                && sock.send_queue() == 0
             {
                 sock.close();
                 conn.fin_sent = true;
@@ -1306,6 +1409,176 @@ mod tests {
         )
         .await
         .expect("round trip in time");
+    }
+
+    /// The relay allowance's bucket (FR-115 P4a, `relay_allowance::permits`): one
+    /// per network, for both directions; a second of rate, at least 64 KiB; refilled
+    /// at the rate; a packet that does not fit is dropped.
+    fn policed(
+        bucket: &std::sync::Mutex<(f64, std::time::Instant)>,
+        rate: f64,
+        len: usize,
+    ) -> bool {
+        let burst = rate.max(64.0 * 1024.0);
+        let mut b = bucket.lock().unwrap();
+        let now = std::time::Instant::now();
+        b.0 = (b.0 + now.duration_since(b.1).as_secs_f64() * rate).min(burst);
+        b.1 = now;
+        if b.0 >= len as f64 {
+            b.0 -= len as f64;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cross-link two stacks packet for packet, through one shared [`policed`]
+    /// bucket when `rate` is set.
+    fn link(a: &Netstack, b: &Netstack, rate: Option<f64>) {
+        let bucket = Arc::new(std::sync::Mutex::new((
+            rate.unwrap_or(0.0).max(64.0 * 1024.0),
+            std::time::Instant::now(),
+        )));
+        for (from, to) in [
+            (a.tun.clone(), b.tun.clone()),
+            (b.tun.clone(), a.tun.clone()),
+        ] {
+            let bucket = bucket.clone();
+            tokio::spawn(async move {
+                while let Ok(pkt) = from.read_packet().await {
+                    if rate.is_some_and(|r| !policed(&bucket, r, pkt.len())) {
+                        continue;
+                    }
+                    if to.write_packet(&pkt).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// #2876 — a policed path must not collapse a netstack sender.
+    ///
+    /// Without a congestion controller smoltcp pushed its whole window into the
+    /// bucket and recovered by 1 s RTOs: roomler SSH held 48.5 kbit/s against a
+    /// 1 Mbit/s bucket in the field, where kernel TCP held 0.86 Mbit/s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policed_path_keeps_most_of_its_rate() {
+        const RATE: f64 = 250_000.0;
+        const SIZE: usize = 512 * 1024;
+        let a_ip = Ipv4Addr::new(10, 9, 1, 1);
+        let b_ip = Ipv4Addr::new(10, 9, 1, 2);
+        let a = Netstack::start(a_ip, 24, 1280);
+        let b = Netstack::start(b_ip, 24, 1280);
+        link(&a, &b, Some(RATE));
+
+        // B sends SIZE bytes to whoever connects, then closes.
+        let mut listener = b.handle.listen(9100).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(mut s) = listener.accept().await {
+                let _ = s.write_all(&vec![7u8; SIZE]).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        let t0 = std::time::Instant::now();
+        let got = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut s = a
+                .handle
+                .connect(SocketAddr::from((b_ip, 9100)))
+                .await
+                .expect("connect");
+            let mut buf = Vec::with_capacity(SIZE);
+            s.read_to_end(&mut buf).await.expect("read");
+            buf.len()
+        })
+        .await
+        .expect("the copy finishes through the bucket");
+        let secs = t0.elapsed().as_secs_f64();
+        assert_eq!(got, SIZE);
+        // The bucket alone needs SIZE / RATE (the first second's burst is free).
+        let ideal = SIZE as f64 / RATE;
+        assert!(
+            secs < ideal * 3.0 + 1.0,
+            "{SIZE} B took {secs:.1} s through a {RATE} B/s bucket (ideal {ideal:.1} s): \
+             the sender is not backing off to the rate"
+        );
+    }
+
+    /// #2882 — a stream dropped without a shutdown still delivers what it queued,
+    /// then a FIN: dropping closes it like a socket `close()`. It used to abort, so
+    /// behind a slow or policed path the queued tail was lost, and the reader saw
+    /// a clean EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_stream_still_delivers_its_tail() {
+        const SIZE: usize = 512 * 1024;
+        let a_ip = Ipv4Addr::new(10, 9, 3, 1);
+        let b_ip = Ipv4Addr::new(10, 9, 3, 2);
+        let a = Netstack::start(a_ip, 24, 1280);
+        let b = Netstack::start(b_ip, 24, 1280);
+        link(&a, &b, Some(250_000.0));
+
+        let mut listener = b.handle.listen(9300).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(mut s) = listener.accept().await {
+                s.write_all(&vec![9u8; SIZE]).await.unwrap();
+                // Dropped here, most of it still queued, with no shutdown.
+            }
+        });
+
+        let got = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut s = a
+                .handle
+                .connect(SocketAddr::from((b_ip, 9300)))
+                .await
+                .expect("connect");
+            let mut buf = Vec::with_capacity(SIZE);
+            s.read_to_end(&mut buf)
+                .await
+                .expect("a closed stream reads to EOF, not an error");
+            buf
+        })
+        .await
+        .expect("the tail arrives");
+        assert_eq!(got.len(), SIZE, "every queued byte arrives before the FIN");
+        assert!(got.iter().all(|&x| x == 9));
+    }
+
+    /// #2882 — a connection that ends without a FIN reads as an error, never as
+    /// EOF, so a reader can tell a cut-short stream from a complete one. Here the
+    /// reader takes nothing in, so the writer's close cannot finish; its LINGER
+    /// runs out and it resets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_reads_as_an_error_not_eof() {
+        let a_ip = Ipv4Addr::new(10, 9, 4, 1);
+        let b_ip = Ipv4Addr::new(10, 9, 4, 2);
+        let a = Netstack::start(a_ip, 24, 1280);
+        let b = Netstack::start(b_ip, 24, 1280);
+        link(&a, &b, None);
+
+        let mut listener = b.handle.listen(9400).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(mut s) = listener.accept().await {
+                // Far more than the reader's buffers take in; give up and drop.
+                let big = vec![1u8; 2 * 1024 * 1024];
+                let _ = tokio::time::timeout(Duration::from_millis(500), s.write_all(&big)).await;
+            }
+        });
+
+        let mut s = a
+            .handle
+            .connect(SocketAddr::from((b_ip, 9400)))
+            .await
+            .expect("connect");
+        tokio::time::sleep(LINGER + Duration::from_secs(2)).await;
+        let res = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await
+        })
+        .await
+        .expect("the read ends");
+        let err = res.expect_err("a reset must not read as EOF");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

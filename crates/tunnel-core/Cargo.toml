@@ -156,6 +156,11 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     # Inert until a node assigns a v6 address (see docs/overlay-communication.md).
     "proto-ipv6",
     "socket-tcp",
+    # #2876: without a congestion controller smoltcp pushes its whole window at line
+    # rate and recovers by 1 s RTOs, so a policed path (the relay allowance) holds
+    # 48.5 kbit/s where kernel TCP holds the bucket's 0.86 Mbit/s. Reno, not Cubic:
+    # smoltcp 0.13's Cubic computes its curve in bytes and pins the window (netstack.rs).
+    "socket-tcp-reno",
     "socket-udp",
     "socket-icmp",
     # Auto-answer ICMP echo requests to our own overlay IP at the iface layer, so
