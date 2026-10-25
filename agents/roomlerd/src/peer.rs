@@ -3580,6 +3580,16 @@ pub(crate) fn frame_video_bytes(payload: &[u8], is_keyframe: bool, timestamp_us:
     out
 }
 
+/// FR-119 P2b-13 — the keyframe flag of a frame [`frame_video_bytes`] built,
+/// read back from its header, so a send task that holds only the wire bytes
+/// can tell the goodput sink which of its blocked sends were keyframes.
+/// `dead_code` as for [`frame_video_bytes`]: both send tasks are behind the
+/// `vp9-444` and `ffmpeg-encoder` features, and the tests run either way.
+#[allow(dead_code)]
+pub(crate) fn video_bytes_is_keyframe(wire: &[u8]) -> bool {
+    wire.get(4).is_some_and(|flags| flags & 0x01 != 0)
+}
+
 /// P5 — VP9 chroma resolution shared by the session dispatcher (pipeline
 /// key) and the pump's encoder build: session pref → env → 4:4:4 default.
 #[cfg(feature = "vp9-444")]
@@ -4190,7 +4200,11 @@ async fn media_pump_vp9_444_dc(
                         if ok {
                             frames_sent.fetch_add(1, Relaxed);
                             bytes_written.fetch_add(total as u64, Relaxed);
-                            goodput_sink.record(total as u64, ser_start.elapsed());
+                            goodput_sink.record_frame(
+                                total as u64,
+                                ser_start.elapsed(),
+                                video_bytes_is_keyframe(&wire),
+                            );
                         }
                     }
                     next = send_rx.try_recv().ok();
@@ -7023,7 +7037,11 @@ async fn media_pump_ffmpeg_dc(
                             // Only a frame that reached the wire measures the
                             // pipe; the sink discards sub-threshold (headroom)
                             // sends itself.
-                            goodput_sink.record(total as u64, ser_start.elapsed());
+                            goodput_sink.record_frame(
+                                total as u64,
+                                ser_start.elapsed(),
+                                video_bytes_is_keyframe(&wire),
+                            );
                             // P7 — queue-wait: enqueue→wire-complete. This is
                             // the transport-added latency the viewer feels;
                             // the heartbeat drains it per window.
@@ -14581,6 +14599,7 @@ mod tests {
 mod video_bytes_wire_tests {
     use super::{
         CHUNK_HEADER_BYTES, agent_epoch_us, chunk_framed, clock_echo_json, frame_video_bytes,
+        video_bytes_is_keyframe,
     };
 
     /// Lock the exact byte layout that `rc-vp9-444-worker.ts`'s
@@ -14678,6 +14697,16 @@ mod video_bytes_wire_tests {
     fn delta_frames_clear_keyframe_flag() {
         let out = frame_video_bytes(b"x", false, 0);
         assert_eq!(out[4], 0x00, "delta frame must not set the keyframe bit");
+    }
+
+    /// FR-119 P2b-13 — the send tasks read the flag back from the header they
+    /// were handed; a buffer too short to carry one is no keyframe.
+    #[test]
+    fn the_keyframe_flag_reads_back_from_the_header() {
+        assert!(video_bytes_is_keyframe(&frame_video_bytes(b"idr", true, 7)));
+        assert!(!video_bytes_is_keyframe(&frame_video_bytes(b"p", false, 7)));
+        assert!(video_bytes_is_keyframe(&frame_video_bytes(&[], true, 0)));
+        assert!(!video_bytes_is_keyframe(&[0, 0, 0]));
     }
 
     #[test]

@@ -1108,6 +1108,10 @@ impl RateGovernor {
             // conditions still stand.
             agent_stalled: sender.is_some_and(|s| s.stalled_passes > 0),
             opening: sender.is_some_and(|s| s.opening),
+            // FR-119 P2b-13 — direct only, like the opening began.
+            keyframe_burst: !constrained
+                && !samples.is_empty()
+                && samples.iter().all(|s| s.keyframe),
             // V2 wires the carrier; until then a change cannot be seen
             // here and the memory keying is where it will be read.
             carrier_changed: false,
@@ -1454,9 +1458,10 @@ impl RateGovernor {
     }
 
     /// FR-79 — windows the validity gate rejected, as
-    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening]`
-    /// (FR-119 P2b-8 appended the fifth, so the first four keep their places).
-    pub fn evidence_rejected(&self) -> [u32; 5] {
+    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening,
+    /// keyframe-burst]` (FR-119 P2b-8 appended the fifth and P2b-13 the sixth,
+    /// so the earlier ones keep their places).
+    pub fn evidence_rejected(&self) -> [u32; 6] {
         self.evidence.counts()
     }
 
@@ -1674,7 +1679,7 @@ mod tests {
         // Four rejections, every one a transit stall — no agent stall, no
         // shadow (each window's predecessor stalled too, and the stall itself
         // is the more specific answer), no carrier change.
-        assert_eq!(g.evidence_rejected(), [0, 4, 0, 0, 0]);
+        assert_eq!(g.evidence_rejected(), [0, 4, 0, 0, 0, 0]);
     }
     /// FR-70 P1 — a remembered-slow pair, constrained, as the field ran it.
     fn remembered(seed_bps: u32, flags: GovernorFlags, now: Instant) -> RateGovernor {
@@ -2942,7 +2947,7 @@ mod tests {
         );
         assert_eq!(
             g.evidence_rejected(),
-            [0, 2, 0, 0, 0],
+            [0, 2, 0, 0, 0, 0],
             "both rejections were transit stalls"
         );
     }
@@ -3575,7 +3580,7 @@ mod tests {
         );
         assert_eq!(
             g.evidence_rejected(),
-            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
             "every window was evidence"
         );
         assert!(
@@ -3835,5 +3840,60 @@ mod tests {
             .expect("window due");
         assert_eq!(g.blocked_send_bps(t2), Some(10_000_000));
         assert!(g.belief_bps(t2).2.is_some(), "the capacity claim folds");
+    }
+
+    /// FR-119 P2b-13 — a DIRECT window whose only blocked send was a keyframe
+    /// is not a capacity measurement: the keyframe spent its send growing the
+    /// SCTP window that the deltas before it had left small. Field 2026-10-24:
+    /// one 625 KB keyframe blocked 71.6 ms, folded as 69.9 Mbit/s on a mesh
+    /// path that carried 311 Mbit/s, and took a granted 120 fps back. A pipe
+    /// that really is narrower shows it in the deltas queued behind the
+    /// keyframe, which block too, and their window still folds. On a relay the
+    /// keyframe alone still folds, as before.
+    #[test]
+    fn a_direct_window_whose_only_blocked_sends_are_keyframes_folds_no_capacity() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        // Past the opening: one keyframe, blocked 72 ms (a 69 Mbit/s drain).
+        sink.record_frame(625_000, Duration::from_millis(72), true);
+        g.note_window_sender(t2_sender(120));
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 120, || 0, || 0, || 0, false, |o| o, 0)
+            .expect("window due");
+        assert_eq!(
+            g.belief_bps(t1).2,
+            None,
+            "no capacity claim from a keyframe alone"
+        );
+        assert_eq!(g.blocked_send_bps(t1), None, "and nothing for the clamp");
+        assert_eq!(g.evidence_rejected()[5], 1, "rejected as a keyframe burst");
+
+        // A narrow pipe: the deltas behind the keyframe block too, and the
+        // window folds (10 × 30 KB in 24 ms each, beside the keyframe).
+        sink.record_frame(625_000, Duration::from_millis(500), true);
+        for _ in 0..10 {
+            sink.record(30_000, Duration::from_millis(24));
+        }
+        g.note_window_sender(t2_sender(11));
+        let t2 = t1 + Duration::from_millis(1100);
+        g.tick_viewer_window(t2, 120, || 0, || 0, || 0, false, |o| o, 0)
+            .expect("window due");
+        assert!(g.belief_bps(t2).2.is_some(), "the capacity claim folds");
+        assert_eq!(g.evidence_rejected()[5], 1, "not a keyframe burst");
+
+        // On a constrained window the keyframe alone is still read.
+        let mut r = gov(start);
+        let relay_sink = r.goodput_sink();
+        relay_sink.record_frame(625_000, Duration::from_millis(900), true);
+        r.note_window_sender(t2_sender(2));
+        r.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        assert_eq!(
+            r.evidence_rejected()[5],
+            0,
+            "a relay keeps the keyframe sample"
+        );
+        assert!(r.blocked_send_bps(t1).is_some(), "and folds it");
     }
 }

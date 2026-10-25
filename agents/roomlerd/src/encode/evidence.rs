@@ -49,6 +49,8 @@
 // 60 s. Twice in four direct sessions. On a direct window the facts that
 // exist there apply — the agent's own stall and the opening; the classifier
 // verdicts stay constrained-only, because the classifier does not run there.
+// P2b-13 added the third direct fact: a window whose only blocked sends were
+// keyframes measured the congestion window's ramp, as the opening does.
 
 use super::pipe_state::PipeState;
 
@@ -69,6 +71,18 @@ pub enum Reason {
     /// opener window (at least 2 s from the first keyframe and until the send
     /// ledger drains, at most 3 s), now kept for every session.
     Opening,
+    /// FR-119 P2b-13 — on a direct path, the window's only blocked sends were
+    /// keyframes. SCTP grows its congestion window only while data is queued,
+    /// so the deltas before a keyframe leave it about one delta's size, and a
+    /// keyframe many times larger spends its send growing it back: the
+    /// opening's defect at a later moment of the session. A pipe narrower
+    /// than the stream shows it in the deltas queued behind the keyframe,
+    /// which block too, so their window is still read. Field 2026-10-24: one
+    /// 625 KB keyframe blocked 71.6 ms and folded as 69.9 Mbit/s on a mesh
+    /// path that carried 311 Mbit/s over TCP, and took a granted 120 fps
+    /// back. Direct only, as the opening began: on a relay a keyframe's drain
+    /// is dominated by the path, and may be the only sample a session gets.
+    KeyframeBurst,
     /// The classifier says the transport stalled in this window.
     TransitStalled,
     /// The window BEFORE this one stalled. What arrives here is the stall's
@@ -86,6 +100,7 @@ impl Reason {
         match self {
             Reason::AgentStalled => "agent-stalled",
             Reason::Opening => "opening",
+            Reason::KeyframeBurst => "keyframe-burst",
             Reason::TransitStalled => "transit-stalled",
             Reason::StallShadow => "stall-shadow",
             Reason::CarrierChanged => "carrier-changed",
@@ -112,6 +127,7 @@ impl Reason {
     ///   the new carrier's memory, not a cut.
     /// - `Opening` is the opening keyframe draining into a transport that is
     ///   still ramping, which FR-35 already declined to cut for.
+    /// - `KeyframeBurst` is the same ramp, later in a direct session.
     ///
     /// ⚠️ True here is NOT "cut". A transit stall on a path we are NOT
     /// overdriving is FR-71's finding 4 (an 8 Mbps relay leg
@@ -124,14 +140,15 @@ impl Reason {
             Reason::TransitStalled => true,
             Reason::AgentStalled
             | Reason::Opening
+            | Reason::KeyframeBurst
             | Reason::StallShadow
             | Reason::CarrierChanged => false,
         }
     }
 
-    /// The counter's position in [`Rejections::counts`]. `Opening` came last
-    /// and is appended, so the four positions a heartbeat reader already knows
-    /// keep their meaning.
+    /// The counter's position in [`Rejections::counts`]. `Opening` and then
+    /// `KeyframeBurst` came last and are appended, so the positions a heartbeat
+    /// reader already knows keep their meaning.
     fn index(self) -> usize {
         match self {
             Reason::AgentStalled => 0,
@@ -139,6 +156,7 @@ impl Reason {
             Reason::StallShadow => 2,
             Reason::CarrierChanged => 3,
             Reason::Opening => 4,
+            Reason::KeyframeBurst => 5,
         }
     }
 }
@@ -159,6 +177,9 @@ pub struct WindowFacts {
     /// The FFmpeg pump keeps FR-35's opener window for every session; a pump
     /// that keeps no send-side figures passes `false`.
     pub opening: bool,
+    /// FR-119 P2b-13 — a direct window whose blocked sends were all keyframes
+    /// ([`Reason::KeyframeBurst`]). Always `false` on a constrained window.
+    pub keyframe_burst: bool,
     /// Did the overlay carrier under the session change since the last
     /// window? (V2 wires this; V1 always passes `false`.)
     pub carrier_changed: bool,
@@ -171,6 +192,9 @@ pub fn rejected(f: WindowFacts) -> Option<Reason> {
     }
     if f.opening {
         return Some(Reason::Opening);
+    }
+    if f.keyframe_burst {
+        return Some(Reason::KeyframeBurst);
     }
     if f.state == PipeState::TransitStalled {
         return Some(Reason::TransitStalled);
@@ -187,7 +211,7 @@ pub fn rejected(f: WindowFacts) -> Option<Reason> {
 /// Rejected windows per reason, for the heartbeat. One field replaces the four
 /// counters T1b, T2 and T2b each added for their own rule.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Rejections([u32; 5]);
+pub struct Rejections([u32; 6]);
 
 impl Rejections {
     pub fn note(&mut self, r: Reason) {
@@ -195,8 +219,9 @@ impl Rejections {
         self.0[i] = self.0[i].saturating_add(1);
     }
 
-    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening]`.
-    pub fn counts(&self) -> [u32; 5] {
+    /// `[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening,
+    /// keyframe-burst]`.
+    pub fn counts(&self) -> [u32; 6] {
         self.0
     }
 
@@ -215,6 +240,7 @@ mod tests {
             prev_state: Some(PipeState::Clear),
             agent_stalled: false,
             opening: false,
+            keyframe_burst: false,
             carrier_changed: false,
         }
     }
@@ -267,6 +293,7 @@ mod tests {
             prev_state: Some(PipeState::TransitStalled),
             agent_stalled: false,
             opening: false,
+            keyframe_burst: false,
             carrier_changed: false,
         };
         assert_eq!(rejected(shadow), Some(Reason::StallShadow));
@@ -275,6 +302,7 @@ mod tests {
             prev_state: Some(PipeState::Overproduced),
             agent_stalled: false,
             opening: false,
+            keyframe_burst: false,
             carrier_changed: false,
         };
         assert_eq!(rejected(after), None);
@@ -292,6 +320,7 @@ mod tests {
                 prev_state: prev,
                 agent_stalled: false,
                 opening: false,
+                keyframe_burst: false,
                 carrier_changed: false,
             });
             if let Some(r) = r {
@@ -301,7 +330,7 @@ mod tests {
             prev = Some(state);
         }
         assert_eq!(seen, vec![Some(Reason::StallShadow), None, None]);
-        assert_eq!(rejections.counts(), [0, 0, 1, 0, 0]);
+        assert_eq!(rejections.counts(), [0, 0, 1, 0, 0, 0]);
         assert_eq!(rejections.total(), 1);
     }
 
@@ -329,6 +358,7 @@ mod tests {
         assert!(Reason::TransitStalled.is_congestion());
         assert!(!Reason::AgentStalled.is_congestion());
         assert!(!Reason::Opening.is_congestion());
+        assert!(!Reason::KeyframeBurst.is_congestion());
         assert!(!Reason::StallShadow.is_congestion());
         assert!(!Reason::CarrierChanged.is_congestion());
     }
@@ -377,8 +407,36 @@ mod tests {
         let mut rejections = Rejections::default();
         rejections.note(Reason::Opening);
         rejections.note(Reason::AgentStalled);
-        assert_eq!(rejections.counts(), [1, 0, 0, 0, 1]);
+        assert_eq!(rejections.counts(), [1, 0, 0, 0, 1, 0]);
         assert_eq!(rejections.total(), 2);
+    }
+
+    /// FR-119 P2b-13 — a direct window whose only blocked sends were keyframes
+    /// is not evidence (on a direct window the classifier says `Unknown`), it
+    /// counts in its own, appended, sixth position, and the agent's stall and
+    /// the opening, the more specific answers, still outrank it.
+    #[test]
+    fn a_keyframe_burst_rejects_a_direct_window_in_the_sixth_position() {
+        let burst = WindowFacts {
+            prev_state: None,
+            keyframe_burst: true,
+            ..facts(PipeState::Unknown)
+        };
+        assert_eq!(rejected(burst), Some(Reason::KeyframeBurst));
+        let mut rejections = Rejections::default();
+        rejections.note(Reason::KeyframeBurst);
+        assert_eq!(rejections.counts(), [0, 0, 0, 0, 0, 1]);
+        assert_eq!(Reason::KeyframeBurst.as_str(), "keyframe-burst");
+        let opening = WindowFacts {
+            opening: true,
+            ..burst
+        };
+        assert_eq!(rejected(opening), Some(Reason::Opening));
+        let stalled = WindowFacts {
+            agent_stalled: true,
+            ..burst
+        };
+        assert_eq!(rejected(stalled), Some(Reason::AgentStalled));
     }
 
     /// The first window of a session has no predecessor and is not in anyone's
