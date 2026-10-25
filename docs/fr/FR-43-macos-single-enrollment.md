@@ -80,7 +80,7 @@ Anchors below verified against master `3980e79d`.
 ### ⚠️ First, a correction to "Key design" above: P2 has no Windows precedent
 
 "Port our own Windows supervisor to launchd" is true of **P1 and only P1**. The Windows
-SCM service is a *pure launcher*: `win_service/mod.rs:400` hands off to
+SCM service is a *pure launcher*: `win_service/mod.rs:404` hands off to
 `supervisor::run(worker_exe, vec!["run"], …)` and does nothing else, so the spawned worker
 is the entire agent — control WS, overlay, capture, input, all in one process. Windows
 never had to split the planes, because a SYSTEM process can attach to the interactive
