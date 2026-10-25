@@ -166,8 +166,18 @@ fn open_system_audio() -> Result<Box<dyn crate::audio::AudioCapture>> {
 fn open_microphone() -> Result<Box<dyn crate::audio::AudioCapture>> {
     #[cfg(feature = "synthetic-frame-source")]
     if std::env::var_os("ROOMLERD_SYNTHETIC_AUDIO").is_some() {
+        // FR-97 P2f-3's stand-in for macOS's microphone question, for the
+        // tests: say a person is being asked, then "answer" after this long.
+        if let Some(ms) = std::env::var("ROOMLERD_SYNTHETIC_MIC_QUESTION_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            super::mic_permission::announce_question();
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         return Ok(Box::new(crate::audio::NoopAudioCapture));
     }
+    // A Mac asks the person here, when nobody has decided (P2f-3).
     #[cfg(target_os = "macos")]
     super::mic_permission::preflight()?;
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]

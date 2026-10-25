@@ -12,9 +12,9 @@
 //! The folder rules live in [`folder`], the facts about a finished recording
 //! in [`sidecar`].
 //!
-//! Not here yet (later phases): the microphone on macOS (FR-97 P2f; computer
-//! audio is there since FR-97 P2a), and re-attaching after a dropped session
-//! (P3b-3). AAC
+//! Not here yet (later phases): re-attaching after a dropped session (P3b-3).
+//! A Mac's computer audio arrived with FR-97 P2a and its microphone with P2f,
+//! which since P2f-3 asks the person itself ([`mic_permission`]). AAC
 //! ([`audio_codec`]) and FFmpeg's H.264 decoder for hardware-encoded
 //! recordings ([`decode`]) are built (P4) and wait only for the vendored
 //! FFmpeg that carries them.

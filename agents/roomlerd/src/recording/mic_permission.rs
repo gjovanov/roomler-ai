@@ -8,11 +8,10 @@
 //! names why (the recorder's own rule, `child::open_audio`), so the recorder
 //! asks AVFoundation first and refuses where the answer is already no.
 //!
-//! A microphone nobody has decided about yet is opened: macOS asks the person
-//! at that moment, naming the app from the bundle's
-//! `NSMicrophoneUsageDescription`, and the track is silent until they answer.
-//! Opening it without that key ends the process, which is why the key ships
-//! in the same change as this code.
+//! A microphone nobody has decided about yet is asked about: macOS asks the
+//! person, naming the app from the bundle's `NSMicrophoneUsageDescription`,
+//! and their answer decides. Asking without that key ends the process, which
+//! is why the key ships in the same change as this code.
 //!
 //! ⚠️ **Except on a supervised Mac** (P2f-1b, measured on the operator's
 //! MacBook, 2026-10-24): the GUI worker is started by the ROOT daemon, which
@@ -26,8 +25,29 @@
 //! `ROOMLERD_RECORDER_DISCLAIM=0`), every answer refuses by name instead (the
 //! manager tells the recorder, [`SUPERVISED_ENV`]).
 //!
+//! ⚠️ **The question takes as long as the person does** (P2f-3, measured on the
+//! operator's MacBook, 2026-10-25). With the permission undecided, CoreAudio's
+//! open blocks until the person answers, and the daemon's 20 s start deadline
+//! killed the recorder while they were still reading it. Their Allow then
+//! stuck, but that first recording had already failed. So an undecided
+//! microphone is asked about here, explicitly
+//! (`requestAccessForMediaType:completionHandler:`), within [`ASK_WINDOW`].
+//! The recorder first tells the daemon it is asking ([`announce_question`]),
+//! and the daemon then waits longer than this window
+//! (`manager::ASK_TIMEOUT`), so the recorder's own answer always comes first.
+//!
 //! The decision is plain data so it is tested on every OS (FR-43's practice);
 //! only the question itself is macOS's.
+
+use std::time::Duration;
+
+/// P2f-3 — how long the recorder waits for the person to answer macOS's
+/// microphone question before it refuses by name.
+pub const ASK_WINDOW: Duration = Duration::from_secs(120);
+
+/// P2f-3 — what a recorder says when the question went unanswered.
+pub const NO_ANSWER_WORDS: &str = "macOS asked whether Roomler Daemon may use the microphone, and \
+     nobody answered within 2 minutes: answer that question, then start the recording again";
 
 /// Set (to `1`) by a supervised Mac worker's recording manager on its
 /// recorder: the microphone's question would be asked for the root daemon.
@@ -91,10 +111,41 @@ impl MicPermission {
     }
 }
 
+/// P2f-3 — what the person did with macOS's microphone question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Allowed,
+    /// They chose "Don't Allow": the same as turning it off.
+    Refused,
+    /// Nobody answered within [`ASK_WINDOW`].
+    NoAnswer,
+}
+
+impl Answer {
+    /// `Err(words)` unless the person allowed it.
+    pub fn verdict(self) -> Result<(), &'static str> {
+        match self {
+            Self::Allowed => Ok(()),
+            Self::Refused => MicPermission::Denied.verdict(),
+            Self::NoAnswer => Err(NO_ANSWER_WORDS),
+        }
+    }
+}
+
+/// P2f-3 — tell the daemon a person is being asked, so its start deadline
+/// does not end this recorder while they read the question. Only a build
+/// that can open a microphone (`audio`) ever asks.
+#[cfg(feature = "audio")]
+pub(crate) fn announce_question() {
+    super::child::emit(&serde_json::json!({"ev": "asking", "what": "microphone"}));
+}
+
 /// Ask AVFoundation, and refuse where the microphone would record silence.
+/// An undecided microphone is asked about here, and the answer decides
+/// (P2f-3).
 #[cfg(all(target_os = "macos", feature = "audio"))]
 pub fn preflight() -> anyhow::Result<()> {
-    let permission = MicPermission::from_raw(authorization_status());
+    let permission = MicPermission::from_raw(av::authorization_status());
     let supervised = std::env::var_os(SUPERVISED_ENV).is_some_and(|v| v == "1");
     tracing::info!(
         ?permission,
@@ -103,29 +154,77 @@ pub fn preflight() -> anyhow::Result<()> {
     );
     permission
         .verdict_where(supervised)
-        .map_err(|words| anyhow::anyhow!(words))
+        .map_err(|words| anyhow::anyhow!(words))?;
+    if permission == MicPermission::NotDetermined {
+        announce_question();
+        let answer = av::request_access(ASK_WINDOW);
+        tracing::info!(
+            ?answer,
+            "recording: the person answered the microphone question"
+        );
+        answer.verdict().map_err(|words| anyhow::anyhow!(words))?;
+    }
+    Ok(())
 }
 
-/// `[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]`,
-/// or -1 where the class is missing. Asking never prompts the person.
+/// The two AVFoundation calls, macOS only.
 #[cfg(all(target_os = "macos", feature = "audio"))]
-fn authorization_status() -> isize {
+mod av {
+    use std::time::Duration;
+
+    use block2::RcBlock;
     use objc2::msg_send;
-    use objc2::runtime::AnyClass;
+    use objc2::runtime::{AnyClass, Bool};
     use objc2_foundation::NSString;
+
+    use super::Answer;
 
     #[link(name = "AVFoundation", kind = "framework")]
     unsafe extern "C" {
         static AVMediaTypeAudio: &'static NSString;
     }
 
-    let Some(class) = AnyClass::get(c"AVCaptureDevice") else {
-        return -1;
-    };
-    // SAFETY: a class method taking an `AVMediaType` (an `NSString *`) and
-    // returning an `NSInteger`; `AVMediaTypeAudio` is a constant AVFoundation
-    // exports for exactly this argument.
-    unsafe { msg_send![class, authorizationStatusForMediaType: AVMediaTypeAudio] }
+    /// `[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]`,
+    /// or -1 where the class is missing. Asking never prompts the person.
+    pub(super) fn authorization_status() -> isize {
+        let Some(class) = AnyClass::get(c"AVCaptureDevice") else {
+            return -1;
+        };
+        // SAFETY: a class method taking an `AVMediaType` (an `NSString *`)
+        // and returning an `NSInteger`; `AVMediaTypeAudio` is a constant
+        // AVFoundation exports for exactly this argument.
+        unsafe { msg_send![class, authorizationStatusForMediaType: AVMediaTypeAudio] }
+    }
+
+    /// `[AVCaptureDevice requestAccessForMediaType:completionHandler:]`: macOS
+    /// asks the person (naming the bundle's usage string), and the handler
+    /// runs on a queue of AVFoundation's with their answer. Waits at most
+    /// `window`; the question stays on screen after that, and its answer is
+    /// kept for the next recording.
+    pub(super) fn request_access(window: Duration) -> Answer {
+        let Some(class) = AnyClass::get(c"AVCaptureDevice") else {
+            return Answer::NoAnswer;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let handler = RcBlock::new(move |granted: Bool| {
+            let _ = tx.try_send(granted.as_bool());
+        });
+        // SAFETY: a class method taking the same `AVMediaType` constant and a
+        // `void (^)(BOOL)` block, which AVFoundation copies and retains until
+        // it runs; the handler only sends on a channel it owns.
+        unsafe {
+            let _: () = msg_send![
+                class,
+                requestAccessForMediaType: AVMediaTypeAudio,
+                completionHandler: &*handler
+            ];
+        }
+        match rx.recv_timeout(window) {
+            Ok(true) => Answer::Allowed,
+            Ok(false) => Answer::Refused,
+            Err(_) => Answer::NoAnswer,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +275,25 @@ mod tests {
         ] {
             assert_eq!(p.verdict_where(true), Err(SUPERVISED_WORDS), "{p:?}");
         }
+    }
+
+    #[test]
+    fn the_persons_answer_decides_and_silence_is_named() {
+        // P2f-3: an undecided microphone is asked about; only "allow" opens it.
+        assert_eq!(Answer::Allowed.verdict(), Ok(()));
+        // "Don't Allow" is the same as turning it off, and says where to undo it.
+        assert_eq!(Answer::Refused.verdict(), MicPermission::Denied.verdict());
+        // A question nobody answered is not a "no": it says so, and how to go on.
+        let words = Answer::NoAnswer.verdict().unwrap_err();
+        assert_eq!(words, NO_ANSWER_WORDS);
+        assert!(words.contains("start the recording again"), "{words}");
+    }
+
+    #[test]
+    fn the_daemon_outwaits_the_question() {
+        // The recorder's own refusal must arrive before the daemon's deadline,
+        // or a person who never answered gets "did not start" instead of why.
+        assert!(super::super::manager::ASK_TIMEOUT > ASK_WINDOW + Duration::from_secs(10));
     }
 
     #[test]
