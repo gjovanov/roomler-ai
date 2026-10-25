@@ -168,7 +168,8 @@ jobs:
             vcpkg's, and the Windows build applies them too:
           $PORT_PATCHES
           * \`recipe/vendor-ffmpeg-windows.yml\` — the exact workflow that
-            produces the Windows (static, MSVC) and Linux (shared) builds,
+            produces the Windows (static, MSVC) and Linux (shared; x86_64 and
+            aarch64) builds,
             including the configure options it injects into the port.
           * \`recipe/vendor-ffmpeg-macos.yml\` — the macOS build.
 
@@ -177,7 +178,7 @@ jobs:
           | Platform | Linkage | Source changes applied | LGPL clause |
           |---|---|---|---|
           | Windows (\`roomlerd.exe\`) | **static** (\`x64-windows-static-md\`) | our patches, then the vcpkg port's own, in its \`PATCHES\` list | §6: relinking must be possible |
-          | Linux (\`.deb\`) | shared (\`--enable-shared --disable-static\`) | our patches (\`patch -p1\` from the source root, in file-name order) | §6(b): the shared mechanism satisfies it |
+          | Linux (\`.deb\`, x86_64 and aarch64) | shared (\`--enable-shared --disable-static\`) | our patches (\`patch -p1\` from the source root, in file-name order) | §6(b): the shared mechanism satisfies it |
           | macOS (\`.pkg\`) | shared (the \`*_videotoolbox\` encoders as dylibs in the app bundle) | none | §6(b): the shared mechanism satisfies it |
 
           Beyond those patches, every build's customisation is its configure
@@ -197,7 +198,8 @@ jobs:
           \`\`\`
           tar xf ffmpeg-$V.tar.gz && cd FFmpeg-$V
           for p in ../patches/*.patch; do patch -p1 < "\$p"; done
-          # then configure with the flags in recipe/vendor-ffmpeg-windows.yml (Linux job)
+          # then configure with the flags in recipe/vendor-ffmpeg-windows.yml
+          # (the build-linux-minimal job on x86_64, build-linux-arm64-minimal on aarch64)
           \`\`\`
 
           ## Relinking the Windows agent

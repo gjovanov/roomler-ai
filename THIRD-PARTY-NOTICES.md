@@ -26,7 +26,7 @@ the build if one appears.
 | Platform | Linkage | Obligation |
 |---|---|---|
 | **Windows** (`roomlerd.exe`) | **static** (`x64-windows-static-md`) | LGPL-2.1 **§6** — recipients must be able to relink |
-| **Linux** (`.deb`) | shared (`--enable-shared --disable-static`) | §6(b) satisfied by the shared-library mechanism |
+| **Linux** (`.deb` and tarball; x86_64, and aarch64 from 0.4.170) | shared (`--enable-shared --disable-static`) | §6(b) satisfied by the shared-library mechanism |
 | **macOS** (`.pkg`, since 2026-08-25) | shared (`--enable-shared`; the three `*_videotoolbox` encoders as dylibs inside the app bundle) | §6(b) satisfied by the shared-library mechanism |
 
 ### Written offer
@@ -105,8 +105,9 @@ The same question now covers two more software codecs, both in the vendored
 FFmpeg since the screen recorder shipped (FR-85 P4c). FFmpeg's H.264 **decoder**
 opens a recording that a hardware encoder wrote in High profile, for the
 recorder's editor, since openh264 decodes only Constrained Baseline. Its native
-AAC-LC **encoder** writes a recording's sound. Linux arm64 carries no FFmpeg and
-stays on openh264 and Opus. Neither is an HEVC component: see below.
+AAC-LC **encoder** writes a recording's sound. Linux arm64 carries the same two
+from 0.4.170 (FR-97 P7a); before it, it carried no FFmpeg and recorded Opus.
+Neither is an HEVC component: see below.
 
 ---
 
@@ -176,8 +177,8 @@ its **upstream licence, unmodified**, and is excluded from our SPDX header sweep
 | russh | Apache-2.0 | Roomler SSH server |
 | Wintun | third-party binary | redistributed unmodified, original signature preserved |
 | Microsoft VC++ runtime | Microsoft redistributable | shipped per redistribution terms, original signatures preserved |
-| libva + libdrm | MIT | bundled in the Linux `.deb` next to the vendored FFmpeg (FR-77 P4): the VA-API dispatcher the `*_vaapi` encoders need at load time; the VA driver itself is the host's and never redistributed |
-| Intel oneVPL dispatcher (libvpl) | MIT | bundled in the Linux `.deb` (the QSV encoders' dispatcher; the runtime is the host's) |
+| libva + libdrm | MIT | bundled in the Linux `.deb` and tarball next to the vendored FFmpeg (FR-77 P4; aarch64 too from 0.4.170, FR-97 P7a): the VA-API dispatcher the `*_vaapi` encoders need at load time; the VA driver itself is the host's and never redistributed |
+| Intel oneVPL dispatcher (libvpl) | MIT | bundled in the x86_64 Linux `.deb` (the QSV encoders' dispatcher; the runtime is the host's). Not in aarch64's, which has no QSV |
 | libvpx | BSD-3-Clause | the VP9 4:4:4 software encoder; bundled in the Linux `.deb`, dynamically linked elsewhere |
 
 ---
