@@ -184,6 +184,17 @@ pub struct KnowhowSettings {
     /// absent: 5.
     #[serde(default)]
     pub scan_sweep_secs: u64,
+    /// P4-5-3 — how many days a person's fact, or a session's proposal a
+    /// person or a probe confirmed, stays `active` with nothing confirming
+    /// it before it turns `stale` (`ROOMLER__KNOWHOW__STALE_DAYS`; decisions
+    /// 40 and 57). Absent: 30. `0`: never. The sync's facts and a scan's own
+    /// never turn stale.
+    #[serde(default)]
+    pub stale_days: Option<u64>,
+    /// P4-5-3 — how often each pod sweeps for facts to turn stale, in
+    /// seconds (`ROOMLER__KNOWHOW__STALE_SWEEP_SECS`). 0 or absent: 3600.
+    #[serde(default)]
+    pub stale_sweep_secs: u64,
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.

@@ -48,6 +48,7 @@ pub mod scan;
 pub mod scope;
 pub mod session;
 mod socket;
+pub mod stale;
 pub mod sync;
 pub mod view;
 mod write;
@@ -180,6 +181,19 @@ impl Module for KnowhowState {
             secs => secs,
         };
         scan::spawn_sweeper(state.clone(), sweep);
+        // P4-5-3 — and turns the facts nothing confirmed for
+        // `knowhow.stale_days` stale (decisions 40 and 57). Every pod, as the
+        // reconciler: the host schedules no periodic job yet.
+        match stale::days(settings.knowhow.stale_days) {
+            Some(days) => {
+                let every = match settings.knowhow.stale_sweep_secs {
+                    0 => stale::DEFAULT_STALE_SWEEP_SECS,
+                    secs => secs,
+                };
+                stale::spawn_sweeper(state.clone(), every, days);
+            }
+            None => tracing::info!("knowhow: knowhow.stale_days is 0, so no fact turns stale"),
+        }
         Ok(state)
     }
 

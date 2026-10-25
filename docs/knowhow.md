@@ -31,10 +31,13 @@ sessions read it too, through their toolbelt.
 > is shown (§13.2); and P4-5-2a, a session's verify, the server's half: a
 > session asks its own device to probe an entity, while its starter holds
 > `KNOWHOW_EDIT`, and is sent what it measured (§13.3); and P4-5-2b, the
-> toolbelt's `knowhow_verify`, which asks a person at each call (§12.1).**
-> People, the sync, scans and sessions' proposals fill the map, and probes
-> verify it. Windows (P4-3b-4), staleness (P4-5-3) and `roomler_connect`
-> (P4-6) come with the steps that build them (§14).
+> toolbelt's `knowhow_verify`, which asks a person at each call (§12.1); and
+> P4-5-3-1, staleness: a person's fact, or a confirmed proposal, that nothing
+> confirmed for `knowhow.stale_days` turns `stale`, and a probe's or a
+> person's word revives it (§13.4).** People, the sync, scans and sessions'
+> proposals fill the map, probes verify it, and what nobody confirms ages.
+> Windows (P4-3b-4) and `roomler_connect` (P4-6) come with the steps that
+> build them (§14).
 
 ## 1. A map, not a gate
 
@@ -65,7 +68,7 @@ flowchart LR
 ## 2. The model
 
 An **entity** is one thing the organization has
-([`model.rs:114`](../crates/modules/knowhow/src/model.rs#L114)):
+([`model.rs:119`](../crates/modules/knowhow/src/model.rs#L119)):
 
 | Field | Meaning |
 |---|---|
@@ -76,7 +79,7 @@ An **entity** is one thing the organization has
 | `owner_id` | the member who answers for it, or none. A member of the organization, checked on every write |
 | `attrs` | a JSON object, up to 16 KiB stored: what describes it |
 | `facts` | what is known of it, each with its provenance (below), up to 64. A machine keeps 15 of them for the sync and its scans, a scan's own entity 9 for its scans (§10, §11.1) |
-| `status` | `active`; `proposed` for a session's (§12.2); `archived` once tombstoned. `stale` comes with P4-5-3 |
+| `status` | `active`; `proposed` for a session's (§12.2); `archived` once tombstoned. A fact also turns `stale` when nothing confirmed it for `knowhow.stale_days` (§13.4) |
 | `source` | where it came from: `person`, `sync` (§10), `scan` (§11.1) or `session` (§12.2) |
 | `device` | for a scan's own entity, the device whose scans made it, keep it and retire it (§11.1); absent otherwise |
 | `session` | for a session's proposal, the session that made it (§12.2); absent otherwise |
@@ -86,7 +89,7 @@ An **entity** is one thing the organization has
 Kinds: `machine`, `repo`, `checkout`, `database`, `cluster`, `namespace`,
 `service`, `endpoint`, `bucket`, `cloud_account`, `domain`, `environment`,
 `team`, `doc`. An **edge** relates two entities, `from` `kind` `to`
-([`model.rs:225`](../crates/modules/knowhow/src/model.rs#L225)), its
+([`model.rs:230`](../crates/modules/knowhow/src/model.rs#L230)), its
 kind one of `runs_on`, `checked_out_at`, `deployed_to`, `depends_on`, `reads`,
 `writes`, `part_of`, `owned_by`, `documented_in`, `authenticates_with`,
 `reachable_via`, with attributes of its own (up to 4 KiB). No rule pairs an
@@ -102,7 +105,7 @@ flowchart LR
 ```
 
 A **fact** is a path, a value and where the value came from
-([`model.rs:169`](../crates/modules/knowhow/src/model.rs#L169)):
+([`model.rs:174`](../crates/modules/knowhow/src/model.rs#L174)):
 
 | Field | Meaning |
 |---|---|
@@ -116,7 +119,7 @@ A **fact** is a path, a value and where the value came from
 
 > [!IMPORTANT]
 > **A person's change to one fact never restamps another**
-> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L696)). An
+> ([`merge_facts`](../crates/modules/knowhow/src/model.rs#L704)). An
 > update names facts by path: a value sets that fact, as the caller's; null
 > removes it; a fact it does not name keeps who said it, from where and when,
 > and so does one set to the value it already holds while active. Restamping
@@ -143,7 +146,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Five collections, per organization
-([`lib.rs:257`](../crates/modules/knowhow/src/lib.rs#L257)):
+([`lib.rs:271`](../crates/modules/knowhow/src/lib.rs#L271)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -159,7 +162,7 @@ An organization's map holds at most 10,000 live entities and 50,000 live links
 either is **409**.
 
 **A write is a compare-and-set on `rev`**
-([`dao.rs:208`](../crates/modules/knowhow/src/dao.rs#L208)): its filter
+([`dao.rs:245`](../crates/modules/knowhow/src/dao.rs#L245)): its filter
 names the rev the writer read, its update `$inc`s it, and the row after is
 returned. A writer that lost the race matches nothing and is told so, rather
 than overwriting what it never saw.
@@ -179,7 +182,7 @@ sequenceDiagram
 ```
 
 ⚠️ **The history is appended after the write it records, never before**
-([`write.rs:154`](../crates/modules/knowhow/src/write.rs#L154)).
+([`write.rs:168`](../crates/modules/knowhow/src/write.rs#L168)).
 Without a transaction, a row written first could name a write that then lost
 its compare-and-set. A row appended after can only go missing: the write
 stands, the failure is logged, and the entity still names who changed it last
@@ -188,7 +191,7 @@ stands, the failure is logged, and the entity still names who changed it last
 **Archiving an entity** tombstones it at the rev it was read, which frees its
 key, and archives every live link to it, each in the history with the cause
 `entity_archived`
-([`archive_links`](../crates/modules/knowhow/src/write.rs#L190)).
+([`archive_links`](../crates/modules/knowhow/src/write.rs#L204)).
 Nothing links to an archived entity: a link's ends are resolved live, within
 the organization, before it is made. A link the archive raced is invisible,
 because a card and a neighbourhood show only the links whose other end is live.
@@ -198,7 +201,7 @@ because a card and a neighbourhood show only the links whose other end is live.
 | Switch | Effect |
 |---|---|
 | `[modules] knowhow` (`ROOMLER__MODULES__KNOWHOW`) | **default OFF**, like `hive` and `vault`: no route is mounted |
-| `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`) | the organizations whose map it keeps ([`KnowhowSettings`](../crates/config/src/settings.rs#L163)). A list alone mounts the module ([`knowhow_on`](../crates/config/src/settings.rs#L1624)), the form a hosted server uses, because no older image reads it. Clearing it is the kill switch |
+| `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`) | the organizations whose map it keeps ([`KnowhowSettings`](../crates/config/src/settings.rs#L163)). A list alone mounts the module ([`knowhow_on`](../crates/config/src/settings.rs#L1635)), the form a hosted server uses, because no older image reads it. Clearing it is the kill switch |
 
 `knowhow.tenants` reads like `vault.tenants`: empty or `*` is every
 organization, and an entry that is not an organization id matches nothing
@@ -256,7 +259,7 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | PATCH | `/edge/{id}` | `{rev, attrs}`: its attributes, replaced. Its ends and kind never change: a different link is archived and made again | `KNOWHOW_EDIT` |
 | DELETE | `/edge/{id}?rev=…` | archive the link | `KNOWHOW_EDIT` |
 | POST | `/entity/{id}/confirm` | P4-4-3, a person's word on a session's proposed entity (§12.3): `{rev}` → **200**, `active`, with `confirmed_by` and `confirmed_at`. **409** for one that is no proposal or at a rev already gone. Its facts are each confirmed on their own | `KNOWHOW_EDIT` |
-| POST | `/entity/{id}/fact/confirm` | `{rev, path}`: one proposed fact, at its entity's rev → **200**. **404** for a path no fact holds, **409** for a fact that is no proposal or a rev already gone | `KNOWHOW_EDIT` |
+| POST | `/entity/{id}/fact/confirm` | `{rev, path}`: one proposed fact, or (P4-5-3) one turned stale, at its entity's rev → **200**. **404** for a path no fact holds, **409** for a fact that is neither, or a rev already gone | `KNOWHOW_EDIT` |
 | POST | `/edge/{id}/confirm` | `{rev}`: a proposed link → **200**, as an entity's | `KNOWHOW_EDIT` |
 | POST | `/scan` | `{device}`: ask a device to scan (§11) → **202** with the scan, or the device's pending one. **409** for a device that cannot scan or is a secondary enrollment; **404** for one that is not the organization's | `KNOWHOW_EDIT` |
 | GET | `/scan?device=…` | a device's scans, newest first: `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts, truncated?, detail?}]}`; `?limit=` 1–200 | `KNOWHOW_VIEW` |
@@ -268,7 +271,7 @@ All under `/api/tenant/{tenant_id}/knowhow`
 The map route walks the links both ways, one step at a time
 ([`routes.rs:465`](../crates/modules/knowhow/src/routes.rs#L465)). Each step
 is one indexed read of the live links from or to the step's entities, at most
-500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L266)), each way on
+500 ([`touching`](../crates/modules/knowhow/src/dao.rs#L303)), each way on
 its own index (`(tenant_id, from, deleted_at)`, `(tenant_id, to, deleted_at)`).
 The entities they lead to are read live, and filtered by `kind` and `env`; the
 centre is always shown. A filtered entity is not walked through. A link is
@@ -289,7 +292,7 @@ stops there.
 
 ## 8. History
 
-One row per write ([`model.rs:272`](../crates/modules/knowhow/src/model.rs#L272)):
+One row per write ([`model.rs:277`](../crates/modules/knowhow/src/model.rs#L277)):
 
 | Field | Meaning |
 |---|---|
@@ -963,7 +966,7 @@ what it was (`entity`, `fact` or `link`), the id of the entity or link it wrote
 
 **The ceiling** is counted from the history: one row a proposal, found by its
 session through a partial index on `{tenant_id, session}`
-([`count_by_session`](../crates/modules/knowhow/src/dao.rs#L390)). A
+([`count_by_session`](../crates/modules/knowhow/src/dao.rs#L427)). A
 session's questions are answered in order on their connection, so its
 proposals are counted one at a time.
 
@@ -996,14 +999,15 @@ sequenceDiagram
 | Word | What it does |
 |---|---|
 | confirm an entity | `active` from now on, its `confirmed` set to who and when, at the rev it was read. Its facts are each confirmed on their own: a reviewer may believe the database and doubt its port |
-| confirm a fact | one proposed fact, by its path, at its entity's rev: `active`, with its own `confirmed`. Its entity is left as it is, so a person's entity stays the person's |
+| confirm a fact | one proposed fact, or (P4-5-3) one turned stale, by its path, at its entity's rev: `active`, with its own `confirmed`, which makes a stale one young again (§13.4). Its entity is left as it is, so a person's entity stays the person's |
 | confirm a link | as an entity, at the link's rev |
 | reject | what the routes already do: archive a proposed entity or link (`DELETE`), remove a proposed fact (`PATCH` with its path set to null) |
 
 What was proposed keeps naming its session after it is confirmed, so the
 card says both who proposed it and who believed it. The history's `confirm`
 row is the person's (`source: person`, `by`), never the session's. Only a
-proposal is confirmed: anything else is **409**, as a rev already gone is.
+proposal is confirmed, and (P4-5-3) a fact turned stale: anything else is
+**409**, as a rev already gone is.
 
 > [!NOTE]
 > **Confirming changes nothing that decides a reach.** The map is still not a
@@ -1278,12 +1282,52 @@ sequenceDiagram
 > answer. A probe it stopped waiting for is still recorded, and the card shows
 > it.
 
+### 13.4 Staleness (P4-5-3-1)
+
+A fact nothing has confirmed for a while turns `stale` (decisions 40 and 57),
+so a card says how far to trust it
+([`stale.rs`](../crates/modules/knowhow/src/stale.rs)). Designed in the FR-90
+spec's §3e "P4-5-3, staleness, as designed".
+
+```mermaid
+flowchart LR
+    W["a person writes a fact,<br/>or confirms a session's proposal"] --> A["active"]
+    A -->|"nothing confirms it for<br/>knowhow.stale_days"| S["stale"]
+    S -->|"a probe finds it as it says (§13.1)"| A
+    S -->|"a person confirms it, or writes it"| A
+    Y["the sync's facts,<br/>a scan's own"] -.->|"never"| S
+```
+
+| Piece | As built |
+|---|---|
+| which facts | an `active` fact whose source is a person or a session ([`ages`](../crates/modules/knowhow/src/stale.rs#L57)). A session's fact is `active` only once a person or a probe confirmed it. Never the sync's (it changes with its source) and never a scan's own (a scan retires what it no longer finds, which is its staleness, §11.1). A `proposed` fact stays `proposed` |
+| its age | from the newest of `verified_at` (a probe found it as it says), `confirmed.at` (a person's word) and `observed_at` (its writing) ([`confirmed_at`](../crates/modules/knowhow/src/stale.rs#L63)). A probe that found it otherwise does not make it younger |
+| the turn | past `knowhow.stale_days`, on a compare-and-set at the entity's rev, read again when a write came between; a history row `op: stale`, `source: system`, no person, naming each fact turned and since when |
+| back to `active` | a probe that finds it as it says (§13.1); a person's confirm, which takes a stale fact as it takes a proposed one (§12.3); a person's write of it, its value as it was or another |
+| the sweep | every pod, every `knowhow.stale_sweep_secs`, a page of 200 entities at a time, only in the organizations knowhow serves ([`sweep_once`](../crates/modules/knowhow/src/stale.rs#L91)) |
+
+| Setting | Effect |
+|---|---|
+| `knowhow.stale_days` (`ROOMLER__KNOWHOW__STALE_DAYS`) | the days a fact may go unconfirmed; absent: 30; `0`: no fact ever turns stale, and no pod sweeps |
+| `knowhow.stale_sweep_secs` (`ROOMLER__KNOWHOW__STALE_SWEEP_SECS`) | how often each pod sweeps, in seconds; 0 or absent: 3600 |
+
+> [!NOTE]
+> **Every pod sweeps, and one write lands.** The host schedules no periodic
+> module job yet (`run_startup_jobs` logs and skips one), so the sweep runs on
+> every pod, as the reconciler does (§10). Two pods that read the same entity
+> race one compare-and-set at its rev: the loser reads it again, finds nothing
+> left to turn, and writes nothing.
+
+> [!IMPORTANT]
+> **A stale fact is shown, never hidden.** The card and a session's
+> `knowhow_get` show it with its status, as any fact. Stale says "confirm me",
+> not "gone": it keeps its value, its provenance and its last `verified`.
+
 ## 14. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-5-3 | staleness, decisions 40 and 57: a person's fact or a confirmed proposal that no probe or person confirmed for `knowhow.stale_days` turns `stale`; the sync's and a scan's own facts never do, since a scan retires what it no longer finds (designed in P4-5-3-0) |
 | P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |
