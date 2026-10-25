@@ -207,6 +207,12 @@ mod knowhow_scan_tests;
 /// live, and only while its starter may read the map.
 #[cfg(test)]
 mod knowhow_session_tests;
+/// FR-90 P4-5-3-1 — staleness: a person's fact nothing confirmed turns
+/// stale at the sweep, a word revives it; the sync's, a scan's own and a
+/// waiting proposal never; an unserved organization and `stale_days = 0`
+/// turn nothing.
+#[cfg(test)]
+mod knowhow_stale_tests;
 /// FR-90 P4-2a — the fleet's devices mirrored onto the map: a hello's
 /// machine, the fleet's changes, the fleet's facts kept the fleet's, a
 /// removal's archive, and the reconcile that retires what is gone.

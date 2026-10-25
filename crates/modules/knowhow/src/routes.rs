@@ -17,7 +17,7 @@
 //! | `PATCH …/knowhow/edge/{id}` | change a link's attributes, at its rev | `KNOWHOW_EDIT` |
 //! | `DELETE …/knowhow/edge/{id}?rev=` | archive a link | `KNOWHOW_EDIT` |
 //! | `POST …/knowhow/entity/{id}/confirm` | a person's word on a session's proposed entity, at its rev (P4-4-3) | `KNOWHOW_EDIT` |
-//! | `POST …/knowhow/entity/{id}/fact/confirm` | on one proposed fact, at its entity's rev | `KNOWHOW_EDIT` |
+//! | `POST …/knowhow/entity/{id}/fact/confirm` | on one proposed fact, or (P4-5-3) a stale one, at its entity's rev | `KNOWHOW_EDIT` |
 //! | `POST …/knowhow/edge/{id}/confirm` | on a proposed link, at its rev | `KNOWHOW_EDIT` |
 //!
 //! `KNOWHOW_EDIT` includes reading: who may change the map may read it.
@@ -49,9 +49,9 @@ use crate::intake::{SCANNED_FACTS, SCANNED_MACHINE_FACTS};
 use crate::model::{
     Confirmed, Fact, KnowhowEdge, KnowhowEntity, MAX_ATTRS_BYTES, MAX_EDGE_ATTRS_BYTES, MAX_FACTS,
     OP_ARCHIVE, OP_CONFIRM, OP_CREATE, OP_UPDATE, SOURCE_PERSON, SOURCE_SCAN, SOURCE_SYNC,
-    STATUS_ACTIVE, STATUS_ARCHIVED, STATUS_PROPOSED, SYNCED_KINDS, TARGET_EDGE, TARGET_ENTITY,
-    check_attrs, check_edge_kind, check_env, check_fact_path, check_fact_value, check_key,
-    check_kind, check_kind_word, check_name, merge_facts,
+    STATUS_ACTIVE, STATUS_ARCHIVED, STATUS_PROPOSED, STATUS_STALE, SYNCED_KINDS, TARGET_EDGE,
+    TARGET_ENTITY, check_attrs, check_edge_kind, check_env, check_fact_path, check_fact_value,
+    check_key, check_kind, check_kind_word, check_name, merge_facts,
 };
 use crate::sync::SYNCED_FACTS;
 use crate::view::{CardView, EdgeView, EntityView, HistoryView, LinkView, NodeView};
@@ -1072,9 +1072,10 @@ pub async fn confirm_entity(
 }
 
 /// `POST /api/tenant/{tenant_id}/knowhow/entity/{entity_id}/fact/confirm` —
-/// a person's word on one proposed fact, at its entity's rev: `active`, with
-/// who confirmed it and when. Its entity is left as it is. Rejecting one is
-/// removing it (`PATCH` with the path set to null).
+/// a person's word on one proposed fact, or (P4-5-3) one turned stale, at
+/// its entity's rev: `active`, with who confirmed it and when, which makes
+/// it young again. Its entity is left as it is. Rejecting one is removing it
+/// (`PATCH` with the path set to null).
 pub async fn confirm_fact(
     State(state): State<KnowhowState>,
     auth: AuthUser,
@@ -1087,8 +1088,11 @@ pub async fn confirm_fact(
     let Some(at) = current.facts.iter().position(|f| f.path == body.path) else {
         return Err(ApiError::NotFound("no fact at that path".into()));
     };
-    if current.facts[at].status != STATUS_PROPOSED {
-        return Err(not_a_proposal("fact", &current.facts[at].status));
+    let status = current.facts[at].status.as_str();
+    if status != STATUS_PROPOSED && status != STATUS_STALE {
+        return Err(ApiError::Conflict(format!(
+            "only a proposed or a stale fact is confirmed: this fact is {status}"
+        )));
     }
     if current.rev != body.rev {
         return Err(stale("entity", body.rev));

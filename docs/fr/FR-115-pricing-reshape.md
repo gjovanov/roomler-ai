@@ -605,7 +605,7 @@ handshake held.
 ### P4c, as built (dark, 2026-10-23)
 
 Built as proposed, behind two switches that ship **off**: `relay_allowance.count_turn` for
-P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:404`, `:410`).
+P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:415`, `:421`).
 
 | Piece | Where |
 |---|---|
@@ -629,7 +629,7 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:404`,
   - **Enterprise has no relay allowance.** Its relay is "custom" on the ladder
     (`crates/db/src/models/tenant.rs:624`).
   - **The operator's orgs are exempt.** `relay_allowance.exempt_tenants`
-    (`crates/config/src/settings.rs:416`) names them, and `is_exempt`
+    (`crates/config/src/settings.rs:427`) names them, and `is_exempt`
     (`crates/services/src/relay_allowance.rs:42`) is asked by both the job and the org's page.
   - **That org's real seats are recorded** (data, in the annex).
 
