@@ -578,22 +578,65 @@
    * root half's network. Say which file this page changes, and how the root
    * half's switches are changed. The text is the daemon-side `note`
    * (commands.rs `two_halves_note`), rendered as text; hidden on every other
-   * layout, and on any failure (the rows stand on their own). */
+   * layout, and on any failure (the rows stand on their own).
+   * #2891: on a Linux system install (and a Mac with a root half alone) the
+   * daemon the page reaches runs as root and refuses the config verbs on its
+   * person socket; `root_only` then carries the explanation the card shows in
+   * place of rows (`renderRootOnly`). Returns the target, so loadCfg's failure
+   * path can read it. */
   async function paintConfigTarget() {
     const banner = $('cfg-target-banner');
-    if (!banner) return;
+    if (!banner) return null;
     try {
       const t = await invoke('cmd_config_target');
-      if (t && t.two_halves && t.note) {
+      if (t && t.note && (t.two_halves || t.root_only)) {
+        setText(
+          'cfg-target-title',
+          t.two_halves
+            ? 'This page edits the per-user half of this Mac'
+            : 'This computer’s settings are an administrator’s',
+        );
         setText('cfg-target-text', t.note);
         show(banner);
       } else {
         hide(banner);
       }
+      return t;
     } catch (e) {
       console.warn('settings: config target unavailable', e);
       hide(banner);
+      return null;
     }
+  }
+
+  /* #2891: what the card shows in place of rows when the daemon's configuration
+   * is root's alone: the daemon, its file and the terminal commands. No Retry —
+   * nothing this app can do changes it. Built with createElement + textContent
+   * (no innerHTML), like the rows. */
+  function renderRootOnly(container, t) {
+    const d = t.reached || t.machine || {};
+    container.replaceChildren();
+    const dl = document.createElement('dl');
+    dl.className = 'kv';
+    const row = (key, value, mono) => {
+      const dt = document.createElement('dt');
+      dt.textContent = key;
+      const dd = document.createElement('dd');
+      dd.textContent = value;
+      if (mono) dd.className = 'mono small';
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    };
+    row(
+      'Service',
+      (d.name || '—') + (d.version ? ' · ' + d.version : '') + ' · runs as root',
+      false,
+    );
+    row('Configuration file', d.config_path || '/etc/roomler/config.toml', true);
+    row('List the settings', 'sudo roomler config ls', true);
+    row('Change one', 'sudo roomler config set <key> <value>', true);
+    container.appendChild(dl);
+    hide($('cfg-search-wrap'));
   }
 
   async function loadCfg(force) {
@@ -606,6 +649,15 @@
       cfgLoaded = true;
       void paintConfigTarget();
     } catch (e) {
+      // #2891 — before showing an error, ask whose configuration this is: a
+      // root daemon's refusal is the expected answer on a system install, and
+      // the card explains it instead. Left unloaded, so the next visit asks
+      // again (the daemon may have been restarted or reinstalled meanwhile).
+      const target = await paintConfigTarget();
+      if (target && target.root_only && target.note) {
+        renderRootOnly(container, target);
+        return;
+      }
       container.replaceChildren();
       const p = document.createElement('p');
       p.className = 'muted small';

@@ -521,10 +521,21 @@ pub async fn cmd_config_cleanup() -> Result<String, String> {
 /// daemon is down.
 #[tauri::command]
 pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> {
-    if let Ok(mut client) = localapi::connect().await
-        && let Ok(entries) = client.config_entries().await
-    {
-        return Ok(entries);
+    if let Ok(mut client) = localapi::connect().await {
+        match client.config_entries().await {
+            Ok(entries) => return Ok(entries),
+            // #2891 — a refusal from a ROOT daemon this unprivileged app
+            // reached (a Linux system install's person socket) is an answer,
+            // not an outage: the file the fallback below reads is not that
+            // daemon's — a per-user path a system install does not have, or a
+            // stale per-user copy no daemon reads — so the daemon's words
+            // stand, and the page explains them (`cmd_config_target`).
+            Err(e) => {
+                if refused_by_root_daemon(&mut client).await {
+                    return Err(daemon_message(&e.to_string()));
+                }
+            }
+        }
     }
     tokio::task::spawn_blocking(|| {
         let is_scm = probe_service_state().0 == "scmService";
@@ -561,7 +572,16 @@ pub async fn cmd_config_set(
             Err(e) if is_daemon_owned_key(&key) => {
                 return Err(explain_daemon_owned_error(&key, &e.to_string()));
             }
-            Err(e) => daemon_err = Some(e.to_string()),
+            Err(e) => {
+                // #2891 — the same for EVERY key when a ROOT daemon refused
+                // this unprivileged app (a Linux system install's person
+                // socket): the per-user file below is not its, and writing it
+                // would report a success the daemon refused.
+                if refused_by_root_daemon(&mut client).await {
+                    return Err(daemon_message(&e.to_string()));
+                }
+                daemon_err = Some(e.to_string());
+            }
         }
     }
     let direct = tokio::task::spawn_blocking(move || config_set_blocking(key, value))
@@ -614,13 +634,22 @@ pub struct ConfigTarget {
     /// account. `Status` is on that socket's allowlist; its config verbs are
     /// not (`localapi::person_may`), so this is a label, not a second editor.
     /// `None` on every other OS, when the reached daemon is itself
-    /// privileged, and when no root half answers.
+    /// privileged, and when no root half answers. Asked for beside a
+    /// per-user daemon (a two-half Mac) and when nothing was reached (#2891:
+    /// a Mac with a root half alone).
     pub machine: Option<DaemonBrief>,
     /// `reached` is an unprivileged daemon and `machine` a root one of another
     /// identity: the page edits the first and must say so ([`two_halves`]).
     pub two_halves: bool,
-    /// What the page shows when `two_halves`: which file its switches change,
-    /// and how the root half's are changed ([`two_halves_note`]).
+    /// #2891 — the daemon whose configuration this page would show runs as
+    /// root and this app does not: a Linux system install's root daemon,
+    /// reached over its person socket, or a Mac with a root half alone. Its
+    /// config verbs are refused there, so the page shows the administrator's
+    /// path in place of rows ([`root_daemon_only`]). Never on Windows, whose
+    /// pipe admits every interactive user to those verbs.
+    pub root_only: bool,
+    /// What the page shows when `two_halves` ([`two_halves_note`]) or
+    /// `root_only` ([`root_only_note`]).
     pub note: Option<String>,
 }
 
@@ -684,6 +713,81 @@ fn two_halves_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
     )
 }
 
+/// #2891 — pure: the ROOT daemon whose configuration this app may neither
+/// read nor change, if the layout has one. Two layouts have: a root daemon
+/// REACHED by an unprivileged companion — a Linux system install, whose person
+/// socket is the first path `connect()` tries and whose `person_may` refuses
+/// every config verb — and a Mac with a root half and no per-user half, where
+/// nothing is reached and the root half answers its person socket alone.
+/// `None` when the companion itself runs as root (it reaches the daemon's own
+/// socket), on Windows (`pipe_admits_users`: the pipe's `IU` ace lets every
+/// interactive user at those verbs), for a per-user daemon, and for a daemon
+/// too old to say which account it runs as — nothing is claimed for it.
+fn root_daemon_only<'a>(
+    reached: Option<&'a DaemonBrief>,
+    machine: Option<&'a DaemonBrief>,
+    companion_is_root: bool,
+    pipe_admits_users: bool,
+) -> Option<&'a DaemonBrief> {
+    if companion_is_root || pipe_admits_users {
+        return None;
+    }
+    match reached {
+        Some(r) => (r.privileged == Some(true)).then_some(r),
+        None => machine.filter(|m| m.privileged == Some(true)),
+    }
+}
+
+/// #2891 — the card's text when [`root_daemon_only`] names a daemon: which
+/// daemon runs, which file its settings are read from, and the administrator's
+/// commands — in place of the "Could not load the configuration" the page
+/// showed when the person socket refused `ConfigGet` and the fallback read a
+/// per-user file a system install does not have.
+fn root_only_note(daemon: &DaemonBrief) -> String {
+    let file = daemon.config_path.clone().unwrap_or_else(|| {
+        "its own config.toml (/etc/roomler/config.toml on a packaged install)".to_string()
+    });
+    format!(
+        "This computer's Roomler service runs as root ({}, {}) — a machine-wide install — and \
+         its settings are read from {}. They are an administrator's to change, in a terminal: \
+         `sudo roomler config ls` lists them, `sudo roomler config set <key> <value>` changes \
+         one. This app reaches that service through the person-at-the-device socket, which \
+         shows who is viewing this screen, ends a session, answers consent prompts and lists \
+         the devices this machine's private network reaches; it serves no configuration, so \
+         the device-owned switches (exec_enabled, ssh_enabled, remote_config_enabled, …) have \
+         no in-app path here.",
+        daemon.name, daemon.version, file
+    )
+}
+
+/// #2891 — does this companion run as root? Only then does `connect()` reach
+/// a root daemon's own socket; otherwise a root daemon it reaches is behind
+/// its person socket, where no config verb is served.
+fn process_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        localapi::process_is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// #2891 — did a config verb's refusal come from a ROOT daemon this
+/// unprivileged companion reached — a Linux system install's person socket,
+/// which serves `Status` and refuses every config verb? Then the per-user file
+/// the callers would fall back to is not that daemon's, and may be a stale
+/// copy no daemon reads: writing it reports a success the daemon refused
+/// (#2871's failure, on Linux). One `Status` on the same connection.
+async fn refused_by_root_daemon(client: &mut localapi::Client) -> bool {
+    let Ok(status) = client.status().await else {
+        return false;
+    };
+    let reached = DaemonBrief::from(&status);
+    root_daemon_only(Some(&reached), None, process_is_root(), cfg!(windows)).is_some()
+}
+
 /// #2871 — the root half's `Status`, over the person socket it serves this
 /// account (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g). macOS only.
 /// Kept only when ROOT serves the socket (`connect_unix_served_by_root`), and
@@ -715,26 +819,39 @@ async fn machine_half_brief() -> Option<DaemonBrief> {
 }
 
 /// #2871 — which daemon the Settings page's Device configuration edits, for
-/// the banner it shows on a two-half Mac. Read-only: one `Status` from the
-/// daemon the page edits, and on a Mac one from the root half's person
-/// socket, which admits nothing else this needs.
+/// the banner it shows on a two-half Mac; #2891 — and whether that daemon's
+/// configuration is root's alone (a Linux system install, a Mac with a root
+/// half alone), for the explanation it shows in place of rows. Read-only: one
+/// `Status` from the daemon the page edits, and on a Mac one from the root
+/// half's person socket, which admits nothing else this needs.
 #[tauri::command]
 pub async fn cmd_config_target() -> ConfigTarget {
-    let Some(reached) = daemon_node_status().await.map(|s| DaemonBrief::from(&s)) else {
-        return ConfigTarget::default();
+    let reached = daemon_node_status().await.map(|s| DaemonBrief::from(&s));
+    let machine = match &reached {
+        // A per-user daemon: is a root half beside it (a two-half Mac)?
+        Some(r) if r.privileged == Some(false) => machine_half_brief().await,
+        // #2891 — nothing reached: a Mac with a root half alone still serves
+        // this person its person socket, and that half is the one to name.
+        None => machine_half_brief().await,
+        Some(_) => None,
     };
-    let machine = if reached.privileged == Some(false) {
-        machine_half_brief().await
-    } else {
-        None
-    };
-    let two = two_halves(&reached, machine.as_ref());
-    let note = match (&machine, two) {
-        (Some(m), true) => Some(two_halves_note(&reached, m)),
+    let two = reached
+        .as_ref()
+        .is_some_and(|r| two_halves(r, machine.as_ref()));
+    let root = root_daemon_only(
+        reached.as_ref(),
+        machine.as_ref(),
+        process_is_root(),
+        cfg!(windows),
+    );
+    let note = match (&reached, &machine, root) {
+        (Some(r), Some(m), _) if two => Some(two_halves_note(r, m)),
+        (_, _, Some(d)) => Some(root_only_note(d)),
         _ => None,
     };
     ConfigTarget {
-        reached: Some(reached),
+        root_only: root.is_some(),
+        reached,
         machine,
         two_halves: two,
         note,
@@ -1439,6 +1556,13 @@ pub async fn cmd_set_device_name(name: String) -> Result<StatusReport, String> {
                     .map_err(|e| format!("task join: {e}"));
             }
             Err(e) => {
+                // #2891 — a ROOT daemon that refused this unprivileged app (a
+                // Linux system install's person socket): its words stand. The
+                // per-user file below is not its, and may be a stale copy
+                // whose rename no daemon would ever read.
+                if refused_by_root_daemon(&mut client).await {
+                    return Err(daemon_message(&e.to_string()));
+                }
                 // Old daemon without the verb (or a daemon-side failure) —
                 // fall back to the direct write so a legacy install still
                 // renames; the write path reports its own honest errors.
@@ -3307,6 +3431,80 @@ mod tests {
             ..old
         };
         assert!(two_halves_note(&old, &root).contains("its own config.toml"));
+    }
+
+    /// #2891 — the root-only layouts, and everything that is NOT one. The
+    /// reached daemon must SAY it runs as root; the companion must not; and
+    /// Windows' pipe admits its interactive users, so nothing is root-only
+    /// there. A root daemon named with nothing reached is a Mac with no
+    /// per-user half.
+    #[test]
+    fn only_a_root_daemon_reached_unprivileged_is_root_only() {
+        let user = brief("u", Some(false), USER_FILE);
+        let root = brief("d", Some(true), ROOT_FILE);
+        // A Linux system install: the root daemon, over its person socket.
+        assert_eq!(
+            root_daemon_only(Some(&root), None, false, false),
+            Some(&root)
+        );
+        // A Mac with a root half alone: nothing reached, the root half answers.
+        assert_eq!(
+            root_daemon_only(None, Some(&root), false, false),
+            Some(&root)
+        );
+        // The companion itself runs as root: it reaches the daemon's own socket.
+        assert_eq!(root_daemon_only(Some(&root), None, true, false), None);
+        // Windows: the SCM service is privileged AND its pipe admits the user.
+        assert_eq!(root_daemon_only(Some(&root), None, false, true), None);
+        // A per-user daemon, with or without a root half beside it (#2871's
+        // two halves): the page edits it.
+        assert_eq!(root_daemon_only(Some(&user), None, false, false), None);
+        assert_eq!(
+            root_daemon_only(Some(&user), Some(&root), false, false),
+            None
+        );
+        // Nothing reached and nothing root answers: no claim.
+        assert_eq!(root_daemon_only(None, None, false, false), None);
+        assert_eq!(root_daemon_only(None, Some(&user), false, false), None);
+        // A daemon too old to say which account it runs as claims nothing.
+        assert_eq!(
+            root_daemon_only(Some(&brief("d", None, ROOT_FILE)), None, false, false),
+            None
+        );
+        // The two layouts never overlap: FR-43's is two halves, not root-only.
+        assert!(two_halves(&user, Some(&root)));
+        assert_eq!(
+            root_daemon_only(Some(&user), Some(&root), false, false),
+            None
+        );
+    }
+
+    /// #2891 — the note names the daemon, its file and both administrator
+    /// commands, and says why the app has no path: the person socket serves
+    /// no configuration.
+    #[test]
+    fn the_root_only_note_names_the_file_and_the_sudo_commands() {
+        let root = brief("d", Some(true), ROOT_FILE);
+        let note = root_only_note(&root);
+        for must in [
+            "mac-d",
+            "0.4.169",
+            ROOT_FILE,
+            "sudo roomler config ls",
+            "sudo roomler config set <key> <value>",
+            "person-at-the-device socket",
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+        ] {
+            assert!(note.contains(must), "the note must say {must:?}: {note}");
+        }
+        // An older daemon without `config_path` still names a file.
+        let old = DaemonBrief {
+            config_path: None,
+            ..root
+        };
+        assert!(root_only_note(&old).contains("/etc/roomler/config.toml"));
     }
 
     /// FR-85 — the page hands the companion a NAME to open, never a path.

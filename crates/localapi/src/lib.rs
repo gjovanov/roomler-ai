@@ -4559,6 +4559,17 @@ pub fn own_person_socket_path() -> Option<std::path::PathBuf> {
     (uid != 0).then(|| person_socket_path(uid))
 }
 
+/// #2891 — does this process run as root? A companion that does reaches a
+/// root daemon's own socket; one that does not reaches, at most, that
+/// daemon's person socket ([`person_may`]), where no config verb is served.
+/// That is how its Device configuration page tells a refusal it must explain
+/// (a Linux system install) from a daemon that is down.
+#[cfg(unix)]
+pub fn process_is_root() -> bool {
+    // SAFETY: geteuid never fails.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// #2871 — is a root half serving this (non-root) process's account its
 /// person socket right now? The one evidence of a root daemon that a console
 /// user on a Mac can read ([`other_daemon_socket`]): the system socket's
