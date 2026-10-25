@@ -2443,6 +2443,7 @@ import { peerAuthBadge } from '@/utils/peerAuth'
 import {
   useRemoteControl,
   nextDirPath,
+  isRootsRequest,
   isKeyboardLockSupported,
   diagHudEnabled,
   storedMetricToggles,
@@ -3043,10 +3044,12 @@ const currentParent = ref<string | null>(null)
 // Distinct from `currentParent === null`. The agent's roots listing
 // returns `parent: null`, but so does any *real* path whose
 // `Path::parent()` is None — e.g. on Windows, `canonicalize("C:\\")`
-// returns `\\?\C:\` whose parent is None. Without this flag the
-// drawer treated `\\?\C:\` as a roots view and dbl-clicking `dev`
-// shipped just `"dev"` to the agent, which failed with
-// "canonicalising dev". Field repro 2026-05-09.
+// returns `\\?\C:\` whose parent is None, and so does `/` on Unix.
+// Without this flag the drawer treated `\\?\C:\` as a roots view and
+// dbl-clicking `dev` shipped just `"dev"` to the agent, which failed
+// with "canonicalising dev". Field repro 2026-05-09. Set from the
+// REQUEST (`isRootsRequest`: the empty path or `~`), and `/` is not one
+// (#2870): it is the Unix root directory, listed like any other.
 const isRootsView = ref(false)
 const dirPathInput = ref('')
 const selectedDirEntries = ref<Set<string>>(new Set())
@@ -3057,7 +3060,10 @@ async function navigateTo(path: string) {
   dirError.value = null
   selectedDirEntries.value = new Set()
   lastSelectedDirIndex = null
-  const requestingRoots = path === '' || path === '~' || path === '/'
+  // #2870 — `/` is a directory, not the roots view: counting it as roots
+  // here (and the agent answering it with the roots list) is what made the
+  // roots view's `/` entry on a Mac or Linux host lead nowhere.
+  const requestingRoots = isRootsRequest(path)
   try {
     const listing = await rc.listDir(path)
     currentDirPath.value = listing.path

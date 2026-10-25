@@ -92,6 +92,8 @@ import {
   turnCredsPath,
   friendlyRcError,
   nextDirPath,
+  isRootsRequest,
+  isViewerOwnInput,
   parseControlInbound,
   hostLockedChipTitle,
   idleSecondsLeft,
@@ -2768,6 +2770,219 @@ describe('nextDirPath', () => {
         nextDirPath({ name: 'dev', is_dir: true }, '\\\\?\\C:\\', false)
       ).toBe('\\\\?\\C:\\dev')
     })
+  })
+})
+
+describe('isRootsRequest (#2870)', () => {
+  it('the empty path and the legacy "~" ask for the roots view', () => {
+    expect(isRootsRequest('')).toBe(true)
+    expect(isRootsRequest('~')).toBe(true)
+  })
+
+  it('"/" is a directory — the Unix root — not the roots view', () => {
+    // The regression: `navigateTo` counted `/` as a roots request and the
+    // agent's `list_dir` answered `/` with the roots list, so on a Mac or
+    // Linux host the roots view's one entry, `/`, led back to itself.
+    expect(isRootsRequest('/')).toBe(false)
+  })
+
+  it('every other path is a directory to list', () => {
+    for (const p of ['C:\\', '\\\\?\\C:\\', '/Users', 'Drives', '//', '~/', ' ']) {
+      expect(isRootsRequest(p), p).toBe(false)
+    }
+  })
+})
+
+describe('files drawer: roots → "/" → child (#2870)', () => {
+  // Drives the drawer's two decisions exactly as RemoteControl.vue does.
+  // `navigateTo(path)` sets `isRootsView = isRootsRequest(path)` from the
+  // REQUEST and shows the agent's listing; `onEntryDblClick(entry)` asks
+  // `nextDirPath(entry, listing.path, isRootsView)` for the next request.
+  // The listings below are what the agent's `list_dir` (files.rs) answers.
+  type Entry = { name: string; is_dir: boolean }
+  type Listing = { path: string; parent: string | null; entries: Entry[] }
+  function open(request: string, listing: Listing) {
+    const isRootsView = isRootsRequest(request)
+    return {
+      isRootsView,
+      dblClick: (entry: Entry) => nextDirPath(entry, listing.path, isRootsView),
+    }
+  }
+
+  it('macOS / Linux: dbl-click "/" lists the real root; dbl-click "Users" there → /Users', () => {
+    // 1. The drawer opens on the roots view — one entry, `/`.
+    const roots = open('', { path: '/', parent: null, entries: [{ name: '/', is_dir: true }] })
+    expect(roots.isRootsView).toBe(true)
+    // 2. Dbl-click `/` → the next request is `/` itself ...
+    const second = roots.dblClick({ name: '/', is_dir: true })
+    expect(second).toBe('/')
+    // 3. ... which is a DIRECTORY: the agent lists the real root and the
+    //    drawer shows it as one, `parent: null` notwithstanding (that is
+    //    what `/` reports, like `\\?\C:\` does).
+    const root = open(second as string, {
+      path: '/',
+      parent: null,
+      entries: [
+        { name: 'Applications', is_dir: true },
+        { name: 'Users', is_dir: true },
+      ],
+    })
+    expect(root.isRootsView).toBe(false)
+    // 4. Dbl-click `Users` → appended to `/`, never shipped bare.
+    const third = root.dblClick({ name: 'Users', is_dir: true })
+    expect(third).toBe('/Users')
+    expect(isRootsRequest(third as string)).toBe(false)
+  })
+
+  it('the Parent button from "/" goes back to the roots view', () => {
+    // RemoteControl.vue: `navigateTo(currentParent || '')` — `/` has no
+    // parent, so the request is the empty path, the roots view.
+    const parentOfRoot: string | null = null
+    expect(isRootsRequest(parentOfRoot || '')).toBe(true)
+  })
+
+  it('Windows: the drives view → C:\\ → a child, unchanged', () => {
+    const drives = open('', {
+      path: 'Drives',
+      parent: null,
+      entries: [
+        { name: 'C:\\', is_dir: true },
+        { name: 'D:\\', is_dir: true },
+      ],
+    })
+    expect(drives.isRootsView).toBe(true)
+    const second = drives.dblClick({ name: 'C:\\', is_dir: true })
+    expect(second).toBe('C:\\')
+    // The agent canonicalises `C:\` to `\\?\C:\`, whose parent is None —
+    // still a directory, because the REQUEST was not a roots request.
+    const cRoot = open(second as string, {
+      path: '\\\\?\\C:\\',
+      parent: null,
+      entries: [{ name: 'Users', is_dir: true }],
+    })
+    expect(cRoot.isRootsView).toBe(false)
+    expect(cRoot.dblClick({ name: 'Users', is_dir: true })).toBe('\\\\?\\C:\\Users')
+  })
+
+  it('a typed path is a directory even when it is "/"', () => {
+    // The path field's Enter calls `navigateTo(dirPathInput)` verbatim.
+    const typed = open('/', {
+      path: '/',
+      parent: null,
+      entries: [{ name: 'Users', is_dir: true }],
+    })
+    expect(typed.isRootsView).toBe(false)
+    expect(typed.dblClick({ name: 'Users', is_dir: true })).toBe('/Users')
+  })
+})
+
+describe('isViewerOwnInput (#2869)', () => {
+  // The page as the viewer builds it: the stage (the host's surface), the
+  // files drawer with its path field, a dialog's fields, the soft keyboard.
+  function page() {
+    document.body.innerHTML = `
+      <div id="stage" tabindex="0"><video id="video"></video><canvas></canvas></div>
+      <aside id="drawer" tabindex="0">
+        <input id="path" type="text" placeholder="Path (Enter to go)" />
+        <button id="refresh">Refresh</button>
+        <div id="row" role="option" tabindex="0">C:\\</div>
+      </aside>
+      <div id="dialog" role="dialog">
+        <textarea id="reason"></textarea>
+        <input id="width" type="number" />
+        <input id="toggle" type="checkbox" />
+        <select id="native"><option>a</option></select>
+        <div id="editor" contenteditable="true"><span id="editor-span">x</span></div>
+        <div id="thumb" role="slider" tabindex="0"></div>
+        <input id="combo" role="combobox" type="text" readonly />
+        <div id="search" role="searchbox" tabindex="0"></div>
+        <button id="close">Close</button>
+      </div>
+      <div class="mobile-keyboard-shell">
+        <textarea id="soft" class="mobile-keyboard-capture" data-rc-capture="soft-keyboard"></textarea>
+        <button id="soft-esc" class="mkb-btn">Esc</button>
+      </div>
+    `
+    const q = (id: string) => document.getElementById(id) as HTMLElement
+    return { stage: q('stage'), q }
+  }
+  afterEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  it("the drawer's path field is the viewer's own: a key typed there is not forwarded", () => {
+    const { stage, q } = page()
+    expect(isViewerOwnInput(q('path'), stage)).toBe(true)
+  })
+
+  it("a dialog's fields and widgets are the viewer's own", () => {
+    const { stage, q } = page()
+    for (const id of ['reason', 'width', 'toggle', 'native', 'editor', 'editor-span', 'thumb', 'combo', 'search']) {
+      expect(isViewerOwnInput(q(id), stage), id).toBe(true)
+    }
+  })
+
+  it("the stage is the host's: the same key with the stage focused is still forwarded", () => {
+    const { stage, q } = page()
+    expect(isViewerOwnInput(stage, stage)).toBe(false)
+    expect(isViewerOwnInput(q('video'), stage)).toBe(false)
+    // Nothing focused: the body. Forwarded, as it always was.
+    expect(isViewerOwnInput(document.body, stage)).toBe(false)
+  })
+
+  it("the soft keyboard's capture textarea is the host's too (phones type through it)", () => {
+    const { stage, q } = page()
+    // Editable, and exempt: a Backspace on its always-empty textarea raises
+    // no `input` event, so the keydown this listener forwards is the only
+    // way it reaches the host. Its toolbar buttons were never editable.
+    expect(isViewerOwnInput(q('soft'), stage)).toBe(false)
+    expect(isViewerOwnInput(q('soft-esc'), stage)).toBe(false)
+  })
+
+  it("buttons, list rows and the drawer itself stay the host's (rc.18)", () => {
+    const { stage, q } = page()
+    for (const id of ['refresh', 'row', 'drawer', 'close', 'dialog']) {
+      expect(isViewerOwnInput(q(id), stage), id).toBe(false)
+    }
+  })
+
+  it('an editable element INSIDE the stage would be the host\'s', () => {
+    const { stage } = page()
+    const inner = document.createElement('input')
+    stage.appendChild(inner)
+    expect(isViewerOwnInput(inner, stage)).toBe(false)
+  })
+
+  it("a target that is not an element is never the viewer's own", () => {
+    const { stage } = page()
+    expect(isViewerOwnInput(null, stage)).toBe(false)
+    expect(isViewerOwnInput(window, stage)).toBe(false)
+    expect(isViewerOwnInput(document, stage)).toBe(false)
+    // No surface at all (a spec, a detached call): the target decides.
+    expect(isViewerOwnInput(document.getElementById('path'), null)).toBe(true)
+  })
+
+  it('reads the target the window-level CAPTURE listener sees, as attachInput registers it', () => {
+    // The production listener is `window.addEventListener('keydown', …,
+    // { capture: true })`, so it runs before the focused element's own
+    // handlers and `ev.target` is that element. Dispatch the same way.
+    const { stage, q } = page()
+    const seen: EventTarget[] = []
+    const listener = (ev: Event) => {
+      if (ev.target) seen.push(ev.target)
+    }
+    window.addEventListener('keydown', listener, { capture: true })
+    try {
+      q('path').dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }))
+      stage.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }))
+      q('soft').dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', bubbles: true }))
+    } finally {
+      window.removeEventListener('keydown', listener, { capture: true })
+    }
+    expect(seen).toHaveLength(3)
+    expect(isViewerOwnInput(seen[0], stage)).toBe(true) // the path field: not sent
+    expect(isViewerOwnInput(seen[1], stage)).toBe(false) // the stage: sent
+    expect(isViewerOwnInput(seen[2], stage)).toBe(false) // the soft keyboard: sent
   })
 })
 
