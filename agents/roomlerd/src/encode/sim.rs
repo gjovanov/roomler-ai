@@ -1071,6 +1071,9 @@ impl RateLaw for GovernorLaw {
             // Nor a transport opening: its scenarios are measured from a
             // transport already past its ramp.
             opening: false,
+            // Its windows are constrained, where a keyframe burst is still
+            // read (FR-119 P2b-13).
+            keyframe_burst: false,
             carrier_changed: false,
         });
         let hold = self.stall_gate && rejected.is_some();
