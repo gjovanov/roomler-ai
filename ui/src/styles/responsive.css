@@ -83,3 +83,47 @@
 .page-no-sideways {
   overflow-x: clip;
 }
+
+/*
+ * FR-120 P6 — on a touch screen a target is at least 36 × 36 px.
+ *
+ * A `size="small"` button is 28 px tall, a small chip 26 px and an x-small
+ * one 20 px: fine for a mouse, a miss for a finger. On a coarse pointer each
+ * button and each tappable chip gets an invisible `::before` that grows its
+ * HIT AREA to 36 px, centred on it. Its box, and so every layout, stays as it
+ * was, and a mouse matches none of this, so a desktop is pixel-identical.
+ *
+ * - The insets are half the shortfall, negative, on each side (`top` and
+ *   `bottom` percentages resolve against the height, `left` and `right`
+ *   against the width), and 0 on a side already 36 px or more.
+ * - `isolation: isolate` makes the control its own stacking context, so the
+ *   `::before` sits at `z-index: -1`: under the control's own content (a
+ *   chip's close button keeps its taps) and still above the row around it.
+ * - `::before`, because Vuetify's `.v-btn::after` is the focus ring.
+ * - A chip clips what overflows it (`overflow: hidden`), which would clip the
+ *   hit area too; a tappable chip clips its label instead. `.v-chip.v-chip--link`
+ *   so that this wins over Vuetify's `.v-chip` whichever stylesheet loads last.
+ */
+@media (pointer: coarse) {
+  .v-btn,
+  .v-chip--link {
+    isolation: isolate;
+  }
+  .v-btn::before,
+  .v-chip--link::before {
+    content: '';
+    position: absolute;
+    z-index: -1;
+    top: min(0px, (100% - 36px) / 2);
+    bottom: min(0px, (100% - 36px) / 2);
+    left: min(0px, (100% - 36px) / 2);
+    right: min(0px, (100% - 36px) / 2);
+  }
+  .v-chip.v-chip--link {
+    overflow: visible;
+  }
+  .v-chip--link > .v-chip__content {
+    min-width: 0;
+    overflow: hidden;
+  }
+}
