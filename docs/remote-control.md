@@ -297,6 +297,15 @@ re-minted every 30 minutes, so nothing logs it.
 | Linux Wayland, **no** scanout (WSL2, containers, nested compositors) | **`xdg-desktop-portal` ScreenCast → PipeWire**, through a privilege-dropped helper in the user's session (FR-45, opt-in `ROOMLERD_PORTAL_CAPTURE=1`) — or `org.gnome.Mutter.ScreenCast` directly where no portal backend can run (`ROOMLERD_MUTTER_CAPTURE=1`, GNOME only, unattended). A **per-user** install in its own Wayland session with no key set switches these on by itself: mutter on GNOME, else the portal (FR-93 P2) | The only route a Wayland compositor sanctions; **attended** — a logged-in user and a consent dialog, never the greeter or a locked screen | X11 |
 | Linux X11 | `XShm` via scrap, with XDamage deciding whether a frame is worth taking (FR-29) | Zero-copy via shared memory; on a headless box the daemon starts its own Xvfb (`ROOMLERD_VIRTUAL_DESKTOP=1`) | `NoopCapture` carrying the reason (§5.1a) |
 
+> ⚠️ **Windows 11 24H2 and later throttle a WGC session to one frame per `MinUpdateInterval`, 16 ms by
+> default: about 60 frames a second, whatever the screen does** (FR-119 P2b-15). Measured on neo16 (2560×1600 at
+> 240 Hz, the screen changing about 180 times a second): 57.9 fps at the default, 188.6 fps at 1 ms. So above 60
+> the backend lowers it to the largest whole number of panel refreshes inside the target's period, less 0.5 ms
+> (`capture::gate::min_update_interval_100ns`). That is every second refresh for 120 on 240 Hz, because every
+> delivered frame costs a full CPU readback, and every refresh for a rate the panel cannot divide, with the
+> slot-first gate pacing the rest. At 60 and below Windows' default stays. Before this, every granted 120 or 144
+> fps session on a Windows host was captured at about 58.
+
 The portal path, and macOS's Screen Recording grant, produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer. The Linux arms, their order and their gates are [`linux-capture.md`](linux-capture.md).
 
 ### 5.1a When capture cannot open, the session says why (FR-80)

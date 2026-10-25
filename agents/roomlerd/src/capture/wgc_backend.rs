@@ -46,8 +46,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use windows::Foundation::TypedEventHandler;
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
+use windows::Foundation::{TimeSpan, TypedEventHandler};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -111,6 +113,10 @@ struct SharedSlot {
     /// see it; [`ScreenCapture::readback_totals`] reports it.
     readback_total: std::sync::atomic::AtomicU64,
     readback_us_total: std::sync::atomic::AtomicU64,
+    /// FR-119 P2b-15 — the session's wanted `MinUpdateInterval`, in 100 ns;
+    /// 0 = Windows' own default. The pump writes it on a rate move, and the
+    /// worker, which owns the session, applies it on its next wake.
+    min_update_100ns: std::sync::atomic::AtomicI64,
 }
 
 /// Internal frame representation carried from the event handler to
@@ -228,6 +234,7 @@ impl WgcCapture {
             dropped_stale: std::sync::atomic::AtomicU64::new(0),
             readback_total: std::sync::atomic::AtomicU64::new(0),
             readback_us_total: std::sync::atomic::AtomicU64::new(0),
+            min_update_100ns: std::sync::atomic::AtomicI64::new(0),
         });
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -271,10 +278,17 @@ impl WgcCapture {
         let gate_mode = super::gate::GateMode::from_env();
         // FR-119 P2b-3 — so is the monitor's refresh rate.
         let refresh_hz = super::refresh::of_monitor(hmon.0 as usize);
+        // FR-119 P2b-15 — and the interval Windows may deliver frames at.
+        let min_update = super::gate::min_update_interval_100ns(target_fps, refresh_hz);
+        shared.min_update_100ns.store(
+            min_update.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         tracing::info!(
             gate = gate_mode.as_str(),
             target_fps,
             ?refresh_hz,
+            min_update_ms = min_update.map(|i| i as f64 / 10_000.0),
             "wgc capture gate"
         );
         Ok(Self {
@@ -411,7 +425,19 @@ impl ScreenCapture for WgcCapture {
         self.target_frame_period = super::gate::legacy_period(fps);
         self.slot_first =
             (gate == super::gate::GateMode::SlotFirst).then(|| super::gate::SlotFirst::new(fps));
-        tracing::info!(gate = gate.as_str(), fps, "wgc capture gate moved");
+        // FR-119 P2b-15 — without this the session still delivers ~60 frames
+        // a second whatever the gate asks for (Windows' 16 ms default).
+        let min_update = super::gate::min_update_interval_100ns(fps, self.refresh_hz);
+        self.shared.min_update_100ns.store(
+            min_update.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        tracing::info!(
+            gate = gate.as_str(),
+            fps,
+            min_update_ms = min_update.map(|i| i as f64 / 10_000.0),
+            "wgc capture gate moved"
+        );
     }
 
     fn backend(&self) -> &'static str {
@@ -696,6 +722,24 @@ fn worker_main(
         });
     let _token = pool.FrameArrived(&handler)?;
 
+    // FR-119 P2b-15 — Windows' own interval, read once (Windows 11 24H2 and
+    // later; an older build has no such property, and nothing is set), then the
+    // one the open's rate wants.
+    let default_min_update = session.MinUpdateInterval().ok().map(|t| t.Duration);
+    if let Some(d) = default_min_update {
+        tracing::info!(
+            default_ms = d as f64 / 10_000.0,
+            "wgc: the session's MinUpdateInterval"
+        );
+    }
+    let mut min_update_applied = 0i64;
+    apply_min_update(
+        &session,
+        &shared,
+        default_min_update,
+        &mut min_update_applied,
+    );
+
     session.StartCapture()?;
     tracing::info!(
         width = size.Width,
@@ -711,12 +755,55 @@ fn worker_main(
     //    pool, not this thread.
     while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
         thread::sleep(Duration::from_millis(100));
+        // FR-119 P2b-15 — a rate move lands here within one wake.
+        apply_min_update(
+            &session,
+            &shared,
+            default_min_update,
+            &mut min_update_applied,
+        );
     }
 
     session.Close().ok();
     pool.Close().ok();
     tracing::info!("wgc: capture session closed");
     Ok(())
+}
+
+/// FR-119 P2b-15 — give the session the `MinUpdateInterval` the pump last
+/// asked for, if it moved since the last call. 0 puts back Windows' default
+/// (read at the open; on a build without the property there is nothing to put
+/// back, and nothing was ever set). A refusal is logged once and not retried
+/// until the wanted value moves again.
+fn apply_min_update(
+    session: &GraphicsCaptureSession,
+    shared: &SharedSlot,
+    default_100ns: Option<i64>,
+    applied: &mut i64,
+) {
+    let want = shared
+        .min_update_100ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if want == *applied {
+        return;
+    }
+    *applied = want;
+    let value = if want == 0 {
+        match default_100ns {
+            Some(d) => d,
+            None => return,
+        }
+    } else {
+        want
+    };
+    match session.SetMinUpdateInterval(TimeSpan { Duration: value }) {
+        Ok(()) => tracing::info!(ms = value as f64 / 10_000.0, "wgc: MinUpdateInterval set"),
+        Err(e) => tracing::warn!(
+            %e,
+            ms = value as f64 / 10_000.0,
+            "wgc: MinUpdateInterval refused; the session keeps Windows' own"
+        ),
+    }
 }
 
 /// Builds a new `ID3D11Device` + `ID3D11DeviceContext` tuned for WGC:
@@ -983,5 +1070,44 @@ mod tests {
         assert_eq!(frame.pixel_format, PixelFormat::Bgra);
         assert_eq!(frame.data.len(), (frame.width * frame.height * 4) as usize);
         assert_eq!(frame.stride, frame.width * 4);
+    }
+
+    /// FR-119 P2b-15 — ignored: on a Windows desktop whose screen keeps
+    /// changing (something moving every composition), how many frames this
+    /// backend delivers in 5 s at `ROOMLER_WGC_BENCH_FPS` (default 120).
+    /// Before P2b-15 every rate above 60 delivered ~58 (Windows' 16 ms
+    /// `MinUpdateInterval`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn wgc_rate_bench() {
+        let fps: u32 = std::env::var("ROOMLER_WGC_BENCH_FPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let mut cap = WgcCapture::primary(fps, DownscalePolicy::Never).expect("wgc open");
+        cap.set_target_fps(fps);
+        // Let the worker's next wake apply the interval, and settle.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while matches!(cap.next_frame().await, Ok(Some(_))) {
+            if cap.start.elapsed() > Duration::from_secs(1) {
+                break;
+            }
+        }
+        let t0 = Instant::now();
+        let mut frames = 0u32;
+        while t0.elapsed() < Duration::from_secs(5) {
+            if let Ok(Some(_)) = cap.next_frame().await {
+                frames += 1;
+            }
+        }
+        let arrived = cap
+            .shared
+            .arrived_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "wgc_rate_bench: target {fps} fps, refresh {:?} Hz: delivered {:.1} fps ({frames} in 5 s), {arrived} arrivals in all",
+            cap.refresh_hz,
+            frames as f64 / t0.elapsed().as_secs_f64()
+        );
     }
 }
