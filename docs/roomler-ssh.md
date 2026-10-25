@@ -125,8 +125,9 @@ its org over the Free allowance, each run a 1 MiB `scp` over roomler SSH:
 
 | smoltcp | runs | result | RTO, as traced |
 |---|---|---|---|
-| 0.13.1 (0.4.170, and master on it) | 5 | 33–101 kbit/s; two did not finish in 150 s | doubled on every retransmit, to 60 s, and held |
+| 0.13.1 (0.4.170, and master on it) | 7 | 33–101 kbit/s; three did not finish in 150 s | doubled on every retransmit, to 60 s, and held |
 | 0.14.0 | 4 | **535–805 kbit/s**, each done in 10–16 s | at most 2 s |
+| 0.14.0, the published agent 0.4.171 | 3 | **538–804 kbit/s**, each done in 10–16 s | — |
 | kernel TCP (HTTP), same pair | 1 | 0.86 Mbit/s | — |
 
 ⚠️ A zero-RTT test link hid this one. The old stack passed the policed test at
