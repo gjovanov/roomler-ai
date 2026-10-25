@@ -35,7 +35,8 @@ sessions read it too, through their toolbelt.
 > P4-5-3-1, staleness: a person's fact, or a confirmed proposal, that nothing
 > confirmed for `knowhow.stale_days` turns `stale`, and a probe's or a
 > person's word revives it (§13.4); and P4-5-4, what each device last found
-> of an entity, on its card beside each fact's last word (§13.5).** People,
+> of an entity, a row of each probe kind (P4-5-4b), on its card beside each
+> fact's last word (§13.5).** People,
 > the sync, scans and sessions' proposals fill the map, probes verify it, and
 > what nobody confirms ages.
 > Windows (P4-3b-4) and `roomler_connect` (P4-6) come with the steps that
@@ -208,7 +209,7 @@ because a card and a neighbourhood show only the links whose other end is live.
 `knowhow.tenants` reads like `vault.tenants`: empty or `*` is every
 organization, and an entry that is not an organization id matches nothing
 ([`scope.rs`](../crates/modules/knowhow/src/scope.rs)). Every route checks, in
-this order ([`routes.rs:82`](../crates/modules/knowhow/src/routes.rs#L82)):
+this order ([`routes.rs:83`](../crates/modules/knowhow/src/routes.rs#L83)):
 
 1. **membership**: someone outside the organization is told `403 not_a_member`,
    and so learns nothing about whether its map is kept;
@@ -251,7 +252,7 @@ All under `/api/tenant/{tenant_id}/knowhow`
 | GET | `` | `{entities, edges}`: how much the map holds, live | `KNOWHOW_VIEW` |
 | GET | `/search` | the live entities whose key or name holds `q` (as written, case aside, never a pattern), of a `kind`, in an `env`, by kind and key; `?limit=` 1–200 (default 50) and `truncated`. Each as a node: no attributes, no facts. A kind this build does not know is searched for, not refused | `KNOWHOW_VIEW` |
 | GET | `/entity?kind=…&key=…` | one live entity's card, by the name a chip and a session use | `KNOWHOW_VIEW` |
-| GET | `/entity/{id}` | its card: `{entity, links[{direction: out · in, edge, other}], truncated, probes, probes_truncated}`, up to 200 links to live entities, and (P4-5-4) each device's last probe that found something, up to 16 devices, each as the probes listing shows one (§13.5) | `KNOWHOW_VIEW` |
+| GET | `/entity/{id}` | its card: `{entity, links[{direction: out · in, edge, other}], truncated, probes, probes_truncated}`, up to 200 links to live entities, and (P4-5-4) each device's last probe that found something, a row of each probe kind (P4-5-4b), up to 16 devices, each as the probes listing shows one (§13.5) | `KNOWHOW_VIEW` |
 | GET | `/map/{id}` | its neighbourhood (§7): `?depth=` 1 (default) or 2, `?kind=`, `?env=` → `{center, entities, edges, truncated}` | `KNOWHOW_VIEW` |
 | GET | `/history` | the writes, newest first; `?entity=` one entity's, its links' included, archived or not; `?limit=` 1–200 | `KNOWHOW_VIEW` |
 | POST | `/entity` | `{kind, key, name, env?, owner_id?, attrs?, facts?: {path: value}}` → **201**. **409** when a live entity holds the kind and key; **400** for `machine`, a kind or a spelling outside the rules, a null fact, an owner who is no member; **422** for an unknown field | `KNOWHOW_EDIT` |
@@ -375,13 +376,13 @@ edge (FR-69's rule 5).
 > its owner or a synced fact is refused **400**, because the next sync would undo it. So is
 > archiving a machine, which leaves the map when its device is removed. A person may give a
 > machine an environment, attributes and facts of their own, and every sync leaves those as
-> they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L191)).
+> they are ([`the_fleets`](../crates/modules/knowhow/src/routes.rs#L192)).
 
 > [!NOTE]
 > **A machine keeps room for the sync's facts.** An entity holds at most 64 facts, and the
 > sync owns 14 of a machine's paths and its scans one more (§11.1), so a person's own facts on
 > a machine stop at 49
-> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L254)), and no sync
+> ([`persons_room`](../crates/modules/knowhow/src/routes.rs#L255)), and no sync
 > takes a machine past 64. An edit that adds none of a person's still passes, so a machine
 > that a newly synced path left past its room can still be tidied.
 
@@ -884,7 +885,7 @@ four tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
 | the word | the device forgets `rc:knowhow.served` at every primary connection and keeps the tools it names from that frame on, each only when this build knows it |
 | the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment. Its settings allow the reads and a proposal outright (`permissions.allow`), since neither asks a person (decision 39), and ask a person for each verify (`permissions.ask`, decision 54), since it aims a connection from this device |
 | the questions | on the primary's connection, a `req_id` each, the session and its fence attached by the daemon, never by the model; each answer matched to its question, 15 s each |
-| the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on. `knowhow_get`'s description says what a card's `verified` and (P4-5-4) `probes` mean: the last probe's word on a fact, and each device's last finding (§13.5) |
+| the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on. `knowhow_get`'s description says what a card's `verified` and (P4-5-4) `probes` mean: the last probe's word on a fact, and each device's last finding of each kind (§13.5) |
 | a proposal unanswered | asked and never answered within its 15 s, it may have been written all the same. The model is told so, and that `knowhow_get` shows whether it was: proposing it again is safe, since one already there is refused `exists` |
 | a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L289)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L584)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
 
@@ -1325,22 +1326,23 @@ flowchart LR
 > `knowhow_get` show it with its status, as any fact. Stale says "confirm me",
 > not "gone": it keeps its value, its provenance and its last `verified`.
 
-### 13.5 What each device found (P4-5-4)
+### 13.5 What each device found (P4-5-4, P4-5-4b)
 
 A fact's `verified` holds the last probe's word, whichever device said it.
 When devices disagree, the last word alone cannot tell "the certificate
 changed" from "one device's network rewrites TLS". The P4-5-1 field run was
 that case: six devices found roomler.ai's certificate as the map says, and
 one, behind a network that inspects TLS, found another key. So a card also
-carries `probes`, each device's last probe of the entity that found something
-(decision 58, [`last_per_device`](../crates/modules/knowhow/src/dao.rs#L761)).
+carries `probes`: each device's last probe of the entity that found
+something, a row of each probe kind (decision 58 and P4-5-4b,
+[`last_per_device_and_kind`](../crates/modules/knowhow/src/dao.rs#L764)).
 
 ```mermaid
 flowchart LR
     P["knowhow_probes:<br/>the entity's, 90 days"] --> F["those that found something:<br/>ok · unreachable"]
     F --> N["the newest 512"]
-    N --> G["each device's newest"]
-    G --> C["probes: 16 devices,<br/>the newest first"]
+    N --> G["each device's newest<br/>of each kind"]
+    G --> C["probes: 16 devices,<br/>a row of each kind,<br/>the newest first"]
     V["each fact's verified:<br/>the last probe's word"] --> K["the card"]
     C --> K
 ```
@@ -1348,9 +1350,9 @@ flowchart LR
 | Piece | As built |
 |---|---|
 | which probes | an `ok` or an `unreachable` one: it reached the target, or tried to. A `not_allowed` one (its owner's list) and a `failed` one (it could not ask) say nothing of the target, so the device's earlier finding stands behind them; a probe never answered is no one's finding |
-| how many | at most 16 devices ([`MAX_CARD_DEVICES`](../crates/modules/knowhow/src/routes.rs#L71)), the newest first, and `probes_truncated` when there were more. They are read from the entity's newest 512 findings, so a device whose last one lies further back is not shown; the probes listing (§6) still has it |
+| how many | at most 16 devices ([`MAX_CARD_DEVICES`](../crates/modules/knowhow/src/routes.rs#L72)), each with a row of each kind it found (`tcp`, `tls`), so at most 32 rows, the newest first, and `probes_truncated` when a device was left out. A device is shown by its newest finding and brings its other kind's row along, however old. They are read from the entity's newest 512 findings, so a device whose last one lies further back is not shown; the probes listing (§6) still has it |
 | each row | the probes listing's own view (§6): its id, which a fact's `verified.probe` names; its device; who asked, or which session; its kind and target; its state, round trip, address and carrier; what TLS showed; and what it measured |
-| the read | one aggregate over the entity's probe index, at every card read ([`card`](../crates/modules/knowhow/src/routes.rs#L445)) |
+| the read | one aggregate over the entity's probe index, at every card read ([`card`](../crates/modules/knowhow/src/routes.rs#L446)); which devices are shown is a pure function of what it read ([`card_rows`](../crates/modules/knowhow/src/probe.rs#L973)) |
 | a session's card | the same rows. Past the card's 64 KiB they go first, the oldest first, before any link ([`bounded`](../crates/modules/knowhow/src/session.rs#L634)), so a card a session was given whole before them still is |
 
 > [!NOTE]
@@ -1360,9 +1362,12 @@ flowchart LR
 > say where the devices disagree, and change nothing.
 
 > [!TIP]
-> **A device's row is its last finding of either kind.** A `tcp` probe after
-> a `tls` one shows no certificate. Every probe stays in the probes listing
-> (`GET …/probe?entity=`) for 90 days.
+> **A row of each kind a device** (P4-5-4b, the operator, 2026-10-25: "2 rows
+> per device"). A `tcp` probe after a `tls` one adds a row of its own and
+> leaves the device's certificate on the card. P4-5-4 showed a device's last
+> finding of either kind, and its field check found a device whose `tcp`
+> probe had hidden what TLS showed it. Every probe stays in the probes
+> listing (`GET …/probe?entity=`) for 90 days.
 
 ## 14. What comes next
 
