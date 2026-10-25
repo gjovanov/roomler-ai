@@ -154,7 +154,7 @@ flowchart LR
   tab is hidden or the overlay closes
   ([`TouchControls.vue:241`](../ui/src/components/remote/TouchControls.vue#L241) `releaseAll`). The stage's
   own release on a blur or a detach covers the controls' presses too, and a release for something already
-  let go is dropped ([`useRemoteControl.ts:11451`](../ui/src/composables/useRemoteControl.ts#L11451)
+  let go is dropped ([`useRemoteControl.ts:11560`](../ui/src/composables/useRemoteControl.ts#L11560)
   `stageControls`).
 - **Ctrl on a Mac host** goes out as the keyboard's would (FR-13): with the viewer turning Ctrl into Cmd,
   Ctrl+C reaches the Mac as Cmd+C, and the button says ⌘C
@@ -171,7 +171,7 @@ flowchart LR
   as the physical keys do. On a Mac host it is Option+Tab, not the app switcher (Cmd+Tab). A preset binds
   the same keys whatever the host, so a Mac host gets a layout of its own from the editor (P4b-2), chosen
   for that device: with the viewer turning Ctrl into Cmd, a button bound to Ctrl+Tab reaches the Mac as
-  Cmd+Tab ([`useRemoteControl.ts:11456`](../ui/src/composables/useRemoteControl.ts#L11456)).
+  Cmd+Tab ([`useRemoteControl.ts:11565`](../ui/src/composables/useRemoteControl.ts#L11565)).
 
 ## The org's presets (P4)
 
@@ -291,9 +291,9 @@ layout:
   machine too. Opening the editor sets `keyboardPaused`
   ([`useRemoteControl.ts:6452`](../ui/src/composables/useRemoteControl.ts#L6452)). The listener then leaves
   every event to the page
-  ([`useRemoteControl.ts:11652`](../ui/src/composables/useRemoteControl.ts#L11652)), and pausing first lets go
+  ([`useRemoteControl.ts:14177`](../ui/src/composables/useRemoteControl.ts#L14177)), and pausing first lets go
   of whatever the keyboard held on the host
-  ([`useRemoteControl.ts:12015`](../ui/src/composables/useRemoteControl.ts#L12015)).
+  ([`useRemoteControl.ts:12017`](../ui/src/composables/useRemoteControl.ts#L12017)).
 - **A live preview** runs the draft through the real overlay on a sink that sends nothing, so a button can
   be tried, a macro included, without pressing anything on the host.
 

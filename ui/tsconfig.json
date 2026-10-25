@@ -22,7 +22,8 @@
     "src/**/*.d.ts",
     "src/**/*.vue",
     "env.d.ts",
-    "docs/**/*.ts"
+    "docs/**/*.ts",
+    "e2e-harness/**/*.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
