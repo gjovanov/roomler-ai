@@ -812,7 +812,7 @@ test of the SIGKILL property itself.
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
     (`crates/localapi/src/lib.rs:2676`, `:2681`, dispatched at `:3290`). They default to the sync reads, so the
     tests' fakes are untouched.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:1954`, `:1967`), with P2g's
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:1960`, `:1973`), with P2g's
     rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:200`). Then
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status and
     MagicDNS (`with_machine_network`, `:213`).

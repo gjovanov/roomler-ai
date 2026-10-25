@@ -2309,17 +2309,37 @@ async fn list_canonical(pb: &std::path::Path) -> Result<DirListing> {
 /// The staging dir is created per update and removed after, so it is absent
 /// most of the time. Erroring then would make the quick-access button useless
 /// except during the few seconds an update is in flight, so an absent staging
-/// dir lists its parent — the machine-global root, which always exists and
-/// holds `crashes/`, `service-logs/` and `uploads/` besides.
+/// dir lists its parent — the machine-global root, which holds `crashes/`,
+/// `service-logs/` and `uploads/` besides. That root is made by whichever of
+/// those is written first, never by this resolver (a listing creates nothing),
+/// so on a host where nothing has written yet — a fresh CI runner, a box whose
+/// ProgramData was cleaned under a running daemon — it is absent too: the one
+/// failure of the first full `--lib` run on a Windows runner (#2886),
+/// `canonicalising C:\ProgramData\roomler\roomler: cannot find the path`. The
+/// contract is "always lands somewhere real", so then the nearest ancestor
+/// that exists is listed, `%PROGRAMDATA%` at the furthest. No wider than the
+/// plain path arm, which lists any directory the caller names.
 #[cfg(target_os = "windows")]
 async fn list_staging() -> Result<DirListing> {
     let staging = staging_root_windows();
     let target = if staging.is_dir() {
         staging
     } else {
-        crate::appdirs::machine_global_dir()
+        let root = crate::appdirs::machine_global_dir();
+        nearest_existing_dir(&root).unwrap_or(root)
     };
     list_canonical(&target).await
+}
+
+/// The deepest directory that exists on `path`'s way up: `path` itself when
+/// it is one, else the nearest ancestor that is. `None` only when nothing on
+/// the way up exists, which no path under a drive or `/` can manage. Compiled
+/// for tests on every OS so its test runs where the Windows caller does not.
+#[cfg(any(target_os = "windows", test))]
+fn nearest_existing_dir(path: &std::path::Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|p| p.is_dir())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Non-Windows hosts stage per-destination (`<dest>/.roomler-partial/<id>`),
@@ -2922,10 +2942,24 @@ mod tests {
             let root = crate::appdirs::machine_global_dir();
             let root_s = root.to_string_lossy().to_lowercase();
             let got = listing.path.to_lowercase();
-            assert!(
-                got.contains(root_s.trim_start_matches(r"\\?\")),
-                "resolved {got} is outside the machine-global root {root_s}"
-            );
+            let got = got.trim_start_matches(r"\\?\");
+            if root.is_dir() {
+                // A host something has written under (an enrolled box): the
+                // staging dir while an update is in flight, else the root.
+                assert!(
+                    got.contains(root_s.trim_start_matches(r"\\?\")),
+                    "resolved {got} is outside the machine-global root {root_s}"
+                );
+            } else {
+                // A host nothing has written under yet — a fresh CI runner
+                // (#2886): the nearest existing ancestor of the root, never an
+                // error. The root's spelling continues the resolved path at a
+                // separator, so `c:\programdata\room` could not pass.
+                assert!(
+                    root_s.starts_with(&format!("{got}\\")),
+                    "resolved {got} is not an existing ancestor of the absent root {root_s}"
+                );
+            }
             // And it must NOT be the literal the viewer used to hold.
             assert!(
                 !got.contains("roomler-agent") || root_s.contains("roomler-agent"),
@@ -2951,6 +2985,35 @@ mod tests {
                 "unhelpful error: {msg}"
             );
         }
+    }
+
+    /// The fallback the sentinel takes on a host where nothing has written
+    /// under the machine-global root yet (#2886): the deepest directory that
+    /// exists on the way up — the path itself when it is one, and a FILE on
+    /// the way is not a directory to list, its parent is. On every OS, so the
+    /// Linux lanes prove the choice the Windows caller makes.
+    #[test]
+    fn the_nearest_existing_dir_is_the_path_or_its_deepest_existing_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let here = tmp.path().to_path_buf();
+        assert_eq!(
+            nearest_existing_dir(&here).as_deref(),
+            Some(here.as_path()),
+            "a directory that exists is its own answer"
+        );
+        let absent = here.join("roomler").join("roomler");
+        assert_eq!(
+            nearest_existing_dir(&absent).as_deref(),
+            Some(here.as_path()),
+            "two absent segments resolve to the deepest existing ancestor"
+        );
+        let file = here.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            nearest_existing_dir(&file.join("below")).as_deref(),
+            Some(here.as_path()),
+            "a file on the way is skipped for its parent"
+        );
     }
 
     #[test]

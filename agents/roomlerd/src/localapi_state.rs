@@ -1229,8 +1229,14 @@ impl LocalApiState for DaemonState {
             // process-global this re-seeds, so the next drop already uses
             // the new folder. The status answer is recomputed HERE, on the
             // blocking thread, so the read right after the set shows it.
-            crate::files::set_files_dir(cfg.files_dir.clone());
+            // Only a set OF `files_dir` re-seeds it (#2886): `files.rs` says a
+            // hand edit of the file is picked up at the next start, exactly
+            // as every other key, so a set of some other key must not make
+            // one live — and in a binary of parallel tests, every other
+            // `config_set` was resetting the global under the test that
+            // had just set it (the "re-seeded for the next drop" flake).
             if key == "files_dir" {
+                crate::files::set_files_dir(cfg.files_dir.clone());
                 crate::files::refresh_effective_files_dir();
             }
             let entry = crate::config_surface::entry_for(&cfg, &key)
@@ -2615,8 +2621,15 @@ mod tests {
         assert!(!is_hex_object_id(""));
     }
 
-    #[test]
-    fn status_and_peers_track_connected_flag() {
+    // A tokio test although nothing here awaits (#2886): under `overlay-l3`,
+    // `status()` reads the LAN captures off `netstate::handle()`, whose
+    // process-wide monitor is spawned lazily by its FIRST caller and needs a
+    // tokio context (the daemon only asks from inside the runtime). As a
+    // plain `#[test]` this was red whenever it got there before any async
+    // test did — 13 of 30 runs of this module alone — and green by luck in
+    // the full suite, where an earlier async test had usually paid the spawn.
+    #[tokio::test]
+    async fn status_and_peers_track_connected_flag() {
         let connected = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = watch::channel(view());
         let consent = crate::consent::ConsentBroker::new(
