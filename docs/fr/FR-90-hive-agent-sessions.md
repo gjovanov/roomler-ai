@@ -3726,6 +3726,83 @@ What each rule is, and where it lives:
 device that adopted it, from the terminal's own history (the device's half P2f-4a, `docs/hive.md`
 §12; the route P2f-4b). A session whose mirroring was stopped from Roomler never is.
 
+### 3i. Hive's boundary: separate processes, a narrow seam, a hive-free build (P8)
+
+**P8, as planned** (the operator, 2026-10-25). Hive's daemon side runs inside `roomlerd`, which is
+SYSTEM or root and also carries the operator's remote control, the overlay and the tunnels. Much
+of that hive code parses what a session's account or another device sends it. A fault there can
+take the whole daemon down, and with it the operator's access to their own box. P8 bounds that
+blast radius with no second install, identity or updater, in three parts, numbered as the
+operator gave them.
+
+```mermaid
+flowchart LR
+    subgraph D["roomlerd (SYSTEM / root): the control socket, overlay, tunnels, RC, LocalAPI, updater"]
+        SUP["hive's supervisor and the lease client's key"]
+    end
+    subgraph W["roomlerd hive-worker (the same binary, a supervised child)"]
+        TB["toolbelt"] --- SC["model sidecar"]
+        VP["credential proxies"] --- EG["egress proxy"]
+    end
+    subgraph A["as the session's account"]
+        H["Claude Code"] --- CK["hive-checkpoint, hive-materialize, hive-import"]
+        KS["knowhow-scan (as each root's owner)"]
+    end
+    SUP <-->|"a private channel: the seam's calls, rc:* frames, passed sockets"| W
+    H <-->|"the session's sockets"| W
+    D -.->|"spawns, limits, restarts"| W
+```
+
+What runs where today, and where P8 puts it:
+
+| Part | Today | Under P8 |
+|---|---|---|
+| Claude Code, `hive-checkpoint` (`agents/roomlerd/src/main.rs:1317`), `hive-materialize` (`:1325`), `hive-import` (`:1342`) | children, as the session's account | unchanged |
+| `knowhow-scan` (`:1358`) | a child per root, as the account that owns it | unchanged |
+| the toolbelt (the model's tool calls), the model sidecar (the harness's HTTP, holding the provider key), the credential proxies (database, HTTP, Kubernetes and SSH-agent wire, holding leased values), the egress proxy (TLS termination and HTTP, P3b) | inside the daemon | a worker (step 1) |
+| the replica store and stream (frames from other devices), the viewer's WebRTC peer, the knowhow prober (certificates) | inside the daemon | a worker, after the session-facing parts (decision 64) |
+| the supervisor, the control socket, the lease client and the device's vault key, the tunnel hub | inside the daemon | unchanged: the worker reaches them only through the seam |
+
+| # | Part | Plan |
+|---|---|---|
+| 1 | **Same binary, separate processes** | the heavy and risky parts run as supervised children of `roomlerd`: `roomlerd hive-worker`, one per session or per device (decision 63). The pattern is the encoder probe's: it runs behind a process boundary, so "the child died" costs that child's work and never the daemon (`agents/roomlerd/src/encode/caps.rs:115`). Sessions already run that way, with Claude Code, the checkpointer and the materializer as separate processes as the session's account. A worker runs as the daemon's own identity, so there is no new account, install or updater, and it may shed privileges it does not use where the OS allows. It is restarted with backoff. A crash loop ends that session's run with a reason, and a hang is caught by a heartbeat. Resource limits come from rlimits on Unix, a cgroup's `memory.max` where the service delegates one, and a Job object on Windows, whose handle inheritance stays as clean as #2836 left it. The daemon's own control path never waits on a worker |
+| 2 | **A narrow boundary in code** | hive already reaches the daemon through traits: `VaultTools` (`agents/roomlerd/src/hive/toolbelt.rs:271`), `KnowhowTools` (`agents/roomlerd/src/hive/knowhow_tools.rs:435`), and the tunnel hub for its session flows (`agents/roomlerd/src/tunnel/client_mgr.rs:462`). Its daemon-free half is in `crates/hive-node` (`crates/hive-node/src/lib.rs`). Finishing the split means every call hive makes into the daemon goes through a trait: `SessionEgress` for the tunnel hub's session flows, P4-6's flow stream among them, and `ControlLink` for the `rc:hive.*`, `rc:vault.*` and `rc:knowhow.*` frames. The session-facing machinery then moves behind them into `crates/hive-node`, or a sibling crate. Those traits are the worker's channel: a worker needs only their calls answered across it, so part 1 is cheap once part 2 is done, and a later separation would be too |
+| 3 | **A hive-free build and package** | the `hive` cargo feature already compiles hive out: it is not in `full`, release builds name it explicitly (`.github/workflows/release-agent.yml:537`, `:1159`, `:1645`, `:2723`), and a build without it advertises no `hive` verb, so no server sends it a session (`agents/roomlerd/src/lib.rs:76`). `vault` implies `hive` (`agents/roomlerd/Cargo.toml`). A package per OS from such a build serves a customer who wants the runtime truly absent, not merely switched off (decision 65) |
+
+- ⚠️ **A worker holds what the daemon gives it, and no more.** The device's vault key stays in the
+  daemon. A worker receives the opened values of the leases it serves, over its private channel,
+  and nothing else. It is the daemon's identity, so this is crash and resource isolation, not a
+  privilege boundary, and it is no defence against a compromised daemon.
+- ⚠️ **A session's endpoints must survive a worker's restart, or end cleanly.** The harness holds
+  its toolbelt socket and the sidecar's port. Whether Claude Code reconnects to an MCP server whose
+  connection dropped, or loses its tools for the rest of the run, is unmeasured. P8-0 measures it
+  first, against the real harness, as P2b's probes did.
+- ⚠️ **P4-6 builds its seam as a trait now.** P4-6-1b's flow stream for the credential proxies goes
+  behind `SessionEgress` from its first commit. Once the proxies move into a worker, the same call
+  crosses the channel, a socket passed by descriptor or handle, and nothing in P4-6 is rewritten.
+- ⚠️ **Publishing a second package is a known way to freeze the fleet.** A frozen agent takes the
+  first asset matching its architecture. The server orders the daemon's assets first
+  (`order_assets_daemon_first`, `crates/modules/fleet/src/agent_release.rs:160`) because a frozen
+  agent can take no fix of its own, after the companion `.deb` was once installed as the daemon's
+  update. That rule sorts only the companion's assets last today, so a hive-free asset would need
+  the same treatment. A hive-free package keeps
+  every one of those couplings:
+  - the server's order;
+  - the six copies of the MSI's version mapping;
+  - the GPG sidecars;
+  - an updater that stays on its own variant;
+  - one daemon a machine, so a switch between variants is an in-place upgrade, never a second
+    install.
+
+| Step | Builds | Kill switch | AC |
+|---|---|---|---|
+| P8-0 | the boundary's design, after decisions 63–65: the channel's protocol, what crosses it, supervision and limits per OS, and a probe of the harness across a worker's restart | docs only | — |
+| P8-1 | part 2, the seam: `SessionEgress` and `ControlLink` beside `VaultTools` and `KnowhowTools`; the session-facing machinery behind them in `crates/hive-node`; a CI audit that no other module of `roomlerd` reaches past them | none (a refactor) | — |
+| P8-2a | part 1, `roomlerd hive-worker`, with what decision 64 moves first; the channel, supervision, restart and limits; Linux and macOS | device `hive_worker = false` keeps the parts in the daemon | AC28 |
+| P8-2b | the same on Windows: a Job object, handle inheritance, the console user's session | the same | AC28 |
+| P8-3 | part 3, the hive-free package, as decision 65 says: the release lane's variant, the server's asset order, the updater's variant, the docs (`docs/installation.md`) | the default package is unchanged | AC29 |
+| P8k | the field run: kill and starve a worker mid-turn on each OS, with remote control, the overlay and the tunnels watched; install, run and update the hive-free package | — | AC28, AC29 |
+
 ## 4. Phases
 
 | P | What | Kill switch | Status |
@@ -3967,6 +4044,7 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P4 | knowhow: graph, sync, scans, map UI, the access-path compiler, probes, chips (its design: §3e "P4, knowhow, as designed"; its steps: P4-0 to P4-8, and P4k) | `knowhow.tenants`; `[modules] knowhow` | — |
 | P5 | the learning loop: reviewer on replicas, proposals and review cards, auto-memory harvesting, scanner, contradiction cards, decay, session cards and central search, telemetry, eval sessions | `hive.learning = false`; `session_cards = metadata` | — |
 | P6 | docs: `docs/hive.md`, `docs/vault.md`, `docs/knowhow.md`, `docs/brain.md`; user docs | — | — |
+| P8 | Hive's boundary (§3i): the heavy and risky parts as supervised `roomlerd hive-worker` children; the seam finished behind traits, in `crates/hive-node`; a hive-free build and package. Its steps: P8-0 to P8-3, and P8k (design §17's P6 and P7 are follow-up FRs, so P8 takes neither name) | device `hive_worker = false`; the default package unchanged | **planned** (the operator, 2026-10-25); decisions 63–65 posed |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
@@ -4296,6 +4374,17 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   - *A session whose history was removed before the request was refused by the device: its
     `hive-import` found no history of the session (`launch_failed`). The record stayed the ended
     adopted session, with the refusal kept in `from_terminal.refused`.*
+- [ ] **AC28:** a hive worker's crash, hang or exhausted memory costs at most its own work (a
+  session's, or the device's hive parts, as decision 63 settles), which restarts or ends with a
+  reason. `roomlerd`'s remote control, overlay and tunnels never drop. Field-verified on Linux,
+  Windows and macOS by killing and starving a worker mid-turn while a remote-control session, an
+  overlay ping and a tunnel forward run, each shown failing first on a build where those parts
+  run inside the daemon. *Added with P8 (the operator, 2026-10-25).*
+- [ ] **AC29:** a hive-free package installs, runs and updates on each OS with no hive code in its
+  binary: no `hive` verb in its hello, so the web app says its build carries no Hive, and the
+  release lane checking the binary's symbols. A hive-free install only ever updates to a hive-free
+  build, and the default package's agents never take a hive-free asset. *Added with P8 (the
+  operator, 2026-10-25).*
 
 ## 6. Open decisions
 
@@ -5120,6 +5209,40 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Or: in P4-6-1, beside the sessions' half.*
       - What it costs: two principals' paths built and verified at once: a session's, decided for
         its starter, and a person's, decided for the device's owner.
+63. **A worker per session, or per device** (P8), for the operator to confirm.
+    - *Recommended: per session for the session-facing parts* (the toolbelt, the sidecar, the
+      credential proxies, the egress proxy), which are already scoped to a session (its runtime
+      directory, sockets, settings and leases end with its run). A session's untrusted input then
+      cannot reach another session's process or exhaust its memory, and a crash ends one run,
+      which resumes. The device-wide parts (the replica store and stream, the viewer's peer, the
+      prober) go to one worker per device, after.
+      - What it costs: a process a session, up to `hive_max_sessions`, and a channel each.
+    - *Or: one worker per device* for everything.
+      - What it costs: one fault ends every session's tools and endpoints at once, though never
+        the daemon's.
+    - *Or: per session for everything.*
+      - What it costs: the store, one SQLite file a device today, split per session, and the
+        stream with it.
+64. **What moves first** (P8), for the operator to confirm.
+    - *Recommended: the egress proxy and the credential proxies first*, since they parse TLS and
+      wire protocols from both sides and hold leased values; then the toolbelt and the sidecar;
+      then the store, the stream, the viewer's peer and the prober.
+      - What it costs: until the last step, a fault in what has not moved still reaches the daemon.
+    - *Or: everything at once*, in one step.
+      - What it costs: the largest change to the daemon in FR-90, verified only as a whole.
+65. **What a hive-free package is** (P8), for the operator to confirm.
+    - *Recommended: a separately named package per OS in the same release*
+      (`roomlerd-nohive-<version>-…`), built once a customer asks. The server orders it after the
+      default for every agent, only a hive-free build picks it (by a mark compiled in), and it is
+      the same product, so a switch is an in-place upgrade.
+      - What it costs: each release builds and signs one more package per OS, and the asset order,
+        the MSI's mapping and the updater each learn a variant.
+    - *Or: a documented source build only*: `cargo build -p roomlerd` with the release's features
+      minus `hive` and `vault`, and no package.
+      - What it costs: the customer builds, signs and updates it themselves.
+    - *Or: a release lineage of its own* (`agent-nohive-v*`), with its own update channel.
+      - What it costs: two lineages to tag, rehearse and promote, which every release step would
+        have to name.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
