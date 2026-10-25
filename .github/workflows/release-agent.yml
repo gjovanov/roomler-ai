@@ -1029,13 +1029,17 @@ jobs:
   # case 2026-08-15 on a Fedora Asahi Remix host (Apple M2) that meshes and
   # screen-shares fine but could never self-update.
   #
-  # Deliberately WITHOUT `ffmpeg-encoder`: the vendored FFmpeg 9.0.1 tree is
-  # published for linux64/macos-arm64 only, there is no linux-arm64 build to
-  # fetch, and the backend it feeds dispatches to nvenc/qsv/amf — none of
-  # which exist on the Apple-silicon and Ampere hosts this targets. Dropping
-  # it also keeps this lane on the P3e size trajectory (no 20 MB of FFmpeg in
-  # a package whose encoders would all fail to init). Video on arm64 is
-  # openh264 (SW H.264) + libvpx VP9-444, both field-verified.
+  # FR-97 P7a: WITH `ffmpeg-encoder`, from the vendored FFmpeg 9.0.1's
+  # linuxarm64 tree (vendor-ffmpeg-windows.yml, build-linux-arm64-minimal):
+  # nvenc, vaapi and vulkan, the h264 decoder and the aac encoder. It has no
+  # qsv and no amf, which ship no arm64 Linux runtime. Until P7a this lane
+  # carried no FFmpeg at all, because no linux-arm64 tree existed. The
+  # result: no hardware cell on any arm64 Linux host, an NVIDIA GPU in an
+  # arm64 server included, and recordings in Opus rather than AAC. The tree
+  # is the trimmed one (a few MB of libs), not the old 20 MB full build.
+  # Where no encoder initialises (an Asahi Mac, a GPU-less Ampere box), the
+  # child-process probe finds no hardware, and video stays on openh264 +
+  # libvpx VP9-444 as before.
   # ---------------------------------------------------------------------------
   build-linux-arm64:
     name: Build .deb (Linux aarch64)
@@ -1087,10 +1091,47 @@ jobs:
         # release run died on exactly this in all three build jobs).
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
-      - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
+      - name: Fetch vendored FFmpeg 9.0.1 (linuxarm64, FR-97 P7a)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The aarch64 twin of the x86_64 lane's fetch: the same trimmed,
+          # patched FFmpeg built on an arm64 runner (vendor-ffmpeg-windows.yml,
+          # build-linux-arm64-minimal), with libva/libdrm in the tree. When
+          # FFmpeg moves, bump this name with the x86_64 lane's.
+          asset=ffmpeg-9.0.1-linuxarm64-lgpl-shared-minimal-vaapi-vulkan-h264dec-aac.tar.xz
+          gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" \
+            --pattern "$asset" --dir /tmp/ffdl
+          sudo mkdir -p /opt/roomler-ffmpeg
+          sudo tar xf "/tmp/ffdl/$asset" -C /opt/roomler-ffmpeg --strip-components=1
+          sudo sed -i "s|^prefix=.*|prefix=/opt/roomler-ffmpeg|" /opt/roomler-ffmpeg/lib/pkgconfig/*.pc
+          {
+            echo "FFMPEG_DIR=/opt/roomler-ffmpeg"
+            echo "PKG_CONFIG_PATH=/opt/roomler-ffmpeg/lib/pkgconfig"
+            echo "LD_LIBRARY_PATH=/opt/roomler-ffmpeg/lib"
+          } >> "$GITHUB_ENV"
+          # FR-62 A2 drift gate, per asset: this tree must have been built from
+          # the patches committed in this checkout (the x86_64 lane checks its
+          # own tree; the FR-24 offer gate is release-wide and runs there).
+          shopt -s nullglob
+          committed=( "$GITHUB_WORKSPACE"/.github/ffmpeg-patches/*.patch )
+          if [ ${#committed[@]} -gt 0 ]; then
+            want=$(for f in "${committed[@]}"; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done | sort)
+            got_file=/opt/roomler-ffmpeg/ROOMLER-PATCHES.txt
+            [ -f "$got_file" ] || { echo "::error::the linuxarm64 FFmpeg carries no ROOMLER-PATCHES.txt but ${#committed[@]} patch(es) are committed — re-run vendor-ffmpeg-windows.yml (linux-arm64)"; exit 1; }
+            got=$(awk 'NF{print tolower($1), $NF}' "$got_file" | sort)
+            if [ "$want" != "$got" ]; then
+              echo "::error::the linuxarm64 FFmpeg's patch manifest != committed .github/ffmpeg-patches/ — re-run vendor-ffmpeg-windows.yml (linux-arm64)"
+              echo "--- committed ---"; echo "$want"; echo "--- in asset ---"; echo "$got"; exit 1
+            fi
+            echo "FR-62 A2 gate OK (aarch64): vendored FFmpeg built from ${#committed[@]} committed patch(es)"
+          fi
+
+      - name: Build agent (release, full + vp9-444 + ffmpeg-encoder)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,hive,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,viewer-indicator-x11"
+        run: cargo build -p roomlerd --release --features "full,hive,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
 
       - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
         run: |
@@ -1098,17 +1139,35 @@ jobs:
           cargo build -p roomler-cli-shim --release
           test -f target/release/roomler-shim || { echo "::error::roomler-shim not produced — the cargo-deb assets entry would fail"; exit 1; }
 
-      - name: Bundle libvpx into the .deb (self-contained, RPATH)
+      - name: Bundle FFmpeg + libvpx into the .deb (self-contained, RPATH)
         run: |
           set -euo pipefail
+          # The x86_64 lane's bundler (see its comments): ship each vendored lib
+          # the binary actually references, under its SONAME as a real file,
+          # found by an ldd fixpoint over the binary's DT_NEEDED and then each
+          # copied lib's own. Stock 24.04 ships FFmpeg 6.1, never our 9.0.1.
+          dst=agents/roomlerd/vendor-ffmpeg
+          rm -rf "$dst" && mkdir -p "$dst"
+          needed=$(ldd target/release/roomlerd | awk '{print $1}')
+          for _pass in 1 2 3 4 5; do
+            grew=0
+            for real in $(find /opt/roomler-ffmpeg/lib -maxdepth 1 -type f -name 'lib*.so.*'); do
+              soname=$(patchelf --print-soname "$real")
+              [ -f "$dst/$soname" ] && continue
+              if echo "$needed" | grep -qx "$soname"; then
+                cp "$real" "$dst/$soname"
+                grew=1
+              fi
+            done
+            [ "$grew" = "1" ] || break
+            needed=$(printf '%s\n' "$needed"; for l in "$dst"/lib*.so.*; do patchelf --print-needed "$l"; done)
+          done
+          copied=$(ls "$dst" | wc -l)
+          [ "$copied" -ge 2 ] || { echo "::error::only $copied vendored FFmpeg libs matched — expected at least avcodec+avutil; the keep-set derivation is broken"; exit 1; }
           # Same ABI trap as the x86_64 lane: the agent links this runner's
           # libvpx-dev (1.12 / libvpx.so.7 on 22.04) and stock 24.04 ships only
           # libvpx.so.9, so without carrying it the .deb installs cleanly and
-          # then aborts at load. The cargo-deb assets glob is
-          # `vendor-ffmpeg/*.so.*` — CI-populated and shared with the x86_64
-          # lane's FFmpeg bundle; here it carries libvpx alone.
-          dst=agents/roomlerd/vendor-ffmpeg
-          rm -rf "$dst" && mkdir -p "$dst"
+          # then aborts at load.
           vpx7=$(readlink -f /usr/lib/aarch64-linux-gnu/libvpx.so.7)
           cp "$vpx7" "$dst/libvpx.so.7"
           [ -f "$dst/libvpx.so.7" ] || { echo "::error::libvpx.so.7 not bundled — agent aborts at load on 24.04"; exit 1; }
@@ -1123,7 +1182,11 @@ jobs:
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
             apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
-            LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version'
+            LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version
+            # FR-97 P7a — the VA loader chain comes from the bundle here too.
+            for l in libva.so.2 libva-drm.so.2 libdrm.so.2; do
+              test -f /w/agents/roomlerd/vendor-ffmpeg/$l || { echo "::error::$l missing from the bundle — the daemon would need the system libva"; exit 1; }
+            done'
 
       - name: Build .deb
         working-directory: agents/roomlerd

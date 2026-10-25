@@ -683,7 +683,7 @@ and the export picks the same way:
 | Build | Track | Sidecar `audio.codec` |
 |---|---|---|
 | `ffmpeg-encoder`, and its FFmpeg carries the native `aac` encoder (the `-h264dec-aac` vendored assets, P4a) | AAC-LC, 48 kHz stereo, 192 kb/s, `mp4a` + `esds` | `aac` |
-| no FFmpeg (Linux arm64), or an FFmpeg without `aac` (every release before P4c flips the assets) | Opus, 48 kHz stereo, 128 kb/s, `Opus` + `dOps` | `opus` |
+| no FFmpeg (Linux arm64 before 0.4.170, FR-97 P7a), or an FFmpeg without `aac` (every release before P4c flips the assets) | Opus, 48 kHz stereo, 128 kb/s, `Opus` + `dOps` | `opus` |
 
 - **Why AAC.** Opus-in-MP4 plays in browsers and VLC, but not in QuickTime,
   and not in Movies & TV without an extension. AAC-LC opens wherever a

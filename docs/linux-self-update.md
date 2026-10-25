@@ -585,7 +585,8 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
   it exists, and FR-117 moves it, above.)
 - **musl / Alpine** — the payload is glibc-linked. A musl target is a separate
   build, not a packaging change.
-- **arm64 FFmpeg** — the aarch64 build ships without `ffmpeg-encoder` (no
-  linux-arm64 vendored FFmpeg exists, and its encoders dispatch to
-  nvenc/qsv/amf, none of which exist on these hosts). Unrelated to install.
+- **arm64 FFmpeg** — from 0.4.170 the aarch64 build carries `ffmpeg-encoder`
+  with its own vendored tree (FR-97 P7a): nvenc, vaapi, vulkan and AAC. It is
+  bundled in the `.deb` and the tarball like x86_64's, so nothing changes about
+  installing. Before it, the aarch64 build shipped without FFmpeg.
 <!-- RETIRED-NAME-ANCHOR-END -->
