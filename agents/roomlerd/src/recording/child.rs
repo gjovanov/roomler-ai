@@ -284,7 +284,8 @@ pub fn parse_event_line(line: &str) -> Option<serde_json::Value> {
 }
 
 /// openh264's recording profile — the software rung, and the whole ladder on a
-/// build without FFmpeg (Linux arm64).
+/// build without FFmpeg (Linux arm64 before 0.4.170). On a screen larger than
+/// openh264 encodes, at a size it does (#2877, [`super::fit`]).
 fn software_encoder(
     w: u32,
     h: u32,
@@ -293,9 +294,7 @@ fn software_encoder(
 ) -> Result<Box<dyn crate::encode::VideoEncoder>> {
     #[cfg(feature = "openh264-encoder")]
     {
-        let e =
-            crate::encode::openh264_backend::Openh264Encoder::new_recording(w, h, fps, gop_frames)?;
-        Ok(Box::new(e))
+        super::fit::software_recording_encoder(w, h, fps, gop_frames)
     }
     #[cfg(not(feature = "openh264-encoder"))]
     {

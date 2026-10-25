@@ -41,7 +41,9 @@ use super::folder::{self, PARTIAL_DIR, PARTIAL_SUFFIX};
 use super::mp4::{self, ColorInfo, FragmentedWriter, VideoTrack};
 use super::pacer::{Cadence, TickFifo};
 use super::pointer::PointerLayer;
-use super::sidecar::{AudioInfo, Event, Initiator, Pointer, SIDECAR_VERSION, Sidecar, StopReason};
+use super::sidecar::{
+    AudioInfo, Event, Initiator, Pointer, SIDECAR_VERSION, Sidecar, SourceSize, StopReason,
+};
 
 /// Everything a recording needs to know before its first frame.
 #[derive(Debug, Clone)]
@@ -107,6 +109,11 @@ pub enum RecorderEvent {
         /// FR-85 P1c — which audio is going in.
         system_audio: bool,
         microphone: bool,
+        /// #2877 — the screen's own size, when the software rung recorded
+        /// it scaled down to fit (`width`×`height` is then the recorded
+        /// size).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scaled_from: Option<SourceSize>,
     },
     Progress {
         duration_ms: u64,
@@ -382,6 +389,13 @@ pub async fn run_with_audio(
             "every encoder backend failed to open",
         ));
     }
+    // #2877 — the size actually recorded. The software rung codes a screen
+    // larger than openh264 takes at a size it does (`super::fit`), and the
+    // track, the `started` event and the sidecar must say that size, not
+    // the screen's. The display-change watch below keeps the screen's own.
+    let (rec_width, rec_height) = encoder.coded_dims().unwrap_or((width, height));
+    let scaled_from =
+        ((rec_width, rec_height) != (width, height)).then_some(SourceSize { width, height });
 
     let partial = staging.join(format!("{}{PARTIAL_SUFFIX}", opts.file_name));
     let dest = opts.dest_dir.join(&opts.file_name);
@@ -404,8 +418,8 @@ pub async fn run_with_audio(
     };
     let cadence = Cadence::new(opts.fps);
     let video = VideoTrack {
-        width,
-        height,
+        width: rec_width,
+        height: rec_height,
         fps: cadence.fps(),
         color: ColorInfo::BT601_LIMITED,
     };
@@ -454,16 +468,17 @@ pub async fn run_with_audio(
     let _ = events.send(RecorderEvent::Started {
         partial: partial.clone(),
         path: dest.clone(),
-        width,
-        height,
+        width: rec_width,
+        height: rec_height,
         fps: cadence.fps(),
         encoder: encoder_name.clone(),
         system_audio: audio_system,
         microphone: audio_microphone,
+        scaled_from,
     });
     tracing::info!(
-        width, height, fps = cadence.fps(), encoder = %encoder_name,
-        partial = %partial.display(), "recording: started"
+        width = rec_width, height = rec_height, fps = cadence.fps(), encoder = %encoder_name,
+        scaled_from = ?scaled_from, partial = %partial.display(), "recording: started"
     );
 
     // ── the pointer (FR-85 P1d) ─────────────────────────────────────────────
@@ -789,8 +804,8 @@ pub async fn run_with_audio(
         started_at: started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ended_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         duration_ms,
-        width,
-        height,
+        width: rec_width,
+        height: rec_height,
         fps: cadence.fps(),
         codec: "h264".into(),
         encoder: encoder_name.clone(),
@@ -806,6 +821,7 @@ pub async fn run_with_audio(
         stop_reason: Some(reason),
         bytes,
         pointer: Some(pointer),
+        scaled_from,
     });
     if let (Some(p), Some(s)) = (&path, &sidecar)
         && let Err(e) = std::fs::write(Sidecar::path_for(p), s.to_json())
@@ -1007,6 +1023,7 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
                     bytes: s.bytes,
                     // Unknown: the recorder that knew is gone.
                     pointer: None,
+                    scaled_from: None,
                 };
                 // A sidecar the dead recorder never wrote: keep an existing
                 // one's facts if there is one, only mark it interrupted.

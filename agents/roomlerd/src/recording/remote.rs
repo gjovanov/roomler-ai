@@ -2238,6 +2238,7 @@ mod tests {
                 stop_reason: None,
                 bytes: 17,
                 pointer: None,
+                scaled_from: None,
             };
             std::fs::write(Sidecar::path_for(&path), sc.to_json()).unwrap();
         }

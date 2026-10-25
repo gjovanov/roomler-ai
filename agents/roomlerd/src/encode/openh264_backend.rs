@@ -589,9 +589,74 @@ fn bgra_to_yuv_buffer(bgra: &[u8], width: usize, height: usize, stride: usize) -
     YUVBuffer::from_vec(packed, w, h)
 }
 
+/// The largest picture openh264 encodes: the longer side at most 3840 and
+/// the shorter at most 2160, in either orientation (the `openh264` crate's
+/// `reinit`, citing the encoder's level-5.2 ceiling). It refuses anything
+/// larger, on EVERY frame, with "Encoder max resolution 3840x2160
+/// horizontal or 2160x3840 vertical"; opening the encoder does not check.
+pub const MAX_LONG_SIDE: u32 = 3840;
+/// See [`MAX_LONG_SIDE`].
+pub const MAX_SHORT_SIDE: u32 = 2160;
+
+/// #2877 — the size to encode a `width`×`height` picture at in software. It is
+/// unchanged when it fits [`MAX_LONG_SIDE`]×[`MAX_SHORT_SIDE`]; otherwise it is
+/// scaled down, keeping its shape, to the largest even size that fits. Never
+/// larger than the input. A DCI-4K screen (4096×2160) records at 3840×2024,
+/// a 16:10 4K one (3840×2400) at 3456×2160, a 5K one at 3840×2160.
+pub fn fit_for_software(width: u32, height: u32) -> (u32, u32) {
+    let (long, short) = (width.max(height), width.min(height));
+    if long <= MAX_LONG_SIDE && short <= MAX_SHORT_SIDE {
+        return (width, height);
+    }
+    // The tighter of the two ratios, compared without floats:
+    // MAX_LONG/long <= MAX_SHORT/short  <=>  MAX_LONG·short <= MAX_SHORT·long.
+    let (num, den) = if u64::from(MAX_LONG_SIDE) * u64::from(short)
+        <= u64::from(MAX_SHORT_SIDE) * u64::from(long)
+    {
+        (u64::from(MAX_LONG_SIDE), u64::from(long))
+    } else {
+        (u64::from(MAX_SHORT_SIDE), u64::from(short))
+    };
+    // Rounding down keeps both sides inside the limits; `& !1` keeps 4:2:0.
+    let scale = |v: u32| (((u64::from(v) * num) / den) as u32 & !1).max(16);
+    (scale(width), scale(height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2877 — the lab's arm64 host scans out 4096×2160, and every software
+    /// recording there ended `encoder_failed` with 0 frames.
+    #[test]
+    fn a_picture_openh264_refuses_is_fitted_keeping_its_shape() {
+        assert_eq!(fit_for_software(1920, 1080), (1920, 1080));
+        assert_eq!(fit_for_software(3840, 2160), (3840, 2160));
+        assert_eq!(fit_for_software(2160, 3840), (2160, 3840));
+        assert_eq!(fit_for_software(4096, 2160), (3840, 2024));
+        // 16:10 4K: the SHORT side binds.
+        assert_eq!(fit_for_software(3840, 2400), (3456, 2160));
+        assert_eq!(fit_for_software(5120, 2880), (3840, 2160));
+        assert_eq!(fit_for_software(5120, 1440), (3840, 1080));
+        assert_eq!(fit_for_software(2160, 4096), (2024, 3840));
+        for (w, h) in [
+            (4096, 2160),
+            (3840, 2400),
+            (5120, 2880),
+            (6016, 3384),
+            (7680, 2160),
+            (2160, 4096),
+            (4096, 256),
+        ] {
+            let (fw, fh) = fit_for_software(w, h);
+            assert!(
+                fw.max(fh) <= MAX_LONG_SIDE && fw.min(fh) <= MAX_SHORT_SIDE,
+                "{w}x{h} -> {fw}x{fh} still too large"
+            );
+            assert!(fw % 2 == 0 && fh % 2 == 0, "{w}x{h} -> {fw}x{fh} odd");
+            assert!(fw <= w && fh <= h, "{w}x{h} -> {fw}x{fh} grew");
+        }
+    }
 
     fn make_bgra_frame(width: u32, height: u32, r: u8, g: u8, b: u8) -> Frame {
         let stride = width * 4;
