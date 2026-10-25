@@ -86,6 +86,57 @@
         :mobile="xs"
         @update:options="onGridOptions"
       >
+        <!-- FR-120 P4 — on a phone a member is one line, their name and roles,
+             and a tap opens the email, the join date and the actions. Every
+             column stacked made a member about 250 px. -->
+        <template v-if="xs" #item="{ item }">
+          <tr class="v-data-table__tr" :class="{ 'stack-open': isOpen(item.id) }">
+            <td class="v-data-table__td stack-row">
+              <button
+                type="button"
+                class="stack-toggle"
+                :aria-expanded="isOpen(item.id)"
+                data-testid="member-row-toggle"
+                @click="toggle(item.id)"
+              >
+                <span class="stack-toggle__text">
+                  <span class="font-weight-medium">{{ item.display_name || '(unknown)' }}</span>
+                  <span class="text-caption text-medium-emphasis">
+                    · {{ rolesOf(item).map((r) => r.name).join(', ') || 'no role' }}
+                  </span>
+                </span>
+                <v-icon size="small" class="flex-shrink-0" aria-hidden="true">
+                  {{ isOpen(item.id) ? 'mdi-chevron-up' : 'mdi-chevron-down' }}
+                </v-icon>
+              </button>
+              <div v-if="isOpen(item.id)" class="pb-2" data-testid="member-row-details">
+                <div v-if="item.nickname" class="text-caption text-medium-emphasis">{{ item.nickname }}</div>
+                <div class="text-body-2 member-email">{{ item.email || '—' }}</div>
+                <div class="text-caption text-medium-emphasis">Joined {{ joinedLabel(item.joined_at) }}</div>
+                <div class="d-flex flex-wrap align-center ga-1 mt-1">
+                  <v-btn size="small" variant="tonal" prepend-icon="mdi-shield-account" @click="openRolesDialog(item)">
+                    Roles
+                  </v-btn>
+                  <v-btn
+                    v-if="item.user_id !== ownerId"
+                    size="small"
+                    variant="text"
+                    color="error"
+                    :prepend-icon="item.user_id === myUserId ? 'mdi-exit-run' : 'mdi-account-remove'"
+                    @click="askRemove(item)"
+                  >
+                    {{ item.user_id === myUserId ? 'Leave' : 'Remove' }}
+                  </v-btn>
+                  <!-- The tooltip a desktop shows on the crown, as text. -->
+                  <span v-else class="text-caption text-medium-emphasis">
+                    <v-icon size="small" aria-hidden="true">mdi-crown</v-icon>
+                    The organization owner cannot be removed
+                  </span>
+                </div>
+              </div>
+            </td>
+          </tr>
+        </template>
         <template #item.name="{ item }">
           <div class="font-weight-medium">{{ item.display_name || '(unknown)' }}</div>
           <div v-if="item.nickname" class="text-caption text-medium-emphasis">
@@ -269,6 +320,7 @@ import { useValidation } from '@/composables/useValidation'
 import { canManageInvites } from '@/utils/permissions'
 import { useGridColumns } from '@/composables/useGridColumns'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { useOpenRows } from '@/composables/useOpenRows'
 import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 
@@ -283,6 +335,8 @@ const { rules } = useValidation()
 // rows, from the same headers): the Roles column and the Roles / Remove
 // actions were behind a sideways scroll inside the table.
 const { xs } = useDisplay()
+// FR-120 P4 — on a phone a member is one line until tapped.
+const { isOpen, toggle } = useOpenRows<string>()
 // FR-120 P3 — a member's roles dialog covers the screen below 600 px.
 const { fullscreen } = useResponsiveDialog()
 
@@ -500,6 +554,9 @@ async function toggleRole(role: Role, on: boolean) {
    a file name): it wraps rather than widening the row past the screen. */
 .members-table--stacked :deep(.v-data-table__td-value) {
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+.member-email {
   overflow-wrap: anywhere;
 }
 </style>
