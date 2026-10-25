@@ -3751,9 +3751,13 @@ async fn run_cmd(
     // task moves cfg out of scope. (Moving cfg lets signaling::run own
     // it for the lifetime of the loop without us having to clone the
     // tokens + URLs that the signaling code rewrites in place.)
-    let auto_update_enabled = node_env("AUTO_UPDATE")
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true);
+    // #2901 — the opt-out marker counts here too: a system install's root
+    // daemon installs its own updates, and it read only `auto_update`.
+    let auto_update = updater::auto_update_decision(
+        node_env("AUTO_UPDATE").as_deref(),
+        updater::opt_out_marker(),
+    );
+    let auto_update_enabled = auto_update == updater::AutoUpdate::On;
     let update_interval = updater::resolve_check_interval(&cfg);
     // S1a — forced-update trigger channel (rc:agent.update → run_periodic),
     // installed only when the updater runs: with it off a push reports
@@ -4868,7 +4872,15 @@ async fn run_cmd(
             async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
         }))
     } else {
-        tracing::info!("auto-update disabled (auto_update = false / ROOMLERD_AUTO_UPDATE=0)");
+        match auto_update {
+            updater::AutoUpdate::OptedOut(marker) => tracing::info!(
+                %marker,
+                "auto-update opted out — the operator's marker is present, updates are manual"
+            ),
+            _ => tracing::info!(
+                "auto-update disabled (auto_update = false / ROOMLERD_AUTO_UPDATE=0)"
+            ),
+        }
         None
     };
 
