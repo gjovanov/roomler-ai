@@ -779,14 +779,16 @@ Key design choices:
   entirely (the touch-layout editor) uses the other mechanism,
   `keyboardPaused` (FR-111 P4b-2).
 - **One owner per key** (#2888). A key aimed at the soft keyboard's textarea
-  has the window listener as its ONE owner: forwarded with the browser's
-  default prevented, whatever the key, and propagation stopped — so the
-  textarea never also receives it and `MobileKeyboard.vue` never also presses
-  it. What the listener drops (an IME keydown, a `code` it cannot map — the OS
-  soft keyboard's own keys) is the component's. Before this, a tablet or a
-  phone with a hardware keyboard beside the open soft keyboard typed every
-  character, Enter, Tab, Escape and arrow twice. §6.3 has the matrix and the
-  real-browser harness that measured it.
+  has ONE owner. A HID frame — a named key, a chord, a modifier — is the window
+  listener's: forwarded with the browser's default prevented and propagation
+  stopped, so the textarea never also receives it and `MobileKeyboard.vue`
+  never also presses it. A printable character is the textarea's: left
+  untouched, typed through its `input` handler, where the toolbar's sticky
+  Ctrl / Alt / Win become a chord. What the listener drops (an IME keydown, a
+  `code` it cannot map — the OS soft keyboard's own keys) is the component's
+  too. Before this, a tablet or a phone with a hardware keyboard beside the
+  open soft keyboard typed every character, Enter, Tab, Escape and arrow
+  twice. §6.3 has the matrix and the real-browser harness that measured it.
 - **`enigo` is the default**, with OS-specific direct backends behind a feature flag for performance and edge cases (UIPI on Windows, IME composition on macOS, `uinput` on Wayland because XTest doesn't exist there).
 
 ### 6.1 The Wayland problem
@@ -874,11 +876,11 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12021`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12013`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
-(`MobileKeyboard.vue:214`), a composition as `compositionend` (`:277`), and a
+(`MobileKeyboard.vue:217`), a composition as `compositionend` (`:280`), and a
 special key the OS keyboard sends as a `keydown` through `onKeyDown` (`:302`).
 Both are needed: the keydown is the only way a Backspace on the always-empty
 textarea or a hardware chord reaches the host (#2878), and the `input` event
@@ -899,73 +901,95 @@ so the host pasted its own clipboard and then typed the browser's.
 
 Measured in a real Chromium by the harness below, on the code before and after
 the fix (soft keyboard open, hardware keyboard; `L` the listener, `S` the
-component, `P` the deferred paste's flush):
+component, `P` the deferred paste's flush). The "before" column's
+pointer-inside chord cells and its Ctrl+Alt+End cells are derived from the
+old code rather than measured: `isCtrlCOverViewer` / `isCtrlVOverViewer`
+returned false for a textarea target in every state, so no mirror and no
+deferral ever applied there. Everything else in that column is the harness's
+pre-fix run.
 
 | key | pointer outside, before | pointer inside, before | after, every state |
 |---|---|---|---|
-| `a`, `Shift+A`, Space | `L text` + `S text` — **twice** | `L text` + `S text` — **twice** | `L text` — once |
+| `a`, `Shift+A`, Space | `L text` + `S text` — **twice** | `L text` + `S text` — **twice** | `S text` — once (the textarea's) |
 | Enter | `L ↓` `S ↓` `S ↑` `L ↑` — **twice** | `L ↓↑` + `S ↓↑` (via `input`) — **twice** | `L ↓↑` — once |
 | Tab, Escape, arrows | `L ↓` `S ↓` `S ↑` `L ↑` — **twice** | `L ↓↑` — once | `L ↓↑` — once |
 | Backspace, Delete, Home, F2 | `L ↓↑` — once | `L ↓↑` — once | `L ↓↑` — once |
-| Ctrl+C | `L` chord — once, no mirror | `L` chord + mirror — once | `L` chord + mirror — once |
-| Ctrl+V | `L` HID Ctrl+V + `S text:"<browser clipboard>"` — **host pasted, then typed** | deferred, paste typed too | `P` paste → `P` Ctrl+V — once, clipboard mirrored |
-| Ctrl+Alt+End | End forwarded, no SAS | SAS | SAS once, no End |
+| Ctrl+C | `L` chord — once, no mirror | `L` chord — once, no mirror (derived) | `L` chord + mirror — once |
+| Ctrl+V | `L` HID Ctrl+V + `S text:"<browser clipboard>"` — **host pasted, then typed** | `L` HID Ctrl+V — once, the paste suppressed by `shouldPreventDefault`, no mirror (derived) | `P` paste → `P` Ctrl+V — once, clipboard mirrored |
+| Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
+| sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14164`, pure)
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14168`, pure)
 and carried out by `applyKeyRoute` (`:14236`): a key whose target is the soft
 keyboard's textarea (`isSoftKeyboardTarget`, `:14009` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
-key over the stage or under keyboard lock, and the listener is its one owner.
+key over the stage or under keyboard lock, and has one owner — which one
+depends on the key.
 
 | the listener… | the textarea's own path carries |
 |---|---|
-| **forwards** (text or HID): default prevented, propagation stopped | nothing — no `input` event, and `onKeyDown` never runs |
+| **forwards a HID frame** (a named key, a chord, a modifier): default prevented, propagation stopped | nothing — no `input` event, and `onKeyDown` never runs |
+| **leaves a printable character** (no chord) untouched — `untouched / soft-keyboard` | the character, through `input` — with the toolbar's sticky Ctrl / Alt / Win applied (`consumeModBits`) |
 | **drops** (IME, `keyCode` 229, a `code` it cannot map): untouched | the typed text, the composition, the code-less Enter / Tab |
-| **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `onPaste` (`:11768`) consumes the paste event |
+| **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `routeDeferredPaste` consumes the paste event for `onPaste` (`:11768`) |
 
 ```mermaid
 flowchart TD
     K["keydown, target = soft keyboard's textarea"] --> R["routeKeyEvent<br/>(window, capture phase)"]
     R -->|"paused · viewer-own"| U["untouched"]
     R -->|"IME · keyCode 229 · unmapped code"| D["untouched → the textarea's own path<br/>input · compositionend · onKeyDown"]
-    R -->|"printable · named key · chord"| F["forward frame<br/>preventDefault + stopPropagation"]
+    R -->|"printable, no chord"| T["untouched → the browser inserts it →<br/>input → keyText, sticky modifiers applied"]
+    R -->|"named key · chord · modifier"| F["forward HID frame<br/>preventDefault + stopPropagation"]
     R -->|"Ctrl+V"| V["defer: no preventDefault<br/>stopPropagation"]
-    V --> P["paste event → onPaste<br/>preventDefault · mirror · flush Ctrl+V"]
+    V --> P["paste event → routeDeferredPaste<br/>preventDefault · mirror · flush Ctrl+V"]
     F --> H["host: once"]
     P --> H
     D --> H
+    T --> H
 ```
 
 ⚠️ **Not by exempting `[data-rc-capture]` from the listener.** That reads as
 the tidy fix and breaks phones: a Backspace on the always-empty textarea raises
 no `input` event, and a hardware chord never does — the keydown the listener
-forwards is the only way either reaches the host. ⚠️ **The drop happens before
-any `preventDefault`.** A dropped keydown must stay untouched, or the IME's
-composition and the OS keyboard's own Enter lose their default and never
-arrive at all. ⚠️ **`onPaste` consumes the paste whenever a deferral is
-pending.** With nothing editable focused the default did nothing anyway; with
-the textarea focused it inserted the clipboard, and the `input` handler typed
-it. `onKeyDown` (`MobileKeyboard.vue:302`) also ignores a `defaultPrevented`
-keydown — the second lock, should the listener ever forward without stopping.
+forwards is the only way either reaches the host. ⚠️ **The printable character
+is the textarea's on purpose.** `MobileKeyboard.vue`'s `input` handler is the
+only code that turns an armed toolbar modifier into a chord (`consumeModBits`)
+— the one chord mechanism a phone has — and iOS's software keyboard fires real
+keydowns (`key` "a", no `code`) for every letter, which `decideKeyAction`
+classifies as text by `key`. A listener that forwarded printable keydowns
+would own the phone's own typing and leave the armed modifier for the next
+toolbar key (the first version of this fix did exactly that; review caught
+it). ⚠️ **The drop happens before any `preventDefault`.** A dropped keydown
+must stay untouched, or the IME's composition and the OS keyboard's own Enter
+lose their default and never arrive at all. ⚠️ **The deferral consumes its
+paste.** `routeDeferredPaste` calls `preventDefault` whenever a deferral is
+pending — in the one function `onPaste`, the harness and the spec all run, so
+it is not a copy that can drift. With nothing editable focused the default did
+nothing anyway; with the textarea focused it inserted the clipboard, and the
+`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:305`) also ignores
+a `defaultPrevented` keydown — the second lock, should the listener ever
+forward without stopping.
 
 The soft keyboard's **own** paths are unchanged and locked beside the fix: text
 through `input`, a composition through `compositionend`, a code-less Enter
 through `onKeyDown`, the toolbar's keys through `sendKey`. The desktop policy
 (rc.18) is unchanged too: with the pointer off the stage and nothing editable
-focused, a key is forwarded with the browser's default kept (Tab and Backspace
-excepted) and its propagation kept.
+focused, a key — a printable character included — is forwarded with the
+browser's default kept (Tab and Backspace excepted) and its propagation kept.
 
 **Proof** — the harness in `ui/e2e-harness/` ([testing.md](testing.md)): the
-real `MobileKeyboard.vue` and the real `routeKeyEvent` / `applyKeyRoute` on one
-page the Vite dev server serves, driven by Playwright in a real Chromium —
-hardware keys in three viewer states, `insertText` (the OS keyboard's path), a
-CDP IME composition, a real paste, the SAS chord, Ctrl→Cmd, the toolbar, the
-closed states and the path field — recording each frame with WHO sent it. The
-vitest matrix (`useRemoteControl.spec.ts`, `MobileKeyboard.spec.ts`) locks the
-verdicts and the one-owner invariant over every key and state. Still owed on
-real devices: a tablet with a hardware keyboard, a phone with a Bluetooth
-keyboard (Android and iOS: Backspace and Enter from the OS keyboard once), and
-a desktop with the soft keyboard toggled on.
+real `MobileKeyboard.vue` and the real `routeKeyEvent` / `applyKeyRoute` /
+`routeDeferredPaste` on one page the Vite dev server serves, driven by
+Playwright in a real Chromium — hardware keys in three viewer states,
+`insertText` (the OS keyboard's path), an iOS-style letter (a code-less
+keydown, then the insertion), the toolbar's sticky Ctrl followed by a hardware
+`c`, a CDP IME composition, a real paste, the SAS chord, Ctrl→Cmd, the toolbar,
+the closed states and the path field — recording each frame with WHO sent it.
+The vitest matrix (`useRemoteControl.spec.ts`, `MobileKeyboard.spec.ts`) locks
+the verdicts, the one-owner invariant over every key and state, and the paste
+seam. Still owed on real devices: a tablet with a hardware keyboard, a phone
+with a Bluetooth keyboard (Android and iOS: Backspace and Enter from the OS
+keyboard once), and a desktop with the soft keyboard toggled on.
 
 ## 7. Signaling protocol (`rc:*` namespace)
 

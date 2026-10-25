@@ -18,15 +18,18 @@
       drawer's path field typed into the host) but keeps forwarding
       keydowns aimed here — a Backspace on this always-empty textarea
       raises no `input` event, so the keydown is the only way it
-      reaches the host. And it is their ONE owner (#2888): every key it
-      can map it forwards with the browser's default prevented, so the
-      character never lands in this textarea, and with propagation
-      stopped, so `onKeyDown` below never sees it; what it drops — an
-      IME keydown, the OS keyboard's own code-less keys — is this
-      component's, through `onInput` / `onCompositionEnd` / `onKeyDown`.
-      `isViewerOwnInput` and `isSoftKeyboardTarget` in
-      `useRemoteControl.ts` read the attribute; their specs lock the
-      pairing, and `ui/e2e-harness/` proves it in a real browser.
+      reaches the host. And one owner per key (#2888): every HID key it
+      can map — a named key, a chord, a modifier — it forwards with the
+      browser's default prevented and propagation stopped, so neither
+      this textarea nor `onKeyDown` below sees it; a printable character
+      with no chord it leaves to THIS textarea, whose `onInput` types it
+      and applies the toolbar's sticky Ctrl / Alt / Win (the only chord
+      mechanism a phone has); what it drops — an IME keydown, the OS
+      keyboard's own code-less keys — is this component's too, through
+      `onInput` / `onCompositionEnd` / `onKeyDown`. `isViewerOwnInput`
+      and `isSoftKeyboardTarget` in `useRemoteControl.ts` read the
+      attribute; their specs lock the pairing, and `ui/e2e-harness/`
+      proves it in a real browser.
     -->
     <textarea
       ref="captureRef"

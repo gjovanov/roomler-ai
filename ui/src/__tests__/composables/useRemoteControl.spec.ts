@@ -100,6 +100,9 @@ import {
   routeKeyEvent,
   applyKeyRoute,
   RC_CAPTURE_SELECTOR,
+  routeDeferredPaste,
+  deferredPasteFrames,
+  DEFERRED_PASTE_FALLBACK_MS,
   type KeyRoute,
   type KeyRouteState,
   type KeyRouteEffects,
@@ -3083,18 +3086,24 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
       expect(isSoftKeyboardTarget(window)).toBe(false)
     })
 
-    it('a printable character is forwarded as text, default prevented, propagation stopped — the textarea never types it too', () => {
+    it("a printable character is the TEXTAREA's: left untouched, so its `input` handler types it and applies the sticky modifiers", () => {
       const { soft } = page()
       for (const init of [K.a, K.A, K.space]) {
-        const r = route(soft, init)
-        expect(r).toEqual({
-          kind: 'text',
-          text: init.key,
-          preventDefault: true,
-          stopPropagation: true,
-          mirrorClipboard: false,
-        })
+        for (const state of [{}, { pointerInside: true }, { keyboardLocked: true }]) {
+          expect(route(soft, init, true, state), `${init.key} ${JSON.stringify(state)}`).toEqual({
+            kind: 'untouched',
+            why: 'soft-keyboard',
+          })
+        }
       }
+      // iOS's software keyboard: a real keydown for a letter, with no physical
+      // code. Forwarded as text (by `key`), the listener would own the phone's
+      // own typing and leave an armed toolbar modifier for the next key.
+      expect(route(soft, { key: 'a', code: '' })).toEqual({ kind: 'untouched', why: 'soft-keyboard' })
+      // AltGr letters are printable too — AltGr is not a chord.
+      expect(
+        route(soft, { key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }, true, {}, (k) => k === 'AltGraph'),
+      ).toEqual({ kind: 'untouched', why: 'soft-keyboard' })
     })
 
     it('Enter, Tab, Escape, the arrows, Backspace, Delete, Home, F2, a modifier: one HID frame, default prevented, propagation stopped', () => {
@@ -3174,7 +3183,7 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
       expect(route(soft, K.a, false)).toEqual(untouched)
     })
 
-    it('the invariant behind one owner: forwarded ⇒ default prevented AND propagation stopped; deferred ⇒ propagation stopped; dropped ⇒ untouched', () => {
+    it("the invariant behind one owner: a HID frame ⇒ default prevented AND propagation stopped; a printable character ⇒ untouched (the textarea's); deferred ⇒ propagation stopped; dropped ⇒ untouched", () => {
       const { soft } = page()
       const every: KeyboardEventInit[] = [
         ...Object.values(K),
@@ -3187,7 +3196,8 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
           for (const state of [{}, { pointerInside: true }, { keyboardLocked: true }]) {
             const r = route(soft, init, down, state)
             const label = `${init.code || init.key} ${down ? 'down' : 'up'} ${JSON.stringify(state)}`
-            if (r.kind === 'text' || r.kind === 'key') {
+            expect(r.kind, `${label}: a printable character is never the listener's on this target`).not.toBe('text')
+            if (r.kind === 'key') {
               expect(r.preventDefault && r.stopPropagation, label).toBe(true)
             } else if (r.kind === 'ctrl-v') {
               expect(r.stopPropagation, label).toBe(true)
@@ -3216,6 +3226,9 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
       expect(route(body, K.ctrlC)).toMatchObject({ kind: 'key', code: 0x06, mods: 1, preventDefault: false, mirrorClipboard: false })
       expect(route(body, K.ctrlV)).toMatchObject({ kind: 'key', code: 0x19, mods: 1, preventDefault: false })
       expect(route(body, K.ctrlAltEnd)).toMatchObject({ kind: 'key', code: 0x4d })
+      // A code-less letter with nothing editable focused is the listener's —
+      // nothing else could type it there.
+      expect(route(body, { key: 'a', code: '' })).toMatchObject({ kind: 'text', text: 'a' })
     })
 
     it('pointer INSIDE the stage: the browser-eaten chords are prevented, propagation stopped, Ctrl+V deferred, Ctrl+C mirrored, the SAS armed', () => {
@@ -3351,6 +3364,78 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
       const r = recorder()
       applyKeyRoute({ kind: 'key', code: 0x06, down: true, mods: 1, preventDefault: true, stopPropagation: true, mirrorClipboard: true }, r.ev, r.fx)
       expect(r.calls).toEqual(['hostKeyCode(6,true)', 'held(6,true)', 'mirror'])
+    })
+  })
+
+  describe('routeDeferredPaste / deferredPasteFrames — the deferral consumes its paste', () => {
+    /** A paste event as the browser dispatches it: `clipboardData` (or none),
+     *  and a `preventDefault` that records every call. */
+    function pasteEvent(data: { text?: string; html?: string; files?: File[] } | null) {
+      const calls: string[] = []
+      const dt =
+        data === null
+          ? null
+          : {
+              files: data.files ?? [],
+              getData: (type: string) => (type === 'text/html' ? (data.html ?? '') : (data.text ?? '')),
+            }
+      const ev = {
+        clipboardData: dt as unknown as DataTransfer | null,
+        preventDefault: () => {
+          calls.push('preventDefault')
+        },
+      }
+      return { ev, calls }
+    }
+
+    it("no deferral pending: not ours — untouched, so an editable field keeps its own paste", () => {
+      const { ev, calls } = pasteEvent({ text: 'x' })
+      expect(routeDeferredPaste(ev, false, true)).toEqual({ kind: 'ignore' })
+      expect(calls).toEqual([])
+    })
+
+    it('a deferral pending: the event is CONSUMED, whatever the clipboard holds — the textarea must not also receive it', () => {
+      // The one `preventDefault` of the paste half of #2888. Remove it and the
+      // browser pastes into the soft keyboard's textarea, whose `input` handler
+      // types the clipboard on the host on top of the flushed Ctrl+V.
+      for (const data of [null, { text: 'x' }, { html: '<b>x</b>', text: 'x' }, { files: [new File(['a'], 'a.txt')] }]) {
+        const { ev, calls } = pasteEvent(data)
+        routeDeferredPaste(ev, true, true)
+        expect(calls, JSON.stringify(data)).toEqual(['preventDefault'])
+      }
+    })
+
+    it('no clipboardData at all: flush the plain Ctrl+V', () => {
+      const { ev } = pasteEvent(null)
+      expect(routeDeferredPaste(ev, true, true)).toEqual({ kind: 'flush' })
+    })
+
+    it('files, with an upload sink: the files — the remote app gets no keystroke', () => {
+      const files = [new File(['a'], 'a.txt'), new File(['b'], 'b.txt')]
+      const { ev } = pasteEvent({ files, text: 'ignored' })
+      expect(routeDeferredPaste(ev, true, true)).toEqual({ kind: 'files', files })
+    })
+
+    it('files, without an upload sink: the content path, as before', () => {
+      const { ev } = pasteEvent({ files: [new File(['a'], 'a.txt')], text: 'a.txt' })
+      expect(routeDeferredPaste(ev, true, false)).toEqual({ kind: 'content', text: 'a.txt', html: '' })
+    })
+
+    it('text and html: both, for the clipboard channels to mirror before the flush', () => {
+      const { ev } = pasteEvent({ text: 'hello', html: '<p>hello</p>' })
+      expect(routeDeferredPaste(ev, true, true)).toEqual({ kind: 'content', text: 'hello', html: '<p>hello</p>' })
+    })
+
+    it("deferredPasteFrames: one V press, down then up, with the chord's mods", () => {
+      expect(deferredPasteFrames(1)).toEqual([
+        { t: 'key', code: 0x19, down: true, mods: 1 },
+        { t: 'key', code: 0x19, down: false, mods: 1 },
+      ])
+      expect(deferredPasteFrames(9).map((f) => f.mods)).toEqual([9, 9])
+    })
+
+    it('the fallback flush waits 50 ms: below keystroke perception, above paste-event scheduling', () => {
+      expect(DEFERRED_PASTE_FALLBACK_MS).toBe(50)
     })
   })
 })

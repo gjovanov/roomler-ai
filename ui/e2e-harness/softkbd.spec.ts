@@ -5,23 +5,26 @@
 //
 // The page under test is `softkbd.html` (see `softkbd.ts`): the real
 // `MobileKeyboard.vue` plus a window-level capture listener running the real
-// `routeKeyEvent` / `applyKeyRoute`, both recording what the host would get
-// and WHO sent it. The states are the viewer's: the soft keyboard open (its
-// textarea focused) with the pointer outside the stage — what a tablet or a
-// phone with a hardware keyboard looks like, since a finger leaves the stage
-// when it lifts — or inside it, or under keyboard lock; the soft keyboard
-// closed with the stage or the body focused; one of the viewer's own inputs
-// focused. The keys are pressed as a hardware keyboard presses them
-// (`page.keyboard.press`), typed as the soft keyboard types them
-// (`insertText`, which raises `input` and no keydown), composed through the
-// IME (CDP `Input.imeSetComposition`), and pasted.
+// `routeKeyEvent` / `applyKeyRoute` / `routeDeferredPaste`, both recording
+// what the host would get and WHO sent it. The states are the viewer's: the
+// soft keyboard open (its textarea focused) with the pointer outside the
+// stage — what a tablet or a phone with a hardware keyboard looks like, since
+// a finger leaves the stage when it lifts — or inside it, or under keyboard
+// lock; the soft keyboard closed with the stage or the body focused; one of
+// the viewer's own inputs focused. The keys are pressed as a hardware
+// keyboard presses them (`page.keyboard.press`), typed as the soft keyboard
+// types them (`insertText`, which raises `input` and no keydown), composed
+// through the IME (CDP `Input.imeSetComposition`), and pasted.
 //
-// Before the fix, with the soft keyboard open and the pointer outside, a
-// printable character, Enter, Tab, Escape and the arrows had two owners (the
-// listener and the component), and Ctrl+V typed the browser's clipboard on
-// top of the host's paste. Every row below asserts one owner.
+// One owner per key, and WHICH owner is part of the contract: a HID frame (a
+// named key, a chord, a modifier) is the listener's; a printable character
+// aimed at the textarea is the textarea's, through its `input` handler — the
+// one place the toolbar's sticky Ctrl / Alt / Win become a chord. Before the
+// fix, with the soft keyboard open and the pointer outside, a printable
+// character, Enter, Tab, Escape and the arrows had two owners, and Ctrl+V
+// typed the browser's clipboard on top of the host's paste.
 import { test, expect, type Page } from '@playwright/test'
-import type { HarnessState, HostFrame } from './softkbd'
+import type { FrameVia, HarnessState, HostFrame } from './softkbd'
 
 const CAPTURE = 'textarea[data-rc-capture]'
 
@@ -40,7 +43,7 @@ async function openSoftKeyboard(page: Page, state: Partial<HarnessState> = {}) {
   await page.evaluate((s) => window.__harness.reset(s), state)
 }
 
-/** What reached the host — after the deferral's 50 ms timer and any `input`
+/** What reached the host — after the deferral's fallback timer and any `input`
  *  event had their chance. */
 async function frames(page: Page): Promise<HostFrame[]> {
   await page.waitForTimeout(150)
@@ -85,7 +88,7 @@ function describeFrames(sent: HostFrame[]): string {
     .map((f) => {
       switch (f.t) {
         case 'key':
-          return `[${tag(f.via)}]key:0x${f.code.toString(16)}${f.down ? '↓' : '↑'}`
+          return `[${tag(f.via)}]key:0x${f.code.toString(16)}${f.down ? '↓' : '↑'}${f.mods ? `(mods=${f.mods})` : ''}`
         case 'key_text':
           return `[${tag(f.via)}]text:${JSON.stringify(f.text)}`
         case 'paste':
@@ -99,18 +102,29 @@ function describeFrames(sent: HostFrame[]): string {
     .join(' ')
 }
 
-/** The expectation every hardware key shares: pressed once, by the listener
- *  alone, every HID down matched by one up, the textarea untouched. */
-async function expectOneOwner(page: Page, sent: HostFrame[], expected: string[], label: string) {
+/** The expectation every key shares: each press once, by exactly the owner the
+ *  contract names, every HID down matched by one up, the textarea left empty.
+ *  A character the textarea owns raises exactly one `input` event; nothing
+ *  else may raise any. */
+async function expectOneOwner(
+  page: Page,
+  sent: HostFrame[],
+  expected: Record<string, FrameVia>,
+  label: string,
+) {
   const got = presses(sent)
   const detail = `${label}: ${describeFrames(sent)}`
-  expect([...got.keys()].sort(), detail).toEqual([...expected].sort())
+  expect([...got.keys()].sort(), detail).toEqual(Object.keys(expected).sort())
   for (const [id, p] of got) {
     expect(p.count, `${id} reached the host ${p.count} times — ${detail}`).toBe(1)
-    expect([...p.via], `${id} was sent by ${[...p.via].join(' and ')} — ${detail}`).toEqual(['listener'])
+    expect([...p.via], `${id} was sent by ${[...p.via].join(' and ')} — ${detail}`).toEqual([expected[id]])
   }
   expect(hidBalance(sent), `held or doubly released — ${detail}`).toEqual({})
-  expect(await page.evaluate(() => window.__harness.inputEvents()), `the textarea took it too — ${detail}`).toBe(0)
+  const typedByTextarea = Object.values(expected).filter((v) => v === 'soft-keyboard').length
+  expect(
+    await page.evaluate(() => window.__harness.inputEvents()),
+    `input events on the textarea — ${detail}`,
+  ).toBe(typedByTextarea)
   expect(await page.evaluate(() => window.__harness.captureValue())).toBe('')
 }
 
@@ -119,21 +133,22 @@ function note(state: string, key: string, sent: HostFrame[]) {
   report.push(`| ${state} | \`${key}\` | ${describeFrames(sent) || '(nothing)'} |`)
 }
 
-/** A hardware key and the one press the host must see for it. */
-const KEYS: { press: string; expected: string[] }[] = [
-  { press: 'a', expected: ['text:a'] },
-  { press: 'Shift+A', expected: ['hid:0xe1', 'text:A'] },
-  { press: 'Space', expected: ['text: '] },
-  { press: 'Enter', expected: ['hid:0x28'] },
-  { press: 'Tab', expected: ['hid:0x2b'] },
-  { press: 'Escape', expected: ['hid:0x29'] },
-  { press: 'ArrowLeft', expected: ['hid:0x50'] },
-  { press: 'ArrowUp', expected: ['hid:0x52'] },
-  { press: 'Backspace', expected: ['hid:0x2a'] },
-  { press: 'Delete', expected: ['hid:0x4c'] },
-  { press: 'Home', expected: ['hid:0x4a'] },
-  { press: 'F2', expected: ['hid:0x3b'] },
-  { press: 'Control+c', expected: ['hid:0xe0', 'hid:0x6'] },
+/** A hardware key, and the one press — with its owner — the host must see
+ *  for it while the soft keyboard is open. */
+const KEYS: { press: string; expected: Record<string, FrameVia> }[] = [
+  { press: 'a', expected: { 'text:a': 'soft-keyboard' } },
+  { press: 'Shift+A', expected: { 'hid:0xe1': 'listener', 'text:A': 'soft-keyboard' } },
+  { press: 'Space', expected: { 'text: ': 'soft-keyboard' } },
+  { press: 'Enter', expected: { 'hid:0x28': 'listener' } },
+  { press: 'Tab', expected: { 'hid:0x2b': 'listener' } },
+  { press: 'Escape', expected: { 'hid:0x29': 'listener' } },
+  { press: 'ArrowLeft', expected: { 'hid:0x50': 'listener' } },
+  { press: 'ArrowUp', expected: { 'hid:0x52': 'listener' } },
+  { press: 'Backspace', expected: { 'hid:0x2a': 'listener' } },
+  { press: 'Delete', expected: { 'hid:0x4c': 'listener' } },
+  { press: 'Home', expected: { 'hid:0x4a': 'listener' } },
+  { press: 'F2', expected: { 'hid:0x3b': 'listener' } },
+  { press: 'Control+c', expected: { 'hid:0xe0': 'listener', 'hid:0x6': 'listener' } },
 ]
 
 const SOFT_STATES: { name: string; state: Partial<HarnessState> }[] = [
@@ -141,6 +156,15 @@ const SOFT_STATES: { name: string; state: Partial<HarnessState> }[] = [
   { name: 'pointer inside the stage', state: { pointerInside: true } },
   { name: 'keyboard lock', state: { keyboardLocked: true } },
 ]
+
+/** The listener's frames for a hardware key with the soft keyboard CLOSED:
+ *  nothing editable is focused, so a printable character is the listener's. */
+const CLOSED_EXPECTED: Record<string, FrameVia> = {
+  'text:a': 'listener',
+  'hid:0x28': 'listener',
+  'hid:0x2b': 'listener',
+  'hid:0x2a': 'listener',
+}
 
 test.beforeEach(async ({ page }) => {
   await open(page)
@@ -172,7 +196,7 @@ test.describe('soft keyboard open, hardware keyboard — the chords with a secon
     await page.keyboard.press('Control+c')
     const sent = await frames(page)
     expect(sent.filter((f) => f.t === 'clipboard-mirror')).toHaveLength(1)
-    await expectOneOwner(page, sent, ['hid:0xe0', 'hid:0x6'], 'Ctrl+C')
+    await expectOneOwner(page, sent, { 'hid:0xe0': 'listener', 'hid:0x6': 'listener' }, 'Ctrl+C')
   })
 
   test('Ctrl+V pastes on the host once and the textarea does not type the clipboard too', async ({ page }) => {
@@ -189,11 +213,14 @@ test.describe('soft keyboard open, hardware keyboard — the chords with a secon
     const got = presses(sent)
     expect([...got.keys()].sort(), describeFrames(sent)).toEqual(['hid:0x19', 'hid:0xe0'])
     // The V is the deferral's: flushed once, after the paste event (or its
-    // 50 ms fallback), never as a plain forwarded keystroke.
+    // fallback timer), never as a plain forwarded keystroke.
     expect(got.get('hid:0x19'), describeFrames(sent)).toEqual({ count: 1, via: new Set(['paste-flush']) })
     expect(got.get('hid:0xe0')).toEqual({ count: 1, via: new Set(['listener']) })
     expect(hidBalance(sent)).toEqual({})
     // Nothing typed through the textarea: no `key_text`, no `input` event.
+    // This is what `routeDeferredPaste`'s `preventDefault` buys — remove it
+    // and the browser pastes into the textarea, whose `input` handler types
+    // the clipboard on the host a second time.
     expect(sent.filter((f) => f.via === 'soft-keyboard'), describeFrames(sent)).toEqual([])
     expect(await page.evaluate(() => window.__harness.inputEvents())).toBe(0)
     if (written) {
@@ -218,7 +245,7 @@ test.describe('soft keyboard open, hardware keyboard — the chords with a secon
     await page.keyboard.press('Control+c')
     const sent = await frames(page)
     note('soft open, Mac host', 'Control+c', sent)
-    await expectOneOwner(page, sent, ['hid:0xe3', 'hid:0x6'], 'Ctrl→Cmd')
+    await expectOneOwner(page, sent, { 'hid:0xe3': 'listener', 'hid:0x6': 'listener' }, 'Ctrl→Cmd')
     expect(sent.filter((f) => f.t === 'key' && (f.code === 0xe0 || f.code === 0xe4))).toEqual([])
   })
 })
@@ -231,6 +258,50 @@ test.describe("the soft keyboard's own paths still reach the host once", () => {
     note('soft open, OS keyboard', 'insertText("hello")', sent)
     expect(sent, describeFrames(sent)).toEqual([{ via: 'soft-keyboard', t: 'key_text', text: 'hello' }])
     expect(await page.evaluate(() => window.__harness.captureValue())).toBe('')
+  })
+
+  test("an iOS-style letter — a real keydown with no physical code, then the insertion — is the textarea's, once", async ({ page }) => {
+    // WebKit's software keyboard fires `keydown` (key "a", keyCode 65, code "")
+    // for every letter and then inserts it. The listener must leave that
+    // keydown alone: before the fix it forwarded it as text (`decideKeyAction`
+    // reads `key`, not `code`) AND the insertion typed it — twice.
+    await openSoftKeyboard(page)
+    await page.evaluate(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-rc-capture]')!
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: '', keyCode: 65, bubbles: true, cancelable: true }))
+    })
+    await page.keyboard.insertText('a')
+    await page.evaluate(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-rc-capture]')!
+      ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', code: '', keyCode: 65, bubbles: true, cancelable: true }))
+    })
+    const sent = await frames(page)
+    note('soft open, iOS-style', 'keydown(a, code "") + insertText("a")', sent)
+    expect(sent, describeFrames(sent)).toEqual([{ via: 'soft-keyboard', t: 'key_text', text: 'a' }])
+  })
+
+  test("the toolbar's sticky Ctrl then a hardware c: the host gets Ctrl+C once, and the modifier is cleared", async ({ page }) => {
+    // The only chord mechanism a phone has: `consumeModBits` in the
+    // component's `input` handler. A listener that owned printable keys would
+    // type the "c" and leave Ctrl armed for the next toolbar key.
+    await openSoftKeyboard(page)
+    const ctrl = page.locator('.mkb-btn', { hasText: 'Ctrl' })
+    await ctrl.tap()
+    await expect(ctrl).toHaveClass(/mkb-btn-mod-active/)
+    await expect(page.locator(CAPTURE)).toBeFocused()
+    await page.keyboard.press('c')
+    const sent = await frames(page)
+    note('soft open, toolbar Ctrl armed', 'c', sent)
+    expect(sent, describeFrames(sent)).toEqual([
+      { via: 'soft-keyboard', t: 'key', code: 0x06, down: true, mods: 0x01 },
+      { via: 'soft-keyboard', t: 'key', code: 0x06, down: false, mods: 0x01 },
+    ])
+    await expect(ctrl).not.toHaveClass(/mkb-btn-mod-active/)
+    // Sticky-once: the next letter is plain text.
+    await page.evaluate(() => window.__harness.reset())
+    await page.keyboard.press('a')
+    const next = await frames(page)
+    expect(next, describeFrames(next)).toEqual([{ via: 'soft-keyboard', t: 'key_text', text: 'a' }])
   })
 
   test('an IME composition arrives as one key_text on compositionend', async ({ page }) => {
@@ -301,7 +372,7 @@ test.describe('the soft keyboard closed', () => {
       for (const k of ['a', 'Enter', 'Tab', 'Backspace']) await page.keyboard.press(k)
       const sent = await frames(page)
       note(`soft closed, ${focus} focused`, 'a Enter Tab Backspace', sent)
-      await expectOneOwner(page, sent, ['text:a', 'hid:0x28', 'hid:0x2b', 'hid:0x2a'], `closed, ${focus}`)
+      await expectOneOwner(page, sent, CLOSED_EXPECTED, `closed, ${focus}`)
     })
   }
 

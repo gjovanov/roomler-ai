@@ -11379,7 +11379,6 @@ export function useRemoteControl(
     // The keyup is also intercepted while a deferral is active so we
     // don't emit a stray V-up against an un-down'd V on the agent.
     let pendingCtrlV: { mods: number; timer: ReturnType<typeof setTimeout> | null } | null = null
-    const KEY_V_HID = 0x19
 
     // Every HID key / pointer button we press on the host is recorded here
     // and force-released when this window loses focus (alt-tab, minimize,
@@ -11660,8 +11659,7 @@ export function useRemoteControl(
       const mods = pendingCtrlV.mods
       if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
-      sendInput({ t: 'key', code: KEY_V_HID, down: true, mods })
-      sendInput({ t: 'key', code: KEY_V_HID, down: false, mods })
+      for (const frame of deferredPasteFrames(mods)) sendInput(frame)
     }
 
     /** Schedule a 25 ms-delayed read of the host's clipboard + mirror
@@ -11739,7 +11737,7 @@ export function useRemoteControl(
         if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
         const timer = setTimeout(() => {
           flushPendingCtrlV()
-        }, 50)
+        }, DEFERRED_PASTE_FALLBACK_MS)
         pendingCtrlV = { mods, timer }
       },
       // rc.18: after a Ctrl+C aimed at the host, mirror its clipboard back to
@@ -11766,42 +11764,36 @@ export function useRemoteControl(
     }
 
     function onPaste(ev: ClipboardEvent) {
-      // Only respond if we deferred a Ctrl+V keystroke. Native paste
-      // events that come from elsewhere (e.g. an editable field
-      // outside the deferral path) keep their default handling.
-      if (!pendingCtrlV) return
-      // #2888 — the deferral has this paste: consume it. With the soft
-      // keyboard's textarea focused (a hardware Ctrl+V on a tablet) the
-      // browser would otherwise also insert the clipboard text there, and
-      // `MobileKeyboard.vue`'s `input` handler would type it on the host on
-      // top of the Ctrl+V flushed below. With nothing editable focused the
-      // default does nothing anyway.
-      ev.preventDefault()
-      const dt = ev.clipboardData
-      if (!dt) {
+      // `routeDeferredPaste` (pure, at the end of this file) decides, and
+      // CONSUMES the event when the deferral has it (#2888): the harness and
+      // the spec run the same decision, so its `preventDefault` is not a copy
+      // that can drift from this one. A paste with no deferral pending is not
+      // ours: an editable field outside the deferral path keeps its default.
+      const route = routeDeferredPaste(
+        ev,
+        pendingCtrlV !== null,
+        options?.onFilesPasted !== undefined,
+      )
+      if (route.kind === 'ignore') return
+      if (route.kind === 'flush') {
         flushPendingCtrlV()
         return
       }
-
-      // Files take precedence Ã¢ÂÂ operator intent is "upload these".
-      if (dt.files && dt.files.length > 0 && options?.onFilesPasted) {
-        ev.preventDefault()
-        if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
+      if (route.kind === 'files') {
+        // Files take precedence — the operator meant "upload these"; the
+        // remote app gets no Ctrl+V keystroke.
+        if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
         pendingCtrlV = null
-        const files: File[] = []
-        for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
-        options.onFilesPasted(files)
+        options?.onFilesPasted?.(route.files)
         return
       }
-
-      // Text path: mirror to host clipboard so the remote app's
-      // paste sees the right content, then emit the Ctrl+V keystroke.
-      const text = dt.getData('text') ?? ''
-      // v2.1 Ã¢ÂÂ rich paste: the paste event exposes text/html
-      // SYNCHRONOUSLY (no clipboard.read() needed). When the agent
-      // takes html, ship both formats so the remote app pastes
-      // formatting (tables, bold, web images), ack-gated like text.
-      const html = dt.getData('text/html') ?? ''
+      // Text path: mirror to the host clipboard so the remote app's paste
+      // sees the right content, then emit the Ctrl+V keystroke. v2.1 — rich
+      // paste: the paste event exposes text/html SYNCHRONOUSLY (no
+      // clipboard.read() needed). When the agent takes html, ship both
+      // formats so the remote app pastes formatting (tables, bold, web
+      // images), ack-gated like text.
+      const { text, html } = route
       // v2.2 Ã¢ÂÂ full fidelity via the local bridge: read the machine's
       // RTF (embedded images the paste event can't carry) and ship it,
       // ack-gated. Only when both ends support native AND a local
@@ -13658,9 +13650,11 @@ export function isRemoteSasChord(
  *     are forwarded by this listener on purpose: a Backspace on an
  *     always-empty textarea raises no `input` event, and a hardware
  *     keyboard's chords (Ctrl+C) never do — the keydown is the only way
- *     either reaches the host. And for every keydown it forwards, the
- *     listener is the ONE owner (#2888, `routeKeyEvent`): default
- *     prevented, propagation stopped, so the textarea never also types it.
+ *     either reaches the host. And one owner per key (#2888,
+ *     `routeKeyEvent`): every HID frame the listener forwards has its
+ *     default prevented and its propagation stopped, so the textarea never
+ *     also types it; a printable character with no chord is the textarea's
+ *     alone, whose `input` handler applies the toolbar's sticky modifiers.
  *
  *  Pure and exported for vitest (the composable itself cannot be
  *  instantiated in a spec). */
@@ -14048,9 +14042,11 @@ export type KeyRoute =
   /** Left to whoever else wants it: nothing sent, no `preventDefault`, no
    *  `stopPropagation`. `paused`: a dialog has the typing (FR-111 P4b-2).
    *  `viewer-own`: one of the viewer's own inputs has it (#2869) — and what
-   *  the host still holds is let go. `drop`: nothing to send (an IME keydown,
-   *  a printable key's release, a `code` with no HID usage). */
-  | { kind: 'untouched'; why: 'paused' | 'viewer-own' | 'drop' }
+   *  the host still holds is let go. `soft-keyboard`: a printable character
+   *  aimed at the soft keyboard's textarea, which types it through its
+   *  `input` handler (#2888). `drop`: nothing to send (an IME keydown, a
+   *  printable key's release, a `code` with no HID usage). */
+  | { kind: 'untouched'; why: 'paused' | 'viewer-own' | 'soft-keyboard' | 'drop' }
   /** Ctrl+Alt+End (RDP convention) / a literal Ctrl+Alt+Del: both key
    *  directions are swallowed so no stray End or Delete reaches the host;
    *  `fire` is true once per held chord (the first, non-repeat keydown). */
@@ -14144,19 +14140,27 @@ function modifierBits(ev: Pick<KeyboardEvent, 'ctrlKey' | 'shiftKey' | 'altKey' 
  *     driving (rc.18: a focused page button must not ALSO see the key).
  *
  * "Driving" is the pointer over the stage, a locked fullscreen, or — #2888 —
- * the soft keyboard's textarea as the target: the one place where a key the
- * listener forwards must ALSO have its default prevented, whatever the key,
- * or the textarea receives it as well and `MobileKeyboard.vue` types it a
- * second time. One owner per key:
+ * the soft keyboard's textarea as the target. There every key has ONE owner:
  *
- *  | the listener…                         | the textarea's own path carries |
- *  |---------------------------------------|---------------------------------|
- *  | forwards (text or HID): default       | nothing — no `input` event, and |
- *  | prevented, propagation stopped        | `onKeyDown` never runs          |
- *  | drops (IME, `keyCode` 229, a `code`   | the typed text, the composition,|
- *  | it cannot map): untouched             | the code-less Enter / Tab       |
- *  | defers Ctrl+V: default NOT prevented  | nothing — `onPaste` consumes    |
- *  | (the paste event must fire)           | the paste event                 |
+ *  | the listener…                           | the textarea's own path carries  |
+ *  |-----------------------------------------|----------------------------------|
+ *  | forwards a HID frame (a named key, a    | nothing — no `input` event, and  |
+ *  | chord, a modifier): default prevented,  | `onKeyDown` never runs           |
+ *  | propagation stopped                     |                                  |
+ *  | leaves a printable character (no chord) | the character, through `input` — |
+ *  | UNTOUCHED (`soft-keyboard`)             | with the toolbar's sticky        |
+ *  |                                         | Ctrl / Alt / Win applied         |
+ *  | drops (IME, `keyCode` 229, a `code` it  | the typed text, the composition, |
+ *  | cannot map): untouched                  | the code-less Enter / Tab        |
+ *  | defers Ctrl+V: default NOT prevented    | nothing — `onPaste` consumes the |
+ *  | (the paste event must fire)             | paste event                      |
+ *
+ * ⚠️ The printable character is the TEXTAREA's on purpose. `MobileKeyboard.vue`'s
+ * `input` handler is the only code that turns an armed toolbar modifier into a
+ * chord (`consumeModBits`) — the one chord mechanism a phone has — and iOS's
+ * software keyboard fires real keydowns (`key` "a", no `code`) for every
+ * letter, so a listener that forwarded printable keydowns as text would own
+ * the phone's own typing and leave the armed modifier for the next key.
  *
  * The `getModifierState` parameter is split out so a spec can drive
  * `AltGraph` without a real DOM event (`KeyboardEventInit` has no such field).
@@ -14170,10 +14174,11 @@ export function routeKeyEvent(
   if (state.keyboardPaused) return { kind: 'untouched', why: 'paused' }
   if (isViewerOwnInput(ev.target, state.surface)) return { kind: 'untouched', why: 'viewer-own' }
   // #2888 — a key aimed at the soft keyboard's textarea is the host's, with
-  // this listener as its ONE owner: driving, like a key over the stage, and
-  // its browser default prevented whatever the key (below), so the textarea
-  // never ALSO receives the character, the newline or the pasted text that
-  // `MobileKeyboard.vue`'s `input` handler would type a second time.
+  // ONE owner: for a HID frame this listener — driving, like a key over the
+  // stage, and its browser default prevented whatever the key (below), so the
+  // textarea never ALSO receives the newline or the pasted text that
+  // `MobileKeyboard.vue`'s `input` handler would type a second time; for a
+  // printable character the textarea itself (further down).
   const softKeyboard = isSoftKeyboardTarget(ev.target)
   const driving = state.pointerInside || state.keyboardLocked || softKeyboard
   // Before the Ctrl+V deferral: the chords are disjoint, the ordering keeps
@@ -14188,6 +14193,14 @@ export function routeKeyEvent(
   // Dropped BEFORE any preventDefault: what this listener does not send, the
   // soft keyboard's own `input` / `compositionend` path still carries.
   if (action.kind === 'drop') return { kind: 'untouched', why: 'drop' }
+  // #2888 — a printable character aimed at the soft keyboard's textarea is
+  // the TEXTAREA's: left untouched, the browser inserts it and the
+  // component's `input` handler types it, applying the toolbar's sticky
+  // Ctrl / Alt / Win (`consumeModBits`) — the one chord mechanism a phone
+  // has, and the path iOS's software keyboard (real keydowns, no `code`)
+  // types through. Forwarding it here would type it once but leave the
+  // armed modifier for the next key.
+  if (action.kind === 'text' && softKeyboard) return { kind: 'untouched', why: 'soft-keyboard' }
   const preventDefault =
     softKeyboard || shouldPreventDefault(ev, state.pointerInside, state.keyboardLocked)
   // Only on the down: a chord produces one keydown, and the mirror must not
@@ -14275,6 +14288,63 @@ export function applyKeyRoute(
       if (route.mirrorClipboard) fx.mirrorClipboard()
       return
   }
+}
+
+/** The deferred Ctrl+V's fallback: how long the viewer waits for the `paste`
+ *  event before flushing the keystroke as a plain Ctrl+V — some browsers fire
+ *  no paste event for an empty or a denied clipboard. Below the human
+ *  keystroke-perception threshold, well above paste-event scheduling. */
+export const DEFERRED_PASTE_FALLBACK_MS = 50
+
+/** USB HID usage of the V key (`kbdCodeToHid('KeyV')`). */
+const KEY_V_HID = 0x19
+
+/** The frames a deferred Ctrl+V's flush sends: one press, down then up, with
+ *  the modifier bits the chord carried. The composable's `flushPendingCtrlV`
+ *  and the harness send exactly these. */
+export function deferredPasteFrames(mods: number): Record<string, unknown>[] {
+  return [
+    { t: 'key', code: KEY_V_HID, down: true, mods },
+    { t: 'key', code: KEY_V_HID, down: false, mods },
+  ]
+}
+
+/** What a `paste` event means to the deferred Ctrl+V (file-DC v2, Phase 5):
+ *  `ignore` — no deferral is pending, the paste is someone else's (an editable
+ *  field's own); `flush` — no `clipboardData` at all, send the plain Ctrl+V;
+ *  `files` — the operator meant "upload these", no keystroke; `content` — the
+ *  text and html to mirror to the host before the keystroke (the caller's
+ *  clipboard channels decide how). */
+export type DeferredPasteRoute =
+  | { kind: 'ignore' }
+  | { kind: 'flush' }
+  | { kind: 'files'; files: File[] }
+  | { kind: 'content'; text: string; html: string }
+
+/** Decide what the deferred Ctrl+V does with its `paste` event — and CONSUME
+ *  the event when the deferral has it. The `preventDefault` lives here, in
+ *  the one function `onPaste`, the harness and the spec all call, so it can
+ *  never be a copy that drifts (#2888): with the soft keyboard's textarea
+ *  focused (a hardware Ctrl+V on a tablet) the browser would otherwise also
+ *  insert the clipboard text there, and `MobileKeyboard.vue`'s `input`
+ *  handler would type it on the host on top of the flushed Ctrl+V. With
+ *  nothing editable focused the default does nothing anyway. Pure apart from
+ *  that one call, which is the point. */
+export function routeDeferredPaste(
+  ev: Pick<ClipboardEvent, 'clipboardData' | 'preventDefault'>,
+  pending: boolean,
+  canUpload: boolean,
+): DeferredPasteRoute {
+  if (!pending) return { kind: 'ignore' }
+  ev.preventDefault()
+  const dt = ev.clipboardData
+  if (!dt) return { kind: 'flush' }
+  if (dt.files && dt.files.length > 0 && canUpload) {
+    const files: File[] = []
+    for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
+    return { kind: 'files', files }
+  }
+  return { kind: 'content', text: dt.getData('text') ?? '', html: dt.getData('text/html') ?? '' }
 }
 
 export { browserButton, kbdCodeToHid }

@@ -315,6 +315,59 @@ describe('MobileKeyboard', () => {
       w.unmount()
     })
 
+    it("a hardware letter: the listener leaves it, and the textarea's input path types it once", async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        const kd = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true, cancelable: true })
+        ta.dispatchEvent(kd)
+        // Untouched: the browser may insert it. jsdom has no default actions,
+        // so the insertion is done by hand, as the browser would.
+        expect(kd.defaultPrevented).toBe(false)
+        ta.value = 'a'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', code: 'KeyA', bubbles: true, cancelable: true }))
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('keyText')).toEqual([['a']])
+      expect(ta.value).toBe('')
+      w.unmount()
+    })
+
+    it("the toolbar's sticky Ctrl, then a hardware c: Ctrl+C once, from the component, and the modifier cleared", async () => {
+      // `consumeModBits` in the `input` handler is the only code that turns an
+      // armed toolbar modifier into a chord — the one chord mechanism a phone
+      // has. A listener that owned printable keys would type the "c" and leave
+      // Ctrl armed for the next toolbar key.
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ctrlBtn = w.findAll('.mkb-btn').find((b) => b.text() === 'Ctrl')
+      await ctrlBtn!.trigger('pointerdown')
+      expect(ctrlBtn!.classes()).toContain('mkb-btn-mod-active')
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        const kd = new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', bubbles: true, cancelable: true })
+        ta.dispatchEvent(kd)
+        expect(kd.defaultPrevented).toBe(false)
+        ta.value = 'c'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'c', code: 'KeyC', bubbles: true, cancelable: true }))
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('key')).toEqual([
+        [0x06, true, 0x01],
+        [0x06, false, 0x01],
+      ])
+      expect(ctrlBtn!.classes()).not.toContain('mkb-btn-mod-active')
+      // Sticky-once: the next letter is plain text.
+      ta.value = 'a'
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+      await flushPromises()
+      expect(w.emitted('keyText')).toEqual([['a']])
+      w.unmount()
+    })
+
     it("the OS keyboard's own Enter (no physical code) is the component's alone", async () => {
       const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
       const ta = w.find('textarea').element as HTMLTextAreaElement

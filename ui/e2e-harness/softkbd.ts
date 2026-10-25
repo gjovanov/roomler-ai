@@ -30,6 +30,9 @@ import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 import {
   applyKeyRoute,
   createHeldInputTracker,
+  DEFERRED_PASTE_FALLBACK_MS,
+  deferredPasteFrames,
+  routeDeferredPaste,
   routeKeyEvent,
   translateModifierForHost,
   type KeyRouteEffects,
@@ -92,15 +95,15 @@ let inputEvents = 0
 let stageEl: HTMLElement | null = null
 const open = ref(false)
 
-const KEY_V_HID = 0x19
-
+/** The deferral's state is `attachInput`'s own (a stash and a fallback timer);
+ *  what it SENDS and what the paste event DECIDES are the composable's exported
+ *  seams, used here as production uses them. */
 function flushPendingCtrlV() {
   if (!pendingCtrlV) return
   const mods = pendingCtrlV.mods
   if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
   pendingCtrlV = null
-  sent.push({ via: 'paste-flush', t: 'key', code: KEY_V_HID, down: true, mods })
-  sent.push({ via: 'paste-flush', t: 'key', code: KEY_V_HID, down: false, mods })
+  for (const frame of deferredPasteFrames(mods)) sent.push({ via: 'paste-flush', ...frame })
 }
 
 /** The effects `onKey` gives `applyKeyRoute`, recording instead of sending. */
@@ -122,7 +125,7 @@ const keyEffects: KeyRouteEffects = {
     if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
     const timer = setTimeout(() => {
       flushPendingCtrlV()
-    }, 50)
+    }, DEFERRED_PASTE_FALLBACK_MS)
     pendingCtrlV = { mods, timer }
   },
   mirrorClipboard: () => sent.push({ via: 'listener', t: 'clipboard-mirror' }),
@@ -146,21 +149,16 @@ function onKey(ev: KeyboardEvent, down: boolean) {
   )
 }
 
-/** `onPaste`'s decision for the text path, minus the clipboard channel: the
- *  deferred keystroke is flushed once the paste event has said what the
- *  clipboard holds. */
+/** `onPaste` minus the clipboard channel: the SAME `routeDeferredPaste`
+ *  decides (and consumes the event when the deferral has it — the one
+ *  `preventDefault`, in the composable, not a copy here); the deferred
+ *  keystroke is then flushed. */
 function onPaste(ev: ClipboardEvent) {
-  if (!pendingCtrlV) return
-  // #2888 — as `onPaste` does: the deferral consumes the paste, so the soft
-  // keyboard's textarea never receives the clipboard text and types it too.
-  ev.preventDefault()
-  const dt = ev.clipboardData
-  sent.push({
-    via: 'paste-flush',
-    t: 'paste',
-    text: dt?.getData('text') ?? '',
-    files: dt?.files?.length ?? 0,
-  })
+  const route = routeDeferredPaste(ev, pendingCtrlV !== null, false)
+  if (route.kind === 'ignore') return
+  if (route.kind === 'content') {
+    sent.push({ via: 'paste-flush', t: 'paste', text: route.text, files: 0 })
+  }
   flushPendingCtrlV()
 }
 

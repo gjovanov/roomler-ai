@@ -139,17 +139,26 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14164`,
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14168`,
   `:14236`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
   owner per key in every viewer state: the soft keyboard open with the pointer
   outside the stage, inside it, or under keyboard lock; closed with the stage
-  or the body focused; one of the viewer's own inputs focused. The Vite DEV
-  server serves the page (`playwright.harness.config.ts`); `vite build` never
-  includes it. CI runs it beside the phone smoke on any PR that touches `ui/`
-  (`ui-phone-smoke.yml`, job `soft-keyboard-harness`).
+  or the body focused; one of the viewer's own inputs focused. WHICH owner is
+  part of the contract: a HID frame (a named key, a chord, a modifier) is the
+  listener's; a printable character aimed at the textarea is the textarea's,
+  through its `input` handler — where the toolbar's sticky Ctrl / Alt / Win
+  become a chord, which a case locks (sticky Ctrl, then a hardware `c`: one
+  Ctrl+C, the modifier cleared), as does the iOS-style letter (a real keydown
+  with no physical code, then the insertion). The paste half runs the same
+  `routeDeferredPaste` production runs, so its one `preventDefault` is not a
+  copy: remove it and the Ctrl+V case fails. The Vite DEV server serves the
+  page (`playwright.harness.config.ts`); `vite build` never includes it. CI
+  runs it as a step of the phone-smoke job on any PR that touches `ui/`
+  (`ui-phone-smoke.yml`) — one runner slot for both, since slots are the
+  scarce resource there.
 
   Its first run, on the code before the fix, measured the bug: with the soft
   keyboard open and the pointer off the stage, `a`, `Shift+A`, Space, Enter,
