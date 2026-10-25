@@ -112,6 +112,19 @@
 }
 
 /*
+ * FR-120 P4 — the phone row a `v-data-table(-server)` renders through its
+ * `#item` slot (Members, Invites, Files): one cell the width of the row. Its
+ * `<tr>` must not carry `v-data-table__tr--mobile`, whose cells are a
+ * two-column grid (label | value): that squeezed the line into half the
+ * width ("An/yo/ne") and set the opened details beside it.
+ */
+.v-data-table .stack-row {
+  height: auto !important;
+  padding-top: 4px !important;
+  padding-bottom: 4px !important;
+}
+
+/*
  * FR-120 P5 — a page outside AppLayout clips what its gutters push past the
  * screen. A `v-row`'s negative margins (12 px) inside the house `pa-2` (8 px)
  * overhang it by 4 px on a phone, and with no clipped `<v-main>` around them
