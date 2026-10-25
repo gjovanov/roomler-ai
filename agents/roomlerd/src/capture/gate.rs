@@ -93,6 +93,40 @@ pub fn pull_gate(fps: u32) -> Option<SlotFirst> {
     (GateMode::at_fps(GateMode::Legacy, fps) == GateMode::SlotFirst).then(|| SlotFirst::new(fps))
 }
 
+/// FR-119 P2b-15 — how far below a whole number of the panel's refreshes the
+/// interval sits, so a composition that lands a hair early still counts.
+const MIN_UPDATE_MARGIN_100NS: i64 = 5_000;
+
+/// FR-119 P2b-15 — the Windows capture session's `MinUpdateInterval` for a
+/// rate, in 100 ns units, or `None` to leave Windows' default.
+///
+/// ⚠️ Windows 11 24H2 delivers a WGC frame at most once per
+/// `MinUpdateInterval`, 16 ms by default: ~60 fps whatever the screen does.
+/// Measured on neo16 (2560×1600 at 240 Hz): 57.9 fps captured while the screen
+/// changed 178 times a second, 188.6 fps with the interval at 1 ms. Every
+/// granted 120 and 144 fps session on Windows ran at that 60.
+///
+/// The interval is the largest whole number of panel refreshes inside the
+/// target's period, less a margin. Every delivered frame costs the backend a
+/// full CPU readback, so a 120 fps session on a 240 Hz panel takes every second
+/// refresh, not all of them. A target the panel cannot divide (144 on 240 Hz)
+/// takes every refresh, and the slot-first gate paces the frames to the
+/// target. At 60 and below nothing changes; an unknown refresh rate takes 1 ms.
+pub fn min_update_interval_100ns(fps: u32, refresh_hz: Option<u16>) -> Option<i64> {
+    if fps <= SLOT_FIRST_ABOVE_FPS {
+        return None;
+    }
+    let target = 10_000_000 / i64::from(fps);
+    let interval = match refresh_hz.filter(|&hz| hz > 0) {
+        Some(hz) => {
+            let refresh = 10_000_000 / i64::from(hz);
+            (target / refresh).max(1) * refresh - MIN_UPDATE_MARGIN_100NS
+        }
+        None => 0,
+    };
+    Some(interval.max(10_000))
+}
+
 /// The slot-first bucket. Pure over the instants it is given, so the tests
 /// drive it with a synthetic timeline.
 #[derive(Debug, Clone)]
@@ -402,5 +436,47 @@ mod tests {
             w >= gate.period() * 2 - MS && w <= gate.period() * 2 + MS,
             "{w:?}"
         );
+    }
+
+    /// FR-119 P2b-15 — at 60 and below the capture session keeps Windows'
+    /// own interval, so nothing a 60 fps session does changes.
+    #[test]
+    fn at_sixty_and_below_the_min_update_interval_stays_windows_default() {
+        for fps in [15, 30, 60] {
+            assert_eq!(min_update_interval_100ns(fps, Some(240)), None, "{fps}");
+            assert_eq!(min_update_interval_100ns(fps, None), None, "{fps}");
+        }
+    }
+
+    /// 120 on a 240 Hz panel: every second refresh (8.33 ms), so 120 frames a
+    /// second reach the readback, not 240. On a 120 or 144 Hz panel at its own
+    /// rate: every refresh.
+    #[test]
+    fn the_interval_is_a_whole_number_of_refreshes_less_a_margin() {
+        // 2 × 41_666 − 5_000
+        assert_eq!(min_update_interval_100ns(120, Some(240)), Some(78_332));
+        // 1 × 83_333 − 5_000
+        assert_eq!(min_update_interval_100ns(120, Some(120)), Some(78_333));
+        // 1 × 69_444 − 5_000
+        assert_eq!(min_update_interval_100ns(144, Some(144)), Some(64_444));
+        // each one shorter than the target's own period, so no refresh is
+        // skipped that the target needed
+        for (fps, hz) in [(120, 240), (120, 120), (144, 144), (120, 165), (144, 240)] {
+            let i = min_update_interval_100ns(fps, Some(hz)).unwrap();
+            assert!(i < 10_000_000 / i64::from(fps), "{fps}@{hz}: {i}");
+        }
+    }
+
+    /// A target the panel cannot divide into whole refreshes (144 on 240 Hz,
+    /// 120 on 165 Hz) takes every refresh, and the slot-first gate paces the
+    /// frames down to the target. An unknown refresh rate takes 1 ms.
+    #[test]
+    fn an_indivisible_target_takes_every_refresh_and_an_unknown_panel_one_ms() {
+        // 1 × 41_666 − 5_000: every 240 Hz refresh
+        assert_eq!(min_update_interval_100ns(144, Some(240)), Some(36_666));
+        // 1 × 60_606 − 5_000: every 165 Hz refresh
+        assert_eq!(min_update_interval_100ns(120, Some(165)), Some(55_606));
+        assert_eq!(min_update_interval_100ns(120, None), Some(10_000));
+        assert_eq!(min_update_interval_100ns(144, Some(0)), Some(10_000));
     }
 }
