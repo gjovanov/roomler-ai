@@ -20,7 +20,9 @@
 //! then. The recorder writes the track at that size
 //! ([`VideoEncoder::coded_dims`]), and the sidecar and the `started` event
 //! say what it was scaled from. A hardware rung records at native size, as
-//! before.
+//! before. The export engine uses the same factory and sizes its track the
+//! same way, so exporting a hardware recording that large where only
+//! software is left comes out scaled instead of failing.
 
 use std::sync::Arc;
 
@@ -93,18 +95,28 @@ pub fn software_recording_encoder(
     gop_frames: u32,
 ) -> Result<Box<dyn VideoEncoder>> {
     let (fw, fh) = fit_for_software(width, height);
-    let inner = Openh264Encoder::new_recording(fw, fh, fps, gop_frames)?;
     if (fw, fh) == (width, height) {
+        let inner = Openh264Encoder::new_recording(width, height, fps, gop_frames)?;
         return Ok(Box::new(inner));
     }
+    let encoder = scaled_openh264((fw, fh), fps, gop_frames)?;
     tracing::info!(
         from = %format!("{width}x{height}"),
         to = %format!("{fw}x{fh}"),
         "recording: the screen is larger than the software encoder takes — recording it scaled"
     );
+    Ok(encoder)
+}
+
+/// openh264's recording profile at `to`, fed every frame scaled down to it.
+/// It is public for the export tests: no software source above 3840 px can
+/// be made for them to export, so they get their encoder that encodes
+/// smaller than its source here.
+pub fn scaled_openh264(to: (u32, u32), fps: u32, gop_frames: u32) -> Result<Box<dyn VideoEncoder>> {
+    let inner = Openh264Encoder::new_recording(to.0, to.1, fps, gop_frames)?;
     Ok(Box::new(FittedEncoder {
         inner,
-        dims: (fw, fh),
+        dims: to,
         resampler: Resampler::new(),
     }))
 }

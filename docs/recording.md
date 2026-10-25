@@ -200,6 +200,14 @@ native size. `a_screen_wider_than_the_software_encoder_records_scaled_to_fit`
 proves the fit, and `the_bare_software_encoder_records_nothing_of_that_screen`
 keeps the bug as a control.
 
+The export (§11) uses the same encoder factory, so the fit reaches it too. A
+hardware recording above 3840×2160, exported where only software is left,
+now comes out scaled instead of failing. Its track takes the encoder's
+`coded_dims`, as the recorder's does. At the source's size, the track would
+disagree with its own stream.
+`an_export_encoded_smaller_gives_the_size_its_stream_holds`
+(`tests/export.rs`) fails without that.
+
 **The hardware recording profile** reuses the live option sets: every one of
 them is field-proven on the fleet's GPUs, and a new private-option dict would
 be a new way for a driver to refuse an open. Three things change:
