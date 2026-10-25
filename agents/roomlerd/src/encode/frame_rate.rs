@@ -198,6 +198,11 @@ pub const TRIAL_STRETCH_GAP_PERIODS: u64 = 3;
 /// A trial fails only when the encoder's p90 time per frame reached this share
 /// of a period: then the host itself cannot keep up, whatever the content did.
 pub const TRIAL_MAX_ENCODE_PCT: u64 = 90;
+/// …and only when the encoder spaced the frames: their median interval at most
+/// this share of the encoder's median time per frame (FR-119 P2b-14). Frames
+/// further apart than that waited on the content, and an encoder timed at such
+/// a light load is no measure of it at full load.
+pub const TRIAL_HOST_BOUND_INTERVAL_PCT: u64 = 150;
 
 /// FR-119 P2b — the trial: does this host sustain `fps` while the content
 /// moves?
@@ -219,6 +224,17 @@ pub const TRIAL_MAX_ENCODE_PCT: u64 = 90;
 /// all: the window starts over, and a later burst of fast content may still
 /// prove the class. Counting it as a failure would cache a capable host as
 /// unable for a week.
+///
+/// ⚠️ **An encoder timed on slow content is not timed at all** (P2b-14). A
+/// laptop GPU clocks itself down under a light load, so the same encoder is
+/// slower per frame on 60 fps content than on 120. Field 2026-10-25, neo16:
+/// `av1_nvenc` at 2560×1600 benched 4.4 ms p90 flat out, but under a viewer
+/// whose drags arrived at 59 fps it drifted from 4.4 to 8.7 ms a frame (the
+/// GPU idles in P8), reached a 10.5 ms p90, and failed the 120 fps class for
+/// a week. So **Failed** also needs the encoder to have spaced the frames:
+/// their median interval within [`TRIAL_HOST_BOUND_INTERVAL_PCT`] of its
+/// median time (11 ms frames 11–13 ms apart). Frames 17 ms apart behind a
+/// 9 ms encoder waited on the content, and conclude nothing.
 #[derive(Debug, Clone)]
 pub struct TrialMeter {
     period_us: u64,
@@ -296,7 +312,10 @@ impl TrialMeter {
             && percentile(&self.intervals_us, 99) < self.period_us * TRIAL_MAX_P99_PERIODS
         {
             Some(Verdict::Proven)
-        } else if percentile(&self.encode_us, 90) * 100 >= self.period_us * TRIAL_MAX_ENCODE_PCT {
+        } else if percentile(&self.encode_us, 90) * 100 >= self.period_us * TRIAL_MAX_ENCODE_PCT
+            && percentile(&self.intervals_us, 50) * 100
+                <= percentile(&self.encode_us, 50) * TRIAL_HOST_BOUND_INTERVAL_PCT
+        {
             Some(Verdict::Failed)
         } else {
             None
@@ -788,13 +807,39 @@ mod tests {
         );
     }
 
-    /// The same 60 fps content with an encoder that needs 9 ms, more than a
-    /// 120 fps period: the host could not have kept up with fast content
-    /// either.
+    /// The same 60 fps content with an encoder that took 9 ms, more than a
+    /// 120 fps period. P2b-14: no verdict either. Frames 16.7 ms apart waited
+    /// on the content, not on the encoder, and an encoder timed at that load
+    /// may be clocked down: the host is not shown unable. (Until P2b-14 this
+    /// failed, on the reasoning that the host "could not have kept up with
+    /// fast content either".)
     #[test]
-    fn a_slow_encoder_fails_even_on_slow_content() {
+    fn a_slow_encoder_on_slow_content_concludes_nothing() {
         assert_eq!(
             run_trial(120, std::iter::repeat_n(16_667, 2_000), 9_000),
+            None
+        );
+    }
+
+    /// FR-119 P2b-14, the field case (2026-10-25, neo16, `av1_nvenc` at
+    /// 2560×1600, a viewer whose drags arrived at 59 fps): frames 16.9 ms
+    /// apart, the encoder at 10.5 ms a frame because the GPU had clocked down
+    /// under that load. It failed the 120 fps class; now it concludes nothing.
+    #[test]
+    fn a_light_load_with_a_clocked_down_encoder_concludes_nothing() {
+        assert_eq!(
+            run_trial(120, std::iter::repeat_n(16_900, 2_000), 10_500),
+            None
+        );
+    }
+
+    /// A host that really cannot keep up still fails when the frames carry
+    /// some overhead beyond the encode itself (readback, send): 10 ms in the
+    /// encoder, frames 12.5 ms apart, so the encoder spaced them.
+    #[test]
+    fn an_encoder_bound_host_fails_with_per_frame_overhead() {
+        assert_eq!(
+            run_trial(120, std::iter::repeat_n(12_500, 2_000), 10_000),
             Some(Verdict::Failed)
         );
     }

@@ -1108,10 +1108,12 @@ impl RateGovernor {
             // conditions still stand.
             agent_stalled: sender.is_some_and(|s| s.stalled_passes > 0),
             opening: sender.is_some_and(|s| s.opening),
-            // FR-119 P2b-13 — direct only, like the opening began.
-            keyframe_burst: !constrained
-                && !samples.is_empty()
-                && samples.iter().all(|s| s.keyframe),
+            // FR-119 P2b-13 — direct only, like the opening began. P2b-14:
+            // ANY blocked keyframe, not only a keyframe alone. The deltas
+            // queued behind it block on the keyframe's own backlog, so they
+            // measure the same ramp; a pipe narrower than the stream shows in
+            // the keyframe-free windows either side, where deltas block alone.
+            keyframe_burst: !constrained && samples.iter().any(|s| s.keyframe),
             // V2 wires the carrier; until then a change cannot be seen
             // here and the memory keying is where it will be read.
             carrier_changed: false,
@@ -3847,9 +3849,9 @@ mod tests {
     /// SCTP window that the deltas before it had left small. Field 2026-10-24:
     /// one 625 KB keyframe blocked 71.6 ms, folded as 69.9 Mbit/s on a mesh
     /// path that carried 311 Mbit/s, and took a granted 120 fps back. A pipe
-    /// that really is narrower shows it in the deltas queued behind the
-    /// keyframe, which block too, and their window still folds. On a relay the
-    /// keyframe alone still folds, as before.
+    /// that really is narrower shows it in deltas blocking without a keyframe
+    /// (P2b-14), and their window still folds. On a relay the keyframe alone
+    /// still folds, as before.
     #[test]
     fn a_direct_window_whose_only_blocked_sends_are_keyframes_folds_no_capacity() {
         let start = Instant::now();
@@ -3869,9 +3871,8 @@ mod tests {
         assert_eq!(g.blocked_send_bps(t1), None, "and nothing for the clamp");
         assert_eq!(g.evidence_rejected()[5], 1, "rejected as a keyframe burst");
 
-        // A narrow pipe: the deltas behind the keyframe block too, and the
-        // window folds (10 × 30 KB in 24 ms each, beside the keyframe).
-        sink.record_frame(625_000, Duration::from_millis(500), true);
+        // A narrow pipe: the deltas block with no keyframe in the window, and
+        // the window folds (10 × 30 KB in 24 ms each).
         for _ in 0..10 {
             sink.record(30_000, Duration::from_millis(24));
         }
@@ -3895,5 +3896,27 @@ mod tests {
             "a relay keeps the keyframe sample"
         );
         assert!(r.blocked_send_bps(t1).is_some(), "and folds it");
+    }
+
+    /// FR-119 P2b-14 — a DIRECT window whose blocked sends include a keyframe
+    /// is not a capacity measurement even when a delta blocked beside it: the
+    /// delta waited on the keyframe's backlog. Field 2026-10-25, a LAN path:
+    /// the idle-settle keyframe after a motion burst blocked 66 ms, a delta
+    /// behind it blocked too, the window folded as 60.7 Mbit/s against the
+    /// 88.8 Mbit/s ceiling at 120, and 120 went back after 6 s on `pipe`.
+    #[test]
+    fn a_direct_window_with_a_keyframe_and_a_delta_behind_it_folds_no_capacity() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        sink.record_frame(500_000, Duration::from_millis(66), true);
+        sink.record_frame(50_000, Duration::from_millis(12), false);
+        g.note_window_sender(t2_sender(120));
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 120, || 0, || 0, || 0, false, |o| o, 0)
+            .expect("window due");
+        assert_eq!(g.belief_bps(t1).2, None, "no capacity claim");
+        assert_eq!(g.blocked_send_bps(t1), None, "and nothing for the clamp");
+        assert_eq!(g.evidence_rejected()[5], 1, "rejected as a keyframe burst");
     }
 }
