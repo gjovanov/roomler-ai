@@ -74,7 +74,7 @@ first fragment only, every field bounds-checked, malformed input answered with
 ### The in-process TCP stack on a lossy or policed path (#2876, #2882)
 
 Interception has a cost: every byte a session sends leaves through smoltcp, not
-the OS TCP stack. Two properties of that stack had to be fixed before roomler
+the OS TCP stack. Three properties of that stack had to be fixed before roomler
 SSH held up on a path that loses packets. The worst case is a path that polices
 rather than queues, like the relay allowance (FR-115), which drops a network's
 frames once they pass its bucket.
@@ -92,11 +92,53 @@ the DERP floor with its org over the Free allowance (a 1 Mbit/s bucket):
 Typing stayed fine throughout: keystroke echo p50 3–4 ms and p95 about 45 ms,
 while a bulk transfer held the bucket full. The netstack now runs **Reno** on
 every socket (`crates/tunnel-core/src/overlay/netstack.rs:613-632`,
-`crates/tunnel-core/Cargo.toml:159-163`).
+`crates/tunnel-core/Cargo.toml:159-166`).
 
 ⚠️ Not smoltcp 0.13's Cubic. It evaluates RFC 8312's curve in bytes rather
 than segments, so after each update the window sits at its 2 KiB floor for
 about 11 s, and a socket's first send stalled under it.
+
+**Its retransmission timer must back off only on a timeout.** smoltcp 0.13 had
+three faults here, which compounded:
+- every *fast* retransmit doubled the RTO, though RFC 6298 backs off only when
+  the timer expires;
+- each one resent the whole window;
+- the backoff collapsed only on an RTT sample from data never sent before, and
+  every retransmit aborted the sample in flight.
+
+A policed path loses part of nearly every window, so that sample almost never
+came. The timer climbed to its 60 s ceiling, and the transfer stood still for
+most of a minute at a time.
+
+```mermaid
+flowchart LR
+  B["a window drains the bucket"] --> L["its tail is dropped"]
+  L --> F["3 duplicate ACKs: fast retransmit"]
+  F -->|"0.13: RTO × 2, the whole window again"| B
+  F -->|"0.14: one segment, RTO unchanged"| R["recovered in a round trip"]
+```
+
+The netstack is on smoltcp 0.14 (`crates/tunnel-core/Cargo.toml:150`). It
+resends one segment, enters Reno fast recovery, and backs off only when the
+timer expires. Measured on the same pair as above, held on the DERP floor with
+its org over the Free allowance, each run a 1 MiB `scp` over roomler SSH:
+
+| smoltcp | runs | result | RTO, as traced |
+|---|---|---|---|
+| 0.13.1 (0.4.170, and master on it) | 5 | 33–101 kbit/s; two did not finish in 150 s | doubled on every retransmit, to 60 s, and held |
+| 0.14.0 | 4 | **535–805 kbit/s**, each done in 10–16 s | at most 2 s |
+| kernel TCP (HTTP), same pair | 1 | 0.86 Mbit/s | — |
+
+⚠️ A zero-RTT test link hid this one. The old stack passed the policed test at
+0.97 Mbit/s, while over a 30 ms round trip a policed copy fell to 34 kbit/s,
+the field's number. The harness link carries a delay now
+(`netstack.rs:1438-1472`).
+
+⚠️ A lower RTO floor is not the fix. On that link a 200 ms floor alone
+collapsed the same way (28 kbit/s, RTO at 60 s): the doubling, not the floor,
+causes the stall. What is left of the gap to kernel TCP is about nine timeouts
+per MiB at the 1 s floor. A later smoltcp with a configurable floor could
+remove them, with no fork.
 
 **A dropped stream must still deliver its tail.** A stream used to be aborted
 the moment the app dropped it, even after a shutdown. Whatever was queued or
@@ -127,11 +169,12 @@ sequenceDiagram
   `ConnectionReset` (`netstack.rs:944-952`, `454-460`).
 
 Locked by three tests that each failed on the old stack. Two stacks are
-cross-linked through a bucket like the relay's (`netstack.rs:1417-1458`):
+cross-linked through a bucket like the relay's, with a one-way delay
+(`netstack.rs:1417-1472`):
 
 | test | what it holds |
 |---|---|
-| `a_policed_path_keeps_most_of_its_rate` | 512 KiB arrives at about the bucket's rate. Before: 479,832 B, then EOF |
+| `a_policed_path_keeps_most_of_its_rate` | 512 KiB at Free's rate, over a 30 ms round trip, arrives at about the bucket's rate (4.6–4.7 s, ideal 4.2 s). Before Reno: 479,832 B, then EOF. On smoltcp 0.13: not finished in 30 s |
 | `a_dropped_stream_still_delivers_its_tail` | a drop without `shutdown` still delivers every byte. Before: the tail never came |
 | `a_reset_reads_as_an_error_not_eof` | a reset is `ConnectionReset`. Before: 703,720 B, then a clean EOF |
 
