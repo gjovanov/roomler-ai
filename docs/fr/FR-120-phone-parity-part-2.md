@@ -3,7 +3,7 @@
 **Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** in progress. On production, all
 on 2026-10-24: P5 (#2843) and P2 (#2845) since 20:34Z (`hosted-20261024-fa90220`), P3 (#2848) since 20:47Z
 (`hosted-20261024-9ea48a1`), P1a (#2850) since 22:05Z (with FR-27's `hosted-20261024-46f3f84`), and P1b (#2856) since
-22:30Z (`hosted-20261024-d96b623`). P4, P6 and P7 are still to come · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
+22:30Z (`hosted-20261024-d96b623`). P6 (#2883) is in review; P4 and P7 are to come · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (#2561, closed 2026-10-23: the same facts and actions at every width, and
 the rules in `docs/ui.md` § Phones and tablets)
 
@@ -107,7 +107,7 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 | **P3** — #2848 | dialogs and rows | revert: UI only | each dialog opened at 360 px | M |
 | **P4** | long pages | revert: UI only | the sweep's heights, red then green | L |
 | **P5** — #2843 | the bugs | revert: UI only | the tutorial at 360 and 1300 px; sign-in's `scrollWidth` | S |
-| **P6** | touch targets | revert: CSS only | the sweep's small-target count on a coarse pointer; desktop pixel-identical | S |
+| **P6** — #2883 | touch targets | revert: CSS only | the sweep's small-target count on a coarse pointer; desktop pixel-identical | S |
 | **P7** | docs | — | CI | S |
 
 ## 5. Acceptance criteria
