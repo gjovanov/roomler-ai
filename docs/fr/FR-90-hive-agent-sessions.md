@@ -3115,7 +3115,10 @@ sequenceDiagram
 | P4-5-3-1 | staleness, as decision 57 says: `knowhow.stale_days`, the leader-gated hourly sweep, `stale` with a history row, back to `active` on a probe's or a person's word | `knowhow.stale_days = 0` | — |
 | P4-5-4 | what each device last found, on the card, as decision 58 says: each device's last probe of the entity that found something, at most 16 devices, beside each fact's `verified`, which stays the last word | the same | — |
 | P4-5-4b | a row of each probe kind a device (the operator, 2026-10-25: "2 rows per device"): a `tcp` probe after a `tls` one leaves the device's certificate on the card | the same | — |
-| P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving | the same; the vault's own gates | AC15 ("through the mesh") |
+| P4-6-0 | `roomler_connect`, as designed (§3e "P4-6, `roomler_connect`, as designed"), and decisions 59–62 | docs only | — |
+| P4-6-1a | the server's half: `rc:knowhow.connect` answered `rc:knowhow.access`, the engine, upstream and credential compiled from the entity's `active` and `stale` facts (decision 59) and its paths from the devices' findings (decision 60), believed as a question is and held to the starter's `KNOWHOW_VIEW` (decision 61); `roomler_connect` in `rc:knowhow.served` for a device that advertises `vault` | `[modules] knowhow`; `knowhow.tenants` | — |
+| P4-6-1b | the device's half: a session's flow with no listener, its stream the proxies dial through; `roomler_connect` in the toolbelt, asked of a person each call, trying its paths in order (its own finding, a probe from here, a device's finding through a forward) | the same; device `vault_enabled`, `hive_net` (for a path through a device), `knowhow_probe_reach` (for its probe) | AC15 ("through the mesh") |
+| P4-6-2 | a person's `roomler connect <kind>/<key>`, if decision 62 asks for it now | `vault.people` | — |
 | P4-7 | the map in the web app | the SPA | — |
 | P4-8 | chips: `#` in the composer, the MCP resource, the terminal's hook | the same | — |
 | P4k | the field run in the test organization | — | AC15 |
@@ -3481,6 +3484,69 @@ finding **of each kind**:
   other kind's row along however old, so a card holds at most 32 rows.
 - `probes_truncated` says a device was left out.
 - The toolbelt's `knowhow_get` description says "a tcp one and a tls one".
+
+**P4-6, `roomler_connect`, as designed (P4-6-0).** A session names an entity of the map and gets
+a local endpoint that reaches it: the entity's own target, over the best path measured from its
+device, signed in with the credential the entity names, in one call a person approves (design
+§9.3). Nothing it opens is new. The path is P3-7's (`rc:vault.net`, a forward through a device).
+The credential is `vault_connect`'s (P3-5's `proxy` mode, a lease for each field). Each piece is
+still decided where it is decided today. `roomler_connect` adds what knowhow knows: which target,
+which credential, and which devices have reached it.
+
+```mermaid
+sequenceDiagram
+    participant S as the session (its toolbelt)
+    participant D as roomlerd (the session's device)
+    participant K as knowhow (server)
+    participant V as vault (server)
+    participant X as a device that reached it
+    participant U as the upstream
+    S->>D: roomler_connect {kind, key}, a person approving
+    D->>K: rc:knowhow.connect, believed as a question is
+    K-->>D: rc:knowhow.access - engine, upstream and credential from the entity's facts, and its paths
+    alt this device's own finding is ok and fresh
+        D->>V: rc:vault.lease per field, proxy, toward the upstream
+        D->>U: the proxy dials it, TLS verified
+    else another device's is
+        D->>V: rc:vault.net (a forward toward X to the upstream) and rc:vault.lease per field
+        D->>X: the session's flow, with no listener
+        X->>U: the flow's far end
+        Note over D,U: TLS from the proxy to the upstream, verified against the audience: X relays ciphertext
+    end
+    D-->>S: the endpoint, the path, the mode, a one-line note
+```
+
+| Piece | Design |
+|---|---|
+| what an entity says | decision 59: reserved fact paths. The target is the probe's (`address` or `host`, `port`, `sni`; `target`, `crates/modules/knowhow/src/probe.rs:183`). `engine` is one of `vault_connect`'s (`postgres`, `mongodb`, `http`, `kubernetes`, `ssh`; `agents/roomlerd/src/hive/vault_connect.rs:11`), or `tcp` for a service with no credential. `credential` is a vault handle, a structured secret by its path or RRN, never a value. Its options are `database`, `auth`, `auth_source` and `ca`. Only facts that are `active` or `stale` are read: a `proposed` one, a session's word alone, never chooses where a credential goes |
+| the upstream | built from the facts as `vault_connect` spells it: `host:port` for a database, `https://host[:port]` for `http` and `kubernetes`, `ssh://host[:port]` for `ssh`. The secret's `audiences` must name it exactly, or the vault refuses the lease (`proxy-only-named-audiences`). A planted `host` fact cannot carry a credential to another host |
+| the paths | decision 60: measured, never assumed (pillar 2's first commitment). First, this device, when its own last finding of the target (P4-5-4b's per-device rows) is `ok` and fresh. When it has none, one probe from here, inside the same call, with the device's `knowhow_probe_reach` deciding as for any probe. Then each device whose last finding is `ok` and fresh, newest first, through a forward. Fresh is `knowhow.connect_fresh_secs` (24 h by default). Nothing else is ever dialled: with no verified path, the answer says which devices tried and that `knowhow_verify` would measure it from here |
+| through a device | P3-7's grant for the session: `net:forward` toward that device, the destination the entity's `host:port`, then `tunnel_policies` and that device's `forward_acl`. The flow has **no listener**: the daemon's proxy opens its upstream connection through it in process, where today it calls `TcpStream::connect` (`agents/roomlerd/src/vault_proxy/pg.rs:435`, `mongo.rs:127`, `http.rs:505`). A seam beside `create_session_flow` (`agents/roomlerd/src/tunnel/client_mgr.rs:462`) yields the flow's stream instead of binding a port. TLS still runs from the proxy to the upstream and is verified against the audience's host, so the device in between relays ciphertext. For `tcp` there is no proxy: the session gets the forward itself, `net_forward`'s listener. `ssh` is the same, because its agent signs and never dials (`vault_connect.rs:14`): the session's own `ssh` takes the forward, and the host key is checked against the secret's `host_keys` |
+| the credential | `vault_connect`'s machinery (`call`, `vault_connect.rs:387`): a lease for each field the engine needs, in `proxy` mode toward the upstream, the endpoint served only to the session's account, closed with its first lease. A path through a device adds the forward's grant, at most 900 s, and the endpoint closes at the earlier end |
+| who may ask | decision 61: the session's starter holding `KNOWHOW_VIEW` (`may_read`, `crates/modules/knowhow/src/session.rs:501`), read at every call. The plan is a read of the map; every reach is the vault's and the network's to decide, as today |
+| a person | the toolbelt's settings ask a person for each call (`permissions.ask`), as for `knowhow_verify` and the vault's uses. The vault's own policies still decide the grant and each lease, record each, and may post an approval card of their own. The answer names every piece: the path, the device it went through, the lease, the endpoint |
+| the wire | `rc:knowhow.connect {req_id, session_id, fence, kind, key}` → `rc:knowhow.access {req_id, access}`: the engine, the upstream, the credential, the options, and the paths with each finding's device, kind, carrier, round trip and time. Refusals are words: `not_found`; `no_access`, for an entity with no `engine`, or no `credential` for an engine that needs one, with the missing path named; `bad_request`; and the question's own words. `roomler_connect` is in `rc:knowhow.served` (`served`, `session.rs:234`) for a device that advertises `vault`; an older agent keeps only the tools it knows |
+| the answer | `{endpoint, connection, engine, mode: proxy, path: direct \| through <device>, carrier, expires_in_secs, tried}`. `connection` is a connection string with no credential in it, as `vault_connect`'s, and `tried` lists every path that was tried and why it failed |
+
+- ⚠️ **A map, still not a gate.** Knowhow compiles a plan and grants nothing. The vault decides each
+  lease and the grant, the network the flow, and the devices their own gates (`hive_net` for a path
+  through a device, `vault_enabled`, `knowhow_probe_reach`). Each refuses on its own, as before.
+- ⚠️ **A session's proposal never places a credential.** Only `active` and `stale` facts are read.
+  A session that proposes `credential` or `host` on an entity has proposed it; until a person
+  confirms it, `roomler_connect` reads the entity as if the fact were absent, and says so.
+- ⚠️ **Through a device, TLS end to end.** The proxy verifies the upstream's certificate against
+  the audience's host, as it does on a direct path. So a device in between, compromised or not,
+  relays ciphertext it cannot read or replay. An engine whose upstream speaks no TLS is refused
+  through a device: the proxies already refuse cleartext.
+- ⚠️ **No listener for the credential's leg.** A forward's loopback listener would hand any process
+  of the session's account a raw pipe past the proxy. The proxy's leg opens the flow itself, so
+  the only endpoint served is the proxy's, to the session's account.
+- **Not in P4-6:**
+  - a person's `roomler connect <kind>/<key>` (decision 62);
+  - `short-lived` engines (MySQL, SQL Server, Redis: P3-6), which issue a credential rather than
+    proxy one;
+  - a path chosen by the session (it names the entity, never the device);
+  - a cadence of probes to keep paths fresh.
 
 ### 3f. The brain
 
@@ -3886,7 +3952,8 @@ device that adopted it, from the terminal's own history (the device's half P2f-4
 | P4-5-3-0 | staleness, as designed (§3e "P4-5-3, staleness, as designed"), docs only: a person's fact and a confirmed proposal age, the sync's and a scan's own never (a scan never rewrites an unchanged finding, and retires what it no longer finds); the age from the newest of the last confirming probe, the confirmation and the writing; `stale` past `knowhow.stale_days` on the entity's rev with a history row, back to `active` on a probe's or a person's word; a leader-gated hourly sweep. Poses decision 57 | docs only | **merged** #2851 `36c3bdb6c` |
 | P4-5-3-1 | staleness (`docs/knowhow.md` §13.4), decision 57 as recommended on the operator's "proceed": an `active` fact of a person or a session (`stale::ages`) last confirmed (`confirmed_at`, the newest of `verified_at`, `confirmed.at`, `observed_at`) before `knowhow.stale_days` (absent 30, `0` never) turns `stale` on the entity's rev with a history row `op: stale`, `source: system`; the sync's and a scan's own and a waiting proposal never; back to `active` on a probe found as it says, a person's confirm (the fact-confirm route now takes a stale fact) or a person's write; every pod sweeps every `knowhow.stale_sweep_secs` (3600), a page of 200 at a time, only in served organizations, since the host schedules no periodic job | `knowhow.stale_days = 0` | **merged** #2874 `1acc44ef0`; prod `hosted-20261025-1acc44e` |
 | P4-5-4 | what each device last found, on the card (`docs/knowhow.md` §13.5), decision 58 as recommended and confirmed by the operator: `probes`, each device's last probe of the entity that found something (`ok` or `unreachable`), at most 16 devices, newest first, read by one aggregate over the entity's newest 512 such probes (`ProbeDao::last_per_device`), with `probes_truncated`; each row the probes listing's view; a fact's `verified` stays the last word, and staleness keeps reading `verified_at`; a session's card drops the rows, oldest first, before any link; `knowhow_get`'s description names `verified` and `probes` | the same | **merged** #2906 `c2ec4958f`; prod `hosted-20261025-c2ec495`, field-verified |
-| P4-5-4b | a row of each probe kind a device (`docs/knowhow.md` §13.5), the operator's "2 rows per device": the aggregate groups by device and kind (`ProbeDao::last_per_device_and_kind`); `probe::card_rows` shows every row of the 16 devices whose findings are the newest, a device counting once and bringing its other kind's row along, at most 32 rows; `knowhow_get`'s description says "a tcp one and a tls one" | the same | **in review** |
+| P4-5-4b | a row of each probe kind a device (`docs/knowhow.md` §13.5), the operator's "2 rows per device": the aggregate groups by device and kind (`ProbeDao::last_per_device_and_kind`); `probe::card_rows` shows every row of the 16 devices whose findings are the newest, a device counting once and bringing its other kind's row along, at most 32 rows; `knowhow_get`'s description says "a tcp one and a tls one" | the same | **merged** #2913 `9db21bd06`; prod `hosted-20261025-9db21bd`, field-verified |
+| P4-6-0 | `roomler_connect`, as designed (§3e "P4-6, `roomler_connect`, as designed"), docs only: an entity names its engine, credential and options as reserved facts, read only when `active` or `stale` (decision 59); its paths are measured ones, this device's own finding, else a probe from here, else a device's through a forward with no listener, TLS verified end to end (decision 60); a starter holding `KNOWHOW_VIEW` may ask (decision 61); people later (decision 62) | docs only | **in review** |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -5008,6 +5075,51 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - **A row of each probe kind a device**, the operator's answer to the P4-5-4 roll note
       (2026-10-25: "2 rows per device"), built in P4-5-4b. A `tcp` probe after a `tls` one no
       longer hides the device's certificate.
+59. **Where an entity says how it is reached** (P4-6), for the operator to confirm.
+    - *Recommended: reserved fact paths* (§3e "P4-6, `roomler_connect`, as designed"): `engine`,
+      `credential` (a vault handle), `database`, `auth`, `auth_source` and `ca`, beside the
+      probe's `address`, `host`, `port` and `sni`. Only `active` and `stale` facts are read, so a
+      session's proposal places no credential until a person confirms it.
+      - What it costs: an entity with two ways in (a primary and a replica, say) is two entities,
+        or waits for a later shape.
+    - *Or: a typed `access` list on the entity* (design §9.1's `access` and `credentials`), each
+      entry an engine, a target and a handle.
+      - What it costs: a second store beside the facts, with its own writes, provenance, history
+        and staleness, before a single path is used.
+    - *Or: the session names the credential and the upstream itself*, as `vault_connect` takes
+      them today.
+      - What it costs: no map in the loop; `roomler_connect` adds only the path.
+60. **Which paths `roomler_connect` takes, and in what order** (P4-6), for the operator to confirm.
+    - *Recommended: measured paths only.* This device, when its own last finding is `ok` and
+      fresh; when it has none, one probe from here in the same call; then each device whose last
+      finding is `ok` and fresh, newest first, through a forward. Fresh is
+      `knowhow.connect_fresh_secs`, 24 h by default. With none, the answer names who tried and
+      what to measure.
+      - What it costs: an entity no device has probed cannot be reached until one does, even when
+        a plain connect from here would have worked.
+    - *Or: dial from here first, then the measured paths*, the cheapest first.
+      - What it costs: an assumed path, against pillar 2's first commitment, and a connect that
+        waits out a dead route's timeout before trying the path that works.
+    - *Or: the measured paths without the probe from here.*
+      - What it costs: a device that can reach the target but never probed it goes through
+        another device, or nowhere.
+61. **Who may ask a `roomler_connect`** (P4-6), for the operator to confirm.
+    - *Recommended: a session whose starter holds `KNOWHOW_VIEW`*, read at every call: the plan
+      is a read of the map, and the vault and the network decide every reach as they do today.
+      - What it costs: whoever may read the map may ask for a plan through it; whether it opens
+        anything stays the vault's and the network's to say.
+    - *Or: `KNOWHOW_EDIT`*, as a probe needs (decision 54).
+      - What it costs: a reader's session cannot connect through the map, though the same reader
+        could pass the same handle to `vault_connect` by hand.
+62. **When people get it: `roomler connect <kind>/<key>`** (design §8.7), for the operator to
+    confirm.
+    - *Recommended: after P4-6-1 is field-verified for sessions, as P4-6-2*, on P3-9's
+      machinery (the device's owner as the principal, `secret:connect`, `vault.people`).
+      - What it costs: people keep naming a handle and an upstream (`roomler connect <handle>`)
+        until then.
+    - *Or: in P4-6-1, beside the sessions' half.*
+      - What it costs: two principals' paths built and verified at once: a session's, decided for
+        its starter, and a person's, decided for the device's owner.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
@@ -5131,6 +5243,7 @@ The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod u
 | 2026-10-25 | prod `hosted-20261025-8a58c53`; NEO16-WSL given the operator's a–e (the token root-only, `hive_api_key_helper`, `hive_enabled`, the operator's user mapped, a folder) | P4k, first: may a grox device host the session step 251 named | ✅ No: grox's `GET …/hive` is **404** "agent sessions are not available to this organization". Prod serves sessions to the vmtest org alone (decision 10), so step 251's choice of NEO16-WSL was wrong, and its a–e stay inert while widening decision 10 is the operator's |
 | 2026-10-25 | the same server. A kept vmtest Ubuntu cell, re-enrolled non-ephemeral as `p4k-u1` on the released 0.4.170, Claude Code 2.1.310, Haiku pinned, the turns on the operator's subscription (the token file's first token, piped into a root-only file and never printed). `endpoint field/roomler-web` on the vmtest org's map with roomler.ai's names and fingerprint; the vmtest admin prompting over the viewer peer and answering each approval | P4k's session half: a session's `knowhow_verify`, denied, allowed, and allowed once the owner's list was emptied (`config clear knowhow_probe_reach`, live) | ✅ **Denied** (17:38:44Z): the device ran no probe, the entity stayed at rev 1, and the session was told "Denied by vmtest admin". **Allowed** (17:39:17Z): a `tls` probe `ok` from `p4k-u1`, 0 ms, `direct`, requested after the approval, its record naming the session and no person. All four facts `verified` `ok`, rev 1 → 2, a `verify` history row; the session answered "Outcome ok, round trip 0 ms, carrier direct, certificate names roomler.ai and *.roomler.ai". **The list emptied**: `not_allowed`, nothing recorded (rev 2 → 2), and the session told so. The cell was destroyed after, the token with its disk, and its device row deleted |
 | 2026-10-25 | prod `hosted-20261025-c2ec495` (P4-5-4; both pods from 19:15:00Z, `/health` 0.4.171) | P4-5-4: what a card shows of the devices' findings. First on `hosted-20261025-8a58c53` (18:14:47Z), the vmtest org's `field/roomler-web`, holding P4k's `ok` probe and a later `not_allowed` one; then after the roll on it and on grox's | ✅ Before the roll the vmtest card had **no `probes`**; at 19:19:02Z **exactly one row**, P4k's `ok`, the `not_allowed` taking none. Grox's card, with no new probe: **7 rows from 7 devices**, newest first: one `tcp`, five `tls` with the map's fingerprint, and one `tls` with **another key** under the same names (CORPLAP-2's inspected network), the facts' last word still `ok`. 15 of 21 grox devices were online as before, and the mesh ping to mars took 31 ms. ⚠️ The `tls` facts' last word was a probe that was no row: NEO16-WSL's `tcp` probe, half a second after its `tls` one, was its last finding → the operator chose a row of each kind (P4-5-4b) |
+| 2026-10-25 | prod `hosted-20261025-9db21bd` (P4-5-4b; both pods from 21:36:22Z, `/health` 0.4.171). Master's per-push CI had cancelled the run on `9db21bd06`; the promote waited for this commit's own hosted-image, integration and installer-smoke runs and for master's newest CI, on `8a92ddfb6`, which contains it | P4-5-4b: a row of each probe kind a device. First on `hosted-20261025-c2ec495` (21:33:59Z), then after the roll, on grox's `field/roomler-web` with no new probe | ✅ Before the roll: 7 rows from 7 devices, none with two rows, and the `tls` facts' last word (NEO16-WSL's `tls` probe) no row. At 21:37:02Z: **8 rows from 7 devices**, NEO16-WSL's `tcp` and `tls` findings each a row, and that `tls` row is the facts' last word. The other key behind the inspecting network was still shown, with 15 of 21 devices online as before and the mesh ping to mars at 31 ms. Unchanged at 22:43Z on `hosted-20261025-6c1760b`, roomler-ai-4c's 0.4.172 roll |
 
 ## 9. Related
 
