@@ -147,7 +147,7 @@ tun = { version = "0.8", optional = true, features = ["async"] }
 # default-features off to drop the Unix-only phy backends (`phy-tuntap_interface`)
 # and the protocols we don't terminate; we feed/drain raw IP packets ourselves
 # via a channel-backed `phy::Device`, so only the `medium-ip` surface is needed.
-smoltcp = { version = "0.13", optional = true, default-features = false, features = [
+smoltcp = { version = "0.14", optional = true, default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
@@ -159,7 +159,10 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     # #2876: without a congestion controller smoltcp pushes its whole window at line
     # rate and recovers by 1 s RTOs, so a policed path (the relay allowance) holds
     # 48.5 kbit/s where kernel TCP holds the bucket's 0.86 Mbit/s. Reno, not Cubic:
-    # smoltcp 0.13's Cubic computes its curve in bytes and pins the window (netstack.rs).
+    # smoltcp 0.13's Cubic computed its curve in bytes and pinned the window. And 0.14,
+    # not 0.13: 0.13 doubled the RTO on every FAST retransmit too, and resent the whole
+    # window for it, so on a 30 ms path the timer climbed to 60 s and the same scp held
+    # 33 kbit/s. 0.14 resends one segment, backs off only on a timeout (netstack.rs).
     "socket-tcp-reno",
     "socket-udp",
     "socket-icmp",
