@@ -58,9 +58,10 @@ does. Unlike the two above, it does not fail silently: if it is turned off,
 that recording is refused and names the setting. Where the **root half** runs
 the screen (`macos_supervise_gui_worker`), macOS asks the same way from agent
 0.4.168. Agents 0.4.166 and 0.4.167 refuse the microphone by name there,
-because macOS never asked, rather than record silence. That first recording
-may stop before you have answered macOS's question. Your answer is kept, so
-start it again and it records.
+because macOS never asked, rather than record silence. From agent 0.4.170 the
+first recording waits while macOS asks you. Before it, that recording could
+stop before you had answered; your answer was kept, so starting it again
+recorded.
 
 You do not have to hunt: the **menu-bar app** names whichever grant is missing
 and opens the right pane. The agent also probes both at startup and reports the
