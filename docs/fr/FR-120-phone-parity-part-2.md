@@ -3,7 +3,7 @@
 **Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** in progress. On production, all
 on 2026-10-24: P5 (#2843) and P2 (#2845) since 20:34Z (`hosted-20261024-fa90220`), P3 (#2848) since 20:47Z
 (`hosted-20261024-9ea48a1`), P1a (#2850) since 22:05Z (with FR-27's `hosted-20261024-46f3f84`), and P1b (#2856) since
-22:30Z (`hosted-20261024-d96b623`). P6 (#2883) merged on 2026-10-25, with the next roll to come; P4a (#2887, with P7's docs) and P4b (#P4BPR) are in review · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
+22:30Z (`hosted-20261024-d96b623`). P6 (#2883) merged on 2026-10-25, with the next roll to come; P4a (#2887, with P7's docs) and P4b (#2895) are in review · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (#2561, closed 2026-10-23: the same facts and actions at every width, and
 the rules in `docs/ui.md` § Phones and tablets)
 
@@ -105,7 +105,7 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 | **P1** — P1a #2850 (the facts) · P1b #2856 (the viewer, Vault) | tap paths for hover-only facts; disabled reasons as text | revert: UI only | the sweep's hover-only count on the touched routes, red then green on production | M |
 | **P2** — #2845 | hive on a phone | revert: UI only | the hive routes at 360 px in the vmtest org (hive is on there) | M |
 | **P3** — #2848 | dialogs and rows | revert: UI only | each dialog opened at 360 px | M |
-| **P4** — P4a #2887 (Devices, the audits, Billing) · P4b (Members, Invites, Files, the usage tables, keep-busy, the agent log, the room search) | long pages | revert: UI only | the sweep's heights, red then green | L |
+| **P4** — P4a #2887 (Devices, the audits, Billing) · P4b #2895 (Members, Invites, Files, the usage tables, keep-busy, the agent log, the room search) | long pages | revert: UI only | the sweep's heights, red then green | L |
 | **P5** — #2843 | the bugs | revert: UI only | the tutorial at 360 and 1300 px; sign-in's `scrollWidth` | S |
 | **P6** — #2883 | touch targets | revert: CSS only | the sweep's small-target count on a coarse pointer; desktop pixel-identical | S |
 | **P7** — with P4a, #2887 | docs | — | CI | S |
