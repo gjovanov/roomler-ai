@@ -495,7 +495,7 @@ carrier: the target is reachable, the bytes arrive intact, and the carrier stays
 
 ⚠️ **Stability counts transitions from an allow-list of carrier shapes** (`direct`, `lan`,
 `relay:*`). The `CONN` column of `roomler peers` also carries *states* — `upgrading` (a
-make-before-break probe on a relayed peer, [`localclient.rs:1259`](../agents/roomler-cli/src/localclient.rs#L1259)),
+make-before-break probe on a relayed peer, [`localclient.rs:1278`](../agents/roomler-cli/src/localclient.rs#L1278)),
 `stalled`, `offline` — and counting those as carriers once reported a healthy peer as flapping.
 They are tallied separately, and any value outside both lists is **reported, never counted**.
 A result reads `transitions=<n>/<k>samples`: for three runs the lane printed
@@ -517,7 +517,7 @@ corporate laptop, a real relay path, or both:
 | round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1104`](../agents/roomlerd/src/ssh.rs#L1104)) |
 | round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:404`](../agents/roomlerd/src/ssh.rs#L404)) |
 | round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:587`](../crates/modules/network/src/routes/agent_ssh.rs#L587)) |
-| round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:598`](../agents/roomler-cli/src/localclient.rs#L598)) |
+| round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:617`](../agents/roomler-cli/src/localclient.rs#L617)) |
 
 ### Reference run — `20260924-155559`, every target on agent 0.4.101
 
