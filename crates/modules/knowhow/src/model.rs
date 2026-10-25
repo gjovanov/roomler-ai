@@ -65,7 +65,9 @@ pub const EDGE_KINDS: &[&str] = &[
 pub const STATUS_ACTIVE: &str = "active";
 /// A session's claim, until a probe or a person confirms it (P4-4).
 pub const STATUS_PROPOSED: &str = "proposed";
-/// Unverified for longer than the organization allows (P4-5).
+/// Unverified for longer than the organization allows (P4-5-3,
+/// [`crate::stale`]): a person's fact, or a confirmed proposal, that nothing
+/// confirmed for `knowhow.stale_days`.
 pub const STATUS_STALE: &str = "stale";
 /// Tombstoned: kept as a record, no longer on the map.
 pub const STATUS_ARCHIVED: &str = "archived";
@@ -81,6 +83,9 @@ pub const SOURCE_SESSION: &str = "session";
 /// P4-5 — a probe's write, as its history row names it. Never a fact's
 /// source: a probe records what it measured of facts others said.
 pub const SOURCE_PROBE: &str = "probe";
+/// P4-5-3 — the server's own write by a rule (a fact turned stale), as its
+/// history row names it. Never a fact's source either.
+pub const SOURCE_SYSTEM: &str = "system";
 
 /// The longest key, in bytes.
 pub const MAX_KEY_LEN: usize = 255;
@@ -317,6 +322,9 @@ pub const OP_ARCHIVE: &str = "archive";
 pub const OP_CONFIRM: &str = "confirm";
 /// P4-5 — a probe recorded what it measured on facts (decision 56).
 pub const OP_VERIFY: &str = "verify";
+/// P4-5-3 — facts nothing confirmed for `knowhow.stale_days` turned stale
+/// (decisions 40 and 57).
+pub const OP_STALE: &str = "stale";
 
 /// P4-3a — one scan asked of a device (the FR-90 spec, §3e "P4-3, scans, as
 /// designed"): who asked and when, where it is, and how it ended. The row is

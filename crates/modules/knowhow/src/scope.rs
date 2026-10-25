@@ -57,6 +57,12 @@ impl TenantScope {
         self.0.as_ref().is_none_or(|ids| ids.contains(&tenant))
     }
 
+    /// P4-5-3 — the organizations listed, for a query that reads only
+    /// theirs; `None` for every organization.
+    pub fn listed(&self) -> Option<Vec<ObjectId>> {
+        self.0.as_ref().map(|ids| ids.iter().copied().collect())
+    }
+
     /// Said once at boot, so the log shows whose maps are kept.
     pub fn log(&self) {
         match &self.0 {

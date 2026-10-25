@@ -13,7 +13,7 @@ use crate::KnowhowState;
 use crate::dao::MAX_EDGES;
 use crate::model::{
     KnowhowHistory, OP_ARCHIVE, Provenance, SOURCE_PERSON, SOURCE_PROBE, SOURCE_SCAN,
-    SOURCE_SESSION, SOURCE_SYNC, STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
+    SOURCE_SESSION, SOURCE_SYNC, SOURCE_SYSTEM, STATUS_ARCHIVED, TARGET_EDGE, TARGET_ENTITY,
 };
 
 /// The links an archive takes with it, per read.
@@ -98,6 +98,20 @@ impl Stamp {
             session: None,
             why: None,
             source: SOURCE_PROBE,
+            at: DateTime::now(),
+        }
+    }
+
+    /// P4-5-3 — the server's own rule (a fact turned stale): nobody wrote
+    /// it, and it sets no fact's value.
+    pub(crate) fn system(tid: ObjectId) -> Self {
+        Self {
+            tid,
+            by: None,
+            device: None,
+            session: None,
+            why: None,
+            source: SOURCE_SYSTEM,
             at: DateTime::now(),
         }
     }

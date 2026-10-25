@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{
     KnowhowEdge, KnowhowEntity, KnowhowHistory, KnowhowProbe, KnowhowScan, Measured,
     PROBE_DELIVERED, PROBE_EXPIRED, PROBE_REQUESTED, SCAN_DELIVERED, SCAN_EXPIRED, SCAN_REQUESTED,
-    SOURCE_SCAN, STATUS_ARCHIVED, ScanWritten,
+    SOURCE_PERSON, SOURCE_SCAN, SOURCE_SESSION, STATUS_ACTIVE, STATUS_ARCHIVED, ScanWritten,
 };
 
 /// The most live entities an organization's map holds.
@@ -203,6 +203,43 @@ impl EntityDao {
             .into_iter()
             .filter_map(|b| b.as_object_id())
             .collect())
+    }
+
+    /// P4-5-3 — a page of the live entities holding a fact that may have
+    /// aged past `cutoff`: an `active` one of a person or a session, written
+    /// before it. A superset, since a later probe or confirmation keeps a
+    /// fact young: which facts turn stale is [`crate::stale::turning`]'s to
+    /// say. Only the organizations in `tenants`, when it lists any; by id,
+    /// after `after`, at most `limit`.
+    pub async fn ageing(
+        &self,
+        tenants: Option<&[ObjectId]>,
+        cutoff: DateTime,
+        after: Option<ObjectId>,
+        limit: i64,
+    ) -> DaoResult<Vec<KnowhowEntity>> {
+        let mut filter = doc! {
+            "deleted_at": null,
+            "facts": { "$elemMatch": {
+                "status": STATUS_ACTIVE,
+                "source": { "$in": [SOURCE_PERSON, SOURCE_SESSION] },
+                "observed_at": { "$lt": cutoff },
+            } },
+        };
+        if let Some(ids) = tenants {
+            filter.insert("tenant_id", doc! { "$in": ids.to_vec() });
+        }
+        if let Some(after) = after {
+            filter.insert("_id", doc! { "$gt": after });
+        }
+        let cursor = self
+            .base
+            .collection()
+            .find(filter)
+            .sort(doc! { "_id": 1 })
+            .limit(limit)
+            .await?;
+        Ok(cursor.try_collect().await?)
     }
 
     /// Set fields on a live entity, at the rev its writer read, and bump it.
