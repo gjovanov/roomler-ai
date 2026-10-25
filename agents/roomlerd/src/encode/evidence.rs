@@ -71,17 +71,22 @@ pub enum Reason {
     /// opener window (at least 2 s from the first keyframe and until the send
     /// ledger drains, at most 3 s), now kept for every session.
     Opening,
-    /// FR-119 P2b-13 — on a direct path, the window's only blocked sends were
-    /// keyframes. SCTP grows its congestion window only while data is queued,
-    /// so the deltas before a keyframe leave it about one delta's size, and a
+    /// FR-119 P2b-13 — on a direct path, the window held a blocked keyframe.
+    /// SCTP grows its congestion window only while data is queued, so the
+    /// deltas before a keyframe leave it about one delta's size, and a
     /// keyframe many times larger spends its send growing it back: the
-    /// opening's defect at a later moment of the session. A pipe narrower
-    /// than the stream shows it in the deltas queued behind the keyframe,
-    /// which block too, so their window is still read. Field 2026-10-24: one
-    /// 625 KB keyframe blocked 71.6 ms and folded as 69.9 Mbit/s on a mesh
-    /// path that carried 311 Mbit/s over TCP, and took a granted 120 fps
-    /// back. Direct only, as the opening began: on a relay a keyframe's drain
-    /// is dominated by the path, and may be the only sample a session gets.
+    /// opening's defect at a later moment of the session. Field 2026-10-24:
+    /// one 625 KB keyframe blocked 71.6 ms and folded as 69.9 Mbit/s on a mesh
+    /// path that carried 311 Mbit/s over TCP, and took a granted 120 fps back.
+    /// P2b-14 widened it from "only keyframes" to "a keyframe at all": the
+    /// deltas queued behind a keyframe block on its backlog, so they measure
+    /// the same ramp. Field 2026-10-25: the idle-settle keyframe after a
+    /// motion burst blocked 66 ms beside such a delta, the window folded as
+    /// 60.7 Mbit/s against an 88.8 Mbit/s ceiling, and 120 went back after
+    /// 6 s on a LAN path. A pipe narrower than the stream still shows: its
+    /// deltas block in the keyframe-free windows too. Direct only, as the
+    /// opening began: on a relay a keyframe's drain is dominated by the path,
+    /// and may be the only sample a session gets.
     KeyframeBurst,
     /// The classifier says the transport stalled in this window.
     TransitStalled,
