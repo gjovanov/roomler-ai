@@ -71,6 +71,70 @@ authenticated peer is not a trusted one): IPv4 + TCP + exact destination +
 first fragment only, every field bounds-checked, malformed input answered with
 "not ours" rather than a panic.
 
+### The in-process TCP stack on a lossy or policed path (#2876, #2882)
+
+Interception has a cost: every byte a session sends leaves through smoltcp, not
+the OS TCP stack. Two properties of that stack had to be fixed before roomler
+SSH held up on a path that loses packets. The worst case is a path that polices
+rather than queues, like the relay allowance (FR-115), which drops a network's
+frames once they pass its bucket.
+
+**It needs a congestion controller.** smoltcp ships without one by default. It
+then sends the receiver's whole window at line rate and repairs every loss by
+retransmission timer, whose floor is 1 s. Measured on 0.4.169, a pair held on
+the DERP floor with its org over the Free allowance (a 1 Mbit/s bucket):
+
+| transfer | throttled | unthrottled, same pair |
+|---|---|---|
+| `scp` over roomler SSH (sender = smoltcp) | 1 MiB in 173 s = **48.5 kbit/s** | 8 MiB in 1.01 s = 66 Mbit/s |
+| HTTP (sender = kernel TCP) | 8 MiB in 77.8 s = **0.86 Mbit/s** | 8 MiB in 0.44 s = 154 Mbit/s |
+
+Typing stayed fine throughout: keystroke echo p50 3–4 ms and p95 about 45 ms,
+while a bulk transfer held the bucket full. The netstack now runs **Reno** on
+every socket (`crates/tunnel-core/src/overlay/netstack.rs:613-632`,
+`crates/tunnel-core/Cargo.toml:159-163`).
+
+⚠️ Not smoltcp 0.13's Cubic. It evaluates RFC 8312's curve in bytes rather
+than segments, so after each update the window sits at its 2 KiB floor for
+about 11 s, and a socket's first send stalled under it.
+
+**A dropped stream must still deliver its tail.** A stream used to be aborted
+the moment the app dropped it, even after a shutdown. Whatever was queued or
+unacknowledged was discarded, and the far side read a clean EOF, so a
+truncated stream looked complete. Now:
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant Stack as netstack (smoltcp)
+  participant Peer
+  App->>Stack: write, then shutdown or drop
+  Stack->>Peer: the queued data, retransmitted until acknowledged
+  Peer-->>Stack: ACK of the last byte
+  Stack->>Peer: FIN, only once the send queue is empty
+  Note over Stack: a reset only if nothing is acknowledged for LINGER (120 s)
+  Peer->>Stack: a reset instead of a FIN
+  Stack-->>App: read fails with ConnectionReset, never EOF
+```
+
+- **Drop closes like `close()`.** The queue drains, then a FIN
+  (`netstack.rs:889-907`). It is reset only if the close stalls, with nothing
+  acknowledged for `LINGER` (`netstack.rs:93-100`). A slow close always finishes.
+- **The FIN waits for the last ACK** (`netstack.rs:995-1009`). smoltcp's
+  `close()` with data still unacknowledged wedged the socket under loss: it
+  stopped retransmitting, with an open window, and the tail never came.
+- **A reset is an error.** A connection that ends without a FIN reads as
+  `ConnectionReset` (`netstack.rs:944-952`, `454-460`).
+
+Locked by three tests that each failed on the old stack. Two stacks are
+cross-linked through a bucket like the relay's (`netstack.rs:1417-1458`):
+
+| test | what it holds |
+|---|---|
+| `a_policed_path_keeps_most_of_its_rate` | 512 KiB arrives at about the bucket's rate. Before: 479,832 B, then EOF |
+| `a_dropped_stream_still_delivers_its_tail` | a drop without `shutdown` still delivers every byte. Before: the tail never came |
+| `a_reset_reads_as_an_error_not_eof` | a reset is `ConnectionReset`. Before: 703,720 B, then a clean EOF |
+
 ## 2. Configuration
 
 | Key | Default | Meaning |
