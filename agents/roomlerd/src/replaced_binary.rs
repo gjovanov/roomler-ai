@@ -681,14 +681,24 @@ mod tests {
         }
     }
 
+    /// "Absolute" as the platform the test runs on spells it (#2886): on
+    /// Windows `Path::is_absolute` wants a drive AND a root, so a Unix path
+    /// there is only rooted, and the function rightly falls through.
     #[test]
     fn the_exec_path_is_argv0_when_absolute_else_the_resolved_executable() {
         use std::ffi::OsStr;
         use std::path::PathBuf;
-        let exe = Some(PathBuf::from("/usr/lib/roomler/roomlerd"));
+        #[cfg(windows)]
+        let (argv0, resolved) = (
+            r"C:\Program Files\Roomler\roomlerd.exe",
+            r"C:\Program Files\Roomler\bin\roomlerd.exe",
+        );
+        #[cfg(not(windows))]
+        let (argv0, resolved) = ("/usr/bin/roomlerd", "/usr/lib/roomler/roomlerd");
+        let exe = Some(PathBuf::from(resolved));
         assert_eq!(
-            pick_exec_path(Some(OsStr::new("/usr/bin/roomlerd")), exe.clone()),
-            Some(PathBuf::from("/usr/bin/roomlerd"))
+            pick_exec_path(Some(OsStr::new(argv0)), exe.clone()),
+            Some(PathBuf::from(argv0))
         );
         assert_eq!(
             pick_exec_path(Some(OsStr::new("roomlerd")), exe.clone()),
@@ -696,6 +706,13 @@ mod tests {
         );
         assert_eq!(pick_exec_path(None, exe.clone()), exe);
         assert_eq!(pick_exec_path(Some(OsStr::new("./roomlerd")), None), None);
+        // Rooted is not absolute here: no drive, so not what argv[0] is
+        // trusted for.
+        #[cfg(windows)]
+        assert_eq!(
+            pick_exec_path(Some(OsStr::new("/usr/bin/roomlerd")), exe.clone()),
+            exe
+        );
     }
 
     #[test]

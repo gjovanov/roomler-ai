@@ -225,21 +225,22 @@ mod tests {
     }
 
     /// #1035 — the regression test. An INHERITABLE pipe is open in this
-    /// process when the child is started; the parent then closes its write
-    /// end and reads. With no inheritance the read sees end-of-file at once;
-    /// if the child got a copy of the write handle, the read blocks until the
-    /// child exits (~3 s here). `std::process::Command` — the pre-D6 spawn —
-    /// fails this.
+    /// process when the child is started, and the child's own handle table is
+    /// asked whether it holds our write end (#2886,
+    /// [`inherited_handle`](super::super::inherited_handle): timing the pipe's
+    /// EOF instead blamed this spawn for any sibling in the suite that
+    /// inherited the decoy). The control is the pre-D6 spawn itself —
+    /// `std::process::Command` — started while the pipe is open: asked the
+    /// same question, it must say yes.
     #[test]
     fn the_spawned_child_holds_no_handle_of_ours() {
-        use std::sync::mpsc;
-        use std::time::Duration;
+        use super::super::inherited_handle::{held_by, unbounded_sibling};
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, TRUE};
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-        use windows_sys::Win32::Storage::FileSystem::ReadFile;
         use windows_sys::Win32::System::Pipes::CreatePipe;
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+            OpenProcess, PROCESS_DUP_HANDLE, PROCESS_TERMINATE, TerminateProcess,
         };
 
         let sa = SECURITY_ATTRIBUTES {
@@ -251,58 +252,36 @@ mod tests {
         // SAFETY: out-pointers are valid; `sa` outlives the call.
         assert_ne!(unsafe { CreatePipe(&mut read, &mut write, &sa, 0) }, 0);
 
-        // A child that lives ~3 s and never touches the pipe.
+        // A child that lives a few seconds and never touches the pipe.
         let ping = std::path::PathBuf::from(
             std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
         )
         .join("System32")
         .join("PING.EXE");
-        let pid = spawn_detached_no_inherit(&ping, &["-n", "4", "127.0.0.1"])
+        let pid = spawn_detached_no_inherit(&ping, &["-n", "6", "127.0.0.1"])
             .expect("spawning the probe child");
+        // SAFETY: our own child, opened for the two rights used below.
+        let child = unsafe { OpenProcess(PROCESS_DUP_HANDLE | PROCESS_TERMINATE, 0, pid) };
+        assert!(!child.is_null(), "opening the probe child");
+        let mut sibling = unbounded_sibling();
 
-        // SAFETY: we own `write`; closing it leaves only copies a child took.
-        unsafe { CloseHandle(write) };
-        let read_raw = read as usize;
-        let (tx, rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let mut buf = [0u8; 16];
-            let mut n = 0u32;
-            // SAFETY: `read_raw` is our live read handle; buffer is valid.
-            let ok = unsafe {
-                ReadFile(
-                    read_raw as HANDLE,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    &mut n,
-                    std::ptr::null_mut(),
-                )
-            };
-            let _ = tx.send((ok, n));
-        });
-        let eof_at_once = rx.recv_timeout(Duration::from_millis(1500));
+        let detached = held_by(child, write);
+        let unbounded = held_by(sibling.as_raw_handle() as HANDLE, write);
 
-        // Clean up the child either way, then the reader.
-        // SAFETY: plain process-handle open/terminate/close on our own child.
+        // SAFETY: `child` is ours to end and close; both pipe ends are ours.
         unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !h.is_null() {
-                TerminateProcess(h, 0);
-                CloseHandle(h);
-            }
+            TerminateProcess(child, 0);
+            CloseHandle(child);
+            CloseHandle(write);
+            CloseHandle(read);
         }
-        let _ = reader.join();
-        // SAFETY: we own `read`.
-        unsafe { CloseHandle(read) };
+        let _ = sibling.kill();
+        let _ = sibling.wait();
 
-        match eof_at_once {
-            Ok((ok, n)) => assert!(
-                ok == 0 && n == 0,
-                "the read must end in end-of-file (broken pipe), got ok={ok} n={n}"
-            ),
-            Err(_) => panic!(
-                "the pipe stayed open after the parent closed its end: the child \
-                 inherited our write handle (#1035)"
-            ),
-        }
+        assert!(
+            unbounded,
+            "the control: the pre-D6 spawn must be seen holding our write handle"
+        );
+        assert!(!detached, "the child inherited our write handle (#1035)");
     }
 }
