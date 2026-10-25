@@ -3752,6 +3752,71 @@ pub(crate) async fn hold_daemon_for_install(socket: PathBuf, ceiling: Duration) 
     }
 }
 
+// The operator's opt-out, current path first.
+// FR-46 P5a — dual-read, and the SENSE is what makes it mandatory: this is
+// an OPT-OUT. Reading only the current path would auto-update a host whose
+// operator opted out under the legacy one, which is the one outcome the
+// marker exists to prevent. The .pkg postinstall migrates the directory, so
+// the legacy arm is normally dead; it covers a host whose move could not
+// happen and a helper still running from before the migration.
+// RETIRED-NAME-ANCHOR(6): the legacy opt-out marker, honoured as a fallback.
+// Deletable once no host can still have one. docs/fr/FR-46
+pub(crate) const OPT_OUT_MARKERS: [&str; 2] = [
+    "/etc/roomler/disable-auto-update",
+    "/etc/roomler-agent/disable-auto-update",
+];
+
+/// #2901 — the opt-out marker present on this host, if any. One list, read by
+/// the root update helper AND by a daemon deciding whether to arm its own
+/// updater. Before #2901 only the helper read it, so a Linux SYSTEM install,
+/// whose root daemon installs its own updates, kept updating itself (and kept
+/// moving its companion package, FR-117) on a host frozen the documented way.
+/// Unix only: the markers are `/etc` paths, and Windows has no such opt-out.
+pub fn opt_out_marker() -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        opt_out_marker_in(|p| std::path::Path::new(p).exists())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+fn opt_out_marker_in(exists: impl Fn(&str) -> bool) -> Option<&'static str> {
+    OPT_OUT_MARKERS.iter().copied().find(|p| exists(p))
+}
+
+/// #2901 — whether this daemon arms its own updater at its start, and if not,
+/// which of the two opt-outs said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoUpdate {
+    On,
+    /// `auto_update = false` or `ROOMLERD_AUTO_UPDATE=0`.
+    OffBySetting,
+    /// The operator's marker file: updates on this host are manual.
+    OptedOut(&'static str),
+}
+
+/// #2901 — the start-up decision, pure so the lib tests can pin it (the
+/// daemon's `main.rs` has no test lane). `setting` is the resolved
+/// `AUTO_UPDATE` value (config key or env); `marker` is [`opt_out_marker`].
+/// Either opt-out turns the updater off. A setting that says off is reported
+/// first, because it is the one the operator set on this daemon.
+pub fn auto_update_decision(setting: Option<&str>, marker: Option<&'static str>) -> AutoUpdate {
+    let on_by_setting = setting
+        .map(|v| !matches!(v, "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    if !on_by_setting {
+        return AutoUpdate::OffBySetting;
+    }
+    match marker {
+        Some(m) => AutoUpdate::OptedOut(m),
+        None => AutoUpdate::On,
+    }
+}
+
 /// `roomlerd update-helper` — the body of `com.roomler.update` on macOS, and
 /// of `roomler-update.service` on Linux (FR-96).
 ///
@@ -3859,20 +3924,10 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
     // The operator's opt-out. postinstall removes the launchd unit when this
     // marker is set, but a loaded job can linger until reboot (it must not
     // bootout its own ancestor mid-install) — so the helper honours the
-    // marker itself, making the lingering job harmless.
-    // FR-46 P5a — dual-read, and the SENSE is what makes it mandatory: this is
-    // an OPT-OUT. Reading only the current path would auto-update a Mac whose
-    // operator opted out under the legacy one, which is the one outcome the
-    // marker exists to prevent. The .pkg postinstall migrates the directory, so
-    // the legacy arm is normally dead; it covers a host whose move could not
-    // happen and a helper still running from before the migration.
-    // RETIRED-NAME-ANCHOR(6): the legacy opt-out marker, honoured as a fallback.
-    // Deletable once no Mac can still have one. docs/fr/FR-46
-    const OPT_OUT: [&str; 2] = [
-        "/etc/roomler/disable-auto-update",
-        "/etc/roomler-agent/disable-auto-update",
-    ];
-    if let Some(marker) = OPT_OUT.iter().find(|p| std::path::Path::new(p).exists()) {
+    // marker itself, making the lingering job harmless. The list, and why it
+    // dual-reads, is [`OPT_OUT_MARKERS`] — shared with the daemon's own
+    // updater since #2901.
+    if let Some(marker) = opt_out_marker() {
         tracing::info!(marker = %marker, "auto-update opted out — exiting");
         return Ok(());
     }
@@ -4109,6 +4164,53 @@ pub fn helper_owns_updates() -> Option<PathBuf> {
 // docs/fr/FR-21
 #[cfg(test)]
 mod tests {
+    /// #2901 — the documented opt-out marker turns a daemon's own updater off,
+    /// exactly as `auto_update = false` does. Field 2026-10-25, a Linux system
+    /// install on 0.4.170: with the marker present the daemon logged
+    /// `auto-updater armed` and FR-117 installed a package.
+    #[test]
+    fn the_opt_out_marker_turns_the_daemons_updater_off() {
+        use super::{AutoUpdate, OPT_OUT_MARKERS, auto_update_decision};
+        let marker = OPT_OUT_MARKERS[0];
+        assert_eq!(auto_update_decision(None, None), AutoUpdate::On);
+        assert_eq!(auto_update_decision(Some("true"), None), AutoUpdate::On);
+        assert_eq!(
+            auto_update_decision(None, Some(marker)),
+            AutoUpdate::OptedOut(marker)
+        );
+        assert_eq!(
+            auto_update_decision(Some("1"), Some(marker)),
+            AutoUpdate::OptedOut(marker),
+            "a setting that says ON does not override the operator's marker"
+        );
+        for off in ["0", "false", "no", "off"] {
+            assert_eq!(
+                auto_update_decision(Some(off), None),
+                AutoUpdate::OffBySetting
+            );
+            // Both say off: the daemon's own setting is the reason reported.
+            assert_eq!(
+                auto_update_decision(Some(off), Some(marker)),
+                AutoUpdate::OffBySetting
+            );
+        }
+    }
+
+    /// #2901 — one list for the helper and the daemon, current path first, the
+    /// legacy one still honoured (an opt-out that read only the new path would
+    /// update a host whose operator opted out under the old one).
+    #[test]
+    fn the_opt_out_marker_reads_both_paths_current_first() {
+        use super::{OPT_OUT_MARKERS, opt_out_marker_in};
+        assert_eq!(OPT_OUT_MARKERS[0], "/etc/roomler/disable-auto-update");
+        assert_eq!(opt_out_marker_in(|_| false), None);
+        assert_eq!(opt_out_marker_in(|_| true), Some(OPT_OUT_MARKERS[0]));
+        assert_eq!(
+            opt_out_marker_in(|p| p == OPT_OUT_MARKERS[1]),
+            Some(OPT_OUT_MARKERS[1])
+        );
+    }
+
     /// FR-67 P7 — the hello's word for each case the `rc:agent.update` arm
     /// handles: a secondary ignores the push whatever its updater, a primary
     /// with no trigger drops it, and only a primary with one acts.
