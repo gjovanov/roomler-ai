@@ -11,7 +11,8 @@
 //! record naming the session and no person; a verify the map cannot ask is
 //! refused in a word (`unprobeable`, `not_found`, `bad_request`); and a
 //! session asks a probe only while its starter holds `KNOWHOW_EDIT`, as a
-//! person's probe needs (`denied`).
+//! person's probe needs (`denied`). P4-5-4: the card a session reads then
+//! shows what its device found.
 
 use std::time::Duration;
 
@@ -155,6 +156,29 @@ async fn a_session_verifies_an_entity_from_its_own_device() {
         probe["measured"],
         json!([{ "path": "address", "ok": true }, { "path": "port", "ok": true }])
     );
+
+    // P4-5-4 — the card the session reads shows what its device found.
+    let card = ask(
+        &mut dev.ws,
+        "g1",
+        "rc:knowhow.get",
+        &sid,
+        fence,
+        json!({ "kind": "endpoint", "key": "db" }),
+    )
+    .await;
+    assert_eq!(card["t"], "rc:knowhow.card", "{card}");
+    let rows = card["card"]["probes"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{card}");
+    assert_eq!(
+        (
+            rows[0]["id"].clone(),
+            rows[0]["device_id"].clone(),
+            rows[0]["session"].clone()
+        ),
+        (json!(probe_id), json!(dev.agent_id), json!(sid))
+    );
+    assert_eq!(card["card"]["probes_truncated"], json!(false));
 
     // Once it has answered, the same verify asks a new probe: one at a time
     // and the ceiling are the device's, as for a person's probe.

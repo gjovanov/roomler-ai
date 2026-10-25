@@ -14,6 +14,10 @@
 //! that says nowhere a probe reaches 400, a member 403; one probe at a time a
 //! device, 30 a minute; an offline device is told at its hello; an answer for
 //! a probe it was not sent is dropped; and one never answered expires.
+//!
+//! P4-5-4 (decision 58) — an entity's card shows each device's last probe
+//! that found something, newest first and at most sixteen, beside each
+//! fact's `verified`, which stays the last word.
 
 use std::time::Duration;
 
@@ -611,4 +615,243 @@ async fn a_probe_waits_for_its_device_and_expires_unanswered() {
     let (code, next) = ask(&app, &t, &admin, &db, &device, "tcp").await;
     assert_eq!(code, 202, "{next}");
     assert_ne!(next["id"], json!(stale.as_object_id().unwrap().to_hex()));
+}
+
+/// An entity's card, whole.
+async fn card(app: &TestApp, t: &SeededTenant, entity: &str) -> Value {
+    let (code, card) = call(app.auth_get(
+        &kpath(&t.tenant_id, &format!("/entity/{entity}")),
+        &t.admin.access_token,
+    ))
+    .await;
+    assert_eq!(code, 200, "{card}");
+    card
+}
+
+/// Ask `device` to probe `entity` as the owner, answer it as `body` says,
+/// and wait until its record is final: the probe's id.
+async fn probed(
+    app: &TestApp,
+    t: &SeededTenant,
+    entity: &str,
+    device: &str,
+    ws: &mut Ws,
+    kind: &str,
+    body: Value,
+) -> String {
+    let (code, asked) = ask(app, t, &t.admin.access_token, entity, device, kind).await;
+    assert_eq!(code, 202, "{asked}");
+    let id = asked["id"].as_str().unwrap().to_string();
+    assert_eq!(probe_sent(ws).await["probe_id"], json!(id));
+    let mut frame = body;
+    frame["probe_id"] = json!(id);
+    let measures = frame["outcome"] == json!("ok") || frame["outcome"] == json!("unreachable");
+    answer(ws, frame).await;
+    wait_probe(app, t, entity, |p| {
+        let open = p["state"] == json!("requested") || p["state"] == json!("delivered");
+        p["id"] == json!(id) && !open && (!measures || !p["measured"].is_null())
+    })
+    .await;
+    id
+}
+
+/// P4-5-4 — a card shows each device's last probe that found something,
+/// newest first, beside each fact's `verified`, which stays the last word
+/// (decision 58). One device finds the certificate the map says, another a
+/// different key under the same name (a network that inspects TLS), a third
+/// the target unreachable; the first device's later probe that measured
+/// nothing (`not_allowed`) leaves its finding standing, and a probe still
+/// waiting for its answer is no one's finding.
+#[tokio::test]
+async fn a_card_shows_each_devices_last_finding_beside_the_last_word() {
+    let app = scan_app().await;
+    let t = app.seed_tenant("knowprobecard").await;
+    let (a, ta) = enroll(&app, &t, "mach-knowcard-a", "linux").await;
+    let (b, tb) = enroll(&app, &t, "mach-knowcard-b", "linux").await;
+    let (c, tc) = enroll(&app, &t, "mach-knowcard-c", "linux").await;
+    let (d, td) = enroll(&app, &t, "mach-knowcard-d", "linux").await;
+    let mut wa = hello(&app, &ta, &["knowhow-probe"], "self").await;
+    let mut wb = hello(&app, &tb, &["knowhow-probe"], "self").await;
+    let mut wc = hello(&app, &tc, &["knowhow-probe"], "self").await;
+    let mut wd = hello(&app, &td, &["knowhow-probe"], "self").await;
+    let web = endpoint(
+        &app,
+        &t,
+        "web.example.com:443",
+        json!({ "host": "web.example.com", "port": 443,
+                "tls.fingerprint": printed("AB"), "tls.names": ["web.example.com"] }),
+    )
+    .await;
+    assert_eq!(card(&app, &t, &web).await["probes"], json!([]), "none yet");
+
+    let seen = |fingerprint: String| {
+        json!({ "outcome": "ok", "rtt_ms": 5, "address": "10.0.0.5",
+                "tls": { "names": ["web.example.com"], "fingerprint": fingerprint } })
+    };
+    let pa = probed(&app, &t, &web, &a, &mut wa, "tls", seen("ab".repeat(32))).await;
+    let pb = probed(&app, &t, &web, &b, &mut wb, "tls", seen("cd".repeat(32))).await;
+    let pc = probed(
+        &app,
+        &t,
+        &web,
+        &c,
+        &mut wc,
+        "tcp",
+        json!({ "outcome": "unreachable", "detail": "timed out" }),
+    )
+    .await;
+    probed(
+        &app,
+        &t,
+        &web,
+        &a,
+        &mut wa,
+        "tcp",
+        json!({ "outcome": "not_allowed" }),
+    )
+    .await;
+    let (code, asked) = ask(&app, &t, &t.admin.access_token, &web, &d, "tcp").await;
+    assert_eq!(code, 202, "{asked}");
+    probe_sent(&mut wd).await;
+
+    let card = card(&app, &t, &web).await;
+    let rows = card["probes"].as_array().unwrap();
+    let by = |field: &str| -> Vec<String> {
+        rows.iter()
+            .map(|r| r[field].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(
+        by("device_id"),
+        [c.clone(), b.clone(), a.clone()],
+        "each device's last finding, the newest first: {rows:?}"
+    );
+    assert_eq!(
+        by("id"),
+        [pc.clone(), pb.clone(), pa.clone()],
+        "a probe that measured nothing, and one never answered, is no finding"
+    );
+    assert_eq!(card["probes_truncated"], json!(false));
+    assert_eq!(
+        (rows[0]["state"].clone(), rows[0]["detail"].clone()),
+        (json!("unreachable"), json!("timed out"))
+    );
+    assert_eq!(
+        rows[0]["measured"],
+        json!([{ "path": "host", "ok": false }, { "path": "port", "ok": false }])
+    );
+    assert_eq!(rows[1]["tls"]["fingerprint"], json!("cd".repeat(32)));
+    assert_eq!(
+        rows[1]["measured"],
+        json!([{ "path": "host", "ok": true }, { "path": "port", "ok": true },
+               { "path": "tls.fingerprint", "ok": false }, { "path": "tls.names", "ok": true }])
+    );
+    assert_eq!(
+        rows[2]["measured"],
+        json!([{ "path": "host", "ok": true }, { "path": "port", "ok": true },
+               { "path": "tls.fingerprint", "ok": true }, { "path": "tls.names", "ok": true }]),
+        "the device that found it as the map says still says so"
+    );
+
+    // Beside it, each fact's last word, whichever device said it.
+    let mut facts = serde_json::Map::new();
+    for f in card["entity"]["facts"].as_array().unwrap() {
+        facts.insert(
+            f["path"].as_str().unwrap().to_string(),
+            f["verified"].clone(),
+        );
+    }
+    for (path, probe, ok) in [
+        ("host", &pc, false),
+        ("port", &pc, false),
+        ("tls.fingerprint", &pb, false),
+        ("tls.names", &pb, true),
+    ] {
+        assert_eq!(
+            (facts[path]["probe"].clone(), facts[path]["ok"].clone()),
+            (json!(probe), json!(ok)),
+            "{path}: {}",
+            facts[path]
+        );
+    }
+}
+
+/// P4-5-4 — at most sixteen devices, the newest first, and the card says
+/// there were more; each device's row is its newest finding, never an older
+/// one, nor a later probe that found nothing, nor another entity's, nor
+/// another organization's.
+#[tokio::test]
+async fn a_card_shows_sixteen_devices_and_says_there_were_more() {
+    let app = scan_app().await;
+    let t = app.seed_tenant("knowprobecard16").await;
+    let web = endpoint(
+        &app,
+        &t,
+        "web16.example.com:443",
+        json!({ "host": "web16.example.com", "port": 443 }),
+    )
+    .await;
+    let other = endpoint(
+        &app,
+        &t,
+        "other.example.com:443",
+        json!({ "host": "other.example.com", "port": 443 }),
+    )
+    .await;
+    let tid = ObjectId::parse_str(&t.tenant_id).unwrap();
+    let (web_id, other_id) = (
+        ObjectId::parse_str(&web).unwrap(),
+        ObjectId::parse_str(&other).unwrap(),
+    );
+    let start = bson::DateTime::now().timestamp_millis() - 3_600_000;
+    let row = |entity: ObjectId, device: ObjectId, second: i64, state: &str| {
+        let at = bson::DateTime::from_millis(start + second * 1000);
+        doc! {
+            "tenant_id": tid, "entity_id": entity, "device_id": device, "requested_at": at,
+            "kind": "tcp", "state": state, "answered_at": at, "rtt_ms": second as i32,
+            "target": { "host": "web16.example.com", "host_path": "host",
+                        "host_value": "web16.example.com", "port": 443_i32, "port_value": 443_i64 },
+        }
+    };
+    let devices: Vec<ObjectId> = (0..17).map(|_| ObjectId::new()).collect();
+    let mut rows: Vec<Document> = devices
+        .iter()
+        .enumerate()
+        .map(|(i, d)| row(web_id, *d, 10 * (i as i64 + 1), "ok"))
+        .collect();
+    // Device 16's older finding comes after device 15's newest, so it would
+    // take a row if each device's findings were not one.
+    rows.push(row(web_id, devices[16], 165, "ok"));
+    rows.push(row(web_id, devices[15], 1000, "not_allowed"));
+    rows.push(row(web_id, devices[14], 1001, "failed"));
+    rows.push(row(other_id, ObjectId::new(), 2000, "ok"));
+    let mut foreign = row(web_id, ObjectId::new(), 3000, "ok");
+    foreign.insert("tenant_id", ObjectId::new());
+    rows.push(foreign);
+    coll(&app).insert_many(rows).await.unwrap();
+
+    let card = card(&app, &t, &web).await;
+    let shown = card["probes"].as_array().unwrap();
+    let ids: Vec<String> = shown
+        .iter()
+        .map(|r| r["device_id"].as_str().unwrap().to_string())
+        .collect();
+    let newest: Vec<String> = devices[1..].iter().rev().map(|d| d.to_hex()).collect();
+    assert_eq!(ids, newest, "the sixteen newest devices, the newest first");
+    assert_eq!(card["probes_truncated"], json!(true), "and there were more");
+    assert_eq!(
+        (shown[0]["rtt_ms"].clone(), shown[0]["state"].clone()),
+        (json!(170), json!("ok")),
+        "a device's newest finding, never an older one"
+    );
+    assert_eq!(
+        (shown[1]["rtt_ms"].clone(), shown[1]["state"].clone()),
+        (json!(160), json!("ok")),
+        "a later probe that found nothing leaves the finding standing"
+    );
+    assert_eq!(
+        (shown[2]["rtt_ms"].clone(), shown[2]["state"].clone()),
+        (json!(150), json!("ok")),
+        "a failed one too"
+    );
 }
