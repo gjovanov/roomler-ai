@@ -663,6 +663,9 @@ impl LocalApiState for DaemonState {
             // so it's kept even across a brief disconnect.
             overlay_ip: self.overlay.borrow().self_ip.clone(),
             overlay_ip6: self.overlay.borrow().self_ip6.clone(),
+            // #2892 — its own, until `person_socket::with_machine_network`
+            // lends a Mac's per-user half the root half's and says so.
+            network_from: None,
             connected: self.connected.load(Ordering::Relaxed),
             // FR-51 P4 — the primary enrollment's nature, stamped at startup.
             ephemeral: self.ephemeral,

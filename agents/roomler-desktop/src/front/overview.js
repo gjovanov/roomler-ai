@@ -72,13 +72,19 @@
     setText('ov-name', st.name || '—');
     setText('ov-daemon-version', st.version || '—');
     setText('ov-link', st.connected ? 'connected' : 'disconnected');
+    const ip = st.overlay_ip
+      ? st.overlay_ip6
+        ? st.overlay_ip + ' · ' + st.overlay_ip6
+        : st.overlay_ip
+      : '(no overlay IP)';
+    // #2892 — on a Mac's per-user half the address is the ROOT half's (FR-97
+    // P2h lends it) and the daemon says so (`network_from`): label it as the
+    // machine's, served by that daemon, not as this daemon's own.
     setText(
       'ov-ip',
-      st.overlay_ip
-        ? st.overlay_ip6
-          ? st.overlay_ip + ' · ' + st.overlay_ip6
-          : st.overlay_ip
-        : '(no overlay IP)',
+      st.network_from && st.network_from.name
+        ? ip + ' · the root daemon’s (' + st.network_from.name + ')'
+        : ip,
     );
     paintExit(st.exit_node);
     paintDns(st.dns);

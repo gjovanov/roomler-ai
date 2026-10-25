@@ -282,7 +282,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:744-871`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:822-827`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:914`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3034`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:146`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3057`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:146`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:670`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:136`) | P0c, D5 |
@@ -792,10 +792,10 @@ test of the SIGKILL property itself.
   lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
   the server and the companion as they are:
   - the root half serves the console user a person socket (FR-27 P11's mechanism) at
-    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4138`). The directory is root's and writable by
-    nobody else (`root_only_dir`, `:4298`), so root binds and then hands the socket over (`bind_root_owned`,
-    `:4311`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
-  - `person_may` (`:3034`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4161`). The directory is root's and writable by
+    nobody else (`root_only_dir`, `:4321`), so root binds and then hands the socket over (`bind_root_owned`,
+    `:4334`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
+  - `person_may` (`:3057`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
     socket the same way, and its companion's Devices page was refused there before;
   - the per-user half asks the root half only when its own answer is `no_node` and it is not root
     (`agents/roomlerd/src/person_socket.rs:121`). It shows the root half's answer only when that is `ok` (`:129`),
@@ -810,16 +810,22 @@ test of the SIGKILL property itself.
 
   Built:
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
-    (`crates/localapi/src/lib.rs:2653`, `:2658`, dispatched at `:3267`). They default to the sync reads, so the
+    (`crates/localapi/src/lib.rs:2676`, `:2681`, dispatched at `:3290`). They default to the sync reads, so the
     tests' fakes are untouched.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:1951`, `:1964`), with P2g's
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:1954`, `:1967`), with P2g's
     rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:200`). Then
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status and
-    MagicDNS (`with_machine_network`, `:208`).
-  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3108`). That drops
+    MagicDNS (`with_machine_network`, `:213`).
+  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3131`). That drops
     the endpoints of either end and of a relay, the carrier snapshot, the path decision and the probes, which
     name other devices' public and LAN addresses.
   - **A root half slow to answer** (1.5 s) leaves the half's own answer for that poll.
+  - **The answer names its lender (#2892).** `with_machine_network` also sets `NodeStatus.network_from`
+    (`crates/localapi/src/lib.rs:186`; the root half's node id and name), additive and absent unless lent. Until then `roomler status` as the console
+    user printed the root half's address as the per-user half's, right above that half's own "overlay OFF"
+    enrollments, and told it to join the mesh with netstack. The CLI marks the lent lines "(the root daemon's)",
+    adds a `network` line naming that daemon, and reads the enrollments' closing line as "off the mesh by design";
+    the companion's Overview labels the address the same way.
 
   Kill switch: `ROOMLERD_PERSON_SOCKET=0` on the root half, as P2g's.
 - **Open, found by AC3's macOS session (§8): Local Network privacy.** macOS 15 asked "Allow 'roomlerd' to find devices

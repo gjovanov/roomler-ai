@@ -139,6 +139,18 @@ pub struct HostFirewallStatus {
     pub admits: Vec<String>,
 }
 
+/// #2892 — the daemon a status's network fields come from, when they are not
+/// its own ([`NodeStatus::network_from`]): a two-half Mac's root half, named so
+/// a reader can tell "the machine's address, served by that daemon" from "this
+/// daemon's address". Identity only — no address, no token.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkOrigin {
+    /// The lending daemon's node id (hex).
+    pub node_id: String,
+    /// Its device name, as it reports it.
+    pub name: String,
+}
+
 /// Snapshot of the local node.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -161,6 +173,17 @@ pub struct NodeStatus {
     /// the overlay runtime alongside the v4. Absent on a v4-only daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_ip6: Option<String>,
+    /// #2892 — the daemon whose NETWORK these fields describe, when it is not
+    /// this one. A Mac's per-user half runs no overlay node, so it answers
+    /// `overlay_ip`, `overlay_ip6`, `exit_node` and `dns` with the ROOT half's
+    /// (FR-97 P2h, `person_socket::with_machine_network`); before this field
+    /// nothing on the wire said so, and `roomler status` printed the root
+    /// half's address as this half's, above that half's own "overlay OFF"
+    /// enrollments. `None` = every field is this daemon's own. Additive: a
+    /// daemon that borrows nothing sends no key (its JSON is unchanged), an
+    /// older daemon never sends it, an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_from: Option<NetworkOrigin>,
     /// Connected to the coordination server.
     pub connected: bool,
     /// FR-51 P4 — this daemon's PRIMARY enrollment is ephemeral: the server
@@ -5637,6 +5660,7 @@ mod tests {
                 tenant_id: Some("t1".into()),
                 overlay_ip: Some("100.64.0.2".into()),
                 overlay_ip6: None,
+                network_from: None,
                 connected: true,
                 ephemeral: false,
                 exit_node: None,
@@ -7038,6 +7062,36 @@ mod tests {
             assert_eq!(back.privileged, Some(p));
             assert_eq!(back.mode, DaemonMode::Service);
         }
+    }
+
+    /// #2892 — `network_from` is additive and says only what the daemon did:
+    /// absent from an older daemon (⇒ `None`), never written by a daemon
+    /// whose network fields are its own (its JSON is byte-identical to
+    /// before), and round-tripped when a Mac's per-user half borrowed them
+    /// from its root half.
+    #[test]
+    fn network_from_is_additive_and_absent_unless_borrowed() {
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true,"overlay_ip":"100.64.0.9"}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(st.network_from, None);
+        assert!(!serde_json::to_string(&st).unwrap().contains("network_from"));
+        let lent = NodeStatus {
+            network_from: Some(NetworkOrigin {
+                node_id: "d".into(),
+                name: "mac-d".into(),
+            }),
+            ..st
+        };
+        let wire = serde_json::to_string(&lent).unwrap();
+        assert!(
+            wire.contains(r#""network_from":{"node_id":"d","name":"mac-d"}"#),
+            "{wire}"
+        );
+        let back: NodeStatus = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            back.network_from.as_ref().map(|o| o.name.as_str()),
+            Some("mac-d")
+        );
     }
 
     /// FR-49 — an OLDER daemon reports no `overlay_mode`, and that must parse

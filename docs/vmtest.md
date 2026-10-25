@@ -174,7 +174,10 @@ copied run directory in seconds.
 ## Traps (each cost a real debug cycle)
 
 - ⚠️ **`roomler status --json`'s overlay address is top-level `.overlay_ip`** —
-  there is no `.orgs[].self_v4`.
+  there is no `.orgs[].self_v4`. ⚠️ On a two-half Mac's **per-user** half it is
+  the ROOT half's (FR-97 P2h lends it), flagged by `.network_from` (#2892): a
+  cell reading the per-user half's own address must treat a present
+  `.network_from` as "none of its own".
 - ⚠️ **libvirt's default lease source misses leases** on the vmtest network (one
   run finds an IP, an identical next run times out); `domifaddr --source arp`
   finds the guest as soon as it sends traffic.
