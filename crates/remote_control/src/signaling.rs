@@ -1004,6 +1004,18 @@ pub enum ClientMsg {
         detail: Option<String>,
     },
 
+    /// FR-121 — the device's loopback-TURN relay, so the server can hand it
+    /// to a browser on this device that never fetched 127.0.0.1. Sent after
+    /// the hello and whenever it changes (the relay came up, moved, or was
+    /// re-minted at half its credential's lifetime); `None` when it went
+    /// away. Primary org only: the relay sits on the primary overlay. The
+    /// server keeps it in memory with the connection and never stores it.
+    #[serde(rename = "rc:agent.local_relay")]
+    AgentLocalRelay {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay: Option<LocalRelayDescriptor>,
+    },
+
     /// FR-90 — the device's answer to [`ServerMsg::HiveStart`]: whether its
     /// own gates let the session run.
     ///
@@ -1978,6 +1990,20 @@ pub enum ClientMsg {
         /// omit it get today's behaviour. See [`LocalRelayDescriptor`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_relay: Option<LocalRelayDescriptor>,
+        /// FR-121 — the requester's own device this browser runs on, when the
+        /// viewer knows it and did NOT probe. The Hub looks up that device's
+        /// reported relay (`rc:agent.local_relay`) and answers on
+        /// `rc:session.created` with `local_relay` or `local_relay_refused`, so
+        /// the browser never fetches 127.0.0.1 (which Chrome gates behind its
+        /// local-network permission). Ignored when `local_relay` is present:
+        /// a probed descriptor is the browser's own evidence. Absent from older
+        /// viewers, and ignored by older servers (the viewer then probes).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "option_oid_hex"
+        )]
+        local_relay_from: Option<ObjectId>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -2752,6 +2778,7 @@ impl ClientMsg {
             ClientMsg::SshGrantAck { .. } => "rc:ssh.grant_ack",
             ClientMsg::ConfigStatus { .. } => "rc:agent.config_status",
             ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
+            ClientMsg::AgentLocalRelay { .. } => "rc:agent.local_relay",
             ClientMsg::HiveStartAck { .. } => "rc:hive.start_ack",
             ClientMsg::HiveState { .. } => "rc:hive.state",
             ClientMsg::HiveTurn { .. } => "rc:hive.turn",
@@ -2849,6 +2876,9 @@ impl ClientMsg {
             | ClientMsg::SessionStats { .. }
             | ClientMsg::RecordingActivity { .. }
             | ClientMsg::PrivacyActivity { .. }
+            // FR-121 — agent-sent like `SessionStats`, and only a remote
+            // session ever reads it.
+            | ClientMsg::AgentLocalRelay { .. }
             // FR-52 — what a controller reaches (§2d of the spec), including
             // the device's answers, which exist only to be relayed back to it.
             | ClientMsg::ExtauthStart { .. }
@@ -2946,6 +2976,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:ssh.grant_ack", Owner::Network),
     ("rc:agent.config_status", Owner::Fleet),
     ("rc:agent.key_rotated", Owner::Network),
+    ("rc:agent.local_relay", Owner::Remote),
     ("rc:hive.start_ack", Owner::Hive),
     ("rc:hive.state", Owner::Hive),
     ("rc:hive.turn", Owner::Hive),
@@ -3170,6 +3201,9 @@ mod namespace_tests {
         assert_eq!(owner_of("rc:consent.pending"), Some(Owner::Fleet));
         assert_eq!(owner_of("rc:relay.probe_report"), Some(Owner::Network));
         assert_eq!(owner_of("rc:agent.key_rotated"), Some(Owner::Network));
+        // FR-121 — agent-sent and `rc:agent.*`, yet only a remote session
+        // ever reads it.
+        assert_eq!(owner_of("rc:agent.local_relay"), Some(Owner::Remote));
     }
 
     /// The ids are what the module graph spells, and they serialise as such.
@@ -3252,6 +3286,18 @@ pub enum ServerMsg {
         /// older than the field; a viewer then keeps its host-prompt wording.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_asks: Option<crate::models::ConsentAsks>,
+        /// FR-121 — the answer to the request's `local_relay_from`: the
+        /// browser's own device's relay, which the viewer adds as
+        /// `turn:127.0.0.1:{turn_port}` before its offer. Sent only to a
+        /// request that named its device; absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_relay: Option<LocalRelayDescriptor>,
+        /// FR-121 — why `local_relay_from` got no relay: `not_your_device`,
+        /// `other_network`, `device_offline`, `rc_overlay_off` or
+        /// `same_device` ([`LocalRelayRefusal`]). The viewer shows an unknown
+        /// word as it came.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_relay_refused: Option<String>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -5417,6 +5463,45 @@ pub struct LocalRelayDescriptor {
     pub username: String,
     /// coturn-REST credential (hex HMAC-SHA1 over `username`) matching it.
     pub credential: String,
+    /// FR-121 — the device whose relay this is (its agent id, hex). The
+    /// loopback probe carries it so a viewer that probed once can remember
+    /// which of its owner's devices it runs on, and stop probing. Absent from
+    /// older agents; nothing on the server reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+/// FR-121 — why a request's `local_relay_from` got no relay, the words
+/// `rc:session.created`'s `local_relay_refused` carries.
+///
+/// ⚠️ A wire spelling, read by the viewer; an unknown word is shown as it came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRelayRefusal {
+    /// The named device is not the requester's own (`owner_user_id`).
+    NotYourDevice,
+    /// The device is not in the organization of the device being viewed, so
+    /// the remote agent could not reach its relay over its own mesh.
+    OtherNetwork,
+    /// Not connected here, or connected without a relay to report (an older
+    /// agent, or `ROOMLERD_LOCAL_TURN=0`).
+    DeviceOffline,
+    /// The device being viewed does not let remote desktop use the overlay
+    /// (#1882's `rc_overlay`), so its agent would discard the relay anyway.
+    RcOverlayOff,
+    /// The viewer is looking at the device it runs on.
+    SameDevice,
+}
+
+impl LocalRelayRefusal {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NotYourDevice => "not_your_device",
+            Self::OtherNetwork => "other_network",
+            Self::DeviceOffline => "device_offline",
+            Self::RcOverlayOff => "rc_overlay_off",
+            Self::SameDevice => "same_device",
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -9050,6 +9135,123 @@ mod tests {
         assert!(!j.contains("username"));
     }
 
+    /// FR-121 — the new fields are additive on every message they ride, and
+    /// a descriptor from an agent that predates `agent_id` still parses.
+    #[test]
+    fn local_relay_from_the_server_is_additive_on_the_wire() {
+        let device = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
+        let relay = LocalRelayDescriptor {
+            turn_port: 47989,
+            overlay_ip: "100.64.0.7".into(),
+            username: "1700000600:507f1f77bcf86cd799439012".into(),
+            credential: "deadbeef".into(),
+            agent_id: Some("507f1f77bcf86cd799439012".into()),
+        };
+
+        // The device's report, with and without a relay.
+        let report = ClientMsg::AgentLocalRelay {
+            relay: Some(relay.clone()),
+        };
+        let s = serde_json::to_string(&report).unwrap();
+        assert!(s.contains(r#""t":"rc:agent.local_relay""#), "{s}");
+        assert!(
+            s.contains(r#""agent_id":"507f1f77bcf86cd799439012""#),
+            "{s}"
+        );
+        let gone = serde_json::to_string(&ClientMsg::AgentLocalRelay { relay: None }).unwrap();
+        assert_eq!(gone, r#"{"t":"rc:agent.local_relay"}"#);
+        match serde_json::from_str::<ClientMsg>(&gone).unwrap() {
+            ClientMsg::AgentLocalRelay { relay } => assert!(relay.is_none()),
+            other => panic!("{other:?}"),
+        }
+
+        // An older agent's descriptor has no `agent_id`.
+        let old: LocalRelayDescriptor = serde_json::from_str(
+            r#"{"turn_port":1,"overlay_ip":"100.64.0.7","username":"u","credential":"c"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.agent_id, None);
+
+        // The request names the device as raw hex, and only when set.
+        let request = |from: Option<ObjectId>| ClientMsg::SessionRequest {
+            agent_id: device,
+            permissions: Permissions::VIEW,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: from,
+        };
+        let s = serde_json::to_string(&request(Some(device))).unwrap();
+        assert!(
+            s.contains(r#""local_relay_from":"507f1f77bcf86cd799439012""#),
+            "{s}"
+        );
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::SessionRequest {
+                local_relay_from, ..
+            } => assert_eq!(local_relay_from, Some(device)),
+            other => panic!("{other:?}"),
+        }
+        let s = serde_json::to_string(&request(None)).unwrap();
+        assert!(!s.contains("local_relay_from"), "{s}");
+
+        // The answer: the relay, or the refusal's word, and neither unset.
+        let created = |local_relay, local_relay_refused| ServerMsg::SessionCreated {
+            session_id: device,
+            agent_id: device,
+            permissions: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: None,
+            idle_secs: None,
+            consent_asks: None,
+            local_relay,
+            local_relay_refused,
+        };
+        let s = serde_json::to_string(&created(Some(relay), None)).unwrap();
+        assert!(
+            s.contains(r#""local_relay":{"#) && !s.contains("local_relay_refused"),
+            "{s}"
+        );
+        let s = serde_json::to_string(&created(
+            None,
+            Some(LocalRelayRefusal::NotYourDevice.wire().into()),
+        ))
+        .unwrap();
+        assert!(
+            s.contains(r#""local_relay_refused":"not_your_device""#),
+            "{s}"
+        );
+        let s = serde_json::to_string(&created(None, None)).unwrap();
+        assert!(!s.contains("local_relay"), "{s}");
+
+        // The refusal words are a wire spelling.
+        let words: Vec<&str> = [
+            LocalRelayRefusal::NotYourDevice,
+            LocalRelayRefusal::OtherNetwork,
+            LocalRelayRefusal::DeviceOffline,
+            LocalRelayRefusal::RcOverlayOff,
+            LocalRelayRefusal::SameDevice,
+        ]
+        .iter()
+        .map(|r| r.wire())
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "not_your_device",
+                "other_network",
+                "device_offline",
+                "rc_overlay_off",
+                "same_device"
+            ]
+        );
+    }
+
     #[test]
     fn object_ids_serialise_as_raw_hex_on_wire() {
         // Lock-in: no `$oid` wrapping anywhere in the WS protocol envelope.
@@ -9065,6 +9267,8 @@ mod tests {
             features_refused: None,
             idle_secs: None,
             consent_asks: None,
+            local_relay: None,
+            local_relay_refused: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -9084,6 +9288,7 @@ mod tests {
             audio_enabled: false,
             override_reason: None,
             local_relay: None,
+            local_relay_from: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -9107,6 +9312,7 @@ mod tests {
             audio_enabled: true,
             override_reason: None,
             local_relay: None,
+            local_relay_from: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
@@ -9132,7 +9338,9 @@ mod tests {
                 overlay_ip: "100.64.0.7".into(),
                 username: "1700000600:507f1f77bcf86cd799439012".into(),
                 credential: "deadbeef".into(),
+                agent_id: None,
             }),
+            local_relay_from: None,
         };
         let s = serde_json::to_string(&req_lr).unwrap();
         assert!(
@@ -9268,6 +9476,8 @@ mod tests {
             features_refused,
             idle_secs: None,
             consent_asks: None,
+            local_relay: None,
+            local_relay_refused: None,
         };
         let none = serde_json::to_string(&mk(None)).unwrap();
         assert!(!none.contains("features_refused"), "{none}");
@@ -9338,6 +9548,8 @@ mod tests {
             features_refused: None,
             idle_secs,
             consent_asks: None,
+            local_relay: None,
+            local_relay_refused: None,
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("idle_secs"), "{none}");
@@ -9389,6 +9601,8 @@ mod tests {
             features_refused: None,
             idle_secs: None,
             consent_asks,
+            local_relay: None,
+            local_relay_refused: None,
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("consent_asks"), "{none}");

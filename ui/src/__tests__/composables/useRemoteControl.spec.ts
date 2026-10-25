@@ -116,6 +116,10 @@ import {
   codecConnectAction,
   parseLocalRelayDescriptor,
   localRelayIceServer,
+  localRelayPlan,
+  withLocalRelay,
+  readStoredThisDevice,
+  deviceToPairFromProbe,
   LOCAL_RELAY_PROBE_PORT,
   LOCAL_RELAY_PROBE_PORTS,
   clipboardBridgeUrl,
@@ -3882,6 +3886,85 @@ describe('parseLocalRelayDescriptor (Phase 2 loopback-TURN corp-relay)', () => {
     expect(parseLocalRelayDescriptor({ ...base, overlay_ip: '' })).toBeNull()
     expect(parseLocalRelayDescriptor({ ...base, username: 5 })).toBeNull()
     expect(parseLocalRelayDescriptor({ ...base, credential: undefined })).toBeNull()
+  })
+
+  it('FR-121 — keeps a well-formed agent_id and drops anything else in it', () => {
+    const base = { turn_port: 47990, overlay_ip: 'x', username: 'u', credential: 'c' }
+    expect(
+      parseLocalRelayDescriptor({ ...base, agent_id: '507f1f77bcf86cd799439012' })?.agent_id,
+    ).toBe('507f1f77bcf86cd799439012')
+    expect(parseLocalRelayDescriptor({ ...base, agent_id: 'evil' })).toEqual(base)
+    expect(parseLocalRelayDescriptor({ ...base, agent_id: 7 })).toEqual(base)
+  })
+})
+
+describe('FR-121 — the relay of the device this browser runs on', () => {
+  const target = '507f1f77bcf86cd799439099'
+  const mine = '507f1f77bcf86cd799439012'
+  const plan = (thisDevice: string | null, enabled = true, external = false) =>
+    localRelayPlan({ enabled, external, thisDevice, target })
+
+  it('names a known device instead of probing, and probes only while none is known', () => {
+    expect(plan(mine)).toEqual({ kind: 'from', device: mine })
+    expect(plan(null)).toEqual({ kind: 'probe' })
+  })
+
+  it('does neither when switched off, external, none of my devices, or viewing itself', () => {
+    expect(plan(mine, false)).toEqual({ kind: 'none' })
+    expect(plan(null, false)).toEqual({ kind: 'none' })
+    expect(plan(mine, true, true)).toEqual({ kind: 'none' })
+    expect(plan('none')).toEqual({ kind: 'none' })
+    expect(plan(target)).toEqual({ kind: 'none' })
+  })
+
+  it('adds the handed-over relay first and keeps every other setting', () => {
+    const cfg: RTCConfiguration = {
+      iceServers: [{ urls: ['stun:stun.example:3478'] }],
+      bundlePolicy: 'max-bundle',
+    }
+    const out = withLocalRelay(cfg, {
+      turn_port: 47990,
+      overlay_ip: '100.64.0.5',
+      username: '1700000600:uid',
+      credential: 'abc',
+    })
+    expect(out.bundlePolicy).toBe('max-bundle')
+    expect(out.iceServers?.[0]).toEqual({
+      urls: ['turn:127.0.0.1:47990'],
+      username: '1700000600:uid',
+      credential: 'abc',
+    })
+    expect(out.iceServers?.[1]).toEqual({ urls: ['stun:stun.example:3478'] })
+    expect(cfg.iceServers).toHaveLength(1)
+  })
+
+  it('a probe pairs an unanswered browser with its own device only', () => {
+    const owns = (id: string) => id === mine
+    expect(deviceToPairFromProbe(mine, null, owns)).toBe(mine)
+    // someone else's machine: keep probing instead of a refusal forever
+    expect(deviceToPairFromProbe(target, null, owns)).toBeNull()
+    // already answered (a device, or none): a probe never overrides it
+    expect(deviceToPairFromProbe(mine, target, owns)).toBeNull()
+    expect(deviceToPairFromProbe(mine, 'none', owns)).toBeNull()
+    // an old agent's descriptor names no device; no ownership oracle, no pair
+    expect(deviceToPairFromProbe(undefined, null, owns)).toBeNull()
+    expect(deviceToPairFromProbe(mine, null, undefined)).toBeNull()
+  })
+
+  it('remembers only an agent id or none', () => {
+    const key = 'roomler-rc-this-device'
+    try {
+      localStorage.removeItem(key)
+      expect(readStoredThisDevice()).toBeNull()
+      localStorage.setItem(key, mine)
+      expect(readStoredThisDevice()).toBe(mine)
+      localStorage.setItem(key, 'none')
+      expect(readStoredThisDevice()).toBe('none')
+      localStorage.setItem(key, 'something else')
+      expect(readStoredThisDevice()).toBeNull()
+    } finally {
+      localStorage.removeItem(key)
+    }
   })
 })
 

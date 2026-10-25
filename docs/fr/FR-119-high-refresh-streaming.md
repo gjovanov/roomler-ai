@@ -532,7 +532,7 @@ delivered, with the session's IDR counter jumping 2–3 at each dip and nowhere 
   - The shed drops an arriving delta when the backlog exceeds 67 ms (`:349`, sampled once per arriving frame,
     `rc-hevc-worker.ts:745`, `rc-vp9-444-worker.ts:668`).
   - A window is bad on a shed, or when its MEAN backlog exceeds 33 ms (`:355`, read at
-    `useRemoteControl.ts:6958`). One slow keyframe lifts a few frames' ages and barely moves a mean; a decoder that
+    `useRemoteControl.ts:7047`). One slow keyframe lifts a few frames' ages and barely moves a mean; a decoder that
     cannot keep up lifts every sample.
   - Both are P6's counts as the time they meant at 60 fps, the rate they were tuned at, and now mean the same at
     every rate.

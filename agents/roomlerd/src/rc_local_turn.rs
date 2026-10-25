@@ -133,6 +133,50 @@ pub fn spawn(
     tokio::spawn(serve(overlay_view, agent_id, shutdown));
 }
 
+/// FR-121 — how often the reported relay is re-minted: half the credential's
+/// lifetime, so the copy the server holds is never stale by more than that.
+const REPORT_REMINT: Duration = Duration::from_secs(CRED_TTL.as_secs() / 2);
+
+/// FR-121 — the relay as the server should hear about it: published by
+/// [`serve`] whenever the TURN host comes up, moves or goes away, and
+/// re-minted every [`REPORT_REMINT`]; `None` while there is no host. The
+/// primary org's signalling connection sends every change as
+/// `rc:agent.local_relay` ([`subscribe`]).
+///
+/// Process-wide for the same reason the host is: one relay per device, and a
+/// secondary org's connection never reports it (it sits on the primary
+/// overlay). Starts at `None`, so a build or config without the relay simply
+/// never reports one.
+fn report_tx() -> &'static watch::Sender<Option<LocalRelayDescriptor>> {
+    static REPORT: std::sync::OnceLock<watch::Sender<Option<LocalRelayDescriptor>>> =
+        std::sync::OnceLock::new();
+    REPORT.get_or_init(|| watch::channel(None).0)
+}
+
+/// FR-121 — subscribe to the device's relay report (see [`report_tx`]).
+pub fn subscribe() -> watch::Receiver<Option<LocalRelayDescriptor>> {
+    report_tx().subscribe()
+}
+
+/// A descriptor for the live host with freshly minted credentials, the same
+/// for the loopback probe and the server's copy. FR-121 — it names the device
+/// (`agent_id`), so a browser that probed once can remember where it runs.
+fn mint_descriptor(h: &LocalTurnHost, agent_id: &str) -> LocalRelayDescriptor {
+    let (username, credential) = h.mint_credentials_now(agent_id, CRED_TTL);
+    LocalRelayDescriptor {
+        turn_port: h.local_addr().port(),
+        overlay_ip: h.relay_ip().to_string(),
+        username,
+        credential,
+        agent_id: Some(agent_id.to_string()),
+    }
+}
+
+/// FR-121 — publish the host's current descriptor, or `None`.
+fn publish_report(host: &Option<LocalTurnHost>, agent_id: &str) {
+    report_tx().send_replace(host.as_ref().map(|h| mint_descriptor(h, agent_id)));
+}
+
 /// The overlay's currently-assigned self-IP, parsed. `None` until the node has
 /// joined a mesh (or in a non-overlay build).
 fn overlay_self_ip(view: &watch::Receiver<OverlayView>) -> Option<IpAddr> {
@@ -242,7 +286,13 @@ async fn serve(
     let mut host: Option<LocalTurnHost> = None;
     if turn_on {
         reconcile_host(&mut host, overlay_self_ip(&overlay_view), &secret).await;
+        publish_report(&host, &agent_id);
     }
+    // FR-121 — the server's copy is re-minted before its credential could
+    // run out. The first tick is immediate; the copy above already went out.
+    let mut remint = tokio::time::interval(REPORT_REMINT);
+    remint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    remint.tick().await;
 
     loop {
         tokio::select! {
@@ -256,7 +306,17 @@ async fn serve(
                     break; // sender dropped — agent is going away
                 }
                 if turn_on {
+                    let before = host.as_ref().map(|h| h.local_addr());
                     reconcile_host(&mut host, overlay_self_ip(&overlay_view), &secret).await;
+                    // FR-121 — the server hears only of a host that moved.
+                    if host.as_ref().map(|h| h.local_addr()) != before {
+                        publish_report(&host, &agent_id);
+                    }
+                }
+            }
+            _ = remint.tick() => {
+                if host.is_some() {
+                    publish_report(&host, &agent_id);
                 }
             }
             accept = listener.accept() => {
@@ -264,15 +324,7 @@ async fn serve(
                 // Mint fresh creds off the live host and hand the connection an
                 // owned descriptor (or None if no overlay yet → 503). No host
                 // sharing across tasks.
-                let descriptor = host.as_ref().map(|h| {
-                    let (username, credential) = h.mint_credentials_now(&agent_id, CRED_TTL);
-                    LocalRelayDescriptor {
-                        turn_port: h.local_addr().port(),
-                        overlay_ip: h.relay_ip().to_string(),
-                        username,
-                        credential,
-                    }
-                });
+                let descriptor = host.as_ref().map(|h| mint_descriptor(h, &agent_id));
                 // Overall per-connection deadline (the per-read timeout
                 // alone leaves a dribbling client's lifetime unbounded —
                 // it resets on every ≥1-byte read). Bounds a slow-loris
@@ -288,6 +340,8 @@ async fn serve(
     if let Some(h) = host.take() {
         let _ = h.stop().await;
     }
+    // FR-121 — and the server stops handing it out.
+    report_tx().send_replace(None);
     info!("loopback-TURN: probe stopped");
 }
 
@@ -624,6 +678,7 @@ mod tests {
             overlay_ip: "100.64.0.7".into(),
             username: "1700000600:507f1f77bcf86cd799439012".into(),
             credential: "abcd1234".into(),
+            agent_id: Some("507f1f77bcf86cd799439012".into()),
         }
     }
 
