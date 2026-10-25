@@ -107,8 +107,15 @@ concurrency:
 # re-measuring. First run after this change rebuilds the caches (the env
 # is part of cargo's fingerprint); that one-time cost is the same class as
 # any dependency bump.
+#
+# FR-6 wave 29: a tag run reuses its rehearsal's compile when both built the
+# same tree. Every build job ends its cargo steps with seed-tree-stamp;
+# seed-cache-restore does the reuse. Kill switch: set the repository variable
+# SEED_REUSE_SAME_TREE=off and every build job recompiles our crates as
+# before.
 env:
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+  SEED_REUSE_SAME_TREE: ${{ vars.SEED_REUSE_SAME_TREE || 'on' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -543,6 +550,15 @@ jobs:
           cargo build -p roomler-cli-shim --release
           test -f target/release/roomler-shim || { echo "::error::roomler-shim not produced — the cargo-deb assets entry would fail"; exit 1; }
 
+      # FR-6 wave 29: after the job's LAST cargo build, so the next run of this
+      # job on this tree (the tag after its rehearsal) reuses the build.
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
+        with:
+          binary: target/release/roomlerd
+          expect-version: ${{ needs.validate-version.outputs.version }}
+          library-path: ${{ env.FFMPEG_DIR }}/lib
+
       - name: Bundle FFmpeg into the .deb (self-contained, RPATH)
         run: |
           set -euo pipefail
@@ -815,6 +831,11 @@ jobs:
       - name: Build the desktop companion
         run: cargo build -p roomler-desktop --release
 
+      # FR-6 wave 29: after the job's last cargo build (cargo deb and
+      # generate-rpm below compile nothing).
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
+
       - name: Build the companion .deb
         working-directory: agents/roomler-desktop
         run: cargo deb --no-build --no-strip
@@ -947,6 +968,10 @@ jobs:
 
       - name: Build the desktop companion
         run: cargo build -p roomler-desktop --release
+
+      # FR-6 wave 29, as in build-linux-companion.
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
 
       - name: Build the companion .deb
         working-directory: agents/roomler-desktop
@@ -1138,6 +1163,14 @@ jobs:
           set -euo pipefail
           cargo build -p roomler-cli-shim --release
           test -f target/release/roomler-shim || { echo "::error::roomler-shim not produced — the cargo-deb assets entry would fail"; exit 1; }
+
+      # FR-6 wave 29, as in build-linux.
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
+        with:
+          binary: target/release/roomlerd
+          expect-version: ${{ needs.validate-version.outputs.version }}
+          library-path: ${{ env.FFMPEG_DIR }}/lib
 
       - name: Bundle FFmpeg + libvpx into the .deb (self-contained, RPATH)
         run: |
@@ -1638,6 +1671,16 @@ jobs:
           }
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
+
+      # FR-6 wave 29, as in build-linux. A reused roomlerd.exe/roomler-shim.exe
+      # may still carry the rehearsal's signature (signing below is in place).
+      # Authenticode `sign` REPLACES it, and the signing action's verify step
+      # checks the signer subject, so the tag ships only its own signature.
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
+        with:
+          binary: target/release/roomlerd.exe
+          expect-version: ${{ needs.validate-version.outputs.version }}
 
       # The rc.65 "Verify FFmpeg link via unit test" step is GONE: even in
       # --release with the exact build feature set, `cargo test` cost 5m33s
@@ -2235,6 +2278,10 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-desktop --release
 
+      # FR-6 wave 29, as in build-linux-companion.
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
+
       - name: Locate + rename tray EXE
         id: locate_tray
         shell: pwsh
@@ -2356,6 +2403,10 @@ jobs:
       # the runner (the same reason the Windows lane uses `cargo build`).
       - name: Build the desktop companion
         run: cargo build -p roomler-desktop --release --target aarch64-apple-darwin
+
+      # FR-6 wave 29, as in build-linux-companion.
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
 
       - name: Upload the companion binary (for build-macos)
         uses: actions/upload-artifact@v4
@@ -2528,12 +2579,27 @@ jobs:
         # artifacts. Dropping just this crate's build dir forces its script to
         # re-run against whatever brew actually installed; everything else in
         # the cache (the expensive part) is kept.
+        #
+        # FR-6 wave 29: drop them only when that Cellar path MOVED (or no run
+        # recorded it), not on every run. A drop recompiles env-libvpx-sys and
+        # therefore roomlerd behind it, which would cancel a same-tree reuse.
+        # The record is written on every run, after the decision: whenever
+        # env-libvpx-sys does get rebuilt, it is against the Cellar recorded.
         run: |
           set -euo pipefail
-          echo "brew libvpx: $(brew --prefix libvpx 2>/dev/null || echo '(none)')"
-          rm -rfv target/aarch64-apple-darwin/release/build/*libvpx* \
-                  target/aarch64-apple-darwin/release/build/*vpx_sys* 2>/dev/null || true
-          echo "stale libvpx build artefacts cleared"
+          cellar="$(cd "$(brew --prefix libvpx)" 2>/dev/null && pwd -P || echo '(none)')"
+          seen=target/aarch64-apple-darwin/release/.libvpx-cellar
+          echo "brew libvpx: ${cellar}"
+          if [ -f "$seen" ] && [ "$(cat "$seen")" = "$cellar" ]; then
+            echo "same Cellar as the seed's build: keeping its libvpx build artefacts"
+          else
+            echo "the seed recorded '$(cat "$seen" 2>/dev/null || echo nothing)': dropping its libvpx build artefacts"
+            rm -rfv target/aarch64-apple-darwin/release/build/*libvpx* \
+                    target/aarch64-apple-darwin/release/build/*vpx_sys* 2>/dev/null || true
+            echo "stale libvpx build artefacts cleared"
+          fi
+          mkdir -p "$(dirname "$seen")"
+          printf '%s\n' "$cellar" > "$seen"
 
       - name: Fetch vendored FFmpeg 9.0.1 (macOS arm64 — VideoToolbox)
         env:
@@ -2663,6 +2729,16 @@ jobs:
       # MSI (P3e lever D); it lands at /usr/local/bin/roomler below.
       - name: Build the roomler CLI shim
         run: cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
+
+      # FR-6 wave 29, as in build-linux. The staging below signs copies, and
+      # until it bundles FFmpeg into the .app this binary finds FFmpeg only
+      # through library-path (it links @rpath/libavcodec…).
+      - name: Stamp the seed with the tree this build compiled
+        uses: ./.github/actions/seed-tree-stamp
+        with:
+          binary: target/aarch64-apple-darwin/release/roomlerd
+          expect-version: ${{ needs.validate-version.outputs.version }}
+          library-path: ${{ env.FFMPEG_DIR }}/lib
 
       # The desktop companion — the macOS counterpart of roomler-desktop.exe —
       # is built by the parallel `build-macos-companion` job (FR-6 wave 18).

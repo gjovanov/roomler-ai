@@ -1,6 +1,19 @@
+diff -ruN --strip-trailing-cr upstream/build.rs vendored/build.rs
+--- upstream/build.rs	2018-01-03 06:28:23.000000000 +0100
++++ vendored/build.rs	2026-10-25 21:13:56.629243000 +0100
+@@ -1,4 +1,9 @@
+ fn main() {
++    // This file is the script's only input. Without the line, cargo re-runs
++    // it whenever ANY file of the crate looks newer than its last run (it
++    // fingerprints the crate's newest mtime), and a release lane that reuses
++    // a same-tree build would recompile roomlerd behind it (FR-6 wave 29).
++    println!("cargo:rerun-if-changed=build.rs");
+     if cfg!(windows) {
+         // The first choice is Windows because DXGI is amazing.
+         println!("cargo:rustc-cfg=dxgi");
 diff -ruN --strip-trailing-cr upstream/src/common/dxgi.rs vendored/src/common/dxgi.rs
 --- upstream/src/common/dxgi.rs	2018-01-04 12:35:10.000000000 +0100
-+++ vendored/src/common/dxgi.rs	2026-10-15 19:54:21.218966997 +0200
++++ vendored/src/common/dxgi.rs	2026-10-25 21:13:56.521171800 +0100
 @@ -68,4 +68,12 @@
      pub fn height(&self) -> usize {
          self.0.height() as usize
@@ -16,7 +29,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/dxgi.rs vendored/src/common/dx
  }
 diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
 --- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/common/quartz.rs	2026-10-15 19:54:21.210967096 +0200
++++ vendored/src/common/quartz.rs	2026-10-25 21:13:56.536528800 +0100
 @@ -9,16 +9,75 @@
  }
  
@@ -137,7 +150,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
  }
 diff -ruN --strip-trailing-cr upstream/src/common/x11.rs vendored/src/common/x11.rs
 --- upstream/src/common/x11.rs	2018-04-08 11:24:21.000000000 +0200
-+++ vendored/src/common/x11.rs	2026-10-15 19:54:21.222966948 +0200
++++ vendored/src/common/x11.rs	2026-10-25 21:13:56.542081500 +0100
 @@ -68,4 +68,13 @@
      pub fn height(&self) -> usize {
          self.0.rect().h as usize
@@ -154,7 +167,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/x11.rs vendored/src/common/x11
  }
 diff -ruN --strip-trailing-cr upstream/src/dxgi/mod.rs vendored/src/dxgi/mod.rs
 --- upstream/src/dxgi/mod.rs	2018-04-08 13:02:22.000000000 +0200
-+++ vendored/src/dxgi/mod.rs	2026-10-15 19:54:21.198967243 +0200
++++ vendored/src/dxgi/mod.rs	2026-10-25 21:13:56.557860500 +0100
 @@ -395,6 +395,19 @@
          self.desc.Rotation
      }
@@ -177,7 +190,7 @@ diff -ruN --strip-trailing-cr upstream/src/dxgi/mod.rs vendored/src/dxgi/mod.rs
          let i = s.iter()
 diff -ruN --strip-trailing-cr upstream/src/quartz/capturer.rs vendored/src/quartz/capturer.rs
 --- upstream/src/quartz/capturer.rs	2018-04-08 13:03:09.000000000 +0200
-+++ vendored/src/quartz/capturer.rs	2026-10-15 19:54:20.854971472 +0200
++++ vendored/src/quartz/capturer.rs	2026-10-25 21:13:56.572790600 +0100
 @@ -5,10 +5,14 @@
  use super::display::Display;
  use super::frame::Frame;
@@ -344,7 +357,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/capturer.rs vendored/src/quart
 +extern "C" fn drained(_: *mut c_void) {}
 diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz/display.rs
 --- upstream/src/quartz/display.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/display.rs	2026-10-15 19:54:21.166967637 +0200
++++ vendored/src/quartz/display.rs	2026-10-25 21:13:56.587949500 +0100
 @@ -40,6 +40,48 @@
          unsafe { CGDisplayPixelsHigh(self.0) }
      }
@@ -396,7 +409,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz
      }
 diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
 --- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/ffi.rs	2026-10-15 19:54:21.154967784 +0200
++++ vendored/src/quartz/ffi.rs	2026-10-25 21:13:56.592005300 +0100
 @@ -9,6 +9,8 @@
  pub type CFNumberRef = *mut c_void;
  pub type CFStringRef = *mut c_void;
@@ -461,7 +474,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi
      pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
 diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
 --- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/frame.rs	2026-10-15 19:54:21.162967686 +0200
++++ vendored/src/quartz/frame.rs	2026-10-25 21:13:56.594080700 +0100
 @@ -3,7 +3,9 @@
  
  pub struct Frame {

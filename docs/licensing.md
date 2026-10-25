@@ -117,7 +117,7 @@ sequenceDiagram
 
 ⚠️ **After any change to `.github/ffmpeg-patches/` or the vcpkg baseline, dispatch
 `lgpl-source-offer.yml` before tagging.** `release-agent.yml` refuses otherwise
-([`:400`](../.github/workflows/release-agent.yml#L400)). Until 2026-09-24 the bundle
+([`:407`](../.github/workflows/release-agent.yml#L407)). Until 2026-09-24 the bundle
 held neither set of patches while three documents said we applied none. The workflow's
 own check was green throughout, because it asked whether an asset *existed*, never
 whether it was the source we built from (#1616).

@@ -23,6 +23,12 @@
 # `_CGYDisplayStreamFrameAvailable` after every session. Field-hit on a
 # MacBook, 2026-10-15.
 #
+# The build script declares `rerun-if-changed=build.rs` (FR-6 wave 29). With
+# no `rerun-if` line at all, cargo fingerprints a path crate's build script by
+# the crate's NEWEST file mtime. A fresh checkout therefore re-ran it and
+# recompiled roomlerd behind it, even when the release lane reused a build of
+# the very same tree.
+#
 #   scripts/revendor-scrap.sh [version]           rebuild the vendored tree from
 #                                                 upstream + patch (use on a bump)
 #   scripts/revendor-scrap.sh --check [version]   verify tree == upstream+patch
