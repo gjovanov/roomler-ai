@@ -5488,17 +5488,17 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
     // it touches nothing, so any uid may ask.
     #[cfg(target_os = "macos")]
     if !check_only && unsafe { libc::geteuid() } != 0 {
-        // RETIRED-NAME-ANCHOR(14): the printed guidance names
-        // /var/log/roomler-agent/update.log and /etc/roomler-agent/disable-auto-update —
-        // real macOS paths fixed by the launchd plists, which are pinned to the frozen
-        // .app bundle name (D5). They sit inside a string literal, so the anchor is on
-        // the statement. docs/fr/FR-21
+        // The paths are this package's own: com.roomler.update has logged to
+        // /var/log/roomler/update.log since FR-46 P5a, and the opt-out read first is
+        // /etc/roomler/disable-auto-update (`updater::OPT_OUT_MARKERS`). P5a missed
+        // this string, so "Apply update" in the companion pointed at a log that no
+        // longer exists on any Mac it had migrated. docs/fr/FR-46
         return match updater::queue_update_check() {
             Ok(()) => {
                 println!(
                     "Queued for the root update helper (com.roomler.update).\n\
-                     Watch: /var/log/roomler-agent/update.log\n\
-                     (If this Mac set /etc/roomler-agent/disable-auto-update, updates are manual:\n\
+                     Watch: /var/log/roomler/update.log\n\
+                     (If this Mac set /etc/roomler/disable-auto-update, updates are manual:\n\
                       sudo installer -pkg <pkg> -target /)"
                 );
                 Ok(())
