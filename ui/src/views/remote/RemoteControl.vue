@@ -1550,8 +1550,14 @@
          (fullscreen, Ctrl-Alt-Del, clipboard, disconnect, the stats
          badge) stay on the toolbar; everything configurable lives here,
          grouped: Video (host encode) / Display (viewer) / Session.
+         FR-120: "phones" is `settingsFullscreen`, not `mobile` (< 1280 px).
          ============================================================ -->
-    <v-dialog v-model="settingsOpen" :fullscreen="mobile" :max-width="mobile ? undefined : 560" scrollable>
+    <v-dialog
+      v-model="settingsOpen"
+      :fullscreen="settingsFullscreen"
+      :max-width="settingsFullscreen ? undefined : 560"
+      scrollable
+    >
       <v-card class="rc-settings-card">
         <v-toolbar density="comfortable" color="surface">
           <v-icon class="ml-3">mdi-tune-variant</v-icon>
@@ -2569,7 +2575,14 @@ function explainRefusal(why: string | null | undefined): void {
 }
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
-const { mobile, xs, width: displayWidth } = useDisplay()
+const { mobile, xs, width: displayWidth, height: displayHeight } = useDisplay()
+// FR-120 — Settings covers the screen on a PHONE, as rc.199 meant: below
+// 600 px wide, or below 600 px tall (a phone held sideways, where the 560 px
+// card would be squeezed into ~340 px of height). It was bound to `mobile`,
+// which in this app means narrower than 1280 px, so a tablet or a laptop
+// window lost the stage behind the panel too; the card leaves the stage in
+// view while a setting changes.
+const settingsFullscreen = computed(() => xs.value || displayHeight.value < 600)
 // FR-120 P3 — the agent log dialog covers the screen below 600 px. (Not the
 // stage's fullscreen: that is `isFullscreen`.)
 const { fullscreen: dialogFullscreen } = useResponsiveDialog()

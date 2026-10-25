@@ -3,7 +3,7 @@
 **Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** in progress. On production, all
 on 2026-10-24: P5 (#2843) and P2 (#2845) since 20:34Z (`hosted-20261024-fa90220`), P3 (#2848) since 20:47Z
 (`hosted-20261024-9ea48a1`), P1a (#2850) since 22:05Z (with FR-27's `hosted-20261024-46f3f84`), and P1b (#2856) since
-22:30Z (`hosted-20261024-d96b623`). P4, P6 and P7 are still to come · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
+22:30Z (`hosted-20261024-d96b623`). P6 (#2883) is in review; P4 and P7 are to come · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (#2561, closed 2026-10-23: the same facts and actions at every width, and
 the rules in `docs/ui.md` § Phones and tablets)
 
@@ -107,7 +107,7 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 | **P3** — #2848 | dialogs and rows | revert: UI only | each dialog opened at 360 px | M |
 | **P4** | long pages | revert: UI only | the sweep's heights, red then green | L |
 | **P5** — #2843 | the bugs | revert: UI only | the tutorial at 360 and 1300 px; sign-in's `scrollWidth` | S |
-| **P6** | touch targets | revert: CSS only | the sweep's small-target count on a coarse pointer; desktop pixel-identical | S |
+| **P6** — #2883 | touch targets | revert: CSS only | the sweep's small-target count on a coarse pointer; desktop pixel-identical | S |
 | **P7** | docs | — | CI | S |
 
 ## 5. Acceptance criteria
@@ -132,13 +132,16 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 - [ ] **AC9**: Docs: `docs/ui.md` states §3.1's rules (its diagram updated), and the `docs/README.md` index row covers
   them.
 
-## 6. Open decisions
+## 6. Decisions
 
-| | decision | recommendation |
+All four were decided by the operator on 2026-10-25, each as recommended.
+
+| | decision | resolution |
 |---|---|---|
-| **D1** | the touch-target minimum: 36, 40 or 44 px | **36 px**: Vuetify's default button height, so small buttons grow to it and nothing else moves |
-| **D2** | compact Devices cards: a one-line summary row that expands, or the FR-116 card with fewer open facts | a summary row (name, status, OS, one action), the card on tap, because the card is what made Devices 3.7× |
-| **D3** | FR-116's D3, carried over: the touch presets above a short landscape stage | still a product call; out of FR-120 unless the operator picks a layout |
+| **D1** | the touch-target minimum: 36, 40 or 44 px | **36 px**: Vuetify's default button height, so a small button's hit area grows to it and nothing else moves (P6) |
+| **D2** | compact Devices cards: a one-line summary row that expands, or the FR-116 card with fewer open facts | **a summary row** (name, status, OS, one action), the card on a tap, because the card is what made Devices 3.7× (P4) |
+| **D3** | FR-116's D3, carried over: the touch presets above a short landscape stage | **out of FR-120**: still a product call, with no layout picked |
+| **D4** | the viewer's Settings is full screen below 1280 px (it was bound to `mobile`), so on a tablet and a laptop window too | **a phone only**: below 600 px wide, or below 600 px tall (a phone held sideways), which is what rc.199 meant by "fullscreen on phones"; above that, the 560 px card leaves the stage in view (P6) |
 
 ## 7. Out of scope
 
@@ -162,6 +165,8 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 | 2026-10-24 22:18Z | production, `hosted-20261024-46f3f84` (entry `index-CdwriITG.js`): P1a live as a passenger of FR-27's roll (its promote finished 22:16Z; pods on it since 22:05Z) | the vmtest org from mars; read-only | 🟢 **AC1, the facts half**, the same results as the branch before merge: Devices has 0 title-only elements and 0 hover-only chips, and a tap on a chip opens its explanation; Analytics has 0 title-only elements, its bar spans 312 of 312 px, and a tap reads the period; the mesh graph is 312 px in its 312 px box with three hit lines, and a tap shows the carrier |
 | 2026-10-24 22:42Z | production, `hosted-20261024-d96b623` (entry `index-DeEzDs4P.js`): P1b live (promote run 40138715145, pods on it since 22:30Z); `/health` ok at 0.4.166; the vmtest org had 4 devices online before and 4 after | the vmtest org from mars; an offline device's viewer | 🟢 **AC1, the viewer half**, the same results as the branch before merge: the viewer has 0 title-only elements, and all six of the files drawer's icon buttons are named |
 | 2026-10-24 22:42–22:55Z | production, `hosted-20261024-d96b623` (entry `index-DeEzDs4P.js`), with every FR-120 phase so far live: P5, P2, P3, P1a and P1b | §2.1's instrument re-run from mars: 35 routes at 360, 390, 768 and 1300 px (140 records); one throwaway room, deleted (200) | 🟢 **AC1, its measured half**: title-only elements at 360, 390 and 768 px are **0 on every route**. §2.1's baseline had 136 on Analytics, 10 on Devices and 5 on the idle viewer. At 1300 px the only ones left are the Devices grid's 10 presence dots, which are decorative: the status chip in the same row carries the same words and opens them on a tap. Still owed for AC1: a field check, in a live session, of the viewer's Settings captions and toolbar tap paths (locked by `fr120P1bViewer.spec.ts`) |
+| 2026-10-25 11:38–11:55Z | P6 before merge: production (`hosted-20261025-033df9d`, entry `index-gJmkfi-I.js`) vs the branch (`index-DnkKDM-_.js`), loaded one after the other for each route | §2.1's 35 routes from mars, at 360 and 768 px (touch) and 1300 px; one throwaway room, deleted (200) | 🔴 → 🟢 **AC7, a first pass**: at 360 px, targets under 36 px go from 43 to 0 on the rooms list, 32 to 9 on Devices, and 5 to 0 on the tutorial and a room. On every signed-in page production also gives a tap inside Search's own box to the unread badge over its corner; the branch gives none. At 1300 px no control is touched (0 isolated on every route). Each difference between the two loads there is live data (an unread count going 6 → 5, the drawer's badges, uptime segments) or the landing and pricing pages, which production serves as static HTML outside the app bundle. **Two wrong turns, recorded:** the run outpaced the API's 60 requests a minute, so some lists loaded blank and a "Too many requests" snackbar sat over the audits' Show more; and its probes, 17.5 px from a centre, sat half a pixel inside hit areas that end exactly where the next box begins (a Devices card's x-small chips above its Access panel, Members' Roles above its divider). A 2 px, then a 1 px probe showed both at exactly 36 px, and the probe now allows that pixel |
+| 2026-10-25 12:05–12:24Z | P6 before merge, paced at 13 s between loads (no load throttled): production vs the branch (`index-CvOqTfG5.js`, then `index-eFVM7XK5.js`) | the vmtest org from mars: the ten routes with a small target, at 360 and 768 px | 🔴 → 🟢 **AC7**: the branch has 0 targets under 36 px on all ten. Devices goes 32 → 0 (35 → 0 at 768), the rooms list 43 → 0, a room 5 → 0, Members 2 → 0, each audit 1 → 0, the viewer 1 → 0, sign-in and sign-up 5 → 0 at 768, and the dashboard 5 → 0 (6 → 0). No target takes another's tap. Every page's boxes match production's except the dashboard's, where the carrier filter's chips now have 10 px above and below on a touch screen. Their chip group scrolls sideways, so it clipped their hit areas to 28 px; at 8 px the two rows' hit areas abutted and split their edge a pixel off-centre |
 
 ## 9. Related
 

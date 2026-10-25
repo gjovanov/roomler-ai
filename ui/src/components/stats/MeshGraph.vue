@@ -454,6 +454,17 @@ const tooltip = computed(() => {
   width: 100%;
   margin-bottom: 4px;
 }
+/* FR-120 P6 — the carrier filter on a touch screen. Its chips are 20 px tall
+   and wrap 8 px apart, and the chip group's scroller (`overflow-y: hidden`)
+   clips a hit area grown past them, so a finger got 28 px. 10 px above and
+   below each chip (Vuetify gives 4) holds the 36 px hit area (8 px past the
+   chip) inside the scroller, and two rows' hit areas 4 px apart: rows that
+   abutted at 36 px split their edge a pixel off-centre in the field. */
+@media (pointer: coarse) {
+  .mesh-controls :deep(.v-chip-group .v-chip) {
+    margin-block: 10px;
+  }
+}
 .mesh-svg {
   overflow: visible;
 }
