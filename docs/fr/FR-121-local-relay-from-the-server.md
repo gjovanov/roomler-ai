@@ -24,10 +24,10 @@ Everything after the hand-off stays as it is today: the browser dials `turn:127.
 The loopback-TURN corp relay (`agents/roomlerd/src/rc_local_turn.rs`) hosts a small TURN server on the device's
 overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), with fallback ports from `:41989`
 (`:53`), returning a descriptor with freshly minted 1-hour credentials (`CRED_TTL`, `:68`; minted at `:268`). The
-viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7199`,
+viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7296`,
 called at `:9168`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3810`) and
-forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:1980`). The Hub stores it
-on the session (`crates/modules/fleet/src/hub.rs:1760`) and hands the remote agent `turn:<overlay>:<port>` with the
+forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:1992`). The Hub stores it
+on the session (`crates/modules/fleet/src/hub.rs:1803`) and hands the remote agent `turn:<overlay>:<port>` with the
 offer (`forward_offer`, `:2133`, the relay at `:2173`), only for an overlay address (`is_overlay_relay_ip`, `:65`) and
 only when the device lets remote desktop use the overlay (#1882's `rc_overlay`).
 
@@ -80,8 +80,8 @@ sequenceDiagram
 
 ### 3.1 The device reports its relay
 
-- `ClientMsg::AgentLocalRelay` (`rc:agent.local_relay`, fleet's namespace) carries
-  `Option<LocalRelayDescriptor>`. The probe server's loop (`serve`, `rc_local_turn.rs:176`) already owns the TURN host
+- `ClientMsg::AgentLocalRelay` (`rc:agent.local_relay`, Remote's namespace: agent-sent like `rc:session.stats`, and only a remote session reads it) carries
+  `Option<LocalRelayDescriptor>`. The probe server's loop (`serve`, `rc_local_turn.rs:220`) already owns the TURN host
   and its per-run secret. It publishes a fresh descriptor on a `watch` whenever the host comes up or moves, and
   re-mints at half the credential's lifetime; `None` when the host goes away. The signalling loop sends the latest
   after the hello and on every change. The secret never leaves the process, exactly as for the probe.
@@ -97,7 +97,9 @@ sequenceDiagram
   (`useRemoteControl.ts:3568`).
 - **Suggested by the probe while the probe still works**: the probe's descriptor gains the device's `agent_id`, and
   the first successful probe records it unless the person chose none. That covers every browser that has the
-  permission or does not ask for it.
+  permission or does not ask for it. ⚠️ Only a device of the **person's own** is recorded: a browser on someone
+  else's machine would otherwise be paired with a device whose relay the server refuses to hand over
+  (`not_your_device`), and would trade a probe that works for that refusal on every later connect.
 - **Once chosen, the viewer never probes again**: no request to 127.0.0.1, so nothing to prompt for. The request
   carries `local_relay_from: <agent_id>` instead of a descriptor.
 
@@ -117,7 +119,7 @@ On `rc:session.request` with `local_relay_from` and no descriptor, the Hub answe
 The descriptor is stored on the session exactly as a probed one is, so `forward_offer` hands the remote agent the
 overlay relay as today, with the same overlay-range check. The browser adds `turn:127.0.0.1:<port>` with
 `pc.setConfiguration` when `rc:session.created` arrives. The peer connection exists by then
-(`useRemoteControl.ts:9183`) and has gathered nothing: the offer waits for `rc:ready` (`:8375`).
+(`useRemoteControl.ts:9315`) and has gathered nothing: the offer waits for `rc:ready` (`:8486`).
 
 ⚠️ The descriptor's credential lets its holder allocate on the device's relay, which the overlay and loopback reach.
 It is minted by the device, valid for an hour, held only in the Hub's memory, and handed only to the device's owner's
@@ -133,14 +135,30 @@ not on the device gets a loopback address it cannot use.
 - **Infer the browser's device** from its public address: two devices behind one NAT are indistinguishable, and a
   wrong guess hands the relay of someone else's device to the browser.
 
+### 3.5 P1 to P3, as built (2026-10-25)
+
+| piece | where |
+|---|---|
+| The probe server publishes the relay on a process-wide `watch` (`report_tx`) when the TURN host comes up, moves or goes away, re-minted every half credential lifetime (`REPORT_REMINT`, 30 min); `None` on exit. The probe and the report mint through one function, which names the device | `agents/roomlerd/src/rc_local_turn.rs:138`, `:150`, `:164`, `:176` |
+| The primary org's connection subscribes after its hello, sends what it holds, then every change (`next_local_relay`, `send_local_relay`, `try_send`: a full queue waits for the next re-mint, and only the error's Display is logged) | `agents/roomlerd/src/signaling.rs:434`, `:453`, `:1979` |
+| `local-relay` in `AgentCaps.rpc` while `ROOMLERD_LOCAL_TURN` is on | `agents/roomlerd/src/encode/caps.rs:2042` |
+| The wire: `rc:agent.local_relay` (Remote's), `local_relay_from` on the request, `local_relay` / `local_relay_refused` on the answer, `LocalRelayRefusal`'s five words | `crates/remote_control/src/signaling.rs:1013`, `:2006`, `:3300`, `:5479` |
+| The Hub keeps the report on the connection's entry (`set_agent_local_relay`), resolves a request against it (`resolve_local_relay`: same device, connected, owner, same organization, `rc_overlay`, a report), and echoes the relay or the refusal (`local_relay_reply`); a coalesced retry gets the live session's relay | `crates/modules/fleet/src/hub.rs:82`, `:3310`, `:3329`, `:3922`, `:3978` |
+| The viewer decides per connect (`localRelayPlan`): name the device, probe while none is known, or neither. A probe naming one of the person's own devices fills the choice in (`deviceToPairFromProbe`; someone else's device keeps the probe). A named device's relay arrives on `rc:session.created` and goes in with `setConfiguration` (`withLocalRelay`) before the offer | `ui/src/composables/useRemoteControl.ts:3798`, `:3823`, `:3840`, `:3852`, `:7285`, `:8410`, `:10756` |
+| Settings → "This browser runs on": the person's own devices that advertise `local-relay`, or none; the refusal in plain words beneath it | `ui/src/views/remote/RemoteControl.vue:1882`, `:3536` |
+
+⚠️ One thing the design did not have to change: the probe server still binds its loopback port before it starts the
+TURN host, so a device whose whole probe band is reserved (the Hyper-V case `PROBE_PORT_FALLBACK` exists for) reports
+no relay either. Splitting the two is a later step if the field ever shows it.
+
 ## 4. Phases
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | Does the local-network permission gate a TURN server on 127.0.0.1? Chrome, then Safari and Firefox | none | **Chrome measured** (§2.3): it does not; Safari and Firefox owed |
-| P1 | The agent reports its relay (`rc:agent.local_relay`, the `watch`, re-minting), the `local-relay` verb, the Hub's in-memory copy | `ROOMLERD_LOCAL_TURN=0` (stops the relay and the report) | — |
-| P2 | `local_relay_from` on the request, `local_relay` / `local_relay_refused` on `rc:session.created`, every refusal; integration tests | the viewer's switch (it never sends the field) | — |
-| P3 | The viewer: the choice, the probe's suggestion (the descriptor's `agent_id`), no probe once chosen, `setConfiguration`, the refusal's words | `roomler-rc-local-relay` | — |
+| P1 | The agent reports its relay (`rc:agent.local_relay`, the `watch`, re-minting), the `local-relay` verb, the Hub's in-memory copy | `ROOMLERD_LOCAL_TURN=0` (stops the relay and the report) | **built** (§3.5) |
+| P2 | `local_relay_from` on the request, `local_relay` / `local_relay_refused` on `rc:session.created`, every refusal; integration tests | the viewer's switch (it never sends the field) | **built** (§3.5): the hub's every arm and the end-to-end dispatch are unit tests; the integration lane runs the composition gate |
+| P3 | The viewer: the choice, the probe's suggestion (the descriptor's `agent_id`), no probe once chosen, `setConfiguration`, the refusal's words | `roomler-rc-local-relay` | **built** (§3.5) |
 | P4 | Field: the MacBook's Chrome with the permission back at "ask", red first | — | — |
 | P5 | Docs | — | — |
 

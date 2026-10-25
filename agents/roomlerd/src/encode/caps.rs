@@ -2035,6 +2035,12 @@ fn rpc_caps() -> Vec<String> {
     // asked at each command. Windows' `console_user` is its service's.
     #[cfg(unix)]
     caps.push(RpcCap::ConsoleUser);
+    // FR-121 — this device reports its loopback relay to the server while the
+    // relay is switched on, so a viewer on it lists it as "this browser runs
+    // on". A device without an overlay yet still says it and reports `None`.
+    if crate::rc_local_turn::enabled() {
+        caps.push(RpcCap::LocalRelay);
+    }
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise

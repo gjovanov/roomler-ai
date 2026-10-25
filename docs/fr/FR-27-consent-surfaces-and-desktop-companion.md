@@ -33,7 +33,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2026`,
+   deny. — `agents/roomlerd/src/signaling.rs:2073`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
@@ -67,12 +67,12 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:2902`, `ssh.rs:2251` vs `git grep write_pending`
+   — `signaling.rs:2949`, `ssh.rs:2251` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
-   built. — `hub.rs:39,841`, `models.rs:393`, `state.rs:1199`
+   built. — `hub.rs:39,862`, `models.rs:393`, `state.rs:1199`
 
 ### Desktop companion
 
@@ -633,7 +633,7 @@ auto` for the run (as found: unset) so the directive did not rest on the
 shortcut alone. Nothing in the consent code differs between the two agent
 builds below (`git log agent-v0.4.101..agent-v0.4.102` touches no consent
 file), and the hub sends `consent_timeout_secs = host_prompt_timeout_secs =
-300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:1034`,
+300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:1058`,
 `crates/remote_control/src/consent.rs:115`).
 
 | | control (as found) | with the floor | restored |
@@ -660,10 +660,10 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2515`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2562`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
-directive: `Prompt { timeout: host_window }` (`signaling.rs:2479`). The control
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2526`). The control
 run pins the other half: same account, device and policy, only the local
 setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
 1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device

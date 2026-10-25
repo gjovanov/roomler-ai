@@ -427,6 +427,38 @@ type NetDeltaRx = std::convert::Infallible;
 /// with no subscription (or after the monitor closes). Minor/immaterial
 /// deltas and `Lagged` are absorbed here — the probe is strictly for "the
 /// network moved" moments. Cancel-safe (broadcast `recv` is cancel-safe).
+/// FR-121 — the next change of the device's loopback relay
+/// ([`crate::rc_local_turn::subscribe`]). Never, for a connection that does not
+/// report it (a secondary org's: the relay sits on the primary overlay), nor
+/// once the probe task has ended.
+async fn next_local_relay(
+    rx: &mut Option<
+        tokio::sync::watch::Receiver<
+            Option<roomler_ai_remote_control::signaling::LocalRelayDescriptor>,
+        >,
+    >,
+) -> Option<roomler_ai_remote_control::signaling::LocalRelayDescriptor> {
+    if let Some(r) = rx.as_mut() {
+        if r.changed().await.is_ok() {
+            return r.borrow_and_update().clone();
+        }
+        *rx = None;
+    }
+    std::future::pending().await
+}
+
+/// FR-121 — queue the relay report for the server. A full queue drops it:
+/// the next re-mint (at most half an hour) or the next connection sends it
+/// again. ⚠️ Logs the error's Display only: the frame carries a live credential.
+fn send_local_relay(
+    outbound: &mpsc::Sender<ClientMsg>,
+    relay: Option<roomler_ai_remote_control::signaling::LocalRelayDescriptor>,
+) {
+    if let Err(e) = outbound.try_send(ClientMsg::AgentLocalRelay { relay }) {
+        debug!(%e, "loopback-TURN: the relay report could not be queued");
+    }
+}
+
 async fn next_major_netchange(rx: &mut Option<NetDeltaRx>) -> String {
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     {
@@ -1942,10 +1974,25 @@ async fn connect_once(
     let mut net_rx: Option<NetDeltaRx> = None;
     let mut netchange_probe: Option<(std::time::Instant, u8)> = None;
 
+    // FR-121 — the primary org's connection tells the server about the
+    // device's loopback relay: what it is now, then every change.
+    let mut local_relay_rx = ctx.is_primary.then(crate::rc_local_turn::subscribe);
+    if let Some(rx) = local_relay_rx.as_mut() {
+        let relay = rx.borrow_and_update().clone();
+        if relay.is_some() {
+            send_local_relay(&outbound_tx, relay);
+        }
+    }
+
     // #2551 — setup is done: from here each arm names its own stage.
     drop(setup_stage);
     loop {
         tokio::select! {
+            relay = next_local_relay(&mut local_relay_rx) => {
+                let _stage = watchdog::enter(ctx.pump, "local_relay");
+                send_local_relay(&outbound_tx, relay);
+                watchdog::tick(ctx.pump);
+            }
             _ = shutdown.changed() => {
                 // #2551 — every arm names its stage, so a stall says where.
                 let _stage = watchdog::enter(ctx.pump, "shutdown");
