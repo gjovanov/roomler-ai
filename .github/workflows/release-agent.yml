@@ -557,6 +557,7 @@ jobs:
         with:
           binary: target/release/roomlerd
           expect-version: ${{ needs.validate-version.outputs.version }}
+          library-path: ${{ env.FFMPEG_DIR }}/lib
 
       - name: Bundle FFmpeg into the .deb (self-contained, RPATH)
         run: |
@@ -1169,6 +1170,7 @@ jobs:
         with:
           binary: target/release/roomlerd
           expect-version: ${{ needs.validate-version.outputs.version }}
+          library-path: ${{ env.FFMPEG_DIR }}/lib
 
       - name: Bundle FFmpeg + libvpx into the .deb (self-contained, RPATH)
         run: |
@@ -2728,12 +2730,15 @@ jobs:
       - name: Build the roomler CLI shim
         run: cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
 
-      # FR-6 wave 29, as in build-linux (the staging below signs copies).
+      # FR-6 wave 29, as in build-linux. The staging below signs copies, and
+      # until it bundles FFmpeg into the .app this binary finds FFmpeg only
+      # through library-path (it links @rpath/libavcodec…).
       - name: Stamp the seed with the tree this build compiled
         uses: ./.github/actions/seed-tree-stamp
         with:
           binary: target/aarch64-apple-darwin/release/roomlerd
           expect-version: ${{ needs.validate-version.outputs.version }}
+          library-path: ${{ env.FFMPEG_DIR }}/lib
 
       # The desktop companion — the macOS counterpart of roomler-desktop.exe —
       # is built by the parallel `build-macos-companion` job (FR-6 wave 18).

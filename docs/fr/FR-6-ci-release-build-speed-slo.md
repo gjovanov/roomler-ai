@@ -59,8 +59,10 @@ itself on the affected run's page. Baseline when the program started: releases t
   same job, and no tracked file is modified, every tracked file gets the mtime
   2000-01-01, and cargo, which judges path crates by mtime, reuses the build. Any other
   case changes nothing, and the stamp is consumed either way. A reused daemon must
-  report the release version (`--version`). Kill switch: repository variable
-  `SEED_REUSE_SAME_TREE=off`.
+  report the release version from `--version`. Where it cannot run before packaging,
+  it must at least contain the version string: the macOS binary links
+  `@rpath/libavcodec…`, which only the `.app` resolves. Kill switch: repository
+  variable `SEED_REUSE_SAME_TREE=off`.
 - **PR CI** (`ci.yml`): Swatinem, keyed on the environment and the lockfile. A member
   crate's `Cargo.toml` edit or a third-party `Cargo.lock` change rotates a family's key,
   and the next run restores the previous generation as a prefix match. A version bump

@@ -21,6 +21,13 @@ inputs:
     description: The version the binary must report (validate-version's output).
     required: false
     default: ''
+  library-path:
+    description: >-
+      Optional: where the binary's shared libraries live before packaging puts
+      them beside it (the vendored FFmpeg). Used as DYLD_LIBRARY_PATH and
+      LD_LIBRARY_PATH for the version check only.
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
@@ -29,18 +36,34 @@ runs:
       env:
         BIN: ${{ inputs.binary }}
         WANT: ${{ inputs.expect-version }}
+        LIBS: ${{ inputs.library-path }}
       run: |
         set -uo pipefail
         if [ -n "${ROOMLER_SEED_REUSED_TREE:-}" ]; then
           # Cargo reused the seed's build. Check the one outcome that must
           # never ship: an older daemon under a new tag.
           if [ -n "$BIN" ] && [ -n "$WANT" ]; then
-            got="$("$BIN" --version 2>&1 | head -n 1)" || true
+            got="$( [ -z "$LIBS" ] || export DYLD_LIBRARY_PATH="$LIBS" LD_LIBRARY_PATH="$LIBS"; "$BIN" --version 2>&1 | head -n 1 | tr -d '\r' )" || true
+            name="$(basename "$BIN" .exe)"
+            # clap prints exactly "<name> <version>".
             case "$got" in
-              *" $WANT"|*" $WANT "*) echo "reused build reports '${got}' (want ${WANT}): OK" ;;
-              *)
+              "$name $WANT")
+                echo "reused build reports '${got}' (want ${WANT}): OK"
+                ;;
+              "$name "*)
                 echo "::error title=Reused build is not ${WANT}::'${BIN} --version' printed '${got}'. The seed is not what its stamp claims. Set the repository variable SEED_REUSE_SAME_TREE=off and re-run, which rebuilds from source."
                 exit 1
+                ;;
+              *)
+                # It did not run here at all, typically a library the packaging
+                # step bundles later (macOS: "Library not loaded: @rpath/…").
+                # The version is still compiled into the binary, so look for it.
+                if LC_ALL=C grep -aqF "$WANT" "$BIN"; then
+                  echo "could not run the reused build here ('${got}'), but it embeds '${WANT}': OK"
+                else
+                  echo "::error title=Reused build is not ${WANT}::'${BIN} --version' printed '${got}', and the binary does not contain '${WANT}'. Set the repository variable SEED_REUSE_SAME_TREE=off and re-run, which rebuilds from source."
+                  exit 1
+                fi
                 ;;
             esac
           fi
