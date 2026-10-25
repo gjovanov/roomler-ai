@@ -131,8 +131,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/main.rs:5604`, called
-at `main.rs:5580`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/main.rs:5616`, called
+at `main.rs:5593`):
 
 ```mermaid
 sequenceDiagram
@@ -306,7 +306,10 @@ sequenceDiagram
   installed: the helper resolves and verifies the release itself
   (`update_trigger_path`, `queue_update_check`, `run_update_helper`, `updater.rs`).
 - **The opt-out** is the macOS one, `/etc/roomler/disable-auto-update`, honoured
-  by the helper itself.
+  by the helper itself. Since #2901 a daemon reads the same marker before it
+  arms its own updater (`updater::opt_out_marker`, one list for both). That
+  matters on a system install, whose root daemon installs its own updates:
+  before #2901 the marker stopped nothing there.
 - **Root only.** The helper refuses any other uid before it touches the wake
   file, the network or the install.
 
@@ -391,7 +394,8 @@ flowchart TD
   `install.sh`. The updater's own tarball install writes units only where absent.
 - **A per-user `auto_update = false` stops the forwarding too**, so a push is
   dropped. The helper's timer still installs, so on a helper host the opt-out is
-  `/etc/roomler/disable-auto-update`.
+  `/etc/roomler/disable-auto-update`. On a system install the marker turns off
+  the root daemon's own updater, the same as `auto_update = false` (#2901).
 - **Enabling the helper takes effect at the daemon's next start**, so `install.sh`
   (P3) reloads the user manager (`systemctl --user daemon-reload`, or the old
   sandbox stays) and restarts the per-user daemon after enabling the units.
@@ -547,7 +551,7 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 | Host | Who moves the companion | When |
 |---|---|---|
 | system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3313`) | after every check that installs nothing; at the start after an update (`:3194`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3245`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3880`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3935`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
 | per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3122`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
