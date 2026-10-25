@@ -1170,3 +1170,22 @@ The device's access policy was restored and read back equal.
 - The fix flags the pages that hold a live session (`meta.liveSession`: both remote viewers and the call). From those, `openInAppLink` opens a notification's link in a new tab. Anywhere else the bell navigates in place as before.
 
 The device's access policy was restored and read back equal after each run.
+
+### 2026-10-24/25 — #2841 and #2815 GREEN (API `hosted-20261024-46f3f84`, agent 0.4.168)
+
+**#2841 GREEN, 22:17Z** (fix #2853). Tab A held a live viewer to the same box; tab B raised a `push` request for it.
+- A click on that request in tab A's bell opened `/consent/<token>` in a **new tab**. The front proxy logged its load with **`Referer: …/agent/…/remote`**, i.e. `window.open` from the viewer.
+- Tab A's URL never changed. It read `connected` 80 s later, and its session ran until my own Disconnect, 108 s after the click.
+- Re-proven on the way: someone at the PC clicked the push toast for the same request, first in Edge and then in Chrome. Each opened the consent page in a window of its own (`Referer: …/sw.js`), so #2827's fix was seen live in both browsers.
+
+**#2815 GREEN, 00:47Z** (fix #2855). The daemon and the companion package on the box were both 0.4.168. The gates were opened exactly as in the 10-24 RED run.
+- The companion's main window was **open** and dragged aside, so nothing could hide under the prompt window. Each exec and SSH request came up **once**, in the prompt window. The main window showed its own page and no modal.
+- The exec prompt read "On behalf of **Grox**": the org's display name, from `rc:rpc.exec.tenant_name`. The RED run read "primary".
+- The SSH prompt read "«owner» (via «controller host») wants to open an SSH session on this device", with no `ssh:` and no `@ip:port`.
+- The daemon log keeps both forms on purpose. The prompt's own lines (`consent prompt surface (ssh)`, `operator approved the session`) carry the readable name. The audit lines (`exec finished caller=ssh:…@…`) keep the technical identity.
+- Both commands ran as the person at the screen (`wlab`, exit 0).
+
+**Restored** in reverse:
+- both policies back to their defaults, read back as absent;
+- `exec_enabled` and `ssh_enabled` back to `false`, and the daemon restarted;
+- re-proven closed: exec says "not enabled", SSH says "its policy is off".
