@@ -1,9 +1,10 @@
 # FR-120: Phone parity, part 2 — nothing a phone user needs is hover-only, clipped, or a page away
 
-**Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** in progress. On production, all
-on 2026-10-24: P5 (#2843) and P2 (#2845) since 20:34Z (`hosted-20261024-fa90220`), P3 (#2848) since 20:47Z
-(`hosted-20261024-9ea48a1`), P1a (#2850) since 22:05Z (with FR-27's `hosted-20261024-46f3f84`), and P1b (#2856) since
-22:30Z (`hosted-20261024-d96b623`). P6 (#2883) and P4a (#2887, with P7's docs) merged on 2026-10-25, with their rolls to come; P4b (#2895) is in review · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
+**Issue:** [#2839](https://github.com/gjovanov/roomler-ai/issues/2839) · **Status:** done, closed 2026-10-25. Every phase is on production:
+P5 (#2843) and P2 (#2845) since 2026-10-24 20:34Z (`hosted-20261024-fa90220`), P3 (#2848) since 20:47Z
+(`hosted-20261024-9ea48a1`), P1a (#2850) since 22:05Z (with FR-27's `hosted-20261024-46f3f84`), P1b (#2856) since
+22:30Z (`hosted-20261024-d96b623`), P6 (#2883) since 2026-10-25 13:59Z (`hosted-20261025-eeb8acd`, the 0.4.170 bump's
+image), and P4a (#2887, with P7's docs) and P4b (#2895) since 14:42Z (`hosted-20261025-8a58c53`) · **Owner:** the web app (UI) · **Anchors:** master `30405d173` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (#2561, closed 2026-10-23: the same facts and actions at every width, and
 the rules in `docs/ui.md` § Phones and tablets)
 
@@ -112,23 +113,35 @@ About 90 findings, every one against the current code; what FR-116 fixed was che
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1**: on the swept routes at 360 px, no fact is reachable only by hover. Every meaning-bearing `title` has a
+- [x] **AC1**: on the swept routes at 360 px, no fact is reachable only by hover. Every meaning-bearing `title` has a
   tap path or visible text, and every disabled control states its reason as text. The sweep's hover-only list is
-  empty except decorative titles, each named in §8. *(The sweep half is met on production, 2026-10-24 22:55Z: 0 at
-  360, 390 and 768 px on every route. Owed: a field check, in a live session, of the viewer's captions and tap paths; §8.)*
-- [ ] **AC2**: hive at 360 px: a session row shows its title, device and folder on at least half the row, with its
+  empty except decorative titles, each named in §8. *(Field-verified on production. The sweep, 2026-10-24 22:55Z: 0 at
+  360, 390 and 768 px on every route. A live session, 2026-10-25 13:52–14:00Z: every off Settings control says why as
+  text, and the toolbar's disabled controls say why on a tap; §8.)*
+- [x] **AC2**: hive at 360 px: a session row shows its title, device and folder on at least half the row, with its
   actions one tap away. The transcript header's controls are all reachable, and every hive dialog is full screen.
-- [ ] **AC3**: every dialog §2.2 lists is full screen on `xs` with its actions reachable, and no title or title row
-  clips its own text or button at 360 px.
-- [ ] **AC4**: Devices, the exec and SSH audits, Billing, Files, Members and Invites are each at most 2× their desktop
-  height at 360 px for the same data (§2.1 is the baseline).
+  *(Field-verified on production. On the vmtest org's data, 2026-10-24 20:45Z: 74 % of the row is text, Start and
+  People are full screen, and the header wraps. With synthetic hive data for what that org cannot reach, 2026-10-25
+  13:44–13:49Z: the row menu, the pager, and the Purge, Edit-a-fact, Add-a-copy, Copies and Manage dialogs, each full
+  screen with a close; §8.)*
+- [x] **AC3**: every dialog §2.2 lists is full screen on `xs` with its actions reachable, and no title or title row
+  clips its own text or button at 360 px. *(Field-verified on production: the Devices dialogs, a member's roles and
+  GIFs on 2026-10-24 20:59Z; the viewer's agent log in a live session on 2026-10-25 14:00Z, full screen, with its line
+  count and path in the toolbar's second row; §8.)*
+- [x] **AC4**: Devices, the exec and SSH audits, Billing, Files, Members and Invites are each at most 2× their desktop
+  height at 360 px for the same data (§2.1 is the baseline). *(Field-verified on production 2026-10-25 14:57Z,
+  `hosted-20261025-8a58c53`: 1.26–1.73× on all seven, with 20 rows on Files, Members and Invites; §8.)*
 - [x] **AC5**: the tutorial's chapter navigation brings the chapter's top into view at 360 and 1300 px. *(Field-verified
   on production 2026-10-24 20:45Z, `hosted-20261024-fa90220`: 486 → 76 px at 360, −1,080 → 76 px at 1300; §8.)*
 - [x] **AC6**: no page-level sideways scroll at 360 and 390 px on any public page (sign-in, sign-up, landing, legal).
   *(Field-verified on production 2026-10-24 20:49Z: all five public pages 0 px at both widths; §8.)*
-- [ ] **AC7**: on a coarse pointer, every primary button and chip on the swept routes has a hit area of at least
-  36 px, with desktop pixel-identical at 1300 px.
-- [ ] **AC8**: the operator tables (Observability, Growth, machine keys) keep their action on screen at 360 px.
+- [x] **AC7**: on a coarse pointer, every primary button and chip on the swept routes has a hit area of at least
+  36 px, with desktop pixel-identical at 1300 px. *(Field-verified on production 2026-10-25 14:40Z,
+  `hosted-20261025-eeb8acd`. Of 303 targets at 360 px and 361 at 768 px, none is under 36 px, crowded, or taking
+  another's tap, on any route or in a live session's toolbar. At 1300 px the rule touches none of 804 controls; §8.)*
+- [x] **AC8**: the operator tables (Observability, Growth, machine keys) keep their action on screen at 360 px.
+  *(Field-verified 2026-10-25 14:11Z on production's bundle with synthetic operator data, since the vmtest admin is no
+  operator: every `inspect`, `timeline` and `revoke` button is on screen; §8.)*
 - [x] **AC9**: Docs: `docs/ui.md` states §3.1's rules (its diagram updated), and the `docs/README.md` index row covers
   them. *(P1b, P6 and P4a's rows in § Phones and tablets; its breakpoint diagram gains the touch screen and the list
   decision the 2× bound; the index row names all four. #2887)*
@@ -171,6 +184,13 @@ All four were decided by the operator on 2026-10-25, each as recommended.
 | 2026-10-25 11:51–11:54Z | P4a before merge, a first pass: production (`index-gJmkfi-I.js`) vs the branch (`index-DiyeYaTU.js`) | the vmtest org from mars; read-only | **A wrong turn, recorded:** the run outpaced the API's 60 requests a minute, so lists came back blank. Production's exec audit measured 780 px because its list never loaded, and one build's Devices page lost its enrollment keys. The paced runs below replace it |
 | 2026-10-25 12:24–12:58Z | P4a before merge, paced at 13 s between loads (no load throttled): production (`hosted-20261025-1acc44e`, entry `index-gJmkfi-I.js`) vs the branch (`index-DiyeYaTU.js`, then `index-BRWjj9YW.js` with the keys, then `index-DrhylERg.js` with Billing) | the vmtest org from mars; read-only, the taps open and close rows | 🔴 → 🟢 **AC4** at 360 px, against desktop heights that did not change: Devices 5,377 → 1,851 px (3.66× → 1.26×), the exec audit 5,664 → 2,934 px (3.34× → 1.73×), the SSH audit 4,480 → 1,990 px (3.64× → 1.62×) and Billing 2,445 → 1,665 px (2.24× → 1.52×). Files, Members and Invites measure 0.87× on both builds: the vmtest org has almost none of each, so P4b measures them with rows. With only the cards folded, Devices came to 3,669 px (2.5×); the rest was the enrollment keys under them, which then got a line of their own. A phone shows ten 50 px device lines; a tap opens one card, with its panels and actions, and leaves the others closed, and a second tap closes it. An exec card goes from 128 to 276 px when opened (Who appears only then), an SSH card from 68 to 194 px. A tablet's Devices cards (768 px) match production box for box |
 | 2026-10-25 13:11–13:25Z | P4b before merge: production (`hosted-20261025-1acc44e`, entry `index-gJmkfi-I.js`) vs the branch (`index-BOFDHIL2.js`, then `index-YZigAQaZ.js`), with the same 20 synthetic members, invites and files served to both builds from the page itself, so nothing reached the server | the vmtest org from mars, paced at 13 s between loads; the vmtest org has almost none of each, so its own pages measured 1× | 🔴 → 🟢 **AC4, with rows**, at 360 px against desktop heights that did not change (1,058, 1,128 and 1,033 px): Files 4,917 → 1,357 px (4.65× → 1.28×), Members 4,296 → 1,520 px (3.81× → 1.35×), Invites 4,876 → 1,401 px (4.72× → 1.36×). A row is 49 px closed; a tap opens it (to 129, 149 or 98 px) and a second tap closes it. The room search finds 18 of the org's 87 rooms for "e", each with its path. **A wrong turn, recorded:** the first branch build kept Vuetify's `v-data-table__tr--mobile` on the phone row, and that class makes each cell a two-column grid. The line was squeezed into half the width ("An/yo/ne") and the opened details sat beside it, so Invites still read 2.26×. The screenshot showed it, and the row no longer carries the class |
+| 2026-10-25 13:33–13:35Z | D4 (in P6) before merge: production (`index-gJmkfi-I.js`) vs the P6 branch (`index-eFVM7XK5.js`) | the vmtest org from mars: an offline device's viewer, Settings opened from its toolbar | 🔴 → 🟢 **D4**: a tablet (768 × 1024) went from a full-screen Settings (768 × 1024) to the 560 px card (560 × 405), with the stage in view. A phone held upright (360 × 780) and one held sideways (844 × 390) keep the full screen on both builds; a 1300 px desktop keeps the card on both |
+| 2026-10-25 13:44–13:49Z | production (`hosted-20261025-1acc44e`, entry `index-gJmkfi-I.js`) with SYNTHETIC hive data, served from the page itself: 60 of my sessions, three running, in an org whose sessions are copied; two kept facts; a policy; and a real hive room of the vmtest org whose record was served with copies (adopted, ended) | the vmtest org from mars at 360 × 780; nothing reached the server but the reads the pages make anyway, and the one write (minting a token for an archive replica) was answered locally with a placeholder | 🟢 **AC2, what the vmtest org cannot reach**: each phone row's ⋮ menu offers Stop and Delete for good; the pager reaches page 2 (sessions 50 to 59); Delete for good, Edit a fact, Add an archive replica, and the transcript header's Copies and Manage each open full screen (360 × 780) with a close. **A wrong turn, recorded:** the first dialog check looked for `.v-dialog` inside the overlay, but Vuetify puts that class on the overlay itself; the screenshots showed the dialogs open |
+| 2026-10-25 13:52–14:00Z | production (`hosted-20261025-1acc44e`, entry `index-gJmkfi-I.js`), live sessions to this run's own kept vmtest cell (an ephemeral Ubuntu guest, `ubuntu/script/system` on zeus, promptless because the vmtest admin enrolled it) | the vmtest org from mars at 360 × 780 with touch; each session ended when its page closed | 🟢 **AC1, the live half**: Settings opens full screen, with four tabs. Every off control says why, as text: Match remote display (it needs an X11 desktop), Host audio and Corp relay assist (both until the next Connect), and clipboard auto-sync (a root daemon has no clipboard). On the toolbar, the disabled clipboard buttons say why on a tap; a refused Record says the owner hasn't allowed remote recording; the touch-mode control says how the new mode works ("Direct touch: the finger is the pointer."). 🟢 **AC3, the agent log**: Settings → Agent logs opens full screen; the title ("Agent log", the device's name after it shrinking with an ellipsis) keeps its refresh, copy and close buttons on screen, and the line count and the log's path ride the second toolbar row. **Two wrong turns, recorded:** the first run decided "connected" from the word Disconnect, which is an icon; and a regex's `\b` arrived on mars as a backspace |
+| 2026-10-25 14:09–14:11Z | production (`hosted-20261025-eeb8acd`, entry `index-DgzwBkIm.js`) with SYNTHETIC operator data: in this headless browser only, `/api/auth/me` answered with `is_platform_admin: true` (the client's own gate) and every `/api/admin/` read answered locally, so no operator request reached the server | the vmtest org's admin from mars at 360 × 780 | 🟢 **AC8**: every operator table's action is on screen: Observability's 12 `inspect` buttons end at 87 px of 360, Growth's 12 `timeline` buttons at 107 px, and the machine keys' 3 `revoke` buttons at 101 px. **A wrong turn, recorded:** the first stub answered the channels report with `{enabled: false}`, and the panel, which renders whenever a report exists and reads its `platforms`, went blank |
+| 2026-10-25 14:05–14:40Z | production, `hosted-20261025-eeb8acd` (entry `index-DgzwBkIm.js`): P6 live, in the 0.4.170 bump's image, promoted by roomler-ai-4c (pods on it since 13:59Z); `/health` ok at 0.4.170; the vmtest org had 4 devices online before, and 5 after (the 5th my kept cell) | §2.1's 35 routes from mars at 360 and 768 px (touch) and 1300 px, paced at 13 s between loads (none throttled); one throwaway room, deleted (200) | 🟢 **AC7**: every enabled button and tappable chip carries its hit area: 303 targets at 360 px and 361 at 768 px, with **0 under 36 px, 0 crowded and 0 taking another's tap** on every route. At 1300 px the rule touches none of the 804 controls. The landing and pricing pages are static HTML outside the app bundle, with no Vuetify buttons or chips. 🟢 **D4**: Settings is full screen on a phone held upright (360 × 780) or sideways (844 × 390), and the 560 px card on a tablet (768 px) and a desktop |
+| 2026-10-25 14:39–14:41Z | production, `hosted-20261025-eeb8acd`, a live session to the kept vmtest cell at 360 × 780 (touch) | the vmtest org from mars | 🟢 **AC7, the session's toolbar**: all 15 of the connected viewer's buttons and chips carry the hit area. 14 were probed (one sat at the screen's edge), with 0 under 36 px, 0 crowded and 0 taking another's tap. The cell was then ended cleanly: its daemon stopped, so the ephemeral device removed itself (its row is gone), and only that VM was destroyed |
+| 2026-10-25 14:51–14:57Z | production, `hosted-20261025-8a58c53` (entry `index-D2-0XM-5.js`): P4a (#2887) and P4b (#2895) live (promote run 40203447488, pods on it since 14:42Z); `/health` ok at 0.4.170; the vmtest org had 4 devices online before and 4 after | the vmtest org from mars, paced; Files, Members and Invites with the same 20 synthetic rows as before merge | 🟢 **AC4**, the same numbers as the branch before merge. At 360 / 1300 px: Devices 1,851 / 1,468 px (1.26×), the exec audit 2,934 / 1,698 (1.73×), the SSH audit 1,990 / 1,230 (1.62×), Billing 1,665 / 1,093 (1.52×), Files 1,357 / 1,058 (1.28×), Members 1,520 / 1,128 (1.35×) and Invites 1,401 / 1,033 (1.36×). A phone shows ten device lines, and a tap opens one card's panels; the first exec card opens; a plan goes from 3 to 9 limits on a tap; a member's row opens its details |
 
 ## 9. Related
 
