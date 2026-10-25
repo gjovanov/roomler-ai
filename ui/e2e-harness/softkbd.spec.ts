@@ -304,6 +304,45 @@ test.describe("the soft keyboard's own paths still reach the host once", () => {
     expect(next, describeFrames(next)).toEqual([{ via: 'soft-keyboard', t: 'key_text', text: 'a' }])
   })
 
+  test("a dead key (´ then e): the dead keydown keeps its default and sends no HID frame; the composed é arrives once", async ({ page }) => {
+    // On a viewer whose browser composes dead keys (macOS, Linux, iPadOS — the
+    // tablet case) a prevented dead keydown kills the composition. The keydown
+    // is dispatched as the browser would; what the OS then does on such a
+    // viewer — compose ´ with the next key — is driven through CDP, since no
+    // headless Chromium composes on its own.
+    await openSoftKeyboard(page)
+    const prevented = await page.evaluate(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-rc-capture]')!
+      const kd = new KeyboardEvent('keydown', { key: 'Dead', code: 'Backquote', bubbles: true, cancelable: true })
+      ta.dispatchEvent(kd)
+      ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'Dead', code: 'Backquote', bubbles: true, cancelable: true }))
+      return kd.defaultPrevented
+    })
+    expect(prevented, 'the dead keydown must keep its default: the browser composes it').toBe(false)
+    const cdp = await page.context().newCDPSession(page)
+    let viaCdp = true
+    try {
+      await cdp.send('Input.imeSetComposition', { text: '´', selectionStart: 1, selectionEnd: 1 })
+      await cdp.send('Input.insertText', { text: 'é' })
+    } catch {
+      viaCdp = false
+      await page.evaluate(() => {
+        const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-rc-capture]')!
+        ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+        ta.value = '´'
+        ta.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: '´' }))
+        ta.value = 'é'
+        ta.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: 'é' }))
+        ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'é' }))
+      })
+    }
+    const sent = await frames(page)
+    note('soft open, dead key', viaCdp ? 'Dead(Backquote) + composed é' : 'Dead(Backquote) + synthetic composition', sent)
+    // No HID frame for the dead key's position (0x35), nothing from the listener at all.
+    expect(sent, describeFrames(sent)).toEqual([{ via: 'soft-keyboard', t: 'key_text', text: 'é' }])
+    expect(await page.evaluate(() => window.__harness.captureValue())).toBe('')
+  })
+
   test('an IME composition arrives as one key_text on compositionend', async ({ page }) => {
     await openSoftKeyboard(page)
     const cdp = await page.context().newCDPSession(page)

@@ -14148,8 +14148,11 @@ function modifierBits(ev: Pick<KeyboardEvent, 'ctrlKey' | 'shiftKey' | 'altKey' 
  *  | chord, a modifier): default prevented,  | `onKeyDown` never runs           |
  *  | propagation stopped                     |                                  |
  *  | leaves a printable character (no chord) | the character, through `input` — |
- *  | UNTOUCHED (`soft-keyboard`)             | with the toolbar's sticky        |
- *  |                                         | Ctrl / Alt / Win applied         |
+ *  | or a dead key UNTOUCHED                 | with the toolbar's sticky        |
+ *  | (`soft-keyboard`)                       | Ctrl / Alt / Win applied; a dead |
+ *  |                                         | key composes with the next, and  |
+ *  |                                         | `compositionend` carries the     |
+ *  |                                         | composed character               |
  *  | drops (IME, `keyCode` 229, a `code` it  | the typed text, the composition, |
  *  | cannot map): untouched                  | the code-less Enter / Tab        |
  *  | defers Ctrl+V: default NOT prevented    | nothing — `onPaste` consumes the |
@@ -14201,6 +14204,15 @@ export function routeKeyEvent(
   // types through. Forwarding it here would type it once but leave the
   // armed modifier for the next key.
   if (action.kind === 'text' && softKeyboard) return { kind: 'untouched', why: 'soft-keyboard' }
+  // A dead key (´, ¨, ^ — `key` "Dead") is the textarea's as well: on a viewer
+  // whose browser composes dead keys (macOS, Linux, iPadOS Safari — the
+  // tablet case) a prevented dead keydown kills the composition, and ´ then
+  // e reaches the host as HID(dead) + "e" instead of "é"; left alone, the
+  // composed character arrives through `compositionend`, with no spurious
+  // HID frame for the dead key's position. The stage keeps forwarding dead
+  // keys as the HID usage of their position: nothing composes there, and
+  // the host's own layout does.
+  if (ev.key === 'Dead' && softKeyboard) return { kind: 'untouched', why: 'soft-keyboard' }
   const preventDefault =
     softKeyboard || shouldPreventDefault(ev, state.pointerInside, state.keyboardLocked)
   // Only on the down: a chord produces one keydown, and the mirror must not

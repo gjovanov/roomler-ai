@@ -3106,6 +3106,27 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
       ).toEqual({ kind: 'untouched', why: 'soft-keyboard' })
     })
 
+    it("a dead key is the textarea's too: the browser composes it, and the composed character arrives through compositionend", () => {
+      // On a viewer whose browser composes dead keys (macOS, Linux, iPadOS —
+      // the tablet case) a prevented dead keydown kills the composition: ´
+      // then e would reach the host as HID(dead) + "e" instead of "é".
+      const { soft, stage } = page()
+      for (const down of [true, false]) {
+        for (const state of [{}, { pointerInside: true }, { keyboardLocked: true }]) {
+          expect(route(soft, { key: 'Dead', code: 'Backquote' }, down, state), JSON.stringify(state)).toEqual({
+            kind: 'untouched',
+            why: 'soft-keyboard',
+          })
+          expect(route(soft, { key: 'Dead', code: 'Quote' }, down, state)).toEqual({ kind: 'untouched', why: 'soft-keyboard' })
+        }
+      }
+      // On the stage a dead key is forwarded as the HID usage of its position,
+      // as before: nothing composes there, and the host's own layout does.
+      expect(route(stage, { key: 'Dead', code: 'Backquote' })).toMatchObject({ kind: 'key', code: 0x35, down: true })
+      expect(route(stage, { key: 'Dead', code: 'Backquote' }, false)).toMatchObject({ kind: 'key', code: 0x35, down: false })
+      expect(route(document.body, { key: 'Dead', code: 'Quote' })).toMatchObject({ kind: 'key', code: 0x34 })
+    })
+
     it('Enter, Tab, Escape, the arrows, Backspace, Delete, Home, F2, a modifier: one HID frame, default prevented, propagation stopped', () => {
       const { soft } = page()
       const expected: [KeyboardEventInit, number][] = [

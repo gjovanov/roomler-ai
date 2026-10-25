@@ -103,7 +103,7 @@ function flushPendingCtrlV() {
   const mods = pendingCtrlV.mods
   if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
   pendingCtrlV = null
-  for (const frame of deferredPasteFrames(mods)) sent.push({ via: 'paste-flush', ...frame })
+  for (const frame of deferredPasteFrames(mods)) sent.push({ via: 'paste-flush', ...frame } as HostFrame)
 }
 
 /** The effects `onKey` gives `applyKeyRoute`, recording instead of sending. */

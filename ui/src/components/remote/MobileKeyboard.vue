@@ -22,9 +22,10 @@
       can map — a named key, a chord, a modifier — it forwards with the
       browser's default prevented and propagation stopped, so neither
       this textarea nor `onKeyDown` below sees it; a printable character
-      with no chord it leaves to THIS textarea, whose `onInput` types it
-      and applies the toolbar's sticky Ctrl / Alt / Win (the only chord
-      mechanism a phone has); what it drops — an IME keydown, the OS
+      with no chord, or a dead key, it leaves to THIS textarea, whose
+      `onInput` types it and applies the toolbar's sticky Ctrl / Alt / Win
+      (the only chord mechanism a phone has) and whose composition events
+      carry a dead key's composed character; what it drops — an IME keydown, the OS
       keyboard's own code-less keys — is this component's too, through
       `onInput` / `onCompositionEnd` / `onKeyDown`. `isViewerOwnInput`
       and `isSoftKeyboardTarget` in `useRemoteControl.ts` read the

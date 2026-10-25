@@ -880,8 +880,8 @@ CAPTURE listener (`attachInput`, `useRemoteControl.ts:12013`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
-(`MobileKeyboard.vue:217`), a composition as `compositionend` (`:280`), and a
-special key the OS keyboard sends as a `keydown` through `onKeyDown` (`:302`).
+(`MobileKeyboard.vue:218`), a composition as `compositionend` (`:281`), and a
+special key the OS keyboard sends as a `keydown` through `onKeyDown` (`:306`).
 Both are needed: the keydown is the only way a Backspace on the always-empty
 textarea or a hardware chord reaches the host (#2878), and the `input` event
 is the only way the phone's letters do (their keydowns carry `keyCode` 229).
@@ -919,9 +919,9 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14168`, pure)
-and carried out by `applyKeyRoute` (`:14236`): a key whose target is the soft
-keyboard's textarea (`isSoftKeyboardTarget`, `:14009` — the same
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14171`, pure)
+and carried out by `applyKeyRoute` (`:14261`): a key whose target is the soft
+keyboard's textarea (`isSoftKeyboardTarget`, `:14003` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
 key over the stage or under keyboard lock, and has one owner — which one
 depends on the key.
@@ -929,16 +929,16 @@ depends on the key.
 | the listener… | the textarea's own path carries |
 |---|---|
 | **forwards a HID frame** (a named key, a chord, a modifier): default prevented, propagation stopped | nothing — no `input` event, and `onKeyDown` never runs |
-| **leaves a printable character** (no chord) untouched — `untouched / soft-keyboard` | the character, through `input` — with the toolbar's sticky Ctrl / Alt / Win applied (`consumeModBits`) |
+| **leaves a printable character** (no chord) **or a dead key** untouched — `untouched / soft-keyboard` | the character, through `input` — with the toolbar's sticky Ctrl / Alt / Win applied (`consumeModBits`); a dead key composes with the next, and `compositionend` carries the composed character |
 | **drops** (IME, `keyCode` 229, a `code` it cannot map): untouched | the typed text, the composition, the code-less Enter / Tab |
-| **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `routeDeferredPaste` consumes the paste event for `onPaste` (`:11768`) |
+| **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `routeDeferredPaste` consumes the paste event for `onPaste` (`:11766`) |
 
 ```mermaid
 flowchart TD
     K["keydown, target = soft keyboard's textarea"] --> R["routeKeyEvent<br/>(window, capture phase)"]
     R -->|"paused · viewer-own"| U["untouched"]
     R -->|"IME · keyCode 229 · unmapped code"| D["untouched → the textarea's own path<br/>input · compositionend · onKeyDown"]
-    R -->|"printable, no chord"| T["untouched → the browser inserts it →<br/>input → keyText, sticky modifiers applied"]
+    R -->|"printable, no chord · dead key"| T["untouched → the browser inserts or composes it →<br/>input / compositionend → keyText, sticky modifiers applied"]
     R -->|"named key · chord · modifier"| F["forward HID frame<br/>preventDefault + stopPropagation"]
     R -->|"Ctrl+V"| V["defer: no preventDefault<br/>stopPropagation"]
     V --> P["paste event → routeDeferredPaste<br/>preventDefault · mirror · flush Ctrl+V"]
@@ -959,14 +959,20 @@ keydowns (`key` "a", no `code`) for every letter, which `decideKeyAction`
 classifies as text by `key`. A listener that forwarded printable keydowns
 would own the phone's own typing and leave the armed modifier for the next
 toolbar key (the first version of this fix did exactly that; review caught
-it). ⚠️ **The drop happens before any `preventDefault`.** A dropped keydown
+it). ⚠️ **A dead key is the textarea's as well.** On a viewer whose browser
+composes dead keys — macOS, Linux, iPadOS Safari, the tablet case — a
+prevented dead keydown kills the composition: ´ then e would reach the host
+as HID(dead) + "e" instead of "é". Windows viewers compose in the OS and were
+never affected. The stage keeps forwarding a dead key as the HID usage of its
+position: nothing composes there, and the host's own layout does.
+⚠️ **The drop happens before any `preventDefault`.** A dropped keydown
 must stay untouched, or the IME's composition and the OS keyboard's own Enter
 lose their default and never arrive at all. ⚠️ **The deferral consumes its
 paste.** `routeDeferredPaste` calls `preventDefault` whenever a deferral is
 pending — in the one function `onPaste`, the harness and the spec all run, so
 it is not a copy that can drift. With nothing editable focused the default did
 nothing anyway; with the textarea focused it inserted the clipboard, and the
-`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:305`) also ignores
+`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:306`) also ignores
 a `defaultPrevented` keydown — the second lock, should the listener ever
 forward without stopping.
 
@@ -983,7 +989,8 @@ real `MobileKeyboard.vue` and the real `routeKeyEvent` / `applyKeyRoute` /
 Playwright in a real Chromium — hardware keys in three viewer states,
 `insertText` (the OS keyboard's path), an iOS-style letter (a code-less
 keydown, then the insertion), the toolbar's sticky Ctrl followed by a hardware
-`c`, a CDP IME composition, a real paste, the SAS chord, Ctrl→Cmd, the toolbar,
+`c`, a dead key followed by its composition, a CDP IME composition, a real
+paste, the SAS chord, Ctrl→Cmd, the toolbar,
 the closed states and the path field — recording each frame with WHO sent it.
 The vitest matrix (`useRemoteControl.spec.ts`, `MobileKeyboard.spec.ts`) locks
 the verdicts, the one-owner invariant over every key and state, and the paste
