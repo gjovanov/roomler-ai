@@ -545,28 +545,57 @@
               :data-testid="`device-card-${item.id}`"
             >
               <!-- Who it is: the name a person knows it by, then what the
-                   machine calls itself (unless hidden), OS, version, last seen. -->
-              <div class="d-flex align-start ga-2 pa-3 pb-2">
-                <!-- FR-120 P1 — the dot only repeats the status chip beside
-                     it, whose meaning opens on a tap; its own `title` reached
-                     a mouse only. -->
-                <v-icon
-                  :color="rowPresenceColor(item)"
-                  size="small"
-                  class="mt-1 flex-shrink-0"
-                  aria-hidden="true"
+                   machine calls itself (unless hidden), OS, version, last seen.
+                   FR-120 P4 — on a phone the card starts as this one line (the
+                   name, the OS, the status, one action) and its head opens the
+                   rest: ten open cards were 3.7× the desktop grid. -->
+              <div
+                class="d-flex ga-2 pa-3"
+                :class="xs ? ['align-center', isCardOpen(item) ? 'pb-2' : 'py-1'] : ['align-start', 'pb-2']"
+              >
+                <component
+                  :is="xs ? 'button' : 'div'"
+                  :type="xs ? 'button' : undefined"
+                  :aria-expanded="xs ? isCardOpen(item) : undefined"
+                  :class="xs ? 'stack-toggle device-card__toggle' : 'd-flex align-start ga-2 flex-grow-1 device-card__toggle'"
+                  :data-testid="xs ? `device-card-toggle-${item.id}` : undefined"
+                  @click="xs && toggleCard(item)"
                 >
-                  {{ rowPresenceIcon(item) }}
-                </v-icon>
-                <div class="flex-grow-1 device-card__head">
-                  <div class="font-weight-medium text-break">{{ deviceLabel(item) }}</div>
-                  <div class="text-caption text-medium-emphasis text-break">
-                    <span v-if="secondaryDeviceName(item, hideNameWhenDisplay)">{{ item.name }} · </span>
-                    <v-icon size="x-small" :icon="osIcon(item.os)" class="mr-1" />{{ item.os }}
-                    <span v-if="item.version"> · v{{ item.version }}</span>
-                    <span :title="fmtDate(item.last_seen_at)"> · {{ fmtRelative(item.last_seen_at) }}</span>
+                  <!-- FR-120 P1 — the dot only repeats the status chip beside
+                       it, whose meaning opens on a tap; its own `title` reached
+                       a mouse only. -->
+                  <v-icon
+                    :color="rowPresenceColor(item)"
+                    size="small"
+                    class="flex-shrink-0"
+                    :class="{ 'mt-1': !xs }"
+                    aria-hidden="true"
+                  >
+                    {{ rowPresenceIcon(item) }}
+                  </v-icon>
+                  <div class="flex-grow-1 device-card__head">
+                    <div class="font-weight-medium text-break">
+                      {{ deviceLabel(item) }}
+                      <v-icon
+                        v-if="xs && !isCardOpen(item)"
+                        size="x-small"
+                        :icon="osIcon(item.os)"
+                        class="ml-1"
+                        role="img"
+                        :aria-label="item.os"
+                      />
+                    </div>
+                    <div v-if="!xs || isCardOpen(item)" class="text-caption text-medium-emphasis text-break">
+                      <span v-if="secondaryDeviceName(item, hideNameWhenDisplay)">{{ item.name }} · </span>
+                      <v-icon size="x-small" :icon="osIcon(item.os)" class="mr-1" />{{ item.os }}
+                      <span v-if="item.version"> · v{{ item.version }}</span>
+                      <span :title="fmtDate(item.last_seen_at)"> · {{ fmtRelative(item.last_seen_at) }}</span>
+                    </div>
                   </div>
-                </div>
+                  <v-icon v-if="xs" size="small" class="flex-shrink-0" aria-hidden="true">
+                    {{ isCardOpen(item) ? 'mdi-chevron-up' : 'mdi-chevron-down' }}
+                  </v-icon>
+                </component>
                 <FactChip
                   size="small"
                   :color="rowStatusColor(item)"
@@ -576,11 +605,40 @@
                 >
                   {{ rowStatusLabel(item) }}
                 </FactChip>
+                <!-- The one action of a closed card: Connect for a device (its
+                     status chip says why when it is disabled), the menu for a
+                     tunnel client. An open card has both, in its actions. -->
+                <template v-if="xs && !isCardOpen(item)">
+                  <v-btn
+                    v-if="item.kind === 'agent'"
+                    icon="mdi-remote-desktop"
+                    size="small"
+                    variant="text"
+                    color="primary"
+                    class="flex-shrink-0"
+                    :disabled="!item.is_online"
+                    :to="{ name: 'agent-remote', params: { tenantId, agentId: item.id } }"
+                    :aria-label="`Connect to ${deviceLabel(item)}`"
+                  />
+                  <DeviceActionsMenu
+                    v-else
+                    :tenant-id="tenantId"
+                    :row="item"
+                    :agent="agentFor(item)"
+                    :client="clientFor(item)"
+                    :node="nodeFor(item)"
+                    :network-mounted="caps.has('network')"
+                    :update-busy="updateBusy === item.id"
+                    :rotate-key-busy="rotateKeyBusy === item.id"
+                    :update-blocked="updateBlockedText(agentFor(item))"
+                    @action="(a: DeviceAction) => onDeviceAction(item, a)"
+                  />
+                </template>
               </div>
               <!-- What needs a person, and the device's own labels: the chips
                    the grid shows (docs/ui.md "needs a person"), never a chip
                    that is only a fact. -->
-              <div v-if="cardHasChips(item)" class="d-flex flex-wrap ga-1 px-3 pb-2">
+              <div v-if="cardHasChips(item) && (!xs || isCardOpen(item))" class="d-flex flex-wrap ga-1 px-3 pb-2">
                 <v-chip
                   v-if="item.kind === 'tunnel_client'"
                   size="x-small"
@@ -708,6 +766,7 @@
                    every card) and the technical facts. Each title says what is
                    inside, so a collapsed card still answers "how is this set?". -->
               <v-expansion-panels
+                v-if="!xs || isCardOpen(item)"
                 variant="accordion"
                 multiple
                 flat
@@ -825,7 +884,7 @@
                   </v-expansion-panel-text>
                 </v-expansion-panel>
               </v-expansion-panels>
-              <v-card-actions class="px-3 pt-1 pb-2">
+              <v-card-actions v-if="!xs || isCardOpen(item)" class="px-3 pt-1 pb-2">
                 <v-btn
                   v-if="item.kind === 'agent'"
                   size="small"
@@ -1423,6 +1482,7 @@ import { useDeviceStore, type DeviceRow } from '@/stores/devices'
 import { useAuthStore } from '@/stores/auth'
 import { useGridColumns } from '@/composables/useGridColumns'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { useOpenRows } from '@/composables/useOpenRows'
 import {
   deviceLabel,
   secondaryDeviceName,
@@ -1960,6 +2020,12 @@ async function onRcOverlayChange(a: Agent, rc_overlay: boolean) {
 const { smAndDown: mobile, xs, lgAndDown } = useDisplay()
 // FR-120 P3 — the page's dialogs of substance cover the screen below 600 px.
 const { fullscreen } = useResponsiveDialog()
+// FR-120 P4 — on a phone a card is one line until its head is tapped: the
+// name, the OS, the status and one action (D2). Keyed by kind as well as id,
+// as the cards are (an agent and a tunnel client never share a key).
+const { isOpen: isCardOpenKey, toggle: toggleCardKey } = useOpenRows<string>()
+const isCardOpen = (item: DeviceRow) => isCardOpenKey(`${item.kind}:${item.id}`)
+const toggleCard = (item: DeviceRow) => toggleCardKey(`${item.kind}:${item.id}`)
 
 // The cards have no v-data-table-server to fire @update:options, so below md a
 // page change fetches here. Guarded by `mobile`: on the grid the table's
