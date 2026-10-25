@@ -1521,11 +1521,37 @@ jobs:
       # #2836: `overlay::socket_inherit_tests` — no tokio socket is inheritable,
       # so a child the daemon spawns (the post-install watcher outlives it by
       # design) never holds its ports. `cfg(windows)`: Unix sockets are CLOEXEC.
+      #
+      # #2886 — and now the WHOLE `--lib` suite, not a list of modules. Until
+      # this, no lane ran `cargo test -p roomlerd --lib` on Windows: this job,
+      # windows-overlay-clippy and windows-recorder each ran a filtered subset,
+      # so `replaced_binary` and `win_service::companion_spawn` — compiled into
+      # this very binary, neither feature-gated — ran on Windows nowhere, and
+      # two Windows-only failures went unseen until #2889. The filter was the
+      # only thing dropping them; removing it costs no compile. Measured by the
+      # FR-6 session on master 0831dd289: 5.5–7.2 min a run, about 8 s of it
+      # tests — the rest is building the test binary from the restored cache.
+      # Locally (32 threads) the full suite is 2422 tests in about 42 s.
+      #
+      # The features are the four this job already built plus `system-context`,
+      # an empty marker (`system-context = []`) that gates the `system_context`
+      # module: nothing to compile, one more module of tests. `overlay-netstack`
+      # is already implied by `ssh-server`. The media half (`full-hw`,
+      # `vp9-444`, `ffmpeg-encoder`) stays OUT: it needs the MSI job's native
+      # setup and a far bigger target, and windows-recorder + windows-overlay-
+      # clippy already compile and run its Windows-only cells. A master+dispatch
+      # job for media parity is a possible follow-up, not this lane.
+      #
+      # `--no-fail-fast`: every failure in the run is reported, not the first.
+      # One step, every test in parallel: eleven local full-suite runs (six at
+      # #2889's tip, five with its two test-order flakes fixed) found no
+      # interference between the modules that spawn children (the supervisor,
+      # companion_spawn, hive_win, the vault's ssh engines); should one appear
+      # on the runner, those move to a second `--test-threads=1` step `--skip`ped
+      # here — never the whole suite serial.
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
-        # A block scalar: `hive:: ` holds `: `, which a plain YAML scalar reads
-        # as a mapping, and then this whole file fails to parse.
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault -- hive:: hive_win win_service::supervisor win_service::tests win_service::orphan vault:: vault_proxy:: ssh_service:: overlay::socket_inherit_tests
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault,system-context --no-fail-fast
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
