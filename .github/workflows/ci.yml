@@ -98,6 +98,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #2893 — tauri-build regenerates `agents/*/gen/schemas/` on every build
+      # of a Tauri app (the ACL manifests, the capabilities, one JSON schema per
+      # HOST platform), and the repo ignores the directory, as Tauri's own
+      # project template does. Four tracked copies per app made every local
+      # build on a Windows checkout dirty (CRLF checked out, LF written back,
+      # an empty diff) and left a macOS build with an untracked file. `git add
+      # -f` would put them back without a word; this says one. A guard, not
+      # anyone's diligence.
+      - name: Guard — Tauri's generated schemas are never tracked (#2893)
+        run: |
+          set -euo pipefail
+          # `agents/*/gen/*`, not `agents/*/gen/`: a pathspec with a wildcard
+          # must match the WHOLE path, and the trailing `*` is what reaches the
+          # files (measured: the slash form listed 0 of the 8 tracked files).
+          if git ls-files -- 'agents/*/gen/*' | grep .; then
+            echo "::error::Tauri's generated files under agents/*/gen/ are tracked — git rm --cached them; tauri-build rewrites them on every build (#2893)"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         # Pinned to the version in rust-toolchain.toml so local dev
         # and CI reject the same lints. Bump both in one commit
