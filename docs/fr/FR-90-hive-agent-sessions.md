@@ -3240,7 +3240,7 @@ sequenceDiagram
   context's user, so it holds no token to offer. The comment that still says so
   (`crates/remote_control/src/knowhow.rs:124`) is corrected in P4-3b-2.
 - **Tests.** The walk, the readers, the bounds and the answer as unit tests over temporary trees,
-  under `hive::`, so the macOS lane's filter runs them as well (`.github/workflows/ci.yml:1230`;
+  under `hive::`, so the macOS lane's filter runs them as well (`.github/workflows/ci.yml:1249`;
   the Linux lane runs every one, `:607`). The frame end to end as an integration test, the scan
   run in-process through the `Runner` hive's children take
   (`agents/roomlerd/src/hive/checkpointer.rs:321`, under `hive-test-launcher`), since the

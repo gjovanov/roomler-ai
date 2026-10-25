@@ -110,7 +110,7 @@ Every line below was read on `origin/master` at `861d4557`.
 10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:529`),
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.
-    — `.github/workflows/ci.yml:128`
+    — `.github/workflows/ci.yml:147`
 
 ### The on-screen panel
 
