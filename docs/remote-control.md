@@ -275,7 +275,7 @@ overlay address. The viewer learns of it one of two ways, chosen per connect by 
 | | how | needs |
 |---|---|---|
 | **named** (FR-121) | Settings → "This browser runs on" names one of the person's own devices that advertise `local-relay`; the request carries `local_relay_from`, and the Hub answers on `rc:session.created` with the relay it holds from that device's `rc:agent.local_relay` report, which the viewer adds with `setConfiguration` before its offer | nothing from the browser: no request to 127.0.0.1 |
-| **probed** (before FR-121) | while no device is named, `fetch http://127.0.0.1:47989/rc-local-turn` (and the fallback band); a descriptor that names its device fills the choice in, so the next connect is named | Chrome's per-origin local-network permission, which a managed browser may forbid |
+| **probed** (before FR-121) | while no device is named, `fetch http://127.0.0.1:47989/rc-local-turn` (and the fallback band); a descriptor that names one of the person's own devices fills the choice in, so the next connect is named (someone else's device keeps the probe: its relay would be refused as `not_your_device`) | Chrome's per-origin local-network permission, which a managed browser may forbid |
 
 Chrome gates only the second. A public page's WebRTC reaches a TURN server on 127.0.0.1 without the permission
 (FR-121 P0, measured on Chrome 155). The Hub hands a named device's relay over only to its owner, for a target in the
@@ -553,7 +553,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
 at [`useRemoteControl.ts:1544`](../ui/src/composables/useRemoteControl.ts#L1544)
 and puts it on the toggle's title
-([`RemoteControl.vue:3373`](../ui/src/views/remote/RemoteControl.vue#L3373)).
+([`RemoteControl.vue:3376`](../ui/src/views/remote/RemoteControl.vue#L3376)).
 
 | `code` | Means |
 |---|---|
@@ -1999,7 +1999,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8656`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8678`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2102,7 +2102,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4510`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4524`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -2135,7 +2135,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4168`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4182`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 

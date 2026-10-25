@@ -28,7 +28,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`agents/roomlerd/src/peer.rs:5310-5317`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:765-782`),
   advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:502-505`).
-- The picker (`ui/src/views/remote/RemoteControl.vue:2776-2784`) is a hard-coded list
+- The picker (`ui/src/views/remote/RemoteControl.vue:2779-2787`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
   (fixed in #1468 by making the list the single source the type derives from).
@@ -116,7 +116,7 @@ Two structural facts shape the design: Chromium keeps **one** `HEVCPROFILE_REXT`
 every RExt chroma form, so `isConfigSupported` cannot tell 4:4:4 from 4:2:2 (the
 mismatch surfaces at the first SPS); and no browser API says whether hardware or software
 decoded. Only a real-bytes trial proves a cell, and the page-scoped transport ban
-(`useRemoteControl.ts:4138`) already is that trial.
+(`useRemoteControl.ts:4152`) already is that trial.
 
 **The honest 4:4:4 cells** are therefore: HEVC 4:4:4 (hardware both ends on modern
 NVIDIA and Intel; not on Linux Chrome), VP9 4:4:4 (software or Intel hardware encode,

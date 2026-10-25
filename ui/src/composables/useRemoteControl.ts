@@ -3832,6 +3832,20 @@ export function localRelayPlan(opts: {
   return { kind: 'from', device: opts.thisDevice }
 }
 
+/** FR-121 — the device a successful probe pairs this browser with, or null.
+ *  Only an unanswered browser pairs, and only with the person's own device:
+ *  on someone else's machine the server would refuse to hand that device's
+ *  relay over (`not_your_device`), so pairing there would trade a working
+ *  probe for a refusal on every later connect. Pure + exported for tests. */
+export function deviceToPairFromProbe(
+  probedAgentId: string | undefined,
+  thisDevice: string | null,
+  ownsDevice: ((agentId: string) => boolean) | undefined,
+): string | null {
+  if (!probedAgentId || thisDevice !== null) return null
+  return ownsDevice?.(probedAgentId) === true ? probedAgentId : null
+}
+
 /** FR-121 — `cfg` with the handed-over relay as its first ICE server; every
  *  other setting kept, because `setConfiguration` refuses to change them.
  *  Pure + exported for tests. */
@@ -4592,6 +4606,14 @@ export function useRemoteControl(
      * its answer names. Without it this page never asks for one.
      */
     userId?: () => string | null
+    /**
+     * FR-121 — is this agent id one of the signed-in person's own devices? A
+     * probe that finds a relay pairs the browser with its device only then: a
+     * browser on someone else's machine keeps probing, because the server
+     * hands a named device's relay to its owner alone. Absent: never pair
+     * from a probe.
+     */
+    ownsDevice?: (agentId: string) => boolean
   },
 ) {
   const ws = useWsStore()
@@ -9274,11 +9296,15 @@ export function useRemoteControl(
           localRelay.overlay_ip,
         )
       }
-      // FR-121 — a probe that named its device answers the question for
-      // good: the next connect names the device and does not probe.
-      if (localRelay?.agent_id && thisDeviceId.value === null) {
-        setThisDevice(localRelay.agent_id)
-      }
+      // FR-121 — a probe that named one of the person's own devices answers
+      // the question for good: the next connect names the device and does
+      // not probe.
+      const pair = deviceToPairFromProbe(
+        localRelay?.agent_id,
+        thisDeviceId.value,
+        opts?.ownsDevice,
+      )
+      if (pair) setThisDevice(pair)
     }
     // #1631 - the last suspension before the peer exists. A disconnect()
     // during any wait above must never leave a peer that nothing will close

@@ -2554,6 +2554,9 @@ const hideDeviceName = useHideDeviceName(() => `${authStore.user?.id ?? 'anon'}:
 const rc = useRemoteControl(agent, {
   external: isExternal,
   userId: () => authStore.user?.id ?? null,
+  // FR-121 — the probe pairs this browser only with the person's own device.
+  ownsDevice: (id) =>
+    agentStore.agents.some((a) => a.id === id && a.owner_user_id === authStore.user?.id),
 })
 const { t } = useI18n()
 const { showSuccess, showError, showSnackbar } = useSnackbar()

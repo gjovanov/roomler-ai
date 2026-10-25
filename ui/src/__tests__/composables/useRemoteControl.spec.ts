@@ -119,6 +119,7 @@ import {
   localRelayPlan,
   withLocalRelay,
   readStoredThisDevice,
+  deviceToPairFromProbe,
   LOCAL_RELAY_PROBE_PORT,
   LOCAL_RELAY_PROBE_PORTS,
   clipboardBridgeUrl,
@@ -3935,6 +3936,19 @@ describe('FR-121 — the relay of the device this browser runs on', () => {
     })
     expect(out.iceServers?.[1]).toEqual({ urls: ['stun:stun.example:3478'] })
     expect(cfg.iceServers).toHaveLength(1)
+  })
+
+  it('a probe pairs an unanswered browser with its own device only', () => {
+    const owns = (id: string) => id === mine
+    expect(deviceToPairFromProbe(mine, null, owns)).toBe(mine)
+    // someone else's machine: keep probing instead of a refusal forever
+    expect(deviceToPairFromProbe(target, null, owns)).toBeNull()
+    // already answered (a device, or none): a probe never overrides it
+    expect(deviceToPairFromProbe(mine, target, owns)).toBeNull()
+    expect(deviceToPairFromProbe(mine, 'none', owns)).toBeNull()
+    // an old agent's descriptor names no device; no ownership oracle, no pair
+    expect(deviceToPairFromProbe(undefined, null, owns)).toBeNull()
+    expect(deviceToPairFromProbe(mine, null, undefined)).toBeNull()
   })
 
   it('remembers only an agent id or none', () => {
