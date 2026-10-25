@@ -251,7 +251,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:261`) | ✅ since P2a: ScreenCaptureKit's mix of every app, in a process with a window-server session; on a supervised Mac the GUI worker, whose offer the root's row carries | Was: macOS had no capture backend; since P0c no `opus` either (`encode/caps.rs:713`) ✔. *P2a:* `agents/roomlerd/src/audio/sck.rs`. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
-| R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ✅ since 0.4.153 (P2b): in the release set (`.github/workflows/release-agent.yml:2581`); on a supervised Mac the root half draws it (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
+| R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ✅ since 0.4.153 (P2b): in the release set (`.github/workflows/release-agent.yml:2644`); on a supervised Mac the root half draws it (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ✅ since P2c: the window server's list, focus through Accessibility, launch through LaunchServices and Terminal; on a supervised Mac the GUI worker serves it, and the root's row carries its words | Was: `Unavailable::Platform` (`apps/mod.rs:347`), no `apps/macos.rs`. *P2c:* `agents/roomlerd/src/apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | 🟡 since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:347`), in a session; a request waiting for consent is not told (P2d-1 found it: the prompt's probe answers `None` here) | ✅ since P2d-1: advisory, from the session dictionary (`lock_state.rs:357`), in a session (`input: "unknown"`) and at a prompt | The pump's `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-326`), on purpose: the hint never becomes its overlay. *P2d-1:* the prompt's probe asks a Mac's session (`lock_state.rs:301-320`) | P2d-1, P3b |
@@ -304,9 +304,9 @@ and the consent chain's fallbacks.
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1180-1189` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`main.rs:3132`, `session_end.rs:220`) | P4d |
-| A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2312-2318`); the CLI and the wizard are universal | D6 |
+| A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2375-2381`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
-| A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` (`release-agent.yml:1093`); recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
+| A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:255`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:197`), from 0.4.149 | P7b |
 
 The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:2068`), so it cannot count the
@@ -663,7 +663,7 @@ test of the SIGKILL property itself.
     only to an object conforming to `SCStreamOutput`.
 - **D2, video through SCK as well.** It would bring dirty rects (R13), keep the banner out of the stream (R14), and
   cursor metadata (R4), but it replaces a backend that works. Decide on a measured A/B of latency and CPU.
-- **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2564-2578`: a dispatch
+- **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2627-2641`: a dispatch
   build on a real Mac where the daemon starts and a prompt appears and answers, then add `viewer-indicator-macos` to
   the release set. It moves tokio off the main thread on every Mac, and a Mac that fails to start cannot pull its own
   fix, so it goes to one Mac, then the field Macs, then a release.
