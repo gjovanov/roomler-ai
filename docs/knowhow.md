@@ -1374,6 +1374,6 @@ flowchart LR
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving |
+| P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving. Designed in the FR-90 spec's §3e "P4-6, `roomler_connect`, as designed" (P4-6-0), with decisions 59–62: the entity's access as reserved facts; measured paths only, this device's own, a probe from here, then a device's through a forward whose proxy leg has no listener |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |
