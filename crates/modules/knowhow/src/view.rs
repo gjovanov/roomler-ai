@@ -264,13 +264,21 @@ pub struct LinkView {
     pub other: NodeView,
 }
 
-/// An entity's card: itself, and its links to live entities.
+/// An entity's card: itself, its links to live entities, and what each
+/// device last found of it.
 #[derive(Serialize, Debug)]
 pub struct CardView {
     pub entity: EntityView,
     pub links: Vec<LinkView>,
     /// More links than one card shows.
     pub truncated: bool,
+    /// FR-90 P4-5-4 — each device's last probe of the entity that found
+    /// something, newest first (decision 58). A fact's `verified` stays the
+    /// last word, whichever device said it; these say where the devices
+    /// disagree.
+    pub probes: Vec<ProbeView>,
+    /// More devices' findings than one card shows.
+    pub probes_truncated: bool,
 }
 
 /// One history row.

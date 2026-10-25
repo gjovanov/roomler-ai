@@ -762,7 +762,10 @@ pub(crate) fn tools(offered: &[&'static str]) -> Vec<Value> {
                             knowhow_search lists them: its facts, each with where it came from \
                             (a person, the fleet's sync, a device's scan) and its status, and its \
                             links to other entities. A machine is keyed by its device's id, with \
-                            its overlay address and names among its facts.",
+                            its overlay address and names among its facts. A fact a probe \
+                            checked carries `verified`, the last probe's word; `probes` holds \
+                            each device's last probe of the entity that found something, so a \
+                            device whose network sees it otherwise shows beside the rest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
