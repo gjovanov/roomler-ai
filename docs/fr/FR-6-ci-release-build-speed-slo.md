@@ -52,6 +52,17 @@ itself on the affected run's page. Baseline when the program started: releases t
   `target` drop over `SEED_TARGET_MAX_MB`, never file-level deletes under `target` —
   cargo fingerprints outlive outputs); `cache-janitor.yml` sweeps PR-ref/idle/tag-ref
   strays every 6 h.
+- **A tag run reuses its rehearsal's compile** (wave 29). After a job's last cargo build,
+  `.github/actions/seed-tree-stamp` writes `tree=<HEAD^{tree}> job=<workflow>/<job>` into
+  `target/.seed-source-tree`. When the next run of that job restores the seed,
+  `.github/actions/seed-tree-reuse` checks the stamp. If it names the same tree and the
+  same job, and no tracked file is modified, every tracked file gets the mtime
+  2000-01-01, and cargo, which judges path crates by mtime, reuses the build. Any other
+  case changes nothing, and the stamp is consumed either way. A reused daemon must
+  report the release version from `--version`. Where it cannot run before packaging,
+  it must at least contain the version string: the macOS binary links
+  `@rpath/libavcodec…`, which only the `.app` resolves. Kill switch: repository
+  variable `SEED_REUSE_SAME_TREE=off`.
 - **PR CI** (`ci.yml`): Swatinem, keyed on the environment and the lockfile. A member
   crate's `Cargo.toml` edit or a third-party `Cargo.lock` change rotates a family's key,
   and the next run restores the previous generation as a prefix match. A version bump
@@ -108,6 +119,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 26 | 10-23 | **The setup wizard's release lane gets seeds**: `release-setup.yml`'s four build jobs restore from the `seed-cache` release (`seed-setup-<platform>`) instead of Swatinem, rehearsals publish, and a `reseed` job dispatches a master rehearsal after every published release. The macOS job builds both triples in one cargo invocation, and both Linux jobs install their Tauri deps from cached apt sets (wave 19's pattern) | #2778 |
 | 27 | 10-24 | **PR CI's two long poles.** The integration suite runs as four shards, not three. FR-90 P1i's Windows agent-session tests move out of `windows-overlay-clippy` into a parallel `windows-agent-sessions` job with its own seed family | #2844 |
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
+| 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
 
 ## Acceptance criteria
 
@@ -742,3 +754,57 @@ itself on the affected run's page. Baseline when the program started: releases t
     x86_64 (apt step 62 s, mostly unpack and configure), `restored 121 .debs` →
     `Need to get 0 B/51.6 MB` on arm64 (25 s). A mirror stall can no longer reach a tag run
     except through the packages Ubuntu changed since the last rehearsal.
+- 2026-10-25: **wave 28 on the first release, and the case for wave 29.**
+  - 0.4.168 (tag run 40144260589): one wizard run (40145679114). The lockstep created
+    `setup-v0.4.168` itself, so the new skip branch has not run in the field yet. Both
+    Linux wizard jobs restored their apt seed: x86_64 `restored 181 .debs` →
+    `Need to get 0 B/72.5 MB` (61 s), arm64 121 → `0 B/51.6 MB` (32 s). The tag run
+    skipped the publish step, as designed.
+  - **Where an agent release's time goes**, in the 0.4.171 rehearsal (40217908387):
+    - The MSI job took 19.0 min, 13.8 of it the build step. The .pkg job took 22.4 min,
+      18.2 of it the build step.
+    - Both seeds restored (2,963 MB and 2,845 MB of target, kept intact). Only about 20
+      crates compiled, all ours or the vendored webrtc chain.
+    - After the last `Compiling` line (`roomler-node-core`) the build ran on for 12.3 min
+      on Windows and 17.3 on macOS. That tail is `roomlerd` itself (353 files, 13 MB of
+      source) at `codegen-units = 1`.
+  - macOS is noisy: the same ~20-crate build took 8.3–19.2 min across the 35 runs of
+    10-24/25. The Windows build step held 13.2–14.6, apart from a few runs at 8.9–9.8
+    (faster hosts).
+  - **The tag recompiles its rehearsal's tree.**
+    - Rehearsal and tag trees compared for 0.4.163, 0.4.166, 0.4.168, 0.4.169, 0.4.170 and
+      0.4.171: identical every time.
+    - 0.4.171's tag (40219775103) then compiled for another 13.6 min (MSI), 14.0 (pkg) and
+      9.7 (.deb), and the whole run took 20.4 min.
+    - Why: cargo judges a path crate by mtime, and a checkout makes every file new.
+  - **Wave 29 probe** (40228482936). It is a temporary push-triggered workflow on
+    `exp/fr6-w29-probe` that restores seeds but never saves one. Each job ran the real
+    release setup and build, then the tag run's case on the same runner: stamp, make every
+    file new, two negative controls, the positive case, and a rebuild.
+    - Windows:
+      - A modified tracked file blocked reuse, and so did another job's stamp.
+      - The same tree and job reused the build. The rebuild took **1 s**, against 565 s
+        for the release build before it, and rewrote no artifact.
+      - The reused `roomlerd.exe` reported `roomlerd 0.4.171`.
+    - macOS:
+      - The same four results; the rebuild took 4 s, against 861 s.
+      - The second libvpx pass found the same Cellar (`/opt/homebrew/Cellar/libvpx/1.17.0`)
+        and kept its build.
+      - The version check then failed: the `roomlerd` in `target/` links
+        `@rpath/libavcodec.63.dylib`, which only the staged `.app` resolves
+        (`dyld: Library not loaded`). Fixed in #2914: the check now gets the vendored FFmpeg
+        dir as its library path, and falls back to the version string compiled into the
+        binary. The fix was re-probed in run 40230929108; its result goes in the next
+        entry, with 0.4.172's field run.
+    - **codegen-units for our crates only** (dependencies stay at 1), Windows, all three
+      builds on one runner:
+
+      | codegen-units | build | `roomlerd` lib + bin | `roomlerd.exe` bytes | gzip -9 |
+      |---|---|---|---|---|
+      | 1 (shipped) | 565 s | 322 + 172 s | 64,755,712 | 22,479,787 |
+      | 4 | 426 s | 231 + 122 s | 75,412,480 (+16.5%) | 25,548,333 (+13.7%) |
+      | 16 | 463 s | 250 + 140 s | 80,180,736 (+23.8%) | 26,865,851 (+19.5%) |
+
+      On four cores, 4 units beat 16. The macOS release build spent 564 s in the
+      `roomlerd` lib and 229 s in its bin (`main.rs`) of 858 s. The two run one after the
+      other, and each is a single crate.

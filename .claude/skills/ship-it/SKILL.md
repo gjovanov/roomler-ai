@@ -61,6 +61,12 @@ re-pushing a tag.
 ⚠️ `agent-v*` tags are a lineage **separate from master** — `git tag --contains
 <master-sha>` misdates a fix. Test with `merge-base --is-ancestor` on the tag
 lineage.
+⚠️ **A tag run reuses its rehearsal's compile** when both built the same git tree
+(FR-6 wave 29): its build steps finish in seconds, and the run page shows the
+notice "Reusing a same-tree build". A reused daemon must report the tag's
+version, or the job fails. If you suspect a reused build, set the repository
+variable `SEED_REUSE_SAME_TREE=off` and re-run; every job then recompiles from
+source.
 
 ## 3 · The updater's trust chain
 
