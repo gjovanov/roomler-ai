@@ -11,10 +11,20 @@
       or `visibility:hidden`; instead we keep a 1×1 transparent
       textarea in-document via `transform: translate(-9999px)` per
       the Monaco / CodeMirror mobile-pattern.
+
+      `data-rc-capture` marks this textarea as a capture surface of the
+      HOST's: the viewer's window-level key listener steps aside for
+      every other editable element on the page (#2869, the files
+      drawer's path field typed into the host) but keeps forwarding
+      keydowns aimed here — a Backspace on this always-empty textarea
+      raises no `input` event, so the keydown is the only way it
+      reaches the host. `isViewerOwnInput` in `useRemoteControl.ts`
+      reads the attribute; its spec locks the pairing.
     -->
     <textarea
       ref="captureRef"
       class="mobile-keyboard-capture"
+      data-rc-capture="soft-keyboard"
       autocapitalize="off"
       autocorrect="off"
       autocomplete="off"
