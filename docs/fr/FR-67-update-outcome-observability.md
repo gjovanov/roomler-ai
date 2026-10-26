@@ -1,6 +1,6 @@
 # FR-67 — An update's outcome is written, and nothing ever reads it
 
-**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P7 field-verified on 0.4.146) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
+**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P1+P2 field-verified on 0.4.172 and re-read on 0.4.174 and 0.4.177, 2026-10-26; P3 built — its field read is owed on the release that carries it; P7 field-verified on 0.4.146; P5 open) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02 · **Doc:** [`docs/update-outcome.md`](../update-outcome.md)
 
 ## Goal
 
@@ -11,8 +11,8 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:129-150`) persisted to
-`<log_dir>/last-install.json` (`post_install.rs:165`).
+InstallerFailed | Timeout`, `post_install.rs:131-151`) persisted to
+`<log_dir>/last-install.json` (`post_install.rs:166`).
 
 Measured on the fleet:
 
@@ -32,8 +32,8 @@ updates, and not one recorded an outcome.
 `Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2207`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
-(`post_install.rs:225`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:1023-1048`).
+(`post_install.rs:226`), polling `kill(pid, 0)` for up to 600 s
+(`post_install.rs:1024-1049`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
@@ -55,11 +55,12 @@ mostly moot. Fixing (2) alone would be building a systemd mechanism to support a
 wait that should not exist.
 
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
-(`post_install.rs:179`) has **zero callers**. The module doc's claim that "the new
+(`post_install.rs:180`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:84-85`, echoed at `:10`, `:114`, `docs/remote-control.md:1256`)
+(`post_install.rs:84-85`, echoed at `:10`, `:115`, `docs/remote-control.md:1256`)
 was never wired. So even on Windows — where the staged watcher does produce a
-verdict — nothing surfaces it.
+verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
+the record at startup and on every `roomler status`, see the P3 section below.
 
 **4. The server never learns.** No wire message carries an install outcome. The
 server infers success only from a changed `agent_version` on the next hello, which
@@ -103,6 +104,53 @@ It was the first design, and it was refuted:
 - **Windows keeps its wait.** The MSI installer is genuinely asynchronous and the
   wedge-recovery path (`recover_wedged_install`) depends on it.
 - The pid stays in the record for forensics; only the *wait* changes.
+
+### P3 — the read half
+
+Built 2026-10-26 (#2924), once the field read of that morning showed P1 and P2 holding
+on the auto-update path (13 of 13 organic updates on one `.deb` host wrote
+`SucceededVerified`, field log). The record now has three readers, none of
+them SSH; the full treatment, with the seven words and the per-role log dirs,
+is [`docs/update-outcome.md`](../update-outcome.md).
+
+```mermaid
+flowchart LR
+    W[post-install watcher] -->|writes| F[last-install.json]
+    F -->|read at startup| L["one `last install:` log line<br/>INFO · WARN by verdict"]
+    F -->|read on every answer| S["NodeStatus.last_install<br/>→ `roomler status` · `--json`"]
+    F -.->|P5, open| H["the hello's caps<br/>→ the fleet answer"]
+```
+
+| Piece | Where |
+|---|---|
+| The wire word, `LastInstallStatus` — the five verdicts spelled as the file spells them, plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:465`; `NodeStatus.last_install`, `:439` |
+| The read, fresh from disk every time | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1168`), its pure half `summarize` (`:1181`) |
+| The startup line and its level | `log_at_startup` (`:1238`), `startup_level` (`:1222`); called right after `agent starting` (`agents/roomlerd/src/main.rs:3679`) |
+| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:858`) |
+| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2819`), printed under `version` (`:2429`) |
+
+- ⚠️ **Read on every answer, never cached at startup.** On Windows the MSI
+  starts the new service while the watcher is still waiting on msiexec, so
+  the verdict lands *after* the new daemon began (dev box, 0.4.172: daemon up
+  at 1792967954, verdict at 1792967960). A startup snapshot would show
+  `InProgress` for the daemon's whole life.
+- ⚠️ **Three states, three words.** No key = a daemon that predates the field,
+  and the CLI prints nothing. `Absent` = no record. `InProgress` = a record
+  with no verdict, "still at work" while the watcher can be alive and `NEVER
+  REPORTED` once it cannot. Collapsing any two recreates this bug one layer
+  up; pinned by tests on both ends.
+- ⚠️ **The reader runs where the updater runs.** On a Windows perMachine
+  host that is the console-session worker, under whichever account the
+  install mode gives it — the signed-in user on an attended install (the dev
+  box, `privileged: false`), LocalSystem under SystemContext — so `<log_dir>`
+  is that account's `%LOCALAPPDATA%…\logs`, where the record is; never the
+  SCM host, whose `service-logs` dir is never written. Read on the attended
+  mode; the SystemContext mode is unread (`docs/update-outcome.md` §5). A
+  two-half Mac's per-user half reads its own dir — the root helper's installs
+  are not its to claim — so it says `Absent` honestly.
+- Windows' watcher is untouched: the diff adds readers and nothing inside
+  `watch()`; the 10-26 record on the dev box shows the kept 23 s wait and the
+  service settle (AC7).
 
 ### P7 — an update the device was never going to act on
 
@@ -163,7 +211,7 @@ sequenceDiagram
 |---|-------|-------------|--------|
 | P1 | Stop waiting on a synchronously-completed install (Linux) | revert = today's unconditional wait | **shipped (#1400)** — field verification pending a release |
 | P2 | Recover a `(deleted)` exe path + refuse a non-existent watcher binary + log the anyhow chain | revert = today's ENOENT | **shipped (#1427)** — ⚠️ NOT the guard it was scoped as: this is the whole reason the `.deb` path had no watcher |
-| P3 | Read the verdict: startup log + `NodeStatus` + `roomler status` | pure addition; revert = today's silence | proposed |
+| P3 | Read the verdict: startup log + `NodeStatus` + `roomler status` | pure addition; revert = today's silence | **built** (#2924, 2026-10-26) — field read owed on the release that carries it |
 | P4 | macOS `AbandonProcessGroup` — **`com.roomler.update.plist`** is the job that matters (`update-helper` is that LaunchDaemon's body and is where `installer -pkg` is spawned) | packaging-only revert | proposed — see the note below |
 | P5 | Fleet answer: report the outcome to the server and show it | render-only; absent field ⇒ today's blank | proposed |
 | P6 | Transient systemd unit — **only if P1 leaves a measurable race** | `update_watcher_escape_cgroup`, default OFF | deferred, evidence-gated |
@@ -171,21 +219,66 @@ sequenceDiagram
 
 ## Acceptance criteria
 
-- [ ] On a systemd host, a **real auto-update** leaves `last-install.json` in a
+- [x] On a systemd host, a **real auto-update** leaves `last-install.json` in a
       terminal status. ⚠️ Show it is `InProgress` on the current release first — a
-      pass proves nothing without the failing "before"
-- [ ] ⚠️ Verified on the **auto-update** path, not a manual foreground
-      `roomlerd self-update` — that reaches a verdict today and hides the bug
+      pass proves nothing without the failing "before". **Before**, 2026-09-05:
+      three cluster nodes at 0.4.70, all `InProgress`, ~54 releases stale (the
+      P1 log). **After**, 2026-10-26: mars, jupiter and zeus — systemd,
+      `KillMode=control-group`, the `.deb` path, 0.4.172 — all
+      `SucceededVerified` for `agent-v0.4.172`, written at the moment of the
+      2026-10-25 22:39Z update; on mars 13 of 13 organic updates since 0.4.155
+      wrote a verdict (field log, 2026-10-26). Re-read the same day on
+      **0.4.174** and on **0.4.177**: all three again `SucceededVerified`
+      each time, 17 of 17 on mars
+- [x] ⚠️ Verified on the **auto-update** path, not a manual foreground
+      `roomlerd self-update` — that reaches a verdict today and hides the bug.
+      mars's 0.4.172 install began `rc:agent.update — operator-triggered
+      self-update` → `new release available — spawning installer and exiting`
+      → `update install: package installed bin="apt-get"` → the watcher's
+      verdict: the daemon's own updater, in the systemd unit, not a foreground
+      command (field log, 2026-10-26). The 0.4.173 update that followed had
+      **no push at all** — the daemon's own poll — and reached the same
+      verdict on all three hosts
 - [ ] A non-`SucceededVerified` outcome is visible without SSH: in the daemon's
-      startup log and in `roomler status`
+      startup log and in `roomler status` — **built** (P3): the startup
+      `last install:` line is WARN for every such outcome and `roomler status`
+      leads with the verdict in capitals; the field read is owed on the release
+      that carries it (a synthetic stale `InProgress` on one host, then
+      `roomler exec <host> -- roomler status` and `journalctl -g "last install"`)
 - [ ] **absent** (no install yet) and **`InProgress`** (an install that never
       reported) stay distinguishable — collapsing them recreates this bug one
-      layer up
+      layer up — **built** (P3): two wire words (`Absent`, `InProgress`) and two
+      sentences (`none recorded`, `NEVER REPORTED`), pinned by
+      `summarize_keeps_absent_and_in_progress_apart` and
+      `absent_never_reported_and_in_progress_are_three_sentences`; the field
+      read (a deleted record beside a stale one, on one host) is owed with the
+      criterion above
 - [x] The `.deb` path is confirmed to spawn a watcher at all — **it did not,
       and the hypothesis was right.** 21 `post-install watcher spawn failed` in
       seven days against **zero** `post-install watcher started` (P2, #1427)
 - [ ] A fleet query answers "did this update succeed on each host" without SSH
-- [ ] Windows behaviour is byte-for-byte unchanged
+      (P5, open — the shape is in `docs/update-outcome.md` §8)
+- [x] Windows behaviour is byte-for-byte unchanged — the install path, which
+      is what this criterion guards: P1 kept the wait (`should_wait_for_installer`
+      stays true for a live pid, and Windows passes `already_exited: false`), P3
+      adds readers and touches nothing inside `watch()`. Field, 2026-10-26, the
+      dev box (perMachine, attended, 0.4.172): `SucceededVerified`,
+      `started_unix` 1792967937 → `finished_unix` 1792967960 — the watcher
+      waited its 23 s on msiexec, then settled the service (`note: … service
+      Roomler: running (0 starts; seen Running)`); again on 0.4.174 (17 s on
+      msiexec) and 0.4.177 (13 s) the same day, the same settle each time.
+      ⚠️ What *did* change on Windows is not this FR's: the watcher's verdict
+      print panicked on a closed exec pipe after each record up to 0.4.174
+      was written (#2934), fixed by #2935 (0.4.175+) — the 0.4.177 record is
+      the first with no panic log beside it — and the record, which is all P3
+      reads, was complete every time
+- [x] Docs: [`docs/update-outcome.md`](../update-outcome.md) — the record and
+      its fields, where `<log_dir>` lands per platform and role, the two Linux
+      defects, the life of a verdict, the seven words and the three that must
+      never collapse, who reads it from which process, the three surfaces, the
+      field table — with diagrams, linked from `docs/README.md`;
+      `docs/remote-control.md` §19.2's "future agent startups read the file" is
+      true now and points there (#2924)
 - [x] **P7**: an update ordered from a device's **secondary** org is refused with
       `primary_org` and the way out, and never counted delivered. ⚠️ The "before"
       is recorded: on 2026-10-19 the bulk route counted it delivered (field log)
@@ -197,7 +290,7 @@ sequenceDiagram
 
 ## Out of scope
 
-- A Unix `ensure_service_running` equivalent (`post_install.rs:549`). Windows needs
+- A Unix `ensure_service_running` equivalent (`post_install.rs:550`). Windows needs
   it because the SCM does not auto-restart; Linux has `Restart=always` +
   `RestartPreventExitStatus=7 8`, and a watcher running `systemctl start` would
   fight the supervisor.
@@ -224,6 +317,15 @@ sequenceDiagram
 | 2026-10-19 | ❌ The "before" on a cell | A kept vmtest Ubuntu cell in two orgs, on 0.4.145 and the then-prod server `hosted-20261019-dd59ede`. A push to its secondary org's row: `HTTP 200 {"delivered":true}`, and in the same second the device logged `rc:agent.update ignored … ignored_total=1` |
 | 2026-10-19 | ✅ **P7 field-verified on 0.4.146** | Server `hosted-20261019-e46da07`, candidate run 39331259421 (its `.deb` byte-identical to the published one). AC1: a push from the secondary org → `HTTP 409` naming `roomlerd org set-primary`, and 0 `rc:agent.update` lines on the device. AC2: `auto_update false` → row `update_mode=off` → `HTTP 409` (`auto_update_off`). AC3: a 0.4.145 agent (no word) → `HTTP 200 delivered`, as before. AC4: a live `keep_busy_enabled` flip made both connections re-announce their caps (`announcing changed capabilities on the heartbeat`), and both rows still carried the word. A lock/unlock first changed no caps, so it re-announced nothing and is not counted. A Win11 SYSTEM install laid over 0.4.145 reads `update_mode=self` |
 | 2026-10-19 | ✅ **The field case itself, on the release** | The two-org aarch64 device from the top of this log, updated to 0.4.146 by its own updater (`.asc` verified against the pinned key; `post-install verdict: SucceededVerified`). Its secondary org's row now reads `update_mode=primary_org`, and a push from that org gets `HTTP 409` with the way out. Earlier the same day the same click was counted delivered three times while the device ignored it |
+| 2026-10-26 | ✅ **P1 + P2 field-verified on the `.deb` path, the auto-update path, three hosts** | mars, jupiter, zeus: systemd units, `MainPID` live, `KillMode=control-group`, on 0.4.172. `/root/.local/share/roomler/logs/last-install.json` on each: `SucceededVerified`, `expected_version agent-v0.4.172`, `installer_exit_code 0`, `started_unix == finished_unix` (1792967957 / 1792967966), file mtime = the unit journal's `post-install verdict: SucceededVerified (new binary at /usr/bin/roomlerd reports roomlerd 0.4.172)` line (22:39:17Z, :17Z, :26Z). mars's journal over 14 days: **13 consecutive organic updates**, 0.4.155 → 0.4.172, each `post-install watcher spawned watcher_exe=/usr/bin/roomlerd staged=false` → `post-install watcher started … already_exited=true` → the verdict. Each began `rc:agent.update — operator-triggered self-update pin=None` → `new release available — spawning installer and exiting` → `update install: package installed bin="apt-get" euid=0`: the daemon's own updater, never a foreground `self-update`. Against the 09-05 "before" (three hosts `InProgress`, ~54 releases stale) this closes AC1 and AC2. P6 (the transient unit) stays unneeded: the race P1 left is not being lost here, 13 of 13 |
+| 2026-10-26 | ✅ **Windows unchanged (AC7), and where the record lives there** | The dev box, perMachine, attended — first written here as "SystemContext"; corrected two rows below — 0.4.172. The record is the console-session **worker's** (`roomlerd run --supervisor scm`, session 1, the console user's token — it runs the updater, so its watcher wrote under that user's `%LOCALAPPDATA%\roomler\roomler\data\logs`): `SucceededVerified`, `started_unix 1792967937` → `finished_unix 1792967960`, `note … service Roomler: running (0 starts; seen Running)` — the 23 s wait on msiexec and the service settle, as before P1. The SYSTEM profile's copy of the file dates from July; the SCM host's `service-logs` dir has none. ⚠️ The LocalAPI `roomler status` reaches is the worker's (its `pid` 292 answered, `privileged:false`), so P3's reader in `DaemonState::status` resolves the dir the record is in. A reader in the SCM host would say `Absent` — honestly, naming `service-logs` |
+| 2026-10-26 | ⚠️ One host off the sample | asahi-m2pro (Fedora, the tarball path) has `exec_enabled` off, so it could not be read this way; the 10-19 row above already saw its verdict line. An exec sweep is a biased sample — these three hosts prove the path, they do not count the fleet |
+| 2026-10-26 | 🔨 **P3 built**, its field read owed | The read half: `NodeStatus.last_install`, the `last install:` startup line, the `last update` line of `roomler status`. Tests on both ends pin `Absent` apart from `InProgress`. ⏳ On the release that carries it: `roomler exec mars -- roomler status` → `last update ok — agent-v0.4.1xx installed … verified`, `journalctl -u roomlerd -g "last install"` → the INFO line; then on one host a stale `InProgress` written by hand and a restart → `NEVER REPORTED` + the WARN line (AC3), and the record deleted and a restart → `none recorded` (AC4) |
+| 2026-10-26, 09:40Z | ✅ **Re-read on 0.4.174, three hosts** | mars, jupiter and zeus had each taken two more organic updates since the row above — 0.4.173 at 02:39Z, 0.4.174 at 09:03Z — and every record reads `SucceededVerified` for `agent-v0.4.174`, `installer_exit_code 0`, `started_unix == finished_unix` (1793005414 · 1793005401 · 1793005402), mtime = the journal's `post-install verdict:` line (09:03:34Z · 09:03:21Z · 09:03:22Z). Each: `new release available — spawning installer and exiting` → `update install: package installed bin="apt-get" euid=0` → `post-install watcher spawned watcher_exe=/usr/bin/roomlerd staged=false` → `watcher started … already_exited=true` → the verdict. ⚠️ The 0.4.173 update ran with **no `rc:agent.update` in the journal** (mars's pushes: 10-25 22:39Z, 10-26 07:35Z, 09:03Z): the daemon's own poll — AC2 in its purest form. mars: 15 of 15 since 0.4.155. Read over `roomler exec` with `MSYS_NO_PATHCONV=1` (Git-Bash otherwise rewrites `/root/…` into a Windows path before `roomler.exe` sees it) and with no `\|` in a `-g` pattern (the exec re-splits it into a shell pipe on the target) |
+| 2026-10-26, 08:01Z | ✅ **Windows again, on 0.4.174 — and the panic beside every Windows record** | The dev box's worker record: `SucceededVerified` for `agent-v0.4.174`, `started_unix 1793001660 → finished_unix 1793001677` (17 s on msiexec), `note … service Roomler: running (0 starts; seen Running)`, written at 1793001692 once the service had settled. In the same second, `panic-58744-1793001692.log`: `failed printing to stdout: The pipe is being closed. (os error 232)` — and the 10-25 22:39Z record has its twin, `panic-30080-1792967976.log`, 16 s after its verdict. That is #2934: under an exec-driven `self-update` the watcher inherits the exec's stdout pipe, the install closes it, and the verdict `println!` — which runs **after** `write_outcome` — panicked. Pre-existing, not this FR's, fixed on master by #2935 (line-neutral in `main.rs`, so no anchor here moved); neither 0.4.173 nor 0.4.174 carries it. AC7 stands: the record, which is all P3 reads, was complete every time |
+| 2026-10-26, 09:55Z | ✅ **The no-key state, on a live daemon** | The branch's `roomler` (built from 98dfc4cac) against the dev box's released 0.4.174 daemon, which predates P3: `roomler status` prints no `last update` line and `--json` carries no `last_install` key — silence, never `none recorded`. The third of the three states that must stay apart, read against a real daemon rather than the CLI's own test |
+| 2026-10-26, 23:20Z | ✅ **Re-read on 0.4.177, three hosts and the dev box — and the journal surface's end date** | mars, jupiter, zeus: `SucceededVerified` for `agent-v0.4.177` on each, `started_unix == finished_unix`, mtime = the journal's verdict line (17:32:49–56Z); two more organic updates since the 0.4.174 row (0.4.175 at 13:03Z, 0.4.177 at 17:32Z — mars and zeus skipped 0.4.176, `current=0.4.175 latest=agent-v0.4.177`), every one `spawning installer and exiting` → `apt-get` → `watcher started … already_exited=true` → the verdict; mars **17 of 17** since 0.4.155. The dev box, 0.4.175 → 0.4.177 at 15:34Z: `SucceededVerified`, 13 s on msiexec, the service settled, and for the first time **no panic log** beside the record — the watcher was 0.4.175's, the first release carrying #2935 (AC7 holds; the #2934 panic is confirmed gone). ⚠️ What this read cannot show yet: **#2943** (0.4.176+) spawns the watcher with no stdio at all (`without_caller_stdio`), so the journal's `post-install watcher started` and `post-install verdict:` lines — the surface the P7 field log and the earlier rows of this log read — end with the first update a 0.4.176+ daemon spawns. None has happened on these hosts yet (every watcher so far was a ≤0.4.175 daemon's), so the end is predicted by the code, not observed. From then on the record file and P3's two readers are the only surfaces: the case for P3, made in the field |
+| 2026-10-26 | ❌→✅ **A label corrected: the dev box is attended, not SystemContext** | The 10-26 AC7 row first called the dev box "perMachine SystemContext". `roomler status` answers `mode service (per-user)` from `privileged: false` (`process_is_privileged` is `process_is_local_system()` on Windows, `agents/roomlerd/src/localapi_state.rs:401`), and `WorkerRole` names a worker `SystemContext` only when its own token is the LocalSystem SID (`agents/roomlerd/src/system_context/worker_role.rs:208`) — the record under the signed-in user's `%LOCALAPPDATA%` says the same. That is `docs/installation.md`'s "machine (attended)" row: perMachine MSI, SCM service, no SystemContext. The topology claim holds (the worker runs the updater, and the reader runs in the worker); the SystemContext mode — a LocalSystem worker whose `<log_dir>` is the SYSTEM profile's, where this box's July `InProgress` for `agent-v0.3.0-rc.183` still sits — is **unread**. Corrected in the spec, `docs/update-outcome.md` §5/§7 and the PR |
 
 ## P4 — scoped, and one question left before it is safe to write
 
@@ -260,3 +362,4 @@ mesh) before a packaging change lands.
 | 2026-09-06 | ✅ **P2's question answered — and it inverts P1's evidence** | The `.deb` path has **never** had a watcher. On a cluster node: **21** `post-install watcher spawn failed` in 7 days, **0** `post-install watcher started`, `last-install.json` untouched since 2026-08-29 while the host moved 0.4.16 → 0.4.73. `apt` replaces `/usr/bin/roomlerd`, unlinking the running image, so `current_exe()` reads `…(deleted)` and `Command::spawn` fails ENOENT. 🔑 The code asserted the opposite — *"Unix package managers replace files without stopping readers, so the in-place spawn stays correct there"* — and replacing the file is exactly what breaks it. ⚠️ **This corrects what P1's "before" evidence meant**: the frozen `InProgress` records were read as the cgroup killing the watcher; on this path there was no watcher to kill. P1 still fixes the *tarball* path, where the watcher does start. |
 | 2026-09-06 | ⚠️ Why it hid for months | the failure surfaced as a single context-less `WARN` — `%e` on an `anyhow::Error` prints only the outermost context (*"spawning post-install-watch subprocess"*) and drops the ENOENT that explains it. P2 logs the chain (`{:#}`). A diagnostic that cannot say *why* is how 21 consecutive failures read as noise. |
 | 2026-09-06 | ⏳ P1 field verification still open | P1 is in released 0.4.72/73/74 and the fleet is on 0.4.73, but every host checked takes the `.deb` path — where P2 had to land first for a watcher to exist at all. Re-verify on a **tarball** host, or on any host once P2 ships. |
+| 2026-10-26 | ✅ **Closed, on the `.deb` path** | With P2 in the fleet since 0.4.75, the same three cluster nodes at 0.4.172 each hold `SucceededVerified` for `agent-v0.4.172`, and one host's journal shows 13 of 13 organic updates reaching a verdict — 15 of 15 by the same day's 0.4.174 re-read (the main log above). The tarball path is still unread this way: the one tarball host has exec off; its 10-19 verdict line is the evidence there |

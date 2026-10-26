@@ -3673,6 +3673,10 @@ async fn run_cmd(
         ?encoder_preference,
         "agent starting"
     );
+    // FR-67 P3 — what the last install came to, one line, right under the
+    // version it produced. This is the "startup reads last-install.json" the
+    // watcher's module doc claimed for months and nothing did.
+    post_install::log_at_startup();
 
     // Phase 8: pre-flight diagnostics (DNS / TCP / clock-skew). Non-
     // blocking — the signaling loop runs unconditionally afterward —
