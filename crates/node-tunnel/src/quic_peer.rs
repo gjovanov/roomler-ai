@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Agent-side QUIC session peer (`quic-v1` transport).
 //!
-//! The QUIC analogue of [`crate::tunnel::peer::AgentTunnelPeer`]: one
+//! The QUIC analogue of [`crate::peer::AgentTunnelPeer`]: one
 //! per active tunnel session. Where the WebRTC peer pre-negotiates a
 //! fixed DC pool + demuxes by `flow_id` prefix, QUIC gives each flow a
 //! native bidirectional stream — so this peer's job is just:
@@ -14,7 +14,7 @@
 //!    connection by the server-minted token, then reads each inbound
 //!    flow stream's `flow_id` preamble and hands the stream to whichever
 //!    forward is waiting for it.
-//! 3. Expose [`take_flow`] so [`crate::tunnel::acceptor`] can, after
+//! 3. Expose [`take_flow`] so [`crate::acceptor`] can, after
 //!    dialing the destination + sending `TcpForwardAccept`, grab the
 //!    client-opened QUIC stream for that `flow_id` and drive
 //!    [`tunnel_core::forward::run_flow_quic`].

@@ -24,7 +24,7 @@
 //!    `flow_demuxes` field so the acceptor can register per-flow
 //!    mailboxes.
 //! 4. Server emits `ServerMsg::TcpForwardForward` for each new flow.
-//!    `crate::tunnel::acceptor::handle_forward_request` consults the
+//!    `crate::acceptor::handle_forward_request` consults the
 //!    ACL, dials dst, calls [`AgentTunnelPeer::register_flow`] to
 //!    bind the flow to a DC, and spawns
 //!    `tunnel_core::forward::run_flow` to drive the bytes.

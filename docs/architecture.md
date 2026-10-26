@@ -116,6 +116,7 @@ flowchart BT
     localapi["crates/localapi<br/>LocalAPI wire types + client"]
     agentcore["crates/agent-core<br/>config · enrollment · machine-id"]
     tunnelcore["crates/tunnel-core<br/>tunnels · transports · overlay (WG)"]
+    nodetunnel["crates/node-tunnel → roomler-node-tunnel<br/>the daemon's tunnel plane (FR-123 P1)"]
     tcpturn["crates/tcp-turn-conn<br/>TURNS/TCP adapter"]
     derprelay["crates/derp-relay<br/>standalone DERP PoP"]
     setupcore["crates/roomler-setup-core<br/>installer mechanics"]
@@ -141,7 +142,8 @@ flowchart BT
 
     tunnelcore --> localapi & tcpturn & rc
     agentcore --> config
-    roomlerd --> tunnelcore & agentcore
+    nodetunnel --> tunnelcore & agentcore & rc
+    roomlerd --> tunnelcore & agentcore & nodetunnel
     tunnel --> tunnelcore
     tray --> localapi & agentcore
     setup --> setupcore
