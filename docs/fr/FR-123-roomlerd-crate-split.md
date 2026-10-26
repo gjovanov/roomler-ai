@@ -468,7 +468,7 @@ v2 runners (§2.4):
 | binary | **−5.5 % Windows, −11.5 % macOS (measured)**: the duplicated generics vanish | today's: two units still instantiate the same generics twice |
 | packages | none change; `roomlerd` keeps its lib and bin | the lib and the bin must sit in different packages (a package's bin may not depend on a crate that depends on the package's lib) |
 | the lane | untouched | layout (ii) below leaves it untouched; (i) changes four build lines |
-| what else | `main.rs`'s tests (`main.rs:6640`) start running under `--lib`; 62 `main.rs:N` anchors in 33 docs take the new file name at the same numbers | the same, plus the layout's CI edits |
+| what else | `main.rs`'s tests (`main.rs:6644`) start running under `--lib`; 62 `main.rs:N` anchors in 33 docs take the new file name at the same numbers | the same, plus the layout's CI edits |
 
 **A first, then B if more time is needed.** A is one moved file, no package change, and the only
 option that improves both axes — it buys 1.2 MB of MSI headroom on Windows against a 22.00 MB
