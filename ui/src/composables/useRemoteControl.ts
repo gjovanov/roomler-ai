@@ -12419,7 +12419,13 @@ export function useRemoteControl(
    * Pre-rc.19 behaviour preserved for non-resume agents: the
    * `supportsResume.value === false` branch falls through to a
    * single fresh-begin attempt with the original fail-fast error.
+   *
+   * #2929 — every upload source (a files paste, a drop on the stage or
+   * on the drawer, the drawer's button, the folder picker) ends here,
+   * so this is where uploads queue: a transfer shows in the panel at
+   * once, as 'queued', and sends its `files:begin` only on its turn.
    */
+  const takeUploadPlace = createUploadQueue()
   function uploadOne(
     file: File,
     relPath?: string,
@@ -12430,8 +12436,9 @@ export function useRemoteControl(
       return Promise.reject(new Error('files channel not open'))
     }
     const id = `up-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const place = takeUploadPlace()
 
-    return new Promise((resolve, reject) => {
+    const upload = new Promise<{ path: string; bytes: number }>((resolve, reject) => {
       const entry: UploadEntry = {
         kind: 'upload',
         status: 'pending',
@@ -12664,8 +12671,22 @@ export function useRemoteControl(
         localFail(new Error('resumable upload exited the infinite-retry loop unexpectedly'))
       }
 
-      void runResumable()
+      // #2929 — begin only once every earlier upload has settled. A
+      // reconnect may be under way by then, so wait for the channel too;
+      // a cancel while queued has settled the entry, and the turn sends
+      // nothing.
+      void place.turn.then(async () => {
+        const e = filesRegistry.get(id)
+        if (!e || e.status === 'settled') return
+        if (!(await waitForFilesChannel())) {
+          localFail(new Error('files channel not open'))
+          return
+        }
+        await runResumable()
+      })
     })
+    upload.then(place.done, place.done)
+    return upload
   }
 
   /** Public single-file upload Ã¢ÂÂ back-compat shim retained so existing
@@ -14401,6 +14422,118 @@ export function drawerPasteFiles(
   const files: File[] = []
   for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
   return files
+}
+
+/** A place in the upload queue: `turn` resolves once every upload placed
+ *  before this one has settled, and `done` is called when this one settles. */
+export type UploadPlace = { turn: Promise<void>; done: () => void }
+
+/** One upload on the wire at a time, per session (#2929). The agent keeps ONE
+ *  active transfer per files channel: a `files:begin` while another is open
+ *  replaces it, both uploads' chunks land in the second, and both fail (field,
+ *  2026-10-26: two uploads started 9 ms apart, and neither arrived).
+ *
+ *  Each upload takes a place. The next place's turn waits for this place's
+ *  turn AND its `done`, so an upload cancelled while still queued (its `done`
+ *  called before its turn) cannot let the one behind it start while an
+ *  earlier upload is still on the wire. Pure, so a spec drives it without a
+ *  session. */
+export function createUploadQueue(): () => UploadPlace {
+  let tail: Promise<void> = Promise.resolve()
+  return () => {
+    const turn = tail
+    let done!: () => void
+    const settled = new Promise<void>((resolve) => {
+      done = resolve
+    })
+    tail = turn.then(() => settled)
+    return { turn, done }
+  }
+}
+
+/** One file's outcome from `uploadFiles`. */
+export type UploadOutcome =
+  | { ok: true; name: string; path: string; bytes: number }
+  | { ok: false; name: string; error: string }
+
+/** A host path as compared: no Windows verbatim prefix (`\\?\`), forward
+ *  slashes, no trailing slash, and case-folded when it is a Windows path (a
+ *  drive letter or a UNC root), whose names are case-insensitive. */
+function comparableHostPath(p: string): string {
+  let s = p.replace(/^(\\\\|\/\/)\?[\\/]/, '').replace(/\\/g, '/')
+  while (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1)
+  return /^[A-Za-z]:(\/|$)/.test(s) || s.startsWith('//') ? s.toLowerCase() : s
+}
+
+/** Whether a file the agent completed at `path` landed inside `destPath`,
+ *  the folder it was asked to land in (#2930). The agent refuses a
+ *  `dest_path` it may not write (a root or SYSTEM service writes only inside
+ *  the active user's profile, FR-84 D4) and falls back to Downloads, saying
+ *  so only in its own log, so the viewer learns it from `path`. Both are the
+ *  agent's canonical form (the drawer only shows a folder the agent listed),
+ *  so a prefix test on whole segments is exact: `/tmp/x` does not hold
+ *  `/tmp/xy/f`. */
+export function uploadLandedIn(path: string, destPath: string): boolean {
+  const dir = comparableHostPath(destPath)
+  const file = comparableHostPath(path)
+  return file.startsWith(dir.endsWith('/') ? dir : `${dir}/`)
+}
+
+/** The folder a file landed in, for a person to read: `path` without the
+ *  `name` it was uploaded as (a folder upload's name is its relative path,
+ *  so its whole tree comes off). */
+function uploadLandingFolder(path: string, name: string): string {
+  const shown = path.replace(/^(\\\\|\/\/)\?[\\/]/, '')
+  let cut = shown.length
+  for (let depth = name.split('/').filter(Boolean).length || 1; depth > 0; depth--) {
+    const at = Math.max(shown.lastIndexOf('/', cut - 1), shown.lastIndexOf('\\', cut - 1))
+    if (at < 0) return shown
+    cut = at === 0 ? 1 : at
+  }
+  return shown.slice(0, cut)
+}
+
+/** What the viewer tells the person when `uploadFiles` returns. Before
+ *  #2930 a file the host had put in Downloads, instead of the folder the
+ *  person chose, was reported as a plain success. */
+export function uploadOutcomeMessage(
+  results: UploadOutcome[],
+  requested: number,
+  destPath?: string,
+): { level: 'success' | 'warning' | 'error'; text: string } {
+  const ok = results.filter((r): r is Extract<UploadOutcome, { ok: true }> => r.ok)
+  const failed = results.filter((r): r is Extract<UploadOutcome, { ok: false }> => !r.ok)
+  if (failed.length > 0) {
+    const first = failed[0]
+    if (ok.length === 0) {
+      return {
+        level: 'error',
+        text:
+          failed.length === 1
+            ? `Upload failed: ${first.error}`
+            : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`,
+      }
+    }
+    return {
+      level: 'error',
+      text: `Uploaded ${ok.length}/${requested} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`,
+    }
+  }
+  const elsewhere = destPath ? ok.filter((r) => !uploadLandedIn(r.path, destPath)) : []
+  if (destPath && elsewhere.length > 0) {
+    const folder = uploadLandingFolder(elsewhere[0].path, elsewhere[0].name)
+    const what =
+      ok.length === 1
+        ? `${ok[0].name} to ${folder}`
+        : elsewhere.length === ok.length
+          ? `${ok.length} files to ${folder}`
+          : `${ok.length} files, ${elsewhere.length} of them to ${folder}`
+    return { level: 'warning', text: `Uploaded ${what} instead: the host refused ${destPath}` }
+  }
+  return {
+    level: 'success',
+    text: ok.length === 1 ? `Uploaded ${ok[0].name}` : `Uploaded ${ok.length} files`,
+  }
 }
 
 export { browserButton, kbdCodeToHid }
