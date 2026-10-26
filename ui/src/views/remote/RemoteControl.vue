@@ -1711,6 +1711,19 @@
             class="mt-3 mb-2"
             data-testid="rc-picker-fps"
           />
+          <!-- FR-119 P2b-17b — the agent refused the ask as unproven and can be
+               asked to trial it again (`fps-retry` in its video caps). -->
+          <v-btn
+            v-if="frameRateRetryable"
+            size="small"
+            variant="text"
+            prepend-icon="mdi-refresh"
+            class="mb-2"
+            data-testid="rc-fps-retry"
+            @click="retryFrameRate"
+          >
+            {{ frameRateRetryLabel }}
+          </v-btn>
 
           </v-tabs-window-item>
 
@@ -2548,7 +2561,13 @@ import {
   type RemoteRecordingItem,
 } from '@/composables/useRemoteRecording'
 import { describePrivacyReason, showsPrivacyRefusal } from '@/composables/usePrivacyMode'
-import { agentOffersHighRefresh, frameRateSummary, type FrameRate } from '@/composables/frameRate'
+import {
+  agentOffersFrameRateRetry,
+  agentOffersHighRefresh,
+  frameRateCanRetry,
+  frameRateSummary,
+  type FrameRate,
+} from '@/composables/frameRate'
 import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -4119,6 +4138,19 @@ const frameRateHint = computed(
     frameRateSummary(rc.frameRateAnswer.value) ??
     'Above 60 only where this device has shown it can sustain it',
 )
+// FR-119 P2b-17b — "try again" for an ask the agent refused as unproven.
+const frameRateRetryable = computed(() =>
+  frameRateCanRetry(
+    rc.frameRateAnswer.value,
+    agentOffersFrameRateRetry(agent.value?.capabilities?.video),
+  ),
+)
+const frameRateRetryLabel = computed(
+  () => `Try ${rc.frameRateAnswer.value?.asked ?? ''} fps again`,
+)
+function retryFrameRate() {
+  rc.setFrameRate(rc.frameRate.value, true)
+}
 const priorityOptions = [
   {
     title: 'Balanced',

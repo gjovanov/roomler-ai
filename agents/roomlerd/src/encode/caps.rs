@@ -1287,7 +1287,7 @@ fn video_features() -> Vec<String> {
     // FR-119 P1 — the viewer may ask for more than 60 fps (`rc:fps`); the
     // answer rides `rc:video-info`. Off unless `ROOMLERD_FPS_HIGH=1`.
     if crate::encode::fps_high_enabled() {
-        features.push(crate::encode::frame_rate::CAP.to_string());
+        features.extend(crate::encode::frame_rate::CAPS.map(str::to_string));
     }
     features
 }
@@ -2428,8 +2428,8 @@ mod tests {
         let features = video_features();
         assert!(features.iter().any(|f| f == "chunk-framing"));
         assert!(
-            !features.iter().any(|f| f == crate::encode::frame_rate::CAP),
-            "fps-high advertised with the switch unset: {features:?}"
+            !crate::encode::frame_rate::any_verb_in(&features),
+            "a frame-rate verb advertised with the switch unset: {features:?}"
         );
     }
 
