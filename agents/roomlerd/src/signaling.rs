@@ -6699,6 +6699,14 @@ async fn handle_server_msg(
                 crate::hive::knowhow_tools::on_verified(&probe_id.to_hex(), probe);
             }
         }
+        // P4-6-1b — what reaching an entity takes, for a session's
+        // `roomler_connect`.
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowAccess { req_id, access } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_access(&req_id, access);
+            }
+        }
         #[cfg(hive_host)]
         ServerMsg::KnowhowRefused { req_id, reason } => {
             if ctx.is_primary {

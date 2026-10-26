@@ -8159,6 +8159,28 @@ done
             !names(&doc["permissions"]["allow"]).contains(&verify),
             "{doc}"
         );
+        // P4-6-1b — a connect opens an endpoint signed in with a credential:
+        // asked at each call, with or without the vault, never allowed.
+        let connect = "mcp__roomler__roomler_connect".to_string();
+        let with_connect = [
+            TOOL_SEARCH,
+            TOOL_GET,
+            TOOL_PROPOSE,
+            TOOL_VERIFY,
+            roomler_ai_remote_control::knowhow::TOOL_CONNECT,
+        ];
+        for (sid, vault) in [("connect", false), ("connect-vault", true)] {
+            write_settings(&runtime, sid, vault, false, false, None, &with_connect).unwrap();
+            let doc = read(sid);
+            assert!(
+                names(&doc["permissions"]["ask"]).contains(&connect),
+                "{doc}"
+            );
+            assert!(
+                !names(&doc["permissions"]["allow"]).contains(&connect),
+                "{doc}"
+            );
+        }
     }
 
     /// FR-90 P3-7-3c — a session's own egress is ASKED for on every call,

@@ -6,12 +6,14 @@
 //!
 //! A session asks the organization's map through `knowhow_search` and
 //! `knowhow_get`, says what it learned through `knowhow_propose` (P4-4-2b),
-//! and has this device probe an entity through `knowhow_verify` (P4-5-2b).
+//! has this device probe an entity through `knowhow_verify` (P4-5-2b), and
+//! reaches one through `roomler_connect` (P4-6-1b, [`super::connect_tool`]).
 //! The daemon carries each question on its primary connection
-//! (`rc:knowhow.search`, `.get`, `.propose`, `.verify`), naming the session
-//! and the fence it runs at; the server believes the session from its record,
-//! answers what its starter may read, writes a proposal `proposed`, and asks
-//! a verify's probe of this device.
+//! (`rc:knowhow.search`, `.get`, `.propose`, `.verify`, `.connect`), naming
+//! the session and the fence it runs at; the server believes the session from
+//! its record, answers what its starter may read, writes a proposal
+//! `proposed`, asks a verify's probe of this device, and says what reaching
+//! an entity takes.
 //!
 //! | Piece | Where |
 //! |---|---|
@@ -31,7 +33,8 @@ use std::time::Duration;
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::knowhow::{
-    ProbeKind, SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY, session_limits,
+    ProbeKind, SessionRefusal, TOOL_CONNECT, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY,
+    session_limits,
 };
 use roomler_ai_remote_control::signaling::ClientMsg;
 use serde_json::{Map, Value, json};
@@ -53,7 +56,19 @@ pub(crate) const VERIFY_DEADLINE: Duration = Duration::from_secs(30);
 const RECENT_VERIFIED: usize = 16;
 
 /// Every knowhow tool this build knows, in the order a session is shown them.
-const KNOWN: [&str; 4] = [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY];
+const KNOWN: [&str; 5] = [
+    TOOL_SEARCH,
+    TOOL_GET,
+    TOOL_PROPOSE,
+    TOOL_VERIFY,
+    TOOL_CONNECT,
+];
+
+/// The tools a session's settings ask a person for at each call, never allow
+/// outright: each aims something from this device. `knowhow_verify` a probe
+/// (decision 54), `roomler_connect` an endpoint signed in with a credential
+/// (P4-6-1b).
+const ASKED: [&str; 2] = [TOOL_VERIFY, TOOL_CONNECT];
 
 /// The three things a session may propose, by the key that names each.
 const PROPOSALS: [&str; 3] = ["entity", "fact", "link"];
@@ -83,6 +98,9 @@ pub(crate) enum Answer {
         probe_id: String,
         probe: Option<Value>,
     },
+    /// P4-6-1b — what reaching an entity takes (`rc:knowhow.access`), as the
+    /// server compiled it ([`super::connect_tool::Access`]).
+    Access(Value),
     Refused(String),
 }
 
@@ -312,6 +330,26 @@ impl Client {
         }
     }
 
+    /// P4-6-1b — `rc:knowhow.connect`, as `session` at `fence`: what reaching
+    /// the entity by `kind` and `key` takes ([`Answer::Access`]).
+    pub(crate) async fn connect(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+    ) -> Result<Answer, AskError> {
+        let req_id = new_req_id();
+        let frame = ClientMsg::KnowhowConnect {
+            req_id: req_id.clone(),
+            session_id: session,
+            fence,
+            kind: kind.to_string(),
+            key: key.to_string(),
+        };
+        self.ask(&req_id, frame).await
+    }
+
     /// What a probe measured (`rc:knowhow.verified`): given to the verifies
     /// waiting for it, or kept for the one about to, the oldest let go past
     /// [`RECENT_VERIFIED`].
@@ -412,6 +450,11 @@ pub fn on_verified(probe_id: &str, probe: Value) {
     CLIENT.verified(probe_id, probe);
 }
 
+/// P4-6-1b — `rc:knowhow.access`: what reaching an entity takes.
+pub fn on_access(req_id: &str, access: Value) {
+    CLIENT.answered(req_id, Answer::Access(access));
+}
+
 /// `rc:knowhow.refused`.
 pub fn on_refused(req_id: &str, reason: String) {
     CLIENT.answered(req_id, Answer::Refused(reason));
@@ -460,6 +503,16 @@ pub(crate) trait KnowhowTools: Send + Sync {
         kind: &str,
         key: &str,
         probe: ProbeKind,
+    ) -> Result<Value, String>;
+    /// P4-6-1b — what reaching the entity by `kind` and `key` takes, as the
+    /// server compiled it; `roomler_connect` ([`super::connect_tool`]) opens
+    /// it.
+    async fn access(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
     ) -> Result<Value, String>;
 }
 
@@ -538,6 +591,16 @@ impl KnowhowTools for DaemonKnowhow {
             answer => read(answer),
         }
     }
+
+    async fn access(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        read(CLIENT.connect(session, fence, kind, key).await)
+    }
 }
 
 /// An answer as the model reads it: what the map said, or why it said
@@ -572,6 +635,7 @@ fn read(answer: Result<Answer, AskError>) -> Result<Value, String> {
                 VERIFY_DEADLINE.as_secs()
             ),
         })),
+        Ok(Answer::Access(access)) => Ok(access),
         Ok(Answer::Refused(word)) => Err(refusal(&word)),
         Err(AskError::NotConnected) => Err("this device is not connected to its server".into()),
         Err(AskError::NoAnswer) => Err("the organization's map did not answer".into()),
@@ -683,24 +747,25 @@ pub(crate) fn refusal(word: &str) -> String {
 
 /// The tools a run offers that its settings allow with no person's approval
 /// (decision 39): the reads and a proposal, which the server holds to what
-/// the session's starter may read and writes `proposed`. Never
-/// `knowhow_verify` ([`asked`]).
+/// the session's starter may read and writes `proposed`. Never one of
+/// [`ASKED`] ([`asked`]).
 pub(crate) fn allowed(offered: &[&'static str]) -> Vec<String> {
     offered
         .iter()
-        .filter(|t| **t != TOOL_VERIFY)
+        .filter(|t| !ASKED.contains(t))
         .map(|t| settings_name(t))
         .collect()
 }
 
 /// P4-5-2b — the tools a run offers that its settings ask a person for at
 /// each call (decision 54): `knowhow_verify`, which aims a connection from
-/// this device, as the session's egress and its commands on other devices
-/// ask (`net_socks`, `ssh_run`).
+/// this device, and (P4-6-1b) `roomler_connect`, which opens an endpoint
+/// signed in with a credential, as the session's egress and its commands on
+/// other devices ask (`net_socks`, `ssh_run`, `vault_connect`).
 pub(crate) fn asked(offered: &[&'static str]) -> Vec<String> {
     offered
         .iter()
-        .filter(|t| **t == TOOL_VERIFY)
+        .filter(|t| ASKED.contains(t))
         .map(|t| settings_name(t))
         .collect()
 }
@@ -880,6 +945,33 @@ pub(crate) fn tools(offered: &[&'static str]) -> Vec<Value> {
                 "required": ["kind", "key"],
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
+        }));
+    }
+    if offered.contains(&TOOL_CONNECT) {
+        out.push(json!({
+            "name": TOOL_CONNECT,
+            "description": "Reach an entity of the organization's map (Roomler knowhow), by its kind \
+                            and key as knowhow_search lists them. The map says its engine, where it \
+                            is, which vault credential reaches it, and which devices have reached \
+                            it. When a probe from this device found it lately, this opens what \
+                            vault_connect opens: an endpoint served only to this session's account, \
+                            signed in upstream with that credential for as long as its leases, and \
+                            a connection string with no credential in it (a `tcp` entity takes no \
+                            credential: the answer says where to dial). When this device has not \
+                            probed it lately, one probe from here is asked first. A person approves \
+                            each call, and the vault decides each lease. Nothing is dialled that no \
+                            probe from here found: when only other devices reached it, the answer \
+                            names them. An entity whose facts do not say how it is reached is \
+                            refused no_access, naming what is missing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "description": "the entity's kind, as knowhow_search shows it"},
+                    "key": {"type": "string", "description": "the entity's key, as knowhow_search shows it"},
+                },
+                "required": ["kind", "key"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
         }));
     }
     out
@@ -1074,7 +1166,29 @@ mod tests {
             "knowhow_get".into(),
             "knowhow_propose".into(),
         ]);
-        assert_eq!(c.offered(), KNOWN, "P4-5-2b's verify, where it is named");
+        assert_eq!(
+            c.offered(),
+            [TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY],
+            "P4-5-2b's verify, where it is named"
+        );
+        c.served(&[
+            "roomler_connect".into(),
+            "knowhow_verify".into(),
+            "knowhow_search".into(),
+            "knowhow_get".into(),
+            "knowhow_propose".into(),
+        ]);
+        assert_eq!(
+            c.offered(),
+            [
+                TOOL_SEARCH,
+                TOOL_GET,
+                TOOL_PROPOSE,
+                TOOL_VERIFY,
+                TOOL_CONNECT
+            ],
+            "P4-6-1b's connect, where it is named"
+        );
         let (tx, _rx2) = mpsc::channel(1);
         c.connected(tx);
         assert!(
@@ -1103,11 +1217,16 @@ mod tests {
                 "knowhow_search",
                 "knowhow_get",
                 "knowhow_propose",
-                "knowhow_verify"
+                "knowhow_verify",
+                "roomler_connect"
             ]
         );
         assert_eq!(names(&[TOOL_PROPOSE]), ["knowhow_propose"]);
         assert!(names(&[]).is_empty());
+        let connect = &tools(&[TOOL_CONNECT])[0];
+        assert_eq!(connect["inputSchema"]["required"], json!(["kind", "key"]));
+        assert_eq!(connect["annotations"]["readOnlyHint"], false);
+        assert_eq!(connect["annotations"]["openWorldHint"], true);
         let propose = &tools(&[TOOL_PROPOSE])[0];
         assert_eq!(propose["inputSchema"]["required"], json!(["why"]));
         assert_eq!(propose["annotations"]["readOnlyHint"], false);
@@ -1120,10 +1239,11 @@ mod tests {
         assert_eq!(verify["annotations"]["openWorldHint"], true);
     }
 
-    /// P4-5-2b — the reads and a proposal are allowed outright; a verify is
-    /// asked of a person at each call, and only where it is offered.
+    /// P4-5-2b — the reads and a proposal are allowed outright; a verify, and
+    /// (P4-6-1b) a connect, are asked of a person at each call, and only
+    /// where they are offered.
     #[test]
-    fn a_verify_is_asked_and_never_allowed() {
+    fn a_verify_and_a_connect_are_asked_and_never_allowed() {
         assert_eq!(
             allowed(&KNOWN),
             [
@@ -1132,9 +1252,46 @@ mod tests {
                 "mcp__roomler__knowhow_propose"
             ]
         );
-        assert_eq!(asked(&KNOWN), ["mcp__roomler__knowhow_verify"]);
+        assert_eq!(
+            asked(&KNOWN),
+            [
+                "mcp__roomler__knowhow_verify",
+                "mcp__roomler__roomler_connect"
+            ]
+        );
         assert!(asked(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE]).is_empty());
         assert!(allowed(&[TOOL_VERIFY]).is_empty());
+        assert!(allowed(&[TOOL_CONNECT]).is_empty());
+    }
+
+    /// P4-6-1b — a connect goes out naming its session, fence and entity,
+    /// and the server's access comes back to it as it was compiled.
+    #[tokio::test]
+    async fn a_connect_is_answered_with_the_access() {
+        let (c, mut rx) = client();
+        let c = Arc::new(c);
+        let session = ObjectId::new();
+        let asking = {
+            let c = Arc::clone(&c);
+            tokio::spawn(async move { c.connect(session, 5, "database", "prod-pg").await })
+        };
+        let frame = rx.recv().await.unwrap();
+        let ClientMsg::KnowhowConnect {
+            req_id,
+            session_id,
+            fence,
+            kind,
+            key,
+        } = frame
+        else {
+            panic!("not a connect: {frame:?}");
+        };
+        assert_eq!((session_id, fence), (session, 5));
+        assert_eq!((kind.as_str(), key.as_str()), ("database", "prod-pg"));
+        let access = json!({"engine": "postgres", "upstream": "db.example.com:5432"});
+        c.answered(&req_id, Answer::Access(access.clone()));
+        assert_eq!(asking.await.unwrap(), Ok(Answer::Access(access.clone())));
+        assert_eq!(read(Ok(Answer::Access(access.clone()))), Ok(access));
     }
 
     /// P4-5-2b — a verify goes out naming its session, fence, entity and
@@ -1452,6 +1609,15 @@ mod tests {
             probe: ProbeKind,
         ) -> Result<Value, String> {
             Ok(json!({ "kind": kind, "key": key, "probe": probe.as_str() }))
+        }
+        async fn access(
+            &self,
+            _: ObjectId,
+            _: u64,
+            kind: &str,
+            key: &str,
+        ) -> Result<Value, String> {
+            Ok(json!({ "entity": {"kind": kind, "key": key} }))
         }
     }
 
