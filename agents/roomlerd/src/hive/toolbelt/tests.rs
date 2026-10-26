@@ -5888,3 +5888,125 @@ async fn a_connect_is_offered_on_the_servers_word_and_asked_as_the_run() {
         "the run's own session and fence; one naming no kind asks nothing"
     );
 }
+
+/// FR-90 P8-2a-2 — where the run has a worker, its `vault_connect`
+/// endpoint is handed to it and served there: the request reaches the
+/// upstream with the secret's token, as the daemon's would; its lease let
+/// go, the endpoint ends in the worker with its connection, and the daemon
+/// forgets it.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_run_has_a_worker_its_endpoint_is_served_there() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = http_belt(
+        dir.path(),
+        &[
+            ("git/bot#token", token.as_bytes()),
+            ("pki/git-ca", ca.as_bytes()),
+        ],
+    );
+    super::super::worker::run_in_process(sid, 5, Arc::new(|_| {}));
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "git/bot",
+            "engine": "http",
+            "upstream": format!("https://localhost:{port}"),
+            "auth": "bearer",
+            "ca": "pki/git-ca",
+            "ttl_s": 60,
+        }),
+    )
+    .await
+    .expect("an endpoint, from the run's worker");
+    assert_eq!(kept_for(sid, 5), 1, "handed to the run's worker");
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    h.write_all(b"GET /api/x?y=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let response = http_response(&mut h).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "served in the worker: {response}"
+    );
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut h, &mut rest),
+    )
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the connection ended with the lease, cut in the worker"
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while kept_for(sid, 5) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(kept_for(sid, 5), 0, "the daemon forgot it");
+    super::super::worker::drop_run(sid, 5);
+}
+
+/// FR-90 P8-2a-2 — where the run's worker is given up on, its endpoint is
+/// refused: served in the worker or not at all, never by the daemon instead.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_runs_worker_is_given_up_on_its_endpoint_is_refused() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, _saw) = fake_http().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, _vault, sid) = http_belt(
+        dir.path(),
+        &[
+            ("git/bot#token", token.as_bytes()),
+            ("pki/git-ca", ca.as_bytes()),
+        ],
+    );
+    super::super::worker::run_never_up(sid, 5, Arc::new(|_| {}));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !super::super::worker::seen(sid, 5).is_some_and(|s| s.gave_up)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&b).await;
+    let asked = tokio::time::Instant::now();
+    let refused = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "git/bot",
+            "engine": "http",
+            "upstream": format!("https://localhost:{port}"),
+            "auth": "bearer",
+            "ca": "pki/git-ca",
+            "ttl_s": 60,
+        }),
+    )
+    .await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "refused at once, not after the wait for a worker coming up"
+    );
+    let why = refused.expect_err("refused, never served by the daemon instead");
+    assert!(why.contains("worker"), "{why}");
+    assert_eq!(kept_for(sid, 5), 0, "nothing handed");
+    super::super::worker::drop_run(sid, 5);
+}
