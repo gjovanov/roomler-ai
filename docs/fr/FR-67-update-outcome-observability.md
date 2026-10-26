@@ -1,6 +1,6 @@
 # FR-67 — An update's outcome is written, and nothing ever reads it
 
-**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P1+P2 field-verified on 0.4.172 and re-read on 0.4.174, 2026-10-26; P3 built — its field read is owed on the release that carries it; P7 field-verified on 0.4.146; P5 open) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02 · **Doc:** [`docs/update-outcome.md`](../update-outcome.md)
+**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** in progress (P1, P2, P7 shipped; P1+P2 field-verified on 0.4.172 and re-read on 0.4.174 and 0.4.177, 2026-10-26; P3 built — its field read is owed on the release that carries it; P7 field-verified on 0.4.146; P5 open) · **Found:** field-testing `agent-v0.4.48`, 2026-09-02 · **Doc:** [`docs/update-outcome.md`](../update-outcome.md)
 
 ## Goal
 
@@ -228,7 +228,8 @@ sequenceDiagram
       `SucceededVerified` for `agent-v0.4.172`, written at the moment of the
       2026-10-25 22:39Z update; on mars 13 of 13 organic updates since 0.4.155
       wrote a verdict (field log, 2026-10-26). Re-read the same day on
-      **0.4.174**: all three again `SucceededVerified`, now 15 of 15 on mars
+      **0.4.174** and on **0.4.177**: all three again `SucceededVerified`
+      each time, 17 of 17 on mars
 - [x] ⚠️ Verified on the **auto-update** path, not a manual foreground
       `roomlerd self-update` — that reaches a verdict today and hides the bug.
       mars's 0.4.172 install began `rc:agent.update — operator-triggered
@@ -264,11 +265,13 @@ sequenceDiagram
       dev box (perMachine, attended, 0.4.172): `SucceededVerified`,
       `started_unix` 1792967937 → `finished_unix` 1792967960 — the watcher
       waited its 23 s on msiexec, then settled the service (`note: … service
-      Roomler: running (0 starts; seen Running)`); again on 0.4.174 the same
-      day, 17 s on msiexec and the same settle. ⚠️ What *did* change on
-      Windows is not this FR's: the watcher's verdict print panicked on a
-      closed exec pipe after each of those records was written (#2934), fixed
-      by #2935 — the record, which is all P3 reads, was complete every time
+      Roomler: running (0 starts; seen Running)`); again on 0.4.174 (17 s on
+      msiexec) and 0.4.177 (13 s) the same day, the same settle each time.
+      ⚠️ What *did* change on Windows is not this FR's: the watcher's verdict
+      print panicked on a closed exec pipe after each record up to 0.4.174
+      was written (#2934), fixed by #2935 (0.4.175+) — the 0.4.177 record is
+      the first with no panic log beside it — and the record, which is all P3
+      reads, was complete every time
 - [x] Docs: [`docs/update-outcome.md`](../update-outcome.md) — the record and
       its fields, where `<log_dir>` lands per platform and role, the two Linux
       defects, the life of a verdict, the seven words and the three that must
@@ -321,6 +324,7 @@ sequenceDiagram
 | 2026-10-26, 09:40Z | ✅ **Re-read on 0.4.174, three hosts** | mars, jupiter and zeus had each taken two more organic updates since the row above — 0.4.173 at 02:39Z, 0.4.174 at 09:03Z — and every record reads `SucceededVerified` for `agent-v0.4.174`, `installer_exit_code 0`, `started_unix == finished_unix` (1793005414 · 1793005401 · 1793005402), mtime = the journal's `post-install verdict:` line (09:03:34Z · 09:03:21Z · 09:03:22Z). Each: `new release available — spawning installer and exiting` → `update install: package installed bin="apt-get" euid=0` → `post-install watcher spawned watcher_exe=/usr/bin/roomlerd staged=false` → `watcher started … already_exited=true` → the verdict. ⚠️ The 0.4.173 update ran with **no `rc:agent.update` in the journal** (mars's pushes: 10-25 22:39Z, 10-26 07:35Z, 09:03Z): the daemon's own poll — AC2 in its purest form. mars: 15 of 15 since 0.4.155. Read over `roomler exec` with `MSYS_NO_PATHCONV=1` (Git-Bash otherwise rewrites `/root/…` into a Windows path before `roomler.exe` sees it) and with no `\|` in a `-g` pattern (the exec re-splits it into a shell pipe on the target) |
 | 2026-10-26, 08:01Z | ✅ **Windows again, on 0.4.174 — and the panic beside every Windows record** | The dev box's worker record: `SucceededVerified` for `agent-v0.4.174`, `started_unix 1793001660 → finished_unix 1793001677` (17 s on msiexec), `note … service Roomler: running (0 starts; seen Running)`, written at 1793001692 once the service had settled. In the same second, `panic-58744-1793001692.log`: `failed printing to stdout: The pipe is being closed. (os error 232)` — and the 10-25 22:39Z record has its twin, `panic-30080-1792967976.log`, 16 s after its verdict. That is #2934: under an exec-driven `self-update` the watcher inherits the exec's stdout pipe, the install closes it, and the verdict `println!` — which runs **after** `write_outcome` — panicked. Pre-existing, not this FR's, fixed on master by #2935 (line-neutral in `main.rs`, so no anchor here moved); neither 0.4.173 nor 0.4.174 carries it. AC7 stands: the record, which is all P3 reads, was complete every time |
 | 2026-10-26, 09:55Z | ✅ **The no-key state, on a live daemon** | The branch's `roomler` (built from 98dfc4cac) against the dev box's released 0.4.174 daemon, which predates P3: `roomler status` prints no `last update` line and `--json` carries no `last_install` key — silence, never `none recorded`. The third of the three states that must stay apart, read against a real daemon rather than the CLI's own test |
+| 2026-10-26, 23:20Z | ✅ **Re-read on 0.4.177, three hosts and the dev box — and the journal surface's end date** | mars, jupiter, zeus: `SucceededVerified` for `agent-v0.4.177` on each, `started_unix == finished_unix`, mtime = the journal's verdict line (17:32:49–56Z); two more organic updates since the 0.4.174 row (0.4.175 at 13:03Z, 0.4.177 at 17:32Z — mars and zeus skipped 0.4.176, `current=0.4.175 latest=agent-v0.4.177`), every one `spawning installer and exiting` → `apt-get` → `watcher started … already_exited=true` → the verdict; mars **17 of 17** since 0.4.155. The dev box, 0.4.175 → 0.4.177 at 15:34Z: `SucceededVerified`, 13 s on msiexec, the service settled, and for the first time **no panic log** beside the record — the watcher was 0.4.175's, the first release carrying #2935 (AC7 holds; the #2934 panic is confirmed gone). ⚠️ What this read cannot show yet: **#2943** (0.4.176+) spawns the watcher with no stdio at all (`without_caller_stdio`), so the journal's `post-install watcher started` and `post-install verdict:` lines — the surface the P7 field log and the earlier rows of this log read — end with the first update a 0.4.176+ daemon spawns. None has happened on these hosts yet (every watcher so far was a ≤0.4.175 daemon's), so the end is predicted by the code, not observed. From then on the record file and P3's two readers are the only surfaces: the case for P3, made in the field |
 | 2026-10-26 | ❌→✅ **A label corrected: the dev box is attended, not SystemContext** | The 10-26 AC7 row first called the dev box "perMachine SystemContext". `roomler status` answers `mode service (per-user)` from `privileged: false` (`process_is_privileged` is `process_is_local_system()` on Windows, `agents/roomlerd/src/localapi_state.rs:401`), and `WorkerRole` names a worker `SystemContext` only when its own token is the LocalSystem SID (`agents/roomlerd/src/system_context/worker_role.rs:208`) — the record under the signed-in user's `%LOCALAPPDATA%` says the same. That is `docs/installation.md`'s "machine (attended)" row: perMachine MSI, SCM service, no SystemContext. The topology claim holds (the worker runs the updater, and the reader runs in the worker); the SystemContext mode — a LocalSystem worker whose `<log_dir>` is the SYSTEM profile's, where this box's July `InProgress` for `agent-v0.3.0-rc.183` still sits — is **unread**. Corrected in the spec, `docs/update-outcome.md` §5/§7 and the PR |
 
 ## P4 — scoped, and one question left before it is safe to write

@@ -5,10 +5,10 @@ that made a verdict reach the disk at all on Linux — P1 (#1400, the watcher no
 longer waits on its own parent's pid) and P2 (#1427, the `.deb` path spawns a
 watcher at all). The fleet half (P5: the verdict reported to the server) is
 open; §8 says what it needs. Field, 2026-10-26: three systemd `.deb` hosts and
-one Windows perMachine host (attended), read on 0.4.172 and again on 0.4.174,
-§7.
+one Windows perMachine host (attended), read on 0.4.172 and again on 0.4.174
+and 0.4.177, §7.
 
-Claims about behaviour were checked against the code at `b0953868e` plus
+Claims about behaviour were checked against the code at `b9933cb1a` plus
 #2924; anchors say where a check would need repeating.
 
 ## 1. The problem
@@ -192,20 +192,32 @@ $ roomler status
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1222`): the two quiet states and a watcher
   still at work are INFO; everything else is WARN.
-- **The watcher's own line**, written as the verdict lands: `post-install
-  verdict: SucceededVerified (new binary at /usr/bin/roomlerd reports roomlerd
-  0.4.172)` on the watcher's stdout, which journald captures on a systemd host
-  (`post_install_watch_cmd`, `main.rs:2342`). This is the line the P7 field
-  log read on 2026-10-19; it was the only reader before P3 and it only exists
-  where stdout goes somewhere. ⚠️ It is printed **after** the record is
-  written, and until #2935 the print itself could kill the watcher: under
-  `roomler exec … roomlerd self-update` the watcher inherits the exec's stdout
-  pipe, the install closes it, and `println!` panicked (`failed printing to
-  stdout: The pipe is being closed. (os error 232)`) — a panic log and a false
-  crash report after a clean install, on every exec-driven Windows update
-  (#2934; three on the dev box, 10-25 → 10-26, each ~10 ms after its record).
-  The record was complete every time, so P3's readers never saw it; #2935
-  writes the line without panicking.
+- **The watcher's own line — a surface that ends at 0.4.176.** Written as
+  the verdict lands: `post-install verdict: SucceededVerified (new binary at
+  /usr/bin/roomlerd reports roomlerd 0.4.172)` on the watcher's stdout
+  (`post_install_watch_cmd`, `main.rs:2342`), which journald captured on a
+  systemd host, beside the watcher's `post-install watcher started` tracing
+  line on its stderr. This is the line the P7 field log read on 2026-10-19
+  and the rows of §7 read on 10-26; it was the only reader before P3.
+  ⚠️ It is printed **after** the record is written, and until #2935 the print
+  itself could kill the watcher: under `roomler exec … roomlerd self-update`
+  the watcher inherited the exec's stdout pipe, the install closed it, and
+  `println!` panicked (`failed printing to stdout: The pipe is being closed.
+  (os error 232)`) — a panic log and a false crash report after a clean
+  install, on every exec-driven Windows update (#2934; three on the dev box,
+  10-25 → 10-26, each ~10 ms after its record). The record was complete every
+  time, so P3's readers never saw it. #2935 (0.4.175+) writes the line without
+  panicking; **#2943 (0.4.176+) then takes the watcher's stdio away
+  altogether** — the same inherited pipe kept the exec's reader from EOF and
+  made the outgoing worker overrun its stop budget — so `spawn_watcher` gives
+  it `/dev/null` for all three on every platform (`without_caller_stdio`,
+  `agents/roomlerd/src/updater.rs:2802`, called at `:2903`). From the first
+  update a 0.4.176+ daemon spawns, the journal shows the daemon's own
+  `post-install watcher spawned` line and nothing from the watcher; the
+  verdict reaches the record file and P3's two readers, and nothing else.
+  As of 2026-10-26 17:32Z every watcher on the three fleet hosts was still a
+  ≤0.4.175 daemon's (mars went 0.4.175 → 0.4.177 directly), so that end is
+  read off the code, not yet observed.
 
 ## 7. What is field-verified, and what is not yet
 
@@ -217,7 +229,9 @@ $ roomler status
 | 2026-10-26, 09:40Z | mars, jupiter, zeus again, now on **0.4.174** | `roomler exec <host> -- cat …/last-install.json`, `stat`, `journalctl -u roomlerd -g post-install` | every record `SucceededVerified` for `agent-v0.4.174`, `installer_exit_code 0`, `started_unix == finished_unix` (1793005414 · 1793005401 · 1793005402), mtime = the journal's verdict line (09:03:34Z · 09:03:21Z · 09:03:22Z). Each host took **two** more organic updates since the row above: 0.4.173 at 02:39Z and 0.4.174 at 09:03Z, each `spawning installer and exiting` → `package installed bin="apt-get"` → `watcher started … already_exited=true` → `SucceededVerified`. ⚠️ The 0.4.173 one had **no `rc:agent.update` push at all** on mars (its pushes: 10-25 22:39Z, 10-26 07:35Z and 09:03Z) — the daemon's own poll, the purest form of the auto-update path. mars: **15 of 15** since 0.4.155 |
 | 2026-10-26, 08:01Z | the dev box again, on 0.4.174 | the worker's `last-install.json` + the logs dir | `SucceededVerified` for `agent-v0.4.174`, `started_unix` 1793001660 → `finished_unix` 1793001677 (17 s on msiexec), `note: … service Roomler: running (0 starts; seen Running)`, the file written at 1793001692 once the service had settled — and `panic-58744-1793001692.log` in the same second: `failed printing to stdout: The pipe is being closed. (os error 232)` at `std/src/io/stdio.rs:1165`, the #2934 signature, after the record. Neither 0.4.173 nor 0.4.174 carries #2935 (merged 09:27Z, after the 0.4.174 tag) |
 | 2026-10-26, 09:55Z | the dev box's released 0.4.174 daemon (pre-P3), read by the branch's CLI | `roomler status`, `roomler status --json` | no `last update` line, no `last_install` key: a daemon that predates the field is **silent**, never `none recorded` — the third state of §4's callout, on a live daemon |
-| — | the release that carries P3 | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
+| 2026-10-26, 23:20Z | mars, jupiter, zeus, now on **0.4.177** | the same files + the journal over `roomler exec` | every record `SucceededVerified` for `agent-v0.4.177`, `started_unix == finished_unix` (1793035976 · 1793035969 · 1793035969), mtime = the journal's verdict line (17:32:56Z · 17:32:49Z · 17:32:49Z). Two more organic updates each since the 0.4.174 row — 0.4.175 at 13:03Z and 0.4.177 at 17:32Z; mars and zeus **skipped 0.4.176** (`current=0.4.175 latest=agent-v0.4.177`; jupiter's journal not read) — each `spawning installer and exiting` → `package installed bin="apt-get"` → `watcher started … already_exited=true` → the verdict. mars: **17 of 17** since 0.4.155. ⚠️ Every watcher so far was a ≤0.4.175 daemon's, so the journal still carries its lines; §6 says why it will not from 0.4.176 on |
+| 2026-10-26, 15:34Z | the dev box, on **0.4.177** | the worker's `last-install.json` + the logs dir | `SucceededVerified` for `agent-v0.4.177`, `started_unix 1793028879 → finished_unix 1793028892` (13 s on msiexec), the service settled — and **no panic log beside it**, the first Windows record this FR has read without one: the watcher was the 0.4.175 daemon's (the box went 0.4.175 → 0.4.177 directly), and 0.4.175 is the first release with #2935. #2943 (0.4.176+) goes further and gives the watcher no stdio at all, §6 |
+| — | the release that carries P3 — none yet: 0.4.177, the newest at this writing, predates #2924 | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
 
 ## 8. Not built
 
@@ -234,5 +248,5 @@ $ roomler status
   may reap the watcher where the installer genuinely is asynchronous. Open
   question on a real Mac, in the FR.
 - **P6 — a transient systemd unit**, only if P1 leaves a measurable race. The
-  10-26 reads say it does not on the `.deb` path: 15 of 15 on one host, and
-  the last two on each of three.
+  10-26 reads say it does not on the `.deb` path: 17 of 17 on one host, and
+  the last four on each of three.
