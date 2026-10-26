@@ -167,44 +167,91 @@
 
   let checking = false;
 
-  // The one update check, for the card's button and the tray's menu item
-  // alike. A stale "Install update" from an earlier check is hidden first;
-  // a second click while a check runs is ignored.
-  async function runUpdateCheck() {
-    if (checking) return;
-    checking = true;
-    hide($('btn-apply-update'));
-    pushOutput('Checking for updates…');
-    try {
-      const out = await invoke('cmd_check_update');
-      pushOutput(out);
-      if (String(out).toLowerCase().includes('update available')) {
-        show($('btn-apply-update'));
-      }
-    } catch (e) {
-      pushOutput('Error: ' + e);
-    } finally {
-      checking = false;
-    }
+  // A check that answers in 200 ms looked like no check at all: "Up to date"
+  // was simply there (field 2026-10-26, on a Mac). The "Checking…" state stays
+  // up at least this long, and the answer carries the time it was asked.
+  const MIN_CHECKING_MS = 700;
+
+  function checkedAt() {
+    return 'Checked at ' + new Date().toLocaleTimeString() + '.';
   }
 
-  // Bring the Updates card into view: the last card of Overview, so a tray
-  // click that only switched views left the result below the fold. When the
-  // view must change first, scroll once app.js has unhidden it: it announces
-  // the view after unhiding, and `scrollIntoView` lays the page out itself.
-  function revealUpdates() {
+  // The one update check, for the card's button and the tray's menu item
+  // alike. A stale "Install update" from an earlier check is hidden first;
+  // a second click while a check runs is ignored. `reveal` (the tray) brings
+  // the card into view again when the answer lands: the cards above may have
+  // grown while it ran.
+  async function runUpdateCheck({ reveal = false } = {}) {
+    if (checking) return;
+    checking = true;
+    const btn = $('btn-check-update');
+    if (btn) btn.disabled = true;
+    hide($('btn-apply-update'));
+    pushOutput('Checking for updates…');
+    const started = Date.now();
+    let text;
+    let available = false;
+    try {
+      const out = String(await invoke('cmd_check_update'));
+      available = out.toLowerCase().includes('update available');
+      text = out;
+    } catch (e) {
+      text = 'Error: ' + e;
+    }
+    const wait = MIN_CHECKING_MS - (Date.now() - started);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    pushOutput(text + '\n' + checkedAt());
+    if (available) show($('btn-apply-update'));
+    if (btn) btn.disabled = false;
+    checking = false;
+    if (reveal) scrollToUpdates();
+  }
+
+  // Bring the Updates card to the top of the content pane (`#content` scrolls,
+  // the body does not). INSTANT on purpose: a smooth scroll is driven by
+  // animation frames, and a page whose window is still coming up gets none.
+  // On macOS 0.4.177's smooth scroll never happened (field 2026-10-26).
+  function scrollToUpdates() {
+    const card = $('ov-updates');
+    if (card) card.scrollIntoView({ block: 'start' });
+  }
+
+  // Draw the eye to the card the tray just opened.
+  function flashUpdates() {
     const card = $('ov-updates');
     if (!card) return;
-    const scroll = () => card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    card.classList.remove('flash');
+    void card.offsetWidth; // restart the animation on a second click
+    card.classList.add('flash');
+    setTimeout(() => card.classList.remove('flash'), 1600);
+  }
+
+  // The last card of Overview, so a tray click that only switched views left
+  // the answer below the fold. When the view must change first, this runs
+  // once app.js has unhidden it (it announces the view after unhiding). A page
+  // that is not visible yet (the tray shows the window and runs this at once)
+  // is placed again the moment it becomes visible.
+  function revealUpdates() {
+    const reveal = () => {
+      scrollToUpdates();
+      flashUpdates();
+      if (document.visibilityState === 'visible') return;
+      const onVisible = () => {
+        if (document.visibilityState !== 'visible') return;
+        document.removeEventListener('visibilitychange', onVisible);
+        scrollToUpdates();
+      };
+      document.addEventListener('visibilitychange', onVisible);
+    };
     const section = $('view-overview');
     if (currentView() === 'overview' && section && !section.hidden) {
-      scroll();
+      reveal();
       return;
     }
     const onView = (ev) => {
       if (ev.detail !== 'overview') return;
       document.removeEventListener('roomler:view', onView);
-      scroll();
+      reveal();
     };
     document.addEventListener('roomler:view', onView);
     navigate('overview');
@@ -214,8 +261,12 @@
   // pending flag and fires the event. One click does it all here.
   function trayCheckUpdate() {
     window.__roomler_tray_check_pending = false;
+    // The check first: it puts "Checking for updates…" in the card before its
+    // first await, so the scroll below already sees the card at that height
+    // (scrolled the other way round, its last line sat below the pane).
+    const running = runUpdateCheck({ reveal: true });
     revealUpdates();
-    void runUpdateCheck();
+    void running;
   }
 
   /* ── FR-84 D4: what this device can encode ─────────────────────────
