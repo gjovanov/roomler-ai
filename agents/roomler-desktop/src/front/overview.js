@@ -163,6 +163,61 @@
     show(el);
   }
 
+  /* ── Updates: one check, from the button or the tray (#2936) ─────── */
+
+  let checking = false;
+
+  // The one update check, for the card's button and the tray's menu item
+  // alike. A stale "Install update" from an earlier check is hidden first;
+  // a second click while a check runs is ignored.
+  async function runUpdateCheck() {
+    if (checking) return;
+    checking = true;
+    hide($('btn-apply-update'));
+    pushOutput('Checking for updates…');
+    try {
+      const out = await invoke('cmd_check_update');
+      pushOutput(out);
+      if (String(out).toLowerCase().includes('update available')) {
+        show($('btn-apply-update'));
+      }
+    } catch (e) {
+      pushOutput('Error: ' + e);
+    } finally {
+      checking = false;
+    }
+  }
+
+  // Bring the Updates card into view: the last card of Overview, so a tray
+  // click that only switched views left the result below the fold. When the
+  // view must change first, scroll once app.js has unhidden it: it announces
+  // the view after unhiding, and `scrollIntoView` lays the page out itself.
+  function revealUpdates() {
+    const card = $('ov-updates');
+    if (!card) return;
+    const scroll = () => card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    const section = $('view-overview');
+    if (currentView() === 'overview' && section && !section.hidden) {
+      scroll();
+      return;
+    }
+    const onView = (ev) => {
+      if (ev.detail !== 'overview') return;
+      document.removeEventListener('roomler:view', onView);
+      scroll();
+    };
+    document.addEventListener('roomler:view', onView);
+    navigate('overview');
+  }
+
+  // The tray's "Check for Updates" (tray.rs): it shows the window, raises the
+  // pending flag and fires the event. One click does it all here.
+  function trayCheckUpdate() {
+    window.__roomler_tray_check_pending = false;
+    revealUpdates();
+    void runUpdateCheck();
+  }
+
   /* ── FR-84 D4: what this device can encode ─────────────────────────
    *
    * `cmd_encoder_caps` reads the service's CACHED probe; the service probes
@@ -634,18 +689,7 @@
       }
     });
 
-    $('btn-check-update').addEventListener('click', async () => {
-      pushOutput('Checking for updates…');
-      try {
-        const out = await invoke('cmd_check_update');
-        pushOutput(out);
-        if (out.toLowerCase().includes('update available')) {
-          show($('btn-apply-update'));
-        }
-      } catch (e) {
-        pushOutput('Error: ' + e);
-      }
-    });
+    $('btn-check-update').addEventListener('click', () => void runUpdateCheck());
 
     $('btn-apply-update').addEventListener('click', async () => {
       pushOutput('Applying update…');
@@ -661,18 +705,10 @@
       }
     });
 
-    // Tray's "Check for Updates" menu item evals a global + dispatches this
-    // event (tray.rs) — surface the result where it's visible.
-    window.addEventListener('roomler-update-check', () => {
-      const r = window.__roomler_check_update_result;
-      if (r && r.check) {
-        navigate('overview');
-        pushOutput(r.check);
-        if (r.check.toLowerCase().includes('update available')) {
-          show($('btn-apply-update'));
-        }
-      }
-    });
+    // #2936 — the tray's "Check for Updates" (tray.rs fires this by name).
+    // A click that landed before this script listened left the flag up.
+    window.addEventListener('roomler-tray-check-update', trayCheckUpdate);
+    if (window.__roomler_tray_check_pending) trayCheckUpdate();
 
     // tunnels.js broadcasts its route list; the overview only needs the count.
     document.addEventListener('roomler:routes', (ev) => {

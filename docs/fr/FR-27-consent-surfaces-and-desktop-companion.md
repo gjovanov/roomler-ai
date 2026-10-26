@@ -80,7 +80,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Tauri 2.11 auto-creates a tray from `app.trayIcon` (id `main`, icon, no menu);
    `tray::install` then builds a *second* one and never calls `.icon()`. The
    blank one carries the menu — which is exactly what the operator described.
-   — `tauri-2.11.2/src/app.rs:2412`, `agents/roomler-desktop/src/tray.rs:53`
+   — `tauri-2.11.2/src/app.rs:2412`, `agents/roomler-desktop/src/tray.rs:54`
 7. **One bug breaks most pages on macOS and Linux: `agent_exe_path()`.** It
    probes for a *sibling* `roomlerd`, then falls back to a bare name on `PATH`.
    On macOS the companion is `/Applications/Roomler.app/Contents/MacOS/`, the
