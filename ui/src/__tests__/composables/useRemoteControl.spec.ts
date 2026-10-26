@@ -101,6 +101,7 @@ import {
   applyKeyRoute,
   RC_CAPTURE_SELECTOR,
   routeDeferredPaste,
+  drawerPasteFiles,
   deferredPasteFrames,
   DEFERRED_PASTE_FALLBACK_MS,
   type KeyRoute,
@@ -3390,8 +3391,10 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
 
   describe('routeDeferredPaste / deferredPasteFrames — the deferral consumes its paste', () => {
     /** A paste event as the browser dispatches it: `clipboardData` (or none),
-     *  and a `preventDefault` that records every call. */
-    function pasteEvent(data: { text?: string; html?: string; files?: File[] } | null) {
+     *  and a `preventDefault` that records every call and, as in the browser,
+     *  sets `defaultPrevented` — `prevented` is a paste an earlier listener on
+     *  the window already consumed (the files drawer's, #2910). */
+    function pasteEvent(data: { text?: string; html?: string; files?: File[] } | null, prevented = false) {
       const calls: string[] = []
       const dt =
         data === null
@@ -3402,8 +3405,10 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
             }
       const ev = {
         clipboardData: dt as unknown as DataTransfer | null,
-        preventDefault: () => {
+        defaultPrevented: prevented,
+        preventDefault() {
           calls.push('preventDefault')
+          ev.defaultPrevented = true
         },
       }
       return { ev, calls }
@@ -3457,6 +3462,61 @@ describe('routeKeyEvent / applyKeyRoute — one owner per key (#2888)', () => {
 
     it('the fallback flush waits 50 ms: below keystroke perception, above paste-event scheduling', () => {
       expect(DEFERRED_PASTE_FALLBACK_MS).toBe(50)
+    })
+
+    it('a paste the files drawer already consumed is `taken` (#2910): no second upload, no keystroke, not consumed twice', () => {
+      // The drawer's listener runs first (registered at mount, before
+      // `attachInput`); answering `files` here uploaded every file again.
+      const { ev, calls } = pasteEvent({ files: [new File(['a'], 'a.txt')] }, true)
+      expect(routeDeferredPaste(ev, true, true)).toEqual({ kind: 'taken' })
+      expect(calls).toEqual([])
+    })
+
+    it('a consumed paste with no deferral pending is still not ours', () => {
+      const { ev } = pasteEvent({ files: [new File(['a'], 'a.txt')] }, true)
+      expect(routeDeferredPaste(ev, false, true)).toEqual({ kind: 'ignore' })
+    })
+  })
+
+  describe("drawerPasteFiles — the files drawer's half of a paste (#2910)", () => {
+    const files = [new File(['a'], 'a.txt'), new File(['b'], 'b.txt')]
+    function pasteOn(target: EventTarget | null, opts: { files?: File[]; prevented?: boolean } = {}) {
+      return {
+        clipboardData: { files: opts.files ?? files } as unknown as DataTransfer,
+        defaultPrevented: opts.prevented ?? false,
+        target,
+      }
+    }
+
+    it('the drawer open, files pasted over the stage: the drawer uploads them', () => {
+      expect(drawerPasteFiles(pasteOn(document.createElement('div')), true)).toEqual(files)
+    })
+
+    it('the drawer shut: not its paste', () => {
+      expect(drawerPasteFiles(pasteOn(document.createElement('div')), false)).toBeNull()
+    })
+
+    it('no files on the clipboard: not its paste', () => {
+      expect(drawerPasteFiles(pasteOn(document.createElement('div'), { files: [] }), true)).toBeNull()
+      expect(drawerPasteFiles({ clipboardData: null, defaultPrevented: false, target: null }, true)).toBeNull()
+    })
+
+    it('already consumed — the deferred Ctrl+V ran first: not its paste, whichever listener the window calls first', () => {
+      expect(drawerPasteFiles(pasteOn(document.createElement('div'), { prevented: true }), true)).toBeNull()
+    })
+
+    it("a form field's own paste (the path input, a textarea, contenteditable): not its paste", () => {
+      const editable = document.createElement('div')
+      // jsdom does not compute `isContentEditable`: model the browser's answer.
+      Object.defineProperty(editable, 'isContentEditable', { value: true })
+      for (const target of [document.createElement('input'), document.createElement('textarea'), editable]) {
+        expect(drawerPasteFiles(pasteOn(target), true), target.tagName).toBeNull()
+      }
+    })
+
+    it('a paste aimed at the window or the document (no element): the drawer still takes it', () => {
+      expect(drawerPasteFiles(pasteOn(document), true)).toEqual(files)
+      expect(drawerPasteFiles(pasteOn(null), true)).toEqual(files)
     })
   })
 })

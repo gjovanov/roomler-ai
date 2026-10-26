@@ -11775,6 +11775,13 @@ export function useRemoteControl(
         options?.onFilesPasted !== undefined,
       )
       if (route.kind === 'ignore') return
+      if (route.kind === 'taken') {
+        // The drawer uploaded it (#2910): the chord is spent, the host gets
+        // no Ctrl+V and the files go nowhere else.
+        if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
+        pendingCtrlV = null
+        return
+      }
       if (route.kind === 'flush') {
         flushPendingCtrlV()
         return
@@ -14154,7 +14161,8 @@ function modifierBits(ev: Pick<KeyboardEvent, 'ctrlKey' | 'shiftKey' | 'altKey' 
  *  |                                         | `compositionend` carries the     |
  *  |                                         | composed character               |
  *  | drops (IME, `keyCode` 229, a `code` it  | the typed text, the composition, |
- *  | cannot map): untouched                  | the code-less Enter / Tab        |
+ *  | cannot map): untouched                  | the code-less Enter / Tab /      |
+ *  |                                         | Backspace / Delete (#2909)       |
  *  | defers Ctrl+V: default NOT prevented    | nothing — `onPaste` consumes the |
  *  | (the paste event must fire)             | paste event                      |
  *
@@ -14326,12 +14334,15 @@ export function deferredPasteFrames(mods: number): Record<string, unknown>[] {
  *  field's own); `flush` — no `clipboardData` at all, send the plain Ctrl+V;
  *  `files` — the operator meant "upload these", no keystroke; `content` — the
  *  text and html to mirror to the host before the keystroke (the caller's
- *  clipboard channels decide how). */
+ *  clipboard channels decide how); `taken` — another window `paste` listener
+ *  already consumed it (the viewer's files drawer, #2910): drop the deferred
+ *  chord, no keystroke and no second upload. */
 export type DeferredPasteRoute =
   | { kind: 'ignore' }
   | { kind: 'flush' }
   | { kind: 'files'; files: File[] }
   | { kind: 'content'; text: string; html: string }
+  | { kind: 'taken' }
 
 /** Decide what the deferred Ctrl+V does with its `paste` event — and CONSUME
  *  the event when the deferral has it. The `preventDefault` lives here, in
@@ -14341,13 +14352,20 @@ export type DeferredPasteRoute =
  *  insert the clipboard text there, and `MobileKeyboard.vue`'s `input`
  *  handler would type it on the host on top of the flushed Ctrl+V. With
  *  nothing editable focused the default does nothing anyway. Pure apart from
- *  that one call, which is the point. */
+ *  that one call, which is the point.
+ *
+ *  A paste someone already prevented is `taken` (#2910): the viewer's files
+ *  drawer listens on `window` too, registered at mount — before
+ *  `attachInput` registers `onPaste` — so with the drawer open it runs FIRST
+ *  and uploads a files paste into the drawer's directory. Acting on the same
+ *  event again uploaded every file a second time, into the default folder. */
 export function routeDeferredPaste(
-  ev: Pick<ClipboardEvent, 'clipboardData' | 'preventDefault'>,
+  ev: Pick<ClipboardEvent, 'clipboardData' | 'preventDefault' | 'defaultPrevented'>,
   pending: boolean,
   canUpload: boolean,
 ): DeferredPasteRoute {
   if (!pending) return { kind: 'ignore' }
+  if (ev.defaultPrevented) return { kind: 'taken' }
   ev.preventDefault()
   const dt = ev.clipboardData
   if (!dt) return { kind: 'flush' }
@@ -14357,6 +14375,32 @@ export function routeDeferredPaste(
     return { kind: 'files', files }
   }
   return { kind: 'content', text: dt.getData('text') ?? '', html: dt.getData('text/html') ?? '' }
+}
+
+/** The files drawer's half of a `paste` (#2910): the files to upload into the
+ *  drawer's directory, or `null` when the paste is not the drawer's — the
+ *  drawer is shut, the clipboard holds no files, the target is an editable
+ *  field (the drawer's own path input), or another `paste` listener already
+ *  consumed it. With `routeDeferredPaste`'s `taken` that is one owner per
+ *  paste, whichever of the two window listeners runs first: today the drawer's
+ *  (registered at mount, before `attachInput`), and `defaultPrevented` keeps
+ *  it right if that order ever flips. */
+export function drawerPasteFiles(
+  ev: Pick<ClipboardEvent, 'clipboardData' | 'defaultPrevented' | 'target'>,
+  drawerOpen: boolean,
+): File[] | null {
+  if (!drawerOpen || ev.defaultPrevented) return null
+  const dt = ev.clipboardData
+  if (!dt || !dt.files || dt.files.length === 0) return null
+  const target = ev.target as Element | null
+  if (target) {
+    const tag = target.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return null
+    if ((target as HTMLElement).isContentEditable) return null
+  }
+  const files: File[] = []
+  for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
+  return files
 }
 
 export { browserButton, kbdCodeToHid }

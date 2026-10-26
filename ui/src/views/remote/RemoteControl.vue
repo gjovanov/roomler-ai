@@ -2467,6 +2467,7 @@ import {
   idleSecondsLeft,
   hostLockedChipTitle,
   awaitingConsentLabel,
+  drawerPasteFiles,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3192,26 +3193,21 @@ async function downloadEntry(entry: { name: string; is_dir: boolean }) {
 // only fire on the focused element — so unless the operator clicked
 // into the drawer first, the handler never ran (Field repro rc.15
 // 2026-05-07). Moving to window scope makes the handler robust to
-// focus state. The viewer's separate composable-side onPaste fires
-// first; it only acts when `pendingCtrlV` is set (Ctrl+V over the
-// viewer specifically), so this drawer handler kicks in for every
-// other paste-with-files when the drawer is open.
+// focus state. It is one of TWO window `paste` listeners: the
+// composable's `onPaste` takes the paste that follows a deferred Ctrl+V
+// over the viewer. This one is registered at mount, before `attachInput`
+// registers that one, so it runs FIRST — and with the drawer open a
+// files Ctrl+V used to upload twice, here and again from `onPaste` into
+// the default folder (#2910). One owner per paste now:
+// `drawerPasteFiles` steps aside on a paste already consumed, and
+// `routeDeferredPaste` answers `taken` for one this handler consumed.
 function onWindowPasteForDrawer(ev: ClipboardEvent) {
-  if (!filesDrawer.value) return
-  const dt = ev.clipboardData
-  if (!dt || !dt.files || dt.files.length === 0) return
-  // Don't intercept paste into form inputs (e.g. the path-input
-  // field at the top of the drawer).
-  const target = ev.target as Element | null
-  if (target) {
-    const tag = target.tagName
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return
-    if ((target as HTMLElement).isContentEditable) return
-  }
+  // Not the drawer's: shut, no files, a form input's own paste (the
+  // path field at the top of the drawer), or already consumed.
+  const files = drawerPasteFiles(ev, filesDrawer.value)
+  if (!files) return
   ev.preventDefault()
   ev.stopPropagation()
-  const files: File[] = []
-  for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
   // Drawer-scope paste honours the current dir as the upload target
   // (file-DC v2.2 path-targeted upload). When the drawer is at the
   // roots view (currentDirPath = "Drives" / "/"), we skip dest_path
@@ -5372,7 +5368,11 @@ watch(
               ? `Uploading ${files[0].name}…`
               : `Uploading ${files.length} files…`
           )
-          void uploadMany(files)
+          // With the drawer open its directory is the destination,
+          // whichever listener took the paste (#2910): the drawer's
+          // handler leaves a paste into the soft keyboard's textarea
+          // (a form input) to this one.
+          void uploadMany(files, filesDrawer.value ? drawerUploadDestPath() : undefined)
         },
         // rc.18: anchor focus on the viewer wrapper itself. The
         // composable's onPointerEnter blurs whatever was focused

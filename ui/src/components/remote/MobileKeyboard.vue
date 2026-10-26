@@ -302,11 +302,22 @@ function onCompositionEnd(ev: CompositionEvent) {
  *  is not ours. Measured in `ui/e2e-harness/` before the fix: with the
  *  soft keyboard open and the pointer off the stage, every hardware
  *  Enter, Tab, Escape and arrow reached the host twice — once from the
- *  listener, once from here. */
+ *  listener, once from here.
+ *
+ *  Backspace and Delete are here for the same reason (#2909): the listener
+ *  maps by `code`, so a code-less one is dropped, and on this always-empty
+ *  textarea the browser's default deletes nothing, so no `input` event
+ *  carries it either — without these two cases it reached the host through
+ *  nobody. A `keyCode` 229 one is the IME's, editing its own composition:
+ *  what it commits arrives through `input` / `compositionend`. */
 function onKeyDown(ev: KeyboardEvent) {
   if (isComposing.value || ev.defaultPrevented) return
   const passthrough = ((): number | null => {
     switch (ev.key) {
+      case 'Backspace':
+        return ev.keyCode === 229 ? null : HID.Backspace
+      case 'Delete':
+        return ev.keyCode === 229 ? null : HID.Delete
       case 'Tab':
         return HID.Tab
       case 'Enter':

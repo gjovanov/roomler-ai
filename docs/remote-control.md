@@ -562,7 +562,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
 at [`useRemoteControl.ts:1544`](../ui/src/composables/useRemoteControl.ts#L1544)
 and puts it on the toggle's title
-([`RemoteControl.vue:3395`](../ui/src/views/remote/RemoteControl.vue#L3395)).
+([`RemoteControl.vue:3391`](../ui/src/views/remote/RemoteControl.vue#L3391)).
 
 | `code` | Means |
 |---|---|
@@ -885,12 +885,12 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12013`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12020`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
 (`MobileKeyboard.vue:218`), a composition as `compositionend` (`:281`), and a
-special key the OS keyboard sends as a `keydown` through `onKeyDown` (`:306`).
+special key the OS keyboard sends as a `keydown` through `onKeyDown` (`:313`).
 Both are needed: the keydown is the only way a Backspace on the always-empty
 textarea or a hardware chord reaches the host (#2878), and the `input` event
 is the only way the phone's letters do (their keydowns carry `keyCode` 229).
@@ -928,9 +928,9 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14171`, pure)
-and carried out by `applyKeyRoute` (`:14261`): a key whose target is the soft
-keyboard's textarea (`isSoftKeyboardTarget`, `:14003` — the same
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14179`, pure)
+and carried out by `applyKeyRoute` (`:14269`): a key whose target is the soft
+keyboard's textarea (`isSoftKeyboardTarget`, `:14010` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
 key over the stage or under keyboard lock, and has one owner — which one
 depends on the key.
@@ -939,7 +939,7 @@ depends on the key.
 |---|---|
 | **forwards a HID frame** (a named key, a chord, a modifier): default prevented, propagation stopped | nothing — no `input` event, and `onKeyDown` never runs |
 | **leaves a printable character** (no chord) **or a dead key** untouched — `untouched / soft-keyboard` | the character, through `input` — with the toolbar's sticky Ctrl / Alt / Win applied (`consumeModBits`); a dead key composes with the next, and `compositionend` carries the composed character |
-| **drops** (IME, `keyCode` 229, a `code` it cannot map): untouched | the typed text, the composition, the code-less Enter / Tab |
+| **drops** (IME, `keyCode` 229, a `code` it cannot map): untouched | the typed text, the composition, the code-less Enter / Tab / Backspace / Delete (#2909) |
 | **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `routeDeferredPaste` consumes the paste event for `onPaste` (`:11766`) |
 
 ```mermaid
@@ -981,13 +981,53 @@ paste.** `routeDeferredPaste` calls `preventDefault` whenever a deferral is
 pending — in the one function `onPaste`, the harness and the spec all run, so
 it is not a copy that can drift. With nothing editable focused the default did
 nothing anyway; with the textarea focused it inserted the clipboard, and the
-`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:306`) also ignores
+`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:313`) also ignores
 a `defaultPrevented` keydown — the second lock, should the listener ever
 forward without stopping.
 
+⚠️ **A code-less Backspace or Delete is the component's** (#2909). The
+listener maps by `code`, so a keydown with `key` "Backspace" and an empty
+`code` — what an OS keyboard that sends keydowns without a physical position
+emits, iOS's being the likely one — is dropped, and the always-empty textarea
+deletes nothing, so no `input` event carries it either: it reached the host
+through nobody. `onKeyDown` now sends both (`MobileKeyboard.vue:317`), with
+its default prevented; a `keyCode` 229 one stays the IME's, editing its own
+composition.
+
+⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
+`window`: the files drawer's `onWindowPasteForDrawer`
+(`RemoteControl.vue:3204`), registered at mount (`:5435`), and the deferred
+Ctrl+V's `onPaste` (`useRemoteControl.ts:11766`), registered later by
+`attachInput` (`:12006`). Same node, same phase, so the drawer's runs
+**first** — and `preventDefault` stops no other listener on the same node.
+With the drawer open, a Ctrl+V over the stage with files on the clipboard
+uploaded every file twice: into the drawer's directory, then again into the
+default folder. Now each half steps aside for the other: `drawerPasteFiles`
+(`useRemoteControl.ts:14388`) returns nothing for a paste already consumed,
+and `routeDeferredPaste` (`:14362`) answers `taken` for one the drawer
+consumed — the deferred chord is dropped, with no keystroke and no second
+upload (`:11778`). Whichever listener runs first owns the paste, so a future
+change to the registration order cannot bring the double back. With the
+drawer open, a files paste that does reach `onPaste` — one aimed at the soft
+keyboard's textarea, which the drawer leaves to it as a form field — uploads
+into the drawer's directory as well (`RemoteControl.vue:5375`).
+
+```mermaid
+flowchart TD
+    E["paste on window"] --> DR["1 · the drawer's listener (mounted first)<br/>drawerPasteFiles"]
+    DR -->|"drawer open · files · not a form field · not consumed"| DU["upload into the drawer's directory<br/>preventDefault"]
+    DR -->|"otherwise: untouched"| OP
+    DU --> OP["2 · onPaste (attachInput)<br/>routeDeferredPaste"]
+    OP -->|"no deferral pending"| IG["ignore"]
+    OP -->|"pending, already consumed"| TK["taken: drop the chord<br/>no keystroke · no upload"]
+    OP -->|"pending, files"| FU["upload, no keystroke"]
+    OP -->|"pending, text"| CT["mirror · flush Ctrl+V"]
+```
+
 The soft keyboard's **own** paths are unchanged and locked beside the fix: text
-through `input`, a composition through `compositionend`, a code-less Enter
-through `onKeyDown`, the toolbar's keys through `sendKey`. The desktop policy
+through `input`, a composition through `compositionend`, a code-less Enter,
+Backspace or Delete through `onKeyDown`, the toolbar's keys through `sendKey`.
+The desktop policy
 (rc.18) is unchanged too: with the pointer off the stage and nothing editable
 focused, a key — a printable character included — is forwarded with the
 browser's default kept (Tab and Backspace excepted) and its propagation kept.
@@ -1000,7 +1040,12 @@ Playwright in a real Chromium — hardware keys in three viewer states,
 keydown, then the insertion), the toolbar's sticky Ctrl followed by a hardware
 `c`, a dead key followed by its composition, a CDP IME composition, a real
 paste, the SAS chord, Ctrl→Cmd, the toolbar,
-the closed states and the path field — recording each frame with WHO sent it.
+the closed states and the path field, a code-less Backspace and Delete
+(#2909), and a files paste with the drawer open and shut, behind the drawer's
+own listener registered first as the viewer registers it (#2910) — recording
+each frame, and each upload, with WHO sent it. With either fix removed the
+harness fails exactly there: the code-less keys reach nobody, and the drawer
+case shows `[D]upload(files=2) [F]upload(files=2)`.
 The vitest matrix (`useRemoteControl.spec.ts`, `MobileKeyboard.spec.ts`) locks
 the verdicts, the one-owner invariant over every key and state, and the paste
 seam. Still owed on real devices: a tablet with a hardware keyboard, a phone

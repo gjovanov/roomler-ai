@@ -139,8 +139,8 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14171`,
-  `:14261`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14179`,
+  `:14269`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -154,7 +154,12 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
   Ctrl+C, the modifier cleared), as does the iOS-style letter (a real keydown
   with no physical code, then the insertion). The paste half runs the same
   `routeDeferredPaste` production runs, so its one `preventDefault` is not a
-  copy: remove it and the Ctrl+V case fails. The Vite DEV server serves the
+  copy: remove it and the Ctrl+V case fails. Behind it sits the files
+  drawer's own `paste` listener, running the real `drawerPasteFiles` and
+  registered FIRST, as `RemoteControl.vue` registers it (#2910): a files paste
+  with the drawer open or shut must start exactly one upload, by the owner the
+  case names — remove `routeDeferredPaste`'s `taken` and the drawer case
+  shows two. The Vite DEV server serves the
   page (`playwright.harness.config.ts`); `vite build` never includes it. CI
   runs it as a step of the phone-smoke job on any PR that touches `ui/`
   (`ui-phone-smoke.yml`) — one runner slot for both, since slots are the
