@@ -6,16 +6,7 @@ use super::*;
 
 /// The bounds a test runs at.
 fn quick() -> Timing {
-    Timing {
-        start: Duration::from_millis(300),
-        beat: Duration::from_millis(60),
-        misses: 2,
-        backoff: Duration::from_millis(10),
-        backoff_max: Duration::from_millis(40),
-        loop_window: Duration::from_secs(30),
-        loop_max: 3,
-        grace: Duration::from_millis(20),
-    }
+    Timing::quick()
 }
 
 /// What one fake worker does on its channel.
@@ -35,6 +26,19 @@ enum Part {
     Foreign,
     /// The worker's own loop for this many milliseconds, then gone.
     LiveFor(u64),
+}
+
+/// A run nobody ends.
+fn nobody() -> GiveUp {
+    Arc::new(|_| {})
+}
+
+/// A run whose end is recorded: each reason it was ended for.
+fn ended_runs() -> (GiveUp, Arc<Mutex<Vec<String>>>) {
+    let ended = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&ended);
+    let give_up: GiveUp = Arc::new(move |why| record.lock().unwrap().push(why));
+    (give_up, ended)
 }
 
 /// A worker's `ready`, at this build's version.
@@ -81,17 +85,23 @@ impl Running for Task {
 }
 
 impl Spawn for Fake {
-    fn spawn(&self, theirs: std::os::unix::net::UnixStream) -> std::io::Result<Box<dyn Running>> {
+    fn spawn(
+        &self,
+        theirs: std::os::unix::net::UnixStream,
+        descriptors: std::os::unix::net::UnixStream,
+    ) -> std::io::Result<Box<dyn Running>> {
         let k = self.started.fetch_add(1, Ordering::SeqCst);
         let part = *self.plan.get(k).or(self.plan.last()).unwrap();
         theirs.set_nonblocking(true)?;
+        descriptors.set_nonblocking(true)?;
         let mut ch = UnixStream::from_std(theirs)?;
+        let descriptors = UnixStream::from_std(descriptors)?;
         let log = Arc::clone(&self.log);
         let note = move |what: String| log.lock().unwrap().push(format!("#{k} {what}"));
         let task = tokio::spawn(async move {
             match part {
                 Part::Serve => {
-                    let ended = serve(ch).await;
+                    let ended = serve(ch, Some(descriptors)).await;
                     note(format!("served: {ended:?}"));
                 }
                 Part::DieAfterReady => {
@@ -126,7 +136,8 @@ impl Spawn for Fake {
                     std::future::pending::<()>().await;
                 }
                 Part::LiveFor(ms) => {
-                    let _ = tokio::time::timeout(Duration::from_millis(ms), serve(ch)).await;
+                    let served = serve(ch, Some(descriptors));
+                    let _ = tokio::time::timeout(Duration::from_millis(ms), served).await;
                     note("lived".into());
                 }
             }
@@ -218,7 +229,7 @@ fn a_worker_is_the_subcommand_alone_in_a_process_the_daemon_started() {
 #[tokio::test]
 async fn a_worker_answers_its_hello_and_each_beat_and_ends_at_bye() {
     let (mut daemon, worker) = UnixStream::pair().unwrap();
-    let served = tokio::spawn(serve(worker));
+    let served = tokio::spawn(serve(worker, None));
     send(
         &mut daemon,
         &Msg::Hello {
@@ -245,7 +256,7 @@ async fn a_worker_answers_its_hello_and_each_beat_and_ends_at_bye() {
     assert_eq!(recv(&mut daemon).await.unwrap(), None, "and closed its end");
 
     let (daemon, worker) = UnixStream::pair().unwrap();
-    let served = tokio::spawn(serve(worker));
+    let served = tokio::spawn(serve(worker, None));
     drop(daemon);
     let ended = tokio::time::timeout(Duration::from_secs(5), served).await;
     ended
@@ -299,7 +310,7 @@ async fn a_worker_lost_once_in_a_long_while_is_never_given_up_on() {
         ..quick()
     };
     let fake = Fake::new(&[Part::LiveFor(150)]);
-    let w = Worker::start(ObjectId::new(), 1, fake.clone(), timing);
+    let w = Worker::start(ObjectId::new(), 1, fake.clone(), timing, nobody());
     let s = until(&w, |s| s.starts >= 4 || s.gave_up).await;
     assert_eq!((s.starts >= 4, s.gave_up), (true, false), "{s:?}");
     w.stop().await;
@@ -310,9 +321,15 @@ async fn a_worker_lost_once_in_a_long_while_is_never_given_up_on() {
 #[tokio::test]
 async fn a_worker_of_another_build_is_given_up_on_at_once() {
     let fake = Fake::new(&[Part::Foreign, Part::Serve]);
-    let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick());
+    let (give_up, ended) = ended_runs();
+    let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick(), give_up);
     let s = until(&w, |s| s.gave_up).await;
     assert_eq!((s.starts, s.up, s.gave_up), (1, false, true), "{s:?}");
+    let ended = ended.lock().unwrap().clone();
+    assert!(
+        ended.len() == 1 && ended[0].contains("version 0.0.0-another"),
+        "the run ended, with why: {ended:?}"
+    );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(fake.started.load(Ordering::SeqCst), 1, "nothing after");
     w.stop().await;
@@ -327,7 +344,7 @@ async fn a_worker_deaf_to_bye_is_killed_after_the_grace() {
         ..quick()
     };
     let fake = Fake::new(&[Part::NoBeats]);
-    let w = Worker::start(ObjectId::new(), 1, fake.clone(), timing);
+    let w = Worker::start(ObjectId::new(), 1, fake.clone(), timing, nobody());
     let s = until(&w, |s| s.up).await;
     assert!(s.up, "{s:?}");
     let stopped = tokio::time::timeout(Duration::from_secs(5), w.stop()).await;
@@ -359,7 +376,7 @@ async fn a_lost_worker_is_started_again() {
         (Part::NoBeats, "ready, deaf"),
     ] {
         let fake = Fake::new(&[first, Part::Serve]);
-        let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick());
+        let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick(), nobody());
         let s = until(&w, |s| s.starts == 2 && s.up).await;
         assert_eq!(
             (s.starts, s.up, s.gave_up),
@@ -372,14 +389,19 @@ async fn a_lost_worker_is_started_again() {
 }
 
 /// Starts past the bound within the window, and the daemon gives up on the
-/// run's worker: no start after it.
+/// run's worker: no start after it, and (P8-2a-2) the run is ended, once,
+/// with the reason.
 #[tokio::test]
 async fn too_many_starts_and_the_daemon_gives_up() {
     let fake = Fake::new(&[Part::DieAtOnce]);
-    let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick());
+    let (give_up, ended) = ended_runs();
+    let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick(), give_up);
     let s = until(&w, |s| s.gave_up).await;
     assert!(s.gave_up, "{s:?}");
     assert_eq!(s.starts, quick().loop_max, "{s:?}");
+    let ended = ended.lock().unwrap().clone();
+    assert_eq!(ended.len(), 1, "the run ended once: {ended:?}");
+    assert!(ended[0].contains("starts within"), "{ended:?}");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         fake.started.load(Ordering::SeqCst),
@@ -393,7 +415,7 @@ async fn too_many_starts_and_the_daemon_gives_up() {
 #[tokio::test]
 async fn a_stopped_worker_is_told_bye() {
     let fake = Fake::new(&[Part::Serve]);
-    let w = Worker::start(ObjectId::new(), 3, fake.clone(), quick());
+    let w = Worker::start(ObjectId::new(), 3, fake.clone(), quick(), nobody());
     let s = until(&w, |s| s.up).await;
     assert!(s.up, "{s:?}");
     // A few heartbeats answered keep it up.
@@ -413,7 +435,7 @@ async fn a_run_gets_a_worker_where_the_owner_said_so_and_loses_it_at_its_end() {
     run_started(session, fence, false);
     assert_eq!(seen(session, fence), None, "off: no worker");
     let fake = Fake::new(&[Part::Serve]);
-    run_started_with(session, fence, fake.clone(), quick());
+    run_started_with(session, fence, fake.clone(), quick(), nobody());
     let deadline = Instant::now() + Duration::from_secs(5);
     while !seen(session, fence).is_some_and(|s| s.up) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -430,25 +452,32 @@ async fn a_run_gets_a_worker_where_the_owner_said_so_and_loses_it_at_its_end() {
 }
 
 /// (Linux and macOS) A program started as a worker gets its channel on
-/// fd 3, and nothing else of the daemon's: it writes there, the daemon reads
-/// it, and the daemon's end closes as the program exits.
+/// fd 3 and (P8-2a-2) the second one on fd 4, and nothing else of the
+/// daemon's: it writes on each, the daemon reads each, and the daemon's ends
+/// close as the program exits.
 #[tokio::test]
 async fn a_program_gets_its_channel_on_fd_3() {
     let program = Program {
         exe: "/bin/sh".into(),
         arg0: None,
-        args: vec!["-c".into(), "printf 'on-fd-3' >&3".into()],
+        args: vec![
+            "-c".into(),
+            "printf 'on-fd-3' >&3; printf 'on-fd-4' >&4".into(),
+        ],
     };
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-    let mut running = program.spawn(theirs).unwrap();
+    let (ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut running = program.spawn(theirs, theirs_d).unwrap();
     assert!(running.pid().is_some());
-    ours.set_nonblocking(true).unwrap();
-    let mut ours = UnixStream::from_std(ours).unwrap();
-    let mut got = String::new();
-    tokio::time::timeout(Duration::from_secs(10), ours.read_to_string(&mut got))
-        .await
-        .expect("the channel ends with the program")
-        .unwrap();
-    assert_eq!(got, "on-fd-3");
+    for (ch, want) in [(ours, "on-fd-3"), (ours_d, "on-fd-4")] {
+        ch.set_nonblocking(true).unwrap();
+        let mut ch = UnixStream::from_std(ch).unwrap();
+        let mut got = String::new();
+        tokio::time::timeout(Duration::from_secs(10), ch.read_to_string(&mut got))
+            .await
+            .expect("each channel ends with the program")
+            .unwrap();
+        assert_eq!(got, want);
+    }
     running.kill().await;
 }
