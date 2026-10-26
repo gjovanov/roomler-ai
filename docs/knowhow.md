@@ -1491,13 +1491,13 @@ agent keeps only the tools it knows (§12.1).
 
 The toolbelt's `roomler_connect` takes the access §13.6 answers and opens it,
 a person approving each call
-([`call`](../agents/roomlerd/src/hive/connect_tool.rs#L320)). It opens it
+([`call`](../agents/roomlerd/src/hive/connect_tool.rs#L322)). It opens it
 from the session's own device when a probe from here found it (P4-6-1b-1), or
 else through each other device that reached it lately, newest first, until one
 opens (P4-6-1b-2,
-[`through`](../agents/roomlerd/src/hive/connect_tool.rs#L249)). What
+[`through`](../agents/roomlerd/src/hive/connect_tool.rs#L251)). What
 it does from here is a pure function of the access
-([`plan`](../agents/roomlerd/src/hive/connect_tool.rs#L146)).
+([`plan`](../agents/roomlerd/src/hive/connect_tool.rs#L148)).
 
 ```mermaid
 flowchart TD
@@ -1516,12 +1516,12 @@ flowchart TD
 
 | Piece | As built |
 |---|---|
-| a path from here | `vault_connect`'s endpoint, asked with the access's credential as its `handle`, its engine and upstream, and its options `database`, `auth`, `auth_source` and `ca` ([`connect_args`](../agents/roomlerd/src/hive/connect_tool.rs#L211)). Its leases, its endpoint served only to the session's account, and its connection string with no credential in it are `vault_connect`'s own, as for a session that names them by hand. The answer adds the entity, `path: direct`, and a probe asked first. A path from here that does not open is answered as it failed: the vault's refusal, or a misdescribed entity, is no reason to go through another device |
+| a path from here | `vault_connect`'s endpoint, asked with the access's credential as its `handle`, its engine and upstream, and its options `database`, `auth`, `auth_source` and `ca` ([`connect_args`](../agents/roomlerd/src/hive/connect_tool.rs#L213)). Its leases, its endpoint served only to the session's account, and its connection string with no credential in it are `vault_connect`'s own, as for a session that names them by hand. The answer adds the entity, `path: direct`, and a probe asked first. A path from here that does not open is answered as it failed: the vault's refusal, or a misdescribed entity, is no reason to go through another device |
 | `tcp` | no credential and no endpoint: from here, the answer says where to dial; through a device, it is the forward itself, `net_forward`'s, served to the session's account |
 | the probe from here | when this device's word is `unmeasured`: one `tcp` probe, asked as the session's own `knowhow_verify` is (§13.3), so it is recorded on the map. Only `ok` opens anything from here |
 | through a device (P4-6-1b-2) | for a credentialed engine, `vault_connect`'s endpoint, its upstream connections riding a flow toward the upstream that only this daemon may use, with TLS verified against the upstream's host (`docs/vault.md` §19, "An endpoint through another device"). For `ssh`, a forward the session's own `ssh` dials, its host key checked with `HostKeyAlias`, and `vault_connect`'s agent beside it: the agent holds the key, so it is opened once, and only once a forward has. Each through `rc:vault.net`'s `net:forward` toward that device, then that device's own gates. The answer names `path: through <device>`, its carrier, and `tried`. "Opens" means the vault granted the forward and the flow was made here: that device's own gates (`forward_acl`, tunnel policies) are met at the first connection through it, so a refusal there fails that connection, its error naming the path (`… (through <end>)`), and does not try the next device |
-| no path | nothing is opened. The answer names each path tried, in order, and why: this device's first (its last probe found it unreachable, the probe from here found something else, or none could be asked), then each device's ([`no_path`](../agents/roomlerd/src/hive/connect_tool.rs#L301)). A refusal that no other device changes ends the trying at once ([`Failed`](../agents/roomlerd/src/hive/connect_tool.rs#L76)): this device's vault or egress turned off, or the vault refusing the credential. The vault's word on one device's forward, or a flow not made, tries the next |
-| `no_access` | each path the map lacks, which of them a session only proposed, and what a person adds ([`no_access`](../agents/roomlerd/src/hive/connect_tool.rs#L122)). An answer naming no engine this build speaks, no upstream, or no credential for an engine that needs one opens nothing either, whatever the server said |
+| no path | nothing is opened. The answer names each path tried, in order, and why: this device's first (its last probe found it unreachable, the probe from here found something else, or none could be asked), then each device's ([`no_path`](../agents/roomlerd/src/hive/connect_tool.rs#L303)). A refusal that no other device changes ends the trying at once ([`Failed`](../agents/roomlerd/src/hive/connect_tool.rs#L76)): this device's vault or egress turned off, or the vault refusing the credential. The vault's word on one device's forward, or a flow not made, tries the next |
+| `no_access` | each path the map lacks, which of them a session only proposed, and what a person adds ([`no_access`](../agents/roomlerd/src/hive/connect_tool.rs#L124)). An answer naming no engine this build speaks, no upstream, or no credential for an engine that needs one opens nothing either, whatever the server said |
 
 > [!IMPORTANT]
 > **Measured, never assumed.** Nothing is dialled that no device's probe

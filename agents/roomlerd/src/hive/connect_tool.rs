@@ -75,7 +75,9 @@ pub(crate) enum Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failed {
     /// That path: the vault refused that exit, or its flow was not made. The
-    /// next device may still open it.
+    /// next device may still open it. Only a build with a vault makes one
+    /// (`toolbelt::DaemonReach`).
+    #[cfg_attr(not(feature = "vault"), allow(dead_code))]
     Path(String),
     /// Every path: this device's vault or egress is off, or the vault refused
     /// the credential. No other device changes that, so none is tried.
