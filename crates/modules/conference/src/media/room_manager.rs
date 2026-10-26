@@ -804,8 +804,9 @@ fn transport_to_options(transport: &WebRtcTransport) -> TransportOptions {
     }
 }
 
-/// Standard SFU media codecs: opus audio + VP8/H264 video.
-fn media_codecs() -> Vec<RtpCodecCapability> {
+/// Standard SFU media codecs: opus audio + VP8/H264 video. Public for the
+/// room-capacity bench (FR-115 O4), which must route what production routes.
+pub fn media_codecs() -> Vec<RtpCodecCapability> {
     vec![
         // Opus audio
         RtpCodecCapability::Audio {

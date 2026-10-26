@@ -8966,6 +8966,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "mediasoup",
+ "rand 0.9.4",
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-chat",
@@ -8977,6 +8978,7 @@ dependencies = [
  "sha1 0.10.6",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

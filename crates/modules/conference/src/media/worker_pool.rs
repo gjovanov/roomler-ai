@@ -19,8 +19,8 @@ impl WorkerPool {
         let mut workers = Vec::with_capacity(settings.num_workers as usize);
 
         for i in 0..settings.num_workers {
-            let mut worker_settings = WorkerSettings::default();
-            worker_settings.rtc_port_range = settings.rtc_min_port..=settings.rtc_max_port;
+            // FR-115 O4: `examples/room_capacity.rs` measures exactly these.
+            let worker_settings = worker_settings(settings);
 
             let worker = worker_manager
                 .create_worker(worker_settings)
@@ -53,4 +53,17 @@ impl WorkerPool {
     pub fn worker_count(&self) -> usize {
         self.workers.len()
     }
+}
+
+/// The settings every production worker is created with.
+///
+/// One function, so the room-capacity bench (FR-115 O4,
+/// `examples/room_capacity.rs`) measures the worker production runs rather than
+/// a copy of it. ⚠️ `WorkerSettings::default()` in mediasoup 0.20 sets
+/// `log_level: Debug` with every log tag on, although its own doc comment says
+/// `Error`; the bench's `--log-level` measures what that costs.
+pub fn worker_settings(settings: &MediasoupSettings) -> WorkerSettings {
+    let mut worker_settings = WorkerSettings::default();
+    worker_settings.rtc_port_range = settings.rtc_min_port..=settings.rtc_max_port;
+    worker_settings
 }
