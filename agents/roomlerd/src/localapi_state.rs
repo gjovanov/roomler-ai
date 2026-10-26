@@ -852,6 +852,10 @@ impl LocalApiState for DaemonState {
             // refreshed off this thread — this is a sync read on the async
             // dispatch, and the honest answer needs the disk.
             files_dir: crate::files::effective_files_dir(),
+            // FR-67 P3 — what the last install came to, read from the record
+            // on every answer (a sync read of a 400-byte file). Never cached:
+            // on Windows the verdict lands after this process started.
+            last_install: Some(crate::post_install::last_install_status()),
         }
     }
 

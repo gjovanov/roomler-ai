@@ -2419,6 +2419,16 @@ fn print_status(s: &NodeStatus) {
     println!("{} {}", up_glyph(s.connected), s.name);
     println!("  node id     {}", short_id(&s.node_id));
     println!("  version     {}", s.version);
+    // FR-67 P3 — what the last install came to, right under the version it
+    // produced. Printed whenever the daemon reports it: an older daemon
+    // sends nothing and the line is absent, which must never be read as
+    // "never updated" — a daemon that was never updated SAYS `none recorded`.
+    if let Some(li) = &s.last_install {
+        println!(
+            "  last update {}",
+            last_install_line(li, &s.version, unix_now())
+        );
+    }
     println!("  mode        {mode}");
     // FR-51 — only when true: a permanent device's output stays byte-stable.
     if s.ephemeral {
@@ -2789,6 +2799,221 @@ fn credential_expiry(expires_at: i64, now_unix: i64) -> String {
             "re-enroll this device".to_string()
         };
         format!("EXPIRED {days} day{} ago ({next})", plural(days))
+    }
+}
+
+/// FR-67 P3 — the `last update` line of `roomler status`: one sentence per
+/// word of [`tunnel_core::localapi::LastInstallStatus`], the verdict first and
+/// in capitals when it wants a look.
+///
+/// ⚠️ `none recorded` (no record at all) and `NEVER REPORTED` (a record whose
+/// verdict never came) are two different sentences on purpose — the second
+/// is the state FR-67 was opened on, and one sentence for both would hide it
+/// again. A fresh `InProgress` is neither: on Windows the new service starts
+/// while the watcher still waits on msiexec, so for a while after an update
+/// the honest answer is "still at work".
+///
+/// `running` is the daemon's own version: a verified install of a release
+/// other than the one running is worth a word, because it means either a
+/// later install left no record or this daemon never restarted onto it.
+fn last_install_line(
+    li: &tunnel_core::localapi::LastInstallStatus,
+    running: &str,
+    now_unix: i64,
+) -> String {
+    use tunnel_core::localapi::LastInstallStatus as L;
+    let expected = li.expected_version.as_deref().unwrap_or("?");
+    let since = li
+        .started_unix
+        .map(|s| ago(now_unix.saturating_sub(s as i64)))
+        .unwrap_or_else(|| "at an unknown time".to_string());
+    let note = li.note.as_deref().unwrap_or("");
+    let path = li.path.as_deref().unwrap_or("the log dir");
+    match li.status.as_str() {
+        s if s == L::ABSENT => {
+            "none recorded — this daemon's updater has not installed anything yet".to_string()
+        }
+        s if s == L::IN_PROGRESS && li.never_reported(now_unix.max(0) as u64) => format!(
+            "NEVER REPORTED — {expected} started {since} and no verdict followed: the watcher \
+             was killed before it could write one ({path})"
+        ),
+        s if s == L::IN_PROGRESS => format!(
+            "in progress — {expected} started {since}; the post-install watcher has not \
+             reported yet"
+        ),
+        s if s == L::SUCCEEDED_VERIFIED => {
+            let probe = li
+                .new_binary_version
+                .as_deref()
+                .map(|v| format!(", verified: {v}"))
+                .unwrap_or_default();
+            let mismatch = if expected_is_running(expected, running) {
+                String::new()
+            } else {
+                format!(" — but this daemon runs {running}")
+            };
+            format!("ok — {expected} installed {since}{probe}{mismatch}")
+        }
+        s if s == L::SUCCEEDED_UNVERIFIED => format!(
+            "UNVERIFIED — {expected} {since}: the installer exited 0 but the version probe \
+             did not confirm it ({note})"
+        ),
+        s if s == L::INSTALLER_FAILED => format!(
+            "FAILED — {expected} {since}: the installer exited {} ({note})",
+            li.installer_exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "with no code".to_string())
+        ),
+        s if s == L::TIMEOUT => format!("TIMED OUT — {expected} {since}: {note}"),
+        s if s == L::UNREADABLE => format!("record UNREADABLE — {note} ({path})"),
+        // A newer daemon's word: shown as it is, never an error.
+        other => format!("{other} — {expected} {since} ({note})"),
+    }
+}
+
+/// `agent-v0.4.172` names the running `0.4.172`. Prefix-tolerant, so a tag
+/// spelled `v0.4.172` or bare matches too; never a semver compare — the line
+/// says "other than", not "older than".
+fn expected_is_running(expected: &str, running: &str) -> bool {
+    let tag = expected
+        .trim_start_matches("agent-")
+        .trim_start_matches('v');
+    !tag.is_empty() && tag == running.trim_start_matches('v')
+}
+
+/// A duration as `roomler status` says it: `12s ago`, `3m ago`, `2h ago`,
+/// `5d ago`. The coarse step is on purpose — an operator reads "days ago"
+/// against "the fleet updated last night", never a clock.
+fn ago(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 90 {
+        format!("{secs}s ago")
+    } else if secs < 5_400 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod last_install_tests {
+    use super::*;
+    use tunnel_core::localapi::LastInstallStatus as L;
+
+    fn record(status: &str) -> L {
+        L {
+            status: status.into(),
+            expected_version: Some("agent-v0.4.172".into()),
+            new_binary_version: Some("roomlerd 0.4.172".into()),
+            started_unix: Some(1_792_967_966),
+            finished_unix: Some(1_792_967_966),
+            installer_exit_code: Some(0),
+            note: Some("new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into()),
+            path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+        }
+    }
+
+    /// FR-67 — the three states that must never read as one: no record,
+    /// a record whose verdict never came, and a watcher still at work.
+    #[test]
+    fn absent_never_reported_and_in_progress_are_three_sentences() {
+        let now = 1_792_967_966 + 3 * 86_400;
+        let absent = last_install_line(&record(L::ABSENT), "0.4.172", now);
+        assert!(absent.starts_with("none recorded"), "{absent}");
+
+        let frozen = last_install_line(&record(L::IN_PROGRESS), "0.4.172", now);
+        assert!(frozen.starts_with("NEVER REPORTED"), "{frozen}");
+        assert!(frozen.contains("agent-v0.4.172 started 3d ago"), "{frozen}");
+        assert!(
+            frozen.contains("last-install.json"),
+            "says where to look: {frozen}"
+        );
+
+        let fresh = last_install_line(&record(L::IN_PROGRESS), "0.4.172", 1_792_967_966 + 17);
+        assert!(fresh.starts_with("in progress"), "{fresh}");
+        assert!(fresh.contains("started 17s ago"), "{fresh}");
+
+        assert_ne!(absent, frozen);
+        assert_ne!(frozen, fresh);
+    }
+
+    /// The quiet line, and the one case it speaks up: a verified install of
+    /// a release other than the one this daemon runs.
+    #[test]
+    fn a_verified_install_is_ok_unless_it_is_not_what_runs() {
+        let now = 1_792_967_966 + 2 * 3_600;
+        let ok = last_install_line(&record(L::SUCCEEDED_VERIFIED), "0.4.172", now);
+        assert_eq!(
+            ok,
+            "ok — agent-v0.4.172 installed 2h ago, verified: roomlerd 0.4.172"
+        );
+        let other = last_install_line(&record(L::SUCCEEDED_VERIFIED), "0.4.175", now);
+        assert!(other.ends_with("— but this daemon runs 0.4.175"), "{other}");
+        assert!(expected_is_running("agent-v0.4.172", "0.4.172"));
+        assert!(expected_is_running("v0.4.172", "0.4.172"));
+        assert!(!expected_is_running("agent-v0.4.17", "0.4.172"));
+        assert!(
+            !expected_is_running("agent-v", "0.4.172"),
+            "an empty tag matches nothing"
+        );
+    }
+
+    /// Every verdict that is not a verified success leads with its word in
+    /// capitals and carries the watcher's note; a word this CLI has never
+    /// heard of is shown, not refused.
+    #[test]
+    fn the_other_verdicts_lead_with_their_word() {
+        let now = 1_792_967_966 + 600;
+        let mut failed = record(L::INSTALLER_FAILED);
+        failed.installer_exit_code = Some(1603);
+        failed.note = Some("installer exited with 1603".into());
+        let line = last_install_line(&failed, "0.4.172", now);
+        assert!(
+            line.starts_with("FAILED — agent-v0.4.172 10m ago: the installer exited 1603"),
+            "{line}"
+        );
+
+        let mut unverified = record(L::SUCCEEDED_UNVERIFIED);
+        unverified.note = Some("could not exec new binary --version: ENOENT".into());
+        let line = last_install_line(&unverified, "0.4.172", now);
+        assert!(line.starts_with("UNVERIFIED"), "{line}");
+        assert!(line.contains("ENOENT"), "{line}");
+
+        let mut timed_out = record(L::TIMEOUT);
+        timed_out.note = Some("installer did not exit within 600s".into());
+        let line = last_install_line(&timed_out, "0.4.172", now);
+        assert_eq!(
+            line,
+            "TIMED OUT — agent-v0.4.172 10m ago: installer did not exit within 600s"
+        );
+
+        let mut unreadable = record(L::UNREADABLE);
+        unreadable.note = Some("parsing /x/last-install.json: expected value".into());
+        let line = last_install_line(&unreadable, "0.4.172", now);
+        assert!(
+            line.starts_with("record UNREADABLE — parsing /x/last-install.json"),
+            "{line}"
+        );
+
+        let line = last_install_line(&record("RolledBack"), "0.4.172", now);
+        assert!(
+            line.starts_with("RolledBack — agent-v0.4.172 10m ago"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn ago_steps_coarsely_and_never_goes_negative() {
+        assert_eq!(ago(0), "0s ago");
+        assert_eq!(ago(-5), "0s ago");
+        assert_eq!(ago(89), "89s ago");
+        assert_eq!(ago(90), "1m ago");
+        assert_eq!(ago(5_399), "89m ago");
+        assert_eq!(ago(5_400), "1h ago");
+        assert_eq!(ago(172_799), "47h ago");
+        assert_eq!(ago(172_800), "2d ago");
     }
 }
 
