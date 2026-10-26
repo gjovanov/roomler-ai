@@ -2802,7 +2802,7 @@ async fn the_daemons_reach_says_which_refusals_another_device_would_change() {
             session_dir: dir.path().join("run"),
             owner: None,
         }),
-        net,
+        net: net.map(|h| Arc::new(h) as Arc<dyn super::super::net_tools::SessionEgress>),
         #[cfg(feature = "ssh-server")]
         ssh: None,
         peer: me(),
@@ -2913,6 +2913,155 @@ async fn the_daemons_reach_says_which_refusals_another_device_would_change() {
     assert!(
         !ended(&mut held, Duration::from_millis(300)).await,
         "this daemon's connection is held"
+    );
+}
+
+/// FR-90 P8-1a — a session's egress reaches the tunnel hub only through its
+/// seam, `SessionEgress`, and says who each listener admits as data: the
+/// session's account for `net_forward`, this daemon alone for a connect's
+/// flow through another device. Each admit is asked before the vault is, so
+/// where the seam cannot say who connects the vault is asked nothing; and a
+/// run's end ends its flows through the seam.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
+    use super::super::net_tools::{self, Admits, SessionEgress};
+    struct FakeEgress {
+        admits: Result<(), String>,
+        said: std::sync::Mutex<Vec<String>>,
+    }
+    impl FakeEgress {
+        fn note(&self, what: String) {
+            self.said.lock().unwrap().push(what);
+        }
+        fn said(&self) -> Vec<String> {
+            self.said.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl SessionEgress for FakeEgress {
+        fn admits(&self, who: &Admits) -> Result<(), String> {
+            self.note(format!("admits {who:?}"));
+            self.admits.clone()
+        }
+        async fn open_flow(
+            &self,
+            _exit: ObjectId,
+            target: tunnel_core::driver::Target,
+            _grant: tunnel_core::driver::SessionGrantRef,
+            _until: std::time::Instant,
+            who: Admits,
+        ) -> Result<(String, std::net::SocketAddr), String> {
+            let n = self.said.lock().unwrap().len();
+            self.note(format!("open {target:?} {who:?}"));
+            Ok((format!("f{n}"), ([127, 0, 0, 1], 4000).into()))
+        }
+        fn end_flow(&self, id: &str) -> bool {
+            self.note(format!("end {id}"));
+            true
+        }
+        fn holds(&self, _id: &str) -> bool {
+            true
+        }
+    }
+    let (exit, fence) = (ObjectId::new(), 7);
+    let forward = json!({ "exit": exit.to_hex(), "host": "db.internal", "port": 5432 });
+
+    let vault = Arc::new(FakeVault::default());
+    let egress = Arc::new(FakeEgress {
+        admits: Ok(()),
+        said: std::sync::Mutex::new(Vec::new()),
+    });
+    let seam: Arc<dyn SessionEgress> = egress.clone();
+    let session = ObjectId::new();
+    let answer = net_tools::call(
+        net_tools::FORWARD,
+        vault.as_ref(),
+        &seam,
+        session,
+        fence,
+        me(),
+        &forward,
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["address"], "127.0.0.1:4000");
+    let flow = net_tools::daemon_flow(
+        vault.as_ref(),
+        &seam,
+        session,
+        fence,
+        exit,
+        "db.internal",
+        5432,
+        60,
+    )
+    .await
+    .unwrap();
+    assert_eq!(flow.end, std::net::SocketAddr::from(([127, 0, 0, 1], 4000)));
+    // The session's own account, exactly, for net_forward; this daemon for a
+    // connect's flow; each checked before the vault was asked.
+    let account = format!("{:?}", Admits::Account(me()));
+    let said = egress.said();
+    assert_eq!(said.len(), 4, "{said:?}");
+    assert_eq!(said[0], format!("admits {account}"), "{said:?}");
+    assert!(
+        said[1].starts_with("open Static") && said[1].ends_with(&account),
+        "{said:?}"
+    );
+    assert_eq!(said[2], "admits Daemon", "{said:?}");
+    assert!(
+        said[3].starts_with("open Static") && said[3].ends_with("Daemon"),
+        "{said:?}"
+    );
+    assert_eq!(vault.nets.lock().unwrap().len(), 2, "one grant a flow");
+    assert_eq!(
+        net_tools::drop_run(session, fence),
+        2,
+        "both end with the run"
+    );
+    assert_eq!(egress.said()[4..], ["end f1", "end f3"], "through the seam");
+
+    let refusing = Arc::new(FakeEgress {
+        admits: Err("this system cannot say who connects to a loopback port".into()),
+        said: std::sync::Mutex::new(Vec::new()),
+    });
+    let seam: Arc<dyn SessionEgress> = refusing.clone();
+    let quiet = Arc::new(FakeVault::default());
+    let session = ObjectId::new();
+    let refused = net_tools::call(
+        net_tools::FORWARD,
+        quiet.as_ref(),
+        &seam,
+        session,
+        fence,
+        me(),
+        &forward,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("cannot say who connects"), "{refused}");
+    let refused = net_tools::daemon_flow(
+        quiet.as_ref(),
+        &seam,
+        session,
+        fence,
+        exit,
+        "db.internal",
+        5432,
+        60,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("cannot say who connects"), "{refused}");
+    assert!(
+        quiet.nets.lock().unwrap().is_empty(),
+        "nothing asked of the vault"
+    );
+    assert_eq!(
+        refusing.said(),
+        [format!("admits {account}"), "admits Daemon".to_string()],
+        "only the admits were asked: no flow opened"
     );
 }
 
@@ -4152,7 +4301,7 @@ fn net_belt(
             vault: Some(vault.clone()),
             knowhow: None,
             exec: None,
-            net: Some(hub.clone()),
+            net: Some(Arc::new(hub.clone())),
             #[cfg(feature = "ssh-server")]
             ssh: None,
         },
@@ -4206,8 +4355,14 @@ async fn the_net_tools_are_offered_only_where_the_owner_offers_egress() {
     let vault = Arc::new(FakeVault::default());
     let hub = crate::tunnel::client_mgr::TunnelClientHub::new("test".into());
     // The vault without egress, and egress without the vault.
-    let offers: [(Option<Arc<dyn VaultTools>>, _); 2] =
-        [(Some(vault.clone()), None), (None, Some(hub.clone()))];
+    type Offer = (
+        Option<Arc<dyn VaultTools>>,
+        Option<Arc<dyn super::super::net_tools::SessionEgress>>,
+    );
+    let offers: [Offer; 2] = [
+        (Some(vault.clone()), None),
+        (None, Some(Arc::new(hub.clone()))),
+    ];
     for (offered, net) in offers {
         let b = belt_running(
             me(),
@@ -4485,10 +4640,11 @@ async fn a_net_connection_from_another_account_is_refused() {
     }
     .to_string();
     let sid = ObjectId::new();
+    let egress: Arc<dyn super::super::net_tools::SessionEgress> = Arc::new(hub.clone());
     let answer = super::super::net_tools::call(
         "net_socks",
         &vault,
-        &hub,
+        &egress,
         sid,
         7,
         other,

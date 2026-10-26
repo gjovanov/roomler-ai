@@ -3978,14 +3978,45 @@ sequenceDiagram
     R->>W: served
 ```
 
+**P8-1a, as built** (the seam's first trait:
+[`SessionEgress`](../../agents/roomlerd/src/hive/net_tools.rs#L364), with
+[`Admits`](../../agents/roomlerd/src/hive/net_tools.rs#L352)).
+Every call hive makes on the tunnel hub's session flows now goes through it:
+- `net_socks` and `net_forward` (`net_tools::call`);
+- a connect's flow through another device (`net_tools::daemon_flow`, P4-6-1b-2);
+- a run's flow places, and its end (`drop_run`).
+
+The run's `net` is an `Arc<dyn SessionEgress>`, and the daemon's is the hub itself
+([`seam`](../../agents/roomlerd/src/hive/net_tools.rs#L401)). The trait sits at the end of its
+file, and the supervisor and the toolbelt keep their line counts, so no doc anchor into the code
+moved (the shifter, run against P8-0's head, finds none to shift).
+
+| As built | Why |
+|---|---|
+| `admits`, `open_flow`, `end_flow`, `holds` | the four things hive asks of the hub's session flows today, and no more |
+| who a listener admits is data, `Admits::Account(peer)` or `Admits::Daemon`, never the admit closure | a closure cannot cross P8-2's channel. The hub's side of the seam turns `Admits` into the hook (`session_admit`, `daemon_admit`), so the listener's admission stays where the listener is (P8-0's point 2) |
+| `admits` is asked before the vault, exactly where the hook was built before | a system that cannot say who connects to a loopback port is refused before the vault is asked, as it was |
+
+A test pins the contract with a recording seam:
+- `net_forward` admits the session's own account, and a connect's flow this daemon;
+- each admit is asked before the grant;
+- a refused admit asks the vault nothing;
+- a run's end ends its flows through the seam.
+
+What P8-1a found of the rest of the seam:
+- **The toolbelt's approval link is already message-shaped.** `ApprovalEvent::{Opened, Closed}` goes out over a channel (`Ctx.events`), and answers come in on the handle (`Pending::answer`, `withdraw`), so a worker's channel carries them as they are.
+- **The toolbelt's other reaches into the daemon are already traits:** `VaultTools`, `KnowhowTools`, `SshRunner`, and now `SessionEgress`.
+- **So P8-2a, the proxies, needs no further trait.** `ControlLink` is needed where a part speaks `rc:hive.*` frames itself (the replica stream and the viewer's peer, P8-2d), and it is built there.
+- The move into `crates/hive-node` and the CI audit remain P8-1's.
+
 | Step | Builds | Kill switch | AC |
 |---|---|---|---|
 | P8-0 | the boundary's design, after decisions 63–65: the channel's protocol, what crosses it, supervision and limits per OS, and a probe of the harness across a worker's restart | docs only | — |
-| P8-1 | part 2, the seam: `SessionEgress` and `ControlLink` beside `VaultTools` and `KnowhowTools`; the session-facing machinery behind them in `crates/hive-node`; a CI audit that no other module of `roomlerd` reaches past them | none (a refactor) | — |
+| P8-1 | part 2, the seam: `SessionEgress` (P8-1a) beside `VaultTools` and `KnowhowTools`; the session-facing machinery behind them in `crates/hive-node`; a CI audit that no other module of `roomlerd` reaches past them. `ControlLink` moves to P8-2d, the first part that needs it (§3i "P8-1a, as built") | none (a refactor) | — |
 | P8-2a | part 1, `roomlerd hive-worker` a session, with what decision 64 moves first (P8-0's point 5): the egress proxy and the credential proxies; the channel, the listeners handed over, supervision, restart and limits; Linux and macOS | device `hive_worker = false` keeps the parts in the daemon | AC28 |
 | P8-2b | the same on Windows: a Job object, the handle list, sockets by `WSADuplicateSocketW`, the console user's session, and P4-6-1b-2's flow admitting the worker | the same | AC28 |
 | P8-2c | the toolbelt and the sidecar into the session's worker, with the relay that outlives it (P8-0's point 1) | the same | AC28 |
-| P8-2d | the device-wide parts (the replica store and stream, the viewer's peer, the prober) into one worker for the device | the same | AC28 |
+| P8-2d | the device-wide parts (the replica store and stream, the viewer's peer, the prober) into one worker for the device, with `ControlLink` for the `rc:hive.*` frames they speak themselves | the same | AC28 |
 | P8-3 | part 3, the hive-free package, as decision 65 says, built once a customer asks: the release lane's variant, the server's asset order, the updater's variant, the docs (`docs/installation.md`) | the default package is unchanged | AC29 |
 | P8k | the field run: kill and starve a worker mid-turn on each OS, with remote control, the overlay and the tunnels watched; install, run and update the hive-free package | — | AC28, AC29 |
 
@@ -4235,6 +4266,7 @@ sequenceDiagram
 | P6 | docs: `docs/hive.md`, `docs/vault.md`, `docs/knowhow.md`, `docs/brain.md`; user docs | — | — |
 | P8 | Hive's boundary (§3i): the heavy and risky parts as supervised `roomlerd hive-worker` children; the seam finished behind traits, in `crates/hive-node`; a hive-free build and package. Its steps: P8-0 to P8-3, and P8k (design §17's P6 and P7 are follow-up FRs, so P8 takes neither name) | device `hive_worker = false`; the default package unchanged | **planned** (the operator, 2026-10-25); decisions 63–65 designed as recommended in P8-0, still the operator's to confirm |
 | P8-0 | Hive's boundary, as designed (§3i "P8-0, as designed"), decisions 63–65 as recommended on the operator's "go": the probe of the harness across a restart, on Claude Code 2.1.280 and 2.1.310 (§8, 2026-10-26: a restart slower than the harness waits loses the session's tools for the rest of its run); the relay that outlives its worker; listeners in the daemon, connections in the worker; the channel per OS; supervision and limits; what moves first; P4-6-1b-2's flow admitting the worker; the steps split into P8-2a to P8-2d | docs only | **in review** |
+| P8-1a | the seam's first trait (§3i "P8-1a, as built"): `SessionEgress` (`admits`, `open_flow`, `end_flow`, `holds`) over the tunnel hub's session flows, which `net_socks`, `net_forward`, a connect's flow through another device and a run's end all go through; who a listener admits as data (`Admits::Account`, `Admits::Daemon`), the hub's side turning it into the hook; the admit still asked before the vault. 1 new test (the seam's contract, with a recording seam) and 4 adapted; 8 negative controls, each caught at its own assertion; no doc anchor moved | none (a refactor) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
