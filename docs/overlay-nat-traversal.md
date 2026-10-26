@@ -480,7 +480,7 @@ carrier itself: relay-to-relay hairpin and full WG over two same-worker
 allocations both verify green. Single-relay avoids it by using one allocation;
 DERP avoids coturn entirely.
 
-**A DERP stamp moves a live TURN carrier (#2820).** A pair's relay strategy is
+**A DERP stamp moves a live TURN carrier (#2820, agent 0.4.175).** A pair's relay strategy is
 the server's per-edge stamp in its netmap row (`relay_strategy`), and the
 coordinator reads it when it **builds** a link. A healthy link never asked again,
 so a pair on TURN kept TURN after the server re-stamped it DERP, until it happened
@@ -524,9 +524,26 @@ carrier in the tick that promotes the probe, and on any relay death it re-reques
 That request's slot outlived the promotion: a tracked peer is skipped by the stamp
 and the regrade alike, and a later build from it would have installed over the
 carrier the probe had just proved.
-⚠️ The move costs the prober's outbound up to one sweep tick (≤ 5 s): the follower
-drops its TURN leg on the nudge, and the probe is promoted on the next tick after
-it latches. The follower's traffic flows through the probe session meanwhile.
+⚠️ The move costs one direction up to one sweep tick (≤ 5 s, the runtime's
+`FALLBACK_TICK`), because a probe is promoted on the next tick after it latches,
+not when it latches. Which direction depends on who probes:
+- **The peer follows** (an older agent, or one whose stamp has not arrived yet):
+  the follower drops its TURN leg on the nudge, so the **prober's** outbound is
+  lost until its promotion. The follower's traffic flows through the probe
+  session meanwhile.
+- **Both ends probe** (both on 0.4.175 or later, so the stamp reaches them in the
+  same fan, the common case once a fleet has updated): each end promotes on its
+  own tick. The first to promote drops its TURN carrier
+  (`WgDevice::promote_direct_probe` replaces the peer, and the old peer's drop
+  aborts its receive task), so the **other** end's outbound is lost until it
+  promotes too.
+
+Field 2026-10-26, on the published 0.4.175, both ends probing: the stamp reached
+both in the same millisecond and they promoted 2.6 s apart (`probe_ms` 1641 and
+4274). A ping every 200 ms across the move lost exactly that window, once.
+Promoting on the latch instead of the tick would shrink the both-probe case to
+about one round trip, and the follower case to the 500 ms the initiation waits
+plus one (#2952).
 
 ## Worker co-location — one pick, everywhere (invariant I6)
 
