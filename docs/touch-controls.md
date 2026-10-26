@@ -37,7 +37,7 @@ machine with its own tests).
 | a finger that moves more than 8 px | a left press where it landed, the moves, a release where it lifted ([`touchGestures.ts:37`](../ui/src/composables/touchGestures.ts#L37) `SLOP_PX`) |
 | a finger held still for 500 ms | a right click where it is ([`touchGestures.ts:39`](../ui/src/composables/touchGestures.ts#L39) `LONG_PRESS_MS`) |
 | two fingers lifted within 350 ms, unmoved | a right click between them ([`touchGestures.ts:42`](../ui/src/composables/touchGestures.ts#L42)) |
-| two fingers moving together | the wheel, one notch per 100 px the fingers travel. The picture follows the fingers, so fingers moving up scroll down. **While the picture is zoomed past the stage**, they pan the picture instead and a one-line hint says so; the host scrolls only once the picture fits (the operator's decision 4, 2026-10-17; [`RemoteControl.vue:3731`](../ui/src/views/remote/RemoteControl.vue#L3731) `onTwoFingerScroll`, [`touchInput.ts:104`](../ui/src/composables/touchInput.ts#L104) `pictureOverflows`) |
+| two fingers moving together | the wheel, one notch per 100 px the fingers travel. The picture follows the fingers, so fingers moving up scroll down. **While the picture is zoomed past the stage**, they pan the picture instead and a one-line hint says so; the host scrolls only once the picture fits (the operator's decision 4, 2026-10-17; [`RemoteControl.vue:3894`](../ui/src/views/remote/RemoteControl.vue#L3894) `onTwoFingerScroll`, [`touchInput.ts:104`](../ui/src/composables/touchInput.ts#L104) `pictureOverflows`) |
 | two fingers spreading or pinching | **nothing**: the viewer zooms its own picture around the point between the fingers |
 
 ```mermaid
@@ -59,7 +59,7 @@ stateDiagram-v2
 
 - **The zoom** switches the viewer to Custom zoom, starting from the size the picture is shown at, and scrolls
   the stage so the point between the fingers stays under them
-  ([`RemoteControl.vue:3703`](../ui/src/views/remote/RemoteControl.vue#L3703) `onPinchZoom`). Zooming
+  ([`RemoteControl.vue:3866`](../ui/src/views/remote/RemoteControl.vue#L3866) `onPinchZoom`). Zooming
   out and back in somewhere else is how a phone moves around a zoomed picture today (open decision 4 in the
   spec).
 - ⚠️ **The scroll goes out in whole steps.** The agent turns a `mouse_wheel` in pixels into wheel steps at
@@ -125,6 +125,22 @@ deployed agent already takes: `key` for a key, and the mouse frames for a mouse 
 ([`touchControls.ts:128`](../ui/src/composables/touchControls.ts#L128) `BUILTIN_PRESETS`. They follow the
 spec's recommendation for open decision 2 until the operator settles it.)
 
+**On a phone held sideways the presets fit** (FR-125). Measured on production before it:
+- **The bars ate the stage.** They left the remote desktop 146–254 px.
+- **The presets need more.** WASD's Fire / Aim / Jump column needs a 326 px stage, and Arrows' keys 260 px.
+- **So they were cut off.** On every phone the top of the column fell outside the stage card, which clips, so those buttons could not be reached.
+
+Two changes fix it:
+- **Immersive mode.** In a session on a phone held sideways, the viewer's immersive mode gives the stage the whole page (304–412 px; [ui.md](ui.md) § Phones and tablets).
+- **A preset fits itself to a stage shorter than it was designed for** (`fitControls`, [`touchControls.ts:264`](../ui/src/composables/touchControls.ts#L264)). The overlay measures its own height ([`TouchControls.vue:121`](../ui/src/components/remote/TouchControls.vue#L121)), and:
+  - a column that would cross the stage's edge becomes a row at the same corner;
+  - a d-pad or a stick that would cross shrinks, never below 96 px;
+  - buttons keep their 44 px.
+
+  A stage with room renders the preset as designed. The rule covers org presets and your own as well.
+
+Measured with both changes at the six sizes, in a live session: every control of WASD inside the stage at each one. At the smallest page, 740 × 304, WASD's column became a row.
+
 ```mermaid
 flowchart LR
     F[A finger on a control] -->|captured, never reaches the stage| C[TouchControls.vue]
@@ -137,36 +153,36 @@ flowchart LR
 
 - **A touch on a control stays with it.** The control captures its pointer and stops its events, so the
   stage's gestures never see it. A touch anywhere else reaches the stage as before
-  ([`TouchControls.vue:32`](../ui/src/components/remote/TouchControls.vue#L32)).
+  ([`TouchControls.vue:33`](../ui/src/components/remote/TouchControls.vue#L33)).
 - **A button holds its keys** while the finger is down: a chord presses in order and lets go in reverse.
   **Every key and button is counted**, so two fingers holding one key send one press and one release
-  ([`touchControls.ts:409`](../ui/src/composables/touchControls.ts#L409) `createControlsDriver`).
+  ([`touchControls.ts:471`](../ui/src/composables/touchControls.ts#L471) `createControlsDriver`).
 - **The d-pad** has eight sectors. Each direction covers 135° around its axis, so a diagonal holds two keys,
   and a finger near the centre holds none
-  ([`touchControls.ts:325`](../ui/src/composables/touchControls.ts#L325) `dpadKeys`). A finger sliding
+  ([`touchControls.ts:387`](../ui/src/composables/touchControls.ts#L387) `dpadKeys`). A finger sliding
   round it lets go of a key it left before it presses one it reached.
 - **The stick** moves the pointer while it is pushed, at a share of the picture's width a second. The speed
   grows with the square of the push past a deadzone, so a small push is precise
-  ([`touchControls.ts:343`](../ui/src/composables/touchControls.ts#L343) `stickVelocity`). An agent that
+  ([`touchControls.ts:405`](../ui/src/composables/touchControls.ts#L405) `stickVelocity`). An agent that
   advertises `mouse-rel` gets the motion as `mouse_rel`, so a game camera turns. An older agent gets
   absolute moves from where its pointer is, as in trackpad mode. Fire and Aim press the same two ways.
 - **Nothing stays held.** The overlay lets go of everything when the preset changes, the window blurs, the
   tab is hidden or the overlay closes
-  ([`TouchControls.vue:241`](../ui/src/components/remote/TouchControls.vue#L241) `releaseAll`). The stage's
+  ([`TouchControls.vue:250`](../ui/src/components/remote/TouchControls.vue#L250) `releaseAll`). The stage's
   own release on a blur or a detach covers the controls' presses too, and a release for something already
   let go is dropped ([`useRemoteControl.ts:11560`](../ui/src/composables/useRemoteControl.ts#L11560)
   `stageControls`).
 - **Ctrl on a Mac host** goes out as the keyboard's would (FR-13): with the viewer turning Ctrl into Cmd,
   Ctrl+C reaches the Mac as Cmd+C, and the button says ⌘C
-  ([`touchControls.ts:312`](../ui/src/composables/touchControls.ts#L312) `controlLabel`).
+  ([`touchControls.ts:374`](../ui/src/composables/touchControls.ts#L374) `controlLabel`).
 - **Per device, in this browser.** The choice is kept under
   `localStorage['roomler-rc-touch-controls:<device id>']`, so a host that runs a game keeps its WASD and a
   work laptop its office row
-  ([`touchControls.ts:263`](../ui/src/composables/touchControls.ts#L263) `readControlsPreset`). The
+  ([`touchControls.ts:325`](../ui/src/composables/touchControls.ts#L325) `readControlsPreset`). The
   default is off.
 - **In fullscreen and in a zoomed picture.** The overlay lives inside the stage, which is the fullscreen
   element, and follows the stage's scroll, so it stays over the part of the picture on screen
-  ([`RemoteControl.vue:3687`](../ui/src/views/remote/RemoteControl.vue#L3687) `onStageScroll`).
+  ([`RemoteControl.vue:3850`](../ui/src/views/remote/RemoteControl.vue#L3850) `onStageScroll`).
 - ⚠️ **Alt+Tab is the host's own chord.** On a Windows host it opens the task switcher and moves the focus,
   as the physical keys do. On a Mac host it is Option+Tab, not the app switcher (Cmd+Tab). A preset binds
   the same keys whatever the host, so a Mac host gets a layout of its own from the editor (P4b-2), chosen
@@ -230,7 +246,7 @@ sequenceDiagram
 
 - **Offered under "Your organization"** in the on-screen controls menu, below the built-ins, once the
   session connects on a device that offers the controls
-  ([`RemoteControl.vue:3593`](../ui/src/views/remote/RemoteControl.vue#L3593) `orgTouchList`). Any member's
+  ([`RemoteControl.vue:3756`](../ui/src/views/remote/RemoteControl.vue#L3756) `orgTouchList`). Any member's
   viewer fetches them
   ([`agents.ts:1462`](../ui/src/stores/agents.ts#L1462) `fetchOrgTouchPresets`). An older server without
   the route, or any error, means none, and the built-ins are offered as before.
@@ -238,21 +254,21 @@ sequenceDiagram
   ([`touchControls.ts:230`](../ui/src/composables/touchControls.ts#L230) `ORG_PRESET_PREFIX`), so it can
   never take a built-in's id; a built-in id always means the built-in. A row that is not a preset (a newer
   server's shape) is left out rather than drawn wrong
-  ([`touchControls.ts:244`](../ui/src/composables/touchControls.ts#L244) `orgPresets`).
+  ([`touchControls.ts:306`](../ui/src/composables/touchControls.ts#L306) `orgPresets`).
 - **Remembered per device like a built-in.** The choice is kept as `org:<id>` until the org's list arrives
   after the page loads, and is resolved then. A preset since deleted reads as off
-  ([`touchControls.ts:263`](../ui/src/composables/touchControls.ts#L263) `readControlsPreset`).
+  ([`touchControls.ts:325`](../ui/src/composables/touchControls.ts#L325) `readControlsPreset`).
 - **A macro plays once per press**, through the same counted presses as a held button
-  ([`touchControls.ts:469`](../ui/src/composables/touchControls.ts#L469) `playMacro`):
+  ([`touchControls.ts:531`](../ui/src/composables/touchControls.ts#L531) `playMacro`):
   - It plays to its end once started. Lifting the finger does not stop it, since a quick tap would otherwise
     cut a short macro in half. A second press while it plays is ignored, and the button stays lit until it
-    ends ([`TouchControls.vue:181`](../ui/src/components/remote/TouchControls.vue#L181) `watchMacro`).
+    ends ([`TouchControls.vue:190`](../ui/src/components/remote/TouchControls.vue#L190) `watchMacro`).
   - The preset changing, a blur, a hidden tab or the overlay closing stop it, and it lets go of whatever it
-    holds ([`touchControls.ts:517`](../ui/src/composables/touchControls.ts#L517) `stopMacros`).
+    holds ([`touchControls.ts:579`](../ui/src/composables/touchControls.ts#L579) `stopMacros`).
   - A step releases only what the macro itself pressed, so it never takes a key from another finger.
     Whatever it still holds at the end is let go, so a press with no release never sticks.
   - No wait is longer than 5 s, whatever a stored row says
-    ([`touchControls.ts:621`](../ui/src/composables/touchControls.ts#L621) `MACRO_STEP_MAX_MS`).
+    ([`touchControls.ts:683`](../ui/src/composables/touchControls.ts#L683) `MACRO_STEP_MAX_MS`).
 
 ```mermaid
 stateDiagram-v2
@@ -320,7 +336,7 @@ sequenceDiagram
 ```
 
 - The stage sets `touch-action: none`
-  ([`RemoteControl.vue:1169`](../ui/src/views/remote/RemoteControl.vue#L1169), decided by
+  ([`RemoteControl.vue:1213`](../ui/src/views/remote/RemoteControl.vue#L1213), decided by
   [`touchInput.ts:17`](../ui/src/composables/touchInput.ts#L17) `stageTouchAction`). The browser no longer
   pans or zooms the page under a finger on the picture, and the page around the stage still scrolls as usual.
 - **A cancelled pointer still lets go.** A cancelled drag is released at its last point; a press the gestures

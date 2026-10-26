@@ -1,7 +1,12 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-container fluid class="pa-0 remote-control-wrapper">
+  <v-container
+    fluid
+    class="pa-0 remote-control-wrapper"
+    :class="{ 'rc-immersive': immersive, 'rc-chrome-revealed': immersive && chromeRevealed }"
+    :style="immersive ? { '--rc-tb-h': `${toolbarHeight}px` } : undefined"
+  >
     <!-- ============================================================
          Toolbar Row 1: primary controls — Back / Title / status /
          Ctrl-Alt-Del / Connect-Disconnect / Fullscreen. Designed to
@@ -17,6 +22,7 @@
       color="surface"
       class="px-2 rc-toolbar-primary"
       :class="{ 'rc-tb-split': sessionToolsOnStrip }"
+      @pointerdown.capture="onChromeTouched"
     >
       <v-btn
         icon="mdi-arrow-left"
@@ -913,7 +919,44 @@
     </v-toolbar>
     <!-- FR-116 P5c — a running session's row: state chips first, then the
          tools, scrolling sideways. Empty and hidden otherwise. -->
-    <div v-show="sessionToolsOnStrip" id="rc-tb-strip" class="rc-tb-strip" data-testid="rc-tb-strip" />
+    <div
+      v-show="sessionToolsOnStrip"
+      id="rc-tb-strip"
+      class="rc-tb-strip"
+      data-testid="rc-tb-strip"
+      @pointerdown.capture="onChromeTouched"
+    />
+
+    <!-- FR-125 — immersive: the toolbar and the strip above are an overlay
+         out of view, and this tab slides them down over the stage. Over it,
+         not beside it: the stage keeps its size, so nothing re-sends
+         rc:resolution. 48 × 36 px of hit area (FR-120's D1), a 44 × 18 px tab. -->
+    <button
+      v-if="immersive && !chromeRevealed"
+      type="button"
+      class="rc-pulltab"
+      aria-label="Show the toolbar"
+      data-testid="rc-pulltab"
+      @click="revealChrome"
+    >
+      <span class="rc-pulltab-tab"><v-icon size="14">mdi-chevron-down</v-icon></span>
+    </button>
+    <!-- FR-125 P3 — once, where the browser can fullscreen the stage. -->
+    <v-chip
+      v-if="fullscreenChipShown"
+      class="rc-fullscreen-chip"
+      color="surface"
+      variant="elevated"
+      size="small"
+      prepend-icon="mdi-fullscreen"
+      closable
+      close-label="Not now"
+      data-testid="rc-fullscreen-chip"
+      @click="fullscreenFromChip"
+      @click:close="closeFullscreenChip"
+    >
+      Full screen
+    </v-chip>
 
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
@@ -939,6 +982,7 @@
       rounded="lg"
       border
       class="ma-2 ma-md-3 remote-stage-card flex-grow-1 d-flex"
+      @pointerdown.capture="onStageTouchedWhileRevealed"
     >
     <div class="remote-stage">
       <!-- An overlay along the top of the stage. As flex siblings of the
@@ -1755,6 +1799,18 @@
             label="Hide device name when a display name is set"
             messages="The same setting as on the Devices page"
           />
+          <!-- FR-125 — the mode's kill switch, offered where a finger is the
+               pointer; remembered per browser. -->
+          <v-checkbox
+            v-if="coarsePointer"
+            v-model="immersiveSetting"
+            density="compact"
+            hide-details="auto"
+            class="mt-2"
+            label="Immersive when sideways on a phone"
+            messages="The bars step aside and the remote desktop takes the whole screen; the tab at the top brings them back"
+            data-testid="rc-immersive-setting"
+          />
 
           </v-tabs-window-item>
 
@@ -2515,6 +2571,15 @@ import {
   readControlsPreset,
   type TouchPreset,
 } from '@/composables/touchControls'
+import {
+  IMMERSIVE_CHROME_HIDE_MS,
+  dismissFullscreenChip,
+  isPhoneSideways,
+  readFullscreenChipDismissed,
+  readImmersiveSetting,
+  setImmersiveViewer,
+  writeImmersiveSetting,
+} from '@/composables/useImmersiveViewer'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 import { hostOffers, hostReason, hostSpeaks } from '@/utils/hostUnavailable'
@@ -2601,6 +2666,104 @@ const settingsOpen = ref(false)
 // next session's verdict is a new object, so it shows again.
 const dismissedInputReach = ref<object | null>(null)
 const clipboardBusy = ref(false)
+
+// FR-125 P1 — immersive landscape on phones. While a session runs on a touch
+// page held sideways and under 500 px tall, the app bar, the toolbar and the
+// tools strip step aside and the stage takes the whole page. The toolbar and
+// the strip become an overlay out of view, still mounted: the strip is the
+// session tools' Teleport target, and the toolbar holds live state. The
+// pull-tab slides them back down OVER the stage, which keeps its size, so
+// nothing re-sends rc:resolution. Measured on production before it: the bars
+// left the remote desktop 146–254 px on a phone held sideways, and every
+// built-in touch preset ran off the top.
+const coarsePointer = (() => {
+  try {
+    return globalThis.matchMedia?.('(pointer: coarse)').matches === true
+  } catch {
+    return false
+  }
+})()
+// The setting is the kill switch (FR-125 §3.4): on unless this browser turned
+// it off; holding the phone upright or ending the session also leaves the mode.
+const immersiveSetting = ref(readImmersiveSetting())
+watch(immersiveSetting, (on) => writeImmersiveSetting(on))
+const immersive = computed(
+  () =>
+    rc.phase.value === 'connected' &&
+    immersiveSetting.value &&
+    isPhoneSideways(coarsePointer, displayWidth.value, displayHeight.value),
+)
+const chromeRevealed = ref(false)
+// Revealed, the strip sits under the toolbar: the toolbar's own height, read
+// when it is revealed (a compact v-toolbar is 48 px).
+const toolbarHeight = ref(48)
+let chromeHideTimer: ReturnType<typeof setTimeout> | null = null
+function clearChromeHide() {
+  if (chromeHideTimer !== null) {
+    clearTimeout(chromeHideTimer)
+    chromeHideTimer = null
+  }
+}
+/** D2 — the revealed toolbar hides again after a few seconds without a touch
+ *  inside it. A dialog or a menu opened from it (an active Vuetify overlay —
+ *  Settings, the files drawer, the touch presets' menu) keeps it up until that
+ *  closes. */
+function armChromeHide() {
+  clearChromeHide()
+  chromeHideTimer = setTimeout(() => {
+    chromeHideTimer = null
+    if (globalThis.document?.querySelector('.v-overlay--active')) armChromeHide()
+    else chromeRevealed.value = false
+  }, IMMERSIVE_CHROME_HIDE_MS)
+}
+function revealChrome() {
+  const tb = globalThis.document?.querySelector<HTMLElement>('.rc-toolbar-primary')
+  if (tb && tb.offsetHeight > 0) toolbarHeight.value = tb.offsetHeight
+  chromeRevealed.value = true
+  armChromeHide()
+}
+function hideChrome() {
+  clearChromeHide()
+  chromeRevealed.value = false
+}
+function onChromeTouched() {
+  if (immersive.value && chromeRevealed.value) armChromeHide()
+}
+/** A tap on the stage while the toolbar is down puts it away; the tap itself
+ *  still reaches the remote desktop. */
+function onStageTouchedWhileRevealed() {
+  if (immersive.value && chromeRevealed.value) hideChrome()
+}
+watch(
+  immersive,
+  (on) => {
+    setImmersiveViewer(on)
+    if (!on) hideChrome()
+  },
+  { immediate: true },
+)
+// FR-125 P3 — where the browser can fullscreen the stage (Android's Chrome),
+// the mode offers it once: it also hides the browser's own bar, which nothing
+// a page does otherwise can. Used or closed, it is gone for this browser.
+// `fullscreenEnabled` and `isFullscreen` are declared further down; the
+// computed reads them only once the page runs.
+const fullscreenChipDismissed = ref(readFullscreenChipDismissed())
+const fullscreenChipShown = computed(
+  () => immersive.value && fullscreenEnabled.value && !isFullscreen.value && !fullscreenChipDismissed.value,
+)
+function closeFullscreenChip() {
+  fullscreenChipDismissed.value = true
+  dismissFullscreenChip()
+}
+function fullscreenFromChip() {
+  closeFullscreenChip()
+  toggleFullscreen()
+}
+onBeforeUnmount(() => {
+  clearChromeHide()
+  // No other page may start without the app bar.
+  setImmersiveViewer(false)
+})
 
 // FR-85 P3c — recording the remote screen (docs/recording.md §10). The file is
 // made and kept on the device; this starts and stops it and downloads it.
@@ -5584,6 +5747,95 @@ onBeforeUnmount(() => {
   overflow: hidden;
   min-height: 0;
   background: #0b0b0b;
+}
+/* FR-125 — immersive landscape on phones (`immersive`): the stage takes the
+   whole page, and the toolbar and the strip become an overlay above it, out of
+   view (and out of the tab order) until the pull-tab slides them down. Over the
+   stage, never beside it: the stage keeps its size, so nothing re-sends
+   rc:resolution. The card's margin, border, corners and shadow go too: 8 px of
+   margin a side is 4 % of a 390 px page. Vuetify's utility classes are
+   !important, hence the !important here. */
+.remote-control-wrapper.rc-immersive {
+  position: relative;
+  overflow: hidden;
+}
+.rc-immersive > .rc-toolbar-primary,
+.rc-immersive > .rc-tb-strip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  visibility: hidden;
+  transition:
+    transform 160ms ease-out,
+    visibility 0s linear 160ms;
+}
+.rc-immersive > .rc-toolbar-primary {
+  top: 0;
+  transform: translateY(-100%);
+}
+.rc-immersive > .rc-tb-strip {
+  top: var(--rc-tb-h, 48px);
+  transform: translateY(calc(-100% - var(--rc-tb-h, 48px)));
+}
+.rc-immersive.rc-chrome-revealed > .rc-toolbar-primary,
+.rc-immersive.rc-chrome-revealed > .rc-tb-strip {
+  visibility: visible;
+  transform: none;
+  transition:
+    transform 160ms ease-out,
+    visibility 0s;
+}
+.rc-immersive > .remote-stage-card {
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+/* Above the stage and the touch overlay (z-index 20), below the revealed
+   toolbar. The button is the 48 × 36 px hit area (FR-120's D1); the tab is
+   what shows. */
+.rc-pulltab {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 25;
+  width: 48px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  cursor: pointer;
+}
+/* The tab sits on whatever the remote desktop shows at its top edge — a dark
+   panel as often as a light title bar — so it is a surface-coloured pill with a
+   shadow, like the full-screen chip: a translucent dark tab vanished against a
+   GNOME top panel in the first field run. */
+.rc-pulltab-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 18px;
+  border-radius: 0 0 10px 10px;
+  background: rgb(var(--v-theme-surface));
+  color: rgb(var(--v-theme-on-surface));
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+.rc-pulltab:focus-visible .rc-pulltab-tab {
+  outline: 2px solid rgb(var(--v-theme-primary));
+}
+.rc-fullscreen-chip {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 25;
 }
 .remote-stage {
   flex: 1;
