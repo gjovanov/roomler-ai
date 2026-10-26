@@ -56,6 +56,32 @@ export function writeImmersiveSetting(
   }
 }
 
+/** FR-125 P3 — the one-time "Full screen" chip, where the browser can put the
+ *  stage into element fullscreen (Android's Chrome; never iPhone Safari): it
+ *  also hides the browser's own bar, 356 → 412 px on a Pixel 7. Used or
+ *  closed once, it is gone for this browser. */
+export const FULLSCREEN_CHIP_STORAGE_KEY = 'roomler-rc-fullscreen-chip.v1'
+
+export function readFullscreenChipDismissed(
+  storage: Pick<Storage, 'getItem'> | undefined = globalThis.localStorage,
+): boolean {
+  try {
+    return storage?.getItem(FULLSCREEN_CHIP_STORAGE_KEY) === 'dismissed'
+  } catch {
+    return false
+  }
+}
+
+export function dismissFullscreenChip(
+  storage: Pick<Storage, 'setItem'> | undefined = globalThis.localStorage,
+): void {
+  try {
+    storage?.setItem(FULLSCREEN_CHIP_STORAGE_KEY, 'dismissed')
+  } catch {
+    /* blocked site data: this tab only */
+  }
+}
+
 const immersive = ref(false)
 
 /** True while the viewer is immersive: the app shell hides its bar. Only the

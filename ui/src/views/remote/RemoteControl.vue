@@ -941,6 +941,22 @@
     >
       <span class="rc-pulltab-tab"><v-icon size="14">mdi-chevron-down</v-icon></span>
     </button>
+    <!-- FR-125 P3 — once, where the browser can fullscreen the stage. -->
+    <v-chip
+      v-if="fullscreenChipShown"
+      class="rc-fullscreen-chip"
+      color="surface"
+      variant="elevated"
+      size="small"
+      prepend-icon="mdi-fullscreen"
+      closable
+      close-label="Not now"
+      data-testid="rc-fullscreen-chip"
+      @click="fullscreenFromChip"
+      @click:close="closeFullscreenChip"
+    >
+      Full screen
+    </v-chip>
 
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
@@ -2557,7 +2573,9 @@ import {
 } from '@/composables/touchControls'
 import {
   IMMERSIVE_CHROME_HIDE_MS,
+  dismissFullscreenChip,
   isPhoneSideways,
+  readFullscreenChipDismissed,
   readImmersiveSetting,
   setImmersiveViewer,
   writeImmersiveSetting,
@@ -2724,6 +2742,23 @@ watch(
   },
   { immediate: true },
 )
+// FR-125 P3 — where the browser can fullscreen the stage (Android's Chrome),
+// the mode offers it once: it also hides the browser's own bar, which nothing
+// a page does otherwise can. Used or closed, it is gone for this browser.
+// `fullscreenEnabled` and `isFullscreen` are declared further down; the
+// computed reads them only once the page runs.
+const fullscreenChipDismissed = ref(readFullscreenChipDismissed())
+const fullscreenChipShown = computed(
+  () => immersive.value && fullscreenEnabled.value && !isFullscreen.value && !fullscreenChipDismissed.value,
+)
+function closeFullscreenChip() {
+  fullscreenChipDismissed.value = true
+  dismissFullscreenChip()
+}
+function fullscreenFromChip() {
+  closeFullscreenChip()
+  toggleFullscreen()
+}
 onBeforeUnmount(() => {
   clearChromeHide()
   // No other page may start without the app bar.
@@ -5788,6 +5823,12 @@ onBeforeUnmount(() => {
 }
 .rc-pulltab:focus-visible .rc-pulltab-tab {
   outline: 2px solid rgb(var(--v-theme-primary));
+}
+.rc-fullscreen-chip {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 25;
 }
 .remote-stage {
   flex: 1;

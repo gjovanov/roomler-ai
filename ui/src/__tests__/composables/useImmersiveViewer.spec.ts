@@ -7,10 +7,13 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
+  FULLSCREEN_CHIP_STORAGE_KEY,
   IMMERSIVE_MAX_HEIGHT,
   IMMERSIVE_STORAGE_KEY,
+  dismissFullscreenChip,
   immersiveViewer,
   isPhoneSideways,
+  readFullscreenChipDismissed,
   readImmersiveSetting,
   setImmersiveViewer,
   writeImmersiveSetting,
@@ -100,6 +103,21 @@ describe('the setting — the kill switch, per browser', () => {
     expect(readImmersiveSetting(throwing)).toBe(true)
     expect(() => writeImmersiveSetting(false, throwing)).not.toThrow()
     expect(readImmersiveSetting(undefined)).toBe(true)
+  })
+})
+
+describe("P3's full-screen chip — once per browser", () => {
+  it('shown until used or closed, then gone for this browser', () => {
+    const s = memoryStorage()
+    expect(readFullscreenChipDismissed(s)).toBe(false)
+    dismissFullscreenChip(s)
+    expect(s.m.get(FULLSCREEN_CHIP_STORAGE_KEY)).toBe('dismissed')
+    expect(readFullscreenChipDismissed(s)).toBe(true)
+  })
+
+  it('blocked site data: shown (never assumed seen), and dismissing does not throw', () => {
+    expect(readFullscreenChipDismissed(throwing)).toBe(false)
+    expect(() => dismissFullscreenChip(throwing)).not.toThrow()
   })
 })
 
