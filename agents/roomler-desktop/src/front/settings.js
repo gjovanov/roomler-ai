@@ -288,7 +288,10 @@
     const value = raw === '' ? null : raw;
     const status = cfgRowStatus(row);
     try {
-      const entry = await invoke('cmd_config_set', { key, value });
+      /* #2871: the group the row was LISTED with, so on a two-half Mac the
+       * change goes to the half the row came from (`is_machine_side`). */
+      const group = row.dataset.group || null;
+      const entry = await invoke('cmd_config_set', { key, value, group });
       // The daemon says per key whether the change is in force already
       // (the gate-4 flags it re-seeds from the file it just wrote,
       // docs/remote-config.md §7b) or waits for a restart. Saying "restart"
@@ -329,6 +332,7 @@
     row.className = 'cfg-row';
     row.style.margin = '10px 0 0';
     row.dataset.key = entry.key;
+    row.dataset.group = entry.group || '';
     // What the search box matches against: the key and the description.
     row.dataset.search = (entry.key + ' ' + (entry.description || '')).toLowerCase();
 

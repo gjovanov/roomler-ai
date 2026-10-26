@@ -2662,7 +2662,7 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3388`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3338`) |
+| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3426`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3376`) |
 | who it acts as | **the device's owner** (decision 23, decided). The vault reads the owner from the device's row, never from the frame, as `rc:ssh.request` does (`crates/modules/network/src/agent_arms.rs:161`, `:211`). A device whose row is gone or removed has no principal and gets nothing |
 | which organization | the device's primary enrollment's, where the lease client lives, as for every vault ask. A secondary organization's secrets are out of reach this way |
 | the call | `roomler connect <handle> --engine <e> --upstream <u> [--ca <handle>] [--ttl <s>]`, the arguments a session's `vault_connect` takes (`docs/vault.md` §19): a structured secret by its path or this organization's RRN, an engine, and the upstream exactly as the secret's `audiences` names it |
@@ -2688,7 +2688,7 @@ sequenceDiagram
   names, and a new action would escape it. So P3-9-1 seeds its twin for `secret:connect`, in
   the same change as the action.
 - ⚠️ **Never on the person socket.** A system install's person socket serves whoever sits at the
-  screen (`crates/localapi/src/lib.rs:3090`), who need not be the device's owner. Serving
+  screen (`crates/localapi/src/lib.rs:3103`), who need not be the device's owner. Serving
   `roomler connect` there would lend the owner's vault to anyone at the seat. On a system install
   it takes the daemon's own endpoint: an administrator, or root.
 - ⚠️ **The owner from the row, never from the frame.** A compromised device can ask for what its
@@ -2745,7 +2745,7 @@ design above:
   (`HiveUpdateHold`). `roomler connect`'s foreground is that connection, so Ctrl-C, a killed
   command or a closed terminal ends the endpoint with no verb of its own. The command asks every
   5 s on the same connection where its endpoint stands, and only that connection may ask
-  (`crates/localapi/src/lib.rs:3763`).
+  (`crates/localapi/src/lib.rs:3836`).
 - **Who may ask is decision 26**, found writing P3-9-2a. The design's "an administrator, or root"
   does not hold on Windows, where the daemon's pipe admits every interactive user. Built as
   recommended, pending the operator's word.
@@ -4685,13 +4685,13 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     the daemon's own endpoint: an administrator, or root" (§3e "P3-9, `roomler connect`, as
     designed"), holds where the system daemon's socket is root's, as on Linux and macOS. It does
     not hold on Windows. There the daemon's pipe admits every interactive user, an RDP session's
-    included (`crates/localapi/src/lib.rs:3940`, `(A;;GA;;;IU)`), and `roomler exec`,
+    included (`crates/localapi/src/lib.rs:4013`, `(A;;GA;;;IU)`), and `roomler exec`,
     `roomler ssh` and `config set` act for them today. Nothing in P3-9-2a depends on the answer;
     P3-9-2b's verb does.
     - *Recommended: hold `roomler connect` to what the design said.* On Windows that is SYSTEM, an
       elevated administrator, or the account the daemon itself runs as (a per-user install). On
       Unix it is root, or the daemon's own account. The listener already reads the caller's token
-      at accept time (`pipe_client_peer`, `:2477`), and would read its SID and its elevation
+      at accept time (`pipe_client_peer`, `:2481`), and would read its SID and its elevation
       beside its session.
       - What it costs: a standard user of a machine-wide install cannot connect. An endpoint is
         served to the account that asked, so an administrator's serves no one else.
@@ -4699,7 +4699,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: on a shared or RDP-served machine, anyone signed in reaches the owner's
         grants.
     - *Or: the person at the console*, as keep busy's start is held
-      (`peer_may_start_keep_busy`, `:2373`): never SYSTEM, never another session.
+      (`peer_may_start_keep_busy`, `:2374`): never SYSTEM, never another session.
       - What it costs: an administrator over RDP cannot, and whoever sits at a shared machine's
         screen can.
     - *Built in P3-9-2b as recommended, pending the operator's word.* A wider answer changes one

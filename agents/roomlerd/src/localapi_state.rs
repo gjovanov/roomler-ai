@@ -1983,6 +1983,21 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// #2871 (review) — is `uid` the person at this device's seat right now
+    /// ([`crate::person_socket::at_the_seat_now`])? The person socket asks
+    /// before it applies a config change. Only Linux and macOS serve one.
+    async fn at_the_seat_now(&self, uid: u32) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            crate::person_socket::at_the_seat_now(uid).await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = uid;
+            false
+        }
+    }
+
     /// S1b — archive the STALE config copy on a split-config host (the
     /// desktop's "Two configurations found" banner finally gets a button).
     /// The daemon is the only safe actor: it knows which copy it LOADED and

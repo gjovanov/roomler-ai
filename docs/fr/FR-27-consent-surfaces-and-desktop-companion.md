@@ -88,7 +88,7 @@ Every line below was read on `origin/master` at `861d4557`.
    `/usr/local/bin` — hence the reported
    `Spawning self-update: No such file or directory (os error 2)`. The same
    failure kills apply-update, `probe_service_state`, service install/uninstall
-   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1826`
+   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1838`
 8. ~~**macOS "Check for updates" targets the wrong mechanism.**~~ **Wrong —
    corrected during implementation.** The reported
    `Spawning self-update: No such file or directory (os error 2)` made this
@@ -291,7 +291,7 @@ started themselves).
 | | What | Where |
 |---|---|---|
 | where | `/run/user/<uid>/roomler.sock`: the person's own `$XDG_RUNTIME_DIR/roomler.sock`, the path their companion and CLI ALREADY try first, so neither changes | `localapi::person_socket_path` |
-| whose | the user of the **active** graphical session on the seat, by the same `loginctl` walk the companion launch uses. Never the display manager's greeter, never a user switched away in the background (who must not answer consent for a view of someone else's desktop), never root (root uses the daemon's own socket). It moves when that person changes | `roomlerd::person_socket` (`step`, every 4 s) |
+| whose | the person signed in at the machine's own screen: logind's `ActiveSession` on `seat0`, when that session is a person's (since #2871's review, 2026-10-26; until then the user of the first **active** graphical session anywhere, by the companion launch's `loginctl` walk, which a remote login could be, logind calling every seatless session active). Never the display manager's greeter, never a user switched away in the background (who must not answer consent for a view of someone else's desktop), never a remote login, never root (root uses the daemon's own socket). It moves when that person changes | `roomlerd::person_socket` (`step`, every 4 s), `companion::seat0_uid` |
 | who may connect | the socket is MADE AS the person: bind and chmod 0600 run on a thread switched to their filesystem ids (`setfsuid`/`setfsgid`), so it is born theirs. ⚠️ Not a root bind followed by a chown: they own the dir, so they could swap the path to a symlink in between, and `chown` follows it (to `/etc/shadow`, say). Caught in self-review before merge. Each connection's `SO_PEERCRED` uid must be theirs or root | `bind_as_person`, `person_peer_ok` |
 | what it serves | `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`, `ConsentDecide` and `RecordStatus`, and nothing else. Anything else is answered with a pointer to `sudo roomler …`. The match is **exhaustive with no `_` arm**, so a verb added later must be placed by hand. (Placed later: keep busy, FR-92; `Devices`, `Mesh`, `Peers`, FR-97 P2g/P2h; and, by #2871's design A on 2026-10-25, `ConfigGet` and `ConfigSet` of the console person's own keys, `CONSOLE_PERSON_KEYS` — never the device-owned gates) | `localapi::person_may`, `Scope::Person` |
 | what it never does | replace a LIVE socket at the path (a per-user daemon of that person owns it); remove a non-socket file; create the runtime dir (logind's); remove anything but the inode it bound | `serve_person_socket` |

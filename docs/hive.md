@@ -732,7 +732,7 @@ flowchart LR
 - ⚠️ The macOS hold is bound to the helper's connection, not to a timer: a helper
   that dies mid-wait releases it, and so does a failed install. The verb is refused
   to every peer but root, because a hold refuses every new prompt and start on the
-  device ([`localapi/src/lib.rs:2891`](../crates/localapi/src/lib.rs#L2891)). A missing, older or
+  device ([`localapi/src/lib.rs:2904`](../crates/localapi/src/lib.rs#L2904)). A missing, older or
   silent daemon (the helper waits at most 2 h) gets the install it got before: the
   helper fails open.
 - ⚠️ `roomlerd self-update`, the CLI, does not wait. It is an operator's explicit

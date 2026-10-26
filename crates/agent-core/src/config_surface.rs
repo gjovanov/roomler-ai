@@ -5224,7 +5224,33 @@ mod tests {
             .map(|m| m.key)
             .filter(|k| roomler_localapi::person_socket_admits_key(k))
             .collect();
-        assert_eq!(served.len(), 15, "{served:?}");
+        // #2871 (review) — by name, in registry order, never a bare count a
+        // new key would just bump.
+        assert_eq!(
+            served,
+            [
+                "files_dir",
+                "external_access_enabled",
+                "external_consent_mode",
+                "external_max_permissions",
+                "record_dir",
+                "record_remote_enabled",
+                "record_remote_audio",
+                "keep_busy_enabled",
+                "privacy_mode_allowed",
+                "lock_on_end",
+                "display_match",
+                "peer_auth",
+                "rc_clipboard",
+                "rc_files",
+                "rc_audio",
+            ],
+            "the keys the person-at-the-device socket of a ROOT install lets the person at the \
+             seat set changed. Does the new one belong to that person — where their files and \
+             recordings land, what a session may take from their screen — or to the device, \
+             which on a root install everyone who sits there later shares? Only the first kind \
+             goes in `localapi::CONSOLE_PERSON_KEYS`' `person_socket` lists"
+        );
         for key in &served {
             let expected = if key.starts_with("external_") {
                 Owner::Machine

@@ -82,7 +82,7 @@ flowchart TD
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through
-    the path FR-27 already uses (`systemd_run_command`, `companion.rs:622`). One that was not running stays stopped.
+    the path FR-27 already uses (`systemd_run_command`, `companion.rs:682`). One that was not running stays stopped.
   - **Never** installs a companion where none is installed, and **never** downgrades one (D1).
   - **The heartbeat:** `installed_version`'s 10-minute cache (`companion.rs:249`, `VERSION_TTL` `:264`) is dropped
     after a sync, so the dashboard's skew clears at the next heartbeat.

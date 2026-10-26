@@ -419,23 +419,23 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3163`): where files and recordings land, keep
+   (`crates/localapi/src/lib.rs:3196`): where files and recordings land, keep
    busy, privacy mode, lock on end, display match, the browser check, what a
    session may use, external access. **Gate 4 is not among them.**
    `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
    read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
-   `:3437`), and a `ConfigSet` of them is refused by name with the
-   administrator's command (`not_on_the_person_socket_for_key`, `:3479`): on a
+   `:3475`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3517`): on a
    root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
    on both OSes. The pane shows the root daemon's value of the switch, marked,
    instead of another daemon's — on a two-half Mac the machine-side rows come
    from the root half and the session rows from the worker
    (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`;
-   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:614`; the table
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:620`; the table
    in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
    than design A, which still refuses the listing, gets the administrator's
    path in place of rows (`root_daemon_only`,
-   `agents/roomler-desktop/src/commands.rs:1026`). Whether the person at the
+   `agents/roomler-desktop/src/commands.rs:1038`). Whether the person at the
    seat may switch gate 4 on a root-mode install — Windows' pipe lets every
    interactive user — is the policy call still open on #2871.
 

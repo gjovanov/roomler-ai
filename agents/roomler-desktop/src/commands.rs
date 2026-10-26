@@ -596,11 +596,17 @@ pub async fn cmd_config_entries() -> Result<ConfigListing, String> {
 
 /// #2871 — is `key` the root half's on a two-half Mac
 /// (`config_surface::owner_for`)? By this build's registry — the companion
-/// and the daemon move together (FR-117) — and a key it does not know is the
-/// session half's, as the page always treated every key.
-fn is_machine_side(key: &str) -> bool {
+/// and the daemon move together (FR-117) — else by `group`, the group the
+/// daemon listed the row with, else the session half's, as the page always
+/// treated every key. ONE decision for both directions (#2871's review): the
+/// listing takes a row from the half this names ([`merge_two_halves`]), and
+/// [`cmd_config_set`] sends its change to the same half, by the same group —
+/// a key a newer root half lists that this build does not know would
+/// otherwise be shown from the root half and written to the per-user file,
+/// #2871's own failure.
+fn is_machine_side(key: &str, group: &str) -> bool {
     use roomler_node_core::config_surface::{Owner, owner_for};
-    owner_for(key, "") == Owner::Machine
+    owner_for(key, group) == Owner::Machine
 }
 
 /// #2871 — pure: a two-half Mac's rows. The per-user (session) half's
@@ -615,9 +621,8 @@ fn merge_two_halves(
     reached: Vec<localapi::ConfigEntry>,
     machine: Vec<localapi::ConfigEntry>,
 ) -> Vec<localapi::ConfigEntry> {
-    use roomler_node_core::config_surface::{Owner, owner_for};
     use std::collections::{HashMap, HashSet};
-    let machine_side = |e: &localapi::ConfigEntry| owner_for(&e.key, &e.group) == Owner::Machine;
+    let machine_side = |e: &localapi::ConfigEntry| is_machine_side(&e.key, &e.group);
     let by_key: HashMap<&str, &localapi::ConfigEntry> = machine
         .iter()
         .filter(|e| machine_side(e))
@@ -799,21 +804,28 @@ async fn root_half_set(
 /// The echoed entry's `restart_required` says whether the change is live
 /// or waits for the next daemon restart (FR-84 D2) — the front renders
 /// that, never a list of its own.
+///
+/// `group` is the group the row was LISTED with (`ConfigEntry::group`;
+/// the Settings page sends it, the pages that set a key of this build's
+/// own do not need to), so a change goes to the half its row came from
+/// ([`is_machine_side`]).
 #[tauri::command]
 pub async fn cmd_config_set(
     key: String,
     value: Option<String>,
+    group: Option<String>,
 ) -> Result<localapi::ConfigEntry, String> {
     let mut daemon_err: Option<String> = None;
     match localapi::connect().await {
         Ok(mut client) => {
             // #2871 (design A) — on a two-half Mac a machine-side key is the
-            // root half's (`is_machine_side`): it goes to the root half over
-            // the person socket, whose answer is final — set, or refused by
-            // name with the administrator's command. The per-user half's copy
-            // of such a key is a file the Mac's device never reads (#2871's
-            // failure), so it is not written.
-            if is_machine_side(&key)
+            // root half's (`is_machine_side`, by the group its row was listed
+            // with): it goes to the root half over the person socket, whose
+            // answer is final — set, or refused by name with the
+            // administrator's command. The per-user half's copy of such a key
+            // is a file the Mac's device never reads (#2871's failure), so it
+            // is not written.
+            if is_machine_side(&key, group.as_deref().unwrap_or(""))
                 && let Some(answer) =
                     root_half_config_set_beside(&mut client, &key, value.as_deref()).await
             {
@@ -3879,7 +3891,9 @@ mod tests {
     /// #2871 (design A) — which half of a two-half Mac a key is sent to, by
     /// this build's registry: the machine-side groups to the root half, the
     /// session-side ones (and a key this build has never heard of) to the
-    /// per-user half, as the page always did.
+    /// per-user half, as the page always did. #2871's review — and a key this
+    /// build does not know goes where the group its row was LISTED with puts
+    /// it, the same decision the listing made.
     #[test]
     fn a_machine_side_key_goes_to_the_root_half_and_a_session_side_key_to_the_worker() {
         for key in [
@@ -3892,7 +3906,7 @@ mod tests {
             "auto_grant_session",
             "auto_update",
         ] {
-            assert!(is_machine_side(key), "{key} is the root half's");
+            assert!(is_machine_side(key, ""), "{key} is the root half's");
         }
         for key in [
             "record_dir",
@@ -3906,7 +3920,45 @@ mod tests {
             "encoder_preference",
             "brand_new_key",
         ] {
-            assert!(!is_machine_side(key), "{key} is the session half's");
+            assert!(!is_machine_side(key, ""), "{key} is the session half's");
+        }
+        // A key a newer daemon lists and this build does not know: by the
+        // group it came with — so the set follows the row (`merge_two_halves`
+        // takes it from the root half for exactly these groups).
+        assert!(is_machine_side("brand_new_key", "access"));
+        assert!(is_machine_side("brand_new_key", "ssh"));
+        assert!(!is_machine_side("brand_new_key", "files"));
+        assert!(!is_machine_side("brand_new_key", "no_such_group"));
+        // A key this build knows is placed by the registry, whatever a row says.
+        assert!(!is_machine_side("rc_clipboard", "access"));
+        assert!(is_machine_side("exec_enabled", "files"));
+        let row = |key: &str, group: &str| {
+            serde_json::from_value::<localapi::ConfigEntry>(serde_json::json!({
+                "key": key, "value": "x", "kind": "string", "restart_required": true,
+                "description": "", "group": group,
+            }))
+            .unwrap()
+        };
+        let merged = merge_two_halves(
+            vec![row("rc_clipboard", "remote_desktop")],
+            vec![
+                row("brand_new_key", "access"),
+                row("brand_new_key_2", "files"),
+            ],
+        );
+        let keys: Vec<&str> = merged.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["rc_clipboard", "brand_new_key"],
+            "the listing took the unknown machine-side row from the root half"
+        );
+        for e in &merged {
+            assert_eq!(
+                is_machine_side(&e.key, &e.group),
+                e.key == "brand_new_key",
+                "{}: the set goes where the row came from",
+                e.key
+            );
         }
     }
 
