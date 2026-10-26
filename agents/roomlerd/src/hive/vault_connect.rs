@@ -1000,6 +1000,13 @@ mod endpoint {
         fn admits(&self, stream: &Self::Stream) -> Result<(), String>;
         /// Close it, and remove whatever it left.
         fn close(self);
+        /// FR-90 P8-2a-2 — its listener, and where it serves, for a
+        /// session's worker to serve it from: the daemon's own places alone
+        /// hand theirs over.
+        #[cfg(unix)]
+        fn handover(&self) -> Option<(std::os::fd::BorrowedFd<'_>, super::handed::At)> {
+            None
+        }
     }
 
     /// What every connection of one endpoint shares: where it authenticates,
@@ -1010,37 +1017,65 @@ mod endpoint {
         /// call leased them: never a value. P3-9-2 — a person's endpoint
         /// swaps them for the leases it renews; a session's never changes.
         values: std::sync::RwLock<Vec<String>>,
-        host: String,
-        port: u16,
-        tls: tokio_rustls::TlsConnector,
+        conf: Conf,
+    }
+
+    /// FR-90 P8-2a-2 — how an endpoint's connections authenticate, none of
+    /// it secret: the daemon's endpoint serves with it, and so does the
+    /// session's worker it is handed to.
+    pub(crate) struct Conf {
+        pub(super) host: String,
+        pub(super) port: u16,
+        pub(super) tls: tokio_rustls::TlsConnector,
         /// P3-5e-2 — the roots `tls` verifies against: a connection that
         /// presents a client certificate gets a connector of its own over
-        /// them.
-        roots: Arc<tokio_rustls::rustls::RootCertStore>,
+        /// them. P8-2a-2 — `ca` is what they were made from, besides the
+        /// system's: the PEM of the CA the call leased, public.
+        pub(super) roots: Arc<tokio_rustls::rustls::RootCertStore>,
+        #[cfg_attr(not(unix), allow(dead_code))]
+        pub(super) ca: Option<String>,
         /// The engine it speaks, MongoDB's auth database, and (P3-5d-2) how
         /// an HTTP endpoint presents the value.
-        engine: Engine,
-        auth_source: Option<String>,
-        auth: Option<Auth>,
+        pub(super) engine: Engine,
+        pub(super) auth_source: Option<String>,
+        pub(super) auth: Option<Auth>,
         /// P3-5d-2 — the endpoint's own origin, where an HTTP endpoint
         /// points a redirect to its upstream back to.
-        front: String,
+        pub(super) front: String,
         /// P3-5f-2 — an SSH agent's: the secret its key is listed under, and
         /// the one account it signs in as, where the upstream names one.
-        secret: String,
-        user: Option<String>,
+        pub(super) secret: String,
+        pub(super) user: Option<String>,
         /// FR-90 P4-6-1b-2 — where each connection's upstream is dialled.
-        dial: crate::vault_proxy::Dial,
+        pub(super) dial: crate::vault_proxy::Dial,
     }
 
     /// One connection's upstream, in its engine: for an SSH agent, the key
     /// it signs with and the hosts it signs a sign-in to (boxed: a key pair
     /// is far larger than the other engines' upstreams).
-    enum Session {
+    pub(crate) enum Session {
         Pg(pg::Upstream),
         Mongo(mongo::Upstream),
         Http(http::Upstream),
         Ssh(Box<ssh_agent::Agent>),
+    }
+
+    /// FR-90 P8-2a-2 — where a connection's upstream comes from as it
+    /// starts: the daemon's endpoint reads its leases; a session's worker
+    /// asks the daemon, over its channel.
+    pub(crate) trait Sessions: Send + Sync + 'static {
+        fn engine(&self) -> Engine;
+        fn session(&self) -> impl Future<Output = Option<Session>> + Send;
+    }
+
+    impl Sessions for Endpoint {
+        fn engine(&self) -> Engine {
+            self.conf.engine
+        }
+
+        async fn session(&self) -> Option<Session> {
+            self.conf.session(|i| self.read(i))
+        }
     }
 
     impl Endpoint {
@@ -1060,25 +1095,40 @@ mod endpoint {
             *self.values.write().unwrap_or_else(|e| e.into_inner()) = values;
         }
 
-        /// The upstream for one connection, its values read from the leases
-        /// now: `None` once any is let go.
-        fn session(&self) -> Option<Session> {
+        /// FR-90 P8-2a-2 — the first `count` values, as each connection of
+        /// the session's worker starts: read from the leases now, none once
+        /// any is let go.
+        #[cfg(unix)]
+        fn reader(self: &Arc<Self>, count: usize) -> super::handed::Values {
+            let endpoint = Arc::clone(self);
+            Arc::new(move || (0..count).map(|i| endpoint.read(i)).collect())
+        }
+    }
+
+    impl Conf {
+        /// The upstream for one connection, its values read with `read` now
+        /// (the daemon's endpoint from its leases; P8-2a-2, a session's
+        /// worker from the daemon): `None` once any is let go.
+        pub(crate) fn session(
+            &self,
+            read: impl Fn(usize) -> Option<Zeroizing<String>>,
+        ) -> Option<Session> {
             let (host, port, tls) = (self.host.clone(), self.port, self.tls.clone());
             let dial = self.dial;
             Some(match self.engine {
                 Engine::Postgres => Session::Pg(pg::Upstream {
                     host,
                     port,
-                    user: self.read(0)?.to_string(),
-                    password: self.read(1)?,
+                    user: read(0)?.to_string(),
+                    password: read(1)?,
                     tls,
                     dial,
                 }),
                 Engine::Mongodb => Session::Mongo(mongo::Upstream {
                     host,
                     port,
-                    user: self.read(0)?.to_string(),
-                    password: self.read(1)?,
+                    user: read(0)?.to_string(),
+                    password: read(1)?,
                     auth_source: self.auth_source.clone().unwrap_or_else(|| "admin".into()),
                     tls,
                     dial,
@@ -1089,7 +1139,7 @@ mod endpoint {
                     // TLS alone, read from its leases now.
                     let tls = match auth {
                         Auth::ClientCert => {
-                            let identity = tls::identity(&self.read(0)?, &self.read(1)?).ok()?;
+                            let identity = tls::identity(&read(0)?, &read(1)?).ok()?;
                             tls::connector_for(Arc::clone(&self.roots), Some(identity)).ok()?
                         }
                         Auth::Basic | Auth::Bearer => tls,
@@ -1097,7 +1147,7 @@ mod endpoint {
                     Session::Http(http::Upstream {
                         host,
                         port,
-                        credential: credential(auth, |i| self.read(i))?,
+                        credential: credential(auth, &read)?,
                         tls,
                         front: self.front.clone(),
                         flavor: match self.engine {
@@ -1109,13 +1159,8 @@ mod endpoint {
                 }
                 // P3-5f-2 — the key and the hosts, read from the leases now.
                 Engine::Ssh => Session::Ssh(Box::new(
-                    ssh_agent::Agent::new(
-                        &self.read(0)?,
-                        &self.read(1)?,
-                        &self.secret,
-                        self.user.as_deref(),
-                    )
-                    .ok()?,
+                    ssh_agent::Agent::new(&read(0)?, &read(1)?, &self.secret, self.user.as_deref())
+                        .ok()?,
                 )),
             })
         }
@@ -1180,6 +1225,7 @@ mod endpoint {
         values: usize,
         tls: tokio_rustls::TlsConnector,
         roots: Arc<tokio_rustls::rustls::RootCertStore>,
+        ca: Option<String>,
         slot: Slot,
         /// P3-5f-2 — an SSH agent's: the hosts' keys, for the answer.
         known_hosts: Option<String>,
@@ -1188,8 +1234,15 @@ mod endpoint {
     /// How an endpoint is held once it is bound.
     enum Kind {
         /// A session's: closed when its first lease is let go, and the leases
-        /// its call asked for itself (`own`) let go with it.
-        Run { own: Vec<String> },
+        /// its call asked for itself (`own`) let go with it. P8-2a-2 — whose
+        /// run it is: its worker may be the one that serves it.
+        Run {
+            own: Vec<String>,
+            #[cfg_attr(not(unix), allow(dead_code))]
+            session: ObjectId,
+            #[cfg_attr(not(unix), allow(dead_code))]
+            fence: u64,
+        },
         /// P3-9-2 — a person's: its leases renewed while it is held.
         Person(PersonHold),
     }
@@ -1347,7 +1400,14 @@ mod endpoint {
                     leases.push(lease);
                 }
                 let own = held.leases.clone();
-                (slot, Kind::Run { own })
+                (
+                    slot,
+                    Kind::Run {
+                        own,
+                        session,
+                        fence,
+                    },
+                )
             }
             // P3-9-2 — every field asked for the device's owner: nothing a
             // session asked for ahead is ever a person's.
@@ -1461,6 +1521,7 @@ mod endpoint {
             values: count,
             tls,
             roots,
+            ca: ca.as_deref().cloned(),
             slot,
             known_hosts,
         };
@@ -1469,19 +1530,19 @@ mod endpoint {
                 let bound = loopback::bind(&at)?;
                 let dial = bound.dial(req.engine, None, &req.upstream);
                 let front = bound.front();
-                start(bound, dial, front, &req, handover)?
+                start(bound, dial, front, &req, handover).await?
             }
             #[cfg(unix)]
             Engine::Postgres | Engine::Mongodb | Engine::Ssh => {
                 let bound = socket::bind(&at, req.engine)?;
                 let dial = bound.dial(req.engine, req.database.as_deref(), &req.upstream);
-                start(bound, dial, String::new(), &req, handover)?
+                start(bound, dial, String::new(), &req, handover).await?
             }
             #[cfg(windows)]
             Engine::Postgres | Engine::Mongodb => {
                 let bound = loopback::bind(&at)?;
                 let dial = bound.dial(req.engine, req.database.as_deref(), &req.upstream);
-                start(bound, dial, String::new(), &req, handover)?
+                start(bound, dial, String::new(), &req, handover).await?
             }
             // P3-5f-3 — Windows: a named pipe, which Win32-OpenSSH dials as
             // `SSH_AUTH_SOCK` names it.
@@ -1489,7 +1550,7 @@ mod endpoint {
             Engine::Ssh => {
                 let bound = pipe::bind(&at)?;
                 let dial = bound.dial(&req.upstream);
-                start(bound, dial, String::new(), &req, handover)?
+                start(bound, dial, String::new(), &req, handover).await?
             }
         };
         // Handed to the endpoint, which lets them go when it closes.
@@ -1503,13 +1564,18 @@ mod endpoint {
     /// its renewal ([`renew`]) instead, and it closes when its [`Control`]
     /// says so or a renewal cannot go on. Answers what the asker is told, and
     /// a person's endpoint's control.
-    fn start<P: Place>(
+    async fn start<P: Place>(
         bound: P,
         dial: Dial,
         front: String,
         req: &ConnectRequest,
         h: Handover<'_>,
     ) -> Result<(Value, Option<Control>), String> {
+        #[cfg(unix)]
+        let run = match &h.kind {
+            Kind::Run { session, fence, .. } => Some((*session, *fence)),
+            Kind::Person(_) => None,
+        };
         let stop = CancellationToken::new();
         let watch = match h.kind {
             Kind::Run { .. } => stop.clone(),
@@ -1533,22 +1599,25 @@ mod endpoint {
         let endpoint = Arc::new(Endpoint {
             vault: Arc::clone(h.vault),
             values: RwLock::new(h.leases[..h.values].to_vec()),
-            host: req.host.clone(),
-            port: req.port,
-            tls: h.tls,
-            roots: h.roots,
-            engine: req.engine,
-            auth_source: req.auth_source.clone(),
-            auth: req.auth,
-            front,
-            secret: req.secret.clone(),
-            user: req.user.clone(),
-            dial: req.dial,
+            conf: Conf {
+                host: req.host.clone(),
+                port: req.port,
+                tls: h.tls,
+                roots: h.roots,
+                ca: h.ca,
+                engine: req.engine,
+                auth_source: req.auth_source.clone(),
+                auth: req.auth,
+                front,
+                secret: req.secret.clone(),
+                user: req.user.clone(),
+                dial: req.dial,
+            },
         });
         let live = Live::new(&stop);
         let renewed = matches!(h.kind, Kind::Person(_));
         let (release, control) = match h.kind {
-            Kind::Run { own } => (Release::Own(own), None),
+            Kind::Run { own, .. } => (Release::Own(own), None),
             Kind::Person(hold) => {
                 let state = Arc::new(Mutex::new(PersonState::default()));
                 let current = Arc::new(Mutex::new(h.leases.to_vec()));
@@ -1577,7 +1646,49 @@ mod endpoint {
                 (release, Some(control))
             }
         };
-        tokio::spawn(serve(bound, endpoint, stop, live, release, h.slot));
+        let (releasing, slot) = (Arc::clone(&endpoint), h.slot);
+        let end = move || {
+            match release {
+                Release::Own(own) => releasing.vault.release(&own),
+                Release::Person { leases, id } => leases.drop_person(id),
+            }
+            drop(slot);
+        };
+        // FR-90 P8-2a-2 — a session's endpoint, dialled directly, served by
+        // the session's worker where the device's owner turned workers on:
+        // the daemon keeps the listener, the leases and the close.
+        #[cfg(unix)]
+        let handed = match (run, bound.handover()) {
+            (Some((session, fence)), Some((listener, at)))
+                if req.dial == crate::vault_proxy::Dial::Direct =>
+            {
+                let spec = super::handed::Spec::of(&endpoint.conf, at);
+                let reader = endpoint.reader(h.values);
+                match super::handed::hand(session, fence, spec, &listener, reader).await {
+                    Ok(handed) => handed,
+                    Err(why) => {
+                        stop.cancel();
+                        bound.close();
+                        return Err(why);
+                    }
+                }
+            }
+            _ => None,
+        };
+        #[cfg(unix)]
+        if let Some(handed) = handed {
+            drop(live);
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                handed.close().await;
+                bound.close();
+                end();
+            });
+        } else {
+            tokio::spawn(serve(bound, endpoint, stop, live, end));
+        }
+        #[cfg(windows)]
+        tokio::spawn(serve(bound, endpoint, stop, live, end));
         let ends = if renewed {
             "It stays open while it is held, its leases renewed before they end; a lease taken \
              back cuts its connections."
@@ -1644,16 +1755,16 @@ mod endpoint {
     /// let go, (P3-9-2) a person's when its control or its renewal closes it.
     /// Each connection from the account it serves, at most
     /// [`MAX_CONNECTIONS`] at once, one engine session each, and cut by
-    /// `live`. Then it closes, what `release` names is let go rather than
-    /// held to its expiry, and its place among its holder's endpoints goes
-    /// with it.
-    async fn serve<P: Place>(
+    /// `live`. Then it closes, and `end` runs: the daemon's lets go of what
+    /// its release names rather than hold it to its expiry, and gives back
+    /// its place among its holder's endpoints; (P8-2a-2) a session's
+    /// worker's lets go of nothing, the leases being the daemon's.
+    pub(crate) async fn serve<P: Place, S: Sessions>(
         bound: P,
-        endpoint: Arc<Endpoint>,
+        endpoint: Arc<S>,
         stop: CancellationToken,
         live: Arc<Live>,
-        release: Release,
-        _slot: Slot,
+        end: impl FnOnce() + Send,
     ) {
         let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
@@ -1676,7 +1787,7 @@ mod endpoint {
             }
             let Ok(permit) = Arc::clone(&open).try_acquire_owned() else {
                 tokio::spawn(refuse(
-                    endpoint.engine,
+                    endpoint.engine(),
                     stream,
                     format!("the endpoint serves {MAX_CONNECTIONS} connections at once"),
                 ));
@@ -1685,9 +1796,9 @@ mod endpoint {
             let (endpoint, cut) = (Arc::clone(&endpoint), live.now());
             tokio::spawn(async move {
                 let _permit = permit;
-                let Some(session) = endpoint.session() else {
+                let Some(session) = endpoint.session().await else {
                     return refuse(
-                        endpoint.engine,
+                        endpoint.engine(),
                         stream,
                         "the endpoint's lease has ended".into(),
                     )
@@ -1712,23 +1823,20 @@ mod endpoint {
             });
         }
         bound.close();
-        match release {
-            Release::Own(own) => endpoint.vault.release(&own),
-            Release::Person { leases, id } => leases.drop_person(id),
-        }
+        end();
     }
 
     /// What cuts the connections an endpoint serves: its close and, for a
     /// person's (P3-9-2), its leases taken back, which cuts every connection
     /// served so far and leaves later ones to a fresh token. Every token is a
     /// child of the endpoint's stop, so its close cuts them all.
-    struct Live {
+    pub(crate) struct Live {
         stop: CancellationToken,
         now: Mutex<CancellationToken>,
     }
 
     impl Live {
-        fn new(stop: &CancellationToken) -> Arc<Self> {
+        pub(crate) fn new(stop: &CancellationToken) -> Arc<Self> {
             Arc::new(Self {
                 stop: stop.clone(),
                 now: Mutex::new(stop.child_token()),
@@ -2043,6 +2151,12 @@ mod endpoint {
                 drop(self.listener);
                 let _ = std::fs::remove_dir_all(&self.dir);
             }
+
+            fn handover(&self) -> Option<(std::os::fd::BorrowedFd<'_>, super::super::handed::At)> {
+                use std::os::fd::AsFd;
+                let at = super::super::handed::At::Socket { peer: self.peer };
+                Some((self.listener.as_fd(), at))
+            }
         }
 
         impl Bound {
@@ -2348,6 +2462,13 @@ mod endpoint {
             fn close(self) {
                 drop(self.listener);
             }
+
+            #[cfg(unix)]
+            fn handover(&self) -> Option<(std::os::fd::BorrowedFd<'_>, super::super::handed::At)> {
+                use std::os::fd::AsFd;
+                let at = super::super::handed::At::Loopback { peer: self.peer };
+                Some((self.listener.as_fd(), at))
+            }
         }
 
         /// FR-90 P3-7-3b — the one account a loopback connection is served
@@ -2633,6 +2754,10 @@ mod endpoint {
         }
     }
 }
+
+/// FR-90 P8-2a-2 — a session's endpoints served by its worker (Unix first).
+#[cfg(unix)]
+pub(crate) mod handed;
 
 #[cfg(test)]
 mod tests;
