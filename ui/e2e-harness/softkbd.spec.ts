@@ -81,7 +81,8 @@ function hidBalance(sent: HostFrame[]): Record<string, number> {
 }
 
 /** One line per key for the report: `[L]` the listener, `[S]` the soft
- *  keyboard component, `[P]` the deferred paste's flush. */
+ *  keyboard component, `[P]` the deferred paste's flush; an upload by `[D]`
+ *  the files drawer or `[F]` the deferred Ctrl+V's files path (#2910). */
 function describeFrames(sent: HostFrame[]): string {
   const tag = (via: string) => (via === 'listener' ? 'L' : via === 'soft-keyboard' ? 'S' : 'P')
   return sent
@@ -93,6 +94,8 @@ function describeFrames(sent: HostFrame[]): string {
           return `[${tag(f.via)}]text:${JSON.stringify(f.text)}`
         case 'paste':
           return `[P]paste(${JSON.stringify(f.text)},files=${f.files})`
+        case 'upload':
+          return `[${f.via === 'drawer' ? 'D' : 'F'}]upload(files=${f.files})`
         case 'release-held':
           return `[L]release-held(${f.keys.map((k) => '0x' + k.toString(16)).join(',')})`
         default:
@@ -397,6 +400,90 @@ test.describe("the soft keyboard's own paths still reach the host once", () => {
       { via: 'soft-keyboard', t: 'key', code: 0x28, down: true, mods: 0 },
       { via: 'soft-keyboard', t: 'key', code: 0x28, down: false, mods: 0 },
     ])
+  })
+
+  // #2909 — the listener maps by `code`, so it drops these; the always-empty
+  // textarea deletes nothing, so no `input` event carries them either.
+  for (const [key, keyCode, hid] of [
+    ['Backspace', 8, 0x2a],
+    ['Delete', 46, 0x4c],
+  ] as const) {
+    test(`a ${key} with no physical code (the OS keyboard's own) has one owner: the component`, async ({ page }) => {
+      await openSoftKeyboard(page)
+      await page.evaluate(
+        ([k, kc]) => {
+          const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-rc-capture]')!
+          ta.dispatchEvent(new KeyboardEvent('keydown', { key: k, code: '', keyCode: kc, bubbles: true, cancelable: true }))
+          ta.dispatchEvent(new KeyboardEvent('keyup', { key: k, code: '', keyCode: kc, bubbles: true, cancelable: true }))
+        },
+        [key, keyCode] as const,
+      )
+      const sent = await frames(page)
+      note('soft open, OS keyboard', `${key} (code "")`, sent)
+      expect(sent, describeFrames(sent)).toEqual([
+        { via: 'soft-keyboard', t: 'key', code: hid, down: true, mods: 0 },
+        { via: 'soft-keyboard', t: 'key', code: hid, down: false, mods: 0 },
+      ])
+    })
+  }
+
+  test('a Backspace an IME is composing with (keyCode 229) is not the component\'s: nothing reaches the host from the keydown', async ({ page }) => {
+    await openSoftKeyboard(page)
+    await page.evaluate(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-rc-capture]')!
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', code: '', keyCode: 229, bubbles: true, cancelable: true }))
+    })
+    const sent = await frames(page)
+    note('soft open, OS keyboard', 'Backspace (code "", keyCode 229)', sent)
+    expect(sent, describeFrames(sent)).toEqual([])
+  })
+})
+
+test.describe('a files paste has ONE owner, the drawer open or shut (#2910)', () => {
+  /** A Ctrl+V over the stage, then the paste event a clipboard of files
+   *  raises. Both synthetic: a real Ctrl+V pastes the browser's clipboard,
+   *  which a page cannot fill with files — and this keydown has no default
+   *  action, so the dispatched paste is the only one. */
+  async function ctrlVFilesOverStage(page: Page, files: number, withCtrlV = true) {
+    await page.evaluate(
+      ([n, ctrlV]) => {
+        const stage = document.getElementById('stage')!
+        stage.focus()
+        if (ctrlV) {
+          stage.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'v', code: 'KeyV', ctrlKey: true, bubbles: true, cancelable: true }),
+          )
+        }
+        const dt = new DataTransfer()
+        for (let i = 0; i < n; i++) dt.items.add(new File([`file ${i}`], `f${i}.txt`, { type: 'text/plain' }))
+        stage.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }))
+      },
+      [files, withCtrlV] as const,
+    )
+  }
+
+  test('the drawer open: uploaded once, into the drawer — the deferred Ctrl+V uploads nothing and sends no keystroke', async ({ page }) => {
+    await page.evaluate(() => window.__harness.reset({ pointerInside: true, drawerOpen: true }))
+    await ctrlVFilesOverStage(page, 2)
+    const sent = await frames(page)
+    note('drawer open, pointer inside', 'Ctrl+V, 2 files', sent)
+    expect(sent, describeFrames(sent)).toEqual([{ via: 'drawer', t: 'upload', files: 2 }])
+  })
+
+  test('the drawer shut: uploaded once, by the deferred Ctrl+V — no keystroke', async ({ page }) => {
+    await page.evaluate(() => window.__harness.reset({ pointerInside: true, drawerOpen: false }))
+    await ctrlVFilesOverStage(page, 2)
+    const sent = await frames(page)
+    note('drawer shut, pointer inside', 'Ctrl+V, 2 files', sent)
+    expect(sent, describeFrames(sent)).toEqual([{ via: 'paste-files', t: 'upload', files: 2 }])
+  })
+
+  test("the drawer open, a files paste with no Ctrl+V before it (the browser's own menu): the drawer's alone", async ({ page }) => {
+    await page.evaluate(() => window.__harness.reset({ pointerInside: true, drawerOpen: true }))
+    await ctrlVFilesOverStage(page, 1, false)
+    const sent = await frames(page)
+    note('drawer open, no Ctrl+V', 'paste, 1 file', sent)
+    expect(sent, describeFrames(sent)).toEqual([{ via: 'drawer', t: 'upload', files: 1 }])
   })
 })
 
