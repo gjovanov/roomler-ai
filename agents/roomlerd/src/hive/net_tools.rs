@@ -18,13 +18,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
 use bson::oid::ObjectId;
 use serde_json::{Value, json};
 use tracing::{info, warn};
-use tunnel_core::driver::Target;
+use tunnel_core::driver::{SessionGrantRef, Target};
 use tunnel_core::socks5::Socks5Credential;
 
 use super::toolbelt::{PeerId, VaultTools};
@@ -55,7 +55,7 @@ struct RunFlows {
     /// and a later call makes a new one, which an older call's place is not
     /// in.
     life: u64,
-    flows: Vec<(TunnelClientHub, String)>,
+    flows: Vec<(Arc<dyn SessionEgress>, String)>,
     asking: usize,
 }
 
@@ -91,7 +91,7 @@ impl Place {
         });
         // A flow the hub no longer has ended already: at its grant's end, or
         // for good on a refusal.
-        r.flows.retain(|(hub, id)| hub.has_flow(id));
+        r.flows.retain(|(egress, id)| egress.holds(id));
         if r.flows.len() + r.asking >= MAX_FLOWS {
             return Err(format!(
                 "this session holds {MAX_FLOWS} egress listeners already: end one first"
@@ -101,21 +101,21 @@ impl Place {
         Ok(Self { run, life: r.life })
     }
 
-    /// The call's listener, `flow` on `hub`, recorded in its place. False,
+    /// The call's listener, `flow` on `egress`, recorded in its place. False,
     /// and the flow ended at once, where the run ended here while the call
     /// asked for it.
-    fn fill(self, hub: &TunnelClientHub, flow: &str) -> bool {
+    fn fill(self, egress: &Arc<dyn SessionEgress>, flow: &str) -> bool {
         let mut open = open_flows();
         let recorded = match open.get_mut(&self.run) {
             Some(r) if r.life == self.life => {
-                r.flows.push((hub.clone(), flow.to_string()));
+                r.flows.push((Arc::clone(egress), flow.to_string()));
                 true
             }
             _ => false,
         };
         drop(open);
         if !recorded {
-            hub.kill_flow(flow);
+            egress.end_flow(flow);
         }
         recorded
     }
@@ -192,7 +192,7 @@ fn capability() -> String {
 pub(crate) async fn call(
     name: &str,
     vault: &dyn VaultTools,
-    hub: &TunnelClientHub,
+    egress: &Arc<dyn SessionEgress>,
     session: ObjectId,
     fence: u64,
     peer: PeerId,
@@ -204,7 +204,7 @@ pub(crate) async fn call(
     let place = Place::hold((session, fence))?;
     // Refused before the vault is asked where this system cannot say who
     // connects to a loopback port.
-    let admit = super::vault_connect::session_admit(peer)?;
+    let who = admitted(egress, Admits::Account(peer))?;
     let grant = vault
         .net(NetAsk {
             session_id: session,
@@ -234,10 +234,10 @@ pub(crate) async fn call(
             )
         }
     };
-    let (flow, addr) = hub
-        .create_session_flow(ask.exit, target, grant.tunnel_ref(), grant.until, admit)
+    let (flow, addr) = egress
+        .open_flow(ask.exit, target, grant.tunnel_ref(), grant.until, who)
         .await?;
-    if !place.fill(hub, &flow) {
+    if !place.fill(egress, &flow) {
         warn!(%session, fence, %flow, "a session's run ended here while its egress was made: ended it");
         return Err("the session's run ended here while its listener was made".into());
     }
@@ -281,7 +281,7 @@ pub(crate) struct DaemonFlow {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn daemon_flow(
     vault: &dyn VaultTools,
-    hub: &TunnelClientHub,
+    egress: &Arc<dyn SessionEgress>,
     session: ObjectId,
     fence: u64,
     exit: ObjectId,
@@ -290,7 +290,7 @@ pub(crate) async fn daemon_flow(
     ttl_secs: u32,
 ) -> Result<DaemonFlow, String> {
     let place = Place::hold((session, fence))?;
-    let admit = super::vault_connect::daemon_admit()?;
+    egress.admits(&Admits::Daemon)?;
     let grant = vault
         .net(NetAsk {
             session_id: session,
@@ -304,16 +304,16 @@ pub(crate) async fn daemon_flow(
     let Some((host, port)) = grant.dst.clone() else {
         return Err("the vault granted no destination for a forward".into());
     };
-    let (flow, end) = hub
-        .create_session_flow(
+    let (flow, end) = egress
+        .open_flow(
             exit,
             Target::Static { host, port },
             grant.tunnel_ref(),
             grant.until,
-            admit,
+            Admits::Daemon,
         )
         .await?;
-    if !place.fill(hub, &flow) {
+    if !place.fill(egress, &flow) {
         return Err("the session's run ended here while its flow was made".into());
     }
     info!(%session, fence, %flow, %end, grant = %grant.grant_id, "a connect's flow through a device serves this daemon");
@@ -338,11 +338,96 @@ pub(crate) fn drop_run(session: ObjectId, fence: u64) -> usize {
         .remove(&(session, fence))
         .map(|r| r.flows)
         .unwrap_or_default();
-    let ended = flows.iter().filter(|(hub, id)| hub.kill_flow(id)).count();
+    let ended = flows.iter().filter(|(e, id)| e.end_flow(id)).count();
     if ended > 0 {
         info!(%session, fence, ended, "a run's egress listeners ended with it");
     }
     ended
+}
+
+/// FR-90 P8-1a — who a session flow's listener admits: data, not a closure,
+/// so the call can cross the channel to the daemon that holds the listener
+/// once hive's parts run in a worker (§3i "P8-0, as designed", point 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Admits {
+    /// The session's account alone: `net_socks`'s and `net_forward`'s.
+    Account(PeerId),
+    /// This daemon alone: a connect's flow through another device, which a
+    /// proxy dials (P4-6-1b-2).
+    Daemon,
+}
+
+/// FR-90 P8-1a — the tunnel hub's session flows, as hive asks for them: the
+/// seam a worker reaches the daemon's hub through (P8-2). The daemon's is the
+/// hub itself.
+#[async_trait::async_trait]
+pub(crate) trait SessionEgress: Send + Sync {
+    /// Whether this system can say who connects to such a listener: asked
+    /// before the vault is, so a refusal here asks it nothing.
+    fn admits(&self, who: &Admits) -> Result<(), String>;
+    /// A flow through `exit` toward `target`, under `grant` until `until`,
+    /// its listener admitting `who`: its id, and the address it serves on.
+    async fn open_flow(
+        &self,
+        exit: ObjectId,
+        target: Target,
+        grant: SessionGrantRef,
+        until: Instant,
+        who: Admits,
+    ) -> Result<(String, std::net::SocketAddr), String>;
+    /// End the flow `id`, its listener and every connection: whether there
+    /// was one.
+    fn end_flow(&self, id: &str) -> bool;
+    /// Whether the flow `id` is still there.
+    fn holds(&self, id: &str) -> bool;
+}
+
+/// `who`, once `egress` says this system can tell who connects: the admit a
+/// call asks before the vault is asked anything.
+fn admitted(egress: &Arc<dyn SessionEgress>, who: Admits) -> Result<Admits, String> {
+    egress.admits(&who)?;
+    Ok(who)
+}
+
+/// The admit hook `who` is, on this system.
+fn admit_of(who: Admits) -> Result<tunnel_core::flow_listener::Admit, String> {
+    match who {
+        Admits::Account(peer) => super::vault_connect::session_admit(peer),
+        Admits::Daemon => super::vault_connect::daemon_admit(),
+    }
+}
+
+/// The daemon's seam: its tunnel hub itself.
+pub(crate) fn seam(hub: TunnelClientHub) -> Arc<dyn SessionEgress> {
+    Arc::new(hub)
+}
+
+#[async_trait::async_trait]
+impl SessionEgress for TunnelClientHub {
+    fn admits(&self, who: &Admits) -> Result<(), String> {
+        admit_of(who.clone()).map(drop)
+    }
+
+    async fn open_flow(
+        &self,
+        exit: ObjectId,
+        target: Target,
+        grant: SessionGrantRef,
+        until: Instant,
+        who: Admits,
+    ) -> Result<(String, std::net::SocketAddr), String> {
+        let admit = admit_of(who)?;
+        self.create_session_flow(exit, target, grant, until, admit)
+            .await
+    }
+
+    fn end_flow(&self, id: &str) -> bool {
+        self.kill_flow(id)
+    }
+
+    fn holds(&self, id: &str) -> bool {
+        self.has_flow(id)
+    }
 }
 
 #[cfg(test)]
