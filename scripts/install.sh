@@ -519,14 +519,12 @@ install_daemon_macos() {
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
 
-    # The .app kept its legacy internal name through the roomlerd rename —
-# RETIRED-NAME-ANCHOR(5): the macOS .app bundle name is FROZEN (FR-21 D5) —
-# it keys the host's Screen Recording and Accessibility TCC grants, which a
-# rename would silently void, leaving a black screen with no error.
-    # CFBundleExecutable is `roomler-agent`, and CI asserts it, because
-    # renaming would change the binary's TCC identity and force every existing
-    # Mac to re-grant Screen Recording and Accessibility. The old probe led
-    # with `roomlerd`, which never exists, and relied on the fallback.
+    # The bundle is `roomlerd.app` with CFBundleExecutable `roomlerd` since
+    # 0.4.41 (FR-46 P5b); ci.yml asserts this exact path in the daemon plist.
+    # CFBundleIdentifier stays `com.roomler.agent` — it is what TCC attributes
+    # the grants to, and it is not a retired name. The bundle rename cost one
+    # re-approval per Mac, which the .pkg postinstall announces when it sweeps
+    # the old bundle.
     daemon_bin="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -617,10 +615,12 @@ install_macos_privileged_half() {
 macos_permissions_notice() {
     say ""
     say "ONE MANUAL STEP REMAINS — macOS will not grant these without you:"
-# RETIRED-NAME-ANCHOR(2): this is the string macOS SHOWS in the privacy pane;
-# it comes from the frozen bundle, so it must match what the user will see.
-    say "  System Settings → Privacy & Security → Screen Recording  → enable 'roomler-agent'"
-    say "  System Settings → Privacy & Security → Accessibility     → enable 'roomler-agent'"
+    # The panes list the bundle's CFBundleName, `Roomler Daemon` (FR-46 P5b,
+    # 0.4.41) — the same words the .pkg postinstall prints. Until 0.4.41 this
+    # named the pre-rename bundle, and from 0.4.41 to this fix it kept naming
+    # it: an entry that no longer exists in either pane.
+    say "  System Settings → Privacy & Security → Screen & System Audio Recording → enable 'Roomler Daemon'"
+    say "  System Settings → Privacy & Security → Accessibility                   → enable 'Roomler Daemon'"
     say ""
     say "Without Screen Recording the remote screen is blank; without Accessibility the"
     say "remote keyboard and mouse do nothing. Neither reports an error. After granting:"
