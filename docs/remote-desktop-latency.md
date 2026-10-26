@@ -46,7 +46,7 @@ flowchart LR
     end
     CAP --> CONV --> ENC --> STAMP --> Q --> NET --> DEC --> PAINT --> AGE
     PTR -->|input DC| agent
-    STAMP -. "rc:clock echo<br/>(same clock)" .-> AGE
+    STAMP -. rc:clock echo .-> AGE
 ```
 
 ## 2. The seven phases
