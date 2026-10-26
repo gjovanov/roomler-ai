@@ -245,6 +245,12 @@ fn record_inner(
         serde_json::to_writer(&mut f, &payload)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         f.flush()?;
+        // #2955 — make the bytes durable BEFORE the rename publishes the
+        // name. `flush` is a no-op on a raw `File`; without `sync_all` a
+        // power loss or OS crash can persist the rename and the length but
+        // not the data, leaving a NUL-filled sidecar no parser will ever
+        // read (measured: 529 bytes of JSON, then 15,735 NULs).
+        f.sync_all()?;
     }
     // POSIX rename + Windows MoveFileEx(MOVEFILE_REPLACE_EXISTING)
     // are both atomic for same-volume targets. The crashes dir lives
@@ -296,10 +302,10 @@ fn supervisor_crashes_dir() -> std::io::Result<PathBuf> {
 /// directory). Returned tuples carry the on-disk path so the
 /// uploader can delete each on successful POST.
 ///
-/// Skipped files (corrupt JSON, > MAX_PAYLOAD_BYTES, unparseable
-/// timestamp) are logged + left on disk — better to leak a few
-/// orphan sidecars than to silently lose a crash record that might
-/// be deserialisable after a future fix.
+/// Oversized or unreadable files are logged + left on disk — better to
+/// leak a few orphan sidecars than to silently lose a crash record. A
+/// file that does not parse is moved ONCE into `malformed/` (#2955): kept
+/// for a later look, never re-warned on every start.
 pub fn pending_all() -> Vec<(PathBuf, AgentCrashPayload)> {
     let mut out: Vec<(PathBuf, AgentCrashPayload)> = Vec::new();
     let mut seen_dirs: Vec<PathBuf> = Vec::with_capacity(2);
@@ -354,16 +360,42 @@ fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
         };
         match serde_json::from_slice::<AgentCrashPayload>(&bytes) {
             Ok(payload) => out.push((path, payload)),
-            Err(e) => {
-                tracing::warn!(
+            // #2955 — moved aside ONCE: kept for a later look, but never
+            // re-read and re-warned on every start. A torn write (a power
+            // loss mid-record) is NUL-filled, and no future parser reads it.
+            Err(e) => match quarantine(dir, &path) {
+                Ok(moved) => tracing::warn!(
+                    file = %path.display(),
+                    moved_to = %moved.display(),
+                    error = %e,
+                    "crash_recorder: malformed sidecar moved aside"
+                ),
+                Err(qe) => tracing::warn!(
                     file = %path.display(),
                     error = %e,
+                    move_error = %qe,
                     "crash_recorder: skipping malformed sidecar"
-                );
-            }
+                ),
+            },
         }
     }
     out
+}
+
+/// #2955 — where a sidecar that does not parse goes: a subdirectory, which
+/// [`scan_dir`] never reads (it does not recurse).
+const MALFORMED_DIR: &str = "malformed";
+
+/// Move a malformed sidecar into [`MALFORMED_DIR`] under `dir`.
+fn quarantine(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("sidecar path has no file name"))?;
+    let target_dir = dir.join(MALFORMED_DIR);
+    fs::create_dir_all(&target_dir)?;
+    let target = target_dir.join(name);
+    fs::rename(path, &target)?;
+    Ok(target)
 }
 
 // ─── Crash-loop suppression ────────────────────────────────────────────────
@@ -1194,5 +1226,69 @@ mod tests {
         // None and a record call to log spam would race other tests).
         let _ = record_with_log_tail as fn(CrashReason, &str, WriterContext, Option<String>);
         let _ = record as fn(CrashReason, &str, WriterContext);
+    }
+
+    // ─── #2955: torn sidecars ────────────────────────────────────────────────
+
+    /// A valid sidecar named `{ts}-{pid}.json`, the shape `record_inner` writes.
+    fn write_valid_sidecar(dir: &Path, unix_ts: i64, pid: u32) {
+        let payload = AgentCrashPayload {
+            crashed_at_unix: unix_ts,
+            reason: CrashReason::SupervisorDetected,
+            summary: "worker exit".to_string(),
+            log_tail: String::new(),
+            agent_version: "0.0.0-test".to_string(),
+            os: "test".to_string(),
+            hostname: "test".to_string(),
+            pid,
+            suppressed_since_last: 0,
+        };
+        let bytes = serde_json::to_vec(&payload).expect("serialise");
+        std::fs::write(dir.join(format!("{unix_ts}-{pid}.json")), bytes).expect("write sidecar");
+    }
+
+    /// A torn write, as a power loss leaves it: a JSON prefix, then NULs.
+    fn write_torn_sidecar(dir: &Path, unix_ts: i64, pid: u32) -> PathBuf {
+        let path = dir.join(format!("{unix_ts}-{pid}.json"));
+        let mut bytes = br#"{"crashed_at_unix":"#.to_vec();
+        bytes.extend_from_slice(&[0u8; 512]);
+        std::fs::write(&path, bytes).expect("write torn sidecar");
+        path
+    }
+
+    /// #2955 — a torn sidecar is moved into `malformed/` on the first scan and
+    /// is not returned, while the valid one beside it still is; a second scan
+    /// finds nothing left to move or warn about.
+    #[test]
+    fn a_torn_sidecar_is_moved_aside_once() {
+        let dir = tempdir_for_test();
+        write_valid_sidecar(&dir, 1_700_000_000, 1);
+        let torn = write_torn_sidecar(&dir, 1_700_000_100, 2);
+
+        let first = scan_dir(&dir);
+        assert_eq!(first.len(), 1, "only the valid sidecar is returned");
+        assert_eq!(first[0].1.pid, 1);
+        assert!(!torn.exists(), "the torn sidecar left the scanned dir");
+        let moved = dir.join(MALFORMED_DIR).join(torn.file_name().unwrap());
+        assert!(moved.exists(), "kept for a later look");
+
+        let second = scan_dir(&dir);
+        assert_eq!(second.len(), 1);
+        assert!(moved.exists(), "a second scan leaves it where it is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2955 — when the move fails, the sidecar stays where it was, as before
+    /// the quarantine existed: skipped, never lost.
+    #[test]
+    fn a_torn_sidecar_that_cannot_move_stays_put() {
+        let dir = tempdir_for_test();
+        // A FILE where the quarantine directory would go: create_dir_all fails.
+        std::fs::write(dir.join(MALFORMED_DIR), b"not a directory").unwrap();
+        let torn = write_torn_sidecar(&dir, 1_700_000_100, 2);
+
+        assert!(scan_dir(&dir).is_empty());
+        assert!(torn.exists(), "the sidecar was not lost");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
