@@ -38,6 +38,7 @@ use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{IndexSet, index, index_partial, index_ttl, index_unique_partial};
 use roomler_core::{AgentSocketHooks, Capabilities, Core, Hooks, Job, Module, TenantCtx};
 
+pub mod connect;
 pub mod dao;
 pub mod intake;
 pub mod model;
