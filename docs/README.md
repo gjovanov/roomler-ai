@@ -142,7 +142,7 @@ same accounts and server.*
 | Doc | What it covers |
 |---|---|
 | [real-time.md](real-time.md) | The WebSocket surfaces: user events, presence, mediasoup signalling, the `rc:*` agent protocol, DERP |
-| [ui.md](ui.md) | Frontend map: views, stores, composables, the remote-desktop viewer, observability components, and the devices list's "needs a person" chips (a credential not renewing, FR-103; a device not updating, FR-106). On phones and tablets (FR-116): what each breakpoint is for, full-screen dialogs, stacked tables, settings as gates, detail on demand, nothing hover-only, devices by their display name. FR-120's four rules: a disabled control says why as text, facts reachable by a tap, 36 px touch targets on a coarse pointer, and a phone page at most twice its desktop height (one-line rows that open on a tap, `useOpenRows`) |
+| [ui.md](ui.md) | Frontend map: views, stores, composables, the remote-desktop viewer, observability components, and the devices list's "needs a person" chips (a credential not renewing, FR-103; a device not updating, FR-106). On phones and tablets (FR-116): what each breakpoint is for, full-screen dialogs, stacked tables, settings as gates, detail on demand, nothing hover-only, devices by their display name. FR-120's four rules: a disabled control says why as text, facts reachable by a tap, 36 px touch targets on a coarse pointer, and a phone page at most twice its desktop height (one-line rows that open on a tap, `useOpenRows`). Calls: a black tile says why (FR-124): a camera sending a black picture (a covered lens) is named on its tile and, for your own, by a warning over the call; a tile the browser refused to start plays muted with "Tap for sound" until the next gesture |
 
 ## 🐝 Agent sessions (Hive)
 
