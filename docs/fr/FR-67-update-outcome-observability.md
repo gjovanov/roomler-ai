@@ -11,7 +11,7 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:130-151`) persisted to
+InstallerFailed | Timeout`, `post_install.rs:131-151`) persisted to
 `<log_dir>/last-install.json` (`post_install.rs:166`).
 
 Measured on the fleet:
@@ -125,7 +125,7 @@ flowchart LR
 |---|---|
 | The wire word, `LastInstallStatus` — the five verdicts spelled as the file spells them, plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:465`; `NodeStatus.last_install`, `:439` |
 | The read, fresh from disk every time | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1168`), its pure half `summarize` (`:1181`) |
-| The startup line and its level | `log_at_startup` (`:1238`), `startup_level` (`:1222`); called right after `agent starting` (`agents/roomlerd/src/main.rs:3651`) |
+| The startup line and its level | `log_at_startup` (`:1238`), `startup_level` (`:1222`); called right after `agent starting` (`agents/roomlerd/src/main.rs:3679`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:858`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2819`), printed under `version` (`:2429`) |
 
