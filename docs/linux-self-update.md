@@ -131,8 +131,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/main.rs:5633`, called
-at `main.rs:5610`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/main.rs:5667`, called
+at `main.rs:5644`):
 
 ```mermaid
 sequenceDiagram
@@ -550,9 +550,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3313`) | after every check that installs nothing; at the start after an update (`:3194`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3245`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3935`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3122`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3368`) | after every check that installs nothing; at the start after an update (`:3249`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3300`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3990`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3177`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in

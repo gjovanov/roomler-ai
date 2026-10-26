@@ -64,8 +64,8 @@ flowchart TD
 - **Linux: the companion tracks the daemon**, the invariant Windows has had since S1a (`companion.rs:3-29`). The one
   process that installs updates as root on the host also moves an installed `roomler-desktop` package to its **own**
   version (`CARGO_PKG_VERSION`), never "latest": the companion follows the daemon, not the feed.
-  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3564`, FR-96). That is a system install's root
-    daemon, or `roomlerd update-helper` (`updater.rs:3834`) for a per-user install. A per-user daemon that sees the
+  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3619`, FR-96). That is a system install's root
+    daemon, or `roomlerd update-helper` (`updater.rs:3889`) for a per-user install. A per-user daemon that sees the
     skew touches the helper's wake file (`/var/tmp/roomler-update-check`): a wake, never an instruction. A non-root
     daemon with no helper skips, with one log line, never a password prompt (D3).
   - **What:** the package database that owns the companion picks the format (`installed_version_inner`,
@@ -88,7 +88,7 @@ flowchart TD
     after a sync, so the dashboard's skew clears at the next heartbeat.
 - **When:** at the owner's start, and again on a 4 h tick, so a failed sync no longer waits for the next restart.
 - **Windows: the same retry.** `refresh_if_stale` runs once, at the start of whichever process owns the refresh (#1686:
-  the SCM host, `win_service/mod.rs:479`, or the worker, `main.rs:3848`). It now runs on the same 4 h tick in that
+  the SCM host, `win_service/mod.rs:479`, or the worker, `main.rs:3868`). It now runs on the same 4 h tick in that
   process. It costs one file read when the version marker matches.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` on both platforms gives back today's behaviour.
 
