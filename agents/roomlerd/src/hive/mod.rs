@@ -81,6 +81,10 @@
 mod checkpointer;
 #[cfg(unix)]
 mod child;
+/// FR-90 P4-6-1b-1 — `roomler_connect`, the device's half: what the
+/// organization's map says reaching an entity takes, opened from this device
+/// when a probe from here found it.
+mod connect_tool;
 /// FR-90 P3b-1b-1 — a session's egress proxy: the fronts Claude Code's
 /// sandbox sends its commands through, each host decided by the vault. No
 /// run starts one before P3b-1b-2.

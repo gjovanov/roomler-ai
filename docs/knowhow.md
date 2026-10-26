@@ -38,11 +38,13 @@ sessions read it too, through their toolbelt.
 > of an entity, a row of each probe kind (P4-5-4b), on its card beside each
 > fact's last word (§13.5); and P4-6-1a, a session's connect, the server's
 > half of `roomler_connect`: the engine, upstream and credential an entity's
-> confirmed facts say, and the paths its devices measured (§13.6).** People,
-> the sync, scans and sessions' proposals fill the map, probes verify it, and
-> what nobody confirms ages.
-> Windows (P4-3b-4) and the toolbelt's `roomler_connect` (P4-6-1b) come with
-> the steps that build them (§14).
+> confirmed facts say, and the paths its devices measured (§13.6); and
+> P4-6-1b-1, the toolbelt's `roomler_connect` from the session's own device,
+> opened when a probe from here found it (§13.7).** People, the sync, scans
+> and sessions' proposals fill the map, probes verify it, and what nobody
+> confirms ages.
+> Windows (P4-3b-4) and `roomler_connect` through another device (P4-6-1b-2)
+> come with the steps that build them (§14).
 
 ## 1. A map, not a gate
 
@@ -874,23 +876,25 @@ a session proposed, each for what it is.
 > on, so a knowhow mounted without hive finds no session and refuses every
 > question `not_located`; the `knowhow` build feature implies `hive`.
 
-### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b, P4-5-2b)
+### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b, P4-5-2b, P4-6-1b-1)
 
 The device's half ([`knowhow_tools.rs`](../agents/roomlerd/src/hive/knowhow_tools.rs)):
-four tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
-`mcp__roomler__knowhow_get`, (P4-4-2b) `mcp__roomler__knowhow_propose` and
-(P4-5-2b) `mcp__roomler__knowhow_verify`, compiled wherever agent sessions are
+five tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
+`mcp__roomler__knowhow_get`, (P4-4-2b) `mcp__roomler__knowhow_propose`,
+(P4-5-2b) `mcp__roomler__knowhow_verify` and (P4-6-1b-1)
+`mcp__roomler__roomler_connect` (§13.7), compiled wherever agent sessions are
 (Linux, macOS, Windows), apart from the scanner.
 
 | Piece | Design |
 |---|---|
 | the verb | every build that runs sessions advertises `knowhow-tools`, so its server tells it whether the map is there |
 | the word | the device forgets `rc:knowhow.served` at every primary connection and keeps the tools it names from that frame on, each only when this build knows it |
-| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment. Its settings allow the reads and a proposal outright (`permissions.allow`), since neither asks a person (decision 39), and ask a person for each verify (`permissions.ask`, decision 54), since it aims a connection from this device |
+| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment. Its settings allow the reads and a proposal outright (`permissions.allow`), since neither asks a person (decision 39), and ask a person for each verify and (P4-6-1b-1) each connect (`permissions.ask`, decision 54, [`ASKED`](../agents/roomlerd/src/hive/knowhow_tools.rs#L71)), since each aims something from this device: a probe, an endpoint signed in with a credential |
 | the questions | on the primary's connection, a `req_id` each, the session and its fence attached by the daemon, never by the model; each answer matched to its question, 15 s each |
 | the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on. `knowhow_get`'s description says what a card's `verified` and (P4-5-4) `probes` mean: the last probe's word on a fact, and each device's last finding of each kind (§13.5) |
 | a proposal unanswered | asked and never answered within its 15 s, it may have been written all the same. The model is told so, and that `knowhow_get` shows whether it was: proposing it again is safe, since one already there is refused `exists` |
-| a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L289)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L584)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
+| a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L307)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L648)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
+| a connect (P4-6-1b-1) | `roomler_connect {kind, key}`, routed apart from the reads, since it needs the run's vault, its command target and its account ([`reach_entity`](../agents/roomlerd/src/hive/toolbelt.rs#L1318)). It asks `rc:knowhow.connect` ([`Client::connect`](../agents/roomlerd/src/hive/knowhow_tools.rs#L335)) and opens the access from this device as §13.7 says |
 
 > [!WARNING]
 > **A tool the server did not name is an unknown tool.** A newer agent may know
@@ -1483,12 +1487,57 @@ agent keeps only the tools it knows (§12.1).
 > who must add the fact needs its path. The tool's `no_access` is read from
 > `missing` (P4-6-1b).
 
+### 13.7 A session's connect, from this device (P4-6-1b-1)
+
+The toolbelt's `roomler_connect` takes the access §13.6 answers and opens it
+from the session's own device, a person approving each call
+([`call`](../agents/roomlerd/src/hive/connect_tool.rs#L215)). What it does is a
+pure function of the access ([`plan`](../agents/roomlerd/src/hive/connect_tool.rs#L106)).
+Through another device is P4-6-1b-2's.
+
+```mermaid
+flowchart TD
+    A["rc:knowhow.access"] --> M{"missing, or an engine<br/>this build does not speak?"}
+    M -->|yes| N["no_access: each path named,<br/>and what a session only proposed"]
+    M -->|no| H{"this device's word"}
+    H -->|verified| O["open it from here"]
+    H -->|unmeasured| P["one tcp probe from here:<br/>the session's knowhow_verify"]
+    P -->|ok| O
+    P -->|anything else| E["no path from this device:<br/>the devices that reached it named"]
+    H -->|unreachable| E
+    O --> T{"engine"}
+    T -->|tcp| D["where to dial, no credential"]
+    T -->|"postgres · mongodb · http · kubernetes · ssh"| V["vault_connect's endpoint, toward the<br/>upstream with the credential"]
+```
+
+| Piece | As built |
+|---|---|
+| a path from here | `vault_connect`'s endpoint, asked with the access's credential as its `handle`, its engine and upstream, and its options `database`, `auth`, `auth_source` and `ca` ([`connect_args`](../agents/roomlerd/src/hive/connect_tool.rs#L193)). Its leases, its endpoint served only to the session's account, and its connection string with no credential in it are `vault_connect`'s own, as for a session that names them by hand. The answer adds the entity, `path: direct`, and a probe asked first |
+| `tcp` | no credential and no endpoint: the answer says where to dial, from this device |
+| the probe from here | when this device's word is `unmeasured`: one `tcp` probe, asked as the session's own `knowhow_verify` is (§13.3), so it is recorded on the map. Only `ok` opens anything |
+| no path from here | nothing is opened. The answer says why (the last probe found it unreachable, or the probe from here found something else, or none could be asked) and names each other device that reached it lately, by its id, probe kind, carrier and time ([`elsewhere`](../agents/roomlerd/src/hive/connect_tool.rs#L141)) |
+| `no_access` | each path the map lacks, which of them a session only proposed, and what a person adds ([`no_access`](../agents/roomlerd/src/hive/connect_tool.rs#L83)). An answer naming no engine this build speaks, no upstream, or no credential for an engine that needs one opens nothing either, whatever the server said |
+
+> [!IMPORTANT]
+> **Measured, never assumed.** Nothing is dialled that no probe from this
+> device found. A device whose owner has not listed the target in
+> `knowhow_probe_reach` never finds it from here (its probe is `not_allowed`),
+> so it opens nothing toward it through the map, though a session naming the
+> same handle and upstream to `vault_connect` by hand still could.
+
+> [!NOTE]
+> **The probe from here needs `KNOWHOW_EDIT`.** It is the session's own
+> verify, and a probe writes what it measured onto the map (decision 54). A
+> starter who may only read the map has sessions that connect when this
+> device's last finding is fresh and `ok`, and are told what the devices
+> found otherwise.
+
 ## 14. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-6-1b | `roomler_connect(entity)`, the device's half: the toolbelt's tool, a person approving each call, taking the access §13.6 answers; its credential leased as `vault_connect`'s, and its path this device's own, a probe from here, then a device's through a forward whose proxy leg has no listener. Designed in the FR-90 spec's §3e "P4-6, `roomler_connect`, as designed" (P4-6-0) |
+| P4-6-1b-2 | `roomler_connect` through another device: the session's flow with no listener, its stream the credential proxies dial through, TLS verified end to end, behind P8's `SessionEgress` seam. Designed in the FR-90 spec's §3e "P4-6, `roomler_connect`, as designed" (P4-6-0) |
 | P4-6-2 | a person's `roomler connect <kind>/<key>`, if decision 62 asks for it |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |

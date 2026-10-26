@@ -1285,6 +1285,11 @@ async fn knowhow_tool(
     let key = id.to_string();
     let asked = async {
         match &ctx.knowhow {
+            // P4-6-1b — the one knowhow tool that opens something: it needs
+            // the run's vault, its command target and its account.
+            Some(k) if name == roomler_ai_remote_control::knowhow::TOOL_CONNECT => {
+                reach_entity(&ctx, k.as_ref(), &args).await
+            }
             Some(k) => {
                 super::knowhow_tools::call(k.as_ref(), ctx.session, ctx.fence, &name, &args).await
             }
@@ -1305,6 +1310,43 @@ async fn knowhow_tool(
         Err(why) => json!({"content": [{"type": "text", "text": why}], "isError": true}),
     };
     let _ = out.send(reply(&id, result)).await;
+}
+
+/// FR-90 P4-6-1b — `roomler_connect`: what the map says reaching the entity
+/// takes, opened from here with `vault_connect`'s endpoint over the run's
+/// vault ([`super::connect_tool`]).
+async fn reach_entity(
+    ctx: &Ctx,
+    knowhow: &dyn super::knowhow_tools::KnowhowTools,
+    args: &Value,
+) -> Result<Value, String> {
+    let open = |asked: Value| async move {
+        #[cfg(feature = "vault")]
+        {
+            let Some(vault) = &ctx.vault else {
+                return Err(
+                    "this device lends no vault values: its owner has not turned its \
+                            vault on (vault_enabled)"
+                        .to_string(),
+                );
+            };
+            super::vault_connect::call(
+                Arc::clone(vault),
+                ctx.session,
+                ctx.fence,
+                ctx.exec.as_ref(),
+                &ctx.peer,
+                &asked,
+            )
+            .await
+        }
+        #[cfg(not(feature = "vault"))]
+        {
+            let _ = asked;
+            Err("this build lends no vault values".to_string())
+        }
+    };
+    super::connect_tool::call(knowhow, ctx.session, ctx.fence, args, open).await
 }
 
 /// What the vault answers one vault tool call, for the session's run.

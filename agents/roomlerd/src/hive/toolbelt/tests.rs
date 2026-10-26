@@ -5176,6 +5176,28 @@ impl super::super::knowhow_tools::KnowhowTools for FakeKnowhow {
         ));
         Ok(json!({"probe_id": "p1", "state": "ok", "rtt_ms": 3}))
     }
+
+    /// P4-6-1b — a `tcp` entity this device reached lately: no credential,
+    /// so no vault is needed to answer where to dial.
+    async fn access(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((session, fence, format!("access {kind}/{key}")));
+        Ok(json!({
+            "entity": {"kind": kind, "key": key},
+            "engine": "tcp", "upstream": "10.0.4.12:6379", "host": "10.0.4.12", "port": 6379,
+            "credential": null, "options": {}, "missing": [], "proposed": [],
+            "here": "verified", "paths": [{"device_id": "6adc000000000000000000ab", "here": true,
+            "kind": "tcp", "carrier": "direct"}], "seen": [], "fresh_secs": 86400,
+        }))
+    }
 }
 
 fn knowhow_run(session: ObjectId, knowhow: Option<Arc<FakeKnowhow>>) -> Run {
@@ -5412,6 +5434,72 @@ async fn a_verify_is_offered_on_the_servers_word_and_asked_as_the_run() {
     assert_eq!(
         map.asked(),
         [(sid, 4, "verify endpoint/db tls".to_string())],
+        "the run's own session and fence; one naming no kind asks nothing"
+    );
+}
+
+/// FR-90 P4-6-1b — `roomler_connect` is offered only where the server names
+/// it, and reaches the connect, not the knowhow reads' chain: the map is asked
+/// for the access as the run's session at its fence, and a `tcp` entity this
+/// device reached is answered where to dial, with no vault in the run. The
+/// person is asked by the session's settings
+/// (`the_settings_ask_a_person_for_each_verify`).
+#[tokio::test]
+async fn a_connect_is_offered_on_the_servers_word_and_asked_as_the_run() {
+    use roomler_ai_remote_control::knowhow::{
+        TOOL_CONNECT, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY,
+    };
+    let cache = || json!({"kind": "service", "key": "cache"});
+    let four = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY]);
+    let r = belt_running(
+        me(),
+        knowhow_run(ObjectId::new(), Some(four.clone())),
+        quick(),
+    );
+    let mut c = Client::connect(&r).await;
+    c.send(tool_call(1, "roomler_connect", cache())).await;
+    assert_eq!(
+        c.recv().await["error"]["code"],
+        -32602,
+        "a server that did not name it has no such tool"
+    );
+    assert!(four.asked().is_empty(), "and asked nobody");
+
+    let map = FakeKnowhow::offering(&[
+        TOOL_SEARCH,
+        TOOL_GET,
+        TOOL_PROPOSE,
+        TOOL_VERIFY,
+        TOOL_CONNECT,
+    ]);
+    let sid = ObjectId::new();
+    let b = belt_running(me(), knowhow_run(sid, Some(map.clone())), quick());
+    let mut c = Client::connect(&b).await;
+    assert_eq!(
+        listed(&mut c).await,
+        [
+            "approve",
+            "knowhow_search",
+            "knowhow_get",
+            "knowhow_propose",
+            "knowhow_verify",
+            "roomler_connect"
+        ]
+    );
+    c.send(tool_call(2, "roomler_connect", cache())).await;
+    let reached = c.recv().await;
+    assert!(reached["result"].get("isError").is_none(), "{reached}");
+    let text: Value =
+        serde_json::from_str(reached["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["connection"], "10.0.4.12:6379");
+    assert_eq!(text["path"], "direct");
+    assert_eq!(text["entity"], cache());
+    c.send(tool_call(3, "roomler_connect", json!({"key": "cache"})))
+        .await;
+    assert_eq!(c.recv().await["result"]["isError"], true);
+    assert_eq!(
+        map.asked(),
+        [(sid, 4, "access service/cache".to_string())],
         "the run's own session and fence; one naming no kind asks nothing"
     );
 }
