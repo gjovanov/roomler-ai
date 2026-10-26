@@ -8281,7 +8281,7 @@ async fn media_pump_ffmpeg_dc(
                     verdict: None,
                     pipe_covers,
                 };
-                if state.decide(inputs, class) {
+                if state.decide_with_retry(inputs, class, viewer_report.take_retrial()) {
                     // FR-119 P2b-12 — the decision's refusal, not the
                     // viewer's answer (which holds it back until the stream
                     // is down at the granted rate), and the two numbers the
@@ -10364,7 +10364,7 @@ fn attach_control_handler(
                     // is what knows the session's cap and transport.
                     match crate::encode::frame_rate::parse_ask(&val) {
                         Some(fps) => {
-                            viewer_report.store_fps_ask(fps);
+                            viewer_report.store_fps_ask_from(fps, &val);
                             info!(%session_id, fps, "control: rc:fps asked");
                         }
                         None => {

@@ -7205,16 +7205,16 @@ export function useRemoteControl(
    *  advertises `fps-high` only: an older one cannot parse `rc:fps`. No-op while
    *  the channel is closed; `channels.control.onopen` calls this, so a reload
    *  re-asks without a click. The answer comes back in `rc:video-info`. */
-  function sendFrameRatePreference() {
+  function sendFrameRatePreference(retry = false) {
     if (!agentOffersHighRefresh(agent?.value?.capabilities?.video)) return
-    sendControl(fpsWireMessage(frameRate.value))
+    sendControl(fpsWireMessage(frameRate.value, retry))
   }
 
-  /** FR-119 P1 — the viewer picked a frame rate. */
-  function setFrameRate(next: FrameRate) {
+  /** FR-119 P1 — the viewer picked a frame rate (P2b-17b: `retry` = try it again). */
+  function setFrameRate(next: FrameRate, retry = false) {
     frameRate.value = next
     persistFrameRate(next)
-    sendFrameRatePreference()
+    sendFrameRatePreference(retry)
   }
 
   /** FR-119 P1 — the agent's answer, from the latest `rc:video-info`; `null`

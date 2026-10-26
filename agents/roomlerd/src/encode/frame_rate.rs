@@ -21,6 +21,17 @@
 /// like it lacks the feature.
 pub const CAP: &str = "fps-high";
 
+/// P2b-17b — this agent acts on `rc:fps {fps, retry: true}`: it forgets the
+/// session's verdict for the class asked for and decides again, so a class
+/// refused as unproven is granted as a trial. The viewer offers "try again"
+/// only to an agent advertising it, because an older one ignores the field.
+///
+/// ⚠️ A wire spelling, matched by equality, like [`CAP`].
+pub const RETRY_CAP: &str = "fps-retry";
+
+/// Every frame-rate verb this agent advertises when `fps-high` is on.
+pub const CAPS: [&str; 2] = [CAP, RETRY_CAP];
+
 /// The rates a viewer may ask for.
 pub const CHOICES: [u32; 3] = [60, 120, 144];
 
@@ -29,6 +40,18 @@ pub const CHOICES: [u32; 3] = [60, 120, 144];
 pub fn parse_ask(msg: &serde_json::Value) -> Option<u32> {
     let fps = u32::try_from(msg.get("fps")?.as_u64()?).ok()?;
     CHOICES.contains(&fps).then_some(fps)
+}
+
+/// P2b-17b — whether an `rc:fps` message asks to trial its rate again. Only a
+/// literal `true` counts: anything else is an ordinary ask.
+pub fn parse_retry(msg: &serde_json::Value) -> bool {
+    msg.get("retry").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// Whether an agent's video verbs name any frame-rate verb ([`CAPS`]).
+#[cfg(test)]
+pub(crate) fn any_verb_in(features: &[String]) -> bool {
+    features.iter().any(|f| CAPS.contains(&f.as_str()))
 }
 
 /// Why the stream runs below what the viewer asked for.
@@ -408,6 +431,18 @@ impl RateState {
         self.decided = Some((inputs, class, g));
         self.sync_trial();
         changed
+    }
+
+    /// P2b-17b — [`Self::decide`], after forgetting this session's verdict for
+    /// `class` when the viewer asked to try it again (`rc:fps {retry: true}`).
+    /// A class refused as unproven is then granted as a trial, and the trial's
+    /// verdict replaces the cached one, as any trial's does. Asking again for a
+    /// class with no verdict changes nothing.
+    pub fn decide_with_retry(&mut self, inputs: GrantInputs, class: ClassKey, retry: bool) -> bool {
+        if retry {
+            self.verdicts.retain(|(k, _)| k != &class);
+        }
+        self.decide(inputs, class)
     }
 
     /// The stream now runs at `fps`: a swap was adopted, an encoder opened at
@@ -1187,6 +1222,54 @@ mod tests {
             s.video_info_fields(),
             r#","fps":60,"fps_asked":120,"fps_reason":"unproven""#
         );
+    }
+
+    /// P2b-17b — a retry forgets the session's verdict for the class asked for,
+    /// so a class refused as unproven is granted again, as a trial. Without the
+    /// retry, or for another class, nothing moves.
+    #[test]
+    fn a_retry_trials_a_failed_class_again() {
+        let k = class("av1_nvenc", 2560, 144);
+        let other = class("av1_nvenc", 2560, 120);
+        let mut s = RateState::new(
+            60,
+            vec![
+                (k.clone(), Verdict::Failed),
+                (other.clone(), Verdict::Failed),
+            ],
+        );
+        s.decide_with_retry(ask(144), k.clone(), false);
+        assert_eq!(s.want(), 60, "no retry: still refused");
+        assert!(
+            s.decide_with_retry(ask(144), k.clone(), true),
+            "the retry changes the decision"
+        );
+        assert_eq!(s.want(), 144, "granted again");
+        s.running_at(144);
+        assert!(s.trial_running(), "as a trial");
+        s.decide_with_retry(ask(120), other, false);
+        assert_eq!(s.want(), 60, "another class keeps its verdict");
+    }
+
+    /// P2b-17b — only a literal `retry: true` asks to trial again, and the two
+    /// verbs keep their wire spellings.
+    #[test]
+    fn only_a_literal_true_retries() {
+        let retry = |v: serde_json::Value| parse_retry(&v);
+        assert!(retry(
+            serde_json::json!({"t": "rc:fps", "fps": 144, "retry": true})
+        ));
+        assert!(!retry(serde_json::json!({"t": "rc:fps", "fps": 144})));
+        assert!(!retry(
+            serde_json::json!({"t": "rc:fps", "fps": 144, "retry": false})
+        ));
+        assert!(!retry(
+            serde_json::json!({"t": "rc:fps", "fps": 144, "retry": "true"})
+        ));
+        assert!(!retry(
+            serde_json::json!({"t": "rc:fps", "fps": 144, "retry": 1})
+        ));
+        assert_eq!(CAPS, ["fps-high", "fps-retry"]);
     }
 
     /// A new class while a trial runs (the geometry moved to another bucket)

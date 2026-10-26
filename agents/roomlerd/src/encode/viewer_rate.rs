@@ -369,6 +369,9 @@ pub struct ViewerFeedback {
     /// it never asked. Unlike the three reports above this is not a per-window
     /// signal: it stands until the viewer asks again, so it is read, never taken.
     fps_asked: std::sync::atomic::AtomicU32,
+    /// FR-119 P2b-17b — the viewer asked to trial its rate again
+    /// (`rc:fps {retry: true}`); taken by the pump's next decision.
+    retrial: std::sync::atomic::AtomicBool,
 }
 
 impl ViewerFeedback {
@@ -399,6 +402,23 @@ impl ViewerFeedback {
             0 => None,
             fps => Some(fps),
         }
+    }
+
+    /// FR-119 P2b-17b — record the ask an `rc:fps` message carries, and whether
+    /// it asks to trial that rate again (`retry: true`).
+    pub fn store_fps_ask_from(&self, fps: u32, msg: &serde_json::Value) {
+        self.store_fps_ask(fps);
+        if crate::encode::frame_rate::parse_retry(msg) {
+            self.retrial
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(fps, "FR-119: the viewer asked to trial this rate again");
+        }
+    }
+
+    /// FR-119 P2b-17b — consume a pending ask to trial again.
+    pub fn take_retrial(&self) -> bool {
+        self.retrial
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The reported fps WITHOUT consuming the report — session telemetry
@@ -1202,5 +1222,22 @@ mod tests {
         assert!(!l.observe(62, 2, 0));
         assert_eq!(l.floor_ms(), Some(2), "nothing to reject against");
         assert_eq!(l.implausible_samples(), 0);
+    }
+
+    /// FR-119 P2b-17b — a retry is stored with its ask and taken once; an
+    /// ordinary ask stores no retry.
+    #[test]
+    fn a_retry_is_taken_once() {
+        let f = ViewerFeedback::new();
+        f.store_fps_ask_from(144, &serde_json::json!({"t": "rc:fps", "fps": 144}));
+        assert_eq!(f.fps_ask(), Some(144));
+        assert!(!f.take_retrial(), "an ordinary ask");
+        f.store_fps_ask_from(
+            144,
+            &serde_json::json!({"t": "rc:fps", "fps": 144, "retry": true}),
+        );
+        assert_eq!(f.fps_ask(), Some(144));
+        assert!(f.take_retrial());
+        assert!(!f.take_retrial(), "taken once");
     }
 }
