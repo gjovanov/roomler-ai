@@ -392,9 +392,9 @@ cascade's guarantees while replacing its reactive counters:
   WireGuard only with its whole 4-byte header, a type and three zero bytes, which a
   greased packet matches only if its random connection ID also opens on three zero bytes;
   and the DERP endpoints advertise no greasing, so nobody greases toward them
-  (`derp_endpoint_config`, [`quic.rs:241`](../crates/tunnel-core/src/transport/quic.rs#L241);
+  (`derp_endpoint_config`, [`quic.rs:254`](../crates/tunnel-core/src/transport/quic.rs#L254);
   the measurement is `quic_over_derp_never_clears_the_fixed_bit`,
-  [`quic.rs:1140`](../crates/tunnel-core/src/transport/quic.rs#L1140)).
+  [`quic.rs:1191`](../crates/tunnel-core/src/transport/quic.rs#L1191)).
   ⚠️ During a rollout an old peer still advertises greasing, so a fixed build still
   greases toward it, and the old peer still reads by the first byte: the old-to-fixed
   direction is clean at once, the fixed-to-old one once the old end upgrades.
