@@ -3412,6 +3412,12 @@ is silent while it waits.
   (`agent_crashes.summary` on the server). The forced exit loses its
   own log line about 1 stall in 6, measured on a Windows dev box on
   2026-10-19.
+- The sidecar is fsync'd before its rename
+  (`crates/agent-core/src/crash_recorder.rs:253`, #2955). Without that,
+  a power loss could persist a NUL-filled file that no parser reads; one
+  was seen, skipped at every start for two weeks. A sidecar that does
+  not parse is now moved once into `crashes/malformed/`
+  (`crash_recorder.rs:390`), so it is kept but not re-warned.
 
 **What the first named stall found** (#2551). The first stall to name
 its stage came on 2026-10-22, under 0.4.151, and read
