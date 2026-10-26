@@ -930,7 +930,7 @@
     <!-- FR-125 — immersive: the toolbar and the strip above are an overlay
          out of view, and this tab slides them down over the stage. Over it,
          not beside it: the stage keeps its size, so nothing re-sends
-         rc:resolution. 48 × 36 px of hit area (FR-120's D1), a 40 × 14 px tab. -->
+         rc:resolution. 48 × 36 px of hit area (FR-120's D1), a 44 × 18 px tab. -->
     <button
       v-if="immersive && !chromeRevealed"
       type="button"
@@ -5811,15 +5811,22 @@ onBeforeUnmount(() => {
   justify-content: center;
   cursor: pointer;
 }
+/* The tab sits on whatever the remote desktop shows at its top edge — a dark
+   panel as often as a light title bar — so it is a surface-coloured pill with a
+   shadow, like the full-screen chip: a translucent dark tab vanished against a
+   GNOME top panel in the first field run. */
 .rc-pulltab-tab {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 14px;
-  border-radius: 0 0 8px 8px;
-  background: rgba(0, 0, 0, 0.55);
-  color: rgba(255, 255, 255, 0.85);
+  width: 44px;
+  height: 18px;
+  border-radius: 0 0 10px 10px;
+  background: rgb(var(--v-theme-surface));
+  color: rgb(var(--v-theme-on-surface));
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(0, 0, 0, 0.12);
 }
 .rc-pulltab:focus-visible .rc-pulltab-tab {
   outline: 2px solid rgb(var(--v-theme-primary));
