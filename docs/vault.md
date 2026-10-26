@@ -882,7 +882,7 @@ no answer, and the daemon stops waiting for it.
 > - **Offered and allowed together.** The daemon decides once, at a run's
 >   launch, whether its toolbelt offers the tools, and writes the settings'
 >   allow from the same answer
->   ([`supervisor.rs:4390`](../agents/roomlerd/src/hive/supervisor.rs#L4390)).
+>   ([`supervisor.rs:4400`](../agents/roomlerd/src/hive/supervisor.rs#L4400)).
 >   It records whether the primary connection takes leases before it resumes
 >   any run ([`signaling.rs:1724`](../agents/roomlerd/src/signaling.rs#L1724)).
 
@@ -956,7 +956,7 @@ device share): a path could match nothing a device asks for.
 > it out of the allow list is not enough. The session's settings list
 > `vault_exec` and `vault_render` under `permissions.ask`
 > ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L448), written
-> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L5038)).
+> by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L5048)).
 > - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
 >   FR-90 spec's open decision 7), and an allow there would skip the person.
 >   Claude Code reads deny, then ask, then allow, across every settings file,
@@ -970,7 +970,7 @@ device share): a path could match nothing a device asks for.
 | Piece | Where |
 |---|---|
 | the tool | `vault_exec` in [`toolbelt.rs:977`](../agents/roomlerd/src/hive/toolbelt.rs#L977), offered with the reads where the device takes leases, and asked for in the settings |
-| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4491`](../agents/roomlerd/src/hive/supervisor.rs#L4491)); none on Windows |
+| where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4501`](../agents/roomlerd/src/hive/supervisor.rs#L4501)); none on Windows |
 | letting go | `Client::release` ([`vault.rs:1146`](../agents/roomlerd/src/vault.rs#L1146)) |
 
 ## 15. A file with values: `vault_render` (P3-4c-2)
@@ -1004,7 +1004,7 @@ sequenceDiagram
 | the file | rendered into a buffer sized once (a vector that grew would leave copies of a value behind), written whole: a temporary made with `create_new`, `0600`, handed to the account, renamed into place | [`vault_render.rs:143`](../agents/roomlerd/src/hive/vault_render.rs#L143), [`:192`](../agents/roomlerd/src/hive/vault_render.rs#L192) |
 | its life | attached to each of its leases, so it is removed the moment the first is let go: at its expiry, at `rc:vault.revoke`, or when the run ends here. The leases are kept, not released, when the call returns | [`vault.rs:272`](../agents/roomlerd/src/vault.rs#L272), [`:1153`](../agents/roomlerd/src/vault.rs#L1153) |
 | a restart | the daemon removes every `secrets/` an earlier process left: no lease outlives the process that held it | [`supervisor.rs:824`](../agents/roomlerd/src/hive/supervisor.rs#L824), [`vault_render.rs:234`](../agents/roomlerd/src/hive/vault_render.rs#L234) |
-| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4974`](../agents/roomlerd/src/hive/supervisor.rs#L4974) |
+| the Read tool | the session's settings deny it the secrets directory where the vault tools are offered | [`supervisor.rs:4984`](../agents/roomlerd/src/hive/supervisor.rs#L4984) |
 
 > [!WARNING]
 > - **`file` is a materializing mode** (design §8.5). The session's account
@@ -1055,7 +1055,7 @@ sequenceDiagram
 | the lease | asked for once, decided by `secret:use` with every guardrail, recorded, and held in daemon memory marked as asked for ahead; the answer names it and how long it lasts, never its value | [`vault_request.rs:117`](../agents/roomlerd/src/hive/vault_request.rs#L117), [`vault.rs:159`](../agents/roomlerd/src/vault.rs#L159) |
 | its use | `vault_exec` takes it when it names the same secret and field for the same program, and the lease covers the command's whole timeout. `vault_render` takes it when it names the same secret toward the same file, and the lease lasts at least the file's `ttl_s`. `vault_placeholder` (P3b-3c-2) takes it when it names the same secret and field toward the same origin, and the lease has 30 seconds left. Otherwise a call asks for its own, as before | [`vault.rs:1182`](../agents/roomlerd/src/vault.rs#L1182), [`vault_exec.rs:616`](../agents/roomlerd/src/hive/vault_exec.rs#L616), the lookup both tools share (`leased_values`, P3-6b-2b) |
 | its end | its expiry, `rc:vault.revoke`, or the run's end: no call lets it go. A file written with it goes with it (§15), so a render's `ttl_s` answers how long the file truly lives: until the first of its leases ends | [`vault_render.rs:293`](../agents/roomlerd/src/hive/vault_render.rs#L293) |
-| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:5016`](../agents/roomlerd/src/hive/supervisor.rs#L5016) |
+| the settings | allowed, with the reads. The vault decides and records it, and it hands the session nothing. Each use of the lease still asks a person (§14) | [`supervisor.rs:5026`](../agents/roomlerd/src/hive/supervisor.rs#L5026) |
 
 > [!IMPORTANT]
 > **A use takes the lease by what it is, not by its id.** The design had the
@@ -2935,7 +2935,7 @@ sequenceDiagram
 |---|---|
 | the offer, the tool, its settings name | `placeholder_offered` ([`hive/toolbelt.rs:1195`](../agents/roomlerd/src/hive/toolbelt.rs#L1195)), `placeholder_tools` ([`:1203`](../agents/roomlerd/src/hive/toolbelt.rs#L1203)), `PLACEHOLDER_TOOLS` ([`:476`](../agents/roomlerd/src/hive/toolbelt.rs#L476)) |
 | the call, its audiences, its bindings | `call` ([`hive/placeholder.rs:351`](../agents/roomlerd/src/hive/placeholder.rs#L351)), `audience_of` ([`:246`](../agents/roomlerd/src/hive/placeholder.rs#L246)), `bind` ([`:184`](../agents/roomlerd/src/hive/placeholder.rs#L184)) |
-| the settings | `vault_use_tools` in [`hive/supervisor.rs:5038`](../agents/roomlerd/src/hive/supervisor.rs#L5038) |
+| the settings | `vault_use_tools` in [`hive/supervisor.rs:5048`](../agents/roomlerd/src/hive/supervisor.rs#L5048) |
 | asked ahead | `parse` in [`hive/vault_request.rs:37`](../agents/roomlerd/src/hive/vault_request.rs#L37) |
 
 ### AWS's signature (P3b-4-1)

@@ -61,6 +61,9 @@ pub struct HiveConfig {
     /// (P3b-5-1) on Windows, where none runs, behind the proxy as its
     /// environment names it.
     pub egress: bool,
+    /// FR-90 P8-2a-1 — whether each session here gets a worker beside it
+    /// (`hive_worker`): `roomlerd hive-worker`, supervised. Unix first.
+    pub worker: bool,
 }
 
 impl HiveConfig {
@@ -91,6 +94,7 @@ impl HiveConfig {
             net: cfg.hive_net,
             ssh: cfg.hive_ssh,
             egress: cfg.hive_egress,
+            worker: cfg.hive_worker,
         }
     }
 
@@ -114,6 +118,7 @@ impl HiveConfig {
             net: false,
             ssh: false,
             egress: false,
+            worker: false,
         }
     }
 }
@@ -167,6 +172,17 @@ mod tests {
                 .collect(),
             ..HiveConfig::closed()
         }
+    }
+
+    /// FR-90 P8-2a-1 — `hive_worker` is the owner's word, read into the
+    /// snapshot as it is, and off in a daemon that read no config.
+    #[test]
+    fn hive_worker_is_the_owners_word() {
+        let mut agent = crate::config::test_fixture();
+        assert!(!HiveConfig::from_agent(&agent).worker, "off by default");
+        agent.hive_worker = true;
+        assert!(HiveConfig::from_agent(&agent).worker);
+        assert!(!HiveConfig::closed().worker);
     }
 
     /// FR-90 P3-7-3c — `hive_net` is the owner's word, read into the snapshot

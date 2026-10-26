@@ -613,6 +613,14 @@ pub struct AgentConfig {
     /// the vault decides is the owner's call.
     #[serde(default)]
     pub hive_egress: bool,
+    /// FR-90 P8-2a-1 — run a worker beside each agent session on this
+    /// device (`roomlerd hive-worker`, the same binary as the daemon's
+    /// supervised child), so a fault in what it serves costs that session's
+    /// worker and never the daemon. Unix first. Default OFF, and never
+    /// pushable: how this device's own processes are arranged is the owner's
+    /// call.
+    #[serde(default)]
+    pub hive_worker: bool,
     /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):
     /// absolute paths, a folder walked for its git checkouts, each read as
     /// the account that owns it and never as the daemon, for metadata alone.
@@ -2862,6 +2870,7 @@ pub fn test_fixture() -> AgentConfig {
         hive_net: false,
         hive_ssh: false,
         hive_egress: false,
+        hive_worker: false,
         knowhow_scan_roots: Vec::new(),
         knowhow_scan_listeners: false,
         knowhow_probe_reach: Vec::new(),

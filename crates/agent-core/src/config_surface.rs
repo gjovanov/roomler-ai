@@ -537,6 +537,14 @@ const KEYS: &[KeyMeta] = &[
         kind: "bool",
         description: "FR-90 - run every agent session on this device in Claude Code's sandbox: its commands reach only the hosts the organization's vault allows the session's role (net:egress), through a proxy in this daemon, and write only to their working directory, temp, and the session's own cache. A session is refused where the sandbox cannot run: Linux without bubblewrap and socat, Claude Code before 2.1.285. On Windows, where no sandbox runs, every session gets the proxy named in its environment, advisory. Only with vault_enabled. Never settable by the server. Default: OFF.",
     },
+    KeyMeta {
+        key: "hive_worker",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - run a worker beside each agent session on this device (roomlerd hive-worker, the daemon's own supervised child), so a fault in what it serves costs that session's worker and never the daemon. Unix only for now. Never settable by the server. Default: OFF.",
+    },
     // FR-90 P4-3b-1 — what a knowhow scan reads (decision 38): the device's,
     // like every Hive key, and absent from `DesiredConfig`, since a server
     // that could set it would choose which folders a device reads.
@@ -2018,6 +2026,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_net" => Some(fmt_bool(cfg.hive_net)),
         "hive_ssh" => Some(fmt_bool(cfg.hive_ssh)),
         "hive_egress" => Some(fmt_bool(cfg.hive_egress)),
+        "hive_worker" => Some(fmt_bool(cfg.hive_worker)),
         "knowhow_scan_roots" => Some(cfg.knowhow_scan_roots.join(",")),
         "knowhow_scan_listeners" => Some(fmt_bool(cfg.knowhow_scan_listeners)),
         "knowhow_probe_reach" => Some(cfg.knowhow_probe_reach.join(",")),
@@ -2379,6 +2388,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "hive_net" => cfg.hive_net = parse_bool_or(value, false)?,
         "hive_ssh" => cfg.hive_ssh = parse_bool_or(value, false)?,
         "hive_egress" => cfg.hive_egress = parse_bool_or(value, false)?,
+        "hive_worker" => cfg.hive_worker = parse_bool_or(value, false)?,
         // Clearing empties the list: nothing is read, the fail-safe direction.
         "knowhow_scan_roots" => {
             cfg.knowhow_scan_roots = parse_absolute_list("knowhow_scan_roots", value)?
@@ -4861,6 +4871,23 @@ mod tests {
         apply(&mut cfg, "hive_egress", None).unwrap();
         assert!(!cfg.hive_egress, "cleared is off");
         assert!(apply(&mut cfg, "hive_egress", Some("sometimes")).is_err());
+    }
+
+    /// FR-90 P8-2a-1 — whether a session here gets a worker beside it: off
+    /// until the owner says so, off again when cleared, and read at start.
+    #[test]
+    fn hive_worker_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.hive_worker);
+        let e = entry_for(&cfg, "hive_worker").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        assert!(e.restart_required, "the hive snapshot is read at start");
+        apply(&mut cfg, "hive_worker", Some("true")).unwrap();
+        assert!(cfg.hive_worker);
+        apply(&mut cfg, "hive_worker", None).unwrap();
+        assert!(!cfg.hive_worker, "cleared is off");
+        assert!(apply(&mut cfg, "hive_worker", Some("sometimes")).is_err());
     }
 
     /// FR-90 P3-8-2b-2 — so is whether a session here may run a command on
