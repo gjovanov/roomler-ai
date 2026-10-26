@@ -1332,6 +1332,14 @@ async fn daemon_main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's worker, which the
+    // daemon starts as its own supervised child with the channel on fd 3. It
+    // runs none of the setup below.
+    #[cfg(all(hive_host, unix))]
+    if roomlerd::hive::worker_args() {
+        std::process::exit(roomlerd::hive::worker_main().await);
+    }
+
     // FR-90 P2e-7 — `roomlerd hive-resume-note <file>`: a Hive session's
     // `SessionStart` hook, run by Claude Code as the session's account. It
     // prints the resume note the daemon left for a session moved here, if

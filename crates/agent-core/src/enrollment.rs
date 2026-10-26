@@ -302,6 +302,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         hive_net: false,
         hive_ssh: false,
         hive_egress: false,
+        hive_worker: false,
         // FR-90 P4-3b-1: nothing scanned until the owner lists a root.
         knowhow_scan_roots: Vec::new(),
         // FR-90 P4-3b-3: no listener reported until the owner says so.

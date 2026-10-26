@@ -4072,6 +4072,9 @@ impl Supervisor {
         // FR-90 P3b-3a — and every placeholder it held.
         #[cfg(feature = "vault")]
         super::placeholder::drop_run(session, fence);
+        // FR-90 P8-2a-1 — and its worker, told `bye`.
+        #[cfg(unix)]
+        super::worker::drop_run(session, fence);
     }
 
     /// P1d-2 — a session resumed after its daemon went down. A turn the
@@ -4249,6 +4252,13 @@ impl Supervisor {
                 workplace,
             },
         );
+        // FR-90 P8-2a-1 — a worker beside the run, where the owner said so.
+        #[cfg(unix)]
+        super::worker::run_started(order.session_id, order.fence, self.cfg.worker);
+        #[cfg(not(unix))]
+        if self.cfg.worker {
+            info!(session = %order.session_id, "hive: no worker beside the session: `hive_worker` is Linux and macOS only so far");
+        }
         if prior.is_some() {
             self.hosted_update(order.session_id, order.fence, |h| {
                 h.harness_pid = pid;
@@ -6715,7 +6725,7 @@ done
             store_quota_mib: None,
             net: false,
             ssh: false,
-            egress: false,
+            ..HiveConfig::closed()
         };
         cfg_with(&mut cfg);
         let store = StoreHandle::spawn(None).unwrap();
@@ -12599,6 +12609,36 @@ done
             }
             assert!(r.sup.have_want_place(sid).is_none(), "run out");
         }
+    }
+
+    /// FR-90 P8-2a-1 — the worker's two hooks in a run's life: no worker
+    /// where the owner left `hive_worker` off; where on, one beside the run
+    /// once it went live (`launch`), and none once it ended (`unlive`, which
+    /// comes before the end is reported).
+    #[tokio::test]
+    async fn a_run_has_its_worker_beside_it_while_live_where_the_owner_said_so() {
+        use super::super::worker::seen;
+        let mut off = rig(true, 4);
+        let o = order(&off);
+        let sid = o.session_id;
+        assert_eq!(off.sup.start(o, true).await, Answer::accepted("dev"));
+        assert_eq!(next_state(&mut off, sid).await.0, HiveRunState::Idle);
+        assert_eq!(seen(sid, 1), None, "off: no worker");
+        off.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut off, sid).await;
+
+        let mut on = rig_with(true, 4, |c| c.worker = true, |s| s);
+        let o = order(&on);
+        let sid = o.session_id;
+        assert_eq!(on.sup.start(o, true).await, Answer::accepted("dev"));
+        assert_eq!(next_state(&mut on, sid).await.0, HiveRunState::Idle);
+        assert!(seen(sid, 1).is_some(), "a worker beside the live run");
+        on.sup.stop(sid, 1, "owner".into());
+        assert_eq!(
+            until_ended(&mut on, sid).await.as_deref(),
+            Some("stopped (owner)")
+        );
+        assert_eq!(seen(sid, 1), None, "gone with the run");
     }
 }
 
