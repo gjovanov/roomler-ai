@@ -3864,13 +3864,129 @@ What runs where today, and where P8 puts it:
   - one daemon a machine, so a switch between variants is an in-place upgrade, never a second
     install.
 
+**P8-0, as designed** (2026-10-26, on the operator's "go" read as building decisions 63–65 as
+recommended; **each is still the operator's to confirm**). The probe came first, against the real
+harness, and the design follows from what it found.
+
+*The probe, as found* (§8, 2026-10-26). Two Claude Code versions ran: 2.1.280, installed on this
+field device (Windows 11), and 2.1.310, npm's latest and the vmtest cells' version on 2026-10-25,
+with its registry hash checked. Each ran with Hive's argv
+(`crates/hive-node/src/launch.rs:221`), its own config directory and home, and none of the calling
+session's environment. It ran against a fake Messages API that was also its HTTP(S) proxy and
+refused every `CONNECT`, so nothing left the host and no model was spent. Its MCP server was a
+stand-in for the toolbelt's relay, whose death each run scripted, and the permission prompt tool
+was that server's own, as Hive's is (`--permission-prompt-tool mcp__roomler__approve`).
+
+| The server | 2.1.280 | 2.1.310 | What it changes |
+|---|---|---|---|
+| exits between two calls | the next call respawns it (a new process, `initialize` again, the tools not listed again) and runs; a call that races the exit fails `Connection closed` | the same | a restart costs the session a failed call, **if the new server starts in time** |
+| exits while a call waits on it | that call fails `Connection closed` as the pipe closes (≈ 0.4 s): there is no timeout to wait out | the same | the same |
+| is the permission prompt tool, and is gone | the tool asked for fails (`Error calling tool (mcp__roomler__tick): Connection closed`) | the same | a worker's death denies; it never allows |
+| answers a call with a JSON-RPC error | that call fails with the error's message, and the server stays connected | the same | a relay can fail one call and keep the session's tools |
+| is respawned and answers `initialize` in 5 s | the call waits, and runs | the same | a relay may wait for its worker, briefly |
+| is respawned and fails at its start | `MCP server "roomler" is not connected` for every later call of every turn: nothing respawns it again | respawned again at the next call, which runs | the field has both answers today |
+| is respawned and answers `initialize` in 40 s | gives up at ≈ 30 s, then `not connected` for the rest of the run | gives up at ≈ 27 s, the same | **on both, a restart slower than the harness waits costs the session every tool, its approvals included, for the rest of its run** |
+
+2.1.310 also defers MCP tools: the model loads one with `ToolSearch` before it can call it. It
+also sends `server/discover` before `initialize`, which the stand-in answered "method not found"
+and the harness went on.
+
+*What follows from it:*
+
+1. **The relay outlives the worker.** `roomlerd hive-mcp`
+   ([`relay`](../../agents/roomlerd/src/hive/toolbelt.rs#L1960)) is started by Claude Code once
+   a run, and today it is bytes only and ends with its socket. Under P8 it holds the session's stdio
+   for the whole run:
+   - it keeps the run's own `initialize` and `notifications/initialized`;
+   - when its toolbelt connection drops, it answers each request still waiting with a JSON-RPC
+     error (`the session's tools restarted: call again`);
+   - it reconnects to the same socket or pipe with backoff, replays the two messages to the new
+     worker, and swallows that `initialize`'s answer;
+   - a request that arrives while it reconnects waits at most 10 s, and is then failed the same way.
+
+   It never exits for a worker's sake, so Claude Code never sees its server die and never meets
+   the restart that fails for good.
+2. **Listeners stay in the daemon; a worker holds only connections.** Every address a session can
+   see is bound by the daemon, as it is today, and handed to the worker:
+   - the toolbelt's socket or pipe;
+   - the sidecar's port;
+   - each `vault_connect` endpoint;
+   - the egress proxy's port;
+   - the end of a connect's flow through another device (P4-6-1b-2).
+
+   A worker's restart drops the connections it held and nothing else. Each address stays where
+   the session's settings, environment and connection strings name it, owned and admitted as now,
+   and the new worker is handed the same listeners. The daemon also keeps each endpoint's leases:
+   it reads their values into the worker's endpoint at each hand-over, and takes them back as it
+   does today.
+3. **The channel.** One per worker, made by the daemon before the spawn:
+   - **Unix:** a `socketpair(AF_UNIX, SOCK_STREAM)`, the worker's end its fd 3 and the only
+     descriptor it inherits. Listeners cross as `SCM_RIGHTS`.
+   - **Windows:** a pipe pair named in `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, the only handles the
+     worker inherits (#2836 found tokio's sockets inherited by every child). A listening socket
+     crosses as `WSADuplicateSocketW`'s protocol info for the worker's pid, and a pipe server end
+     by `DuplicateHandle` into it.
+   - **Framing:** a `u32` length, then a JSON message, at most 1 MiB, each request with an id and
+     answered by it.
+   - **What crosses:** the seam's calls (P8-1: `VaultTools`, `KnowhowTools`, `SessionEgress`,
+     `ControlLink`), the listeners, a heartbeat, and the lease values the worker serves, zeroized
+     where it drops them. The device's vault key never crosses.
+4. **Supervision and limits.** `roomlerd hive-worker` is a subcommand read from raw argv, as
+   `hive-mcp` is, so it runs none of the daemon's start-up. It runs as the daemon's identity, with
+   stdin and stdout null and stderr to the daemon's log.
+   - **Linux:** `PR_SET_PDEATHSIG` so it dies with the daemon; `RLIMIT_CORE = 0` and a bounded
+     `RLIMIT_NOFILE`; memory through the unit's cgroup `memory.max` only where the service
+     delegates one. `RLIMIT_AS` stays unset: glibc reserves 64 MiB of address space for each
+     thread's arena, so a cap on address space fails healthy threads long before it stops a
+     runaway.
+   - **macOS:** the same rlimits, and no cgroup.
+   - **Windows:** a Job object with `KILL_ON_JOB_CLOSE` and a per-process memory limit, so the
+     daemon's exit ends it.
+   - **Health:** a heartbeat every 5 s on the channel; three missed, and the worker is killed and
+     restarted. Restarts back off (1, 2, 4 … 30 s), and five in 10 min end that run with
+     `hive_worker_crash_loop`, resumable as any ended run is.
+   - **Never waiting on it:** the daemon's own control path never awaits a worker. Every call into
+     one comes from hive's tasks, bounded by a timeout.
+5. **What moves first** (decision 64 as recommended). The steps go in this order:
+   - the egress proxy and the credential proxies (`vault_proxy`, behind `vault_connect`'s
+     endpoints), since they parse TLS and wire protocols from both sides and hold leased values;
+   - then the toolbelt and the sidecar, with the relay of point 1;
+   - then the device-wide parts (the replica store and stream, the viewer's peer, the prober), in
+     one worker for the device (decision 63 as recommended: one worker a session for what is
+     already the session's).
+
+   Until a part has moved, a fault in it still reaches the daemon.
+6. **P4-6-1b-2's flow admits the worker.** `daemon_admit` admits the daemon's own process on
+   Windows ([`daemon_admit`](../../agents/roomlerd/src/hive/vault_connect.rs#L2450)). Once the
+   proxies run in a worker, the flow's listener (the daemon's, by point 2) admits that worker's pid
+   too. Unix is unchanged: the worker is the daemon's account.
+
+```mermaid
+sequenceDiagram
+    participant H as Claude Code
+    participant R as roomlerd hive-mcp (the relay)
+    participant D as roomlerd (the daemon)
+    participant W as roomlerd hive-worker
+    H->>R: tools/call (stdio)
+    R->>W: over the toolbelt socket (the daemon's listener, the worker's connection)
+    Note over W: the worker dies
+    W--xR: the connection closes
+    R-->>H: a JSON-RPC error: the session's tools restarted, call again
+    D->>W: a new worker, handed the same listeners over its channel
+    R->>W: reconnects to the same socket, replays initialize + initialized
+    H->>R: tools/call
+    R->>W: served
+```
+
 | Step | Builds | Kill switch | AC |
 |---|---|---|---|
 | P8-0 | the boundary's design, after decisions 63–65: the channel's protocol, what crosses it, supervision and limits per OS, and a probe of the harness across a worker's restart | docs only | — |
 | P8-1 | part 2, the seam: `SessionEgress` and `ControlLink` beside `VaultTools` and `KnowhowTools`; the session-facing machinery behind them in `crates/hive-node`; a CI audit that no other module of `roomlerd` reaches past them | none (a refactor) | — |
-| P8-2a | part 1, `roomlerd hive-worker`, with what decision 64 moves first; the channel, supervision, restart and limits; Linux and macOS | device `hive_worker = false` keeps the parts in the daemon | AC28 |
-| P8-2b | the same on Windows: a Job object, handle inheritance, the console user's session | the same | AC28 |
-| P8-3 | part 3, the hive-free package, as decision 65 says: the release lane's variant, the server's asset order, the updater's variant, the docs (`docs/installation.md`) | the default package is unchanged | AC29 |
+| P8-2a | part 1, `roomlerd hive-worker` a session, with what decision 64 moves first (P8-0's point 5): the egress proxy and the credential proxies; the channel, the listeners handed over, supervision, restart and limits; Linux and macOS | device `hive_worker = false` keeps the parts in the daemon | AC28 |
+| P8-2b | the same on Windows: a Job object, the handle list, sockets by `WSADuplicateSocketW`, the console user's session, and P4-6-1b-2's flow admitting the worker | the same | AC28 |
+| P8-2c | the toolbelt and the sidecar into the session's worker, with the relay that outlives it (P8-0's point 1) | the same | AC28 |
+| P8-2d | the device-wide parts (the replica store and stream, the viewer's peer, the prober) into one worker for the device | the same | AC28 |
+| P8-3 | part 3, the hive-free package, as decision 65 says, built once a customer asks: the release lane's variant, the server's asset order, the updater's variant, the docs (`docs/installation.md`) | the default package is unchanged | AC29 |
 | P8k | the field run: kill and starve a worker mid-turn on each OS, with remote control, the overlay and the tunnels watched; install, run and update the hive-free package | — | AC28, AC29 |
 
 ## 4. Phases
@@ -4102,8 +4218,8 @@ What runs where today, and where P8 puts it:
 | P4-5-4b | a row of each probe kind a device (`docs/knowhow.md` §13.5), the operator's "2 rows per device": the aggregate groups by device and kind (`ProbeDao::last_per_device_and_kind`); `probe::card_rows` shows every row of the 16 devices whose findings are the newest, a device counting once and bringing its other kind's row along, at most 32 rows; `knowhow_get`'s description says "a tcp one and a tls one" | the same | **merged** #2913 `9db21bd06`; prod `hosted-20261025-9db21bd`, field-verified |
 | P4-6-0 | `roomler_connect`, as designed (§3e "P4-6, `roomler_connect`, as designed"), docs only: an entity names its engine, credential and options as reserved facts, read only when `active` or `stale` (decision 59); its paths are measured ones, this device's own finding, else a probe from here, else a device's through a forward with no listener, TLS verified end to end (decision 60); a starter holding `KNOWHOW_VIEW` may ask (decision 61); people later (decision 62) | docs only | **merged** #2918 `d211617ca` |
 | P4-6-1a | `roomler_connect`, the server's half (`docs/knowhow.md` §13.6), decisions 59–61 as recommended on the operator's "go": `rc:knowhow.connect {req_id, session_id, fence, kind, key}`, believed as a question is and held to the starter's `KNOWHOW_VIEW` at every connect, answered `rc:knowhow.access {req_id, access}` by `connect::compile` from the entity's `active` and `stale` facts (`engine`, `host` else `address`, `port`, `credential`, and the options `database`, `auth`, `auth_source`, `ca` and `user`): the upstream spelled as `vault_connect` takes it, `missing` and `proposed` naming what the map does not say, `here` (this device's own last word), `paths` (each device whose last finding, of either kind, is `ok` and fresh, the session's own first, at most 16) and `seen`; `knowhow.connect_fresh_secs` (a day); `roomler_connect` named in `rc:knowhow.served` for a device that advertises `vault`, which an older agent drops. 12 new unit tests (10 of `connect::compile`, 2 of the wire) and 4 integration; 27 negative controls, each caught at its own assertion (20 unit, 3 wire, 4 integration) | `[modules] knowhow`; `knowhow.tenants`; no agent asks before P4-6-1b | **merged** #2938 `16e30eb49` |
-| P4-6-1b-1 | `roomler_connect` from the session's own device (`docs/knowhow.md` §12.1, §13.7): `roomler_connect` in the toolbelt's knowhow tools, kept only where the server names it, **asked** in the session's settings beside `knowhow_verify` and never allowed (`knowhow_tools::ASKED`), routed apart from the reads with the run's vault, command target and account; `rc:knowhow.connect` asked and `rc:knowhow.access` read (`Answer::Access`); `connect_tool::plan`, a pure function of the access (`no_access` for what is missing, a path from here for `verified`, one probe from here first for `unmeasured`, none otherwise); a path from here opens `vault_connect`'s endpoint with the access's credential, engine, upstream and options, `tcp` answered where to dial; no path from here names the devices that reached it. 7 new tests (5 of the connect, 1 of the client, 1 of the toolbelt's routing) and 4 extended; 16 negative controls, each caught at its own assertion | device `vault_enabled`; `knowhow_probe_reach`; the server's `[modules] knowhow` | **in review** #2950 |
-| P4-6-1b-2 | `roomler_connect` through another device (`docs/knowhow.md` §13.7, `docs/vault.md` §19 "An endpoint through another device"), as decision 60 says: no path from here tries each other device the access names in `paths`, newest first, until one opens (`connect_tool::call`, over the `Reach` seam the daemon implements on the run's vault and egress hub, `toolbelt::DaemonReach`); a credentialed engine opens `vault_connect`'s endpoint dialling `vault_proxy::Dial::Through` the end of `net_tools::daemon_flow`, a forward asked of the vault as `net:forward` and admitted to this daemon alone (`vault_connect::daemon_admit`: the connection's process on Windows, its account on Unix), the Postgres, MongoDB and HTTP proxies dialling it while TLS and `Host` stay the upstream's; only `vault_connect::call_through` sets the dial, never a call's arguments; `tcp` gets `net_forward`'s forward, `ssh` a forward and then `vault_connect`'s agent, once; a refusal no other device changes ends the trying (`Failed::Every`); the answer names `path: through <device>`, the carrier and `tried`. The design's "no listener" became a listener only the daemon may use, since every forward's carry path takes a `TcpStream` (§3e "P4-6-1b-2, as built"). 8 new tests (2 of the connect, 3 of the proxies' dial, 1 of the daemon's admit, 2 of the toolbelt: an endpoint through a flow end to end, and the reach's refusals and flows), 2 rewritten and 1 extended (`parse` reads no `dial`); 26 negative controls, each caught at its own assertion | device `hive_net` and `vault_enabled`; the server's `[modules] knowhow` | **in review** |
+| P4-6-1b-1 | `roomler_connect` from the session's own device (`docs/knowhow.md` §12.1, §13.7): `roomler_connect` in the toolbelt's knowhow tools, kept only where the server names it, **asked** in the session's settings beside `knowhow_verify` and never allowed (`knowhow_tools::ASKED`), routed apart from the reads with the run's vault, command target and account; `rc:knowhow.connect` asked and `rc:knowhow.access` read (`Answer::Access`); `connect_tool::plan`, a pure function of the access (`no_access` for what is missing, a path from here for `verified`, one probe from here first for `unmeasured`, none otherwise); a path from here opens `vault_connect`'s endpoint with the access's credential, engine, upstream and options, `tcp` answered where to dial; no path from here names the devices that reached it. 7 new tests (5 of the connect, 1 of the client, 1 of the toolbelt's routing) and 4 extended; 16 negative controls, each caught at its own assertion | device `vault_enabled`; `knowhow_probe_reach`; the server's `[modules] knowhow` | **merged** #2950 `059856d35` |
+| P4-6-1b-2 | `roomler_connect` through another device (`docs/knowhow.md` §13.7, `docs/vault.md` §19 "An endpoint through another device"), as decision 60 says: no path from here tries each other device the access names in `paths`, newest first, until one opens (`connect_tool::call`, over the `Reach` seam the daemon implements on the run's vault and egress hub, `toolbelt::DaemonReach`); a credentialed engine opens `vault_connect`'s endpoint dialling `vault_proxy::Dial::Through` the end of `net_tools::daemon_flow`, a forward asked of the vault as `net:forward` and admitted to this daemon alone (`vault_connect::daemon_admit`: the connection's process on Windows, its account on Unix), the Postgres, MongoDB and HTTP proxies dialling it while TLS and `Host` stay the upstream's; only `vault_connect::call_through` sets the dial, never a call's arguments; `tcp` gets `net_forward`'s forward, `ssh` a forward and then `vault_connect`'s agent, once; a refusal no other device changes ends the trying (`Failed::Every`); the answer names `path: through <device>`, the carrier and `tried`. The design's "no listener" became a listener only the daemon may use, since every forward's carry path takes a `TcpStream` (§3e "P4-6-1b-2, as built"). 8 new tests (2 of the connect, 3 of the proxies' dial, 1 of the daemon's admit, 2 of the toolbelt: an endpoint through a flow end to end, and the reach's refusals and flows), 2 rewritten and 1 extended (`parse` reads no `dial`); 26 negative controls, each caught at its own assertion | device `hive_net` and `vault_enabled`; the server's `[modules] knowhow` | **in review** #2963 |
 | P2d | the carrier and the stream: `rc:hive.replica.want` · `grant` · `ready` · `dial` · `close`, the source confirming before the member dials (FR-83); QUIC per session, member and source on the ladder, climbed again at every renewal; hello · diverged · events · blobs · ack; a replica's read-only view; AC2 on two devices in CI | the same | — |
 | P2e | promotion and fencing: `rc:hive.prepare`, `drain` and `drained`, the lease CAS, every member's floor first, `rc:hive.move` and the resume note, `rc:hive.demote`; an unreachable primary waited out (230 s); a replicated session run only on the server's word on that connection; a newer fence superseding an older run on the same device (`finish` and `let_go` fence-aware); the path map | the same | — |
 | P2f | teleport (prepare, join, a full sync that packs against what the target's repository holds, promote), fork (`--fork-session`, a parent link, its own replicaset under the parent's tags), and an ended adopted session promoted into a managed one (decision 11's half) | the same | — |
@@ -4117,7 +4233,8 @@ What runs where today, and where P8 puts it:
 | P4 | knowhow: graph, sync, scans, map UI, the access-path compiler, probes, chips (its design: §3e "P4, knowhow, as designed"; its steps: P4-0 to P4-8, and P4k) | `knowhow.tenants`; `[modules] knowhow` | — |
 | P5 | the learning loop: reviewer on replicas, proposals and review cards, auto-memory harvesting, scanner, contradiction cards, decay, session cards and central search, telemetry, eval sessions | `hive.learning = false`; `session_cards = metadata` | — |
 | P6 | docs: `docs/hive.md`, `docs/vault.md`, `docs/knowhow.md`, `docs/brain.md`; user docs | — | — |
-| P8 | Hive's boundary (§3i): the heavy and risky parts as supervised `roomlerd hive-worker` children; the seam finished behind traits, in `crates/hive-node`; a hive-free build and package. Its steps: P8-0 to P8-3, and P8k (design §17's P6 and P7 are follow-up FRs, so P8 takes neither name) | device `hive_worker = false`; the default package unchanged | **planned** (the operator, 2026-10-25); decisions 63–65 posed |
+| P8 | Hive's boundary (§3i): the heavy and risky parts as supervised `roomlerd hive-worker` children; the seam finished behind traits, in `crates/hive-node`; a hive-free build and package. Its steps: P8-0 to P8-3, and P8k (design §17's P6 and P7 are follow-up FRs, so P8 takes neither name) | device `hive_worker = false`; the default package unchanged | **planned** (the operator, 2026-10-25); decisions 63–65 designed as recommended in P8-0, still the operator's to confirm |
+| P8-0 | Hive's boundary, as designed (§3i "P8-0, as designed"), decisions 63–65 as recommended on the operator's "go": the probe of the harness across a restart, on Claude Code 2.1.280 and 2.1.310 (§8, 2026-10-26: a restart slower than the harness waits loses the session's tools for the rest of its run); the relay that outlives its worker; listeners in the daemon, connections in the worker; the channel per OS; supervision and limits; what moves first; P4-6-1b-2's flow admitting the worker; the steps split into P8-2a to P8-2d | docs only | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
@@ -5311,6 +5428,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Or: per session for everything.*
       - What it costs: the store, one SQLite file a device today, split per session, and the
         stream with it.
+    - *Designed in P8-0 as recommended*, on the operator's "go" (2026-10-26): a worker a session
+      for the session-facing parts (P8-2a to P8-2c), and one for the device's own (P8-2d).
+      Another answer changes how P8-2's supervisor keys its workers, not the channel.
 64. **What moves first** (P8), for the operator to confirm.
     - *Recommended: the egress proxy and the credential proxies first*, since they parse TLS and
       wire protocols from both sides and hold leased values; then the toolbelt and the sidecar;
@@ -5318,6 +5438,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: until the last step, a fault in what has not moved still reaches the daemon.
     - *Or: everything at once*, in one step.
       - What it costs: the largest change to the daemon in FR-90, verified only as a whole.
+    - *Designed in P8-0 as recommended*, on the operator's "go" (2026-10-26): P8-2a and P8-2b move
+      the egress and credential proxies, P8-2c the toolbelt and the sidecar, P8-2d the device's
+      parts. Another answer merges those steps.
 65. **What a hive-free package is** (P8), for the operator to confirm.
     - *Recommended: a separately named package per OS in the same release*
       (`roomlerd-nohive-<version>-…`), built once a customer asks. The server orders it after the
@@ -5331,6 +5454,8 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Or: a release lineage of its own* (`agent-nohive-v*`), with its own update channel.
       - What it costs: two lineages to tag, rehearse and promote, which every release step would
         have to name.
+    - *Designed in P8-0 as recommended*, on the operator's "go" (2026-10-26): P8-3 waits for a
+      customer's ask. Another answer changes P8-3 alone.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
@@ -5455,6 +5580,7 @@ The stack for the 2026-10-07 runs was throwaway, on one workstation, with prod u
 | 2026-10-25 | the same server. A kept vmtest Ubuntu cell, re-enrolled non-ephemeral as `p4k-u1` on the released 0.4.170, Claude Code 2.1.310, Haiku pinned, the turns on the operator's subscription (the token file's first token, piped into a root-only file and never printed). `endpoint field/roomler-web` on the vmtest org's map with roomler.ai's names and fingerprint; the vmtest admin prompting over the viewer peer and answering each approval | P4k's session half: a session's `knowhow_verify`, denied, allowed, and allowed once the owner's list was emptied (`config clear knowhow_probe_reach`, live) | ✅ **Denied** (17:38:44Z): the device ran no probe, the entity stayed at rev 1, and the session was told "Denied by vmtest admin". **Allowed** (17:39:17Z): a `tls` probe `ok` from `p4k-u1`, 0 ms, `direct`, requested after the approval, its record naming the session and no person. All four facts `verified` `ok`, rev 1 → 2, a `verify` history row; the session answered "Outcome ok, round trip 0 ms, carrier direct, certificate names roomler.ai and *.roomler.ai". **The list emptied**: `not_allowed`, nothing recorded (rev 2 → 2), and the session told so. The cell was destroyed after, the token with its disk, and its device row deleted |
 | 2026-10-25 | prod `hosted-20261025-c2ec495` (P4-5-4; both pods from 19:15:00Z, `/health` 0.4.171) | P4-5-4: what a card shows of the devices' findings. First on `hosted-20261025-8a58c53` (18:14:47Z), the vmtest org's `field/roomler-web`, holding P4k's `ok` probe and a later `not_allowed` one; then after the roll on it and on grox's | ✅ Before the roll the vmtest card had **no `probes`**; at 19:19:02Z **exactly one row**, P4k's `ok`, the `not_allowed` taking none. Grox's card, with no new probe: **7 rows from 7 devices**, newest first: one `tcp`, five `tls` with the map's fingerprint, and one `tls` with **another key** under the same names (CORPLAP-2's inspected network), the facts' last word still `ok`. 15 of 21 grox devices were online as before, and the mesh ping to mars took 31 ms. ⚠️ The `tls` facts' last word was a probe that was no row: NEO16-WSL's `tcp` probe, half a second after its `tls` one, was its last finding → the operator chose a row of each kind (P4-5-4b) |
 | 2026-10-25 | prod `hosted-20261025-9db21bd` (P4-5-4b; both pods from 21:36:22Z, `/health` 0.4.171). Master's per-push CI had cancelled the run on `9db21bd06`; the promote waited for this commit's own hosted-image, integration and installer-smoke runs and for master's newest CI, on `8a92ddfb6`, which contains it | P4-5-4b: a row of each probe kind a device. First on `hosted-20261025-c2ec495` (21:33:59Z), then after the roll, on grox's `field/roomler-web` with no new probe | ✅ Before the roll: 7 rows from 7 devices, none with two rows, and the `tls` facts' last word (NEO16-WSL's `tls` probe) no row. At 21:37:02Z: **8 rows from 7 devices**, NEO16-WSL's `tcp` and `tls` findings each a row, and that `tls` row is the facts' last word. The other key behind the inspecting network was still shown, with 15 of 21 devices online as before and the mesh ping to mars at 31 ms. Unchanged at 22:43Z on `hosted-20261025-6c1760b`, roomler-ai-4c's 0.4.172 roll |
+| 2026-10-26 | Claude Code 2.1.280 (installed on the operator's Windows 11 field device) and 2.1.310 (npm's latest, its registry hash checked), each with Hive's argv, its own config directory and home, and none of the calling session's environment, against a fake Messages API that was also its proxy and refused every `CONNECT`. Its MCP server stood in for the toolbelt's relay, and was also its permission prompt tool; each run scripted that server's death. No model spend | P8-0's probe: what the harness does when its MCP server dies mid-session, in eight scenarios on each version, over two to four turns | ✅ Most of it held on both versions:<br>• a dead server is respawned at the next call, and the call that races its exit fails `Connection closed`;<br>• a call in flight fails as the pipe closes (≈ 0.4 s);<br>• a dead permission prompt tool fails the call it was asked about, and never allows it;<br>• a JSON-RPC error fails one call and keeps the server;<br>• a respawn answering `initialize` in 5 s is waited for.<br>The versions differ on a respawn that **fails at its start**: 2.1.280 never retries it, and 2.1.310 retries at the next call. A respawn answering `initialize` in 40 s is given up at ≈ 30 s (2.1.280) or ≈ 27 s (2.1.310). After that the server is `not connected` for every later call of every turn, on both. Hence P8-0's relay that outlives its worker (§3i "P8-0, as designed") |
 
 ## 9. Related
 
