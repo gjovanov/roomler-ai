@@ -567,7 +567,7 @@ mechanism does not exist, so this section replaces it.
   session's bytes with no regard for packet type, so it would also hold WireGuard handshakes,
   which P4a was built never to do.
 - **The overlay already has the right lever.** A pair with no TURN grant stays on its DERP
-  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2010`), and P4a already holds DERP's
+  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2119`), and P4a already holds DERP's
   bulk frames to the plan's rate while letting every handshake through. The server can also
   stamp a pair's relay tier itself (`server_relay_verdict`,
   `crates/modules/network/src/overlay.rs:2312`), flipping both ends at once.
