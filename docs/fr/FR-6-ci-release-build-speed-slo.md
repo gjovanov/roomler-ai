@@ -123,7 +123,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 27 | 10-24 | **PR CI's two long poles.** The integration suite runs as four shards, not three. FR-90 P1i's Windows agent-session tests move out of `windows-overlay-clippy` into a parallel `windows-agent-sessions` job with its own seed family | #2844 |
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
-| 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability) | #2940 |
+| 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
 
 ## Acceptance criteria
 
@@ -879,3 +879,18 @@ itself on the affected run's page. Baseline when the program started: releases t
     reused rebuild took **0.9 s** in all three variants, with nothing compiled, against
     157–251 s before. A normal build still passes. The capability set is unchanged and
     empty: the parser loads only `*.json`/`*.toml` files.
+- 2026-10-26, midday: **agent-v0.4.175, cut by roomler-ai-df.** Rehearsal 40308879884 and tag
+  run 40312190685 were both at `027206d82`, with no dispatch between them.
+  - Reuse held in every job, as reported by df: MSI 5.3 min, `.pkg` 6.6, `.deb` aarch64
+    1.6. The Linux x86_64 build step took 4 s.
+  - The run was created at 11:03:40, but its jobs only started at 11:09:59, after 6 min
+    waiting for runners.
+  - ⚠️ In attempt 1, the Linux x86_64 job **hung 23+ min in "Install system build deps
+    (cached apt)"** (`awalsh128/cache-apt-pkgs-action`), from 11:11:16. The same step took
+    37 s in the rehearsal and 37 s on the re-run. It had no limit of its own, so only the
+    job's 60 min would have ended it.
+  - df cancelled it at 11:34:47 and re-ran the failed jobs (attempt 2: 11:36:55–11:38:54).
+    The release published at 11:39:58, **36.3 min** after the tag, against 7.2 min for
+    0.4.174.
+  - Wave 30 bounds both cached-apt steps (8 min + `continue-on-error`) into the existing
+    fallback. A hang now costs at most ~8 min plus a direct apt-get, and never the job.
