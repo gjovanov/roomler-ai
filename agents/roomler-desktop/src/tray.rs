@@ -18,8 +18,9 @@
 //!                           cannot run. A light poll, every 3 s
 //!   - Onboarding…        — show the main window on the Onboarding view
 //!   - Welcome tour…      — FR-84 D6: the first-run tour, again
-//!   - Check for Updates  — invoke `cmd_check_update` and surface
-//!                           the result in the Overview's update panel
+//!   - Check for Updates  — one click (#2936): show the window, and the page
+//!                           brings the Overview's Updates card into view and
+//!                           runs the same check as its button
 //!   - Open Logs Folder   — invoke `cmd_open_log_dir`
 //!   - Quit                — exit the desktop app; the device service
 //!                           keeps running unaffected.
@@ -563,29 +564,65 @@ fn open_roomler_web<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
+/// #2936 — the event the tray's "Check for Updates" fires in the page.
+/// `overview.js` listens for it by this exact name.
+const TRAY_CHECK_UPDATE_EVENT: &str = "roomler-tray-check-update";
+
+/// The page side of a tray click. The flag goes up first, so a page that is
+/// not listening yet (the window still loading) runs the check when its
+/// script starts; a listening page clears it in its handler.
+fn tray_check_update_js() -> String {
+    format!(
+        "window.__roomler_tray_check_pending = true; \
+         window.dispatchEvent(new Event('{TRAY_CHECK_UPDATE_EVENT}'))"
+    )
+}
+
+/// #2936 — ONE click. Before, this ran the check here, on the menu thread,
+/// and showed the window only afterwards, at the top of Overview, with the
+/// result in the last card. Nothing visible happened for seconds, and people
+/// scrolled down and clicked "Check for updates" again. Now the window comes
+/// up at once and the page does the rest: the Updates card scrolled into
+/// view, "Checking for updates…", the result, and "Install update" when one
+/// is available. Installing stays a separate click.
 fn check_updates<R: Runtime>(app: &AppHandle<R>) {
-    match crate::commands::cmd_check_update() {
-        Ok(stdout) => {
-            // Forward to the main window so the SPA can render the
-            // update banner. Sets a global flag the SPA polls.
-            if let Some(window) = app.get_webview_window("main") {
-                let payload = serde_json::json!({ "check": stdout }).to_string();
-                let _ = window.eval(format!(
-                    "window.__roomler_check_update_result = {payload}; window.dispatchEvent(new Event('roomler-update-check'))"
-                ));
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }
-        Err(e) => {
-            tracing::warn!(%e, "check-update failed");
-        }
-    }
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("check for updates: no main window to show the result in");
+        return;
+    };
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = window.eval(tray_check_update_js());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2936 — the tray and the page agree on the event and the flag. A
+    /// rename on one side would make the menu item show the window and do
+    /// nothing else, with no error anywhere.
+    #[test]
+    fn the_tray_update_check_fires_what_the_overview_listens_for() {
+        let js = tray_check_update_js();
+        assert!(
+            js.contains("window.__roomler_tray_check_pending = true"),
+            "{js}"
+        );
+        assert!(
+            js.contains(&format!("new Event('{TRAY_CHECK_UPDATE_EVENT}')")),
+            "{js}"
+        );
+        let page = include_str!("front/overview.js");
+        assert!(
+            page.contains(&format!("'{TRAY_CHECK_UPDATE_EVENT}'")),
+            "overview.js no longer listens for {TRAY_CHECK_UPDATE_EVENT}"
+        );
+        assert!(
+            page.contains("__roomler_tray_check_pending"),
+            "overview.js no longer reads the pending flag"
+        );
+    }
 
     /// FR-92 — the item is a Stop exactly while keep busy is on; off, an
     /// older service, or no answer at all leave it disabled (there is no

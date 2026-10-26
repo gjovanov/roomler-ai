@@ -1603,8 +1603,18 @@ pub fn cmd_default_device_name() -> String {
 /// Spawn `roomlerd self-update --check-only` and parse the
 /// stdout — looks for the "Update available" sentinel line and
 /// extracts the version pair.
+///
+/// #2936 — `async`, the wait on a blocking thread: a synchronous command runs
+/// on the app's main thread, and this one spawns `roomlerd` and waits for a
+/// network round-trip, which froze the window for the whole check.
 #[tauri::command]
-pub fn cmd_check_update() -> Result<String, String> {
+pub async fn cmd_check_update() -> Result<String, String> {
+    tokio::task::spawn_blocking(check_update_blocking)
+        .await
+        .map_err(|e| format!("task join: {e}"))?
+}
+
+fn check_update_blocking() -> Result<String, String> {
     let exe = agent_exe_path()?;
     let output = no_window_command(&exe)
         .args(["self-update", "--check-only"])
