@@ -48,7 +48,7 @@ At 820 px (a portrait tablet) the same one-column cards stretched every select t
 ### 2.2 Every page: a 4 px sideways scroll
 
 The house padding is `pa-2` (8 px) on phones (`docs/ui.md` § Responsive page padding), and a default `v-row` pulls
-12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1227-1233`, `overflow-y: auto`), so it also scrolls
+12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1231-1237`, `overflow-y: auto`), so it also scrolls
 **sideways by 4 px** on every page that has a row: measured on the tenant dashboard, the org list, Billing and
 Observability, and on the sign-in pages.
 
@@ -123,7 +123,7 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | the page scrolls sideways by 4 px (§2.2) | `AppLayout.vue:1227-1233` | `overflow-x: hidden` on `v-main`; `v-row dense` where a page needs edge-to-edge |
 | app bar overflow: with the unread and call buttons up, the avatar menu — and **Logout** — go off-screen | `AppLayout.vue:431-540` | a phone budget: `?` and the theme toggle into the avatar menu below 600 px, the text buttons icon-only with a badge |
 | a page opens at the previous page's scroll offset (`v-main` is the scroller, nothing resets it) | `AppLayout.vue:563-567` | reset on path change |
-| a running call leaves no visible controls once you leave its page | `AppLayout.vue:406-420`, `:703-707` | an in-call control in the app bar on phones (D5) |
+| a running call leaves no visible controls once you leave its page | `AppLayout.vue:406-420`, `:706-710` | an in-call control in the app bar on phones (D5) |
 | other-org activity and the current org's name are drawer-only | `AppLayout.vue:57-65` | a dot on the nav icon |
 | dialogs never go full screen on a phone | 20+ dialogs | a `useResponsiveDialog()` (`fullscreen` on `xs`), with a toolbar close |
 | rail state from a wide window leaks into the phone drawer | `AppLayout.vue:49`, `:176`, `:271`, `:412` | `railActive = !mobile && rail` |
@@ -163,11 +163,11 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | finding | where | fix |
 |---|---|---|
 | once a session starts, the toolbar's title gets 0 px (no device name), chips lose their text, and **Disconnect** and Fullscreen are off-screen | `RemoteControl.vue:15-883`, `:50` | on `xs`: name, status and Disconnect on row 1, tools on an extension row; the rarer tools in an overflow menu |
-| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:908-970`, `:5248-5255` | the alerts as an overlay on the stage |
-| the **Unverified** device-identity badge is hidden below 600 px | `RemoteControl.vue:81-92` | always shown when it warns (icon-only on `xs`) |
-| the Settings **Session** tab is off-screen on a phone | `RemoteControl.vue:1522-1527` | `show-arrows` |
-| the Metrics tab's live values never render (`hide-details` with `messages`) | `RemoteControl.vue:1707-1755` | `hide-details="auto"` |
-| the files drawer has no tap path into a folder and no "upload here" | `RemoteControl.vue:2226-2232` | a chevron per folder; an upload button |
+| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:914-1014`, `:5411-5418` | the alerts as an overlay on the stage |
+| the **Unverified** device-identity badge is hidden below 600 px | `RemoteControl.vue:87-98` | always shown when it warns (icon-only on `xs`) |
+| the Settings **Session** tab is off-screen on a phone | `RemoteControl.vue:1566-1571` | `show-arrows` |
+| the Metrics tab's live values never render (`hide-details` with `messages`) | `RemoteControl.vue:1751-1799` | `hide-details="auto"` |
+| the files drawer has no tap path into a folder and no "upload here" | `RemoteControl.vue:2282-2288` | a chevron per folder; an upload button |
 
 **P6 — observability, analytics, growth, hive**
 
@@ -203,7 +203,7 @@ actions inside the viewport.
 | **P3d** — #2607 | the audit lists on a phone: compact cards, 20 at a time, a long command clamped until tapped; and the SSH audit's refusal that also read "granted" (P3a) | revert: UI only | the exec audit at 360 px with 100 rows: 47,997 → 4,822 px in the harness; production after a promote | S |
 | **P4** — P4a #2574 (chat) · P4b #2580 (calls) | chat and conference | revert | a two-browser call with one at phone width | L |
 | **P5** — #2577 · P5b #2588 (the files drawer; a stack on #2577) | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
-| **P5c** — #2768 | a running session's state chips and tools ride their own row under the toolbar, at every width (`#rc-tb-strip`, `RemoteControl.vue:916`; one `<Teleport>`, `:58-870`, gated by `sessionToolsOnStrip`, `:2596`), so the toolbar keeps Back, the device's name, Disconnect and Fullscreen; Connect's phases keep the one row. P5's single scrolling row could not: the tools overflowed it, and an overflowing flex row shrinks the title first — to its 96 px minimum on a phone, to 0 px on a 1300 px desktop (the operator chose the strip for desktop too, 2026-10-23) | revert: UI only | a session at 360 px on production, red (§8, 2026-10-23), then this build served at the production origin, green at 360–1920 px; then production as deployed (`hosted-20261023-978e47b`), green | S |
+| **P5c** — #2768 | a running session's state chips and tools ride their own row under the toolbar, at every width (`#rc-tb-strip`, `RemoteControl.vue:922`; one `<Teleport>`, `:64-876`, gated by `sessionToolsOnStrip`, `:2661`), so the toolbar keeps Back, the device's name, Disconnect and Fullscreen; Connect's phases keep the one row. P5's single scrolling row could not: the tools overflowed it, and an overflowing flex row shrinks the title first — to its 96 px minimum on a phone, to 0 px on a 1300 px desktop (the operator chose the strip for desktop too, 2026-10-23) | revert: UI only | a session at 360 px on production, red (§8, 2026-10-23), then this build served at the production origin, green at 360–1920 px; then production as deployed (`hosted-20261023-978e47b`), green | S |
 | **P6** — P6a #2584 (UI) · P6b #2586 (D4, the server); hive's rows are FR-90's and stay open | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
 | **P6c** — #2652 | hive's session rows and dialogs name the device as the Devices page does (a UI join on `device_id`; the kept `device_name` only for a device the org no longer lists). The agent's message author, `Claude · <device_name>` (`crates/modules/hive/src/model.rs:640`), is stamped by the server and stays FR-90's | revert: UI only | the hive pages on production after a promote | S |
 | **P6d** — #2792 | what the server writes into a session's room names the device as the device list does: the author line `Claude · <device>`, the notes (started, adopted, refused, managed, moving, moved, forked, the failures, tail), an approval's notification, and the reasons a move or fork sends back. It is resolved live when the text is written: `crates/modules/hive/src/room.rs` `for_people` / `promotion_for_people`. The record (`location.device_name`, `to_name`) and what the device's harness reads (the memory snapshot, a move's resume note) keep the machine's name, which the CLI's selectors resolve. Taken with the operator's go (2026-10-23), FR-90 told on #1827 | revert: a display-only lookup, nothing stored changes | `hive_tests::a_sessions_room_names_its_device_as_the_device_list_does` (a display name, a rename, a cleared one), then a session's room on production (`hosted-20261023-f530ac6`): red before, green after (§8) | S |
