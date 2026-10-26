@@ -861,7 +861,7 @@ sequenceDiagram
 The toolbelt (FR-90 P1a, [`hive.md`](hive.md) §4) offers the two tools only
 where the device takes leases: its owner's `vault_enabled` on, a build with
 `vault`, the primary connection
-([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L480)). Wherever it
+([`daemon_vault`](../agents/roomlerd/src/hive/toolbelt.rs#L481)). Wherever it
 offers them, the session's settings allow them (`permissions.allow`,
 [`launch.rs:412`](../crates/hive-node/src/launch.rs#L412)), so no person is
 asked to approve each one: they only read, and their gate is the vault's own
@@ -891,7 +891,7 @@ no answer, and the daemon stops waiting for it.
 | the frames | `rc:vault.list` · `rc:vault.describe` ([`signaling.rs:1530`](../crates/remote_control/src/signaling.rs#L1530)) and `rc:vault.listed` · `rc:vault.described` ([`:5035`](../crates/remote_control/src/signaling.rs#L5035)); refusals reuse `rc:vault.refused` |
 | the decisions | `list` and `describe` ([`meta.rs:116`](../crates/modules/vault/src/meta.rs#L116)); `secret:list` in [`policy.cedarschema`](../crates/modules/vault/src/policy.cedarschema) and `Ask::ListSecret` ([`policy.rs:567`](../crates/modules/vault/src/policy.rs#L567)) |
 | the daemon's asks | `Client::list` and `Client::describe` ([`vault.rs:830`](../agents/roomlerd/src/vault.rs#L830)) |
-| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:943`](../agents/roomlerd/src/hive/toolbelt.rs#L943)), answered by `vault_tool` ([`toolbelt.rs:1247`](../agents/roomlerd/src/hive/toolbelt.rs#L1247)) |
+| the tools | `vault_list` and `vault_describe` ([`toolbelt.rs:944`](../agents/roomlerd/src/hive/toolbelt.rs#L944)), answered by `vault_tool` ([`toolbelt.rs:1248`](../agents/roomlerd/src/hive/toolbelt.rs#L1248)) |
 
 ## 14. A command with values: `vault_exec` (P3-4c-1)
 
@@ -955,7 +955,7 @@ device share): a path could match nothing a device asks for.
 > **A person approves every use because the settings ASK for it.** Keeping
 > it out of the allow list is not enough. The session's settings list
 > `vault_exec` and `vault_render` under `permissions.ask`
-> ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L447), written
+> ([`VAULT_USE_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L448), written
 > by [`vault_use_tools`](../agents/roomlerd/src/hive/supervisor.rs#L5038)).
 > - **Why an ask:** a repository's own `.claude/settings.json` loads too (the
 >   FR-90 spec's open decision 7), and an allow there would skip the person.
@@ -969,7 +969,7 @@ device share): a path could match nothing a device asks for.
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_exec` in [`toolbelt.rs:976`](../agents/roomlerd/src/hive/toolbelt.rs#L976), offered with the reads where the device takes leases, and asked for in the settings |
+| the tool | `vault_exec` in [`toolbelt.rs:977`](../agents/roomlerd/src/hive/toolbelt.rs#L977), offered with the reads where the device takes leases, and asked for in the settings |
 | where it runs | the run's `ExecTarget`, made at launch from the session's account, home and folder ([`supervisor.rs:4491`](../agents/roomlerd/src/hive/supervisor.rs#L4491)); none on Windows |
 | letting go | `Client::release` ([`vault.rs:1146`](../agents/roomlerd/src/vault.rs#L1146)) |
 
@@ -1019,7 +1019,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_render` in [`toolbelt.rs:1009`](../agents/roomlerd/src/hive/toolbelt.rs#L1009), offered with the reads, and asked for in the settings as `vault_exec` is (§14) |
+| the tool | `vault_render` in [`toolbelt.rs:1010`](../agents/roomlerd/src/hive/toolbelt.rs#L1010), offered with the reads, and asked for in the settings as `vault_exec` is (§14) |
 | keeping the leases | `Releasing::keep` ([`vault_exec.rs:494`](../agents/roomlerd/src/hive/vault_exec.rs#L494)) |
 
 ## 16. A lease asked for ahead: `vault_request` (P3-4c-3)
@@ -1072,7 +1072,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the tool | `vault_request` in [`toolbelt.rs:1074`](../agents/roomlerd/src/hive/toolbelt.rs#L1074), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L456)) |
+| the tool | `vault_request` in [`toolbelt.rs:1075`](../agents/roomlerd/src/hive/toolbelt.rs#L1075), offered with the reads, allowed in the settings with them ([`VAULT_AHEAD_TOOLS`](../agents/roomlerd/src/hive/toolbelt.rs#L457)) |
 | finding the lease | `Client::find_ahead` ([`vault.rs:1182`](../agents/roomlerd/src/vault.rs#L1182)); how long one has left, `Client::left` ([`vault.rs:1206`](../agents/roomlerd/src/vault.rs#L1206)) |
 
 ## 17. What a device reports doing: `vault_activity` (P3-4d)
@@ -1195,7 +1195,7 @@ owner.
 | the routes | `GET …/vault/approval/{id}`: the approval as the session's readers see it, with `may_answer` (the caller drives it now) and `may_approve` (and the policy would take their yes) for the caller. `POST …/vault/approval/{id}` `{answer: "approve" \| "deny"}` | [`approval.rs:595`](../crates/modules/vault/src/approval.rs#L595), [`approval.rs:622`](../crates/modules/vault/src/approval.rs#L622) |
 | one yes, one lease | the lease spends the yes by compare-and-set (`approved` → `used`) before its allow is recorded | [`lease.rs:1138`](../crates/modules/vault/src/lease.rs#L1138), [`dao.rs:820`](../crates/modules/vault/src/dao.rs#L820) |
 | the windows | a card waits 10 min for an answer (`APPROVAL_ANSWER_SECS`); a yes is usable for 5 min from the answer (`APPROVAL_USE_SECS`) | [`vault.rs:94`](../crates/remote_control/src/vault.rs#L94) |
-| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:765`](../agents/roomlerd/src/vault.rs#L765), [`vault.rs:1015`](../agents/roomlerd/src/vault.rs#L1015), [`toolbelt.rs:493`](../agents/roomlerd/src/hive/toolbelt.rs#L493), [`toolbelt.rs:577`](../agents/roomlerd/src/hive/toolbelt.rs#L577) |
+| the device's wait (P3-4e-2) | `awaiting_approval` reaches the lease client with its approval's id, and a tool's lease (`vault_exec`, `vault_render`, `vault_request`) asks again while the card waits: after 2 s, the pause doubling to 15 s, for at most the card's 10 minutes. Each ask is a decision the vault records, which is why the pause grows. A lease goes on as any lease does; a `denied` tells the model a driver may have said no; a card nobody answered in time names its approval and says to ask again once a driver can answer a new card. A cancelled tool call stops the asking | [`vault.rs:765`](../agents/roomlerd/src/vault.rs#L765), [`vault.rs:1015`](../agents/roomlerd/src/vault.rs#L1015), [`toolbelt.rs:494`](../agents/roomlerd/src/hive/toolbelt.rs#L494), [`toolbelt.rs:578`](../agents/roomlerd/src/hive/toolbelt.rs#L578) |
 | the web app (P3-4e-3) | under a message bound to `{module: "vault"}`, the approval as `GET …/vault/approval/{id}` gives it: where it stands, the deadline while it waits, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve`, else off with why). A refusal is shown in the server's words. The vault edits the card's message whenever the approval moves on, and the new `updated_at` reads it again. The buttons only reflect what the route says; every decision stays the server's | [`VaultApprovalCard.vue`](../ui/src/components/vault/VaultApprovalCard.vue), [`MessageBubble.vue`](../ui/src/components/chat/MessageBubble.vue) |
 | the row | `vault_approvals`, one per card: its request, its status (`pending` · `approved` · `denied` · `used` · `expired` · `withdrawn`), who answered and when, the lease that spent it, and the card's message. A unique index holds one pending card per request | [`model.rs:367`](../crates/modules/vault/src/model.rs#L367), [`lib.rs:370`](../crates/modules/vault/src/lib.rs#L370) |
 
@@ -1263,13 +1263,13 @@ sequenceDiagram
 
 | Step | What the engine does | Where |
 |---|---|---|
-| the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:100` |
-| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:107`, `pg.rs:467` |
-| its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:119`, `pg.rs:136` |
-| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:431`, `agents/roomlerd/src/vault_proxy/tls.rs:72` |
-| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts; bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3) | `pg.rs:198`, `pg.rs:210`, `pg.rs:216`, `pg.rs:258` |
-| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:280`, `pg.rs:290` |
-| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:153` |
+| the client's `SSLRequest`, `GSSENCRequest` | answered `N`: the endpoint is a local socket | `agents/roomlerd/src/vault_proxy/pg.rs:103` |
+| its `CancelRequest` | sent to the upstream as it came, over TLS: the key it names is the upstream's own, relayed unchanged | `pg.rs:110`, `pg.rs:463` |
+| its startup | `replication` refused, each one it names (Postgres takes the last, so a "no" first is no cover); `user` replaced by the secret's; everything else kept | `pg.rs:122`, `pg.rs:139` |
+| the upstream | TCP, an `SSLRequest` it must accept, and TLS verified against the system's roots and the secret's `ca` | `pg.rs:434`, `agents/roomlerd/src/vault_proxy/tls.rs:72` |
+| its authentication | SCRAM-SHA-256 only, and the server's signature checked before the session starts; bound to the certificate the proxy verified where the upstream offers `-PLUS` (P3-5b-3) | `pg.rs:201`, `pg.rs:213`, `pg.rs:219`, `pg.rs:261` |
+| what it says meanwhile | a protocol negotiation passed on at once, since a client takes one only before its `AuthenticationOk`; a notice held until after it | `pg.rs:283`, `pg.rs:293` |
+| then | `AuthenticationOk` to the client, and every byte both ways | `pg.rs:156` |
 
 > ⚠️ **The client never authenticates.** The endpoint is its credential: a
 > socket only the session's account can reach (P3-5b-2). The client is never
@@ -1280,7 +1280,7 @@ sequenceDiagram
 
 | What | The refusal says |
 |---|---|
-| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:454`) |
+| an upstream that declines TLS | "the upstream declined TLS" (`pg.rs:450`) |
 | a certificate that no root and no `ca` vouches for | "TLS to *host*: …" |
 | a cleartext or MD5 password asked for, or Kerberos, GSSAPI or SSPI | "the upstream asked for …; the proxy authenticates with SCRAM-SHA-256 only" |
 | SASL without SCRAM-SHA-256 | "the upstream offers no SCRAM-SHA-256" |
@@ -1289,7 +1289,7 @@ sequenceDiagram
 | a client asking for a replication connection | refused before any upstream is dialled |
 
 The proxy's refusals reach the client as Postgres writes a fatal error
-(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:558`). An upstream's own
+(`FATAL`, SQLSTATE `08004`), saying why (`pg.rs:554`). An upstream's own
 error, such as a wrong password or an unknown database, is relayed as the
 upstream wrote it.
 
@@ -1324,10 +1324,10 @@ upstream wrote it.
 > linked: `tokio-rustls` without its default `aws-lc-rs`.
 
 **Bounds.** A session has 30 s to start, both sides together, and an
-upstream has 10 s to accept a connection (`pg.rs:50`, `pg.rs:52`). A
+upstream has 10 s to accept a connection (`pg.rs:53`, `pg.rs:55`). A
 client's startup packet is at most 10,000 bytes (Postgres's own limit), and
-an upstream's message before the session at most 64 KiB (`pg.rs:46`,
-`pg.rs:48`).
+an upstream's message before the session at most 64 KiB (`pg.rs:49`,
+`pg.rs:51`).
 
 **Tested** against a fake upstream over real TLS, with a certificate made
 for each test:
@@ -1370,12 +1370,12 @@ sequenceDiagram
 
 | Step | What the engine does | Where |
 |---|---|---|
-| the client's first message | read whole, at most 1 MiB: its handshake, `hello` or the legacy `isMaster`, as `OP_MSG` or `OP_QUERY`; held until the session starts | `mongo.rs:80`, `mongo.rs:50` |
-| the upstream | TCP, then TLS from its first byte, verified against the system's roots and the secret's `ca` | `mongo.rs:123` |
-| its authentication | SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user named in the exchange (MongoDB takes it from there, not from a startup), `skipEmptyExchange` asked for, and the empty exchange given to a server before 4.4 that still asks for it | `mongo.rs:145`, `mongo.rs:186` |
-| the server's signature | checked before a byte of the client's is sent: a server that cannot sign is refused | `mongo.rs:183` |
-| then | the client's first message, then every byte both ways | `mongo.rs:106` |
-| a refusal | answers the client's first message as a server would: an `OP_REPLY` to an `OP_QUERY`, an `OP_MSG` to an `OP_MSG`, `ok: 0` with the reason and the code of a failed sign-in (18) | `mongo.rs:373` |
+| the client's first message | read whole, at most 1 MiB: its handshake, `hello` or the legacy `isMaster`, as `OP_MSG` or `OP_QUERY`; held until the session starts | `mongo.rs:83`, `mongo.rs:53` |
+| the upstream | TCP, then TLS from its first byte, verified against the system's roots and the secret's `ca` | `mongo.rs:126` |
+| its authentication | SCRAM-SHA-256 by `saslStart` and `saslContinue` in the auth database, the user named in the exchange (MongoDB takes it from there, not from a startup), `skipEmptyExchange` asked for, and the empty exchange given to a server before 4.4 that still asks for it | `mongo.rs:141`, `mongo.rs:182` |
+| the server's signature | checked before a byte of the client's is sent: a server that cannot sign is refused | `mongo.rs:179` |
+| then | the client's first message, then every byte both ways | `mongo.rs:109` |
+| a refusal | answers the client's first message as a server would: an `OP_REPLY` to an `OP_QUERY`, an `OP_MSG` to an `OP_MSG`, `ok: 0` with the reason and the code of a failed sign-in (18) | `mongo.rs:369` |
 
 > [!WARNING]
 > - **The proxy sends no `hello` of its own.** A server takes client
@@ -1423,15 +1423,15 @@ sequenceDiagram
 
 | Step | What the engine does | Where |
 |---|---|---|
-| a request | origin-form only: `CONNECT` answered `405`, an absolute or authority form and `*` answered `400`; nothing reaches the upstream | `http.rs:334`, `http.rs:340` |
-| its headers | the client's `Authorization` and `Proxy-Authorization` dropped, with every hop-by-hop header and those its `Connection` names; `Host` the upstream's; the secret's `Authorization` added, marked sensitive | `http.rs:355`, `http.rs:389` |
+| a request | origin-form only: `CONNECT` answered `405`, an absolute or authority form and `*` answered `400`; nothing reaches the upstream | `http.rs:337`, `http.rs:343` |
+| its headers | the client's `Authorization` and `Proxy-Authorization` dropped, with every hop-by-hop header and those its `Connection` names; `Host` the upstream's; the secret's `Authorization` added, marked sensitive | `http.rs:358`, `http.rs:392` |
 | the credential | `Basic` from the secret's `user` and `password`, or `Bearer` from its `token`. A user with a colon, or a token that is empty or holds a space, a control character or a byte that is not ASCII, is never sent: the client is answered `502` | `http.rs:69`, `http.rs:98` |
-| the upstream | TCP and TLS within 10 s, verified against the system's roots and the secret's `ca`; HTTP/1.1, one connection per client connection, dialled at its first request and again when the upstream closes it, a request it never wrote sent once more | `http.rs:502`, `http.rs:473` |
-| the response | streamed back; a `Location` on the upstream's own origin pointed back at the endpoint; `Alt-Svc`, `Strict-Transport-Security` and the hop-by-hop headers dropped | `http.rs:371`, `http.rs:419` |
-| a refusal | the client's request answered `503` with the reason, and the connection closed | `http.rs:193` |
+| the upstream | TCP and TLS within 10 s, verified against the system's roots and the secret's `ca`; HTTP/1.1, one connection per client connection, dialled at its first request and again when the upstream closes it, a request it never wrote sent once more | `http.rs:505`, `http.rs:476` |
+| the response | streamed back; a `Location` on the upstream's own origin pointed back at the endpoint; `Alt-Svc`, `Strict-Transport-Security` and the hop-by-hop headers dropped | `http.rs:374`, `http.rs:422` |
+| a refusal | the client's request answered `503` with the reason, and the connection closed | `http.rs:196` |
 | for Kubernetes (P3-5e-1): a client certificate | presented in the TLS handshake, by a connector made for the one connection, so no header carries it and TLS proves the key without sending it. An identity is a certificate (and any intermediates) and a key, both PEM | `http.rs:80`, `tls.rs:37`, `tls.rs:52` |
-| for Kubernetes: an upgrade | to `websocket` or `SPDY/3.1`, what `kubectl exec`, `attach` and `port-forward` stream over, relayed on a connection of its own. On the API server's `101` the two ends are joined, and carried within the client connection's own session, so they end with it. Any other protocol (`h2c`), and any upgrade on a plain HTTP endpoint, is never relayed | `http.rs:255`, `http.rs:298`, `http.rs:162` |
-| for Kubernetes: impersonation | every `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid` and `Impersonate-Extra-*` dropped | `http.rs:315`, `http.rs:62` |
+| for Kubernetes: an upgrade | to `websocket` or `SPDY/3.1`, what `kubectl exec`, `attach` and `port-forward` stream over, relayed on a connection of its own. On the API server's `101` the two ends are joined, and carried within the client connection's own session, so they end with it. Any other protocol (`h2c`), and any upgrade on a plain HTTP endpoint, is never relayed | `http.rs:258`, `http.rs:301`, `http.rs:165` |
+| for Kubernetes: impersonation | every `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid` and `Impersonate-Extra-*` dropped | `http.rs:318`, `http.rs:62` |
 
 > [!WARNING]
 > - **`Authorization` shows the upstream the value.** SCRAM never shows a
@@ -1642,14 +1642,14 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:231`, `agents/roomlerd/src/vault_proxy/mod.rs:62`, `agents/roomlerd/src/vault_proxy/mod.rs:114`, `vault_connect.rs:178` |
-| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:913` |
-| the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1241` |
-| the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1347`, `vault_connect.rs:1370`, `vault_connect.rs:1378`, `vault_connect.rs:1029`, `vault_connect.rs:1071` |
-| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). (P3-5f-2) An SSH agent's is `…/ssh-agent.sock`, on Linux and macOS; (P3-5f-3) on Windows it is a named pipe, `\\.\pipe\roomler-vault-<id>`, its DACL the session's account's to open as Win32-OpenSSH opens an agent, for reading and writing whole (`agent_pipe_sddl`; the toolbelt pipe's grant would refuse a session's `ssh.exe`), local clients only, its first instance made before the session is told its name. Either is named in `SSH_AUTH_SOCK`, as OpenSSH and Win32-OpenSSH dial it. Every database endpoint on Windows (P3-5b-4), and an HTTP or Kubernetes one everywhere (P3-5d-2, P3-5e-2; macOS from P3-5d-3), since neither git nor `kubectl` can dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:2094`, `vault_connect.rs:2224`, `vault_connect.rs:1446`, `vault_connect.rs:2512`, `vault_connect.rs:2497` |
-| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a pipe (P3-5f-3), past its DACL, the client's process is read from the pipe (`GetNamedPipeClientProcessId`) and its token's SID compared with the session's, and the next instance is made before the client is looked at, so a second connection always finds one listening. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:1992`, `vault_connect.rs:2193`, `vault_connect.rs:2300`, `vault_connect.rs:554`, `vault_connect.rs:736`, `vault_connect.rs:819`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
-| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket, pipe or port and every connection it holds, an upgraded stream (`kubectl exec`) and an agent's connection included. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1478`, `vault_connect.rs:1675`, `vault_connect.rs:417` |
-| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once. For `kubernetes` (P3-5e-2) the `uri` is the endpoint's origin, and the answer carries a `kubeconfig`: one cluster whose `server` is the endpoint, one context, one user with no credential. For `ssh` (P3-5f-2) `host` is the agent's socket, or (P3-5f-3) on Windows its pipe's name, and `env` names it in `SSH_AUTH_SOCK`; the `uri` is the upstream, which the session's own `ssh` dials; and `known_hosts` holds the hosts' keys under the upstream's name (`[host]:port` where the port is not 22), so `ssh` checks the host by the very keys the agent binds to. Nothing in any of them is secret: the session writes a `kubeconfig` or a `known_hosts` to a file of its own | `vault_connect.rs:1568`, `vault_connect.rs:2429`, `vault_connect.rs:1593`, `vault_connect.rs:2015`, `vault_connect.rs:2209`, `vault_connect.rs:1582` |
+| the call | `handle`: a structured secret, by its path or this org's RRN, with no `#field`. `engine`: `postgres`, (P3-5c-2) `mongodb`, (P3-5d-2) `http`, (P3-5e-2) `kubernetes`, or (P3-5f-2) `ssh`. `upstream`, exactly as the secret's `audiences` names it: a database's `host:port` (a host name, an IPv4 address or a bracketed IPv6 one; one spelling per port); for `http` and `kubernetes` an origin, `https://host` or `https://host:port` (TLS always; no path, query or user; the port only where it is not 443); for `ssh`, `ssh://host`, `ssh://host:port` or `ssh://user@host` (no path; the port only where it is not 22; a user in it, a POSIX account name, is the one account the key signs in as). `auth`: required for `http` and `kubernetes`, refused for a database and for `ssh`: `basic` (the secret's `user` and `password`; `http` only, since no API server takes it) or `bearer` (its `token`), sent as `Authorization`, or (P3-5e-2) `client-cert` (its `cert` and `key`, PEM), presented in the TLS handshake. `database`: optional, a database's, named in the connection string. `ca`: optional, a secret whose value is the upstream's CA (PEM); refused for `ssh`, whose host is checked by the secret's own `host_keys`. `auth_source`: MongoDB's, the database the secret's user is defined in, default `admin` (refused in any other call). `ttl_s`: 30 to 900, default 300 | `vault_connect.rs:236`, `agents/roomlerd/src/vault_proxy/mod.rs:96`, `agents/roomlerd/src/vault_proxy/mod.rs:148`, `vault_connect.rs:183` |
+| its place | at most 8 endpoints per run, taken before the vault is asked, so a call past it asks the vault nothing | `vault_connect.rs:947` |
+| the leases | the secret's `user` and `password` (for `bearer`, its `token`; for `client-cert`, its `cert` and `key`; for `ssh`, its `key` and `host_keys`), and the CA's, each in `proxy` mode toward the upstream: `proxy-only-named-audiences` refuses an upstream the secret does not name (§7), recorded. A lease `vault_request` asked for ahead toward the same upstream (§16) is taken as it is | `vault_connect.rs:1281` |
+| the values | read once to check them: a user the database takes; a value `Authorization` can carry (a user with no colon, a token of visible ASCII); a cert and key TLS can present, proven by making a connector with them, the refusal naming no parser's words, which could quote the key; (P3-5f-2) a key and hosts the SSH agent takes, read as it reads them, its refusals naming no byte of either; a CA that parses. Then again from the leases as each connection starts, never kept by the endpoint: a client certificate goes into that one connection's TLS, and an agent's key into that one connection's agent | `vault_connect.rs:1387`, `vault_connect.rs:1410`, `vault_connect.rs:1418`, `vault_connect.rs:1065`, `vault_connect.rs:1111` |
+| the endpoint | a database's, on Unix: `<runtime>/<session>/proxies/<id>/.s.PGSQL.5432`, both directories the daemon's (`0711`), the socket handed to the session's account (`0600`); a Postgres client dials it as `host=<that directory>`, port 5432. For MongoDB the socket is `…/mongodb-27017.sock`, which a driver dials by its path (a host that ends in `.sock`). (P3-5f-2) An SSH agent's is `…/ssh-agent.sock`, on Linux and macOS; (P3-5f-3) on Windows it is a named pipe, `\\.\pipe\roomler-vault-<id>`, its DACL the session's account's to open as Win32-OpenSSH opens an agent, for reading and writing whole (`agent_pipe_sddl`; the toolbelt pipe's grant would refuse a session's `ssh.exe`), local clients only, its first instance made before the session is told its name. Either is named in `SSH_AUTH_SOCK`, as OpenSSH and Win32-OpenSSH dial it. Every database endpoint on Windows (P3-5b-4), and an HTTP or Kubernetes one everywhere (P3-5d-2, P3-5e-2; macOS from P3-5d-3), since neither git nor `kubectl` can dial a Unix socket: `127.0.0.1`, on a port the system picks. A system that cannot say who connected serves no loopback endpoint, refused before anything is leased | `vault_connect.rs:2135`, `vault_connect.rs:2265`, `vault_connect.rs:1486`, `vault_connect.rs:2616`, `vault_connect.rs:2601` |
+| a connection | from the session's account only, root's refused too. On a socket its peer uid is checked again. On a pipe (P3-5f-3), past its DACL, the client's process is read from the pipe (`GetNamedPipeClientProcessId`) and its token's SID compared with the session's, and the next instance is made before the client is looked at, so a second connection always finds one listening. On a loopback port, Windows finds its process in the connection table (`GetExtendedTcpTable`) and compares its token's SID with the session's; Linux (P3-5d-2) reads `/proc/net/tcp` and `tcp6`, whose row for the connection's client end names the uid that owns the socket, and never believes a row in TIME_WAIT or with no inode; macOS (P3-5d-3) reads every process's descriptors (`proc_listpids`, `PROC_PIDLISTFDS`) and each socket's ends (`PROC_PIDFDSOCKETINFO`), and serves the connection only where its client end is held, and held only, by processes running as the session's account; macOS cannot say who made a socket. At most 16 at once, one engine session each | `vault_connect.rs:2033`, `vault_connect.rs:2234`, `vault_connect.rs:2341`, `vault_connect.rs:588`, `vault_connect.rs:770`, `vault_connect.rs:853`, `agents/roomlerd/src/hive_win.rs:348`, `hive_win.rs:318` |
+| its life | the first of its leases to be let go (its expiry, `rc:vault.revoke`, the run's end) cancels the endpoint's stop, which closes its socket, pipe or port and every connection it holds, an upgraded stream (`kubectl exec`) and an agent's connection included. The leases the call asked for itself are then let go too, rather than held to their expiry. An earlier process's endpoints go at the daemon's start | `vault_connect.rs:1518`, `vault_connect.rs:1716`, `vault_connect.rs:449` |
+| the answer | `host`, `port`, `database`, a `uri` and `env` (`PGHOST`, `PGPORT`, `PGDATABASE`), `ttl_s`: no `PGPASSWORD`, no value. On Unix the `uri` is `postgresql:///<db>?host=<dir>&port=5432`; on Windows `postgresql://127.0.0.1:<port>/<db>?sslmode=disable`, with `PGSSLMODE=disable` (the loopback leg is plain; the upstream's is TLS). For MongoDB it is `mongodb://<the socket's path, %-encoded>/<db>?directConnection=true` on Unix, with no `port`, and `mongodb://127.0.0.1:<port>/<db>?directConnection=true` on Windows, in `MONGODB_URI` too; `directConnection` keeps a driver on the one host, never discovering a member to dial around the proxy. For `http` (P3-5d-2) the `uri` is the endpoint's origin, `http://127.0.0.1:<port>`, and `env` holds git's own configuration by environment (`GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0` = `url.<uri>/.insteadOf`, `GIT_CONFIG_VALUE_0` = `<upstream>/`) and `GIT_TERMINAL_PROMPT=0`: `git clone <upstream>/<repo>` goes through the endpoint with no change to the session's configuration, and a credential the upstream refuses fails at once. For `kubernetes` (P3-5e-2) the `uri` is the endpoint's origin, and the answer carries a `kubeconfig`: one cluster whose `server` is the endpoint, one context, one user with no credential. For `ssh` (P3-5f-2) `host` is the agent's socket, or (P3-5f-3) on Windows its pipe's name, and `env` names it in `SSH_AUTH_SOCK`; the `uri` is the upstream, which the session's own `ssh` dials; and `known_hosts` holds the hosts' keys under the upstream's name (`[host]:port` where the port is not 22), so `ssh` checks the host by the very keys the agent binds to. Nothing in any of them is secret: the session writes a `kubeconfig` or a `known_hosts` to a file of its own | `vault_connect.rs:1609`, `vault_connect.rs:2533`, `vault_connect.rs:1634`, `vault_connect.rs:2056`, `vault_connect.rs:2250`, `vault_connect.rs:1623` |
 
 > [!WARNING]
 > - **The settings ASK for every call.** `vault_connect` hands the session no
@@ -1677,9 +1677,61 @@ sequenceDiagram
 >   message answered with the reason, as a server answers it; an HTTP client
 >   (P3-5d-2), its first request, `503`. An SSH agent's protocol carries
 >   no reason (P3-5f-2): its client is hung up on, and `ssh` moves on to
->   its other methods (`vault_connect.rs:1943`).
+>   its other methods (`vault_connect.rs:1984`).
 > - **A use is not reported yet.** `vault_activity` (§17) takes `exec` and
 >   `render`; a `proxy` endpoint's opening is a later step's report.
+
+### An endpoint through another device (FR-90 P4-6-1b-2)
+
+`roomler_connect` opens `vault_connect`'s endpoint through another device
+when the session's own device cannot reach the upstream and that device can
+(`docs/knowhow.md` §13.7). The endpoint is the same one, served to the same
+account. What changes is where each of its connections dials: the end of a
+flow toward the upstream that only this daemon may use
+([`daemon_flow`](../agents/roomlerd/src/hive/net_tools.rs#L282)), never
+`host:port` itself.
+
+```mermaid
+sequenceDiagram
+    participant M as the session (Claude Code)
+    participant T as its toolbelt (roomlerd)
+    participant V as vault
+    participant E as the endpoint (roomlerd)
+    participant X as the device that reached it
+    participant U as upstream
+    M->>T: roomler_connect {kind, key}
+    Note over M,T: asked of a person first
+    T->>V: rc:vault.net, a forward through X to host:port (net:forward)
+    V-->>T: the grant, at most 900 s
+    Note over T: the flow's loopback end admits this daemon alone
+    T->>V: the leases, proxy mode, toward the upstream (as vault_connect)
+    T-->>M: the endpoint, served to the session's account
+    M->>E: a client connection, no credential
+    E->>X: TCP to the flow's end, carried to X
+    X->>U: the flow's far end dials host:port
+    Note over E,U: TLS verified against the upstream's host, end to end: X relays ciphertext
+```
+
+| Piece | As built |
+|---|---|
+| the dial | [`vault_proxy::Dial`](../agents/roomlerd/src/vault_proxy/mod.rs#L59): `Direct`, or `Through` a flow's end, dialled by [`tcp_to`](../agents/roomlerd/src/vault_proxy/mod.rs#L68). Postgres, MongoDB and HTTP (and Kubernetes) dial `up.dial`, and verify TLS against `up.host` either way ([`pg.rs:435`](../agents/roomlerd/src/vault_proxy/pg.rs#L435)), so `Host` and the certificate are still the upstream's |
+| who sets it | [`vault_connect::call_through`](../agents/roomlerd/src/hive/vault_connect.rs#L417), which only `roomler_connect` calls. A call's arguments never carry it: [`parse`](../agents/roomlerd/src/hive/vault_connect.rs#L236) makes every request `Direct`, whatever `dial` a call names, so a session cannot choose where a proxy dials |
+| the flow | [`net_tools::daemon_flow`](../agents/roomlerd/src/hive/net_tools.rs#L282): the vault's `net:forward` toward the device, the destination the upstream's `host:port`, then that device's own gates (`forward_acl`, tunnel policies). It holds one of the run's 8 egress places and ends with the run, and it goes at once if the endpoint does not open ([`toolbelt.rs:1430`](../agents/roomlerd/src/hive/toolbelt.rs#L1430)) |
+| its admit | [`vault_connect::daemon_admit`](../agents/roomlerd/src/hive/vault_connect.rs#L2450): on Windows the connection's process must be this daemon; on Unix its account must be the daemon's own (root). The session's account is refused, so it is never handed a raw pipe past the proxy |
+
+> [!NOTE]
+> **A listener, but not one the session can use.** The P4-6-0 design said the
+> flow has no listener. tunnel-core's carry path takes only a `TcpStream`, on
+> every forward's data path, so the flow keeps its loopback listener and
+> admits this daemon alone. That keeps the property the design asked for
+> (no process of the session's account reaches the upstream past the proxy)
+> without changing the tunnels' data path.
+
+> [!WARNING]
+> **A dynamic secret's mint dials from this device.** An issuer is reached
+> with `Dial::Direct` ([`bundle.rs:101`](../agents/roomlerd/src/vault_proxy/bundle.rs#L101)), never through a session's
+> flow. A dynamic secret whose issuer this device cannot reach mints nothing
+> through another device; a static secret is what reaches an upstream there.
 
 ## 20. `short-lived` mode (P3-6)
 
@@ -1754,7 +1806,7 @@ sequenceDiagram
 
 | Step | Built |
 |---|---|
-| the issuer | the bundle's `admin_user` and `admin_password`, signed in by SCRAM-SHA-256 over TLS verified against its `ca` (or the system's roots), to its `database`, at the secret's one audience. A bundle that does not parse, or lacks one of those three, is refused before anything is dialled, in words that name no value ([`pg_mint.rs:51`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L51)). Since P3-6d-1a the bundle is opened by one reader every minter shares, whose parsed fields are zeroed when they drop, so the parse leaves no copy of the password behind ([`bundle.rs:29`](../agents/roomlerd/src/vault_proxy/bundle.rs#L29)). The sign-in is the proxy's own handshake, with no client behind it ([`pg.rs:310`](../agents/roomlerd/src/vault_proxy/pg.rs#L310)) |
+| the issuer | the bundle's `admin_user` and `admin_password`, signed in by SCRAM-SHA-256 over TLS verified against its `ca` (or the system's roots), to its `database`, at the secret's one audience. A bundle that does not parse, or lacks one of those three, is refused before anything is dialled, in words that name no value ([`pg_mint.rs:51`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L51)). Since P3-6d-1a the bundle is opened by one reader every minter shares, whose parsed fields are zeroed when they drop, so the parse leaves no copy of the password behind ([`bundle.rs:29`](../agents/roomlerd/src/vault_proxy/bundle.rs#L29)). The sign-in is the proxy's own handshake, with no client behind it ([`pg.rs:313`](../agents/roomlerd/src/vault_proxy/pg.rs#L313)) |
 | the sweep | first, at every mint: each role named `roomler_…`, past its `VALID UNTIL`, whose comment is `roomler lease …`, dropped where the issuer may. That is what a daemon that died before revoking left ([`pg_mint.rs:173`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L173)) |
 | the mint | `CREATE ROLE "roomler_<lease id>" LOGIN PASSWORD '<verifier>' VALID UNTIL '<the lease's end>' IN ROLE <grants>`, and `COMMENT ON ROLE … IS 'roomler lease <lease id>'`, sent as one query and so run as one transaction ([`pg_mint.rs:123`](../agents/roomlerd/src/vault_proxy/pg_mint.rs#L123)). The grants are the issuer's `grants` field, one role per line |
 | the password | 32 random bytes, base64url, one per lease. Postgres is sent its SCRAM-SHA-256 verifier, `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, never the password, so a database that logs its statements logs no password ([`scram.rs:239`](../agents/roomlerd/src/vault_proxy/scram.rs#L239)) |
@@ -1893,7 +1945,7 @@ sequenceDiagram
 | Step | Built |
 |---|---|
 | the client | one request per connection, over TLS verified against the issuer's `ca` (or the system's roots), on the HTTP/1 client the `http` engine dials with. The issuer signs in by `admin_token` in `Authorization`, or by `admin_cert` and `admin_key` in the handshake, the key read again for each connection's TLS alone ([`k8s_mint.rs:466`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L466)). Each request has ten seconds, and an answer at most 4 MiB, read into memory that is zeroed when it drops, and that grows without leaving a copy behind ([`:541`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L541)) |
-| the issuer | the bundle's one audience, an origin as the `http` engine reads one, `origin_of` ([`mod.rs:114`](../agents/roomlerd/src/vault_proxy/mod.rs#L114)), moved from `hive::vault_connect` for it as `upstream_of` was. Its `namespace` must be a name Kubernetes gives a namespace and its `service_account` one it gives an account, since both go into a request's path; one credential, never both; `audiences` one per line ([`k8s_mint.rs:94`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L94)) |
+| the issuer | the bundle's one audience, an origin as the `http` engine reads one, `origin_of` ([`mod.rs:148`](../agents/roomlerd/src/vault_proxy/mod.rs#L148)), moved from `hive::vault_connect` for it as `upstream_of` was. Its `namespace` must be a name Kubernetes gives a namespace and its `service_account` one it gives an account, since both go into a request's path; one credential, never both; `audiences` one per line ([`k8s_mint.rs:94`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L94)) |
 | the sweep | first, at every mint: the namespace's Secrets labelled `roomler.ai/lease`, and each whose name is a minted one and whose `roomler.ai/until` has passed, deleted on its uid. An issuer that may not list is not swept, and the mint goes on ([`k8s_mint.rs:357`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L357)) |
 | the mint | an empty `Opaque` Secret `roomler-<lease id>`, labelled with its lease and annotated with its end (RFC 3339); then a `TokenRequest` bound to it by name and uid (`boundObjectRef`), `expirationSeconds` the lease's TTL or 600, whichever is longer, and the issuer's `audiences` where it names some. A token refused takes the Secret back on its uid, and the mint is refused in the API server's words ([`k8s_mint.rs:251`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L251)) |
 | the credential | `token`, `server` (the audience), `ca` (the issuer's, or empty where the system's roots verify the API server) and `namespace`; no issuer field ([`k8s_mint.rs:196`](../agents/roomlerd/src/vault_proxy/k8s_mint.rs#L196)) |
@@ -2340,8 +2392,8 @@ stateDiagram-v2
 | Piece | Where |
 |---|---|
 | the ask | `PersonAsk` and `Holder` ([`vault.rs:167`](../agents/roomlerd/src/vault.rs#L167)); `Client::connect` ([`vault.rs:814`](../agents/roomlerd/src/vault.rs#L814)) and `drop_person` ([`vault.rs:1221`](../agents/roomlerd/src/vault.rs#L1221)) |
-| the endpoint | `open_person` ([`vault_connect.rs:452`](../agents/roomlerd/src/hive/vault_connect.rs#L452)); the lease source, `PersonLeases` ([`:1169`](../agents/roomlerd/src/hive/vault_connect.rs#L1169)), and the daemon's, `DaemonPersonLeases`, in words for the person (`person_why`, [`:495`](../agents/roomlerd/src/hive/vault_connect.rs#L495)); on Unix, `person_dir` ([`:2085`](../agents/roomlerd/src/hive/vault_connect.rs#L2085)) |
-| the renewal | `renew` ([`vault_connect.rs:1798`](../agents/roomlerd/src/hive/vault_connect.rs#L1798)), `generation` and `swap`; when, `Timing` ([`:1204`](../agents/roomlerd/src/hive/vault_connect.rs#L1204)); what cuts a connection, `Live` ([`:1684`](../agents/roomlerd/src/hive/vault_connect.rs#L1684)); what its holder reads and ends, `Control` ([`:1738`](../agents/roomlerd/src/hive/vault_connect.rs#L1738)) |
+| the endpoint | `open_person` ([`vault_connect.rs:484`](../agents/roomlerd/src/hive/vault_connect.rs#L484)); the lease source, `PersonLeases` ([`:1209`](../agents/roomlerd/src/hive/vault_connect.rs#L1209)), and the daemon's, `DaemonPersonLeases`, in words for the person (`person_why`, [`:527`](../agents/roomlerd/src/hive/vault_connect.rs#L527)); on Unix, `person_dir` ([`:2126`](../agents/roomlerd/src/hive/vault_connect.rs#L2126)) |
+| the renewal | `renew` ([`vault_connect.rs:1839`](../agents/roomlerd/src/hive/vault_connect.rs#L1839)), `generation` and `swap`; when, `Timing` ([`:1244`](../agents/roomlerd/src/hive/vault_connect.rs#L1244)); what cuts a connection, `Live` ([`:1725`](../agents/roomlerd/src/hive/vault_connect.rs#L1725)); what its holder reads and ends, `Control` ([`:1779`](../agents/roomlerd/src/hive/vault_connect.rs#L1779)) |
 
 **The person's command (P3-9-2b).** `roomler connect` asks the daemon's own
 LocalAPI endpoint for a person's endpoint, and holds it in the foreground:
@@ -2881,7 +2933,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the offer, the tool, its settings name | `placeholder_offered` ([`hive/toolbelt.rs:1194`](../agents/roomlerd/src/hive/toolbelt.rs#L1194)), `placeholder_tools` ([`:1202`](../agents/roomlerd/src/hive/toolbelt.rs#L1202)), `PLACEHOLDER_TOOLS` ([`:475`](../agents/roomlerd/src/hive/toolbelt.rs#L475)) |
+| the offer, the tool, its settings name | `placeholder_offered` ([`hive/toolbelt.rs:1195`](../agents/roomlerd/src/hive/toolbelt.rs#L1195)), `placeholder_tools` ([`:1203`](../agents/roomlerd/src/hive/toolbelt.rs#L1203)), `PLACEHOLDER_TOOLS` ([`:476`](../agents/roomlerd/src/hive/toolbelt.rs#L476)) |
 | the call, its audiences, its bindings | `call` ([`hive/placeholder.rs:351`](../agents/roomlerd/src/hive/placeholder.rs#L351)), `audience_of` ([`:246`](../agents/roomlerd/src/hive/placeholder.rs#L246)), `bind` ([`:184`](../agents/roomlerd/src/hive/placeholder.rs#L184)) |
 | the settings | `vault_use_tools` in [`hive/supervisor.rs:5038`](../agents/roomlerd/src/hive/supervisor.rs#L5038) |
 | asked ahead | `parse` in [`hive/vault_request.rs:37`](../agents/roomlerd/src/hive/vault_request.rs#L37) |

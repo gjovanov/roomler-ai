@@ -16,7 +16,28 @@ fn upstream(ca: Option<&str>, port: u16, password: &str) -> Upstream {
         password: Zeroizing::new(password.into()),
         auth_source: "admin".into(),
         tls: tls::connector(ca).unwrap(),
+        dial: crate::vault_proxy::Dial::Direct,
     }
+}
+
+/// FR-90 P4-6-1b-2 — through another device the TCP goes to the flow's
+/// end, never to `host:port`, and TLS is still verified against `host`.
+#[tokio::test]
+async fn through_a_flow_the_tcp_goes_to_its_end_and_tls_to_the_host() {
+    let pw = made();
+    let (ca, port, _saw) = fake_mongo(MongoUpstreams::Scram(pw.clone())).await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut through = upstream(Some(&ca), closed, &pw);
+    through.dial = crate::vault_proxy::Dial::Through(([127, 0, 0, 1], port).into());
+    let (mut c, _session) = client_of(through);
+    c.write_all(&handshake(7)).await.unwrap();
+    let m = reply(&mut c).await;
+    assert_eq!((m.op_code, m.response_to), (OP_REPLY, 7));
+    assert_eq!(reply_doc(&m).get_bool("ismaster"), Ok(true));
 }
 
 /// Serve one client of `up` over a pipe; the client's end, and the

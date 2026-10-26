@@ -51,6 +51,40 @@ pub(crate) mod ssh_agent;
 pub(crate) mod testing;
 pub(crate) mod tls;
 
+/// FR-90 P4-6-1b-2 — where a proxy's upstream connection is dialled: the
+/// upstream itself, or, through another device, the end of the session's
+/// flow toward it that only this daemon may use. TLS is verified against the
+/// upstream's own host either way, so a device in between relays ciphertext.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Dial {
+    #[default]
+    Direct,
+    /// The flow's loopback end (`hive::net_tools::daemon_flow`).
+    Through(std::net::SocketAddr),
+}
+
+/// TCP toward `host:port` as `dial` says: the upstream itself, or the flow's
+/// end that leads there.
+pub(crate) async fn tcp_to(
+    host: &str,
+    port: u16,
+    dial: Dial,
+) -> std::io::Result<tokio::net::TcpStream> {
+    match dial {
+        Dial::Direct => tokio::net::TcpStream::connect((host, port)).await,
+        Dial::Through(end) => tokio::net::TcpStream::connect(end).await,
+    }
+}
+
+/// How an upstream connection is named in an error: `host:port`, and the
+/// flow's end it went through when it did.
+pub(crate) fn dialled(host: &str, port: u16, dial: Dial) -> String {
+    match dial {
+        Dial::Direct => format!("{host}:{port}"),
+        Dial::Through(end) => format!("{host}:{port} (through {end})"),
+    }
+}
+
 /// `host:port`, as an audience names an upstream: a host name (`_` allowed:
 /// a Compose service may carry one), an IPv4 address
 /// or a bracketed IPv6 one, then a port written plainly (no sign, no leading
