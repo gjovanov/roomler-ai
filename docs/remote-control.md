@@ -562,7 +562,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
 at [`useRemoteControl.ts:1544`](../ui/src/composables/useRemoteControl.ts#L1544)
 and puts it on the toggle's title
-([`RemoteControl.vue:3554`](../ui/src/views/remote/RemoteControl.vue#L3554)).
+([`RemoteControl.vue:3573`](../ui/src/views/remote/RemoteControl.vue#L3573)).
 
 | `code` | Means |
 |---|---|
@@ -996,7 +996,7 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3367`), registered at mount (`:5598`), and the deferred
+(`RemoteControl.vue:3386`), registered at mount (`:5630`), and the deferred
 Ctrl+V's `onPaste` (`useRemoteControl.ts:11766`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
@@ -1010,7 +1010,7 @@ upload (`:11778`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
-into the drawer's directory as well (`RemoteControl.vue:5538`).
+into the drawer's directory as well (`RemoteControl.vue:5570`).
 
 ```mermaid
 flowchart TD

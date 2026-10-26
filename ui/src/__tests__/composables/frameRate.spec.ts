@@ -3,11 +3,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   FPS_CAP,
+  FPS_RETRY_CAP,
   FRAME_RATES,
+  agentOffersFrameRateRetry,
   agentOffersHighRefresh,
   describeFrameRateReason,
   fpsWireMessage,
   frameRateAnswerOf,
+  frameRateCanRetry,
   frameRateOptions,
   frameRateSummary,
   hostRefreshHzOf,
@@ -121,5 +124,27 @@ describe('FR-119 P2b — a trial, the new reasons, the host refresh rate', () =>
       [120, false],
       [144, false],
     ])
+  })
+})
+
+describe('FR-119 P2b-17b — try a refused rate again', () => {
+  it('asks with retry only when it means it, and only of an agent that advertises it', () => {
+    expect(FPS_RETRY_CAP).toBe('fps-retry')
+    expect(fpsWireMessage(144, true)).toEqual({ t: 'rc:fps', fps: 144, retry: true })
+    expect(fpsWireMessage(144)).toEqual({ t: 'rc:fps', fps: 144 })
+    expect('retry' in fpsWireMessage(120, false)).toBe(false)
+    expect(agentOffersFrameRateRetry(['fps-high', 'fps-retry'])).toBe(true)
+    expect(agentOffersFrameRateRetry(['fps-high'])).toBe(false)
+    expect(agentOffersFrameRateRetry(undefined)).toBe(false)
+  })
+
+  it('offers it only for an unproven refusal, from an agent that can act on it', () => {
+    const unproven = frameRateAnswerOf({ fps: 60, fps_asked: 144, fps_reason: 'unproven' })
+    const relayed = frameRateAnswerOf({ fps: 30, fps_asked: 144, fps_reason: 'constrained' })
+    expect(frameRateCanRetry(unproven, true)).toBe(true)
+    expect(frameRateCanRetry(unproven, false)).toBe(false)
+    expect(frameRateCanRetry(relayed, true)).toBe(false)
+    expect(frameRateCanRetry(frameRateAnswerOf({ fps: 120 }), true)).toBe(false)
+    expect(frameRateCanRetry(null, true)).toBe(false)
   })
 })

@@ -27,7 +27,7 @@ What it must not do:
 **Setup:**
 - Production, from mars, with Playwright 1.62 in Chromium's mobile emulation (touch, `isMobile`).
 - An offline device's viewer in the vmtest org, so no session was started.
-- The stage is `.remote-stage`, measured idle. A running session adds the tools strip (`.rc-tb-strip`, at least 44 px, `RemoteControl.vue:5555`), so the connected stage is the idle one minus 44.
+- The stage is `.remote-stage`, measured idle. A running session adds the tools strip (`.rc-tb-strip`, at least 44 px, `RemoteControl.vue:5587`), so the connected stage is the idle one minus 44.
 - Rows marked "with bar" subtract what the browser's own address bar takes in landscape (approximate).
 
 | phone, sideways | page | stage starts at | idle stage | stage in a session |
@@ -58,7 +58,7 @@ The presets place controls at fixed distances from the stage's edges:
 | Arrows | PgUp … Esc, a column 16 px above the bottom (`touchControls.ts:166`): 16 + 5 × 44 + 4 × 6 | **260 px** | by 6–114 px |
 | Office keys | one row 12 px above the bottom | 56 px | fits |
 
-The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5583-5584`). A control past the stage's top edge is cut off, and it cannot be reached.
+The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5615-5616`). A control past the stage's top edge is cut off, and it cannot be reached.
 
 On an iPhone 14 with WASD, Fire and Aim are gone and only Jump shows; at 740 × 304 the d-pad and the stick lose their top edges too. Measured in a live session, P1's field run, §8.
 
@@ -66,7 +66,7 @@ On an iPhone 14 with WASD, Fire and Aim are gone and only Jump shows; at 740 × 
 
 ### 2.3 Android has a way out, iPhone has none
 
-The viewer's ⛶ puts the stage itself into element fullscreen (`toggleFullscreen`, `RemoteControl.vue:4106`). The touch overlay lives inside the stage (`:1398`), so it comes along. In fullscreen the stage is the whole screen, and every preset fits.
+The viewer's ⛶ puts the stage itself into element fullscreen (`toggleFullscreen`, `RemoteControl.vue:4125`). The touch overlay lives inside the stage (`:1398`), so it comes along. In fullscreen the stage is the whole screen, and every preset fits.
 
 The button shows only where `document.fullscreenEnabled` is true (`:4094`, `:902`): Android's Chrome, but not iPhone Safari, which fullscreens only video. On an iPhone held sideways there is no way to give the remote desktop more than 182–232 px today.
 
@@ -95,7 +95,7 @@ The tallest page a phone held sideways leaves is about 430 px. A tablet held sid
 - **Revealing.** A tap slides the toolbar and the strip down over the stage, above the touch overlay (whose z-index is 20, `TouchControls.vue:277`).
 - **The stage does not resize.** They are an overlay, so no `rc:resolution` is sent. FR-116 §3.3 measured what a resize costs when the stage alerts used to take space.
 - **Hiding again.** They hide after **4 s** without a touch inside them (D2), on a tap on the stage, or on the tab.
-- **Dialogs.** A dialog opened from the toolbar, such as Settings (full screen on such a page, FR-120's D4, `RemoteControl.vue:2586`), keeps the toolbar up until the dialog closes.
+- **Dialogs.** A dialog opened from the toolbar, such as Settings (full screen on such a page, FR-120's D4, `RemoteControl.vue:2605`), keeps the toolbar up until the dialog closes.
 
 ```mermaid
 stateDiagram-v2
