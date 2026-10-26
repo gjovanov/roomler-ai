@@ -222,6 +222,17 @@ body {
   box-shadow: var(--shadow);
 }
 
+/* #2936 — the card the tray's "Check for Updates" just brought into view,
+ * ringed once so the eye lands on it. */
+.card.flash { animation: card-flash 1.6s ease-out; }
+@keyframes card-flash {
+  from { box-shadow: 0 0 0 3px var(--primary); }
+  to { box-shadow: var(--shadow); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card.flash { animation: none; outline: 2px solid var(--primary); }
+}
+
 .card h3 {
   margin: 0 0 10px;
   font-size: 13px;

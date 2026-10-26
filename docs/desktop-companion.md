@@ -879,19 +879,23 @@ sequenceDiagram
     participant C as cmd_check_update
     T->>T: show and focus the main window
     T->>P: raise the pending flag, fire roomler-tray-check-update
-    P->>P: clear the flag, switch to Overview, scroll the Updates card into view
-    P->>P: show "Checking for updates…"
+    P->>P: clear the flag, show "Checking for updates…" in the card
+    P->>P: switch to Overview, scroll the card into view (instant), ring it once
     P->>C: invoke (off the main thread)
+    Note over P: the page becomes visible: scroll again
     C-->>P: what roomlerd self-update --check-only said
-    P->>P: show the answer, and "Install update" when one is available
+    P->>P: after at least 0.7 s, the answer and "Checked at 21:45:25."
+    P->>P: "Install update" when one is available, scroll again
 ```
 
 | Piece | Where | Why |
 |---|---|---|
 | the tray's half | `check_updates`, `src/tray.rs:588` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
 | the event and the flag | `tray_check_update_js`, `src/tray.rs:574` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
-| one check | `runUpdateCheck`, `src/front/overview.js:173` | the card's button and the tray share it: a stale "Install update" is hidden first, a second click while one runs is ignored, and a failure lands in the card |
-| into view | `revealUpdates`, `src/front/overview.js:195` | the Updates card is the last one on Overview. After a view switch it scrolls on app.js's `roomler:view` |
+| one check | `runUpdateCheck`, `src/front/overview.js:184` | the card's button and the tray share it: a stale "Install update" is hidden first, the button is disabled while it runs, and a failure lands in the card |
+| a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:173` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
+| into view | `scrollToUpdates`, `src/front/overview.js:214`; `revealUpdates`, `:234` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
+| the ring | `flashUpdates`, `src/front/overview.js:220`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
 | off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:1611` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
