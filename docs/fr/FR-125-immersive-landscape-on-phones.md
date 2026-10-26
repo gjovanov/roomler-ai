@@ -1,6 +1,8 @@
 # FR-125: Immersive landscape on phones — a session held sideways gets the whole screen
 
-**Issue:** [#2947](https://github.com/gjovanov/roomler-ai/issues/2947) · **Status:** proposed 2026-10-26, spec and claim ·
+**Issue:** [#2947](https://github.com/gjovanov/roomler-ai/issues/2947) · **Status:** in progress since 2026-10-26.
+P1–P4 are built in one PR and field-verified on the branch against production (§8); production and the operator's
+phones (AC6) are next ·
 **Owner:** the web app (UI) · **Anchors:** master `a350082a8` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (its D3), [FR-120](FR-120-phone-parity-part-2.md) (D3 carried, D1's
 36 px targets, D4's full-screen Settings) and [FR-111](FR-111-touch-controls.md) (the touch presets)
@@ -56,7 +58,11 @@ The presets place controls at fixed distances from the stage's edges:
 | Arrows | PgUp … Esc, a column 16 px above the bottom (`touchControls.ts:166`): 16 + 5 × 44 + 4 × 6 | **260 px** | by 6–114 px |
 | Office keys | one row 12 px above the bottom | 56 px | fits |
 
-In the default "fit" scale the stage does not clip (`.video-frame`, `RemoteControl.vue:5621`; only `scale-original` and `scale-custom` scroll, `:5697`). An overflowing control is therefore drawn over the bars above the stage, at the right end, where the toolbar keeps its own buttons. On an iPhone 14 with WASD, Fire lands on the toolbar and Aim on the tools strip.
+The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5583-5584`). A control past the stage's top edge is cut off, and it cannot be reached.
+
+On an iPhone 14 with WASD, Fire and Aim are gone and only Jump shows; at 740 × 304 the d-pad and the stick lose their top edges too. Measured in a live session, P1's field run, §8.
+
+*Corrected 2026-10-26:* the claim said the overflow was drawn over the bars above the stage. The first screenshots showed it clipped. `.video-frame` itself does not clip in "fit" (`:5621`), but its card does.
 
 ### 2.3 Android has a way out, iPhone has none
 
@@ -147,7 +153,7 @@ Where `document.fullscreenEnabled` is true, entering the mode shows a one-time c
 - [ ] **AC1**: in a session on a touch page held sideways, the stage is the whole page (±2 px) at 844 × 390, 844 × 340, 915 × 412, 915 × 356, 740 × 360 and 740 × 304. Measured on production against §2.1's baseline (182–254 px), red then green.
 - [ ] **AC2**: every control of the three built-in presets lies inside the stage at the six sizes.
 - [ ] **AC3**: one tap on the pull-tab puts Disconnect and Settings on screen. Showing and hiding the toolbar leaves the stage's size unchanged, and no `rc:resolution` is sent for it.
-- [ ] **AC4**: a phone held upright (360 × 780), a tablet both ways (768 × 1024 and 1024 × 768, touch) and a desktop (1300 × 900) render as on production. Element geometry is identical, and the desktop screenshot is byte for byte.
+- [ ] **AC4**: a phone held upright (360 × 780), a tablet both ways (768 × 1024 and 1024 × 768, touch) and a desktop (1300 × 900) render as on production. Measured in a live session, so the remote picture moves and no screenshot can match byte for byte: no immersive class and no pull-tab, and the app bar, the toolbar and the stage have the same boxes on both builds. The mode's CSS applies only under `.rc-immersive`.
 - [ ] **AC5**: turning the setting off restores the normal layout at once, and the choice survives a reload.
 - [ ] **AC6**: on a real iPhone and a real Android phone held sideways in a session, the desktop fills the screen, the WASD preset is usable, and the toolbar is one tap away. The operator runs this.
 - [ ] **AC7**: docs. `docs/ui.md` § Phones and tablets gets the mode's rule and a diagram. `docs/touch-controls.md` gets the fit rule, and that the presets now fit sideways. `docs/remote-control.md` notes the mode next to fullscreen. The `docs/README.md` index row covers them.
@@ -174,6 +180,10 @@ Where `document.fullscreenEnabled` is true, entering the mode shows a one-time c
 | When (UTC) | Build | Instrument | Result |
 |---|---|---|---|
 | 2026-10-26 00:46Z | production `hosted-20261025-6c1760b` | Playwright 1.62 on mars, Chromium mobile emulation; an offline device's viewer in the vmtest org; `.remote-stage` measured at the six sizes | 🔴 **the baseline (§2.1)**: the stage starts at 105 px; idle 190–298 px, so 146–254 px in a session. WASD (326 px) and Arrows (260 px) overflow at every size |
+| 2026-10-26 11:10–11:11Z | production (`index-DbWa1WpV.js`) | the run below, its first attempt | ⚪ **a wrong turn, recorded**: the run stopped at its first session, "not connected". The session had connected; the page snapshot showed it. The check read the tools strip's `textContent`, which runs the chips together ("connectedVerified…"), so `\bconnected\b` never matched. `innerText` would have worked on production but reads nothing on the branch, where the strip is `visibility: hidden`. Fixed by reading the status chip's own text |
+| 2026-10-26 11:12–11:22Z | production (`index-DbWa1WpV.js`) vs the branch (`index-B-zb3AaA.js`, P1–P3) served at the production origin | Playwright 1.62 on mars; live sessions to this FR's kept vmtest cell (Ubuntu, promptless: the vmtest admin enrolled it); the WASD preset chosen before each load; 13 s between loads | 🔴 → 🟢 **AC1, AC2, AC3, AC5 on the branch.**<br>**AC1, the stage in a session:** 232 → **390**, 182 → **340**, 254 → **412**, 198 → **356**, 202 → **360** and 146 → **304** px. The stage starts at 0 and fills the page at every size.<br>**AC2, WASD controls outside the stage:** 2, 3, 2, 3, 3 and 5 on production (Fire and Aim cut off at the top, plus the d-pad and the stick at 304 px); 0 on the branch at every size.<br>**AC3:** one tap on the pull-tab put the toolbar on screen with Disconnect and Settings in view, the stage kept exactly its box, and 5 s later the toolbar had hidden again, at all six sizes.<br>**AC4:** the phone held upright, the tablet both ways and the desktop had the same app bar, toolbar and stage boxes on both builds (stage 622, 866, 602 and 734 px), with no immersive class and no pull-tab.<br>**AC5:** at 844 × 390 with the setting off (stored before the load: a reload), the normal layout came back, a 232 px stage. Its WASD controls still all fit: P2 turned Fire / Aim / Jump into a row |
+| 2026-10-26 11:22Z | the screenshots of the run above | read by eye | ⚪ **two findings, recorded.** (1) §2.2 was wrong: production does not draw the cut-off controls over the bars; the stage card clips them (corrected above, and in the issue). (2) The pull-tab, a translucent dark tab, vanished against the remote desktop's dark top panel; it is now a surface-coloured pill with a shadow, like the full-screen chip |
+| 2026-10-26 11:26–11:27Z | the branch (`index-DhtIHld5.js`, with the pull-tab fix) | the same instrument, a Pixel 7 held sideways (915 × 412) | 🟢 **P3 on the branch.**<br>The full-screen chip shows, and the pull-tab (a 44 × 18 px pill in its 48 × 36 px hit area) is plain to see on the remote desktop's dark panel. A tap on the chip put the stage into element fullscreen (`document.fullscreenElement` is `.video-frame`) and the chip went away; after a reload it stayed away.<br>With `document.fullscreenEnabled` forced to false (iPhone Safari's case) the mode still applied, and no chip showed. The size gain itself needs a real phone: in headless Chromium the screen is the page |
 
 ## 9. Related
 

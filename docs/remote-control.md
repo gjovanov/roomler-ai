@@ -562,7 +562,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
 at [`useRemoteControl.ts:1544`](../ui/src/composables/useRemoteControl.ts#L1544)
 and puts it on the toggle's title
-([`RemoteControl.vue:3391`](../ui/src/views/remote/RemoteControl.vue#L3391)).
+([`RemoteControl.vue:3554`](../ui/src/views/remote/RemoteControl.vue#L3554)).
 
 | `code` | Means |
 |---|---|
@@ -996,7 +996,7 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3204`), registered at mount (`:5435`), and the deferred
+(`RemoteControl.vue:3367`), registered at mount (`:5598`), and the deferred
 Ctrl+V's `onPaste` (`useRemoteControl.ts:11766`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
@@ -1010,7 +1010,7 @@ upload (`:11778`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
-into the drawer's directory as well (`RemoteControl.vue:5375`).
+into the drawer's directory as well (`RemoteControl.vue:5538`).
 
 ```mermaid
 flowchart TD
@@ -3225,6 +3225,16 @@ RustDesk's native client on the HW path. Details in
   `cursorMapping()`.
 - **Fullscreen** toggle: `requestFullscreen` on the stage element,
   `fullscreenchange` listener flips the icon, ESC exits natively.
+  Shown only where `document.fullscreenEnabled` (Android's Chrome, a
+  desktop) — never on iPhone Safari, which fullscreens only video.
+- **Immersive landscape on phones** (FR-125): on a phone held sideways in
+  a session, the app bar, the toolbar and the tools strip step aside and
+  the stage takes the whole page — the one way to give an iPhone's
+  remote desktop more than 182–232 px. The bars come back as an overlay
+  behind a pull-tab, so the stage never resizes and `fit` mode re-sends
+  no `rc:resolution` for it. Where the browser can fullscreen the stage,
+  the mode offers it once with a chip, which also hides the browser's own
+  bar. Detail: [ui.md](ui.md) § Phones and tablets.
 - **Remote Resolution** (`rc:resolution` control-DC message): tells
   the agent to capture/encode at a specific size. Modes:
   `original` (native monitor), `fit` (match local stage ×
