@@ -3550,7 +3550,7 @@ sequenceDiagram
   - a cadence of probes to keep paths fresh.
 
 **P4-6-1a, as built** (`docs/knowhow.md` §13.6). Decisions 59–61 as recommended, on the operator's
-"go" (2026-10-26). Each is still the operator's to confirm. The server's half: `rc:knowhow.connect`
+"go" (2026-10-26), each confirmed by the operator on 2026-10-27 (§6). The server's half: `rc:knowhow.connect`
 is answered `rc:knowhow.access` by `connect::compile`, a pure function of the entity and its
 findings, and `rc:knowhow.served` names `roomler_connect` for a device that advertises `vault`. The
 toolbelt's tool is P4-6-1b's, so no agent asks yet. The design holds, with one change and six
@@ -3865,7 +3865,7 @@ What runs where today, and where P8 puts it:
     install.
 
 **P8-0, as designed** (2026-10-26, on the operator's "go" read as building decisions 63–65 as
-recommended; **each is still the operator's to confirm**). The probe came first, against the real
+recommended; **each confirmed by the operator on 2026-10-27**, §6). The probe came first, against the real
 harness, and the design follows from what it found.
 
 *The probe, as found* (§8, 2026-10-26). Two Claude Code versions ran: 2.1.280, installed on this
@@ -4070,6 +4070,18 @@ The real binary was driven through the whole path by a harness playing the daemo
 `serve` handed over, an HTTPS upstream verified against the handed CA, `values` answered. The
 request reached the upstream with the daemon's value. A lease let go answered 503, and the close
 freed the port. A session field run waits on a server with the vault mounted (P3k).
+
+**P8-2a-3, as built** (`agents/roomlerd/src/hive/worker.rs`, Unix): P8-0's point 4, the limits.
+A worker sets them as it starts, before it takes its channels, and one that cannot set them does not
+run:
+
+| Limit | As built | Why |
+|---|---|---|
+| core dumps | `RLIMIT_CORE` 1 byte, soft and hard | its memory holds the values of the endpoints it serves. **1, not 0**: where the system pipes a dump to a helper (systemd-coredump, apport, WSL's capture), a limit of 0 was dumped all the same, measured on Linux 6.6; the kernel keeps 1 for a helper's own crash and dumps nothing at it, and a dump to a file needs more than a byte |
+| open files | `RLIMIT_NOFILE` at most 4096, soft and hard, from the daemon's hard limit, never raised | each connection is one or two descriptors: a worker that leaks sockets stops at 4096, long before it takes the host's ephemeral ports, which a socket leak once did (`docs/tunnels.md`) |
+| address space | not limited | glibc reserves 64 MiB a thread for its arenas, so a cap fails healthy threads long before a runaway |
+| memory | not limited yet | a cgroup's `memory.max` needs the service to delegate one; later |
+| attaching | the worker stays dumpable | the daemon runs as root: being non-dumpable would add nothing against an attach root could make anyway, and the core limit already stops its dump |
 
 | Step | Builds | Kill switch | AC |
 |---|---|---|---|
@@ -4330,7 +4342,8 @@ freed the port. A session field run waits on a server with the vault mounted (P3
 | P8-0 | Hive's boundary, as designed (§3i "P8-0, as designed"), decisions 63–65 as recommended on the operator's "go": the probe of the harness across a restart, on Claude Code 2.1.280 and 2.1.310 (§8, 2026-10-26: a restart slower than the harness waits loses the session's tools for the rest of its run); the relay that outlives its worker; listeners in the daemon, connections in the worker; the channel per OS; supervision and limits; what moves first; P4-6-1b-2's flow admitting the worker; the steps split into P8-2a to P8-2d | docs only | **merged** #2966 `59db18070` |
 | P8-1a | the seam's first trait (§3i "P8-1a, as built"): `SessionEgress` (`admits`, `open_flow`, `end_flow`, `holds`) over the tunnel hub's session flows, which `net_socks`, `net_forward`, a connect's flow through another device and a run's end all go through; who a listener admits as data (`Admits::Account`, `Admits::Daemon`), the hub's side turning it into the hook; the admit still asked before the vault. 1 new test (the seam's contract, with a recording seam) and 4 adapted; 8 negative controls, each caught at its own assertion; no doc anchor moved | none (a refactor) | **merged** #2968 `5dd2a8837` |
 | P8-2a-1 | the worker's process model (§3i "P8-2a-1, as built"), Unix: `roomlerd hive-worker` from the daemon's own image (`/proc/self/exe` on Linux), its channel on fd 3 (a `socketpair`, `pre_exec`'s `dup2`), length-prefixed JSON frames (`hello`, `ready`, `beat`, `bye`) read whole on a task of their own, the 10 s handshake with the version checked, the 5 s heartbeat with three misses, restarts backing off to 30 s and resetting as starts age out of the window, giving up after five in 10 minutes, the run's end dropping it, the daemon's end ending it (not `PR_SET_PDEATHSIG`, which fires on a thread's exit); nothing of the session in it yet. 17 new tests (the worker's 14, the supervisor's two hooks, the gate, the key) and the real binary driven over its fd 3 (16 checks); 26 negative controls, each caught at its own assertion; field-verified on a vmtest cell, RED on 0.4.177 and GREEN on a release build of the branch (§8), which found #2972 | device `hive_worker = false` (default) | **merged** #2973 `35b2059a6`; field-verified on a vmtest cell (§8) |
-| P8-2a-2 | the credential endpoints served in the session's worker (§3i "P8-2a-2, as built"), Unix: the endpoint's listener handed across the worker's second channel (fd 4, `SCM_RIGHTS`), its `Spec` (none of it secret) beside it, its values asked of the daemon as each connection starts; calls either way over the channel, frames wiped after use; a new worker handed every endpoint again; served in the worker or not at all (refused while none is up, the run ended when the daemon gives up on it); a person's endpoint and one through another device stay the daemon's; a call the daemon cannot send its worker, or that goes unanswered, ends that worker's life. 20 new tests (the second channel's 3, the link's 5, the hand-over's 10, the toolbelt's 2) and 3 of the worker's adapted; the real binary driven through the endpoint path (10 checks) and P8-2a-1's harness again (15); 26 negative controls, 25 caught at their own assertion on the final code, the real binary's stopped by the host's memory before it ended (on its first run the same mutation failed the harness at the hand-over, which found the gap a lost link closes); no field run while prod's vault is unmounted (P3k) | device `hive_worker = false` (default) | **in review** |
+| P8-2a-2 | the credential endpoints served in the session's worker (§3i "P8-2a-2, as built"), Unix: the endpoint's listener handed across the worker's second channel (fd 4, `SCM_RIGHTS`), its `Spec` (none of it secret) beside it, its values asked of the daemon as each connection starts; calls either way over the channel, frames wiped after use; a new worker handed every endpoint again; served in the worker or not at all (refused while none is up, the run ended when the daemon gives up on it); a person's endpoint and one through another device stay the daemon's; a call the daemon cannot send its worker, or that goes unanswered, ends that worker's life. 20 new tests (the second channel's 3, the link's 5, the hand-over's 10, the toolbelt's 2) and 3 of the worker's adapted; the real binary driven through the endpoint path (10 checks) and P8-2a-1's harness again (15); 26 negative controls, 25 caught at their own assertion on the final code, the real binary's stopped by the host's memory before it ended (on its first run the same mutation failed the harness at the hand-over, which found the gap a lost link closes); no field run while prod's vault is unmounted (P3k) | device `hive_worker = false` (default) | **merged** #2975 `b9933cb1a` |
+| P8-2a-3 | the worker's limits (§3i "P8-2a-3, as built"), Unix, P8-0's point 4: set as it starts, before it takes its channels, and a worker that cannot set them does not run; `RLIMIT_CORE` 1 byte, since a limit of 0 is dumped all the same through a pipe helper (measured); `RLIMIT_NOFILE` at most 4096, from the daemon's hard limit, never raised; no address-space limit, and memory by cgroup later. 2 new tests (the bound, and the limits set in a child of the test) and the real binary's limits read from `/proc` (2 checks); 5 negative controls, each caught at its own assertion | device `hive_worker = false` (default) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
@@ -5450,7 +5463,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - **A row of each probe kind a device**, the operator's answer to the P4-5-4 roll note
       (2026-10-25: "2 rows per device"), built in P4-5-4b. A `tcp` probe after a `tls` one no
       longer hides the device's certificate.
-59. **Where an entity says how it is reached** (P4-6), for the operator to confirm.
+59. **Where an entity says how it is reached** (P4-6), confirmed by the operator.
     - *Recommended: reserved fact paths* (§3e "P4-6, `roomler_connect`, as designed"): `engine`,
       `credential` (a vault handle), `database`, `auth`, `auth_source` and `ca`, beside the
       probe's `address`, `host`, `port` and `sni`. Only `active` and `stale` facts are read, so a
@@ -5467,7 +5480,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Built in P4-6-1a as recommended*, on the operator's "go" (2026-10-26), with `user` as a
       fifth option (`ssh`'s account). Another answer changes one function (`connect::compile`,
       `crates/modules/knowhow/src/connect.rs`).
-60. **Which paths `roomler_connect` takes, and in what order** (P4-6), for the operator to confirm.
+    - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
+      recommendation").
+60. **Which paths `roomler_connect` takes, and in what order** (P4-6), confirmed by the operator.
     - *Recommended: measured paths only.* This device, when its own last finding is `ok` and
       fresh; when it has none, one probe from here in the same call; then each device whose last
       finding is `ok` and fresh, newest first, through a forward. Fresh is
@@ -5485,7 +5500,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       paths in this order, a device's newest finding of either kind its last word, and `here`,
       which tells the device whether to probe from here. Trying them, and the probe, are
       P4-6-1b's.
-61. **Who may ask a `roomler_connect`** (P4-6), for the operator to confirm.
+    - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
+      recommendation").
+61. **Who may ask a `roomler_connect`** (P4-6), confirmed by the operator.
     - *Recommended: a session whose starter holds `KNOWHOW_VIEW`*, read at every call: the plan
       is a read of the map, and the vault and the network decide every reach as they do today.
       - What it costs: whoever may read the map may ask for a plan through it; whether it opens
@@ -5501,8 +5518,10 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       *Recommended: as built*, since a probe writes onto the map, which decision 54 holds to
       `KNOWHOW_EDIT`. *Or:* a connect's probe allowed under `KNOWHOW_VIEW`; what it costs is a
       reader's session writing measurements onto the map through the connect.
-62. **When people get it: `roomler connect <kind>/<key>`** (design §8.7), for the operator to
-    confirm.
+    - **Confirmed by the operator as recommended**, the connect's own probe as built with it
+      (2026-10-27: "59-65 per your recommendation").
+62. **When people get it: `roomler connect <kind>/<key>`** (design §8.7), confirmed by the
+    operator.
     - *Recommended: after P4-6-1 is field-verified for sessions, as P4-6-2*, on P3-9's
       machinery (the device's owner as the principal, `secret:connect`, `vault.people`).
       - What it costs: people keep naming a handle and an upstream (`roomler connect <handle>`)
@@ -5510,7 +5529,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Or: in P4-6-1, beside the sessions' half.*
       - What it costs: two principals' paths built and verified at once: a session's, decided for
         its starter, and a person's, decided for the device's owner.
-63. **A worker per session, or per device** (P8), for the operator to confirm.
+    - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
+      recommendation"): P4-6-2 waits for P4-6-1's field run for sessions.
+63. **A worker per session, or per device** (P8), confirmed by the operator.
     - *Recommended: per session for the session-facing parts* (the toolbelt, the sidecar, the
       credential proxies, the egress proxy), which are already scoped to a session (its runtime
       directory, sockets, settings and leases end with its run). A session's untrusted input then
@@ -5527,7 +5548,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Designed in P8-0 as recommended*, on the operator's "go" (2026-10-26): a worker a session
       for the session-facing parts (P8-2a to P8-2c), and one for the device's own (P8-2d).
       Another answer changes how P8-2's supervisor keys its workers, not the channel.
-64. **What moves first** (P8), for the operator to confirm.
+    - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
+      recommendation").
+64. **What moves first** (P8), confirmed by the operator.
     - *Recommended: the egress proxy and the credential proxies first*, since they parse TLS and
       wire protocols from both sides and hold leased values; then the toolbelt and the sidecar;
       then the store, the stream, the viewer's peer and the prober.
@@ -5537,7 +5560,9 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     - *Designed in P8-0 as recommended*, on the operator's "go" (2026-10-26): P8-2a and P8-2b move
       the egress and credential proxies, P8-2c the toolbelt and the sidecar, P8-2d the device's
       parts. Another answer merges those steps.
-65. **What a hive-free package is** (P8), for the operator to confirm.
+    - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
+      recommendation").
+65. **What a hive-free package is** (P8), confirmed by the operator.
     - *Recommended: a separately named package per OS in the same release*
       (`roomlerd-nohive-<version>-…`), built once a customer asks. The server orders it after the
       default for every agent, only a hive-free build picks it (by a mark compiled in), and it is
@@ -5552,6 +5577,8 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         have to name.
     - *Designed in P8-0 as recommended*, on the operator's "go" (2026-10-26): P8-3 waits for a
       customer's ask. Another answer changes P8-3 alone.
+    - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
+      recommendation"): P8-3 waits for a customer's ask.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
