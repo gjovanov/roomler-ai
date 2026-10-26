@@ -317,8 +317,13 @@ jobs:
       # mistake nothing else does: a `mod x_tests;` added to `lib.rs` WITHOUT its
       # `#[cfg(test)]` gate compiles the module's helpers into the lib target as
       # dead code, which only `--all-targets` surfaces.
+      #
+      # `roomler-ai-mod-conference` joined with FR-115 O4: it carries the
+      # room-capacity bench (`examples/room_capacity.rs`), which no other step
+      # compiles, so without this it would break unseen the first time the
+      # mediasoup API or the worker settings moved. Checked green first.
       - name: Run clippy on the audited crates (incl. test targets)
-        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core --all-targets -- -D warnings
+        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core -p roomler-ai-mod-conference --all-targets -- -D warnings
 
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat
