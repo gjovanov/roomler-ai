@@ -111,6 +111,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::connect_tool::Failed;
 use super::lines::LineReader;
 use super::supervisor::Author;
 
@@ -1313,40 +1314,162 @@ async fn knowhow_tool(
 }
 
 /// FR-90 P4-6-1b — `roomler_connect`: what the map says reaching the entity
-/// takes, opened from here with `vault_connect`'s endpoint over the run's
-/// vault ([`super::connect_tool`]).
+/// takes, opened over the run's vault and egress ([`super::connect_tool`]).
 async fn reach_entity(
     ctx: &Ctx,
     knowhow: &dyn super::knowhow_tools::KnowhowTools,
     args: &Value,
 ) -> Result<Value, String> {
-    let open = |asked: Value| async move {
+    super::connect_tool::call(knowhow, &DaemonReach { ctx }, ctx.session, ctx.fence, args).await
+}
+
+/// FR-90 P4-6-1b — what `roomler_connect` reaches the world with: the run's
+/// vault, for `vault_connect`'s endpoints, and (P4-6-1b-2) its egress hub,
+/// for a path through another device.
+struct DaemonReach<'a> {
+    ctx: &'a Ctx,
+}
+
+#[cfg(feature = "vault")]
+impl DaemonReach<'_> {
+    fn vault(&self) -> Result<&Arc<dyn VaultTools>, String> {
+        self.ctx.vault.as_ref().ok_or_else(|| {
+            "this device lends no vault values: its owner has not turned its vault on \
+             (vault_enabled)"
+                .to_string()
+        })
+    }
+
+    fn hub(&self) -> Result<&crate::tunnel::client_mgr::TunnelClientHub, String> {
+        self.ctx.net.as_ref().ok_or_else(|| {
+            "this device's owner has not turned its sessions' egress on (hive_net): there is no \
+             path through another device"
+                .to_string()
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl super::connect_tool::Reach for DaemonReach<'_> {
+    async fn open(&self, asked: Value) -> Result<Value, String> {
         #[cfg(feature = "vault")]
         {
-            let Some(vault) = &ctx.vault else {
-                return Err(
-                    "this device lends no vault values: its owner has not turned its \
-                            vault on (vault_enabled)"
-                        .to_string(),
-                );
-            };
             super::vault_connect::call(
-                Arc::clone(vault),
-                ctx.session,
-                ctx.fence,
-                ctx.exec.as_ref(),
-                &ctx.peer,
+                Arc::clone(self.vault()?),
+                self.ctx.session,
+                self.ctx.fence,
+                self.ctx.exec.as_ref(),
+                &self.ctx.peer,
                 &asked,
             )
             .await
         }
         #[cfg(not(feature = "vault"))]
         {
-            let _ = asked;
+            let _ = (self.ctx, asked);
             Err("this build lends no vault values".to_string())
         }
-    };
-    super::connect_tool::call(knowhow, ctx.session, ctx.fence, args, open).await
+    }
+
+    async fn open_through(
+        &self,
+        asked: Value,
+        exit: ObjectId,
+        host: &str,
+        port: u16,
+    ) -> Result<Value, Failed> {
+        #[cfg(feature = "vault")]
+        {
+            // This device's own: no other device changes them.
+            let vault = self.vault().map_err(Failed::Every)?;
+            let hub = self.hub().map_err(Failed::Every)?;
+            // The flow lives as the endpoint's leases are asked to.
+            let ttl = asked
+                .get("ttl_s")
+                .and_then(Value::as_u64)
+                .and_then(|t| u32::try_from(t).ok())
+                .unwrap_or(super::net_tools::DEFAULT_TTL_SECS);
+            let flow = super::net_tools::daemon_flow(
+                vault.as_ref(),
+                hub,
+                self.ctx.session,
+                self.ctx.fence,
+                exit,
+                host,
+                port,
+                ttl,
+            )
+            .await
+            // The vault's word on that exit, or its flow: the next device
+            // may still do.
+            .map_err(Failed::Path)?;
+            match super::vault_connect::call_through(
+                Arc::clone(vault),
+                self.ctx.session,
+                self.ctx.fence,
+                self.ctx.exec.as_ref(),
+                &self.ctx.peer,
+                &asked,
+                crate::vault_proxy::Dial::Through(flow.end),
+            )
+            .await
+            {
+                Ok(mut answer) => {
+                    if let Value::Object(map) = &mut answer {
+                        let left = flow
+                            .until
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs();
+                        map.insert("through_expires_in_secs".into(), json!(left));
+                    }
+                    Ok(answer)
+                }
+                // No endpoint rides it: the flow goes at once. The vault's
+                // word on the credential is the same through any device.
+                Err(why) => {
+                    hub.kill_flow(&flow.flow);
+                    Err(Failed::Every(why))
+                }
+            }
+        }
+        #[cfg(not(feature = "vault"))]
+        {
+            let _ = (self.ctx, asked, exit, host, port);
+            Err(Failed::Every(
+                "this build lends no vault values".to_string(),
+            ))
+        }
+    }
+
+    async fn forward(&self, exit: ObjectId, host: &str, port: u16) -> Result<Value, Failed> {
+        #[cfg(feature = "vault")]
+        {
+            let vault = self.vault().map_err(Failed::Every)?;
+            let hub = self.hub().map_err(Failed::Every)?;
+            #[cfg(unix)]
+            let peer = self.ctx.peer;
+            #[cfg(windows)]
+            let peer = self.ctx.peer.clone();
+            super::net_tools::call(
+                super::net_tools::FORWARD,
+                vault.as_ref(),
+                hub,
+                self.ctx.session,
+                self.ctx.fence,
+                peer,
+                &json!({ "exit": exit.to_hex(), "host": host, "port": port }),
+            )
+            .await
+            // The vault's word on that exit, or its listener: the next device
+            // may still do.
+            .map_err(Failed::Path)
+        }
+        #[cfg(not(feature = "vault"))]
+        {
+            let _ = (self.ctx, exit, host, port);
+            Err(Failed::Every("this build has no egress".to_string()))
+        }
+    }
 }
 
 /// What the vault answers one vault tool call, for the session's run.

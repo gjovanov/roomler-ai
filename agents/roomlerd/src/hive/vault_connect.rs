@@ -135,6 +135,11 @@ pub(crate) struct ConnectRequest {
     /// upstream names one.
     pub(crate) user: Option<String>,
     pub(crate) ttl: u32,
+    /// FR-90 P4-6-1b-2 — where the endpoint's upstream connections are
+    /// dialled. Never read from a call's arguments: `parse` makes it
+    /// `Direct`, and only `roomler_connect` sets a flow's end
+    /// ([`call_through`]), so a session cannot choose where the proxy dials.
+    pub(crate) dial: crate::vault_proxy::Dial,
 }
 
 impl ConnectRequest {
@@ -374,6 +379,7 @@ pub(crate) fn parse(args: &Value) -> Result<ConnectRequest, String> {
         auth,
         user,
         ttl,
+        dial: crate::vault_proxy::Dial::Direct,
     })
 }
 
@@ -392,7 +398,33 @@ pub(crate) async fn call(
     peer: &PeerId,
     args: &Value,
 ) -> Result<Value, String> {
-    let req = parse(args)?;
+    call_through(
+        vault,
+        session,
+        fence,
+        target,
+        peer,
+        args,
+        crate::vault_proxy::Dial::Direct,
+    )
+    .await
+}
+
+/// FR-90 P4-6-1b-2 — [`call`], its upstream connections dialled as `dial`
+/// says: through another device, the end of a flow toward the upstream that
+/// only this daemon may use (`net_tools::daemon_flow`). TLS is still
+/// verified against the upstream's host. `roomler_connect` alone calls it.
+pub(crate) async fn call_through(
+    vault: Arc<dyn VaultTools>,
+    session: ObjectId,
+    fence: u64,
+    target: Option<&ExecTarget>,
+    peer: &PeerId,
+    args: &Value,
+    dial: crate::vault_proxy::Dial,
+) -> Result<Value, String> {
+    let mut req = parse(args)?;
+    req.dial = dial;
     #[cfg(unix)]
     let at = {
         let _ = peer;
@@ -533,6 +565,8 @@ fn person_why(e: crate::vault::LeaseError) -> Refused {
 
 #[cfg(all(unix, test))]
 pub(crate) use endpoint::MAX_ENDPOINTS;
+/// FR-90 P4-6-1b-2 — a flow's admit hook for this daemon alone.
+pub(crate) use endpoint::loopback::daemon_admit;
 /// FR-90 P3-7-3c — the admit hook a session's net listener takes.
 pub(crate) use endpoint::loopback::session_admit;
 
@@ -995,6 +1029,8 @@ mod endpoint {
         /// the one account it signs in as, where the upstream names one.
         secret: String,
         user: Option<String>,
+        /// FR-90 P4-6-1b-2 — where each connection's upstream is dialled.
+        dial: crate::vault_proxy::Dial,
     }
 
     /// One connection's upstream, in its engine: for an SSH agent, the key
@@ -1028,6 +1064,7 @@ mod endpoint {
         /// now: `None` once any is let go.
         fn session(&self) -> Option<Session> {
             let (host, port, tls) = (self.host.clone(), self.port, self.tls.clone());
+            let dial = self.dial;
             Some(match self.engine {
                 Engine::Postgres => Session::Pg(pg::Upstream {
                     host,
@@ -1035,6 +1072,7 @@ mod endpoint {
                     user: self.read(0)?.to_string(),
                     password: self.read(1)?,
                     tls,
+                    dial,
                 }),
                 Engine::Mongodb => Session::Mongo(mongo::Upstream {
                     host,
@@ -1043,6 +1081,7 @@ mod endpoint {
                     password: self.read(1)?,
                     auth_source: self.auth_source.clone().unwrap_or_else(|| "admin".into()),
                     tls,
+                    dial,
                 }),
                 Engine::Http | Engine::Kubernetes => {
                     let auth = self.auth?;
@@ -1065,6 +1104,7 @@ mod endpoint {
                             Engine::Kubernetes => http::Flavor::Kubernetes,
                             _ => http::Flavor::Plain,
                         },
+                        dial,
                     })
                 }
                 // P3-5f-2 — the key and the hosts, read from the leases now.
@@ -1503,6 +1543,7 @@ mod endpoint {
             front,
             secret: req.secret.clone(),
             user: req.user.clone(),
+            dial: req.dial,
         });
         let live = Live::new(&stop);
         let renewed = matches!(h.kind, Kind::Person(_));
@@ -2397,6 +2438,69 @@ mod endpoint {
                     connection_is(&peer, client, server)
                 },
             ))
+        }
+
+        /// FR-90 P4-6-1b-2 — the admit hook of a flow only this daemon may
+        /// use (`net_tools::daemon_flow`), whose end a proxy dials its
+        /// upstream through: never the session's account. Windows asks the
+        /// connection's process itself, which must be this one; Unix asks
+        /// its account, which must be this daemon's own (root, as it runs).
+        /// Refused where this system cannot say who connects to a loopback
+        /// port.
+        pub(crate) fn daemon_admit() -> Result<tunnel_core::flow_listener::Admit, String> {
+            admit_only(own())
+        }
+
+        /// This daemon's identity, as a connection is asked for it: its
+        /// process on Windows, its account on Unix.
+        #[cfg(windows)]
+        pub(crate) type Own = u32;
+        #[cfg(unix)]
+        pub(crate) type Own = Peer;
+
+        /// This daemon's own [`Own`]: its process.
+        #[cfg(windows)]
+        pub(crate) fn own() -> Own {
+            std::process::id()
+        }
+
+        /// This daemon's own [`Own`]: its account.
+        #[cfg(unix)]
+        pub(crate) fn own() -> Own {
+            // SAFETY: `geteuid` reads our own credentials and cannot fail.
+            unsafe { libc::geteuid() }
+        }
+
+        /// The admit hook that serves `own` alone ([`daemon_admit`]'s, and a
+        /// test's for another identity).
+        pub(crate) fn admit_only(own: Own) -> Result<tunnel_core::flow_listener::Admit, String> {
+            identifies()?;
+            Ok(std::sync::Arc::new(
+                move |tcp: &TcpStream, local: SocketAddr| {
+                    let SocketAddr::V4(client) = tcp.peer_addr().map_err(|e| e.to_string())? else {
+                        return Err("a client that is not IPv4 loopback".into());
+                    };
+                    let SocketAddr::V4(server) = local else {
+                        return Err("a listener that is not IPv4 loopback".into());
+                    };
+                    held_by_own(own, client, server)
+                },
+            ))
+        }
+
+        /// Whether the connection `client` → `server` is `own`'s.
+        #[cfg(windows)]
+        fn held_by_own(own: Own, client: SocketAddrV4, server: SocketAddrV4) -> Result<(), String> {
+            match crate::hive_win::tcp_client_pid(client, server) {
+                Some(pid) if pid == own => Ok(()),
+                Some(pid) => Err(format!("pid {pid}, not this daemon")),
+                None => Err("a connection no process owns any more".into()),
+            }
+        }
+
+        #[cfg(unix)]
+        fn held_by_own(own: Own, client: SocketAddrV4, server: SocketAddrV4) -> Result<(), String> {
+            connection_is(&own, client, server)
         }
 
         impl Bound {

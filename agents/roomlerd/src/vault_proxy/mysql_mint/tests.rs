@@ -66,6 +66,7 @@ async fn signs_in_as(f: &FakeMysql, user: &str, password: &str) -> Result<(), St
         user: user.into(),
         password: Zeroizing::new(password.into()),
         tls: tls::connector(Some(&f.ca)).unwrap(),
+        dial: crate::vault_proxy::Dial::Direct,
     };
     let s = mysql::sign_in(&up, "orders").await?;
     mysql::quit(s).await;
@@ -405,6 +406,7 @@ async fn reads_as(m: &Minted, root: &Upstream) -> Result<Vec<Vec<Option<String>>
         user: m.user.clone(),
         password: m.password.clone(),
         tls: root.tls.clone(),
+        dial: crate::vault_proxy::Dial::Direct,
     };
     let mut s = mysql::sign_in(&up, &m.database).await?;
     let rows = mysql::query(&mut s, "SELECT CURRENT_ROLE(), (SELECT id FROM t)").await;

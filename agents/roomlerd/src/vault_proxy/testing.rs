@@ -611,6 +611,7 @@ pub(crate) fn real_mysql() -> Option<super::pg::Upstream> {
         user: "root".into(),
         password: zeroize::Zeroizing::new(word.trim().to_string()),
         tls: super::tls::connector(Some(&ca)).ok()?,
+        dial: super::Dial::Direct,
     })
 }
 

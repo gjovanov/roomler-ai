@@ -263,6 +263,67 @@ pub(crate) async fn call(
     })
 }
 
+/// FR-90 P4-6-1b-2 — a flow through another device that only this daemon
+/// may use: where its end is, and when its grant ends.
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonFlow {
+    pub(crate) flow: String,
+    pub(crate) end: std::net::SocketAddr,
+    pub(crate) until: Instant,
+}
+
+/// FR-90 P4-6-1b-2 — a forward through `exit` to `host:port` for this daemon
+/// alone: the end a proxy dials its upstream through (`vault_connect`'s
+/// endpoint, through another device), while the session's account is served
+/// only the proxy's own endpoint. Asked of the vault as a forward is
+/// (`net:forward`), it holds one of the run's [`MAX_FLOWS`] places and ends
+/// with the run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn daemon_flow(
+    vault: &dyn VaultTools,
+    hub: &TunnelClientHub,
+    session: ObjectId,
+    fence: u64,
+    exit: ObjectId,
+    host: &str,
+    port: u16,
+    ttl_secs: u32,
+) -> Result<DaemonFlow, String> {
+    let place = Place::hold((session, fence))?;
+    let admit = super::vault_connect::daemon_admit()?;
+    let grant = vault
+        .net(NetAsk {
+            session_id: session,
+            fence,
+            exit,
+            dst: Some((host.to_string(), port)),
+            ttl_secs,
+        })
+        .await?;
+    // The destination exactly as granted: the vault's one spelling.
+    let Some((host, port)) = grant.dst.clone() else {
+        return Err("the vault granted no destination for a forward".into());
+    };
+    let (flow, end) = hub
+        .create_session_flow(
+            exit,
+            Target::Static { host, port },
+            grant.tunnel_ref(),
+            grant.until,
+            admit,
+        )
+        .await?;
+    if !place.fill(hub, &flow) {
+        return Err("the session's run ended here while its flow was made".into());
+    }
+    info!(%session, fence, %flow, %end, grant = %grant.grant_id, "a connect's flow through a device serves this daemon");
+    Ok(DaemonFlow {
+        flow,
+        end,
+        until: grant.until,
+    })
+}
+
 /// What a listener serves: SOCKS with its credential, or a forward to one
 /// destination.
 enum Serves {
