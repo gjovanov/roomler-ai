@@ -245,11 +245,13 @@ pub fn run_probe_helper() {
             .unwrap_or_else(|_| Err("the probe's thread panicked".into())),
         Err(e) => Err(format!("no thread for the probe: {e}")),
     };
+    // #2719 — never `println!`: the daemon that reads this answer can be gone
+    // by now (a stop, an update), and a panic would be filed as a crash.
     match answer {
-        Ok(()) => println!("{CAN}yes"),
+        Ok(()) => crate::logging::say_on_stdout(format_args!("{CAN}yes")),
         Err(why) => {
-            eprintln!("portal-helper --notify-probe: {why}");
-            println!("{CAN}no {why}");
+            crate::logging::say_on_stderr(format_args!("portal-helper --notify-probe: {why}"));
+            crate::logging::say_on_stdout(format_args!("{CAN}no {why}"));
         }
     }
 }
@@ -626,9 +628,10 @@ pub fn run_helper() {
             .unwrap_or_else(|_| Err("the helper's thread panicked".into())),
         Err(e) => Err(format!("no thread for the helper: {e}")),
     };
+    // #2719 — as the probe's answer above: the reader may be gone.
     if let Err(why) = outcome {
-        eprintln!("portal-helper --notify: {why}");
-        println!("{FAILED}{why}");
+        crate::logging::say_on_stderr(format_args!("portal-helper --notify: {why}"));
+        crate::logging::say_on_stdout(format_args!("{FAILED}{why}"));
     }
 }
 
@@ -754,11 +757,15 @@ mod helper {
 
         let mut id = post(&proxy, &req, &body)?;
         say(format!("{SHOWN}{id}"));
-        eprintln!("portal-helper --notify: posted notification {id}");
+        crate::logging::say_on_stderr(format_args!(
+            "portal-helper --notify: posted notification {id}"
+        ));
 
         let close = |id: u32, why: &str| {
             let _ = proxy.call_method("CloseNotification", &(id,));
-            eprintln!("portal-helper --notify: closed notification {id} ({why})");
+            crate::logging::say_on_stderr(format_args!(
+                "portal-helper --notify: closed notification {id} ({why})"
+            ));
         };
         let deadline = Instant::now() + Duration::from_millis(req.lifetime_ms);
         loop {
@@ -772,7 +779,9 @@ mod helper {
                 Ok(Event::Action(i, key)) if i == id && key == DEFAULT => {
                     close(i, "its body was clicked");
                     id = post(&proxy, &req, &body)?;
-                    eprintln!("portal-helper --notify: posted it again as notification {id}");
+                    crate::logging::say_on_stderr(format_args!(
+                        "portal-helper --notify: posted it again as notification {id}"
+                    ));
                 }
                 Ok(Event::Action(i, key)) if i == id => {
                     say(format!("{ACTION}{key}"));

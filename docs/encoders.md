@@ -268,6 +268,13 @@ Implementation notes that keep the child honest:
   in-process, so nothing can recurse into an endless spawn.
 - stdout is **marker-parsed, not last-line-parsed** — the daemon logs to stdout,
   so "the last line" would have been a log line on the very first run.
+- The child **never `println!`s** (#2719). Every line goes through
+  `child::emit`, which writes and flushes without panicking. On an update the
+  supervisor terminates the worker while its probe child still runs, so the
+  child's report meets a pipe whose reader is gone (`os error 232` on Windows,
+  EPIPE elsewhere). `println!` panicked there, and the panic hook filed an agent
+  crash on every update a stop met a probe. A closed pipe now means "the parent
+  is gone": the child exits `3` (`EXIT_PARENT_GONE`) and records nothing.
 - The child's **stderr is inherited on purpose**: its per-codec probe lines are
   the record of *which* codec died, and they belong in the daemon log directly
   above the verdict.

@@ -148,6 +148,48 @@ mod child {
     /// last one in its verdict.
     pub(super) const PROGRESS: &str = "ROOMLER_CAPS_PROGRESS:";
 
+    /// #2719 — how a child whose parent stopped reading exits. In the field
+    /// nobody is left to read it (the parent was terminated); a parent that
+    /// is still there reads any non-zero exit as "no hardware", the safe
+    /// answer.
+    pub(super) const EXIT_PARENT_GONE: i32 = 3;
+
+    /// #2719 — one line on stdout for the parent, and never a panic doing it.
+    ///
+    /// `println!` PANICS when the write fails, and on an update it does. The
+    /// supervisor terminates the worker while its probe child still runs,
+    /// the child's report then meets a pipe whose reader is gone (`os error
+    /// 232` on Windows, EPIPE elsewhere), and the panic hook files that as
+    /// an agent crash, on every update a stop meets a probe (CORPLAP-1,
+    /// 0.4.151). The parent being gone is no crash: exit quietly. The flush
+    /// is what keeps a PROGRESS line if the open it announces kills the
+    /// process.
+    pub(super) fn emit(line: &str) {
+        match write_line(&mut std::io::stdout().lock(), line) {
+            Ok(()) => {}
+            Err(e) if parent_gone(&e) => std::process::exit(EXIT_PARENT_GONE),
+            Err(e) => {
+                tracing::error!(%e, "caps probe: could not write to stdout");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    pub(super) fn write_line(w: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+        writeln!(w, "{line}")?;
+        w.flush()
+    }
+
+    /// Whether a failed write means the reading end is gone. std reads EPIPE
+    /// and both Windows codes as `BrokenPipe`: `ERROR_BROKEN_PIPE` (109) and
+    /// `ERROR_NO_DATA` (232, "the pipe is being closed"), the one the field
+    /// saw (measured on 1.95). The numbers are matched as well, so a std that
+    /// reads them otherwise cannot bring the crash back.
+    pub(super) fn parent_gone(e: &std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::BrokenPipe
+            || (cfg!(windows) && matches!(e.raw_os_error(), Some(109 | 232)))
+    }
+
     /// Set in the child's environment. A belt-and-braces recursion guard:
     /// `detect()` in a process carrying this must never spawn again.
     pub(super) const CHILD_ENV: &str = "ROOMLERD_CAPS_CHILD";
@@ -540,7 +582,7 @@ pub fn print_probe_result() {
             let names = child::names_444_from_env();
             let opened = probe_444(&names);
             match serde_json::to_string(&opened) {
-                Ok(json) => println!("{}{json}", child::MARKER_444),
+                Ok(json) => child::emit(&format!("{}{json}", child::MARKER_444)),
                 Err(e) => {
                     tracing::error!(%e, "caps probe: could not serialise the 4:4:4 answer");
                     std::process::exit(2);
@@ -550,7 +592,7 @@ pub fn print_probe_result() {
         phase => {
             let report = in_process_report(phase != child::Phase::Base);
             match serde_json::to_string(&report) {
-                Ok(json) => println!("{}{json}", child::MARKER),
+                Ok(json) => child::emit(&format!("{}{json}", child::MARKER)),
                 Err(e) => {
                     tracing::error!(%e, "caps probe: could not serialise caps");
                     std::process::exit(2);
@@ -576,7 +618,7 @@ fn probe_444(names: &[String]) -> Vec<String> {
         let Some(name) = FfmpegEncoder::static_name(name) else {
             continue;
         };
-        println!("{}{name}:yuv444", child::PROGRESS);
+        child::emit(&format!("{}{name}:yuv444", child::PROGRESS));
         let t = std::time::Instant::now();
         match FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, true) {
             Ok(enc) => {
@@ -3596,6 +3638,36 @@ mod tests {
             Some("vp9_qsv:yuv444")
         );
         assert_eq!(child::last_progress(""), None);
+    }
+
+    /// #2719 — a line written to a pipe whose reader is gone (the parent was
+    /// terminated mid-probe) reads as "the parent is gone", where `println!`
+    /// panicked. A real OS pipe, so the error is the one the field saw:
+    /// `os error 232` on Windows, EPIPE elsewhere.
+    #[test]
+    fn a_line_to_a_closed_pipe_reads_as_the_parent_gone() {
+        let line = format!("{}{{}}", child::MARKER);
+        let (reader, mut writer) = std::io::pipe().expect("an OS pipe");
+        drop(reader);
+        let e = child::write_line(&mut writer, &line)
+            .expect_err("nobody reads the pipe, so the write must fail");
+        assert!(
+            child::parent_gone(&e),
+            "a closed pipe must read as the parent gone: {e:?} (kind {:?}, os error {:?})",
+            e.kind(),
+            e.raw_os_error()
+        );
+        // Any other failure is still an error worth a line in the log.
+        assert!(!child::parent_gone(&std::io::Error::other("disk full")));
+
+        // A reader that is there gets the line, newline-terminated, as the
+        // parent's marker parse expects.
+        let (mut reader, mut writer) = std::io::pipe().expect("an OS pipe");
+        child::write_line(&mut writer, &line).expect("a live reader");
+        drop(writer);
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut got).expect("read the pipe");
+        assert_eq!(got, format!("{line}\n"));
     }
 
     /// FR-77 P3c — the child reads its phase from the environment; unset is

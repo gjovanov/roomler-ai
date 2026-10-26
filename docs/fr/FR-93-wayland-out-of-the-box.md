@@ -50,9 +50,9 @@ ships — works the way a Windows or macOS host does: install, enroll, connect, 
 |---|---|---|
 | Capture | scrap connects to Xwayland's `DISPLAY` and streams Xwayland's empty root: **a live black stream, no reason** (#1719 measured `backend=scrap`, ~1.2 KB/s of black VP9) | the root unit has no `DISPLAY` (`packaging/linux/roomlerd.service:20-53`), scrap's `xcb_connect(NULL)` fails, and the FR-80 classifier says **`no_display` — "headless, or no desktop session"**, false for this host (`capture/mod.rs:660-668`, hint `:539-540`). DRM and the portal are skipped without a log line (`:858-919`) |
 | Input | enigo/XTest reaches **Xwayland clients only**; native windows (Settings, Files, the shell) get nothing and nothing says so (`input/mod.rs:351-353`) | no `DISPLAY` ⇒ `NoopInjector`, which returns `Ok(())` for every event (`input/mod.rs:286-295`) |
-| What the viewer is told about input | `has_input_permission = true`, hard-coded off macOS (`encode/caps.rs:1648-1650`, `:1047-1056`, `:1075-1084`) | the same |
+| What the viewer is told about input | `has_input_permission = true`, hard-coded off macOS (`encode/caps.rs:1690-1692`, `:1089-1098`, `:1117-1126`) | the same |
 | Cursor | none — the Linux cursor tracker is unwired (`capture/cursor.rs:88-94`); the viewer paints the controller's initials badge | none |
-| Clipboard | arboard over X11 into Xwayland's selection bridge (unmeasured) | **off** — `clipboard.rs` has no session discovery; `supports_clipboard` is compile-time (`caps.rs:1706`) |
+| Clipboard | arboard over X11 into Xwayland's selection bridge (unmeasured) | **off** — `clipboard.rs` has no session discovery; `supports_clipboard` is compile-time (`caps.rs:1748`) |
 | Consent / indicator | the X11 panel over Xwayland — "it shows; it just cannot guarantee stacking above native Wayland clients" (`indicator/x11.rs:33-39`), never field-run; the companion fallback launches through the **system** manager (`companion.rs:655`), which its own doc says asks polkit for a password nobody types (`:694-696`) | the companion over the P11 person socket — GREEN on vmtest Ubuntu 24.04 (FR-27 P10/P11). **x86_64 only**: no aarch64 companion is built (`.github/workflows/release-agent.yml:1069-1258`) |
 
 The vmtest Ubuntu lane never saw this because it sets the opt-in keys itself
