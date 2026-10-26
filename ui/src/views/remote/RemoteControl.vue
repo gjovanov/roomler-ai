@@ -2537,6 +2537,7 @@ import {
   hostLockedChipTitle,
   awaitingConsentLabel,
   drawerPasteFiles,
+  uploadOutcomeMessage,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3013,7 +3014,10 @@ watch(
     if (phase !== 'connected') mobileKeyboardOpen.value = false
   },
 )
-const uploadBusy = ref(false)
+// A count, not a flag (#2929): a drop while an upload runs now queues behind
+// it, and the first of the two to finish must not stop the spinner.
+const uploadsInFlight = ref(0)
+const uploadBusy = computed(() => uploadsInFlight.value > 0)
 // Visual cue when a draggable item is hovering the stage. Toggled on
 // dragenter/dragover (true) + drop/dragleave (false). The
 // `.prevent.stop` modifiers on the v-on bindings are what actually
@@ -3567,32 +3571,16 @@ async function uploadMany(
   destPath?: string
 ) {
   if (items.length === 0) return
-  uploadBusy.value = true
+  uploadsInFlight.value++
   try {
     const results = await rc.uploadFiles(items, destPath ? { destPath } : undefined)
-    const ok = results.filter((r) => r.ok).length
-    const failed = results.filter((r) => !r.ok)
-    if (failed.length === 0) {
-      showSuccess(
-        ok === 1
-          ? `Uploaded ${results[0].name}`
-          : `Uploaded ${ok} files`
-      )
-    } else if (ok === 0) {
-      const first = failed[0] as { name: string; error: string }
-      showError(
-        failed.length === 1
-          ? `Upload failed: ${first.error}`
-          : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`
-      )
-    } else {
-      const first = failed[0] as { name: string; error: string }
-      showError(
-        `Uploaded ${ok}/${items.length} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`
-      )
-    }
+    // #2930 — a file the host put somewhere else is a warning, not "Uploaded".
+    const said = uploadOutcomeMessage(results, items.length, destPath)
+    if (said.level === 'success') showSuccess(said.text)
+    else if (said.level === 'warning') showSnackbar(said.text, 'warning', 10000)
+    else showError(said.text)
   } finally {
-    uploadBusy.value = false
+    uploadsInFlight.value--
   }
 }
 
