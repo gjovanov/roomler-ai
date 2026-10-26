@@ -195,6 +195,12 @@ pub struct KnowhowSettings {
     /// seconds (`ROOMLER__KNOWHOW__STALE_SWEEP_SECS`). 0 or absent: 3600.
     #[serde(default)]
     pub stale_sweep_secs: u64,
+    /// P4-6-1 — how long a probe's finding counts as fresh for
+    /// `roomler_connect`, in seconds (`ROOMLER__KNOWHOW__CONNECT_FRESH_SECS`;
+    /// decision 60): a path is taken only when its device's last finding is
+    /// `ok` and this young. 0 or absent: 86400, a day.
+    #[serde(default)]
+    pub connect_fresh_secs: u64,
 }
 
 /// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.

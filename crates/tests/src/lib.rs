@@ -161,6 +161,12 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-6-1a — a session's connect: offered to a device with a vault
+/// client, answered with the access the entity's facts say and the paths the
+/// devices' findings measured, this device's first; a proposal places no
+/// credential; the refusals in a word.
+#[cfg(test)]
+mod knowhow_connect_tests;
 /// FR-90 P4-5-1b — a device's probe end to end: the real agent loop probes
 /// within the list its config file holds, what it measured on the map; an
 /// emptied list answers `not_allowed`. Linux, as the device's scan test is:

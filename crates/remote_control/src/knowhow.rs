@@ -439,6 +439,82 @@ pub const TOOL_PROPOSE: &str = "knowhow_propose";
 /// FR-90 P4-5-2 — a session asks its own device to probe an entity of the
 /// map (decision 54), the settings asking a person each call.
 pub const TOOL_VERIFY: &str = "knowhow_verify";
+/// FR-90 P4-6 — a session reaches an entity of the map: its target, over a
+/// path a probe measured, signed in with the credential the entity names,
+/// the settings asking a person each call (the FR-90 spec, §3e "P4-6,
+/// `roomler_connect`, as designed").
+pub const TOOL_CONNECT: &str = "roomler_connect";
+
+/// FR-90 P4-6 — the fact paths an entity says how it is reached by
+/// (decision 59), beside a probe's `address`, `host`, `port` and `sni`. Only
+/// an `active` or `stale` fact is read: a session's proposal, until a person
+/// confirms it, never places a credential.
+pub mod access_facts {
+    /// One of [`super::Engine`]'s words.
+    pub const ENGINE: &str = "engine";
+    /// A vault handle: a structured secret, by its path or its RRN. Never a
+    /// value.
+    pub const CREDENTIAL: &str = "credential";
+    /// `vault_connect`'s options, as its call names them.
+    pub const DATABASE: &str = "database";
+    pub const AUTH: &str = "auth";
+    pub const AUTH_SOURCE: &str = "auth_source";
+    /// A vault handle whose value is the upstream's CA.
+    pub const CA: &str = "ca";
+    /// `ssh`'s user, in the upstream `ssh://user@host`.
+    pub const USER: &str = "user";
+    /// Every option above, in the order an answer lists them.
+    pub const OPTIONS: [&str; 5] = [DATABASE, AUTH, AUTH_SOURCE, CA, USER];
+}
+
+/// FR-90 P4-6 — what an entity's `engine` fact names (decision 59): one of
+/// `vault_connect`'s engines, whose credential the vault leases in `proxy`
+/// mode, or `tcp`, a service reached with none. The frame and the fact carry
+/// it as its word ([`Engine::as_str`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Engine {
+    Postgres,
+    Mongodb,
+    Http,
+    Kubernetes,
+    Ssh,
+    Tcp,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 6] = [
+        Self::Postgres,
+        Self::Mongodb,
+        Self::Http,
+        Self::Kubernetes,
+        Self::Ssh,
+        Self::Tcp,
+    ];
+
+    /// Exactly what an entity's fact says and the wire carries. ⚠️ A
+    /// compatibility surface: `vault_connect`'s engine words, locked by test.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Mongodb => "mongodb",
+            Self::Http => "http",
+            Self::Kubernetes => "kubernetes",
+            Self::Ssh => "ssh",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    /// A word, read back: `None` for one this build does not know.
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == word)
+    }
+
+    /// Whether the entity must name a credential: every engine but `tcp`.
+    pub const fn needs_credential(self) -> bool {
+        !matches!(self, Self::Tcp)
+    }
+}
 
 /// FR-90 P4-4-1 — why knowhow refused a session's question. The words are a
 /// compatibility surface: a device decides from them whether asking again
@@ -983,6 +1059,33 @@ mod tests {
             assert_eq!(SessionRefusal::from_wire(r.wire()), Some(r));
         }
         assert_eq!(SessionRefusal::from_wire("teleported"), None);
+    }
+
+    /// P4-6 — WIRE LOCK: an entity's engine words are `vault_connect`'s,
+    /// plus `tcp`; only `tcp` needs no credential; a word this build does
+    /// not know reads as none. The tool's name and the access fact paths are
+    /// locked with them.
+    #[test]
+    fn connect_words_are_locked() {
+        assert_eq!(
+            Engine::ALL.map(Engine::as_str),
+            ["postgres", "mongodb", "http", "kubernetes", "ssh", "tcp"]
+        );
+        for e in Engine::ALL {
+            assert_eq!(Engine::from_word(e.as_str()), Some(e));
+            assert_eq!(serde_json::to_value(e).unwrap(), json!(e.as_str()));
+            assert_eq!(e.needs_credential(), e != Engine::Tcp, "{e:?}");
+        }
+        assert_eq!(Engine::from_word("mysql"), None);
+        assert_eq!(TOOL_CONNECT, "roomler_connect");
+        assert_eq!(
+            (access_facts::ENGINE, access_facts::CREDENTIAL),
+            ("engine", "credential")
+        );
+        assert_eq!(
+            access_facts::OPTIONS,
+            ["database", "auth", "auth_source", "ca", "user"]
+        );
     }
 
     /// P4-5 — WIRE LOCK: a probe's kinds and its outcomes. A kind this build

@@ -1819,6 +1819,27 @@ pub enum ClientMsg {
         probe: String,
     },
 
+    /// FR-90 P4-6-1a — a session on this device asks how an entity of the
+    /// map is reached, by its kind and key: the engine, the upstream and the
+    /// credential its facts say (decision 59), and the paths the devices'
+    /// findings measured (decision 60). Believed and held as
+    /// [`ClientMsg::KnowhowSearch`] is, and answered with
+    /// [`ServerMsg::KnowhowAccess`] or [`ServerMsg::KnowhowRefused`]. It
+    /// grants nothing: the device asks the vault and the network for each
+    /// piece. Absent, the strings read as empty and are refused
+    /// `bad_request`, so the frame is always answered.
+    #[serde(rename = "rc:knowhow.connect")]
+    KnowhowConnect {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        key: String,
+    },
+
     /// FR-90 P4-5 — the device's answer to a [`ServerMsg::KnowhowProbe`]: how
     /// the probe ended, the round trip of its connect, the address it
     /// connected to (one it resolved and checked), and for `tls` what the
@@ -2814,6 +2835,7 @@ impl ClientMsg {
             ClientMsg::KnowhowPropose { .. } => "rc:knowhow.propose",
             ClientMsg::KnowhowProbed { .. } => "rc:knowhow.probed",
             ClientMsg::KnowhowVerify { .. } => "rc:knowhow.verify",
+            ClientMsg::KnowhowConnect { .. } => "rc:knowhow.connect",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2951,7 +2973,8 @@ impl ClientMsg {
             | ClientMsg::KnowhowGet { .. }
             | ClientMsg::KnowhowPropose { .. }
             | ClientMsg::KnowhowProbed { .. }
-            | ClientMsg::KnowhowVerify { .. } => Owner::Knowhow,
+            | ClientMsg::KnowhowVerify { .. }
+            | ClientMsg::KnowhowConnect { .. } => Owner::Knowhow,
         }
     }
 }
@@ -3012,6 +3035,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:knowhow.propose", Owner::Knowhow),
     ("rc:knowhow.probed", Owner::Knowhow),
     ("rc:knowhow.verify", Owner::Knowhow),
+    ("rc:knowhow.connect", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -5173,6 +5197,18 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         probe_id: ObjectId,
         probe: serde_json::Value,
+    },
+
+    /// FR-90 P4-6-1a — how an entity is reached, for a session's
+    /// `roomler_connect`: the engine, the upstream and the credential handle
+    /// its `active` and `stale` facts say, what is `missing` for those, and
+    /// the paths the devices' findings measured, this device's first. Raw
+    /// JSON, as a card is. It grants nothing: the vault and the network
+    /// decide every piece the device then asks for.
+    #[serde(rename = "rc:knowhow.access")]
+    KnowhowAccess {
+        req_id: String,
+        access: serde_json::Value,
     },
 
     /// FR-90 P4-5 — a probe, asked of a device whose last hello advertised
@@ -7422,6 +7458,46 @@ mod tests {
             .unwrap(),
             serde_json::json!({"t": "rc:knowhow.verified", "probe_id": probe.to_hex(),
                                "probe": {"state": "ok"}})
+        );
+    }
+
+    /// FR-90 P4-6-1a — a session's connect and its answer: the entity by its
+    /// kind and key, a bare one still decoding so it is answered
+    /// `bad_request`; `access` carrying the compiled access as raw JSON.
+    #[test]
+    fn knowhow_connect_frames_wire_shape_is_locked() {
+        let session = ObjectId::new();
+        let connect = ClientMsg::KnowhowConnect {
+            req_id: "c1".into(),
+            session_id: session,
+            fence: 3,
+            kind: "database".into(),
+            key: "prod-mongo".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&connect).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.connect", "req_id": "c1",
+                               "session_id": session.to_hex(), "fence": 3,
+                               "kind": "database", "key": "prod-mongo"})
+        );
+        assert_eq!(connect.namespace(), Owner::Knowhow);
+        assert_eq!(connect.wire_tag(), "rc:knowhow.connect");
+        let bare = serde_json::json!({"t": "rc:knowhow.connect", "req_id": "c2",
+                                      "session_id": session.to_hex(), "fence": 3});
+        match serde_json::from_value::<ClientMsg>(bare).unwrap() {
+            ClientMsg::KnowhowConnect { kind, key, .. } => {
+                assert!(kind.is_empty() && key.is_empty())
+            }
+            other => panic!("not a connect: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowAccess {
+                req_id: "c1".into(),
+                access: serde_json::json!({"engine": "mongodb"}),
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.access", "req_id": "c1",
+                               "access": {"engine": "mongodb"}})
         );
     }
 
