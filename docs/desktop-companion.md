@@ -69,7 +69,7 @@ on one connection) and closes. Five things poll it at once in a running companio
 |---|---|---|---|
 | service status | `src/front/app.js:166` | 10 s | 0 (reads config, runs `roomlerd service status`) |
 | device view (`Status` + `Peers`) | `src/front/app.js:168` → `cmd_device_view`, `src/commands.rs:323` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:1884` | 2 s, visible only | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:2181` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:157` | 1.5 s | 1 |
 | consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
 
@@ -124,7 +124,7 @@ A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in
 under the config write lock and restarts its flow; an invalid replacement is refused and the
 old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
-service predates route editing"* (`src/commands.rs:1935`), never as a blank page.
+service predates route editing"* (`src/commands.rs:2232`), never as a blank page.
 
 ⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
@@ -705,7 +705,7 @@ also keeps a system install's Wayland capture opt-in.
 | Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:127`, `:416` |
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
-| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:239` |
+| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:380` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
 | Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:513` |
 
@@ -866,6 +866,36 @@ flowchart TD
   (`forget_installed_version`, `companion.rs:322`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
   the Windows retry. Windows' refresh at start is older and stays.
+
+### 13.1 Checking for updates: one click from the tray (#2936)
+
+The tray's **Check for Updates** and the Overview's **Updates** card run one routine. A tray click
+shows the window at once and hands the rest to the page:
+
+```mermaid
+sequenceDiagram
+    participant T as tray.rs check_updates
+    participant P as overview.js
+    participant C as cmd_check_update
+    T->>T: show and focus the main window
+    T->>P: raise the pending flag, fire roomler-tray-check-update
+    P->>P: clear the flag, switch to Overview, scroll the Updates card into view
+    P->>P: show "Checking for updates…"
+    P->>C: invoke (off the main thread)
+    C-->>P: what roomlerd self-update --check-only said
+    P->>P: show the answer, and "Install update" when one is available
+```
+
+| Piece | Where | Why |
+|---|---|---|
+| the tray's half | `check_updates`, `src/tray.rs:588` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
+| the event and the flag | `tray_check_update_js`, `src/tray.rs:574` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
+| one check | `runUpdateCheck`, `src/front/overview.js:173` | the card's button and the tray share it: a stale "Install update" is hidden first, a second click while one runs is ignored, and a failure lands in the card |
+| into view | `revealUpdates`, `src/front/overview.js:195` | the Updates card is the last one on Overview. After a view switch it scrolls on app.js's `roomler:view` |
+| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:1611` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
+
+⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
+**Install update** queues the root update helper (FR-27).
 
 ## 14. Opening links: View screen and Open Roomler (#2713)
 
