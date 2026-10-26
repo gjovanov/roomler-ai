@@ -3562,9 +3562,9 @@ front stayed taken 0.8 s past the new daemon's one bind attempt, and the
 org had no front until the next restart. Two things now prevent it:
 - mio 1.2.1 creates sockets with `WSA_FLAG_NO_HANDLE_INHERIT`. That is
   locked by `overlay::socket_inherit_tests`
-  (`agents/roomlerd/src/overlay.rs:1371-1426`), which a child process
+  (`agents/roomlerd/src/overlay.rs:1330-1385`), which a child process
   spawned in the test cannot get past.
-- The front waits out a busy port (`overlay.rs:868-927`).
+- The front waits out a busy port (`overlay.rs:827-886`).
 
 **Never leave the service stopped (#2711, Windows perMachine).** The
 watcher is the only actor that outlives the install, so its last act

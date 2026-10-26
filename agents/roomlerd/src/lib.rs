@@ -245,7 +245,11 @@ pub mod tarball_owner;
 pub mod telemetry;
 /// FR-103 — renewing each enrollment's agent token before it expires.
 pub mod token_renewal;
-pub mod tunnel;
+/// The tunnel plane — a crate of its own since FR-123 P1 (`crates/node-tunnel`),
+/// so it compiles beside the rest of the daemon. Re-exported here, so every
+/// `crate::tunnel::…` path in this crate and `roomlerd::tunnel::…` outside it
+/// still resolves, as `roomler_node_core`'s modules above do.
+pub use roomler_node_tunnel as tunnel;
 pub mod updater;
 /// FR-90 P3-3 — the device's vault key: made while `vault_enabled` is on, in
 /// memory only, its public half in the primary enrollment's hello. Compiled

@@ -242,6 +242,11 @@ crates/
   agent-core/       → package `roomler-node-core`: daemon-free agent building blocks
                       (config, enrollment, machine-id, logging, sentinels, forward ACL).
                       The desktop companion deps THIS, never the full agent
+  node-tunnel/      → package `roomler-node-tunnel` (FR-123 P1): the daemon's tunnel plane —
+                      the forward acceptor + dialer, the tunnel-client hub, QUIC/TURN setup,
+                      the route reconciler, the port holder. roomlerd re-exports it as
+                      `crate::tunnel`; split out so it compiles BESIDE the daemon, not inside
+                      its one `codegen-units = 1` release unit
   core/             → package `roomler-core` (AGPL, SERVER side, never linked by an agent):
                       the `Module` trait, hooks, jobs, the module DAG, the composition
                       snapshot, and `Core` itself (`state.rs`) with the /ws registry,

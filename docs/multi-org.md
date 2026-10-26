@@ -286,7 +286,7 @@ its free pool → cycle every agent's WS.
 > compensation stack around it, once its evidence counters (`mux_nat_rewrites`,
 > `restores`, `skip_as_source_flips`) had read zero fleet-wide for 7 days. Every
 > org now gets its own adapter ([Per-org TUN adapters](#per-org-tun-adapters-the-only-path-since-w7c),
-> `agents/roomlerd/src/overlay.rs:318`). This section records how the mux
+> `agents/roomlerd/src/overlay.rs:277`). This section records how the mux
 > worked, for the history it explains.
 
 One `roomler` adapter, N per-org runtimes. Each org's `OverlayRuntime` gets a
@@ -385,7 +385,7 @@ re-binds ONCE, and every org re-establishes on `Ready`.
 ### Per-org TUN adapters (the only path since W7c)
 
 The second half of multi-org v2: with `overlay_multi_org` on, each org gets its
-**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:318`).
+**own adapter** (`per_org_systun_factory`, `agents/roomlerd/src/overlay.rs:277`).
 It shipped behind `overlay_tun_per_org`, default ON since rc.339; W7c deleted
 the switch along with the shared adapter it chose between, so neither the key
 nor `ROOMLERD_OVERLAY_TUN_PER_ORG` is read any more:
@@ -578,7 +578,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 | One org's server is down / its token is revoked | Only that supervisor backs off and retries; other orgs are untouched, each with its own `DOWN_SINCE` | P1 |
 | Pod roll | Every org's WS reconnects independently and re-lands on the current LB hash; rc/tunnel/media/derp rehome per the S6 cluster layer | P1 + S6 |
 | Half-open WS (middlebox ACKs pings after the upstream leg dies) | Per-connection receive-liveness deadline (rc.293): no inbound frames for 80–90 s ⇒ reconnect | pre-existing, per-org since P1 |
-| A netstack org's loopback SOCKS port is still held when its front starts | The front waits it out with a bind retry that doubles from 1 s to 30 s. It WARNs on the first failure and every 10th, and the stack logs `socks_front="not bound yet"` until the bind succeeds (`agents/roomlerd/src/overlay.rs:868-927`). Before the fix it tried ONCE, and the org had no front until the next daemon restart while its log said the stack was up. The holder, measured on Windows: across a self-update, the post-install watcher held an inherited copy of the old front's socket, now impossible (`docs/remote-control.md`, the watcher) | #2836 |
+| A netstack org's loopback SOCKS port is still held when its front starts | The front waits it out with a bind retry that doubles from 1 s to 30 s. It WARNs on the first failure and every 10th, and the stack logs `socks_front="not bound yet"` until the bind succeeds (`agents/roomlerd/src/overlay.rs:827-886`). Before the fix it tried ONCE, and the org had no front until the next daemon restart while its log said the stack was up. The holder, measured on Windows: across a self-update, the post-install watcher held an inherited copy of the old front's socket, now impossible (`docs/remote-control.md`, the watcher) | #2836 |
 | Redis down | Presence sweeper aborts rather than mass-emitting from a partial view; per-pod fan-out degrades to pod-local; the UI's slow poll is the belt | P4 |
 | Agent crash mid-renumber | Node rows are written before the network row, so the worst case is nodes already on new addresses with the network still describing the old range — re-running the renumber is idempotent from there | P2b |
 | Renumber loses the block-allocation race | The old block is already quarantined and the network keeps its old CIDR — safe, and the retry allocates above | P2b |
@@ -677,7 +677,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   when it has its own port and key (`crates/agent-core/src/config.rs:2193-2195`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
-  (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
+  (`agents/roomlerd/src/overlay.rs:270`). A port that is unset is **picked**:
   - at `enroll --overlay`, `org overlay <org> netstack` and a pushed join;
   - at daemon start, for an entry from before the fix.
 

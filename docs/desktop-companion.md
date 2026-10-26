@@ -122,7 +122,7 @@ sequenceDiagram
 
 A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in one save
 under the config write lock and restarts its flow; an invalid replacement is refused and the
-old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
+old route keeps running (`crates/node-tunnel/src/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
 service predates route editing"* (`src/commands.rs:2232`), never as a blank page.
 

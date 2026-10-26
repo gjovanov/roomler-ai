@@ -50,6 +50,7 @@ CLIENT_PATHS=(
   agents/roomler-cli
   crates/agent-core
   crates/hive-node
+  crates/node-tunnel
   crates/roomler-setup-core
   crates/tunnel-core
   crates/remote_control
@@ -105,6 +106,7 @@ CLIENT_CRATES=(
   roomler-cli
   roomler-node-core
   roomler-hive-node
+  roomler-node-tunnel
   roomler-setup-core
   roomler-ai-tunnel-core
   roomler-ai-remote-control

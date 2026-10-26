@@ -89,7 +89,7 @@ struct Inner {
     /// applied by `run_cmd`) — never re-derived here.
     config_path: PathBuf,
     /// Daemon-wide config write lock (shared with main.rs's writers).
-    cfg_lock: crate::config::WriteLock,
+    cfg_lock: roomler_node_core::config::WriteLock,
     /// Declared routes — in-memory mirror of `config.tunnel_routes`.
     routes: StdMutex<Vec<RouteDescriptor>>,
     /// Per-route runtime state, keyed by route id.
@@ -106,7 +106,7 @@ impl RouteReconciler {
     pub fn new(
         hub: TunnelClientHub,
         config_path: PathBuf,
-        cfg_lock: crate::config::WriteLock,
+        cfg_lock: roomler_node_core::config::WriteLock,
         declared: Vec<RouteDescriptor>,
     ) -> Self {
         Self {
@@ -221,7 +221,7 @@ impl RouteReconciler {
             // Failed so a mislabeled route can't hammer the WRONG org's WS
             // with doomed opens.
             if let Some(org) = route.org.as_deref()
-                && org != crate::config::PRIMARY_ORG_LABEL
+                && org != roomler_node_core::config::PRIMARY_ORG_LABEL
             {
                 let mut runtime = self.inner.runtime.lock().unwrap();
                 if !matches!(runtime.get(&route.id), Some(RouteRuntime::Failed { .. })) {
@@ -596,10 +596,10 @@ impl RouteReconciler {
     /// OTHER fields are preserved).
     async fn persist(&self, routes: &[RouteDescriptor]) -> Result<(), String> {
         let _guard = self.inner.cfg_lock.lock().await;
-        let mut cfg = crate::config::load(&self.inner.config_path)
+        let mut cfg = roomler_node_core::config::load(&self.inner.config_path)
             .map_err(|e| format!("could not reload config to persist routes: {e:#}"))?;
         cfg.tunnel_routes = routes.to_vec();
-        crate::config::save(&self.inner.config_path, &cfg)
+        roomler_node_core::config::save(&self.inner.config_path, &cfg)
             .map_err(|e| format!("could not persist routes: {e:#}"))?;
         Ok(())
     }
@@ -688,9 +688,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         // Persist targets need a loadable config on disk.
-        let mut cfg = crate::config::test_fixture();
+        let mut cfg = roomler_node_core::config::test_fixture();
         cfg.tunnel_routes = declared.clone();
-        crate::config::save(&path, &cfg).unwrap();
+        roomler_node_core::config::save(&path, &cfg).unwrap();
         let r = RouteReconciler::new(
             TunnelClientHub::new("test".into()),
             path,
@@ -767,7 +767,7 @@ mod tests {
         ok.id = String::new();
         let eff = r.add(ok).await.unwrap();
         assert!(eff.id.starts_with("route-"), "generated id, got {}", eff.id);
-        let on_disk = crate::config::load(&r.inner.config_path).unwrap();
+        let on_disk = roomler_node_core::config::load(&r.inner.config_path).unwrap();
         assert_eq!(on_disk.tunnel_routes.len(), 1);
         assert_eq!(on_disk.tunnel_routes[0].id, eff.id);
 
@@ -787,7 +787,7 @@ mod tests {
 
         assert!(r.set_enabled("a", false).await.unwrap());
         assert!(
-            !crate::config::load(&r.inner.config_path)
+            !roomler_node_core::config::load(&r.inner.config_path)
                 .unwrap()
                 .tunnel_routes[0]
                 .enabled
@@ -801,7 +801,7 @@ mod tests {
 
         assert!(r.remove("a").await.unwrap());
         assert!(
-            crate::config::load(&r.inner.config_path)
+            roomler_node_core::config::load(&r.inner.config_path)
                 .unwrap()
                 .tunnel_routes
                 .is_empty()
@@ -863,7 +863,7 @@ mod tests {
             !r.inner.hub.has_flow(&f1),
             "the old flow is retired the moment the replacement is persisted"
         );
-        let on_disk = crate::config::load(&r.inner.config_path)
+        let on_disk = roomler_node_core::config::load(&r.inner.config_path)
             .unwrap()
             .tunnel_routes;
         assert_eq!(
@@ -926,7 +926,7 @@ mod tests {
                 r.inner.hub.has_flow(&f1),
                 "{what}: old flow still in the hub"
             );
-            let on_disk = crate::config::load(&r.inner.config_path)
+            let on_disk = roomler_node_core::config::load(&r.inner.config_path)
                 .unwrap()
                 .tunnel_routes;
             assert_eq!(on_disk.len(), 2, "{what}: nothing removed from disk");
@@ -944,7 +944,7 @@ mod tests {
         let eff = r.replace(same_port).await.unwrap();
         assert_eq!(eff.remote.as_deref(), Some("db:6543"));
         assert_eq!(
-            crate::config::load(&r.inner.config_path)
+            roomler_node_core::config::load(&r.inner.config_path)
                 .unwrap()
                 .tunnel_routes
                 .iter()
@@ -968,7 +968,7 @@ mod tests {
             err.contains("id"),
             "an empty id cannot address a route: {err}"
         );
-        let on_disk = crate::config::load(&r.inner.config_path)
+        let on_disk = roomler_node_core::config::load(&r.inner.config_path)
             .unwrap()
             .tunnel_routes;
         assert_eq!(on_disk.len(), 1);
