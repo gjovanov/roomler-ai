@@ -1292,6 +1292,7 @@ mod tests {
             stop_reason: Some(super::super::sidecar::StopReason::Requested),
             bytes: 20,
             pointer: None,
+            scaled_from: None,
         };
         std::fs::write(Sidecar::path_for(&b), sc.to_json()).unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();

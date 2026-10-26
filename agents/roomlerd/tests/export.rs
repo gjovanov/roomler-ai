@@ -243,6 +243,46 @@ async fn keeping_everything_reproduces_the_recording() {
     assert_eq!(counters(&dest), (0..90).collect::<Vec<u16>>());
 }
 
+/// #2877: an encoder that encodes smaller than its source has the export's
+/// track give the size its stream holds. That encoder is the software rung
+/// above openh264's limit, which an export of a hardware recording that large
+/// reaches where only software is left. Before, the track gave the source's
+/// size whatever the stream held.
+#[tokio::test]
+async fn an_export_encoded_smaller_gives_the_size_its_stream_holds() {
+    use openh264::formats::YUVSource;
+    let d = dir();
+    let source = d.path().join("source.mp4");
+    make_source(&source, 30).await;
+    let dest = export::edited_name(&source).unwrap();
+    let half: roomlerd::recording::recorder::EncoderFactory =
+        Box::new(|w, h| roomlerd::recording::fit::scaled_openh264((w / 2, h / 2), FPS, FPS * 2));
+    let s = export::export(
+        &source,
+        &edit_list(vec![seg(0, 1000, Action::Keep)]),
+        &dest,
+        half,
+        &AtomicBool::new(false),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.frames, 30);
+
+    let pf = ProgressiveFile::open(&dest).unwrap();
+    let f = pf.video_format().unwrap();
+    assert_eq!((f.width, f.height), (W / 2, H / 2), "the track's size");
+    // The stream holds that size: its first picture decodes at it.
+    let samples = pf.samples(VIDEO_TRACK_ID).unwrap();
+    let mut file = std::fs::File::open(&dest).unwrap();
+    let mut au = pf.avc_parameter_sets_annexb().unwrap();
+    let raw = pf.read_sample(&mut file, &samples[0]).unwrap();
+    au.extend_from_slice(&length_prefixed_to_annexb(&raw).unwrap());
+    let mut dec = openh264::decoder::Decoder::new().unwrap();
+    let pic = dec.decode(&au).unwrap().expect("a picture");
+    assert_eq!(pic.dimensions(), ((W / 2) as usize, (H / 2) as usize));
+}
+
 #[tokio::test]
 async fn a_cancelled_or_impossible_export_leaves_nothing_behind() {
     let d = dir();

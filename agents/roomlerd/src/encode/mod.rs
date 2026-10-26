@@ -1250,6 +1250,14 @@ pub trait VideoEncoder: Send {
     fn is_hardware(&self) -> bool {
         false
     }
+
+    /// The size this encoder actually codes, when it differs from the frames
+    /// it is handed: a recording's software rung scales a screen larger than
+    /// openh264 accepts (#2877, `recording::fit`). `None` = the frames' own
+    /// size, which is every live-session backend.
+    fn coded_dims(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 pub struct NoopEncoder;

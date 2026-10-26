@@ -92,6 +92,10 @@ pub mod export;
 /// list, and background music (Opus, like a recording's).
 #[cfg(feature = "audio")]
 pub mod export_audio;
+/// #2877 — the software rung on a screen larger than openh264 encodes:
+/// recorded scaled to fit, keeping its shape.
+#[cfg(feature = "openh264-encoder")]
+pub mod fit;
 pub mod folder;
 /// FR-85 P1e — who the recorder runs as (the person signed in at the
 /// device, at normal integrity), and launching it as that.
