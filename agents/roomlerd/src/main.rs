@@ -1221,7 +1221,7 @@ fn main() -> Result<()> {
             let res = rt.block_on(daemon_main());
             // FR-97 P0e — drop the runtime (cancelling every task, as the
             // non-AppKit `main` does) before purging, so nothing re-pins.
-            drop(rt);
+            drop_runtime_timed(rt);
             purge_after_daemon();
             if let Err(e) = res {
                 tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
@@ -1248,6 +1248,25 @@ fn main() -> Result<()> {
     roomlerd::indicator::mac::run_main_loop();
 }
 
+/// #2718 — drop the daemon's runtime, saying so when that took seconds.
+/// Dropping a runtime waits for every `spawn_blocking` task to RETURN. One
+/// still blocked (a child process it waits on, a pipe it reads) holds the
+/// process past a service host's stop budget without a word: on an update the
+/// outgoing worker went silent for 8 s after its teardown and was terminated.
+/// A drop that never returns shows as `shutdown: clean stop recorded; the
+/// runtime is dropped next` with nothing after it.
+fn drop_runtime_timed(rt: tokio::runtime::Runtime) {
+    let dropping = std::time::Instant::now();
+    drop(rt);
+    let elapsed_ms = dropping.elapsed().as_millis() as u64;
+    if elapsed_ms >= 1_000 {
+        tracing::warn!(
+            elapsed_ms,
+            "the runtime took seconds to drop: a blocking task held the exit (#2718)"
+        );
+    }
+}
+
 /// Exactly what `#[tokio::main]` expanded to — a multi-thread runtime with
 /// every driver enabled, `block_on` the daemon, drop the runtime — spelled out
 /// for one reason: FR-84 D3's requested restart must pick its exit code only
@@ -1255,14 +1274,15 @@ fn main() -> Result<()> {
 /// exit (an auto-update, a SIGTERM) already gets. Nothing else changes.
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 fn main() -> Result<()> {
-    // The runtime is a temporary: it is dropped at the end of this statement,
-    // cancelling every task still running and waiting on blocking work.
-    let res = tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("Failed building the Runtime")
-        .block_on(daemon_main());
-    // FR-97 P0e — the runtime is gone (dropped with the statement above).
+        .expect("Failed building the Runtime");
+    let res = rt.block_on(daemon_main());
+    // Dropping the runtime cancels every task still running and waits for
+    // every blocking task to RETURN.
+    drop_runtime_timed(rt);
+    // FR-97 P0e — the runtime is gone.
     purge_after_daemon();
     if res.is_ok() {
         // Diverges when a restart was requested; otherwise a no-op.
@@ -4982,6 +5002,11 @@ async fn run_cmd(
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
+    // #2718 — how long each stage of the teardown takes. On an update the
+    // outgoing worker heard the stop, ended its signaling loops within
+    // milliseconds, and then logged nothing until its service host
+    // terminated it 8 s later. These lines say where those seconds went.
+    let teardown = std::time::Instant::now();
     wd_task.abort();
     clean_run_task.abort();
     crash_drain_task.abort();
@@ -5018,6 +5043,10 @@ async fn run_cmd(
     // is kept for the next daemon to resume. Bounded.
     #[cfg(hive_host)]
     roomlerd::hive::wind_down().await;
+    tracing::info!(
+        elapsed_ms = teardown.elapsed().as_millis() as u64,
+        "shutdown: tasks stopped"
+    );
     // On graceful shutdown, mark the config so the next startup
     // doesn't count this run as a crash. Reload-then-save again to
     // avoid clobbering any concurrent writes (clean_run_task may
@@ -5074,6 +5103,11 @@ async fn run_cmd(
     // and Windows may end the process.
     #[cfg(target_os = "windows")]
     roomlerd::win_service::session_end::clean_stop_done();
+    tracing::info!(
+        elapsed_ms = teardown.elapsed().as_millis() as u64,
+        graceful = graceful_shutdown,
+        "shutdown: clean stop recorded; the runtime is dropped next"
+    );
     // FR-84 D3 — leave with the code the supervisor relaunches on, now that
     // the clean shutdown is on disk. Only through the graceful door (a
     // requested restart is always our own internal shutdown), and never
