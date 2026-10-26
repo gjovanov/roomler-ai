@@ -29,17 +29,26 @@ without operator setup.
 
 ## Bring-up steps (FR-114: run on mars, the build host)
 
-### 1. Build + push the agent-e2e image, under a DATED tag
+### 1. Build + push the agent-e2e image, named for an agent release
+
+**The nightly does this itself (FR-126).** Every night its step 2b compares the
+harness's image with the newest `agent-v*` tag. If they differ, it builds that
+tag's tree, pushes `agent-e2e-v<version>` and rolls the StatefulSet to it. A
+failed build keeps the old agents. A release whose agent doesn't come up is
+rolled back and named in the night's verdict. Switch it off with
+`E2E_AGENT_FOLLOW_RELEASE=0` in the cron line, and the harness stays where it
+is. By hand, for a first bring-up or a deliberate pin:
 
 ```bash
-cd <a clean roomler-ai checkout at master>
-TAG="agent-e2e-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)"
-docker build -f Dockerfile.agent-e2e -t "registry.roomler.ai/roomlerd-e2e:$TAG" .
+cd <a clean roomler-ai checkout>
+REL=$(git tag -l 'agent-v*' --sort=-v:refname | head -1)    # or the release you want
+TAG="agent-e2e-${REL#agent-}"                                 # e.g. agent-e2e-v0.4.177
+D=$(mktemp -d); git archive "$REL" | tar -x -C "$D"
+docker build -f "$D/Dockerfile.agent-e2e" -t "registry.roomler.ai/roomlerd-e2e:$TAG" "$D"
 docker push "registry.roomler.ai/roomlerd-e2e:$TAG"   # mars is logged in to it
 ```
 
-Never `latest`: the overlay pins the tag, so a night's agent is a known
-build. Image size sanity-check: ~150 MiB with `recording` (FR-114 measured
+Never `latest`: a night's agent is a known release. Image size sanity-check: ~150 MiB with `recording` (FR-114 measured
 147 MiB on 2026-10-19; it was ~80–100 MiB before FR-85). If it's >200 MiB something
 pulled in scrap-capture transitively — re-check the
 `--no-default-features` + feature list in `Dockerfile.agent-e2e`.

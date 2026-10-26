@@ -98,6 +98,69 @@ kubectl -n "$NS" set image deploy/roomler2 "roomler2=${PRODIMG}" >> "$LOG" 2>&1
 kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to ${PRODIMG}"
 note "e2e stack on ${PRODIMG}"
 
+# ── 2b. the agent-e2e harness on the newest agent release (FR-126) ───
+# The harness's agents follow the release the way the server follows prod. The
+# newest `agent-v*` tag's TREE is built with Dockerfile.agent-e2e (the harness's
+# feature set), and the StatefulSet is rolled to it. The overlay's pin stays the
+# fallback a full apply uses, as it is for the server. Built by hand, the agents
+# drifted 27 releases in a week (FR-126 §2).
+# A failed BUILD keeps the old agents: a lane problem, logged. A rollout that
+# does not come up is a FINDING (the release's agent cannot start in a
+# container): the old image is restored and the verdict names the release.
+# Never a silent rollback. Kill switch: E2E_AGENT_FOLLOW_RELEASE=0.
+AGENT_FAIL=""; AGENT_OLD=""
+AE_REPO=registry.roomler.ai/roomlerd-e2e
+if [ "${E2E_AGENT_FOLLOW_RELEASE:-1}" != "0" ] && kubectl -n "$NS" get statefulset agent-e2e >/dev/null 2>&1; then
+  git -C "$REPO" fetch --quiet --force origin 'refs/tags/agent-v*:refs/tags/agent-v*' 2>/dev/null \
+    || note "agent-e2e: could not fetch the agent-v tags; deciding from the ones this clone has"
+  REL=$(git -C "$REPO" tag -l 'agent-v*' --sort=-v:refname | head -1)
+  HAVE=$(kubectl -n "$NS" get statefulset agent-e2e -o jsonpath='{.spec.template.spec.containers[?(@.name=="agent")].image}' 2>/dev/null)
+  WANT="$AE_REPO:agent-e2e-${REL#agent-}"
+  if [ -z "$REL" ] || [ -z "$HAVE" ]; then
+    note "agent-e2e: no agent-v tag or no harness image; the harness stays as it is"
+  elif [ "$HAVE" = "$WANT" ]; then
+    note "agent-e2e harness on ${REL}"
+  else
+    note "agent-e2e harness on ${HAVE##*:}; the newest release is ${REL}"
+    BUILT=0
+    if docker manifest inspect "$WANT" >/dev/null 2>&1; then
+      BUILT=1; note "  ${WANT##*:} is already in the registry: reusing it"
+    else
+      BDIR=$(mktemp -d -p "$OUT")
+      if git -C "$REPO" archive "$REL" | tar -x -C "$BDIR" \
+        && docker build -f "$BDIR/Dockerfile.agent-e2e" -t "$WANT" "$BDIR" > "$OUT/$STAMP-agent-build.log" 2>&1 \
+        && docker push "$WANT" >> "$OUT/$STAMP-agent-build.log" 2>&1; then
+        BUILT=1; note "  built ${WANT##*:} from the tag's tree and pushed it"
+      else
+        note "  could not build ${WANT##*:} (see $OUT/$STAMP-agent-build.log): the harness stays on ${HAVE##*:}"
+      fi
+      rm -rf "$BDIR"
+    fi
+    if [ "$BUILT" = 1 ]; then
+      kubectl -n "$NS" set image statefulset/agent-e2e "agent=$WANT" >> "$LOG" 2>&1
+      if kubectl -n "$NS" rollout status statefulset/agent-e2e --timeout=420s >> "$LOG" 2>&1; then
+        note "  agent-e2e harness rolled to ${REL}"
+      else
+        # The newest ordinal is updated first, so it holds the failing pod's story.
+        note "  agent ${REL} did NOT come up in the harness: restoring ${HAVE##*:}"
+        kubectl -n "$NS" logs agent-e2e-2 -c agent --tail=40 2>&1 | grep -v 'logging in as' >> "$LOG"
+        kubectl -n "$NS" set image statefulset/agent-e2e "agent=$HAVE" >> "$LOG" 2>&1
+        # An OrderedReady StatefulSet will not roll past a pod that never became
+        # Ready: delete the pods, and they come back on the restored template.
+        kubectl -n "$NS" delete pod -l app=agent-e2e --wait=false >> "$LOG" 2>&1
+        kubectl -n "$NS" rollout status statefulset/agent-e2e --timeout=420s >> "$LOG" 2>&1 \
+          || note "  …and ${HAVE##*:} did not come back either: the agent-e2e specs will fail tonight"
+        AGENT_FAIL="$REL"; AGENT_OLD="${HAVE##*:}"
+      fi
+    fi
+  fi
+  # This lane's own images only, the newest three kept. The build cache is shared, not ours.
+  docker image ls "$AE_REPO" --format '{{.Tag}}' 2>/dev/null | grep -E '^agent-e2e-v' | sort -rV | tail -n +4 \
+    | while read -r t; do docker image rm "$AE_REPO:$t" >/dev/null 2>&1; done
+fi
+AGENTS_TAG=$(kubectl -n "$NS" get statefulset agent-e2e -o jsonpath='{.spec.template.spec.containers[?(@.name=="agent")].image}' 2>/dev/null)
+AGENTS_TAG="${AGENTS_TAG##*:}"
+
 # ── 3. the browser is IN the pod ─────────────────────────────────────
 # FR-37. There are no port-forwards any more, and that is the point.
 #
@@ -247,10 +310,14 @@ if [ -n "$UNEXPECTED" ]; then
   done <<< "$VFAILED"
 fi
 
+# FR-126 — an agent release that could not start in the harness is a finding
+# of its own. It joins after §6, which rebuilds the list from spec failures only.
+[ -n "$AGENT_FAIL" ] && UNEXPECTED+="[agent-e2e harness] agent ${AGENT_FAIL} did not come up in the harness; the night ran on ${AGENT_OLD} (its log tail is in ${LOG})"$'\n'
+
 if [ -n "$UNEXPECTED" ]; then
   note "CONFIRMED REGRESSION (survived isolated re-run):"
   echo "$UNEXPECTED" | tee -a "$LOG"
-  echo "$STAMP REGRESSION ($SUMMARY) tag=$PRODTAG — see $LOG" > "$OUT/LATEST"
+  echo "$STAMP REGRESSION ($SUMMARY) tag=$PRODTAG agents=${AGENTS_TAG:--} — see $LOG" > "$OUT/LATEST"
   if command -v gh > /dev/null 2>&1 && gh auth status > /dev/null 2>&1; then
     gh issue create --repo gjovanov/roomler-ai \
       --title "e2e nightly regression ($STAMP)" \
@@ -260,7 +327,7 @@ if [ -n "$UNEXPECTED" ]; then
   exit 1
 fi
 
-echo "$STAMP OK ($SUMMARY) tag=$PRODTAG rc=$RC" > "$OUT/LATEST"
+echo "$STAMP OK ($SUMMARY) tag=$PRODTAG agents=${AGENTS_TAG:--} rc=$RC" > "$OUT/LATEST"
 note "OK ($SUMMARY)"
 # Keep the last 14 logs.
 ls -1t "$OUT"/2*.log 2>/dev/null | tail -n +15 | xargs -r rm -f
