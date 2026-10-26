@@ -89,7 +89,7 @@ each a module behind the FR-69 contract (`crates/core/src/module.rs:23`); new `E
 `crates/core/src/graph.rs:15`, the forbidden pairs untouched; `hive` first in `HOOK_ORDER`
 (`crates/core/src/hooks.rs:37`), because it holds sessions. The node side is a `roomlerd` feature,
 and its user-level half is `roomlerd hive-host`, re-exec'd as the mapped user like `portal-helper`
-(`agents/roomlerd/src/main.rs:222`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
+(`agents/roomlerd/src/main.rs:229`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
 `rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:2271`); new
 `RpcCap` verbs `hive`, `hive-view` (P0d-2), `hive-replica`, `vault`, `knowhow-scan`, equality-matched
 (`crates/remote_control/src/models.rs:765,757`).
@@ -1428,8 +1428,8 @@ which ran in no lane before. Nothing calls them yet. The supervisor is wired to 
 
 | Block | Where | What its tests pin |
 |---|---|---|
-| a Job Object: `KILL_ON_JOB_CLOSE`, no breakaway | `win_service/supervisor.rs:2160` `JobObject` | ending the job ends what its process started (`cmd` and its `ping`); closing its last handle ends its processes |
-| the start into the job | `win_service/supervisor.rs:2277` `spawn_into_job`: created `CREATE_SUSPENDED`, assigned to the job (`:2407`), only then resumed (`:2416`). One that cannot join is ended, never resumed | the process is in its job, and sees the session's variable |
+| a Job Object: `KILL_ON_JOB_CLOSE`, no breakaway | `win_service/supervisor.rs:2168` `JobObject` | ending the job ends what its process started (`cmd` and its `ping`); closing its last handle ends its processes |
+| the start into the job | `win_service/supervisor.rs:2285` `spawn_into_job`: created `CREATE_SUSPENDED`, assigned to the job (`:2415`), only then resumed (`:2424`). One that cannot join is ended, never resumed | the process is in its job, and sees the session's variable |
 | the environment | `merge_env_block` (`:2573`): the user's own block (`CreateEnvironmentBlock`), the session's variables laid over it by name, case-insensitively, then sorted and double-NUL ended | `Path` and `PATH` are one variable; a NUL in a name or a value is refused, so it cannot smuggle in an entry of its own |
 | what the child inherits | `InheritOnly` (`:2440`): a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` of its three standard handles, and nothing else the daemon holds | (the hang `pty/windows.rs` measured without one) |
 | who it runs as | `SpawnAs::User(token)`. The daemon's own identity exists only under `cfg(test)`, so no build that ships can start a session as SYSTEM | |
@@ -1437,7 +1437,7 @@ which ran in no lane before. Nothing calls them yet. The supervisor is wired to 
 | the mapping | `hive_win.rs:564` `names_console_user` and `:577` `check_mapping`: `name`, `DOMAIN\name` or `.\name`, case-insensitively. Anything else is `no_account`, naming who is at the console | a table of 15, including `CORP\dev` ≠ `WS-1\dev`, and `.` against a domain account |
 | the harness | `hive_win.rs:604` `harness_candidates`, `:620` `resolve_harness` | `hive_harness` alone when set; else `claude.exe`, then npm's `claude.cmd`; a directory of that name is no harness |
 | its command line | `hive_win.rs:690` `harness_command_line`: an `.exe` quoted for the C runtime; a `.cmd` through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`, an argument holding one of cmd's metacharacters (`:676`, `:680`) refused, never escaped | every argument reads back exactly through `CommandLineToArgvW`; eleven metacharacters are refused |
-| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1141` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
+| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1148` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
 
 Three decisions differ from the table above:
 

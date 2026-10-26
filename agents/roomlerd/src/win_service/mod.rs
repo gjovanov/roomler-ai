@@ -41,6 +41,10 @@ pub mod companion_spawn;
 pub mod desktop;
 pub mod environment;
 pub mod firewall;
+/// FR-119 P2b-16 — the host's half of the GPU clock pin: locking the clocks
+/// needs admin, and the worker that encodes runs as the person, so it renews
+/// a lease here and the host pins them.
+pub mod gpu_pin_relay;
 /// #2886 — test support: whether a child holds a handle of ours, read from
 /// its own handle table rather than timed on a pipe's EOF.
 #[cfg(test)]

@@ -6504,6 +6504,9 @@ async fn media_pump_ffmpeg_dc(
     // open, no frame-rate move is opened again before this instant: a rate
     // the backend refuses must not cost an open on every frame.
     let mut fps_retry_at: Option<std::time::Instant> = None;
+    // FR-119 P2b-16 — held while this pump wants an NVENC rate above 60;
+    // dropped with the pump, so a session's end releases the GPU clock pin.
+    let mut high_rate_pin: Option<crate::gpu_clock::HighRateGuard> = None;
     let mut dims_swaps: u32 = 0;
     /// Frames the pump may skip after a capture-cap change before it treats
     /// a dims mismatch as real: the backend applies a cap "from the next
@@ -8304,6 +8307,16 @@ async fn media_pump_ffmpeg_dc(
                 target_fps = pace;
                 state.running_at(pace);
             }
+            // FR-119 P2b-16 — above 60 an NVENC session holds the GPU clock
+            // pin, from the moment the grant wants the rate, so the
+            // replacement opens and the trial runs at full clocks: under an
+            // encoder-only load the driver drops the memory clock to a
+            // fraction, and NVENC's time per frame doubles with it.
+            crate::gpu_clock::hold_high_rate(
+                &mut high_rate_pin,
+                state.want() > crate::gpu_clock::HIGH_RATE_ABOVE_FPS
+                    && enc.name().contains("nvenc"),
+            );
         }
         // FR-70 M2 — the make-before-break is decided from the PLAN, never
         // from a frame: a live encoder built for `built_target` that the
