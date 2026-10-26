@@ -17,9 +17,11 @@
         object-fit="contain"
         :show-actions="true"
         :stream-key="p.streamKey"
+        :is-screen-share="p.isScreenShare"
         @toggle-pin="$emit('toggle-pin', p.streamKey)"
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
+        @picture-black="$emit('picture-black', p.streamKey, $event)"
       />
     </div>
 
@@ -39,9 +41,11 @@
         :show-actions="true"
         :stream-key="p.streamKey"
         :object-fit="p.isLocal && selfViewMode === 'in-grid-uncropped' ? 'contain' : 'cover'"
+        :is-screen-share="p.isScreenShare"
         @toggle-pin="$emit('toggle-pin', p.streamKey)"
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
+        @picture-black="$emit('picture-black', p.streamKey, $event)"
       />
     </div>
 
@@ -59,6 +63,7 @@
         :compact="true"
         object-fit="contain"
         @spotlight="$emit('spotlight', $event)"
+        @picture-black="$emit('picture-black', selfParticipant.streamKey, $event)"
       />
     </div>
   </div>
@@ -85,6 +90,8 @@ defineEmits<{
   'toggle-pin': [streamKey: string]
   'request-pip': [streamKey: string]
   spotlight: [streamKey: string]
+  /** FR-124 — a tile's picture turned black (or stopped being black). */
+  'picture-black': [streamKey: string, black: boolean]
 }>()
 
 const primaryGridStyle = computed(() => {
