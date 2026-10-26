@@ -314,17 +314,32 @@ Linux system install's companion runs as the desktop user and could not reach th
 socket. That left the person at the screen with no "being viewed" banner, no
 Disconnect, and on Wayland no consent prompt. The root daemon therefore also serves
 `/run/user/<uid>/roomler.sock`:
-- it belongs to the user of the **active** graphical session only;
+- it belongs to the person signed in at the machine's own screen: logind's active session
+  on `seat0`, when that session is a person's (`companion::seat0_uid`,
+  `agents/roomlerd/src/companion.rs:1138` — the rule received files and `console_user`
+  already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
+  although logind calls it active. Until #2871's review the socket went to the first
+  active graphical session anywhere, which on a host with remote logins could be one;
 - it is 0600 and theirs because it is **made as them**: the bind and the `chmod` run on a
   thread switched to their filesystem ids (`setfsuid`/`setfsgid`). Their own directory
   lets them swap the path between any two root calls, and `chmod`/`chown` follow
   symlinks, so a root `chown` of that path could be raced into handing them
   `/etc/shadow`. The daemon therefore never runs a root path operation there;
-- `SO_PEERCRED` is checked against that user or root on every connection;
+- `SO_PEERCRED` is checked against that user or root on every connection, and again by
+  the per-peer gates (below);
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
   `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
-  `Devices` and `Mesh`; and since P2h, `Peers`, served through `person_view`.
+  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; and
+  since #2871 (design A, the operator's decision) `ConfigGet` — the listing, no
+  secret being on that surface, with every key the socket will not set marked
+  `read_only = "root_only"` — and `ConfigSet` of exactly the keys that are the
+  console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
+  `crates/localapi/src/lib.rs:3196`): the keys the daemon's own endpoint already
+  gated to that person because Windows' pipe admits every interactive user.
+  Never the device-owned gates `exec_enabled`, `ssh_enabled` and
+  `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
+  administrator's command (`not_on_the_person_socket_for_key`, `:3517`).
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -363,7 +378,27 @@ the directory is not the person's:
 
 The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
 new verb cannot reach it by default. Widening it is a security change and needs
-review like one. The root socket itself is unchanged. Kill switch:
+review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
+for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
+`exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
+install pending a separate policy call. The dispatcher gates the peer again, three ways
+(#2871's review):
+- **who**: the connection's uid, which the kernel read, must be the person the socket was
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2435`, by
+  `person_peer_ok`, `:4505`). The listener makes that check before a byte is read; the gate
+  makes it again where the decision is, so the rule no longer rests on one call site that
+  no test could see. An unknown peer is refused;
+- **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
+  and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
+  daemon asks once more, fresh, whether that uid is at the seat
+  (`LocalApiState::at_the_seat_now`, `:2748`), so a person who switched away cannot change
+  the next person's settings over a connection still open. Root is not asked;
+- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3171`). The
+  `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
+  widen this one, so a new key reaches the person socket only by a decision.
+
+The server reaches none of it (the socket is local, and `remote_config_enabled` stays
+structurally outside `DesiredConfig`). The root socket itself is unchanged. Kill switch:
 `ROOMLERD_PERSON_SOCKET=0`.
 
 **A remote-desktop session's media transport is hardened past webrtc-rs' defaults**

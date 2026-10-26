@@ -13,10 +13,13 @@
 //!
 //! This module keeps ONE [`localapi::serve_person_socket`] listening for
 //! whoever is at the seat, and moves it when that changes:
-//! - on Linux, "at the seat" is the ACTIVE graphical session's user, by the
-//!   same `loginctl` walk the companion launch uses — never a display
-//!   manager's greeter, and never a user switched away in the background
-//!   (they must not answer consent for a view of someone else's desktop);
+//! - on Linux, "at the seat" is the person signed in at seat0 — logind's
+//!   `ActiveSession` there, when it is a person's (`companion::seat0_uid`) —
+//!   never a display manager's greeter, never a user switched away in the
+//!   background (they must not answer consent for a view of someone else's
+//!   desktop), and never a remote login, which sits on no seat (#2871's
+//!   review: the first active graphical session anywhere, which this took
+//!   before, could be an xrdp user's);
 //! - on a Mac, it is the console user, `/dev/console`'s owner, as the FR-43
 //!   supervisor reads it;
 //! - root at the seat needs nothing: root reaches the daemon's own socket;
@@ -258,8 +261,10 @@ pub async fn or_machine_peers(
     own
 }
 
-/// Who is at the seat now: on Linux the active graphical session's user, on
-/// a Mac the console user. `None` for nobody, and for root.
+/// Who is at the seat now: on Linux the person signed in at seat0 (logind's
+/// `ActiveSession` there, when it is a person's: `companion::seat0_uid`, the
+/// rule received files and `console_user` already use), on a Mac the console
+/// user. `None` for nobody, and for root.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn person_at_the_seat() -> Option<u32> {
     #[cfg(target_os = "linux")]
@@ -270,9 +275,12 @@ fn person_at_the_seat() -> Option<u32> {
         if !any_user_runtime_dir(std::path::Path::new("/run/user")) {
             return None;
         }
-        crate::companion::graphical_session_matching(None, true)
-            .ok()
-            .map(|s| s.uid)
+        // #2871 (review) — seat0's person, never the first active graphical
+        // session anywhere: logind calls every seatless session active, so on
+        // a host with remote logins (xrdp, GNOME Remote Login) that was
+        // whoever logind listed first, and since design A this socket sets
+        // the person's own config keys.
+        crate::companion::seat0_uid().ok().filter(|&u| u != 0)
     }
     #[cfg(target_os = "macos")]
     {
@@ -284,6 +292,21 @@ fn person_at_the_seat() -> Option<u32> {
             .map(|m| m.uid())
             .filter(|&u| u != 0)
     }
+}
+
+/// #2871 (review) — is `uid` the person at the seat RIGHT NOW? The person
+/// socket asks before it applies a config change
+/// (`LocalApiState::at_the_seat_now`): its listener follows the seat on a
+/// [`POLL`], so a person who switched away still holds an open connection
+/// until the next look, and must not change settings that are the next
+/// person's by then.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub async fn at_the_seat_now(uid: u32) -> bool {
+    tokio::task::spawn_blocking(person_at_the_seat)
+        .await
+        .ok()
+        .flatten()
+        == Some(uid)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

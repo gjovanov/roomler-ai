@@ -126,7 +126,7 @@ Three rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:274`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:598`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:658`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -440,10 +440,10 @@ label    = "Safari"
 
 | Key | Where | Default | Notes |
 |---|---|---|---|
-| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1542`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
+| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1629`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
 | `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux and macOS, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch. On a Mac a `terminal`/`tmux` entry opens a new Terminal window running it, and an app is `["open", "-b", "<bundle id>"]` (§2b) |
 | `ROOMLERD_APPS` | env (`apps::APPS_ENV`); published as `0` by `env_fallbacks` from a config that says `false` | unset | FR-97 P2c — a **floor**: `0`/`false`/`no`/`off` switches Remote Apps off (`switched_off`), nothing switches them on. A supervised Mac's root forwards it to its GUI worker, which is how the root's `enabled = false` reaches the sessions |
-| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1084`) | **off** | P4 — attended by construction; restart required |
+| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1171`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
 `roomlerd apps-probe` (`agents/roomlerd/src/main.rs:5996`) answers the whole

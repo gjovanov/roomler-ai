@@ -480,7 +480,7 @@ boundary.
 every agent mid-turn.
 
 - Linux: `hive-host` runs as a transient unit outside the daemon's cgroup
-  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:724-738`),
+  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:784-798`),
   so `systemctl restart roomlerd` leaves it running, and it reconnects to the daemon's
   per-uid socket.
 - macOS: `hive-host` starts in the user's bootstrap context (`launchctl asuser`, as
@@ -881,7 +881,7 @@ One MCP server per session, reached through `roomler mcp` (a stdio shim the harn
 starts) over a **per-session endpoint**: a Unix socket owned by the mapped account
 (`0600` under a `0700` directory) or a named pipe whose DACL names only that account's
 SID. It can't be the main LocalAPI endpoint: on a root daemon that socket is root-only
-(`crates/localapi/src/lib.rs:4082-4100`), and on Windows the pipe admits every
+(`crates/localapi/src/lib.rs:4412-4430`), and on Windows the pipe admits every
 interactive user and most verbs trust the pipe alone (`lib.rs:1104-1106`).
 
 | Tool or resource | Does | Gate |

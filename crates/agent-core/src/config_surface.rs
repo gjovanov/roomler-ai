@@ -177,6 +177,93 @@ impl Tier {
     }
 }
 
+/// #2871 — which daemon a key belongs to on a host that runs TWO: a Mac with
+/// a root half (the LaunchDaemon: the private network, Roomler SSH, remote
+/// commands, access policy, the updater, the supervisor) and a per-user half
+/// (the GUI worker that serves the remote-desktop session, which FR-43 keeps
+/// on its own enrollment and file through P2). The companion's Device
+/// configuration page shows the Mac as one device, so each row must come
+/// from, and a change go to, the half that READS the key — a switch written
+/// into the other half's file changes nothing the device does (#2871: the
+/// app showed `ssh_enabled = off` while the root half served SSH). Every
+/// other install runs one daemon, which reads every key, and this is moot.
+///
+/// Derived from the key's [`Group`] ([`Group::owner`]), one table: the
+/// session-side groups are the worker's, the rest the root half's.
+///
+/// ⚠️ Two caveats the split cannot express, both resolved by FR-43 P3 (one
+/// enrollment, one file):
+/// - the root half forwards its OWN value of a few session knobs to the
+///   worker as a floor (`macos_supervisor::WORKER_ENV_FORWARD`: display match,
+///   the encoder and fps denylists, the Mac kill switches), and the worker
+///   keeps the stricter — so editing the worker's value, where this routes a
+///   session key, never loosens a machine policy, and has no effect while the
+///   root has one;
+/// - a delegated session's policies are judged twice, by the root half's
+///   signalling with its config (the browser check, the session-policy mask,
+///   consent) and by the worker's with its own, so the effective policy is
+///   the stricter of the two halves' and the worker's copy — the one this
+///   routes to — can only tighten what the root half allows.
+///
+/// Locked by `every_key_has_an_owner_and_the_console_persons_keys_split_as_designed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Owner {
+    /// The root half reads it: the private network, SSH, remote commands,
+    /// access and consent policy, the daemon itself.
+    Machine,
+    /// The per-user half that serves the session reads it: remote desktop,
+    /// capture and input, video, files.
+    Session,
+}
+
+impl Owner {
+    /// A stable spelling, for logs and tests.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Owner::Machine => "machine",
+            Owner::Session => "session",
+        }
+    }
+}
+
+impl Group {
+    /// #2871 — which half of a two-half Mac reads this group's keys
+    /// ([`Owner`]). Exhaustive on purpose: a new group places itself.
+    pub const fn owner(self) -> Owner {
+        match self {
+            Group::Access
+            | Group::Network
+            | Group::NetworkCarriers
+            | Group::NetworkRouting
+            | Group::Tunnels
+            | Group::Ssh
+            | Group::Device => Owner::Machine,
+            Group::RemoteDesktop
+            | Group::CaptureInput
+            | Group::VideoEncoding
+            | Group::VideoRate
+            | Group::Files => Owner::Session,
+        }
+    }
+
+    /// The group with this wire id (`ConfigEntry::group`), if any.
+    pub fn from_wire(wire: &str) -> Option<Group> {
+        Group::ALL.into_iter().find(|g| g.wire() == wire)
+    }
+}
+
+/// #2871 — the [`Owner`] of a key: by this build's registry when the key is
+/// known, else by the group the daemon sent beside it (`ConfigEntry::group`),
+/// else the session half — which keeps the per-user half's row for a key
+/// this build has never heard of, as the page always showed it.
+pub fn owner_for(key: &str, group_wire: &str) -> Owner {
+    KEYS.iter()
+        .find(|m| m.key == key)
+        .map(|m| m.group.owner())
+        .or_else(|| Group::from_wire(group_wire).map(Group::owner))
+        .unwrap_or(Owner::Session)
+}
+
 /// One registry row. Every field is a claim the desktop puts on screen, so
 /// a wrong one is a lie to the person at the machine — `live` above all:
 /// `true` means the daemon applies a change WITHOUT a restart, which today
@@ -1931,6 +2018,9 @@ fn to_entry(cfg: &AgentConfig, m: &KeyMeta) -> ConfigEntry {
         group_label: m.group.label().to_string(),
         tier: m.tier.wire().to_string(),
         default: builtin_default(m.key),
+        // #2871 — set only by the person socket's view (`localapi::person_view`),
+        // never by the surface: a daemon's own endpoint sets every key.
+        read_only: None,
     }
 }
 
@@ -5069,6 +5159,119 @@ mod tests {
         assert!(apply(&mut cfg, "forward_acl", Some("{nope")).is_err());
         apply(&mut cfg, "forward_acl", None).unwrap();
         assert!(cfg.forward_acl.enabled, "default ACL is enabled");
+    }
+
+    /// #2871 — every key has an owner on a two-half Mac, derived from its
+    /// group, and the keys the person socket serves split as designed: the
+    /// FR-52 external-access keys are the root half's (its row is the device
+    /// an outsider reaches, and it holds the password record), every other
+    /// one the session half's (the worker serves the session; its policies
+    /// apply to a delegated one too, and can only tighten the root half's).
+    /// The device-owned gates and the network are the root half's.
+    #[test]
+    fn every_key_has_an_owner_and_the_console_persons_keys_split_as_designed() {
+        for m in KEYS {
+            assert_eq!(owner_for(m.key, ""), m.group.owner(), "{}", m.key);
+            assert_eq!(
+                owner_for(m.key, m.group.wire()),
+                m.group.owner(),
+                "{}",
+                m.key
+            );
+        }
+        for key in [
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            "overlay_enabled",
+            "auto_update",
+            "auto_grant_session",
+            "allow_plaintext_server",
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+            "macos_supervise_gui_worker",
+            "relay_server_enabled",
+        ] {
+            assert_eq!(owner_for(key, ""), Owner::Machine, "{key}");
+        }
+        for key in [
+            "record_dir",
+            "record_remote_enabled",
+            "record_remote_audio",
+            "files_dir",
+            "keep_busy_enabled",
+            "privacy_mode_allowed",
+            "lock_on_end",
+            "display_match",
+            "peer_auth",
+            "rc_clipboard",
+            "rc_files",
+            "rc_audio",
+            "encoder_preference",
+            "drm_capture",
+            "rate_factor_h264",
+        ] {
+            assert_eq!(owner_for(key, ""), Owner::Session, "{key}");
+        }
+        // The person socket's `ConfigSet` allowlist (localapi), key by key:
+        // the external-access surface is the root half's, the rest the
+        // worker's — so on a two-half Mac the companion edits exactly
+        // `external_*` over the person socket and everything else where it
+        // always did.
+        let served: Vec<&str> = KEYS
+            .iter()
+            .map(|m| m.key)
+            .filter(|k| roomler_localapi::person_socket_admits_key(k))
+            .collect();
+        // #2871 (review) — by name, in registry order, never a bare count a
+        // new key would just bump.
+        assert_eq!(
+            served,
+            [
+                "files_dir",
+                "external_access_enabled",
+                "external_consent_mode",
+                "external_max_permissions",
+                "record_dir",
+                "record_remote_enabled",
+                "record_remote_audio",
+                "keep_busy_enabled",
+                "privacy_mode_allowed",
+                "lock_on_end",
+                "display_match",
+                "peer_auth",
+                "rc_clipboard",
+                "rc_files",
+                "rc_audio",
+            ],
+            "the keys the person-at-the-device socket of a ROOT install lets the person at the \
+             seat set changed. Does the new one belong to that person — where their files and \
+             recordings land, what a session may take from their screen — or to the device, \
+             which on a root install everyone who sits there later shares? Only the first kind \
+             goes in `localapi::CONSOLE_PERSON_KEYS`' `person_socket` lists"
+        );
+        for key in &served {
+            let expected = if key.starts_with("external_") {
+                Owner::Machine
+            } else {
+                Owner::Session
+            };
+            assert_eq!(owner_for(key, ""), expected, "{key}");
+        }
+        // A key this build does not know: by the group the daemon sent, else
+        // the session half (the per-user row, as the page always showed it).
+        assert_eq!(owner_for("brand_new", "ssh"), Owner::Machine);
+        assert_eq!(owner_for("brand_new", "files"), Owner::Session);
+        assert_eq!(owner_for("brand_new", ""), Owner::Session);
+        assert_eq!(owner_for("brand_new", "no_such_group"), Owner::Session);
+        assert_eq!(
+            Group::from_wire("remote_desktop"),
+            Some(Group::RemoteDesktop)
+        );
+        assert_eq!(Group::from_wire("Remote desktop"), None);
+        assert_eq!(Owner::Machine.wire(), "machine");
+        assert_eq!(Owner::Session.wire(), "session");
     }
 
     #[test]

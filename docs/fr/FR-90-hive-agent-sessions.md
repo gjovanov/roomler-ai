@@ -2662,7 +2662,7 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3089`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3057`) |
+| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3426`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3376`) |
 | who it acts as | **the device's owner** (decision 23, decided). The vault reads the owner from the device's row, never from the frame, as `rc:ssh.request` does (`crates/modules/network/src/agent_arms.rs:161`, `:211`). A device whose row is gone or removed has no principal and gets nothing |
 | which organization | the device's primary enrollment's, where the lease client lives, as for every vault ask. A secondary organization's secrets are out of reach this way |
 | the call | `roomler connect <handle> --engine <e> --upstream <u> [--ca <handle>] [--ttl <s>]`, the arguments a session's `vault_connect` takes (`docs/vault.md` §19): a structured secret by its path or this organization's RRN, an engine, and the upstream exactly as the secret's `audiences` names it |
@@ -2688,7 +2688,7 @@ sequenceDiagram
   names, and a new action would escape it. So P3-9-1 seeds its twin for `secret:connect`, in
   the same change as the action.
 - ⚠️ **Never on the person socket.** A system install's person socket serves whoever sits at the
-  screen (`crates/localapi/src/lib.rs:3036`), who need not be the device's owner. Serving
+  screen (`crates/localapi/src/lib.rs:3103`), who need not be the device's owner. Serving
   `roomler connect` there would lend the owner's vault to anyone at the seat. On a system install
   it takes the daemon's own endpoint: an administrator, or root.
 - ⚠️ **The owner from the row, never from the frame.** A compromised device can ask for what its
@@ -2745,7 +2745,7 @@ design above:
   (`HiveUpdateHold`). `roomler connect`'s foreground is that connection, so Ctrl-C, a killed
   command or a closed terminal ends the endpoint with no verb of its own. The command asks every
   5 s on the same connection where its endpoint stands, and only that connection may ask
-  (`crates/localapi/src/lib.rs:3519`).
+  (`crates/localapi/src/lib.rs:3836`).
 - **Who may ask is decision 26**, found writing P3-9-2a. The design's "an administrator, or root"
   does not hold on Windows, where the daemon's pipe admits every interactive user. Built as
   recommended, pending the operator's word.
@@ -3211,7 +3211,7 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| the roots | `knowhow_scan_roots`, absolute paths, the device's own as `hive_roots` is (`crates/agent-core/src/config.rs:488`): set in its config or over the LocalAPI (`crates/agent-core/src/config_surface.rs:405`, read by `parse_absolute_list`, `:2945`), absent from `DesiredConfig` and named in the test that keeps every device-owned key out of it (`crates/remote_control/src/models.rs:9284`). **Empty means nothing is read**: the answer is `no_roots`. Read again from the config file at each scan, so an owner's edit takes the next scan with no restart. A folder is walked for checkouts; a file is read as a kubeconfig (decision 46) |
+| the roots | `knowhow_scan_roots`, absolute paths, the device's own as `hive_roots` is (`crates/agent-core/src/config.rs:488`): set in its config or over the LocalAPI (`crates/agent-core/src/config_surface.rs:492`, read by `parse_absolute_list`, `:3035`), absent from `DesiredConfig` and named in the test that keeps every device-owned key out of it (`crates/remote_control/src/models.rs:9284`). **Empty means nothing is read**: the answer is `no_roots`. Read again from the config file at each scan, so an owner's edit takes the next scan with no restart. A folder is walked for checkouts; a file is read as a kubeconfig (decision 46) |
 | the verb | `knowhow-scan`, advertised by every build that can scan (`rpc_caps`, `agents/roomlerd/src/encode/caps.rs:1991`) whatever its roots say, since an empty list is an answer: Linux and macOS from P4-3b-1, Windows from P4-3b-4. Compiled where agent sessions are (`cfg(hive_host)`: the `hive` feature, which every release build carries, `.github/workflows/release-agent.yml:537`), since it shares their drop |
 | the frame | `rc:knowhow.scan`, in `handle_server_msg` (`agents/roomlerd/src/signaling.rs:3156`), on the **primary's** connection only (`OrgCtx.is_primary`, `:528`): one arriving on a secondary's is answered `failed` and never run (decision 43), so the gate holds at the device as well as at the server's 409. The scan runs off the signaling loop, never awaited in it, and answers on the primary's connection of the moment, as a session's reports do (`agents/roomlerd/src/hive/supervisor.rs:1547`) |
 | once | one scan at a time. A scan id already running is not started again, and the last 16 answers are kept in memory, so a scan delivered again after a lost connection (the delivery, in P4-3's design above) is answered from what it found, never run twice |
@@ -4685,13 +4685,13 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     the daemon's own endpoint: an administrator, or root" (§3e "P3-9, `roomler connect`, as
     designed"), holds where the system daemon's socket is root's, as on Linux and macOS. It does
     not hold on Windows. There the daemon's pipe admits every interactive user, an RDP session's
-    included (`crates/localapi/src/lib.rs:3683`, `(A;;GA;;;IU)`), and `roomler exec`,
+    included (`crates/localapi/src/lib.rs:4013`, `(A;;GA;;;IU)`), and `roomler exec`,
     `roomler ssh` and `config set` act for them today. Nothing in P3-9-2a depends on the answer;
     P3-9-2b's verb does.
     - *Recommended: hold `roomler connect` to what the design said.* On Windows that is SYSTEM, an
       elevated administrator, or the account the daemon itself runs as (a per-user install). On
       Unix it is root, or the daemon's own account. The listener already reads the caller's token
-      at accept time (`pipe_client_peer`, `:2423`), and would read its SID and its elevation
+      at accept time (`pipe_client_peer`, `:2481`), and would read its SID and its elevation
       beside its session.
       - What it costs: a standard user of a machine-wide install cannot connect. An endpoint is
         served to the account that asked, so an administrator's serves no one else.
@@ -4699,11 +4699,11 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: on a shared or RDP-served machine, anyone signed in reaches the owner's
         grants.
     - *Or: the person at the console*, as keep busy's start is held
-      (`peer_may_start_keep_busy`, `:2353`): never SYSTEM, never another session.
+      (`peer_may_start_keep_busy`, `:2374`): never SYSTEM, never another session.
       - What it costs: an administrator over RDP cannot, and whoever sits at a shared machine's
         screen can.
     - *Built in P3-9-2b as recommended, pending the operator's word.* A wider answer changes one
-      gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2303`), and its test.
+      gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2323`), and its test.
 27. **What a session's egress proxy allows, before knowhow** (P3b-1), for the operator to confirm
     (P3b-0, §3e "P3b, `placeholder` egress, as designed"). The design's §7.2 takes the allowlist
     from the session's role and the knowhow audiences it may reach, and knowhow is P4. Nothing in
