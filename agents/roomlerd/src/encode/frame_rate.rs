@@ -99,8 +99,9 @@ pub fn long_edge_bucket(width: u32, height: u32) -> u32 {
 pub enum Verdict {
     /// A trial sustained the rate: grant it without one next time.
     Proven,
-    /// A trial fell short: do not trial again until the build, the hardware or
-    /// the knobs change (the cache's key).
+    /// A trial fell short: do not trial again for an hour (P2b-17a,
+    /// `fps_class_cache::FAILED_MAX_AGE_SECS`), or until the build, the
+    /// hardware or the knobs change (the cache's key).
     Failed,
 }
 
