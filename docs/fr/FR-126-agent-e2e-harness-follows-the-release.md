@@ -53,7 +53,7 @@ flowchart TD
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P1 | `e2e-nightly.sh` §2b (resolve, build, push, roll, wait, roll back on failure, prune); `LATEST` names the agents; the overlay pin's comment; `docs/testing.md` + `AGENT-E2E.md` | `E2E_AGENT_FOLLOW_RELEASE=0` in the cron line (the harness then stays where it is, as before) | — |
+| P1 | `e2e-nightly.sh` §2b (resolve, build, push, roll, wait, roll back on failure, prune); `LATEST` names the agents; the overlay pin's comment; `docs/testing.md` + `AGENT-E2E.md` | `E2E_AGENT_FOLLOW_RELEASE=0` in the cron line (the harness then stays where it is, as before) | rehearsed 2026-10-26 (AC2, AC3; AC1's mechanism); this PR |
 | P2 | field: the first nightly after a new `agent-v*` tag rebuilds and rolls the harness, and the seven agent tests run on it | as P1 | — |
 
 ## 5. Acceptance criteria
@@ -61,8 +61,8 @@ flowchart TD
 - [ ] **AC1 (P1):** with the harness behind the newest `agent-v*` tag, the nightly builds `agent-e2e-v<that version>`
   from the tag's tree, rolls the StatefulSet to it, and runs the agent tests on it; `LATEST` names the agents' tag. Red
   first: before P1 the harness stays on its hand-built tag however many releases go by.
-- [ ] **AC2 (P1):** a build failure leaves the harness on its old image, the night still runs, and the log says why.
-- [ ] **AC3 (P1):** a rollout that does not reach Ready restores the old image (all three agents Ready on it again),
+- [x] **AC2 (P1):** a build failure leaves the harness on its old image, the night still runs, and the log says why.
+- [x] **AC3 (P1):** a rollout that does not reach Ready restores the old image (all three agents Ready on it again),
   the night still runs, and an issue names the release. Shown by a deliberately broken image, in a rehearsal outside a
   real night.
 - [ ] **AC4 (P2):** the first nightly after a real release does AC1 unattended, and the seven agent tests pass on it, or
@@ -89,3 +89,7 @@ flowchart TD
 
 | Date | Build | What was checked | Result |
 |---|---|---|---|
+| 2026-10-26 16:28Z | the harness on `agent-e2e-20261025-d211617` (0.4.172, refreshed by hand at 00:06Z); the newest tag `agent-v0.4.177` | AC1's red | **5 releases behind** after 16 h, and nothing in the lane would move it |
+| 2026-10-26 16:34Z | §2b as committed on the P1 branch, run by a driver on mars with the nightly's variables; the Dockerfile path forced to a missing file | AC2 | `could not build agent-e2e-v0.4.177 … the harness stays on agent-e2e-20261025-d211617`. The build log names the cause (`failed to read dockerfile … NOPE`); the tag's archive was fine (`724ef9273`, which carries `Dockerfile.agent-e2e`). 3/3 Ready, 0 restarts, no failure recorded, the block carried on |
+| 2026-10-26 16:34–16:36Z | the same block, the image forced to `busybox:1.36` (exits at once), the rollout timeout cut to 90 s | AC3 | Not Ready in 90 s: `agent agent-v0.4.177 did NOT come up in the harness: restoring agent-e2e-20261025-d211617`. The pods were deleted and came back **3/3 Ready on the old image**, 0 restarts; `AGENT_FAIL=agent-v0.4.177`. The verdict section, run locally with `gh` stubbed: `LATEST` reads `REGRESSION … agents=agent-e2e-20261025-d211617`, an issue is filed whose body names the release, exit 1. With no failure, `LATEST` reads `OK … agents=…` and no issue is filed |
+| 2026-10-26 16:36–16:45Z | the block as committed | AC1's mechanism, then the suite | Built `agent-e2e-v0.4.177` **from the tag's tree** (6 min), pushed, rolled in 15 s; **3/3 Ready on v0.4.177**, each recording state advertised. The seven agent tests on `hosted-20261026-21d7c18`, with the specs at that image's commit: **7/7**. AC1 itself ticks with AC4: the first night that does this unattended |
