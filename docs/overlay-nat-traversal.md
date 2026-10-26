@@ -487,24 +487,36 @@ so a pair on TURN kept TURN after the server re-stamped it DERP, until it happen
 to churn. Two stamps make that wrong: FR-115 P4c-1's, when an org crosses its relay
 allowance (TURN is not throttled, DERP is), and P7's churn pin, which rides the
 same verdict (`fan_pair_verdicts`). `RelayCoordinator::stamp_to_derp`
-(`crates/tunnel-core/src/overlay/relay_link.rs:1034`), asked from the
-keep-the-relay paths of `install_peers`
-(`crates/tunnel-core/src/overlay/runtime/establish.rs:964`), builds the DERP
-carrier on the live mux and installs it over the TURN one: **make-before-break**,
-the path demote-follow takes. The peer moves on its own copy of the stamp, and an
-older agent by demote-follow, because our frames now arrive over `/derp`.
-⚠️ Only an installed **TURN** carrier moves, and only on the server's stamp, never
-on a local derivation. A direct carrier, an org relay, a pair with a
-make-before-break direct probe in flight and a pair still being established are
-left alone: DERP is a fallback tier, not a destination.
-⚠️ Unlike a follow, the move records `Derp` as the pair's established strategy
-(`roles`), so when the stamp turns again (the org back under, the pin lapsed) the
-ordinary DERP regrade (`derp_regrade_due`) takes the pair back to TURN. That way
-back is break-before-make and only as good as the regrade: an end that reached
-DERP by demote-follow keeps its old strategy and never regrades, and frames a busy
-peer still sends over `/derp` pull a regrading end back by the same follow (field
-2026-10-24: one TURN sample, then DERP). A pair left there sits on DERP, the floor
-every fleet pair is born on.
+(`crates/tunnel-core/src/overlay/relay_link.rs`), asked from the keep-the-relay
+paths of `install_peers` (`maybe_probe_stamp_to_derp`,
+`crates/tunnel-core/src/overlay/runtime/establish.rs`), builds the DERP carrier
+on the live mux and **probes** it: the carrier waits in the make-before-break
+probe slot (`WgDevice::start_relay_probe`) while TURN keeps the pair's traffic,
+and `sweep_upgrade_probes` promotes it over the TURN carrier only once a
+handshake over `/derp` has latched. The one-byte permission nudge goes out over
+`/derp` first and the initiation 500 ms later, so a peer that follows us there
+(demote-follow, on any agent) has its DERP carrier up when the handshake arrives.
+A peer probing at the same moment answers on its own probe.
+⚠️ **The stamp alone is never enough to move.** It says both ends *support* DERP,
+not that the peer's `/derp` is up: the verdict and the grant both decide on
+`supports_derp`, and the measured `derp_ws_ok` rides a ~20-minute netcheck, too
+stale to gate on. Field 2026-10-26: the first version installed the DERP carrier
+straight over TURN, released the allocation the peer was dialing, and a peer whose
+`/derp` had never opened sat with no carrier for 12 minutes, where 0.4.172 kept
+the pair on TURN. Now a peer that does not answer within 15 s keeps the pair on
+TURN, and is not probed again for 10 minutes (`STAMP_PROBE_BACKOFF`).
+⚠️ Only an installed **TURN** carrier is probed, and only on the server's stamp,
+never on a local derivation. A direct carrier, an org relay, a pair with another
+probe in flight and a pair still being established are left alone: DERP is a
+fallback tier, not a destination.
+⚠️ Unlike a follow, the promotion records `Derp` as the pair's established strategy
+(`roles`, `commit_stamp_derp`), so when the stamp turns again (the org back under,
+the pin lapsed) the ordinary DERP regrade (`derp_regrade_due`) takes the pair back
+to TURN. That way back is break-before-make and only as good as the regrade: an end
+that reached DERP by demote-follow keeps its old strategy and never regrades, and
+frames a busy peer still sends over `/derp` pull a regrading end back by the same
+follow (field 2026-10-24: one TURN sample, then DERP). A pair left there sits on
+DERP, the floor every fleet pair is born on.
 
 ## Worker co-location — one pick, everywhere (invariant I6)
 

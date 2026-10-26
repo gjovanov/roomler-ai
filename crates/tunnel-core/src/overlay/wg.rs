@@ -763,6 +763,28 @@ impl Drop for Peer {
     }
 }
 
+/// Send one handshake initiation for `tunn` over `carrier`, `after` from now
+/// (zero: at once). rc.211 — the bytes are formatted under the session lock
+/// and sent once it is released, the same split as the timer tasks.
+fn spawn_initiation(tunn: Arc<Mutex<Tunn>>, carrier: Arc<Carrier>, after: Duration) {
+    tokio::spawn(async move {
+        if !after.is_zero() {
+            tokio::time::sleep(after).await;
+        }
+        let mut buf = vec![0u8; WG_BUF];
+        let out = {
+            let mut t = tunn.lock().await;
+            match t.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                _ => None,
+            }
+        };
+        if let Some(b) = out {
+            let _ = carrier.send(&b).await;
+        }
+    });
+}
+
 /// rc.134/143 — shared-routes demux for N direct-LAN peers. One UDP socket
 /// **per usable LAN interface** (each bound to its interface IP, not `0.0.0.0`
 /// — rc.143), and one recv loop per socket, all routing into a single shared
@@ -1362,6 +1384,61 @@ impl WgDevice {
         carrier: Arc<Carrier>,
         initiate: bool,
     ) {
+        let peer = self.build_carrier_session(peer_public, overlay_ip, carrier.clone());
+        let (tunn, stats) = (peer.tunn.clone(), peer.stats.clone());
+        if let Some(old) = self.peers.insert(peer_public, peer) {
+            self.unregister_plane_route(&old);
+        }
+        self.send_install(
+            peer_public,
+            overlay_ip,
+            tunn.clone(),
+            carrier.clone(),
+            stats,
+        );
+        self.debug_assert_send_synced();
+        if initiate {
+            spawn_initiation(tunn, carrier, Duration::ZERO);
+        }
+    }
+
+    /// #2820 — a shadow probe over a carrier with its own receive loop (a
+    /// `/derp` carrier): the session [`add_peer`](Self::add_peer) would
+    /// install, held in `probes` instead, so the peer's active carrier keeps
+    /// all its traffic until this one is PROVEN. It promotes and drops exactly
+    /// as a direct probe does ([`promote_direct_probe`](Self::promote_direct_probe),
+    /// [`drop_direct_probe`](Self::drop_direct_probe)), and replaces any probe
+    /// already in flight for the peer.
+    ///
+    /// A latched handshake is the proof: the peer answered over this carrier,
+    /// so it can be reached there. The initiation goes out after `initiate_after`
+    /// rather than at once, so a peer that follows the carrier only once it
+    /// hears from us over it (demote-follow) has registered for it when the
+    /// handshake arrives.
+    pub async fn start_relay_probe(
+        &mut self,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        carrier: Arc<Carrier>,
+        initiate_after: Duration,
+    ) {
+        self.drop_direct_probe(&peer_public).await;
+        let peer = self.build_carrier_session(peer_public, overlay_ip, carrier.clone());
+        let tunn = peer.tunn.clone();
+        self.probes.insert(peer_public, peer);
+        spawn_initiation(tunn, carrier, initiate_after);
+    }
+
+    /// A fresh WireGuard session for `peer_public` over `carrier`, with its
+    /// recv + timer tasks running: the part [`add_peer`](Self::add_peer) and
+    /// [`start_relay_probe`](Self::start_relay_probe) share. It is installed
+    /// nowhere: the caller puts it in `peers` or in `probes`.
+    fn build_carrier_session(
+        &mut self,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        carrier: Arc<Carrier>,
+    ) -> Peer {
         let index = self.alloc_index();
 
         let tunn = Tunn::new(
@@ -1469,45 +1546,15 @@ impl WgDevice {
             }
         });
 
-        if let Some(old) = self.peers.insert(
-            peer_public,
-            Peer {
-                tunn: tunn.clone(),
-                carrier: carrier.clone(),
-                overlay_ip,
-                tasks: vec![recv_task, timer_task],
-                stats: stats.clone(),
-                direct_src: None,
-                plane_idx: None,
-                direct_index: None,
-            },
-        ) {
-            self.unregister_plane_route(&old);
-        }
-        self.send_install(
-            peer_public,
+        Peer {
+            tunn,
+            carrier,
             overlay_ip,
-            tunn.clone(),
-            carrier.clone(),
+            tasks: vec![recv_task, timer_task],
             stats,
-        );
-        self.debug_assert_send_synced();
-
-        if initiate {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; WG_BUF];
-                // rc.211 — same lock-then-send split as the timer tasks.
-                let out = {
-                    let mut t = tunn.lock().await;
-                    match t.format_handshake_initiation(&mut buf, false) {
-                        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
-                        _ => None,
-                    }
-                };
-                if let Some(b) = out {
-                    let _ = carrier.send(&b).await;
-                }
-            });
+            direct_src: None,
+            plane_idx: None,
+            direct_index: None,
         }
     }
 
@@ -2845,6 +2892,86 @@ mod tests {
             dev.peer_traffic(&pk).is_some(),
             "the active carrier survives an unrelated probe drop"
         );
+    }
+
+    /// #2820 — a probe over a carrier with its own receive loop (`/derp`) is
+    /// held exactly like a direct probe: the peer's ACTIVE relay carrier keeps
+    /// routing until the probe is promoted, a dropped probe never disturbs it,
+    /// and a relay probe replaces a direct one already in flight (one probe
+    /// slot per peer).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_probe_holds_the_active_carrier_until_promoted() {
+        let kp = WgKeypair::generate();
+        let peer = WgKeypair::generate();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        let pk = peer.public.to_bytes();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 4);
+        let turn: SocketAddr = "127.0.0.1:11".parse().unwrap();
+        let derp: SocketAddr = "127.0.0.1:12".parse().unwrap();
+
+        // The pair rides a relay carrier (TURN).
+        dev.add_peer(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), turn),
+            false,
+        );
+        assert!(dev.peer_traffic(&pk).is_some());
+
+        dev.start_relay_probe(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), derp),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(dev.has_direct_probe(&pk));
+        assert_eq!(dev.probe_count(), 1);
+        assert_eq!(dev.peer_count(), 1, "the probe is not a second routed peer");
+        assert_eq!(dev.probe_handshake_done(&pk), Some(false));
+        assert!(
+            dev.peer_traffic(&pk).is_some(),
+            "the active carrier keeps the pair while the probe is unproven"
+        );
+
+        // The peer answered over the probe's carrier → it becomes the active one.
+        dev.test_latch_probe_handshake_done(&pk);
+        assert!(dev.promote_direct_probe(&pk));
+        assert_eq!(dev.probe_count(), 0, "promoted out of the shadow map");
+        assert_eq!(dev.peer_count(), 1);
+
+        // An unanswered relay probe is dropped; the active carrier survives.
+        dev.start_relay_probe(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), turn),
+            Duration::from_millis(1),
+        )
+        .await;
+        dev.drop_direct_probe(&pk).await;
+        assert_eq!(dev.probe_count(), 0);
+        assert!(dev.peer_traffic(&pk).is_some());
+
+        // One slot per peer: a relay probe replaces a direct probe in flight.
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev.ensure_direct_demux(sock.clone());
+        dev.start_direct_probe(sock, pk, overlay_ip, "127.0.0.1:13".parse().unwrap(), false)
+            .await;
+        assert_eq!(dev.probe_count(), 1);
+        dev.start_relay_probe(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), derp),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(
+            dev.probe_count(),
+            1,
+            "the relay probe replaced the direct one"
+        );
+        dev.drop_direct_probe(&pk).await;
+        assert_eq!(dev.probe_count(), 0);
     }
 
     /// P1 (S6) — the shared send half must track every routing mutation:

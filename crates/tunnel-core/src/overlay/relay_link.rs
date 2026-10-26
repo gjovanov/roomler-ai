@@ -117,6 +117,12 @@ const REGRADE_EVIDENCE_CEILING: Duration = Duration::from_secs(7_200);
 /// middlebox eating wss:/derp while TURNS works) reports within a minute.
 const DERP_WS_DOWN_EVIDENCE: Duration = Duration::from_secs(60);
 
+/// #2820 — how long after the peer did not answer a `/derp` probe the server's
+/// DERP stamp is no reason to probe again. Such a peer has no live `/derp`
+/// (its WS is down, or never opened), which a TURN pair can afford to learn
+/// once and not on every netmap. A carrier death re-requests regardless.
+pub(crate) const STAMP_PROBE_BACKOFF: Duration = Duration::from_secs(600);
+
 /// Unresponsive-peer re-request ladder: consecutive relay deaths 1-2 keep
 /// today's immediate re-request (ordinary transients — coturn blip, worker
 /// roll — must stay snappy); from the 3rd the peer has been dark for ≥ two
@@ -385,6 +391,10 @@ pub struct RelayCoordinator {
     /// frozen once tracked (`request` early-returns on `is_tracking`), so without
     /// this recompute the pair would never heal.
     roles: HashMap<ObjectId, RelayStrategy>,
+    /// #2820 — when a `/derp` probe for the peer (the server's DERP stamp on a
+    /// live TURN pair) went unanswered; [`stamp_to_derp`](Self::stamp_to_derp)
+    /// declines for [`STAMP_PROBE_BACKOFF`] after it.
+    stamp_probe_failed: HashMap<ObjectId, Instant>,
     /// P7 — per-peer force-DERP pins from the server's `OverlayForceDerp`
     /// escalation push (sustained TURN churn on the pair). While a pin is
     /// unexpired, [`relay_strategy`](Self::relay_strategy) returns
@@ -576,6 +586,7 @@ impl RelayCoordinator {
             derp_floor: super::direct::derp_floor_enabled(),
             derp_mux,
             roles: HashMap::new(),
+            stamp_probe_failed: HashMap::new(),
             forced_derp_until: HashMap::new(),
             org_sessions: HashMap::new(),
             org_peers: HashMap::new(),
@@ -1017,21 +1028,38 @@ impl RelayCoordinator {
     /// there for 6+ minutes after both pods re-stamped it, and moved only when
     /// one end restarted.
     ///
-    /// The DERP carrier is built the way demote-follow builds one
+    /// This builds the DERP carrier, the way demote-follow builds one
     /// ([`follow_peer_to_derp`](Self::follow_peer_to_derp): on the live mux,
-    /// for a peer holding no relay slot), and `Derp` becomes the pair's
-    /// established strategy. That last part is what makes the way back work:
-    /// when the stamp turns again (the org back under), [`derp_regrade_due`](
-    /// Self::derp_regrade_due) sees a DERP-established pair and regrades it
-    /// under its own cooldown and evidence gates, as for any other DERP pair.
+    /// for a peer holding no relay slot), and the runtime PROBES it rather
+    /// than installing it: the TURN carrier keeps the pair's traffic until a
+    /// handshake over `/derp` completes, and only then is the DERP carrier
+    /// promoted over it ([`commit_stamp_derp`](Self::commit_stamp_derp)).
     ///
-    /// Only the server's stamp moves a pair here, never a local derivation, and
+    /// ⚠️ The stamp alone is not enough to move. The server stamps an
+    /// over-allowance pair DERP when both ends *support* DERP, and that says
+    /// nothing about whether the peer's `/derp` is up now. Field 2026-10-26:
+    /// installing the DERP carrier straight over TURN released the allocation
+    /// the peer was dialing, and a peer whose `/derp` had never opened was left
+    /// with no carrier at all, for 12 minutes, where 0.4.172 kept the pair on
+    /// TURN. A handshake over `/derp` is proof the peer is there: a peer on an
+    /// older agent follows us onto it (demote-follow) and answers; a peer
+    /// probing at the same moment answers on its own probe. A peer that never
+    /// answers keeps the pair on TURN, and is not probed again for
+    /// [`STAMP_PROBE_BACKOFF`] ([`note_stamp_probe_failed`](Self::note_stamp_probe_failed)).
+    ///
+    /// Only the server's stamp starts a probe, never a local derivation, and
     /// only one that [`relay_strategy`](Self::relay_strategy) agrees with — so a
     /// live org-relay session or a force-DERP pin still decides first. A peer
     /// mid-establishment is left to `maybe_complete`'s recompute. `None` = no
-    /// move: not stamped DERP, the peer can't speak DERP, or no live mux serves
-    /// it (`follow_peer_to_derp` decides that before touching anything).
-    pub fn stamp_to_derp(&mut self, node_id: ObjectId, peer: PeerConfig) -> Option<ReadyLink> {
+    /// probe: not stamped DERP, a recent probe went unanswered, the peer can't
+    /// speak DERP, or no live mux serves it (`follow_peer_to_derp` decides that
+    /// before touching anything).
+    pub fn stamp_to_derp(
+        &mut self,
+        node_id: ObjectId,
+        peer: PeerConfig,
+        now: Instant,
+    ) -> Option<ReadyLink> {
         if !self.server_strategy || peer.relay_strategy != Some(RelayStrategyWire::Derp) {
             return None;
         }
@@ -1040,15 +1068,38 @@ impl RelayCoordinator {
         {
             return None;
         }
-        let link = self.follow_peer_to_derp(node_id, peer)?;
+        if self
+            .stamp_probe_failed
+            .get(&node_id)
+            .is_some_and(|&t| now.saturating_duration_since(t) < STAMP_PROBE_BACKOFF)
+        {
+            return None;
+        }
+        self.follow_peer_to_derp(node_id, peer)
+    }
+
+    /// #2820 — the `/derp` probe [`stamp_to_derp`](Self::stamp_to_derp) built
+    /// handshook and the runtime promoted it: `Derp` is now the pair's
+    /// established strategy. That is what makes the way back work: when the
+    /// stamp turns again (the org back under), [`derp_regrade_due`](
+    /// Self::derp_regrade_due) sees a DERP-established pair and regrades it
+    /// under its own cooldown and evidence gates, as for any other DERP pair.
+    pub fn commit_stamp_derp(&mut self, node_id: ObjectId) {
         self.roles.insert(node_id, RelayStrategy::Derp);
-        // The TURN carrier this link replaces takes its allocation with it when
-        // the runtime installs over it, so the relay address we advertised for
-        // this pair (if we were its anchor) is dead. Left in the set, every
-        // later `endpoints` trickle would hand the peer that dead address
-        // again: the rc.125→126 failure the per-peer keying exists to prevent.
+        self.stamp_probe_failed.remove(&node_id);
+        // The TURN carrier the promotion replaced took its allocation with it,
+        // so the relay address we advertised for this pair (if we were its
+        // anchor) is dead. Left in the set, every later `endpoints` trickle
+        // would hand the peer that dead address again: the rc.125→126 failure
+        // the per-peer keying exists to prevent.
         self.advertised.remove(&node_id);
-        Some(link)
+    }
+
+    /// #2820 — the peer did not answer the `/derp` probe: the pair stays on
+    /// TURN, and the stamp is no reason to probe again for
+    /// [`STAMP_PROBE_BACKOFF`].
+    pub fn note_stamp_probe_failed(&mut self, node_id: ObjectId, now: Instant) {
+        self.stamp_probe_failed.insert(node_id, now);
     }
 
     /// v1 single-relay role for this peer, or `None` for the both-allocate path:
@@ -4206,13 +4257,16 @@ mod tests {
         );
     }
 
-    /// #2820 — `stamp_to_derp` moves an INSTALLED pair (it holds no relay slot)
-    /// off TURN only when the SERVER's stamp says DERP. It adopts `Derp` as
-    /// the pair's established strategy, so the ordinary regrade brings it back
-    /// once the stamp turns again, and prunes the TURN relay address we
-    /// advertised. On every precondition it declines without touching anything.
+    /// #2820 — `stamp_to_derp` builds a `/derp` probe for an INSTALLED pair (it
+    /// holds no relay slot) only when the SERVER's stamp says DERP, and changes
+    /// nothing else: the pair moves only once the runtime has promoted the
+    /// probe and calls `commit_stamp_derp`, which adopts `Derp` as the
+    /// established strategy (so the ordinary regrade brings it back once the
+    /// stamp turns) and prunes the TURN relay address we advertised. A probe
+    /// the peer never answered backs off for `STAMP_PROBE_BACKOFF`. On every
+    /// precondition it declines without touching anything.
     #[tokio::test]
-    async fn stamp_to_derp_moves_a_live_turn_pair_and_the_regrade_brings_it_back() {
+    async fn stamp_to_derp_probes_and_only_the_commit_moves_the_pair() {
         let (tx, _rx) = mpsc::channel::<ClientMsg>(8);
         let mux = DerpMux::new([9u8; 32]).0;
         let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], Some(Arc::clone(&mux)));
@@ -4242,13 +4296,14 @@ mod tests {
                 && !c.is_tracking(&node)
         };
 
+        let now = Instant::now();
         // Still stamped TURN ⇒ nothing moves.
-        assert!(coord.stamp_to_derp(node, turn_peer.clone()).is_none());
+        assert!(coord.stamp_to_derp(node, turn_peer.clone(), now).is_none());
         assert!(untouched(&coord));
 
         // A host that does not take the server's verdict ignores its stamp.
         coord.server_strategy = false;
-        assert!(coord.stamp_to_derp(node, derp_peer.clone()).is_none());
+        assert!(coord.stamp_to_derp(node, derp_peer.clone(), now).is_none());
         assert!(untouched(&coord));
         coord.server_strategy = true;
 
@@ -4257,13 +4312,13 @@ mod tests {
             supports_derp: false,
             ..derp_peer.clone()
         };
-        assert!(coord.stamp_to_derp(node, no_derp).is_none());
+        assert!(coord.stamp_to_derp(node, no_derp, now).is_none());
         assert!(untouched(&coord));
 
         // A peer mid-establishment belongs to `maybe_complete`'s recompute.
         let other = ObjectId::new();
         coord.dialing.insert(other, derp_peer.clone());
-        assert!(coord.stamp_to_derp(other, derp_peer.clone()).is_none());
+        assert!(coord.stamp_to_derp(other, derp_peer.clone(), now).is_none());
         assert!(
             coord.dialing.contains_key(&other),
             "a tracked peer keeps its slot"
@@ -4271,19 +4326,31 @@ mod tests {
 
         // The mux is down ⇒ withheld (a DERP carrier on a dead WS is born dead).
         mux.mark_down();
-        assert!(coord.stamp_to_derp(node, derp_peer.clone()).is_none());
+        assert!(coord.stamp_to_derp(node, derp_peer.clone(), now).is_none());
         assert!(
             untouched(&coord),
-            "a withheld move leaves no slot and no role change"
+            "a withheld probe leaves no slot and no role change"
         );
         mux.mark_up();
 
-        // The real case: stamped DERP, installed (no slot) ⇒ moves.
+        // The real case: stamped DERP, installed (no slot) ⇒ a probe is built,
+        // and the pair has not moved yet.
         let link = coord
-            .stamp_to_derp(node, derp_peer.clone())
-            .expect("a live TURN pair stamped DERP moves onto DERP");
+            .stamp_to_derp(node, derp_peer.clone(), now)
+            .expect("a live TURN pair stamped DERP gets a /derp probe");
         assert_eq!(link.relay_kind, RelayKind::Derp);
         assert_eq!(link.node_id, node);
+        assert!(
+            untouched(&coord),
+            "building the probe moves nothing: TURN keeps the pair until it handshakes"
+        );
+        assert!(
+            !coord.forced_derp_active(&node),
+            "a stamp is not a force-DERP pin: no TTL outlives the verdict"
+        );
+
+        // The probe handshook and the runtime promoted it.
+        coord.commit_stamp_derp(node);
         assert_eq!(
             coord.roles.get(&node),
             Some(&RelayStrategy::Derp),
@@ -4291,25 +4358,36 @@ mod tests {
         );
         assert!(
             !coord.advertised.contains_key(&node),
-            "the TURN relay address dies with the carrier, so it leaves the trickle set"
+            "the TURN relay address died with the carrier, so it leaves the trickle set"
         );
-        assert!(
-            !coord.forced_derp_active(&node),
-            "a stamp is not a force-DERP pin: no TTL outlives the verdict"
-        );
-        assert!(
-            !coord.is_tracking(&node),
-            "the build leaves no tracking slot behind"
-        );
-
         // While the stamp still says DERP, the regrade leaves it there…
-        let now = Instant::now();
         assert!(!coord.derp_regrade_due(&node, &derp_peer, now));
         // …and once it turns back (the org under its allowance again), the
         // ordinary DERP → TURN regrade is due.
         assert!(
             coord.derp_regrade_due(&node, &turn_peer, now),
             "the way back: a DERP-established pair regrades when the stamp turns"
+        );
+
+        // An unanswered probe: no new one inside the backoff, a new one after.
+        let peer2 = ObjectId::new();
+        coord.note_stamp_probe_failed(peer2, now);
+        assert!(
+            coord
+                .stamp_to_derp(peer2, derp_peer.clone(), now + Duration::from_secs(1))
+                .is_none(),
+            "a peer that did not answer over /derp is not probed again at once"
+        );
+        assert!(
+            coord
+                .stamp_to_derp(peer2, derp_peer.clone(), now + STAMP_PROBE_BACKOFF)
+                .is_some(),
+            "the backoff lapses"
+        );
+        coord.commit_stamp_derp(peer2);
+        assert!(
+            !coord.stamp_probe_failed.contains_key(&peer2),
+            "a promoted probe clears the backoff"
         );
     }
 
