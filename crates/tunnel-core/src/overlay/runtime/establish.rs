@@ -19,6 +19,18 @@ use super::*;
 const REINIT_WINDOW: Duration = Duration::from_secs(60);
 const REINIT_PRESSURE_MIN: u32 = 5;
 
+/// #2820 — the `/derp` probe's handshake leaves this long after its nudge, so
+/// a peer that follows us onto `/derp` on hearing the nudge (its demote-follow
+/// runs on its own event loop, in milliseconds) has registered its DERP
+/// carrier by the time the initiation arrives. Sent earlier, the initiation
+/// is dropped there, and the handshake waits out boringtun's 5 s retransmit.
+const STAMP_PROBE_INITIATE_AFTER: Duration = Duration::from_millis(500);
+
+/// #2820 — how long the `/derp` probe waits for the peer's handshake before
+/// the pair stays on TURN: two retransmits past the initiation, so one lost
+/// initiation is not a verdict.
+const STAMP_PROBE_DEADLINE: Duration = Duration::from_secs(15);
+
 /// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
 /// interface (each bound to that interface IP — rc.143), this node's LAN IPs
 /// across ALL interfaces (for the same-subnet test), and the `IP:port`
@@ -944,6 +956,91 @@ impl OverlayRuntime {
         removed
     }
 
+    /// #2820 — probe `/derp` for a peer on an installed **TURN** carrier once
+    /// the server stamps its pair DERP; [`Self::sweep_upgrade_probes`] moves
+    /// the pair only when the probe handshakes. FR-115 P4c-1 re-stamps an
+    /// org's pairs DERP when the org crosses its relay allowance, and TURN is
+    /// not throttled, so a pair left on TURN kept the unmetered tier until it
+    /// happened to churn.
+    ///
+    /// The mirror of [`Self::maybe_regrade_derp`] (DERP → TURN), called from
+    /// the same keep-the-relay paths of [`Self::install_peers`], so a direct
+    /// upgrade always wins first. It is **make-before-break for the pair**,
+    /// not just for this end: the DERP carrier waits in the probe slot while
+    /// TURN keeps the traffic, and a peer that cannot be reached over `/derp`
+    /// keeps the pair on TURN. ⚠️ Field 2026-10-26: installing the DERP carrier
+    /// straight over TURN released the allocation the peer was dialing, and a
+    /// peer whose `/derp` had never opened was left with no carrier for 12
+    /// minutes. The nudge (the one-byte frame `install_ready` sends to open a
+    /// relay permission) reaches the peer over `/derp` first, so a peer that
+    /// follows us there (demote-follow, any agent) has its DERP carrier up when
+    /// the handshake arrives [`STAMP_PROBE_INITIATE_AFTER`] later.
+    /// `RelayCoordinator::stamp_to_derp` owns the decision.
+    ///
+    /// Returns whether a probe started.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn maybe_probe_stamp_to_derp(
+        &self,
+        node_id: ObjectId,
+        cfg: &PeerConfig,
+        pk: &[u8; 32],
+        wg: &mut WgDevice,
+        by_node: &HashMap<ObjectId, Installed>,
+        relay: &mut Option<RelayCoordinator>,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        now: Instant,
+    ) -> bool {
+        // Only an installed TURN carrier is in scope (DERP is the target,
+        // direct beats both, an org relay is the tenant's own and unmetered),
+        // and never beside another probe: a direct one may be about to retire
+        // the relay altogether, and a DERP one is this, already in flight.
+        if by_node.get(&node_id).and_then(|e| e.relay_kind)
+            != Some(crate::overlay::relay_link::RelayKind::Turn)
+            || upgrade_probes.contains_key(&node_id)
+            || wg.has_direct_probe(pk)
+        {
+            return false;
+        }
+        let Some(link) = relay
+            .as_mut()
+            .and_then(|r| r.stamp_to_derp(node_id, cfg.clone(), now))
+        else {
+            return false;
+        };
+        let (local, dst) = match &link.relay_parts {
+            Some((conn, dst)) => {
+                let _ =
+                    crate::overlay::wg::assert_relay_permission(conn, *dst, "stamp-probe").await;
+                (conn.local_addr().ok(), *dst)
+            }
+            None => (None, std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+        };
+        wg.start_relay_probe(
+            link.public_key,
+            link.overlay_ip,
+            link.carrier.clone(),
+            STAMP_PROBE_INITIATE_AFTER,
+        )
+        .await;
+        upgrade_probes.insert(
+            node_id,
+            UpgradeProbe {
+                pubkey: link.public_key,
+                overlay_ip: link.overlay_ip,
+                dst,
+                tier: DirectTier::Relay,
+                since: now,
+                initiated: true,
+                local,
+            },
+        );
+        info!(
+            peer = %node_id,
+            "overlay relay: the server now stamps this pair DERP (an org past its relay allowance leaves unmetered TURN) — probing /derp; the live TURN carrier moves only if the peer answers there"
+        );
+        true
+    }
+
     /// Re-establish a peer stuck on an **established DERP** carrier whose
     /// strategy inputs have since improved (the peer's — or our own — srflx
     /// arrived after the link was built), so the pair moves DERP → TURN.
@@ -1517,22 +1614,39 @@ impl OverlayRuntime {
                             // the relay; record the decision.
                             record("install_peers:upgrade", path::PathAction::Keep);
                             // …but "keep the relay" must not mean "keep the
-                            // WRONG relay tier": a DERP carrier built while the
-                            // pair looked both-UDP-blocked is re-graded here
-                            // once srflx says otherwise.
-                            self.maybe_regrade_derp(
-                                np.node_id,
-                                &cfg,
-                                &pk,
-                                wg,
-                                by_node,
-                                tun,
-                                relay,
-                                relay_bq,
-                                upgrade_probes,
-                                now,
-                            )
-                            .await;
+                            // WRONG relay tier": a TURN carrier the server now
+                            // stamps DERP moves onto DERP (#2820), and a DERP
+                            // carrier built while the pair looked
+                            // both-UDP-blocked is re-graded here once srflx
+                            // says otherwise. Different carrier kinds, so at
+                            // most one of the two acts.
+                            if !self
+                                .maybe_probe_stamp_to_derp(
+                                    np.node_id,
+                                    &cfg,
+                                    &pk,
+                                    wg,
+                                    by_node,
+                                    relay,
+                                    upgrade_probes,
+                                    now,
+                                )
+                                .await
+                            {
+                                self.maybe_regrade_derp(
+                                    np.node_id,
+                                    &cfg,
+                                    &pk,
+                                    wg,
+                                    by_node,
+                                    tun,
+                                    relay,
+                                    relay_bq,
+                                    upgrade_probes,
+                                    now,
+                                )
+                                .await;
+                            }
                         }
                         continue;
                     }
@@ -1590,19 +1704,33 @@ impl OverlayRuntime {
                         // the make-before-break arm above — the relay staying
                         // still leaves the DERP-vs-TURN question to re-ask.
                         record("install_peers:upgrade", path::PathAction::Keep);
-                        self.maybe_regrade_derp(
-                            np.node_id,
-                            &cfg,
-                            &pk,
-                            wg,
-                            by_node,
-                            tun,
-                            relay,
-                            relay_bq,
-                            upgrade_probes,
-                            now,
-                        )
-                        .await;
+                        if !self
+                            .maybe_probe_stamp_to_derp(
+                                np.node_id,
+                                &cfg,
+                                &pk,
+                                wg,
+                                by_node,
+                                relay,
+                                upgrade_probes,
+                                now,
+                            )
+                            .await
+                        {
+                            self.maybe_regrade_derp(
+                                np.node_id,
+                                &cfg,
+                                &pk,
+                                wg,
+                                by_node,
+                                tun,
+                                relay,
+                                relay_bq,
+                                upgrade_probes,
+                                now,
+                            )
+                            .await;
+                        }
                     }
                     continue;
                 }
@@ -1959,6 +2087,61 @@ impl OverlayRuntime {
         let mbb = crate::overlay::direct::make_before_break_enabled();
         let mut settled: Vec<ObjectId> = Vec::new();
         for (nid, p) in upgrade_probes.iter() {
+            // #2820 — a `/derp` probe (the server's DERP stamp on a live TURN
+            // pair, `maybe_probe_stamp_to_derp`): promoted over the TURN carrier
+            // on a latched handshake, dropped at its own deadline with the pair
+            // left on TURN. Never a direct tier's bookkeeping (no monitor
+            // verdict, no tier strike): the pair stays relayed, and
+            // `commit_stamp_derp` forgets its TURN-era relay state, including
+            // the re-request a same-tick health sweep left behind.
+            if p.tier == DirectTier::Relay {
+                if wg.probe_handshake_done(&p.pubkey) == Some(true) {
+                    if wg.promote_direct_probe(&p.pubkey) {
+                        // Any QUIC build still in flight was for the TURN link.
+                        relay_bq.invalidate(nid);
+                        if let Some(r) = relay.as_mut() {
+                            r.commit_stamp_derp(*nid);
+                        }
+                        if matches!(self.mode, CarrierMode::Relay) {
+                            self.shadow(|s| s.mon.on_installed(nid, DirectTier::Relay, now));
+                        }
+                        // As `install_built` records a DERP link.
+                        by_node.insert(
+                            *nid,
+                            Installed {
+                                initiated: true,
+                                hs_done: true,
+                                carrier_local: p.local,
+                                carrier_dst: Some(p.dst),
+                                relay_kind: Some(crate::overlay::relay_link::RelayKind::Derp),
+                                relay_local: p.local,
+                                relay_dst: Some(p.dst),
+                                ..Installed::base(p.pubkey, p.overlay_ip, DirectTier::Relay, now)
+                            },
+                        );
+                        tun.add_peer_route(p.overlay_ip).await.ok();
+                        info!(
+                            peer = %nid,
+                            probe_ms = now.saturating_duration_since(p.since).as_millis() as u64,
+                            "overlay relay: the peer answered over /derp — the pair moved off its live TURN carrier onto DERP (make-before-break: TURN carried it until now)"
+                        );
+                    }
+                    settled.push(*nid);
+                } else if now.saturating_duration_since(p.since) >= STAMP_PROBE_DEADLINE {
+                    let saw_inbound = wg.probe_saw_inbound(&p.pubkey);
+                    wg.drop_direct_probe(&p.pubkey).await;
+                    if let Some(r) = relay.as_mut() {
+                        r.note_stamp_probe_failed(*nid, now);
+                    }
+                    warn!(
+                        peer = %nid, saw_inbound,
+                        backoff_s = crate::overlay::relay_link::STAMP_PROBE_BACKOFF.as_secs(),
+                        "overlay relay: the peer did not answer over /derp — the pair stays on its live TURN carrier (the peer's /derp is down or never opened)"
+                    );
+                    settled.push(*nid);
+                }
+                continue;
+            }
             // P2 — the promote/expire/wait decision is the pure
             // `lifecycle::probe_tick`; this loop executes the disposition.
             let verdict = probe_tick(

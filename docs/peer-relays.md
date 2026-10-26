@@ -39,7 +39,7 @@ flowchart LR
 The org relay is a **third kind of relay, not a new tier**. The ladder is still LAN
 → public → srflx hole-punch → relay. A relay carrier is now one of three `RelayKind`s,
 `Turn`, `Derp` or `Org`
-([`relay_link.rs:160`](../crates/tunnel-core/src/overlay/relay_link.rs#L160)), and
+([`relay_link.rs:166`](../crates/tunnel-core/src/overlay/relay_link.rs#L166)), and
 DERP over TLS :443 stays the floor under all of them. The org relay shows in the CONN
 column as `relay:org/udp`.
 
@@ -52,7 +52,7 @@ behaviour too. Adding a transport behind the existing `RelayConn` seam (`OrgRela
 changed none of the send path, the router or the carrier plane.
 
 Which relay a pair uses is decided in this order
-([`relay_link.rs:1052`](../crates/tunnel-core/src/overlay/relay_link.rs#L1052)):
+([`relay_link.rs:1161`](../crates/tunnel-core/src/overlay/relay_link.rs#L1161)):
 
 | priority | source | why it sits there |
 |---|---|---|
@@ -394,7 +394,7 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 | the relay's session table (pure) | [`orgrelay/session.rs`](../crates/tunnel-core/src/overlay/orgrelay/session.rs) |
 | the relay server + counters | [`orgrelay/server.rs`](../crates/tunnel-core/src/overlay/orgrelay/server.rs), [`agents/roomlerd/src/relay_server.rs`](../agents/roomlerd/src/relay_server.rs) |
 | the member: bind + `OrgRelayConn` | [`orgrelay/client.rs`](../crates/tunnel-core/src/overlay/orgrelay/client.rs) |
-| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1052`, `org_request_bind` `:1946`, `commit_org_bind` `:1972` |
+| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1161`, `org_request_bind` `:2055`, `commit_org_bind` `:2081` |
 | pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:62`](../crates/api/src/cluster/metrics.rs#L62) |
 
 ## Not built
