@@ -28,6 +28,11 @@ in-process — that is the recursion guard.
 ⚠️ stdout is **marker-parsed**, not last-line-parsed, so anything else logging
 there cannot be mistaken for the result. The child's stderr is **inherited on
 purpose** so per-codec probe lines land in the daemon log next to the verdict.
+⚠️ **The child never `println!`s** — every line goes through `child::emit`
+(#2719). On an update the parent is terminated mid-probe, the report meets a
+closed pipe, and `println!` panics there: the panic hook then filed an agent
+crash on every such update. A closed pipe now exits `EXIT_PARENT_GONE` (3) and
+records nothing.
 
 ### Anything derived from CONFIG belongs in the PARENT
 

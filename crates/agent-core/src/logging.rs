@@ -305,6 +305,19 @@ pub fn say_on_stderr(msg: impl std::fmt::Display) {
     let _ = writeln!(std::io::stderr().lock(), "{msg}");
 }
 
+/// #2719 — say one line on stdout, and never panic doing it: `println!`'s
+/// failure is the same as `eprintln!`'s ([`say_on_stderr`]). A process the
+/// daemon spawned answers on a stdout whose reader can be gone by then (a
+/// stop, an update). The post-install watcher's `println!` met exactly that
+/// after an exec-driven update (`os error 232`, #2934), and the panic hook
+/// filed an agent crash. For a line nothing depends on being read.
+pub fn say_on_stdout(msg: impl std::fmt::Display) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{msg}");
+    let _ = out.flush();
+}
+
 /// Path of TODAY's rolling log file, if file logging is active.
 /// Used by `crash_recorder::record` to attach a `log_tail` to crash
 /// sidecars. Returns `None` when `init()` hasn't run yet OR no log

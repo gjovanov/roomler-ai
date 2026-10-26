@@ -2064,7 +2064,7 @@ knob half is a SHA-256 over **every** `ROOMLERD_*` variable the daemon can see
 is in [`encoders.md`](encoders.md#the-probe-lifecycle)). So a capture flag
 that has nothing to do with encoding still changes the key, the single-entry
 cache misses (`a ROOMLERD_* knob changed`), and the next start runs the full
-probe in a child process bounded at 60 s per phase (`encode/caps.rs:165`).
+probe in a child process bounded at 60 s per phase (`encode/caps.rs:207`).
 Restoring the old knob set afterwards is a **second** miss, because the cache
 now holds the new key.
 
