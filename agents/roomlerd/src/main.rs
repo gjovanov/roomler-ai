@@ -2339,10 +2339,10 @@ async fn post_install_watch_cmd(
     })
     .await
     .context("post-install watcher join")??;
-    println!(
-        "post-install verdict: {:?} ({})",
-        outcome.status, outcome.note
-    );
+    // #2934 — nobody may read this stdout any more (an exec's closed pipe): never panic.
+    let (status, note) = (&outcome.status, &outcome.note);
+    let line = format!("post-install verdict: {status:?} ({note})\n");
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), line.as_bytes());
     Ok(())
 }
 
