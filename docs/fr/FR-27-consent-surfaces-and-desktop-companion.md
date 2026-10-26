@@ -1,7 +1,7 @@
 # FR-27 — Host consent: every mode, every OS, and a desktop companion that works
 
 **Issue:** [#854](https://github.com/gjovanov/roomler-ai/issues/854)
-**Status:** design
+**Status:** ✅ **closed 2026-10-26**. Every acceptance criterion is field-verified; the last was macOS "Apply update" from the companion (0.4.172 → 0.4.174, see the 10-26 log entry).
 
 ## Goal
 
@@ -426,7 +426,7 @@ Ticked only where a run is recorded in the field log below.
       2026-10-25.**
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
-- [ ] macOS "Check for updates" and "Apply update" both work from the companion.
+- [x] macOS "Check for updates" and "Apply update" both work from the companion.
       **"Check for updates" verified — the Mac, 0.4.117, 2026-10-08**: the button
       runs `<daemon> self-update --check-only` (`cmd_check_update`, via
       `agent_exe_path`), replicated as the console user → `Up to date (current:
@@ -438,6 +438,13 @@ Ticked only where a run is recorded in the field log below.
       companion. The window is between a release publishing and the fleet roll:
       at the next release, leave one Mac out of the roll and click "Apply update"
       in its companion.)*
+      **"Apply update" verified — the operator's MacBook, 0.4.172 → 0.4.174,
+      2026-10-26 08:18Z**: his click in the companion woke the root update
+      helper, which verified and installed 0.4.174. The companion came back on
+      0.4.174, and both agent rows read 0.4.174 with `update_mode=self`. No push
+      reached the Mac during the run: neither the server's log nor either half's
+      log shows one. Two earlier tries were voided by a web "Update all" (see the
+      10-26 log entry).
 - [x] The Devices grid shows the companion version alongside the agent version.
       (Implemented in #877; deployed since API `v20260829-0d5078f44e42` + 0.4.18.)
       **Half met, 2026-09-25 on the live grid (API 0.4.101, 21 devices):** the
@@ -1260,3 +1267,36 @@ The cell was shut down gracefully (the service stops and the ephemeral device un
 | it clears | `auto_update` back to `true` (as found) and the marker removed (it was absent before). At the next start FR-117 repaired the skew in **2.5 s** (`from=0.4.169 to=0.4.170 restarted=1`). The agent row then read 0.4.170, and the grid carried no caption anywhere |
 
 The lab lock was held throughout and released after.
+
+### 2026-10-26 — "Apply update" from the companion on the operator's MacBook (0.4.172 → 0.4.174)
+
+**What this had to prove: that the button, and nothing else, moves the Mac.** On macOS the agents install nothing. Both halves only forward an `rc:agent.update` push to the root update helper's wake file (`agents/roomlerd/src/updater.rs:3095-3101`). The helper, `com.roomler.update`, also runs on its own 6-hour timer. So a push, the timer and the button all end in the same helper run, and the update log alone cannot tell them apart. The proof is that no push and no timer run happened.
+
+**Two tries were voided first, and why is the finding.**
+
+| release | what moved the Mac before the click | evidence |
+|---|---|---|
+| 0.4.171 | the web Devices page's "Update all", 10-25 19:33:11Z | server: `operator-triggered bulk agent self-update requested=21 delivered=15`. The Mac's root log: `rc:agent.update — operator-triggered self-update`, then the helper's install |
+| 0.4.172 | the same button, 41 s after the click was requested (22:39:14Z) | `requested=21 delivered=14`, then the same pair of lines on the Mac |
+
+Keeping one Mac out of the fleet roll is not enough. "Update all" sends an empty body, which means every device in the org, and anyone with the org's admin rights can press it.
+
+**The protection that worked, and why on macOS it is the marker and not `auto_update = false`.** `auto_update = false` stops a daemon's own updater, and its row reports `update_mode=off`, so the server refuses a push. But the helper reads only `/etc/roomler/disable-auto-update` (`updater.rs:3930`), so its own timer still installs. The marker stops every helper run, whatever woke it. The sequence:
+
+1. **Marker set**, 10-25 23:27Z. Overnight it stopped the helper's timer (05:28Z) and a third "Update all" (10-26 07:35:38Z), each logged as `auto-update opted out — exiting`.
+2. **The daemon restarted with the marker present**, 07:42:38Z. On macOS the per-user half is the daemon's supervised child, so one `launchctl kickstart -k system/com.roomler.daemon` restarts both. Both halves logged `auto-update opted out — the operator's marker is present, updates are manual` (#2901), and both agent rows read `update_mode=off`: the server now refuses every push to either.
+3. **Marker removed**, 08:16:31Z. From then on only a click could move the Mac, or the helper's own timer, which was next due about 13:36Z.
+
+**The run.**
+
+| when (UTC) | what | evidence |
+|---|---|---|
+| 08:17:55 | the operator opens the companion | `roomler-desktop starting version="0.4.172"` |
+| 08:18:16 | the helper verifies and installs | `.asc verified against the pinned release signing key`, `artifact self-identifies as the release it was offered as … claimed=agent-v0.4.174 artifact_version=0.4.174`, `installing … current=0.4.172 latest=agent-v0.4.174` |
+| 08:18:18 | the companion relaunches | `roomler-desktop starting version="0.4.174"` |
+| 08:18:21 | both halves restart on 0.4.174 | `agent starting version="0.4.174"`, then `auto-updater armed interval_h=4`: the marker is gone, so both are `self` again |
+| 08:18:22 | the helper finishes | `installed — postinstall re-bootstrapped the agent halves latest=agent-v0.4.174` |
+
+**No push.** Neither half logged an `rc:agent.update` between 08:16 and 08:19, and neither server pod logged an `operator-triggered … self-update` between 08:15 and 08:20. Both agent rows afterwards: `agent_version` 0.4.174, `companion_version` 0.4.174, `update_mode=self`. Nothing was left to restore.
+
+**Found on the way, fixed separately.** The text the button prints still named the log path from before FR-46 P5a, which does not exist on a migrated Mac. It now names `/var/log/roomler/update.log`: #2916, shipped in 0.4.172.
