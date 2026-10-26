@@ -179,6 +179,35 @@ flowchart TB
 | `hardware` | the FFmpeg H.264 cascade in its **recording profile** (`FfmpegEncoder::new_recording`); refuses rather than fall back to software | its own, `fps × 2` | see below |
 | `auto` | `hardware`, then `software` | | |
 
+**The software rung fits openh264's size** (#2877). openh264 encodes at most
+3840 on the long side and 2160 on the short one, either orientation. It
+refuses anything larger on every frame, not when it opens. A recording is
+made at the capture's native size, so a DCI-4K screen (4096×2160), a 16:10 4K
+one, 5K and 6K screens, an ultrawide, or two monitors side by side used to
+report `started` and then end `encoder_failed` with 0 frames, wherever
+software was the rung. That covered every arm64 Linux host before 0.4.170,
+and any host whose hardware cells are denied or failed. It was measured on
+the lab's arm64 host, whose scanout is 4096×2160.
+
+`recording::fit` now opens openh264 at `fit_for_software`'s size: the largest
+even size that fits, keeping the screen's shape (4096×2160 → 3840×2024,
+3840×2400 → 3456×2160, 5120×2880 → 3840×2160). It downscales each frame to
+that size with the live pump's resampler (`encode/resample.rs`: Lanczos-3,
+box below its floor), after the pointer is drawn at native size. The track,
+the `started` event and the sidecar carry the recorded size, and
+`scaled_from` carries the screen's (§8). A hardware rung still records at
+native size. `a_screen_wider_than_the_software_encoder_records_scaled_to_fit`
+proves the fit, and `the_bare_software_encoder_records_nothing_of_that_screen`
+keeps the bug as a control.
+
+The export (§11) uses the same encoder factory, so the fit reaches it too. A
+hardware recording above 3840×2160, exported where only software is left,
+now comes out scaled instead of failing. Its track takes the encoder's
+`coded_dims`, as the recorder's does. At the source's size, the track would
+disagree with its own stream.
+`an_export_encoded_smaller_gives_the_size_its_stream_holds`
+(`tests/export.rs`) fails without that.
+
 **The hardware recording profile** reuses the live option sets: every one of
 them is field-proven on the fleet's GPUs, and a new private-option dict would
 be a new way for a driver to refuse an open. Three things change:
@@ -640,8 +669,10 @@ owned by user and not by session id), start and end times, size and fps,
 codec and the backend that encoded it, colour, audio sources, frames,
 late ticks, events, the stop reason, bytes, and how the pointer got in
 (`in_frame`, `drawn` or `none`, §1; absent from a sidecar written before P1d,
-or rebuilt by the reconciler). ⚠️ **Never content**: no window titles, and
-nothing typed.
+or rebuilt by the reconciler). `scaled_from` is set only when the software
+rung recorded a screen too large for openh264 at a smaller size
+(`{"width":4096,"height":2160}`, §3, #2877); `width`×`height` is then the
+recorded size. ⚠️ **Never content**: no window titles, and nothing typed.
 
 ## 9. Audio (P1c)
 
@@ -1107,7 +1138,7 @@ sequenceDiagram
   for the new console user and stops the old worker's process group, recorder
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
-  `child.rs:409-417`); a recording never follows a user switch.
+  `child.rs:408-416`); a recording never follows a user switch.
 - **Both audio sources on a supervised Mac.** Computer audio since FR-97 P2a
   (ScreenCaptureKit, in the worker's session: the worker advertises
   `remote-audio` while the owner allows it, as any host does). The microphone
