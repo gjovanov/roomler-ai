@@ -1,7 +1,7 @@
 # FR-1: RustDesk-parity remote-desktop drag smoothness
 
 **Status:** phases P1–P4 shipped + field-verified; P2/P3 shipped, relay-gated after field
-read; P5 shipped in 0.4.4 (field gate pending); P6 + P7-HUD remaining. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
+read; P5 shipped in 0.4.4; P6 + P7-HUD shipped in #793 (0.4.6 + web). **Field-gated 2026-10-26 (prod `agent_logs`):** P7 end-to-end age verified fleet-wide (AC8 HUD half); P5 cadence partial — `>=45` fps at 2880x1800 Iris-Xe NOT reached (~38 fps), met at 1920x1200 (AC6); P6 field read owed (AC7). Write-up: `docs/remote-desktop-latency.md`. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -78,6 +78,9 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
       "Delay"
 - [ ] Final A/B on the reference pair: subjective parity-or-better vs RustDesk on BOTH
       transports
+- [x] Docs: `docs/remote-desktop-latency.md` created (P5/P6/P7 design + the 2026-10-26
+      field evidence, mermaid pipeline, `file:line` anchors), linked from
+      `docs/README.md`'s index
 
 ## Open decisions
 
@@ -102,3 +105,4 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | 0.4.3 (relay gating) | WINHOST-J "much better now", verified from neo16, CORPLAP-1 and MacBook; relay reverted to rc.483 posture (re-test pending) |
 | 0.4.4 (P5) | **field PASS 2026-08-27**: "WINHOST-J's screen works nicely now" (direct); relay pairs handled by FR-10 (0.4.5, its own field PASS) |
 | 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (WINHOST-J ≈ 40–70 ms direct; CORPLAP-3-from-neo16 ≈ 120–180 ms relay; CORPLAP-1 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |
+| 0.4.167-0.4.172 (field read 2026-10-26, prod `agent_logs`, read-only via mars) | **AC6 partial** — at the named 2880x1800 Iris-Xe geometry (av1_qsv, 918 windows/8 sessions) delivered fps maxed 38.5, 0% of windows `>=45`, encode ~20 ms, pace engaged 100% @ 50 (`>=45` NOT reached: the pace keys on encode time, the 5.2 MPix pipeline delivers only ~38); at 1920x1200 Iris-Xe (hevc_qsv) motion-median 45 fps, encode ~10.5 ms (met at the lower geometry); WGC drop ratio median 2% on the one WGC host (was ~33%). **AC8 met (HUD half)** — end-to-end age a real value on 209709/259704 heartbeat windows, 294 sessions/10 hosts; direct median 15 ms, relay median 36 ms. **AC7** — the `setTimeout(8 ms)` + `pointerrawupdate` mechanism is confirmed in source; a foreground-browser field read is owed. Full write-up + anchors: `docs/remote-desktop-latency.md` §6 |
