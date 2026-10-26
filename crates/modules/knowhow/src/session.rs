@@ -18,6 +18,7 @@
 //! | what it may read | [`may_read`] |
 //! | the answers, cut to their bounds | [`search`], [`get`], [`bounded`] |
 //! | a proposal, within the session's ceiling (decisions 50 and 51) | [`crate::propose`] |
+//! | (P4-6-1a) how an entity is reached, `rc:knowhow.connect` (decisions 59–61) | [`crate::connect`] |
 //! | the map is there for this device (decision 49) | [`served`] |
 //!
 //! ⚠️ Still a map, not a gate: an answer tells a session where things are, and
@@ -30,7 +31,8 @@ use dashmap::DashMap;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_mod_hive::model::{AgentSession, SessionStatus};
 use roomler_ai_remote_control::knowhow::{
-    ProbeKind, SessionRefusal, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY, session_limits,
+    ProbeKind, SessionRefusal, TOOL_CONNECT, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY,
+    session_limits,
 };
 use roomler_ai_remote_control::models::{RpcCap, UpdateRefusal};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
@@ -86,6 +88,14 @@ pub(crate) enum Question {
         key: String,
         probe: String,
     },
+    /// P4-6-1a — how an entity is reached ([`crate::connect`]).
+    Connect {
+        req_id: String,
+        session_id: ObjectId,
+        fence: u64,
+        kind: String,
+        key: String,
+    },
 }
 
 impl Question {
@@ -94,7 +104,8 @@ impl Question {
             Self::Search { req_id, .. }
             | Self::Get { req_id, .. }
             | Self::Propose { req_id, .. }
-            | Self::Verify { req_id, .. } => req_id,
+            | Self::Verify { req_id, .. }
+            | Self::Connect { req_id, .. } => req_id,
         }
     }
 }
@@ -176,6 +187,19 @@ impl Questions {
                 kind,
                 key,
                 probe,
+            },
+            ClientMsg::KnowhowConnect {
+                req_id,
+                session_id,
+                fence,
+                kind,
+                key,
+            } => Question::Connect {
+                req_id,
+                session_id,
+                fence,
+                kind,
+                key,
             },
             other => return Some(other),
         };
@@ -261,6 +285,11 @@ pub(crate) async fn served(state: &KnowhowState, conn: Conn) -> Option<ServerMsg
     // only where that device can probe.
     if agent.capabilities.has_rpc(RpcCap::KnowhowProbe) {
         tools.push(TOOL_VERIFY.to_string());
+    }
+    // P4-6-1a — a connect leases its credential through the device's own
+    // vault client: offered only where the device has one.
+    if agent.capabilities.has_rpc(RpcCap::Vault) {
+        tools.push(TOOL_CONNECT.to_string());
     }
     Some(ServerMsg::KnowhowServed { tools })
 }
@@ -353,6 +382,23 @@ pub(crate) async fn answer(state: &KnowhowState, conn: Conn, question: &Question
                 .map(|probe_id| ServerMsg::KnowhowVerifying {
                     req_id: req_id.to_string(),
                     probe_id,
+                }),
+            Err(refusal) => Err(refusal),
+        },
+        // P4-6-1a — `identify` has read the starter's `KNOWHOW_VIEW`
+        // (decision 61); the access is the map's word alone.
+        Question::Connect {
+            session_id,
+            fence,
+            kind,
+            key,
+            ..
+        } => match identify(state, conn, *session_id, *fence).await {
+            Ok(_) => crate::connect::access(state, conn, kind, key)
+                .await
+                .map(|access| ServerMsg::KnowhowAccess {
+                    req_id: req_id.to_string(),
+                    access,
                 }),
             Err(refusal) => Err(refusal),
         },
