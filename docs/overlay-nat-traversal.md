@@ -509,14 +509,24 @@ TURN, and is not probed again for 10 minutes (`STAMP_PROBE_BACKOFF`).
 never on a local derivation. A direct carrier, an org relay, a pair with another
 probe in flight and a pair still being established are left alone: DERP is a
 fallback tier, not a destination.
-⚠️ Unlike a follow, the promotion records `Derp` as the pair's established strategy
-(`roles`, `commit_stamp_derp`), so when the stamp turns again (the org back under,
-the pin lapsed) the ordinary DERP regrade (`derp_regrade_due`) takes the pair back
-to TURN. That way back is break-before-make and only as good as the regrade: an end
-that reached DERP by demote-follow keeps its old strategy and never regrades, and
-frames a busy peer still sends over `/derp` pull a regrading end back by the same
-follow (field 2026-10-24: one TURN sample, then DERP). A pair left there sits on
-DERP, the floor every fleet pair is born on.
+⚠️ **There is no way back by regrade.** The promotion forgets the pair's relay state
+(`commit_stamp_derp`), as a direct promotion does. It adopts no `Derp` strategy, so
+when the stamp turns again (the org back under, the pin lapsed) the pair stays on
+DERP, the floor every fleet pair is born on, until its next re-establishment reads
+the stamp afresh. Measured both ways (field 2026-10-26): in every run one end
+probed and the other, on an older agent or not, followed the nudge. So the
+DERP→TURN regrade (`derp_regrade_due`, break-before-make) fired on the prober
+alone. That left the follower with no carrier for 18 s, and the pair back on DERP
+by demote-follow anyway.
+⚠️ The forget also clears a slot the move would otherwise leave behind. A peer that
+followed us abandoned the TURN leg, so the health sweep usually convicts our TURN
+carrier in the tick that promotes the probe, and on any relay death it re-requests.
+That request's slot outlived the promotion: a tracked peer is skipped by the stamp
+and the regrade alike, and a later build from it would have installed over the
+carrier the probe had just proved.
+⚠️ The move costs the prober's outbound up to one sweep tick (≤ 5 s): the follower
+drops its TURN leg on the nudge, and the probe is promoted on the next tick after
+it latches. The follower's traffic flows through the probe session meanwhile.
 
 ## Worker co-location — one pick, everywhere (invariant I6)
 

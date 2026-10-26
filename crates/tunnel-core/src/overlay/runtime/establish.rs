@@ -2090,8 +2090,10 @@ impl OverlayRuntime {
             // #2820 — a `/derp` probe (the server's DERP stamp on a live TURN
             // pair, `maybe_probe_stamp_to_derp`): promoted over the TURN carrier
             // on a latched handshake, dropped at its own deadline with the pair
-            // left on TURN. Never a direct tier's bookkeeping: no monitor
-            // verdict, no tier strike, and no `forget` (the pair stays relayed).
+            // left on TURN. Never a direct tier's bookkeeping (no monitor
+            // verdict, no tier strike): the pair stays relayed, and
+            // `commit_stamp_derp` forgets its TURN-era relay state, including
+            // the re-request a same-tick health sweep left behind.
             if p.tier == DirectTier::Relay {
                 if wg.probe_handshake_done(&p.pubkey) == Some(true) {
                     if wg.promote_direct_probe(&p.pubkey) {

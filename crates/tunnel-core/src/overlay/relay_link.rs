@@ -1079,20 +1079,34 @@ impl RelayCoordinator {
     }
 
     /// #2820 — the `/derp` probe [`stamp_to_derp`](Self::stamp_to_derp) built
-    /// handshook and the runtime promoted it: `Derp` is now the pair's
-    /// established strategy. That is what makes the way back work: when the
-    /// stamp turns again (the org back under), [`derp_regrade_due`](
-    /// Self::derp_regrade_due) sees a DERP-established pair and regrades it
-    /// under its own cooldown and evidence gates, as for any other DERP pair.
+    /// handshook and the runtime promoted it over the TURN carrier: forget the
+    /// pair's relay state, as a direct promotion does.
+    ///
+    /// Two things this clears, each measured in the field (2026-10-26):
+    ///
+    /// - **A slot under the promoted carrier.** A peer that followed us onto
+    ///   `/derp` abandoned the TURN leg, so the health sweep usually convicts
+    ///   our TURN carrier in the very tick the probe promotes, and on any relay
+    ///   death it re-requests (`forget` + `request`). That request's slot would
+    ///   outlive the promotion. A tracked peer is skipped by the stamp and the
+    ///   regrade alike, and a later build from it would install over the
+    ///   carrier the probe just proved.
+    /// - **The TURN-era strategy.** No `Derp` is adopted either, so
+    ///   [`derp_regrade_due`](Self::derp_regrade_due) never fires for the pair
+    ///   and it stays on DERP once the stamp turns back: the floor every fleet
+    ///   pair is born on, until its next re-establishment, which reads the
+    ///   stamp afresh. A regrade did that job and paid for it: it is
+    ///   break-before-make, the peer that had followed us never regrades, and
+    ///   it left that peer with no carrier for 18 s and the pair back on DERP
+    ///   anyway (demote-follow).
+    ///
+    /// `forget` also prunes the relay address we advertised for the pair (if we
+    /// were its anchor), dead with its allocation. Left in the set, every later
+    /// `endpoints` trickle would hand the peer that dead address again: the
+    /// rc.125→126 failure the per-peer keying exists to prevent.
     pub fn commit_stamp_derp(&mut self, node_id: ObjectId) {
-        self.roles.insert(node_id, RelayStrategy::Derp);
+        self.forget(&node_id);
         self.stamp_probe_failed.remove(&node_id);
-        // The TURN carrier the promotion replaced took its allocation with it,
-        // so the relay address we advertised for this pair (if we were its
-        // anchor) is dead. Left in the set, every later `endpoints` trickle
-        // would hand the peer that dead address again: the rc.125→126 failure
-        // the per-peer keying exists to prevent.
-        self.advertised.remove(&node_id);
     }
 
     /// #2820 — the peer did not answer the `/derp` probe: the pair stays on
@@ -4260,11 +4274,12 @@ mod tests {
     /// #2820 — `stamp_to_derp` builds a `/derp` probe for an INSTALLED pair (it
     /// holds no relay slot) only when the SERVER's stamp says DERP, and changes
     /// nothing else: the pair moves only once the runtime has promoted the
-    /// probe and calls `commit_stamp_derp`, which adopts `Derp` as the
-    /// established strategy (so the ordinary regrade brings it back once the
-    /// stamp turns) and prunes the TURN relay address we advertised. A probe
-    /// the peer never answered backs off for `STAMP_PROBE_BACKOFF`. On every
-    /// precondition it declines without touching anything.
+    /// probe and calls `commit_stamp_derp`, which forgets the pair's relay
+    /// state as a direct promotion does (a stale re-request slot, the TURN-era
+    /// strategy, the dead TURN relay address) so no regrade ever drags it back
+    /// break-before-make. A probe the peer never answered backs off for
+    /// `STAMP_PROBE_BACKOFF`. On every precondition it declines without
+    /// touching anything.
     #[tokio::test]
     async fn stamp_to_derp_probes_and_only_the_commit_moves_the_pair() {
         let (tx, _rx) = mpsc::channel::<ClientMsg>(8);
@@ -4349,24 +4364,33 @@ mod tests {
             "a stamp is not a force-DERP pin: no TTL outlives the verdict"
         );
 
+        // The health sweep convicted the abandoned TURN carrier in the same
+        // tick and re-requested the peer (field 2026-10-26): a slot that would
+        // outlive the promotion.
+        coord.derping.insert(node, derp_peer.clone());
+        assert!(coord.is_tracking(&node));
+
         // The probe handshook and the runtime promoted it.
         coord.commit_stamp_derp(node);
-        assert_eq!(
-            coord.roles.get(&node),
-            Some(&RelayStrategy::Derp),
-            "DERP is now the pair's established strategy"
+        assert!(
+            !coord.is_tracking(&node),
+            "the stale re-request slot goes with the promotion"
+        );
+        assert!(
+            !coord.roles.contains_key(&node),
+            "no strategy is adopted: the pair is on DERP the way a follow leaves it"
         );
         assert!(
             !coord.advertised.contains_key(&node),
             "the TURN relay address died with the carrier, so it leaves the trickle set"
         );
-        // While the stamp still says DERP, the regrade leaves it there…
+        // Neither while the stamp says DERP nor once it turns back (the org
+        // under its allowance again) does the break-before-make regrade fire:
+        // the pair rests on DERP until it next re-establishes.
         assert!(!coord.derp_regrade_due(&node, &derp_peer, now));
-        // …and once it turns back (the org under its allowance again), the
-        // ordinary DERP → TURN regrade is due.
         assert!(
-            coord.derp_regrade_due(&node, &turn_peer, now),
-            "the way back: a DERP-established pair regrades when the stamp turns"
+            !coord.derp_regrade_due(&node, &turn_peer, now),
+            "no way back by regrade: measured, it stranded the follower for 18 s and ended on DERP"
         );
 
         // An unanswered probe: no new one inside the backoff, a new one after.
