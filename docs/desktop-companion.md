@@ -183,7 +183,7 @@ compile.
   (#2871, the operator, 2026-10-25):** the root half's person socket now serves the
   configuration — the listing, with every key it will not set marked
   `read_only = "root_only"`, and `ConfigSet` of exactly the keys that are the console
-  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3163`;
+  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3196`;
   the device-owned gates are not among them) — and the page shows the Mac as one device:
   each row comes from, and a change goes to, the half that READS the key. The split is the
   key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`):
@@ -193,23 +193,23 @@ compile.
   | **session** — the per-user half, which serves the remote-desktop session | Remote desktop · Capture & input · Video encoding · Video rate · Files | the worker's row, edited on the worker as before | `rc_clipboard`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, `encoder_preference` |
   | **machine** — the root half, the device `roomler ssh` / `roomler exec` reach | Access & consent · Private network · Carriers · Routing · Tunnels · Roomler SSH · Device & service | the root half's row, over its person socket: editable where that socket sets the key (`external_*`), otherwise read-only with the administrator's command | `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `overlay_enabled`, `auto_grant_session`, `auto_update`, `external_access_enabled` |
 
-  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:614`) builds the rows —
+  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:620`) builds the rows —
   machine-side keys from the root half's listing, in the worker's order — and
-  `cmd_config_set` (`:803`) sends a machine-side key to the root half
-  (`root_half_config_set_beside`, `:733`), whose answer is final: the worker's copy of
+  `cmd_config_set` (`:813`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:738`), whose answer is final: the worker's copy of
   such a key is a file the Mac's device never reads, so it is not written. The worker's
   own copies of machine keys stay reachable with `roomler config …` in a terminal, and
   the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
   the root half forwards its own value of a few session knobs to the worker as a floor
   (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
   halves' configs, so the worker's copy — the one this edits — can only tighten the
-  root's. The banner (`cmd_config_target`, `:1156`; `two_halves_note`, `:980`) names both
+  root's. The banner (`cmd_config_target`, `:1168`; `two_halves_note`, `:992`) names both
   halves' files and says which rows change here. It is shown only when the reached daemon
   says it runs unprivileged AND a root daemon of another identity answers `Status` over the
-  person socket (`two_halves`, `:963`) — one daemon behind both sockets, a root daemon's
+  person socket (`two_halves`, `:975`) — one daemon behind both sockets, a root daemon's
   legacy per-user bind, is not two halves. A root half older than design A still refuses
   the listing; the rows are then the worker's alone and the banner carries the #2879 words
-  (`two_halves_legacy_note`, `:1001`): the root half's switches are
+  (`two_halves_legacy_note`, `:1013`): the root half's switches are
   `sudo roomler config set <key> <value>`.
 - **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
   daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
@@ -221,19 +221,19 @@ compile.
   written, a file no daemon reads (#2871's failure, on Linux). #2891 made a root daemon's
   refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
   falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:1111`). Since design A the same socket serves the
-  listing, marked: `cmd_config_target` (`:1156`) reports `root_only` (`root_daemon_only`,
-  `:1026`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  `agents/roomler-desktop/src/commands.rs:1123`). Since design A the same socket serves the
+  listing, marked: `cmd_config_target` (`:1168`) reports `root_only` (`root_daemon_only`,
+  `:1038`, pure: the reached daemon says it runs as root, this process does not, and the OS
   is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
   are editable, and the rest — the device-owned gates, the network, SSH, the updater — show
   the root daemon's value with "administrator's" and `sudo roomler config set <key> <value>`
-  (`settings.js`, the `read_only` row; `root_only_note`, `:1053`). From a daemon older than
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1065`). From a daemon older than
   design A the card still shows the daemon, its file (`Status.config_path`:
   `/etc/roomler/config.toml`) and the administrator's commands in place of rows
-  (`root_only_legacy_note`, `:1075`).
+  (`root_only_legacy_note`, `:1087`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:3286`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:3298`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
@@ -379,7 +379,7 @@ sequenceDiagram
   (§5), so the person always knows which daemon answered; the per-user half's own
   `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
   the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4806`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4880`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -677,7 +677,12 @@ banner, no Disconnect, and on Wayland no companion consent prompt (measured 2026
 at the person's own `/run/user/<uid>/roomler.sock`, which is the path the companion already
 tries first:
 - it is theirs, mode 0600, and only they or root may connect (`SO_PEERCRED`);
-- it follows the active graphical session's user;
+- it follows the person signed in at the machine's own screen: logind's active session on
+  `seat0`, when that session is a person's (`companion::seat0_uid`). Never a remote login,
+  which sits on no seat although logind calls it active (#2871's review: the first active
+  graphical session anywhere, which the socket followed before, could be an xrdp user's).
+  Before it applies a config change it asks again whether that person is still at the
+  seat ([security baseline](security-baseline.md) §4);
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
@@ -846,7 +851,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1139`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1244`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -940,7 +945,7 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not: FR-27's consent launch, FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
-first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:724`). For a
+first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:784`). For a
 root daemon that is a transient **system** unit, which inherits nothing of the desktop; its
 environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`,
 `WAYLAND_DISPLAY`) and nothing else.
@@ -948,8 +953,8 @@ environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DI
 Since #2713 a root daemon reads the session user's systemd manager environment, the store the
 desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
 privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
-`companion.rs:804`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:752`;
-parsing in `session_env_pairs`, `companion.rs:778`):
+`companion.rs:864`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:812`;
+parsing in `session_env_pairs`, `companion.rs:838`):
 
 - ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
   runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
@@ -1042,7 +1047,7 @@ kills everything left in its cgroup. Quitting the companion, a crash, and FR-117
 crashed with them (the field check below).
 
 Since #2729 the daemon starts the companion with `--property=KillMode=process`
-(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:889`), in a root daemon's system
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:949`), in a root daemon's system
 unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
 Its own helpers end with it regardless, since WebKit's web and network processes exit when their
 UI process's connection closes.

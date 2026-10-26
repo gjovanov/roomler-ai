@@ -2415,8 +2415,8 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the wire | `Request::Connect` and `ConnectStatus` ([`localapi/src/lib.rs:1562`](../crates/localapi/src/lib.rs#L1562)), `ConnectArgs` ([`:1573`](../crates/localapi/src/lib.rs#L1573)) and `EndpointState` ([`:1602`](../crates/localapi/src/lib.rs#L1602)); `Response::Connected` and `ConnectState` ([`:1943`](../crates/localapi/src/lib.rs#L1943)) |
-| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2323`](../crates/localapi/src/lib.rs#L2323)); the account, `ClientPeer::asker` ([`:2283`](../crates/localapi/src/lib.rs#L2283)); both read from one opening of the token, `token_facts` ([`:2583`](../crates/localapi/src/lib.rs#L2583)) |
-| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3763`](../crates/localapi/src/lib.rs#L3763)); each id kept before its answer is written ([`:3807`](../crates/localapi/src/lib.rs#L3807)), and let go at the connection's end ([`:3838`](../crates/localapi/src/lib.rs#L3838)) |
+| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2323`](../crates/localapi/src/lib.rs#L2323)); the account, `ClientPeer::asker` ([`:2283`](../crates/localapi/src/lib.rs#L2283)); both read from one opening of the token, `token_facts` ([`:2587`](../crates/localapi/src/lib.rs#L2587)) |
+| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3836`](../crates/localapi/src/lib.rs#L3836)); each id kept before its answer is written ([`:3880`](../crates/localapi/src/lib.rs#L3880)), and let go at the connection's end ([`:3911`](../crates/localapi/src/lib.rs#L3911)) |
 | the daemon | `open` ([`person_connect.rs:33`](../agents/roomlerd/src/hive/person_connect.rs#L33)), `state` and `release` ([`:93`](../agents/roomlerd/src/hive/person_connect.rs#L93)); `DaemonState::connect` ([`localapi_state.rs:1735`](../agents/roomlerd/src/localapi_state.rs#L1735)) |
 | the command | `Command::Connect` ([`cli.rs:478`](../agents/roomler-cli/src/cli.rs#L478)); `run` ([`connectcmd.rs:30`](../agents/roomler-cli/src/connectcmd.rs#L30)) and `hold` ([`:71`](../agents/roomler-cli/src/connectcmd.rs#L71)) |
 

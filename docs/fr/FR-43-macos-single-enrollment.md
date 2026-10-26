@@ -808,7 +808,7 @@ person socket — is the decision open on #2871.
 **Design A shipped (#2871, the operator's decision, 2026-10-25).** The root half's person
 socket now serves the configuration — the listing, marked per key, and `ConfigSet` of
 exactly the console person's own keys (`localapi::CONSOLE_PERSON_KEYS`,
-`crates/localapi/src/lib.rs:3163`) — and the companion shows the Mac as one device, each
+`crates/localapi/src/lib.rs:3196`) — and the companion shows the Mac as one device, each
 row from the half that reads the key, by its group (`config_surface::Owner`,
 `crates/agent-core/src/config_surface.rs:210`): the session groups to the worker, the
 rest to the root half ([desktop-companion.md](../desktop-companion.md) §5). The
