@@ -310,6 +310,10 @@ impl WorkerStopEvent {
 /// event never fabricates a shutdown or a self-unenroll.
 pub async fn wait_for_stop_event(name: &str) -> io::Result<()> {
     let ev = WorkerStopEvent::open(name)?;
+    // #2717 — when this worker started hearing stops. On CORPLAP-1 a newborn
+    // worker, mid first-boot caps probe, never logged a stop the host had
+    // signaled; a stop that lands before this line is one it could not hear.
+    tracing::info!("watching the service host's stop event");
     loop {
         if ev.is_signaled()? {
             return Ok(());

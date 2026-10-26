@@ -3774,8 +3774,8 @@ What runs where today, and where P8 puts it:
 
 | Part | Today | Under P8 |
 |---|---|---|
-| Claude Code, `hive-checkpoint` (`agents/roomlerd/src/main.rs:1317`), `hive-materialize` (`:1325`), `hive-import` (`:1342`) | children, as the session's account | unchanged |
-| `knowhow-scan` (`:1358`) | a child per root, as the account that owns it | unchanged |
+| Claude Code, `hive-checkpoint` (`agents/roomlerd/src/main.rs:1337`), `hive-materialize` (`:1345`), `hive-import` (`:1362`) | children, as the session's account | unchanged |
+| `knowhow-scan` (`:1378`) | a child per root, as the account that owns it | unchanged |
 | the toolbelt (the model's tool calls), the model sidecar (the harness's HTTP, holding the provider key), the credential proxies (database, HTTP, Kubernetes and SSH-agent wire, holding leased values), the egress proxy (TLS termination and HTTP, P3b) | inside the daemon | a worker (step 1) |
 | the replica store and stream (frames from other devices), the viewer's WebRTC peer, the knowhow prober (certificates) | inside the daemon | a worker, after the session-facing parts (decision 64) |
 | the supervisor, the control socket, the lease client and the device's vault key, the tunnel hub | inside the daemon | unchanged: the worker reaches them only through the seam |

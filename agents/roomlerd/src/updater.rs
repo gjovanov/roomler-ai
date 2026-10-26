@@ -2247,10 +2247,14 @@ pub fn spawn_installer_for_flavour_with_properties(
             WindowsInstallFlavour::PerUser => {
                 // /qn silent install; non-elevated msiexec inherits
                 // the user token and writes under %LOCALAPPDATA%.
-                let child = std::process::Command::new("msiexec")
-                    .args(argv.iter().map(String::as_str).collect::<Vec<_>>())
-                    .spawn()
-                    .context("spawning msiexec (perUser)")?;
+                // #2718 — `/qn` prints nothing, and an inherited copy of our
+                // stdio held a caller's pipes for the whole install.
+                let child = without_caller_stdio(
+                    std::process::Command::new("msiexec")
+                        .args(argv.iter().map(String::as_str).collect::<Vec<_>>()),
+                )
+                .spawn()
+                .context("spawning msiexec (perUser)")?;
                 Ok(child.id())
             }
             WindowsInstallFlavour::PerMachine => {
@@ -2777,6 +2781,54 @@ fn strip_deleted_suffix(exe: &std::path::Path) -> Option<PathBuf> {
     Some(PathBuf::from(stripped))
 }
 
+/// #2718 — a process the updater leaves running (the post-install watcher,
+/// a perUser msiexec) gets none of its caller's stdio. One that outlives its
+/// caller and holds a copy of the caller's stdout keeps the caller's reader
+/// from ever seeing EOF. Under `roomler exec … self-update` that reader is
+/// the worker's: the exec hung, and a service stop during the update found
+/// the worker's runtime drop waiting on it, so the worker overran its 8 s
+/// stop budget into a terminate. That happened on every exec-driven update
+/// (NEO16: 0.4.169, 0.4.172, 0.4.174); the updates its own updater ran
+/// exited in ~1 s.
+///
+/// ⚠️ On Windows nulling the child's std handles is not enough. `Command`
+/// creates the child with `bInheritHandles = TRUE`, which passes EVERY
+/// inheritable handle of this process. This process's own std handles are
+/// inheritable whenever it inherited them (an exec'd `self-update` did), so
+/// the child got a copy of our stdout anyway: measured, EOF still waited the
+/// full 5 s in the test below. Their inherit flag is cleared first, which
+/// costs no later child anything: `Stdio::inherit` hands a child a fresh
+/// inheritable duplicate.
+fn without_caller_stdio(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    stop_own_std_handles_inheriting();
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+}
+
+/// Clear `HANDLE_FLAG_INHERIT` on this process's stdin/stdout/stderr
+/// ([`without_caller_stdio`]). Best effort: a console handle may refuse, and
+/// nothing is lost when it does.
+#[cfg(target_os = "windows")]
+fn stop_own_std_handles_inheriting() {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` takes a constant and returns this process's
+        // own handle, or null / INVALID_HANDLE_VALUE when there is none;
+        // `SetHandleInformation` changes only that handle's inherit flag.
+        let h = unsafe { GetStdHandle(id) };
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
 fn spawn_watcher(
     spawned: InstallerSpawn,
     installer_path: &std::path::Path,
@@ -2846,6 +2898,9 @@ fn spawn_watcher(
     if let Some(origin) = install_path_before_rename(&exe).filter(|_| !staged) {
         cmd.arg("--origin-exe").arg(&origin);
     }
+    // #2718 — the watcher outlives whoever ran this (by ~30 s). It logs to its
+    // file; nothing reads its stdio.
+    without_caller_stdio(&mut cmd);
     let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;
@@ -6826,6 +6881,90 @@ mod tests {
             failed("fetch", rate_limited),
             CheckOutcome::Skipped(_)
         ));
+    }
+
+    // ── #2718: a process the updater leaves running holds none of its caller's stdio ──
+
+    const STDIO_2718: &str = "ROOMLER_STDIO_2718";
+
+    /// The lingering half of the test below, run by this test binary itself:
+    /// what the updater leaves running (the watcher). Nothing in an ordinary
+    /// run.
+    #[test]
+    fn stdio_lingerer_child() {
+        if std::env::var(STDIO_2718).as_deref() == Ok("linger") {
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    /// The caller half: `roomlerd self-update` under an exec. It starts the
+    /// lingerer, with or without `without_caller_stdio`, and exits without
+    /// waiting for it. Nothing in an ordinary run.
+    // Not waiting is the point: the caller must exit while the lingerer runs,
+    // as `self-update` leaves the watcher.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn stdio_caller_child() {
+        let detach = match std::env::var(STDIO_2718).as_deref() {
+            Ok("caller-inherit") => false,
+            Ok("caller-detached") => true,
+            _ => return,
+        };
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        cmd.args([
+            "--exact",
+            "updater::tests::stdio_lingerer_child",
+            "--test-threads=1",
+        ])
+        .env(STDIO_2718, "linger");
+        if detach {
+            without_caller_stdio(&mut cmd);
+        }
+        cmd.spawn().expect("start the lingerer");
+    }
+
+    /// How long reading the caller's stdout to EOF takes, as the worker's
+    /// exec drain threads do.
+    fn eof_after(mode: &str) -> Duration {
+        use std::io::Read;
+        let started = Instant::now();
+        let mut caller =
+            std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    "updater::tests::stdio_caller_child",
+                    "--test-threads=1",
+                ])
+                .env(STDIO_2718, mode)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start the caller");
+        let mut out = Vec::new();
+        caller
+            .stdout
+            .take()
+            .expect("a piped stdout")
+            .read_to_end(&mut out)
+            .expect("read to EOF");
+        let _ = caller.wait();
+        started.elapsed()
+    }
+
+    #[test]
+    fn a_process_left_running_does_not_hold_its_callers_stdout() {
+        // The control first: inherited, EOF waits for the 5 s lingerer, so
+        // this test can tell the helper from a pipe that closes anyway.
+        let inherited = eof_after("caller-inherit");
+        assert!(
+            inherited >= Duration::from_secs(4),
+            "the control should wait for the lingerer: {inherited:?}"
+        );
+        let detached = eof_after("caller-detached");
+        assert!(
+            detached < Duration::from_secs(3),
+            "EOF should come when the caller exits, not the lingerer: {detached:?}"
+        );
     }
 }
 // RETIRED-NAME-ANCHOR-END
