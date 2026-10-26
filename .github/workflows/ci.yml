@@ -400,6 +400,13 @@ jobs:
         # default --workspace clippy never sees it. Lint it explicitly.
         run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
 
+      - name: Clippy roomler-node-tunnel --features overlay-l3,overlay-netstack (tests too)
+        # FR-123 P1: the tunnel plane's overlay-shaped arms (netwatch, the
+        # route reconciler's derp flavor) and its tests compile only with an
+        # overlay feature on; `-p roomlerd` above lints the crate's default
+        # arms, never its test targets.
+        run: cargo clippy -p roomler-node-tunnel --features overlay-l3,overlay-netstack --all-targets -- -D warnings
+
   rust-unit:
     name: Rust unit tests (server + crates)
     timeout-minutes: 30
@@ -493,6 +500,10 @@ jobs:
       # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
       # an attribute have one spelling, and a person's change to one fact
       # keeps every other fact's provenance.
+      # `roomler-node-tunnel` (FR-123 P1) was `roomlerd`'s `tunnel/` module
+      # until it became a crate: its tests (the acceptor's replies, the
+      # client hub's flow bookkeeping, the route reconciler's config writes)
+      # ran in roomlerd's `--lib` steps and would run nowhere once moved.
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -503,6 +514,7 @@ jobs:
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
           -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
           -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
+          -p roomler-node-tunnel
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above
@@ -1432,6 +1444,12 @@ jobs:
       # carries yet, so this is the only place their code is linted.
       - name: Clippy roomlerd (overlay-l3 + ssh-server + hive, incl. tests)
         run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive,vault --tests -- -D warnings
+      # FR-123 P1 — the tunnel plane is its own crate now; `-p roomlerd` above
+      # lints it as a dependency but never builds its test targets, and the
+      # port holder's Windows half (GetExtendedTcpTable, OpenProcess) lives in
+      # its tests as well as its library.
+      - name: Clippy roomler-node-tunnel (overlay-l3 + overlay-netstack, incl. tests)
+        run: cargo clippy -p roomler-node-tunnel --features overlay-l3,overlay-netstack --tests -- -D warnings
       # FR-92 P10b — the LocalAPI crate's Windows half ran in NO lane: its
       # tests run on Linux, where every `#[cfg(windows)]` test compiles out,
       # and tunnel-core's clippy above builds only its library. That half is
@@ -1557,6 +1575,13 @@ jobs:
       - name: Agent sessions on Windows — unit tests (FR-90 P1i)
         run: |
           cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault,system-context --no-fail-fast
+
+      # FR-123 P1 — the tunnel plane's tests ran inside the line above while it
+      # was roomlerd's `tunnel/` module; as a crate they need naming, and the
+      # port holder's Windows arm runs natively only here.
+      - name: roomler-node-tunnel on Windows — unit tests (FR-123 P1)
+        run: |
+          cargo test -p roomler-node-tunnel --lib --features overlay-l3,overlay-netstack --no-fail-fast
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

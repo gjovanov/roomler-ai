@@ -1,0 +1,51 @@
+[package]
+name = "roomler-node-tunnel"
+license = "MPL-2.0"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "The daemon's tunnel plane (FR-123 P1): the forward acceptor and dialer, the tunnel-client hub, the QUIC/TURN setup, the route reconciler, the port holder — extracted from roomlerd so it compiles beside the rest of the daemon."
+
+[lib]
+name = "roomler_node_tunnel"
+path = "src/lib.rs"
+
+[dependencies]
+# The wire (ClientMsg / ServerMsg, the forward request shapes) — agent side
+# only, as roomlerd takes it.
+roomler-ai-remote-control = { path = "../remote_control", default-features = false }
+# AgentConfig, the forward ACL (`acl`, re-exported at the crate root) and the
+# config load/save this crate's route reconciler writes through.
+roomler-node-core = { path = "../agent-core" }
+# Transports, the tunnel protocol, the overlay's netstate and DERP handles.
+roomler-ai-tunnel-core = { path = "../tunnel-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+bson = { workspace = true }
+webrtc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `port_holder`: who holds a port a declared route cannot bind (proc_pidpath).
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",            # OpenProcess / QueryFullProcessImageNameW — the port holder's name
+    "Win32_NetworkManagement_IpHelper",  # GetExtendedTcpTable — who listens on the port (FR-84 D6 / #1035)
+] }
+
+[features]
+# Mirrors of roomlerd's: the overlay's netstate and DERP tunnel handles exist
+# only with an overlay; `roomlerd`'s features of the same name forward here.
+overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3", "roomler-node-core/overlay-l3"]
+overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-node-core/overlay-netstack"]
+
+[dev-dependencies]
+roomler-node-core = { path = "../agent-core", features = ["test-fixtures"] }
+# The route reconciler's tests write a config into a temporary directory.
+tempfile = { workspace = true }

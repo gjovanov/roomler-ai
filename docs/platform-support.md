@@ -80,7 +80,7 @@ flowchart LR
   (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, in every OS's release build) still gives it the mesh,
   outbound, through a loopback SOCKS5 front. Other nodes cannot reach the host's own services
   that way, but Roomler SSH answers, because it terminates inside the daemon
-  (`agents/roomlerd/src/overlay.rs:334-340`).
+  (`agents/roomlerd/src/overlay.rs:293-299`).
 - A Mac needs both halves for both planes: a root process has no WindowServer, and the person
   cannot create a `utun`. Each half is its own enrollment, so such a Mac is two device rows
   until FR-43 P3 (`docs/installation.md`, macOS). With `macos_supervise_gui_worker` on (default
@@ -123,7 +123,7 @@ flow, and the consent chain's fallbacks.
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
 | In the mesh on an OS adapter | ✅ perMachine | ✅ system unit | ✅ root half, a second device row (FR-43 P3) | §2 |
-| One adapter per organization (multi-org) | ✅ | ✅ | ✅ | `agents/roomlerd/src/overlay.rs:318-324`; `docs/multi-org.md` |
+| One adapter per organization (multi-org) | ✅ | ✅ | ✅ | `agents/roomlerd/src/overlay.rs:277-283`; `docs/multi-org.md` |
 | Exit node, as a client | ✅ | ✅ | ✅ when the uplink has v6, else v6 fail-closed | `docs/overlay-exit-nodes.md`, Platform support |
 | Exit node and subnet router, serving IPv4 | 🟡 WinNAT, which needs the Hyper-V feature: without it (always on Home) the offer is withheld, with the reason | ✅ iptables | ✅ pf, in our own anchor; root half only | each OS's probe (`crates/tunnel-core/src/overlay/nat.rs:211`, `:228`, `:257`) |
 | Exit node, serving IPv6 | ⛔ v6 fail-closed | ✅ ip6tables | ✅ pf NAT66 to a stable address, where an unscoped v6 default exists | `crates/tunnel-core/src/overlay/nat.rs:451-453`; §8 |
@@ -131,7 +131,7 @@ flow, and the consent chain's fallbacks.
 | Exit node: DNS goes through the exit | ✅ | 🟡 systemd-resolved only, else `DNS NOT steered` | ✅ | the same steer, with a catch-all domain |
 | The host firewall admits the mesh | ✅ the daemon's Defender rule, and WFP | 🟡 firewalld and ufw left to the owner, and reported | ❌ the Application Firewall is left alone | carriers pass a host firewall by conntrack; only services on the overlay address need an allow (D13, `crates/tunnel-core/src/overlay/hostfw.rs:3-8`) |
 | LAN-direct egress pin; repair of the LAN's own route | ✅ | ❌ | ❌ | out of scope until a field case asks for it (FR-97 §7); `crates/tunnel-core/src/overlay/lan_repair.rs:3-7` |
-| Who holds a busy port | ✅ | ✅ | ✅ `lsof` | `agents/roomlerd/src/tunnel/port_holder.rs:315-329` |
+| Who holds a busy port | ✅ | ✅ | ✅ `lsof` | `crates/node-tunnel/src/port_holder.rs:315-329` |
 
 At parity on all three: TUN bring-up; v4 and v6 ULA addressing; route-change subscriptions;
 PathMonitor; every carrier (disco, direct, netcheck, relays, DERP, QUIC); org relay serving
