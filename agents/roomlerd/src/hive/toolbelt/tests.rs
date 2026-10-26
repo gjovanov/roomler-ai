@@ -2687,6 +2687,235 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     assert!(ended.is_ok(), "the connection ended with the lease");
 }
 
+/// FR-90 P4-6-1b-2 — an endpoint `roomler_connect` opens through another
+/// device: its upstream connections dial the flow's end, never the
+/// upstream's own address, while TLS is verified against the upstream's host
+/// and the request is still the upstream's. A session's own `vault_connect`
+/// cannot say where it dials: a `dial` it names is not read, and its endpoint
+/// dials the upstream.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn an_endpoint_through_a_flow_dials_its_end_and_a_call_cannot_say_where() {
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    // The upstream's own address answers nobody: only the flow's end does.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let vault = Arc::new(FakeVault {
+        values: [
+            ("git/bot#token".to_string(), token.as_bytes().to_vec()),
+            ("pki/git-ca".to_string(), ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    });
+    let target = super::super::vault_exec::ExecTarget {
+        account: None,
+        home: dir.path().to_path_buf(),
+        folder: dir.path().to_path_buf(),
+        session_dir: dir.path().join("run"),
+        owner: None,
+    };
+    let end = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let args = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": format!("https://localhost:{closed}"),
+        "auth": "bearer",
+        "ca": "pki/git-ca",
+        "ttl_s": 60,
+        "dial": end.to_string(),
+        "through": end.to_string(),
+    });
+    let get = |answer: Value| async move {
+        let at = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+        let mut h = tokio::net::TcpStream::connect(("127.0.0.1", at))
+            .await
+            .unwrap();
+        h.write_all(b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        http_response(&mut h).await
+    };
+    let sid = ObjectId::new();
+    let own = super::super::vault_connect::call(vault.clone(), sid, 5, Some(&target), &me(), &args)
+        .await
+        .unwrap();
+    let response = get(own).await;
+    assert!(
+        response.starts_with("HTTP/1.1 502"),
+        "the upstream's own address, which answers nobody: {response}"
+    );
+    assert!(saw.try_recv().is_err(), "nothing reached the flow's end");
+
+    let through = super::super::vault_connect::call_through(
+        vault,
+        sid,
+        5,
+        Some(&target),
+        &me(),
+        &args,
+        crate::vault_proxy::Dial::Through(end),
+    )
+    .await
+    .unwrap();
+    let response = get(through).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+}
+
+/// FR-90 P4-6-1b-2 — which refusals of a path through another device the
+/// daemon's reach says another device would change: this device's own word
+/// (no vault, no egress) and the vault's word on the credential are every
+/// device's, the vault's word on that exit is that path's. A flow no
+/// endpoint rides goes at once; one an endpoint rides is held, toward the
+/// upstream as asked.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn the_daemons_reach_says_which_refusals_another_device_would_change() {
+    use super::super::connect_tool::{Failed, Reach};
+    use crate::tunnel::client_mgr::TunnelClientHub;
+    use crate::vault_proxy::testing::made;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let ctx = |vault: Option<Arc<FakeVault>>, net: Option<TunnelClientHub>| Ctx {
+        session: ObjectId::new(),
+        fence: 5,
+        vault: vault.map(|v| v as Arc<dyn VaultTools>),
+        knowhow: None,
+        exec: Some(super::super::vault_exec::ExecTarget {
+            account: None,
+            home: dir.path().to_path_buf(),
+            folder: dir.path().to_path_buf(),
+            session_dir: dir.path().join("run"),
+            owner: None,
+        }),
+        net,
+        #[cfg(feature = "ssh-server")]
+        ssh: None,
+        peer: me(),
+        pending: Arc::new(Pending::default()),
+        events: mpsc::channel(1).0,
+        timing: quick(),
+    };
+    let hub = || TunnelClientHub::new("test".into());
+    let exit = ObjectId::new();
+    let asked = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": "https://localhost:8443",
+        "auth": "bearer",
+        "ttl_s": 60,
+    });
+
+    let vault = Arc::new(FakeVault::default());
+    for (c, why) in [
+        (ctx(None, Some(hub())), "(vault_enabled)"),
+        (ctx(Some(vault.clone()), None), "(hive_net)"),
+    ] {
+        let reach = DaemonReach { ctx: &c };
+        let through = reach
+            .open_through(asked.clone(), exit, "localhost", 8443)
+            .await;
+        assert!(
+            matches!(&through, Err(Failed::Every(w)) if w.contains(why)),
+            "{through:?}"
+        );
+        let forward = reach.forward(exit, "localhost", 8443).await;
+        assert!(
+            matches!(&forward, Err(Failed::Every(w)) if w.contains(why)),
+            "{forward:?}"
+        );
+    }
+    assert!(
+        vault.nets.lock().unwrap().is_empty(),
+        "nothing asked of the vault"
+    );
+
+    let refusing = Arc::new(FakeVault {
+        net_refusal: Some("the vault refused: net:forward".into()),
+        ..FakeVault::default()
+    });
+    let on = hub();
+    let c = ctx(Some(refusing.clone()), Some(on.clone()));
+    let reach = DaemonReach { ctx: &c };
+    let through = reach
+        .open_through(asked.clone(), exit, "localhost", 8443)
+        .await;
+    assert!(
+        matches!(&through, Err(Failed::Path(w)) if w.contains("net:forward")),
+        "{through:?}"
+    );
+    let forward = reach.forward(exit, "localhost", 8443).await;
+    assert!(
+        matches!(&forward, Err(Failed::Path(w)) if w.contains("net:forward")),
+        "{forward:?}"
+    );
+    assert_eq!(refusing.nets.lock().unwrap().len(), 2);
+    assert!(on.flows_snapshot().is_empty());
+
+    let bare = Arc::new(FakeVault::default());
+    let on = hub();
+    let c = ctx(Some(bare.clone()), Some(on.clone()));
+    let through = DaemonReach { ctx: &c }
+        .open_through(asked.clone(), exit, "localhost", 8443)
+        .await;
+    assert!(
+        matches!(&through, Err(Failed::Every(w)) if w.contains("no_secret")),
+        "{through:?}"
+    );
+    assert_eq!(bare.nets.lock().unwrap().len(), 1, "its flow was made");
+    assert!(on.flows_snapshot().is_empty(), "and went at once");
+
+    let lending = Arc::new(FakeVault {
+        values: [("git/bot#token".to_string(), made().into_bytes())]
+            .into_iter()
+            .collect(),
+        ..FakeVault::default()
+    });
+    let on = hub();
+    let c = ctx(Some(lending.clone()), Some(on.clone()));
+    let answer = DaemonReach { ctx: &c }
+        .open_through(asked, exit, "localhost", 8443)
+        .await
+        .unwrap();
+    assert!(
+        answer["through_expires_in_secs"]
+            .as_u64()
+            .is_some_and(|s| s <= 60),
+        "{answer}"
+    );
+    let flows = on.flows_snapshot();
+    assert_eq!(flows.len(), 1, "held for its endpoint");
+    assert_eq!(
+        {
+            let nets = lending.nets.lock().unwrap();
+            (nets[0].exit, nets[0].dst.clone())
+        },
+        (exit, Some(("localhost".to_string(), 8443)))
+    );
+    // Its end serves this daemon: this process's own connection is held.
+    let mut held = tokio::net::TcpStream::connect(flows[0].local_addr.as_str())
+        .await
+        .unwrap();
+    assert!(
+        !ended(&mut held, Duration::from_millis(300)).await,
+        "this daemon's connection is held"
+    );
+}
+
 /// FR-90 P3-9-2 — a person's leases over the fake vault: each asked for
 /// recorded with the endpoint it is for, refused while `refuse` says so, and
 /// every lease an endpoint was given let go when it closes.

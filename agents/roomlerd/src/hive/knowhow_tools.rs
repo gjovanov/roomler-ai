@@ -959,10 +959,14 @@ pub(crate) fn tools(offered: &[&'static str]) -> Vec<Value> {
                             a connection string with no credential in it (a `tcp` entity takes no \
                             credential: the answer says where to dial). When this device has not \
                             probed it lately, one probe from here is asked first. A person approves \
-                            each call, and the vault decides each lease. Nothing is dialled that no \
-                            probe from here found: when only other devices reached it, the answer \
-                            names them. An entity whose facts do not say how it is reached is \
-                            refused no_access, naming what is missing.",
+                            each call, and the vault decides each lease. When this device cannot \
+                            reach it, it goes through another device that reached it lately: the \
+                            endpoint's upstream connection rides a flow toward it, TLS still \
+                            verified against the upstream's host, and a `tcp` entity gets the \
+                            forward itself. Nothing is dialled that no device's probe found, and \
+                            the answer names the path it took and every path tried before it. An \
+                            entity whose facts do not say how it is reached is refused no_access, \
+                            naming what is missing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

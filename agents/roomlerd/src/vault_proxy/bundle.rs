@@ -96,6 +96,9 @@ impl Opened {
             user: user.clone(),
             password: Zeroizing::new(with.clone()),
             tls: tls::connector_for(tls::roots(self.optional("ca").map(String::as_str))?, None)?,
+            // An issuer is reached from this device: a mint never rides a
+            // session's flow (FR-90 P4-6-1b-2).
+            dial: super::Dial::Direct,
         })
     }
 }
