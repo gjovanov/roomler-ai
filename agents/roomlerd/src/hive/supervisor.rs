@@ -1556,9 +1556,9 @@ impl Supervisor {
     /// on, once the daemon built its primary hub. None otherwise, and then
     /// `net_socks` and `net_forward` are not offered.
     #[cfg(feature = "vault")]
-    fn net_hub(&self, vault: bool) -> Option<crate::tunnel::client_mgr::TunnelClientHub> {
+    fn net_hub(&self, vault: bool) -> Option<Arc<dyn super::net_tools::SessionEgress>> {
         if vault && self.cfg.net {
-            crate::tunnel::client_mgr::primary()
+            crate::tunnel::client_mgr::primary().map(super::net_tools::seam)
         } else {
             None
         }

@@ -373,7 +373,7 @@ pub(crate) struct Run {
     /// where the device's owner turned `hive_net` on and the vault is
     /// offered; without it `net_socks` and `net_forward` are not offered.
     #[cfg(feature = "vault")]
-    pub(crate) net: Option<crate::tunnel::client_mgr::TunnelClientHub>,
+    pub(crate) net: Option<Arc<dyn super::net_tools::SessionEgress>>,
     /// FR-90 P3-8-2b-2 — how `ssh_run` reaches another device, where the
     /// device's owner turned `hive_ssh` on and the vault is offered; without
     /// it `ssh_run` is not offered.
@@ -394,7 +394,7 @@ struct Ctx {
     exec: Option<super::vault_exec::ExecTarget>,
     /// FR-90 P3-7-3c — where `net_socks` and `net_forward` open their flows.
     #[cfg(feature = "vault")]
-    net: Option<crate::tunnel::client_mgr::TunnelClientHub>,
+    net: Option<Arc<dyn super::net_tools::SessionEgress>>,
     /// FR-90 P3-8-2b-2 — how `ssh_run` runs its command.
     #[cfg(all(feature = "vault", feature = "ssh-server"))]
     ssh: Option<Arc<dyn super::ssh_tools::SshRunner>>,
@@ -1340,7 +1340,7 @@ impl DaemonReach<'_> {
         })
     }
 
-    fn hub(&self) -> Result<&crate::tunnel::client_mgr::TunnelClientHub, String> {
+    fn egress(&self) -> Result<&Arc<dyn super::net_tools::SessionEgress>, String> {
         self.ctx.net.as_ref().ok_or_else(|| {
             "this device's owner has not turned its sessions' egress on (hive_net): there is no \
              path through another device"
@@ -1382,7 +1382,7 @@ impl super::connect_tool::Reach for DaemonReach<'_> {
         {
             // This device's own: no other device changes them.
             let vault = self.vault().map_err(Failed::Every)?;
-            let hub = self.hub().map_err(Failed::Every)?;
+            let egress = self.egress().map_err(Failed::Every)?;
             // The flow lives as the endpoint's leases are asked to.
             let ttl = asked
                 .get("ttl_s")
@@ -1391,7 +1391,7 @@ impl super::connect_tool::Reach for DaemonReach<'_> {
                 .unwrap_or(super::net_tools::DEFAULT_TTL_SECS);
             let flow = super::net_tools::daemon_flow(
                 vault.as_ref(),
-                hub,
+                egress,
                 self.ctx.session,
                 self.ctx.fence,
                 exit,
@@ -1427,7 +1427,7 @@ impl super::connect_tool::Reach for DaemonReach<'_> {
                 // No endpoint rides it: the flow goes at once. The vault's
                 // word on the credential is the same through any device.
                 Err(why) => {
-                    hub.kill_flow(&flow.flow);
+                    egress.end_flow(&flow.flow);
                     Err(Failed::Every(why))
                 }
             }
@@ -1445,7 +1445,7 @@ impl super::connect_tool::Reach for DaemonReach<'_> {
         #[cfg(feature = "vault")]
         {
             let vault = self.vault().map_err(Failed::Every)?;
-            let hub = self.hub().map_err(Failed::Every)?;
+            let egress = self.egress().map_err(Failed::Every)?;
             #[cfg(unix)]
             let peer = self.ctx.peer;
             #[cfg(windows)]
@@ -1453,7 +1453,7 @@ impl super::connect_tool::Reach for DaemonReach<'_> {
             super::net_tools::call(
                 super::net_tools::FORWARD,
                 vault.as_ref(),
-                hub,
+                egress,
                 self.ctx.session,
                 self.ctx.fence,
                 peer,
@@ -1510,7 +1510,7 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
     }
     #[cfg(feature = "vault")]
     if name == super::net_tools::SOCKS || name == super::net_tools::FORWARD {
-        let Some(hub) = &ctx.net else {
+        let Some(egress) = &ctx.net else {
             return Err("this device offers its sessions no egress (hive_net)".into());
         };
         #[cfg(unix)]
@@ -1520,7 +1520,7 @@ async fn ask_vault(ctx: &Ctx, name: &str, args: &Value) -> Result<Value, String>
         return super::net_tools::call(
             name,
             vault.as_ref(),
-            hub,
+            egress,
             ctx.session,
             ctx.fence,
             peer,
