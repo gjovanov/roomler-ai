@@ -111,12 +111,8 @@ fn parse_args() -> anyhow::Result<Args> {
             "--audio-kbps" => a.audio_kbps = next_value(&mut it, &flag)?.parse()?,
             "--fps" => a.fps = next_value(&mut it, &flag)?.parse()?,
             "--packet-bytes" => a.packet_bytes = next_value(&mut it, &flag)?.parse()?,
-            "--warmup-s" => {
-                a.warmup = Duration::from_secs(next_value(&mut it, &flag)?.parse()?)
-            }
-            "--window-s" => {
-                a.window = Duration::from_secs(next_value(&mut it, &flag)?.parse()?)
-            }
+            "--warmup-s" => a.warmup = Duration::from_secs(next_value(&mut it, &flag)?.parse()?),
+            "--window-s" => a.window = Duration::from_secs(next_value(&mut it, &flag)?.parse()?),
             "--log-level" => {
                 a.log_level = Some(match next_value(&mut it, &flag)?.as_str() {
                     "debug" => WorkerLogLevel::Debug,
@@ -327,7 +323,9 @@ fn spawn_generator(
                                     // frame carries the start code and 640x480.
                                     pkt.extend_from_slice(&[if key { 0x10 } else { 0x11 }, 0, 0]);
                                     if key {
-                                        pkt.extend_from_slice(&[0x9d, 0x01, 0x2a, 0x80, 0x02, 0xe0, 0x01]);
+                                        pkt.extend_from_slice(&[
+                                            0x9d, 0x01, 0x2a, 0x80, 0x02, 0xe0, 0x01,
+                                        ]);
                                     }
                                 }
                                 pkt.resize(12 + shape.packet_bytes, 0xaa);
@@ -636,7 +634,9 @@ async fn main() -> anyhow::Result<()> {
     let level = format!("{:?}", settings.log_level);
     let liburing = settings.enable_liburing;
     let worker = WorkerManager::new().create_worker(settings).await?;
-    let router = worker.create_router(RouterOptions::new(media_codecs())).await?;
+    let router = worker
+        .create_router(RouterOptions::new(media_codecs()))
+        .await?;
     // `RtpCapabilitiesFinalized` → `RtpCapabilities`, as `create_rtp_tap` does.
     let caps: RtpCapabilities =
         serde_json::from_value(serde_json::to_value(router.rtp_capabilities())?)?;
@@ -666,7 +666,16 @@ async fn main() -> anyhow::Result<()> {
     );
     println!(
         "{:>4} {:>9} {:>9} {:>10} {:>9} {:>9} {:>8} {:>10} {:>9} {:>6}",
-        "N", "consumers", "in_pkt/s", "out_pkt/s", "out_Mb/s", "fwd_Mb/s", "cpu_%", "delivered", "bench_%", "late"
+        "N",
+        "consumers",
+        "in_pkt/s",
+        "out_pkt/s",
+        "out_Mb/s",
+        "fwd_Mb/s",
+        "cpu_%",
+        "delivered",
+        "bench_%",
+        "late"
     );
 
     let streams = if shape.packets_per_frame > 0 { 2 } else { 1 };
@@ -702,8 +711,15 @@ async fn main() -> anyhow::Result<()> {
         let in_pkts = (b.sent.0 - a.sent.0) as f64;
         let expected = in_pkts * (n - 1) as f64;
         let out_pkts = (b.received.0 - a.received.0) as f64;
-        let delivered = if expected > 0.0 { 100.0 * out_pkts / expected } else { 0.0 };
-        let worker = b.worker_cpu.zip(a.worker_cpu).map(|(b, a)| 100.0 * (b - a) / secs);
+        let delivered = if expected > 0.0 {
+            100.0 * out_pkts / expected
+        } else {
+            0.0
+        };
+        let worker = b
+            .worker_cpu
+            .zip(a.worker_cpu)
+            .map(|(b, a)| 100.0 * (b - a) / secs);
         let bench = b
             .process_cpu
             .zip(a.process_cpu)
@@ -740,7 +756,10 @@ async fn main() -> anyhow::Result<()> {
             })
         );
         if delivered < args.stop_below {
-            println!("delivery fell below {}% at N = {n}: stopping", args.stop_below);
+            println!(
+                "delivery fell below {}% at N = {n}: stopping",
+                args.stop_below
+            );
             break;
         }
     }
