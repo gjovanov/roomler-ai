@@ -15,7 +15,12 @@
 //     `sendKeyText` would send;
 //   - a window-level CAPTURE key listener that runs the real `routeKeyEvent`
 //     and `applyKeyRoute`, exactly as `onKey` does, with effects that record
-//     the frames `sendInput` would send.
+//     the frames `sendInput` would send;
+//   - the viewer's TWO window `paste` listeners in the viewer's order (#2910):
+//     the files drawer's first (the real `drawerPasteFiles`, registered at
+//     mount in `RemoteControl.vue`), then the deferred Ctrl+V's `onPaste` (the
+//     real `routeDeferredPaste`, registered later by `attachInput`), each
+//     recording the uploads it would start.
 //
 // Playwright (`softkbd.spec.ts`) presses real keys, types through
 // `insertText` (the soft keyboard's own path), composes through the IME and
@@ -32,6 +37,7 @@ import {
   createHeldInputTracker,
   DEFERRED_PASTE_FALLBACK_MS,
   deferredPasteFrames,
+  drawerPasteFiles,
   routeDeferredPaste,
   routeKeyEvent,
   translateModifierForHost,
@@ -39,8 +45,9 @@ import {
 } from '@/composables/useRemoteControl'
 
 /** Who produced a frame: the viewer's window listener, the soft keyboard
- *  component's own emits, or the deferred paste's flush. */
-export type FrameVia = 'listener' | 'soft-keyboard' | 'paste-flush'
+ *  component's own emits, or the deferred paste's flush — and, for an upload,
+ *  the files drawer's paste handler or the deferred Ctrl+V's `onPaste`. */
+export type FrameVia = 'listener' | 'soft-keyboard' | 'paste-flush' | 'drawer' | 'paste-files'
 
 export type HostFrame =
   | { via: FrameVia; t: 'key'; code: number; down: boolean; mods: number }
@@ -49,6 +56,7 @@ export type HostFrame =
   | { via: 'listener'; t: 'clipboard-mirror' }
   | { via: 'listener'; t: 'release-held'; keys: number[] }
   | { via: 'paste-flush'; t: 'paste'; text: string; files: number }
+  | { via: 'drawer' | 'paste-files'; t: 'upload'; files: number }
 
 export interface HarnessState {
   pointerInside: boolean
@@ -56,6 +64,8 @@ export interface HarnessState {
   keyboardPaused: boolean
   /** `hostIsMac && ctrlAsCmd` — FR-13's Ctrl→Cmd substitution. */
   macCtrlAsCmd: boolean
+  /** The viewer's Remote files drawer is open (#2910). */
+  drawerOpen: boolean
 }
 
 export interface Harness {
@@ -87,6 +97,7 @@ const state: HarnessState = {
   keyboardLocked: false,
   keyboardPaused: false,
   macCtrlAsCmd: false,
+  drawerOpen: false,
 }
 const ctrlSubState = { ctrlHeldAsCmd: false }
 const heldInputs = createHeldInputTracker()
@@ -151,15 +162,33 @@ function onKey(ev: KeyboardEvent, down: boolean) {
 
 /** `onPaste` minus the clipboard channel: the SAME `routeDeferredPaste`
  *  decides (and consumes the event when the deferral has it — the one
- *  `preventDefault`, in the composable, not a copy here); the deferred
- *  keystroke is then flushed. */
+ *  `preventDefault`, in the composable, not a copy here). Files go to the
+ *  upload sink (`onFilesPasted`) and a paste the drawer already took is
+ *  dropped — no keystroke either way, as in the composable; otherwise the
+ *  deferred keystroke is flushed. */
 function onPaste(ev: ClipboardEvent) {
-  const route = routeDeferredPaste(ev, pendingCtrlV !== null, false)
+  const route = routeDeferredPaste(ev, pendingCtrlV !== null, true)
   if (route.kind === 'ignore') return
+  if (route.kind === 'taken' || route.kind === 'files') {
+    if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
+    pendingCtrlV = null
+    if (route.kind === 'files') sent.push({ via: 'paste-files', t: 'upload', files: route.files.length })
+    return
+  }
   if (route.kind === 'content') {
     sent.push({ via: 'paste-flush', t: 'paste', text: route.text, files: 0 })
   }
   flushPendingCtrlV()
+}
+
+/** The files drawer's window `paste` handler (`onWindowPasteForDrawer`): the
+ *  SAME `drawerPasteFiles` decides; it consumes what it uploads. */
+function onDrawerPaste(ev: ClipboardEvent) {
+  const files = drawerPasteFiles(ev, state.drawerOpen)
+  if (!files) return
+  ev.preventDefault()
+  ev.stopPropagation()
+  sent.push({ via: 'drawer', t: 'upload', files: files.length })
 }
 
 const HarnessApp = defineComponent({
@@ -198,6 +227,9 @@ const HarnessApp = defineComponent({
 
 createApp(HarnessApp).mount('#app')
 
+// The drawer's paste handler first: `RemoteControl.vue` registers it at mount,
+// before a session connects and `attachInput` registers its own (#2910).
+window.addEventListener('paste', onDrawerPaste)
 // As `attachInput` registers them: window, CAPTURE phase; paste on the window.
 window.addEventListener('keydown', (e) => onKey(e, true), { capture: true })
 window.addEventListener('keyup', (e) => onKey(e, false), { capture: true })
