@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Agent-side `roomler` plumbing.
+//! Agent-side `roomler` plumbing: the daemon's tunnel plane.
+//!
+//! A crate of its own since FR-123 P1 — until then `roomlerd`'s `tunnel/`
+//! module, which `roomlerd` still re-exports as `crate::tunnel`, so every
+//! path that named it keeps resolving. It was split out so it compiles
+//! beside the rest of the daemon instead of inside its one release unit;
+//! nothing about what it does changed. It reaches the daemon through
+//! nothing: what the overlay runtime hands it (the live DERP muxes) is
+//! registered into [`netwatch`] from above.
 //!
 //! The server-side ACL gate in `crates/api/src/ws/tunnel.rs` is the
 //! authoritative auth boundary (plan §"Multi-tenancy gotcha" +
-//! §"Server-side ACL gate"). This module is the **second** gate the
+//! §"Server-side ACL gate"). This crate is the **second** gate the
 //! operator can configure on the controlled host:
 //!
 //! 1. Server gates every `TcpForwardRequest` against `tunnel_policies`
@@ -28,11 +36,15 @@
 pub mod acceptor;
 // P3e lever E: the agent-side forward allowlist moved to
 // `roomler-node-core::acl` (AgentConfig embeds its types, and AgentConfig
-// lives there now). Re-exported so `crate::tunnel::acl::…` stays valid.
+// lives there now). Re-exported so `crate::acl::…` stays valid.
 pub use roomler_node_core::acl;
 pub mod client_mgr;
 pub mod dialer;
-pub(crate) mod netwatch;
+/// The bridge to the overlay's netstate, and the registry of live DERP
+/// muxes the overlay runtime fills (FR-123 P1 moved it here from
+/// `roomlerd`'s `overlay.rs`). Public: `signaling.rs` and Hive's stream
+/// supervisor read the handles from above.
+pub mod netwatch;
 pub mod peer;
 /// FR-84 D6 / #1035 — name who holds a port a declared route cannot bind.
 pub mod port_holder;

@@ -10,6 +10,9 @@ members = [
     # FR-90 — Hive on the device: transcript events, the replica store, the
     # stream-json adapter, the launch spec. Daemon-side only (MPL).
     "crates/hive-node",
+    # FR-123 P1 — the daemon's tunnel plane, extracted from roomlerd so it
+    # compiles beside the rest of the daemon. Daemon-side only (MPL).
+    "crates/node-tunnel",
     "crates/tunnel-core",
     # P5 — the webrtc-ice fork's substance (TURNS/TCP Conn adapter), extracted
     # so the vendored tree is a mechanical patch. Consumed by tunnel-core AND

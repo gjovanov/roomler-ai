@@ -9487,6 +9487,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-node-tunnel"
+version = "0.4.175"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bson",
+ "libc",
+ "roomler-ai-remote-control",
+ "roomler-ai-tunnel-core",
+ "roomler-node-core",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "webrtc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "roomler-setup"
 version = "0.4.175"
 dependencies = [
@@ -9600,6 +9620,7 @@ dependencies = [
  "roomler-cli",
  "roomler-hive-node",
  "roomler-node-core",
+ "roomler-node-tunnel",
  "russh",
  "rustls-native-certs",
  "scrap",
