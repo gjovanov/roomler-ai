@@ -1,6 +1,7 @@
 # FR-124: A black call tile says why — a covered camera is named, a refused start recovers
 
-**Issue:** [#2945](https://github.com/gjovanov/roomler-ai/issues/2945) · **Status:** proposed 2026-10-26 — spec and claim
+**Issue:** [#2945](https://github.com/gjovanov/roomler-ai/issues/2945) · **Status:** in progress 2026-10-26 — P1–P3 built in
+one PR; red on production recorded (§8), green owed after the roll
 · **Owner:** the web app (UI) · **Anchors:** master `a350082a8` · **Builds on:** [FR-30](FR-30-camera-state-signalling.md)
 (a peer's own word that their camera is off), [FR-25](FR-25-call-layout-mentions-pip.md) (the call layouts)
 
@@ -91,12 +92,16 @@ flowchart TB
     MUTE -->|resolves| SND["picture on screen<br/>'Tap for sound' on the tile"]
     MUTE -->|refused| TAP["'Tap to play' on the tile"]
     M -->|yes| TAP
-    SND & TAP --> G["the next pointerdown / keydown anywhere<br/>(capture phase) or a tap on the tile's button"]
+    SND & TAP --> G["the next click / keydown anywhere<br/>(capture phase) or a tap on the tile's button"]
     G --> R["unmute → play() inside the gesture"]
 ```
 
 The `:muted` binding reads `isLocal || soundBlocked`, so a re-render cannot unmute a tile behind the browser's back,
 and the gesture listeners are removed once used and when the tile unmounts.
+
+⚠️ **`click`, not `pointerdown`** (changed from the claim's design while building). On a touch screen the user
+activation arrives with the pointer's release, so a `play()` at `pointerdown` would be refused again. `click` fires
+after the release for both a mouse and a finger.
 
 ## 4. Phases
 
@@ -147,8 +152,14 @@ Proposed with the claim; the operator may overrule any of them.
 
 ## 8. Field-verification log
 
+The instrument: two tabs of neo16's Edge 156 in an operator-only room on production, each with `getUserMedia`
+replaced by a canvas (black, or a bright moving pattern) and silent audio, so no real camera or microphone was used.
+Tab A joined with a real click (user activation); tab B joined with a scripted `click()`, which gives none. Each read
+is the page's own DOM, plus a 16×12 luma probe of every tile's `<video>`.
+
 | date | build | host | result |
 |---|---|---|---|
+| 2026-10-26 10:55–10:57Z | production before FR-124 (entry `index-DbWa1WpV.js`) | neo16, Edge 156, tabs A and B as above | 🔴 **AC1**: tab A sent black for 8 s; its own tile played at 640 px with mean and peak luma 0, and there was **no notice and no warning**. 🔴 **AC2**: with tab B sending black, tab A played B's tile (`paused: false`, mean and peak 0) for 7 s with **no notice**. 🔴 **AC4**: in tab B (`userActivation.hasBeenActive: false`) the browser refused A's unmuted tile: `paused: true`, black, **no button**. It stayed black after A switched to a bright pattern (A's own tile read mean 83), so the black was the refusal and not the content |
 
 ## 9. Related
 

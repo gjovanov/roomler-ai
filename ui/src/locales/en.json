@@ -184,7 +184,8 @@
     "pip": "Picture-in-Picture",
     "files": "Files",
     "noFiles": "No files uploaded yet",
-    "uploadFile": "Upload File"
+    "uploadFile": "Upload File",
+    "blackPicture": "Your camera is sending a black picture. Is the lens covered or a privacy shutter closed?"
   },
   "files": {
     "upload": "Upload",
