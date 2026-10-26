@@ -423,6 +423,104 @@ pub struct NodeStatus {
     /// "Change…" / "Use default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_dir: Option<String>,
+    /// FR-67 P3 — what the most recent install attempt came to, as the
+    /// post-install watcher left it in `<log_dir>/last-install.json`
+    /// ([`LastInstallStatus`]). Read from disk on every answer, so a verdict
+    /// written after this daemon started (Windows: the new service starts
+    /// while the watcher still waits on msiexec) shows up without a restart.
+    ///
+    /// ⚠️ Three states must stay apart, and they do by construction: `None`
+    /// is a daemon that predates the field and cannot say; `Some` with
+    /// [`LastInstallStatus::ABSENT`] is a daemon with no record (its updater
+    /// has installed nothing); `Some` with [`LastInstallStatus::IN_PROGRESS`]
+    /// is a record whose verdict never came — the bug FR-67 exists for.
+    /// Collapsing any two of them recreates that bug one layer up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_install: Option<LastInstallStatus>,
+}
+
+/// FR-67 P3 — the post-install watcher's record of the most recent install
+/// attempt (`<log_dir>/last-install.json`), as the daemon reads it back.
+///
+/// The watcher (`roomlerd post-install-watch`, spawned by the updater beside
+/// the installer) writes the record; until P3 nothing read it, on any
+/// platform. `status` is one of the words below, spelled exactly as the file
+/// and the watcher's own `post-install verdict:` log line spell them, so one
+/// grep finds all three surfaces:
+///
+/// | word | meaning |
+/// |---|---|
+/// | `Absent` | no record: this daemon's updater has installed nothing yet, or the record sits in another process role's log dir — `path` says where this one looked |
+/// | `InProgress` | the watcher wrote its opening line and no verdict. Younger than [`Self::STALE_AFTER_SECS`], a watcher still at work (on Windows the new service starts while it still waits on msiexec). Older, an install that never reported: the watcher was killed first |
+/// | `SucceededVerified` | the installer exited 0 and the new binary's `--version` answered `expected_version` |
+/// | `SucceededUnverified` | the installer exited 0 but the version probe did not confirm it; `note` says what it saw |
+/// | `InstallerFailed` | the installer exited non-zero (`installer_exit_code`) |
+/// | `Timeout` | the installer did not exit within the watcher's budget (on Windows, not after the kill-and-retry either) |
+/// | `Unreadable` | a file is there and does not parse; `note` carries the error |
+///
+/// Additive everywhere: a daemon that predates it sends no key, an older
+/// client ignores it. A word this client does not know is a newer daemon's
+/// and is shown as it is, never an error.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LastInstallStatus {
+    pub status: String,
+    /// The release the install was for (`agent-v0.4.172`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// What the new binary's `--version` printed, when the probe ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_binary_version: Option<String>,
+    /// When the watcher started, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix: Option<u64>,
+    /// When it wrote its verdict, unix seconds; unset while `InProgress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer_exit_code: Option<i32>,
+    /// The watcher's own note on the verdict; for `Unreadable`, the error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The file this answer was read from, or looked for. `None` when the
+    /// daemon resolved no log dir at all (a checkout run with no home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl LastInstallStatus {
+    pub const ABSENT: &'static str = "Absent";
+    pub const IN_PROGRESS: &'static str = "InProgress";
+    pub const SUCCEEDED_VERIFIED: &'static str = "SucceededVerified";
+    pub const SUCCEEDED_UNVERIFIED: &'static str = "SucceededUnverified";
+    pub const INSTALLER_FAILED: &'static str = "InstallerFailed";
+    pub const TIMEOUT: &'static str = "Timeout";
+    pub const UNREADABLE: &'static str = "Unreadable";
+
+    /// An `InProgress` record older than this never got its verdict. The
+    /// watcher's whole life is bounded: 10 min on the installer (twice on a
+    /// Windows wedge retry), 2 min settling the Windows service. Nothing is
+    /// still writing a record this old.
+    pub const STALE_AFTER_SECS: u64 = 25 * 60;
+
+    /// A record with no verdict yet — fresh or stale alike.
+    pub fn in_progress(&self) -> bool {
+        self.status == Self::IN_PROGRESS
+    }
+
+    /// `InProgress`, and old enough that no watcher can still be at work on
+    /// it: the install never reported. A record with no start time cannot be
+    /// fresh, so it counts as never reported too.
+    pub fn never_reported(&self, now_unix: u64) -> bool {
+        self.in_progress()
+            && self
+                .started_unix
+                .is_none_or(|s| now_unix.saturating_sub(s) >= Self::STALE_AFTER_SECS)
+    }
+
+    /// The one outcome nobody needs to look at.
+    pub fn is_verified_success(&self) -> bool {
+        self.status == Self::SUCCEEDED_VERIFIED
+    }
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -5686,6 +5784,7 @@ mod tests {
                 legacy_env_uses: Some(Vec::new()),
                 retired_env_present: Some(Vec::new()),
                 files_dir: None,
+                last_install: None,
                 derp_inbound_drops: None,
                 netcheck: None,
                 pid: None,
@@ -6723,6 +6822,94 @@ mod tests {
         );
         let back: NodeStatus = serde_json::from_str(&without).unwrap();
         assert_eq!(back.files_dir, None);
+    }
+
+    /// FR-67 P3 — `NodeStatus.last_install` is additive, and the three states
+    /// it must keep apart survive the wire: no key (a daemon that predates it)
+    /// parses to `None`; `Absent` and `InProgress` are two different words
+    /// that round-trip as themselves.
+    #[test]
+    fn node_status_last_install_is_additive_and_keeps_absent_from_in_progress() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("last_install"), "{without}");
+        let back: NodeStatus = serde_json::from_str(&without).unwrap();
+        assert_eq!(back.last_install, None, "no key = a daemon that cannot say");
+
+        let absent = LastInstallStatus {
+            status: LastInstallStatus::ABSENT.into(),
+            expected_version: None,
+            new_binary_version: None,
+            started_unix: None,
+            finished_unix: None,
+            installer_exit_code: None,
+            note: None,
+            path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+        };
+        st.last_install = Some(absent.clone());
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""last_install":{"status":"Absent""#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&with).unwrap();
+        assert_eq!(back.last_install.as_ref(), Some(&absent));
+        assert!(!absent.in_progress());
+        assert!(
+            !absent.never_reported(u64::MAX),
+            "absent is not a record that never reported"
+        );
+
+        let frozen = LastInstallStatus {
+            status: LastInstallStatus::IN_PROGRESS.into(),
+            expected_version: Some("agent-v0.4.16".into()),
+            started_unix: Some(1_756_475_398),
+            ..absent.clone()
+        };
+        let back: LastInstallStatus =
+            serde_json::from_str(&serde_json::to_string(&frozen).unwrap()).unwrap();
+        assert_eq!(back, frozen);
+        assert_ne!(back.status, absent.status, "the two words never collapse");
+    }
+
+    /// FR-67 P3 — `InProgress` is a verdict still being written only while
+    /// the watcher can still be alive; past its whole budget it is an install
+    /// that never reported, and a record with no start time cannot be fresh.
+    #[test]
+    fn last_install_in_progress_is_never_reported_only_once_stale() {
+        let started = 1_792_967_937u64;
+        let mut li = LastInstallStatus {
+            status: LastInstallStatus::IN_PROGRESS.into(),
+            expected_version: Some("agent-v0.4.172".into()),
+            new_binary_version: None,
+            started_unix: Some(started),
+            finished_unix: None,
+            installer_exit_code: None,
+            note: None,
+            path: None,
+        };
+        assert!(li.in_progress());
+        assert!(
+            !li.never_reported(started + 17),
+            "17 s in, the Windows watcher is still waiting on msiexec"
+        );
+        assert!(
+            !li.never_reported(started + LastInstallStatus::STALE_AFTER_SECS - 1),
+            "inside the budget it is still a watcher at work"
+        );
+        assert!(li.never_reported(started + LastInstallStatus::STALE_AFTER_SECS));
+        assert!(li.never_reported(started + 86_400 * 7));
+        li.started_unix = None;
+        assert!(
+            li.never_reported(started),
+            "no start time = no claim to freshness"
+        );
+        li.status = LastInstallStatus::SUCCEEDED_VERIFIED.into();
+        assert!(
+            !li.never_reported(u64::MAX),
+            "a verdict is never 'never reported'"
+        );
+        assert!(li.is_verified_success());
     }
 
     #[tokio::test]

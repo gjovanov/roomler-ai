@@ -98,6 +98,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 #[cfg(all(unix, not(target_os = "windows")))]
 use std::time::Instant;
+use tunnel_core::localapi::LastInstallStatus;
 
 /// Wall-clock budget for waiting on the installer to finish.
 /// Conservative — the longest-observed install in the field is
@@ -1127,6 +1128,162 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// FR-67 P3 — the read half. Everything above writes `last-install.json`;
+// nothing read it until this, on any platform: `read_outcome` had no caller
+// (the module doc's "the new binary reads it at startup" was never wired),
+// so the only hosts anyone looked at were the ones somebody SSHed into.
+// ---------------------------------------------------------------------------
+
+impl InstallStatus {
+    /// The status word as the wire and the CLI spell it — the SAME spelling
+    /// the file carries and the watcher's `post-install verdict:` line prints,
+    /// so one grep finds all three surfaces. Locked to the serde spelling by
+    /// `install_status_words_match_the_file_spelling`.
+    pub fn word(&self) -> &'static str {
+        match self {
+            InstallStatus::InProgress => LastInstallStatus::IN_PROGRESS,
+            InstallStatus::SucceededVerified => LastInstallStatus::SUCCEEDED_VERIFIED,
+            InstallStatus::SucceededUnverified => LastInstallStatus::SUCCEEDED_UNVERIFIED,
+            InstallStatus::InstallerFailed => LastInstallStatus::INSTALLER_FAILED,
+            InstallStatus::Timeout => LastInstallStatus::TIMEOUT,
+        }
+    }
+}
+
+/// The record as this daemon reports it — in `roomler status`, in the
+/// startup log, and (P5) in its hello. Read fresh from disk every time: on
+/// Windows the new service starts while the watcher is still waiting on
+/// msiexec, so the verdict lands AFTER this process began and a one-time
+/// snapshot would show `InProgress` for the daemon's whole life.
+///
+/// ⚠️ Resolves the SAME `<log_dir>` the watcher wrote to only when this
+/// process runs in the role that spawned it. On a Windows SystemContext host
+/// that is the console-session worker (it runs the updater, the LocalAPI and
+/// the signaling loop), not the SCM host, whose log dir is `service-logs`.
+/// Field 2026-10-26 on the dev box: the 0.4.172 record sits under the console
+/// user's `%LOCALAPPDATA%`, where the worker's watcher wrote it; the SYSTEM
+/// profile's copy dates from July. A reader in the wrong role answers
+/// `Absent` honestly, and `path` says where it looked.
+pub fn last_install_status() -> LastInstallStatus {
+    summarize(read_outcome(), outcome_path().as_deref())
+}
+
+/// Pure half of [`last_install_status`]: one word from what the read
+/// returned, every field of the record carried along.
+///
+/// ⚠️ `Absent` and `InProgress` are DIFFERENT words on purpose. "No install
+/// has ever been recorded here" and "an install was recorded and its verdict
+/// never came" lead to opposite next actions, and the second is the exact
+/// state this FR was opened on (`last-install.json` frozen at `InProgress`
+/// for `agent-v0.4.16` on a host running 0.4.50). Folding them into one
+/// "nothing to show" would hide that bug one layer up from where it was found.
+pub(crate) fn summarize(
+    read: Result<Option<InstallOutcome>>,
+    path: Option<&std::path::Path>,
+) -> LastInstallStatus {
+    let path = path.map(|p| p.display().to_string());
+    let empty = |status: &str| LastInstallStatus {
+        status: status.to_string(),
+        expected_version: None,
+        new_binary_version: None,
+        started_unix: None,
+        finished_unix: None,
+        installer_exit_code: None,
+        note: None,
+        path: path.clone(),
+    };
+    match read {
+        Ok(None) => empty(LastInstallStatus::ABSENT),
+        Ok(Some(o)) => LastInstallStatus {
+            status: o.status.word().to_string(),
+            expected_version: Some(o.expected_version),
+            new_binary_version: o.new_binary_version,
+            started_unix: Some(o.started_unix),
+            finished_unix: o.finished_unix,
+            installer_exit_code: o.installer_exit_code,
+            note: (!o.note.is_empty()).then_some(o.note),
+            path,
+        },
+        Err(e) => LastInstallStatus {
+            // The chain, not just the outermost context: a context-less
+            // one-liner is how 21 consecutive watcher spawn failures read as
+            // noise for months (P2).
+            note: Some(format!("{e:#}")),
+            ..empty(LastInstallStatus::UNREADABLE)
+        },
+    }
+}
+
+/// The level a startup line about `li` belongs at. INFO is the two quiet
+/// states — a verified success and no record at all — plus a watcher that
+/// can still be at work; everything else is a WARN that wants a look,
+/// including the record this FR was opened on.
+pub(crate) fn startup_level(li: &LastInstallStatus, now_unix: u64) -> tracing::Level {
+    match li.status.as_str() {
+        s if s == LastInstallStatus::SUCCEEDED_VERIFIED || s == LastInstallStatus::ABSENT => {
+            tracing::Level::INFO
+        }
+        s if s == LastInstallStatus::IN_PROGRESS && !li.never_reported(now_unix) => {
+            tracing::Level::INFO
+        }
+        _ => tracing::Level::WARN,
+    }
+}
+
+/// Say at startup what the last install came to — one line, always prefixed
+/// `last install:`, so `journalctl -g "last install"` / `roomler logs --grep`
+/// finds it whatever the verdict. The seven words of [`LastInstallStatus`]
+/// each get their own sentence; the level is [`startup_level`]'s.
+pub fn log_at_startup() {
+    let li = last_install_status();
+    let now = unix_now();
+    let age_s = li.started_unix.map(|s| now.saturating_sub(s));
+    let status = li.status.as_str();
+    let expected = li.expected_version.as_deref().unwrap_or("-");
+    let note = li.note.as_deref().unwrap_or("");
+    let path = li.path.as_deref().unwrap_or("(no log dir)");
+    if startup_level(&li, now) == tracing::Level::INFO {
+        match status {
+            s if s == LastInstallStatus::ABSENT => tracing::info!(
+                path,
+                "last install: no record — this daemon's updater has not installed anything yet"
+            ),
+            s if s == LastInstallStatus::IN_PROGRESS => tracing::info!(
+                expected,
+                age_s,
+                "last install: in progress — the post-install watcher is still at work"
+            ),
+            _ => tracing::info!(
+                expected,
+                age_s,
+                version = li.new_binary_version.as_deref().unwrap_or("-"),
+                "last install: SucceededVerified"
+            ),
+        }
+    } else {
+        match status {
+            s if s == LastInstallStatus::IN_PROGRESS => tracing::warn!(
+                expected,
+                age_s,
+                path,
+                "last install: NEVER REPORTED — the watcher wrote InProgress and no verdict followed; it was killed before it could write one (FR-67)"
+            ),
+            s if s == LastInstallStatus::UNREADABLE => {
+                tracing::warn!(path, error = note, "last install: record UNREADABLE")
+            }
+            _ => tracing::warn!(
+                status,
+                expected,
+                age_s,
+                exit = ?li.installer_exit_code,
+                note,
+                "last install: not a verified success — needs a look"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,6 +1409,168 @@ mod tests {
             !should_wait_for_installer(0, false),
             "pid 0 is not waitable — kill(0, 0) addresses the whole process group, so the poll would succeed forever"
         );
+    }
+
+    /// FR-67 P3 — the read half keeps "no record" and "a record whose verdict
+    /// never came" as two words. The second is the shape this FR was opened
+    /// on: `InProgress` for `agent-v0.4.16`, written 2026-08-29, still there
+    /// on a host running 0.4.50. One word for both would have hidden it.
+    #[test]
+    fn summarize_keeps_absent_and_in_progress_apart() {
+        let path = std::path::Path::new("/root/.local/share/roomler/logs/last-install.json");
+        let absent = summarize(Ok(None), Some(path));
+        assert_eq!(absent.status, LastInstallStatus::ABSENT);
+        assert_eq!(absent.expected_version, None);
+        assert_eq!(absent.started_unix, None);
+        assert_eq!(
+            absent.path.as_deref(),
+            Some(path.display().to_string().as_str())
+        );
+
+        let frozen = summarize(
+            Ok(Some(InstallOutcome {
+                installer_pid: 4242,
+                installer_path: "/tmp/roomlerd-0.4.16.deb".into(),
+                expected_version: "agent-v0.4.16".into(),
+                started_unix: 1_756_475_398,
+                finished_unix: None,
+                installer_exit_code: None,
+                new_binary_path: None,
+                new_binary_version: None,
+                status: InstallStatus::InProgress,
+                note: String::new(),
+            })),
+            Some(path),
+        );
+        assert_eq!(frozen.status, LastInstallStatus::IN_PROGRESS);
+        assert_eq!(frozen.expected_version.as_deref(), Some("agent-v0.4.16"));
+        assert_eq!(frozen.started_unix, Some(1_756_475_398));
+        assert_eq!(frozen.finished_unix, None);
+        assert_eq!(frozen.note, None, "an empty note is no note");
+        assert_ne!(frozen.status, absent.status);
+        // A day later it has not reported; a minute later it may still be
+        // the watcher at work (Windows: waiting on msiexec).
+        assert!(frozen.never_reported(1_756_475_398 + 86_400));
+        assert!(!frozen.never_reported(1_756_475_398 + 60));
+        assert!(!absent.never_reported(u64::MAX));
+
+        // The verdict the fleet reads today (mars, 0.4.172, 2026-10-25).
+        let ok = summarize(
+            Ok(Some(InstallOutcome {
+                installer_pid: 2_289_990,
+                installer_path:
+                    "/tmp/roomlerd-update.73eYDG/roomlerd-0.4.172-x86_64-unknown-linux-gnu.deb"
+                        .into(),
+                expected_version: "agent-v0.4.172".into(),
+                started_unix: 1_792_967_966,
+                finished_unix: Some(1_792_967_966),
+                installer_exit_code: Some(0),
+                new_binary_path: Some("/usr/bin/roomlerd".into()),
+                new_binary_version: Some("roomlerd 0.4.172".into()),
+                status: InstallStatus::SucceededVerified,
+                note: "new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into(),
+            })),
+            Some(path),
+        );
+        assert_eq!(ok.status, LastInstallStatus::SUCCEEDED_VERIFIED);
+        assert!(ok.is_verified_success());
+        assert_eq!(ok.new_binary_version.as_deref(), Some("roomlerd 0.4.172"));
+        assert_eq!(ok.installer_exit_code, Some(0));
+        assert_eq!(
+            ok.note.as_deref(),
+            Some("new binary at /usr/bin/roomlerd reports roomlerd 0.4.172")
+        );
+    }
+
+    /// FR-67 P3 — a record that is there and does not parse is its own word,
+    /// carrying the error chain: not `Absent` (the file exists), not a
+    /// verdict (there is none to read).
+    #[test]
+    fn summarize_unreadable_carries_the_error_chain() {
+        let err = anyhow::anyhow!("expected value at line 1 column 1")
+            .context("parsing /x/last-install.json");
+        let li = summarize(Err(err), Some(std::path::Path::new("/x/last-install.json")));
+        assert_eq!(li.status, LastInstallStatus::UNREADABLE);
+        let note = li.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("parsing /x/last-install.json") && note.contains("line 1 column 1"),
+            "the whole chain, not the outermost context: {note}"
+        );
+        assert_eq!(li.expected_version, None);
+    }
+
+    /// FR-67 P3 — the word on the wire IS the word in the file. The file is
+    /// serde's spelling of `InstallStatus`; the wire is [`InstallStatus::word`];
+    /// an operator grepping `SucceededVerified` must hit both, and the
+    /// watcher's own `post-install verdict: {:?}` line prints the same.
+    #[test]
+    fn install_status_words_match_the_file_spelling() {
+        for st in [
+            InstallStatus::InProgress,
+            InstallStatus::SucceededVerified,
+            InstallStatus::SucceededUnverified,
+            InstallStatus::InstallerFailed,
+            InstallStatus::Timeout,
+        ] {
+            let in_file = serde_json::to_string(&st).unwrap();
+            assert_eq!(in_file, format!("\"{}\"", st.word()), "{st:?}");
+            assert_eq!(
+                format!("{st:?}"),
+                st.word(),
+                "the verdict log line spells it the same"
+            );
+        }
+        // And the two words only the reader can say are not among them.
+        assert_ne!(LastInstallStatus::ABSENT, InstallStatus::InProgress.word());
+        assert!(serde_json::from_str::<InstallStatus>("\"Absent\"").is_err());
+        assert!(serde_json::from_str::<InstallStatus>("\"Unreadable\"").is_err());
+    }
+
+    /// FR-67 P3 — what wakes an operator and what does not: a verified
+    /// success and no record are INFO; so is a watcher that can still be at
+    /// work. A record frozen past the watcher's whole budget, an unreadable
+    /// file and every non-verified verdict are WARN.
+    #[test]
+    fn startup_level_warns_on_everything_but_the_quiet_states() {
+        let base = LastInstallStatus {
+            status: LastInstallStatus::SUCCEEDED_VERIFIED.into(),
+            expected_version: Some("agent-v0.4.172".into()),
+            new_binary_version: Some("roomlerd 0.4.172".into()),
+            started_unix: Some(1_000_000),
+            finished_unix: Some(1_000_000),
+            installer_exit_code: Some(0),
+            note: None,
+            path: None,
+        };
+        let with = |status: &str| LastInstallStatus {
+            status: status.into(),
+            ..base.clone()
+        };
+        let now = 1_000_000 + 30;
+        assert_eq!(startup_level(&base, now), tracing::Level::INFO);
+        assert_eq!(
+            startup_level(&with(LastInstallStatus::ABSENT), now),
+            tracing::Level::INFO
+        );
+        assert_eq!(
+            startup_level(&with(LastInstallStatus::IN_PROGRESS), now),
+            tracing::Level::INFO,
+            "30 s in, the watcher may still be waiting on the installer"
+        );
+        assert_eq!(
+            startup_level(&with(LastInstallStatus::IN_PROGRESS), 1_000_000 + 86_400),
+            tracing::Level::WARN,
+            "a day later nothing is still writing it"
+        );
+        for st in [
+            LastInstallStatus::SUCCEEDED_UNVERIFIED,
+            LastInstallStatus::INSTALLER_FAILED,
+            LastInstallStatus::TIMEOUT,
+            LastInstallStatus::UNREADABLE,
+            "SomeFutureWord",
+        ] {
+            assert_eq!(startup_level(&with(st), now), tracing::Level::WARN, "{st}");
+        }
     }
 
     #[test]
