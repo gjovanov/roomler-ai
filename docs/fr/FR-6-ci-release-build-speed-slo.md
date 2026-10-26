@@ -166,6 +166,12 @@ itself on the affected run's page. Baseline when the program started: releases t
       586 s were the final single-crate compile of `roomlerd` under `codegen-units=1`, which
       took 349 s on 0.4.114 for the same code: runner speed, not work. The remaining
       levers are the operator's (see Open decisions)
+      **Since wave 29 the compile is no longer the reason.** agent-v0.4.173 (2026-10-26,
+      run 40250842840) reused its rehearsal's build: MSI 4.0 min, `.pkg` 2.0, Linux 1.9
+      and 1.4. From the first build job to the post-release reseed, its own critical path
+      was about 7 min. It still took **17.0 min** on the clock, because its jobs waited up
+      to 10 min for a runner (the account runs at most 20 jobs at once). Still unmet: the
+      box is ticked when a tag lands under 10 min on the clock.
 
 ## Open decisions / residual levers (all trade-offs, not waste)
 
@@ -808,3 +814,37 @@ itself on the affected run's page. Baseline when the program started: releases t
       On four cores, 4 units beat 16. The macOS release build spent 564 s in the
       `roomlerd` lib and 229 s in its bin (`main.rs`) of 858 s. The two run one after the
       other, and each is a single crate.
+- 2026-10-26: **wave 29 field-verified on agent-v0.4.173.**
+  - The macOS re-probe (40230929108) passed. The fixed check ran the reused binary
+    with the vendored FFmpeg as its library path: `reused build reports 'roomlerd 0.4.171'
+    (want 0.4.171): OK`. On macOS, codegen-units 4 took 494 s and 16 took 439 s, against
+    766 s at 1, for +14.2% and +23.7% gzip size.
+  - **The real workflow, before any release depended on it:**
+    - The post-merge master reseed (40244838141, `30f6aa5ca`) stamped all 8 build jobs
+      (`tree=1a584f76… job=Release roomlerd/<job>`), the two Windows jobs included, so a
+      fresh Windows checkout reads as clean.
+    - A same-tree dress rehearsal (40247220674, on a temporary branch at `30f6aa5ca`)
+      then reused in all 8 jobs. The daemon build steps took 3–43 s, and all four version
+      checks passed, the two Linux jobs that no probe had covered included.
+  - **0.4.173**, cut by roomler-ai-7e at `0040f6bb7` (tree `99bc30a6276b`), with no release
+    dispatch between rehearsal and tag:
+    - Rehearsal 40249389321: every job found the reseed's stamp for another tree,
+      rebuilt as before, and stamped its own: 8 of 8.
+    - Tag 40250842840: 8 of 8 jobs reused the build, and the 4 daemon jobs reported
+      `roomlerd 0.4.173`.
+
+    | job | 0.4.172 tag | 0.4.173 rehearsal | 0.4.173 tag | build step |
+    |---|---|---|---|---|
+    | .msi (Windows) | 17.6 min | 16.1 | **4.0** | 38 s |
+    | .pkg (macOS) | 12.8 | 16.3 | **2.0** | 8 s |
+    | .deb (Linux x86_64) | 11.5 | 12.4 | **1.9** | 6 s |
+    | .deb (Linux aarch64) | 10.7 | 11.8 | **1.4** | 4 s |
+    | the four companions | 3.7–6.2 | 4.4–7.0 | 3.0–4.2 | 114–149 s |
+
+  - The build jobs' runner time fell from about 72 min to about 24.
+  - End-to-end, the run took 17.0 min against 18.7. The jobs queued for runners: the first
+    build job started 3 min in, and the MSI job 10 min in. Their own critical path was
+    about 7 min.
+  - ⚠️ The companions still recompile `roomler-desktop`. Tauri regenerates its gitignored
+    `gen/schemas/` (#2894), so its build script reruns on a fresh checkout. Carrying
+    `agents/*/gen/` in the seed is the open fix.
