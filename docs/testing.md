@@ -600,3 +600,44 @@ corporate laptop, a real relay path, or both:
 - It is **opt-in** (`--lane stress`) and takes about 2 h 50 min for both arms. The target list,
   credentials and the client key live in a private env file on the driver host, never in git — they
   name real machines.
+
+## The room-capacity bench (FR-115 O4)
+
+What one meeting room carries. A room is one mediasoup router on one worker thread, and
+nothing pipes a room across workers, so this measures the room's ceiling directly: one worker
+with production's settings (`media::worker_pool::worker_settings`) and one router with
+production's codecs (`media::room_manager::media_codecs`), under synthetic participants that
+send what the client sends (one VP8 camera stream with no simulcast and one Opus stream each,
+every participant consuming every other one's).
+
+```bash
+RUST_LOG=warn cargo run --release -p roomler-ai-mod-conference --example room_capacity -- \
+    --steps 5,10,15,20,25,30 --video-kbps 1700     # 0 = audio only
+```
+
+```mermaid
+flowchart LR
+  G["generator thread<br/>Opus every 20 ms, a VP8 frame every 1/fps"] -->|RTP| ST["N send PlainTransports<br/>(comedia)"]
+  ST --> W(("ONE worker thread<br/>production settings"))
+  W -->|"SRTP, N·(N−1) per stream"| RT["N recv PlainTransports"]
+  RT --> S["sink threads<br/>count RTP, not RTCP"]
+  P["/proc/self/task/TID/stat"] -.->|the worker thread's CPU| W
+```
+
+| Column | Means |
+|---|---|
+| `cpu_%` | the worker THREAD's CPU, from procfs. mediasoup's `get_resource_usage` is process-wide when the worker runs as a thread, so it would count the bench too |
+| `delivered` | RTP that reached the receivers over RTP that should have: each generated packet once per other participant. The knee is where it leaves 100 % |
+| `fwd_Mb/s` | what the worker says it sent (`rtp_bytes_sent`). Beside `out_Mb/s` it tells a slow receiver from a saturated worker |
+| `bench_%`, `late` | the bench's own CPU, and the sends its generator skipped. Neither may be the bottleneck |
+
+- ⚠️ **An upper bound.** ICE consent and DTLS, receiver RTCP (reports, transport-cc, NACKs),
+  retransmission and the senders' SRTP decryption are not modelled, and each costs the real
+  worker more.
+- ⚠️ **Run it on production's CPU class.** Measured 2026-10-26 (FR-115, *O4, measured*): the
+  knee with cameras on is N = 20 on a Zen 5 and N = 15 on a Zen 1.
+- `--log-level` overrides production's worker log level (mediasoup 0.20's default is `Debug`
+  with every tag on, whatever its doc says), and `--no-liburing` turns io_uring off. Neither
+  moved the knee. Each row's JSON twin (`O4 {…}`) records both settings.
+- A saturated worker floods the log with `BitrateProber … probe delay too high` WARNs, so
+  filter the output for the table rows.

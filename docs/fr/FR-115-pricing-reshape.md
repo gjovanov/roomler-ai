@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
-| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; still open, and the FR waits on them: the issue #2820 (P4c-1 moves a live TURN carrier only when the pair re-establishes; the real-pair test is done, *P4c, as built*) and O4's measurement. **O3 is complete** (2026-10-25, the field log). Free's and the paid rate keep typing, kernel-TCP bulk and a remote-desktop session over the overlay usable. roomler SSH's collapse under both was #2876, fixed by #2899, which shipped in agent 0.4.171 and was verified on the published build |
+| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; still open, and the FR waits on them: the issue #2820 (P4c-1 moves a live TURN carrier only when the pair re-establishes; the real-pair test is done, *P4c, as built*) and O4's decision. **O4 is measured** (2026-10-26, *O4, measured*): one room carries about 20 people with cameras on. **O3 is complete** (2026-10-25, the field log). Free's and the paid rate keep typing, kernel-TCP bulk and a remote-desktop session over the overlay usable. roomler SSH's collapse under both was #2876, fixed by #2899, which shipped in agent 0.4.171 and was verified on the published build |
 | **Arc** | P3 of the pricing sequence in [`../business-model.md`](../business-model.md) §5 (enforce → meter → **reshape** → keys) |
 | **Related** | [FR-32](FR-32-plan-limit-enforcement.md) (the one decision point), [FR-20](FR-20-per-tenant-relay-cost-metering.md) (the ledger), [FR-19](FR-19-peer-relays.md) (org relays), [FR-52](FR-52-cross-org-remote-access.md) (support sessions to other orgs), [FR-102](FR-102-growth-observability.md) (revenue view) |
 | **Private annex** | `roomler-ai-docs/gtm/pricing/FR-115-annex-census-2026-10-19.md` — per-org census, account counts, competitor detail |
@@ -751,6 +751,52 @@ roughly 500 consumers. A meeting where everyone sends a camera and a microphone 
 fits. Pro's 50 (P1 raised it from 10) and Business's 100 (unchanged) do not, unless a
 room is piped across workers. That is O4.
 
+### O4, measured: one room is one worker thread (2026-10-26)
+
+Prod gave nothing to measure (one audio-only sample in the whole retention window,
+2026-10-26), so the bench builds the room itself.
+`crates/modules/conference/examples/room_capacity.rs` drives one mediasoup worker with the
+production settings (`media::worker_pool::worker_settings`, now the one function the pool
+uses too) and one router with the production codecs (`media::room_manager::media_codecs`).
+Its synthetic participants send what the client sends (`ui/src/stores/conference.ts`): one
+VP8 camera stream with no simulcast and one Opus stream each, with every participant
+consuming every other one's. Each sends RTP into its own `PlainTransport` and receives on an
+SRTP-encrypting one, so the per-consumer encryption (the N² half of the work) is paid as on
+a `WebRtcTransport`. The CPU is the worker *thread's*, from procfs. `get_resource_usage` is
+process-wide when the worker runs as a thread.
+
+⚠️ **It is an upper bound.** Not modelled, and each makes the real cost higher: ICE
+consent checks and DTLS, receiver RTCP (reports, transport-cc feedback, NACKs) and
+retransmission, and decrypting the senders' SRTP.
+
+| Per participant | Host | Last N delivering ≥ 97 % | The next step |
+|---|---|---|---|
+| VP8 1.58 Mbit/s (Chrome's ceiling for the client's unconstrained 640×480 capture) + Opus 40 kbit/s | Ryzen 9 9955HX3D (Zen 5) | **20**: worker 99.8 %, 88,200 pkt/s out | 25: 60 % |
+| the same | Ryzen 7 1700X (Zen 1) | **15**: worker 85 % | 20: 35 % |
+| VP8 0.53 Mbit/s + Opus | Zen 5 | **30**: worker 100 %, 92,800 pkt/s | 35: 69 % |
+| Opus only, everyone unmuted | Zen 5 | **40**: worker 76 % | 50: 89 % |
+
+Production's nodes are Ryzen 9 7950X3D (Zen 4), between the two hosts and much nearer the
+first.
+
+- **The ceiling is packets, not bits.** One worker thread forwards about 85,000–110,000
+  packets a second, whatever their size: audio's small packets saturate it at 109,000.
+- **Neither knob moved it.** `WorkerSettings::default()` in mediasoup 0.20 runs the worker at
+  `Debug` with every log tag on, although its own doc says `Error`. `Warn` measured the same.
+  io_uring off measured the same.
+- **A saturated worker floods its log.** It emits `BitrateProber … probe delay too high` as a
+  WARN, about 3,300 lines in one run. Production's `warn` floor passes them, so an overloaded
+  room would also fill the pod's log.
+- **A pod gives its four workers two CPUs between them**
+  (`roomler-ai-deploy/k8s/base/deployment-roomler2.yaml`), so it carries at most about two
+  such rooms at once.
+- **The client has its own ceiling.** At 50 people each participant would receive
+  49 × 1.6 Mbit/s ≈ 78 Mbit/s, which a home uplink and a browser decoding 16 tiles do not
+  sustain either.
+
+So neither Pro's 50 nor Business's 100 fits one room as built: about 20 people with
+cameras on. O4's two branches are the operator's to choose (*Open decisions*).
+
 ## Phases
 
 | Phase | What | Kill switch | Status |
@@ -791,7 +837,7 @@ room is piped across workers. That is O4.
 | O1 | Live Stripe prices: create the annual Prices and the EUR currency options in the live account, then set `ROOMLER__STRIPE__PRICE_PRO_ANNUAL`, `…__PRICE_BUSINESS_ANNUAL` and `ROOMLER__STRIPE__CURRENCIES=usd,eur` | **Decided 2026-10-20: yes, and done.** Both monthly Prices carry an EUR option at the USD number; annual Prices exist on the same products; the prod ConfigMap names them and sets `usd,eur` (the field log) |
 | O2 | Do pending invites count toward Free's 10? | no — a seat is a member who accepted |
 | O3 | Throttled rate for an over-allowance org | 1 Mbps per org on Free, 4 Mbps on paid plans, measured before it ships |
-| O4 | Pro's 50 and Business's 100 people per meeting, against one mediasoup worker per room (*Meetings, as built*) | the numbers stay as published; a synthetic-participant load test measures what one room carries, then either a room pipes across workers or the published numbers come down to the measured one |
+| O4 | Pro's 50 and Business's 100 people per meeting, against one mediasoup worker per room (*Meetings, as built*) | the numbers stay as published; a synthetic-participant load test measures what one room carries, then either a room pipes across workers or the published numbers come down to the measured one. **Measured 2026-10-26: about 20 people with cameras on, 40 on audio alone** (*O4, measured*). Waiting on the operator: publish the measured number, or build the scaling (simulcast, receiving only the visible tiles, a room piped across workers) as its own FR and re-measure |
 | O5 | AC10's "no per-org view counts them". Admin stats, plan compliance and weekly active orgs exclude the 62 tombstoned orphans. FR-102's growth **Orgs** list shows them with an *archived* chip, and a cohort view asked for more than its default 26 weeks would count them in their February cohorts. Hiding archived orgs outright would also hide an owner's own archive, which is the churn signal that list is for | **Decided 2026-10-20: remove them completely, and done.** Every document of the 62 is deleted (the field log), so no view lists or counts them |
 | O6 | Whose plan pays for an external (FR-52) session (*P3b, as proposed*)? | **Decided 2026-10-20 (operator): it uses the quota of the org it is for, at that org's tier.** The outsider picks the org on `/connect`, from all of their orgs, and the session takes one of that org's concurrent-session slots. An account in no org uses Free's quota (one session), counted against the account; the operator confirmed this case on 2026-10-21 |
 | O7 | Do accounts in no paid org get no external sessions? | **Decided 2026-10-20 (operator): no, no paid org is needed.** FR-52's helping-a-friend case keeps working without membership |
@@ -852,3 +898,4 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-25 | **O3, the paid rate**, on the operator's go. The same throwaway org was switched Free → Pro by a direct write to its `plan`. It had no billing, so it counted one seat. A synthetic DERP row put it past Pro's one-seat allowance, so the set held its network at 500,000 B/s. Afterwards it went back to Free, with every row it got deleted (`plan=free`, `billing=null`, the set absent). Each run is 8 MiB from the device to the client | **HTTP over kernel TCP: 3.62 and 3.63 Mbit/s.** `scp` over roomler SSH: 0.4.170 **did not finish in 150 s** (2.6 MB and 3.7 MB), while smoltcp 0.14 held **3.23 and 3.21 Mbit/s** (89% of kernel TCP). Typing on 0.14 beside an 8 MiB bulk: 60/60 keystrokes, p50 2 / p95 11 / max 43 ms. The paid bucket behaves like Free's at four times the rate, and #2876 is no artefact of Free's low one (#2557 -6401254452) |
 | 2026-10-25 | **#2876 on the published agent 0.4.171** (tagged `agent-v0.4.171` on `0831dd289`, published 18:28:01Z, 37 assets). The binary under test came out of the released x86_64 `.deb`, whose SHA-256 matched its published sidecar. It was interleaved with 0.4.170 on the device node under Free's throttle, each run a 1 MiB `scp` | **0.4.171: 803, 804 and 538 kbit/s**, each done in 10–16 s, with every file's SHA-256 intact. **0.4.170: 77 kbit/s, then not finished in 150 s** (999,424 B). Kernel TCP: 0.86 Mbit/s. **#2876 and #2882 closed** (-6401683455, -6400998813). The throttle was lifted, and the org's rows deleted |
 | 2026-10-25 | **O3, a remote-desktop session over the overlay**, the last O3 item (#2557 -6402633621). A new node in the throwaway org ran the published 0.4.171 with its own desktop: Xvfb at 1280×720 with openbox, a clock, a terminal and xeyes. Its `rc_overlay` was on, and its UDP was open only to DNS and the overlay prefix. The viewer was the remote-desktop e2e spec's headless Chromium, inside the client node's network namespace. As FR-121 provides, it named the device it runs on, so the server handed it that device's loopback relay; every other TURN server was stripped. So the only possible pair was overlay to overlay, and every session selected the agent's candidate on its overlay address. Each session is 60 s, **light** (the clock plus a terminal redrawing twice a second) or **heavy** (plus a full-screen terminal scrolling without pause) | **Light:** fps p50 16 unthrottled (308 kbit/s), **16 at Free's rate** (346 kbit/s), **17 at the paid rate** (372 kbit/s), so unaffected. **Heavy:** fps p50 40 unthrottled (3.1 Mbit/s), **12 at Free's** (634 kbit/s), **27 at the paid** (2.67 Mbit/s). The stream is held to the bucket and degrades without stalling. In all six sessions: connect 0.31–0.45 s, first frame 1.5–2.4 s, RTT p50 4–11 ms, **no sample at zero fps**. With the bulk and typing rows above, 1 Mbit/s keeps the mesh usable, so the policy and the Free rate stand. **O3 is complete.** Afterwards the org went back to Free with every row deleted. A first driver run died when a bulk agent update restarted the rig host's own daemon mid-run (its systemd cgroup took the job), which left the Free throttle on until it was cleaned by hand. The rerun used a transient unit |
+| 2026-10-26 | **O4: what one room carries.** Prod first: a read-only aggregate of `stats_call_user` found one audio-only sample (33 kbit/s up) in the whole retention window, so no field calibration exists. Then `examples/room_capacity.rs` (*O4, measured*), production's worker settings and codecs, on a Ryzen 9 9955HX3D and on a Ryzen 7 1700X. Each step held 5 s, then 15 s measured, ramping N until under 90 % delivered | **Cameras at Chrome's 640×480 ceiling (1.58 Mbit/s VP8 + 40 kbit/s Opus):** delivered 100 % up to N = 20 (worker 99.8 %, 88,200 pkt/s, 653 Mbit/s), 60 % at 25. On Zen 1: 100 % at 15 (85 %), 35 % at 20. **0.53 Mbit/s VP8:** 100 % at 25 (89 %), 97 % at 30 (100 %), 69 % at 35. **Audio only:** 100 % at 40 (76 %), 89 % at 50 (100 %, 109,000 pkt/s). `--log-level warn` and `--no-liburing` measured the same as production's defaults. A saturated worker logged about 3,300 `BitrateProber … probe delay too high` WARNs. **One room carries about 20 people with cameras on, against Pro's 50 and Business's 100** |
