@@ -2483,12 +2483,18 @@ mod tests {
         assert!(!outcome.stdout.contains("should-never-run"));
     }
 
+    /// #3002 — sized for a loaded runner, because no test that takes it is
+    /// about the deadline. Under the whole Windows suite, a PowerShell
+    /// one-liner (the auto shell) took 8–10+ s to run on the 4-core runner.
+    /// A test about timing out sets its own `timeout_ms`.
+    const TEST_DEADLINE_MS: u64 = 60_000;
+
     fn req(command: &str) -> ExecRequest {
         ExecRequest {
             request_id: "t1".into(),
             shell: String::new(),
             command: command.into(),
-            timeout_ms: 10_000,
+            timeout_ms: TEST_DEADLINE_MS,
             max_output_bytes: 0,
             cwd: None,
             caller: "test".into(),
@@ -2554,8 +2560,11 @@ mod tests {
             .await;
         assert_eq!(out.error, None, "stderr was: {}", out.stderr);
         assert!(out.stdout.contains("hello"), "stdout was: {:?}", out.stdout);
+        // Waiting on the feed would run into the deadline, so returning well
+        // before it is the property. A fixed 8 s was not: on a busy runner,
+        // starting PowerShell alone took 8.2–8.4 s (#3002).
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(8),
+            started.elapsed() < std::time::Duration::from_millis(TEST_DEADLINE_MS / 2),
             "the engine waited on the feed: {:?}",
             started.elapsed()
         );
