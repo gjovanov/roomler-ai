@@ -595,7 +595,7 @@ sequenceDiagram
   Note over D,W: the daemon keeps its end of the pipe open for the worker's life
   D->>D: dies without its clean shutdown - exit(2), a crash, kill -9
   Note over W: the pipe closes - end-of-file on stdin
-  W->>W: internal shutdown, marked clean
+  W->>W: internal shutdown - a stop that completes is marked clean
   L->>D: KeepAlive starts a new daemon
   D->>D: reap - stop any worker still running run --supervised
   D->>W: spawn a fresh worker on the current release
@@ -604,7 +604,7 @@ sequenceDiagram
 | Mechanism | How | Catches |
 |---|---|---|
 | **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:630`, `:514`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:460`, `:504`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person: SIGTERM, 2 s, then SIGKILL (`macos_supervisor.rs:799`, `:441`). It runs at start, and again after a worker exits 0 within 30 s. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:799`, `:441`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
 | **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:459`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
@@ -614,10 +614,11 @@ end-of-file where the offer would be, arms nothing and behaves as before. Which
 release is on disk is never known at spawn time, because an update replaces the
 binary under a running daemon.
 
-⚠️ **The worker leaves as an update would, not as an OS stop.** The run is
-marked clean, so the crash-and-rollback counter never counts it. An ephemeral
-device does not unenroll, and the next daemon's worker comes up on the same
-enrollment.
+⚠️ **The worker leaves as an update would, not as an OS stop.** A stop that
+completes marks the run clean, so the crash-and-rollback counter never counts
+it. An ephemeral device does not unenroll, and the next daemon's worker comes
+up on the same enrollment. The 15 s backstop's exit is unclean on purpose: it
+fires only when that stop wedged.
 
 ⚠️ The reap matches the whole command line, and nothing else: `--supervised` is
 on no command line but the one `spawn_worker` builds. A hand-run `roomlerd run`,
