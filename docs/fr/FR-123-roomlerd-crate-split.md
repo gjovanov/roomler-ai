@@ -1,8 +1,9 @@
 # FR-123: The daemon compiles in parallel — `roomlerd` split into sibling crates
 
-**Issue:** [#2941](https://github.com/gjovanov/roomler-ai/issues/2941) · **Status:** P2 in flight 2026-10-27 —
-spec, claim, the Phase 0 measurements and two probes on the release runners; the operator decided A as P2 and
-holds P1 (#2944, a draft) for a re-measurement on top of A · **Owner:** the agent's build shape (with FR-6 for the lane and
+**Issue:** [#2941](https://github.com/gjovanov/roomler-ai/issues/2941) · **Status:** P2 merged 2026-10-27
+(#2999, master `ae5ca6f6e`): the daemon compiles as one unit, measured −14.3 % / −30.5 % of its compile and
+−5.6 % / −11.6 % of binary on the release runners; the field proof is the next release's rehearsal timing
+(0.4.180), still open; P1 (#2944) held, a draft · **Owner:** the agent's build shape (with FR-6 for the lane and
 FR-90 P8 for Hive's crate) · **Anchors:** master `12a0edc81` (2026-10-26) unless a row says otherwise ·
 **Parent:** [FR-6](FR-6-ci-release-build-speed-slo.md) (#773), whose residual lever this is
 
@@ -491,7 +492,7 @@ v2 runners (§2.4):
 | binary | **−5.5 % Windows, −11.5 % macOS (measured)**: the duplicated generics vanish | today's: two units still instantiate the same generics twice |
 | packages | none change; `roomlerd` keeps its lib and bin | the lib and the bin must sit in different packages (a package's bin may not depend on a crate that depends on the package's lib) |
 | the lane | untouched | layout (ii) below leaves it untouched; (i) changes four build lines |
-| what else | `main.rs`'s tests (`agents/roomlerd/src/app.rs:6682` after the rename) start running under `--lib`; 59 anchors in 30 docs take the new file name at the same numbers (FR-28's two `main.rs:N` are the API's and stay) | the same, plus the layout's CI edits |
+| what else | `main.rs`'s tests (`agents/roomlerd/src/app.rs:6685` after the rename) start running under `--lib`; 59 anchors in 30 docs take the new file name at the same numbers (FR-28's two `main.rs:N` are the API's and stay) | the same, plus the layout's CI edits |
 
 **A first, then B if more time is needed.** A is one moved file, no package change, and the only
 option that improves both axes — it buys 1.2 MB of MSI headroom on Windows against a 22.00 MB
@@ -515,7 +516,7 @@ How A is cut, so that it is the measured shape and nothing else:
   file keeps its `roomlerd::` spelling (219 sites) behind `extern crate self as roomlerd;` in
   `lib.rs`, so an edit in flight on the old file still applies *and compiles* when its branch
   rebases. The `crate::` respelling is a later, quiet commit once the open PRs have landed.
-- **Its tests run for the first time.** `app::tests` (`agents/roomlerd/src/app.rs:6682`) — the CLI
+- **Its tests run for the first time.** `app::tests` (`agents/roomlerd/src/app.rs:6685`) — the CLI
   parses the wizard's snippets rely on, the config-path ladder, the self-heal predicate, the
   retired-spelling guard — ran in no lane while they were a bin's; under `--lib` the Linux, Windows
   and macOS unit steps now run them. They are pure (clap parses, pure predicates, a process-env
@@ -575,7 +576,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 |---|---|---|---|
 | **P0** | this spec, the claim, the Phase 0 measurements (§2.2) and the probes (§2.4, §8) | runs 40303391151 (v1), 40308429566 (v2) | spec PR #2942; v1 measured 2026-10-26, v2 in flight |
 | **P1** | `roomler-node-tunnel` (§3.4): the crate, the registry inversion, the licence tables, the CI lanes, the anchor pass | the v2 probe's same-runner A/B, Windows + macOS; then **re-measured on top of P2** (base vs A vs A + P1, one runner per OS) | PR #2944, every lane green; alone: −6.7 % / −12.6 % time, +3.4 % / +3.1 % size; **on top of A: −0.6 % / −1.4 % time, +4.1 % size** (§2.4 v3) — **held** (decision 7): A + P1 is still smaller than today (−1.7 % / −7.9 %), but P1 earns ~1 % now; the recipe waits for a sibling with sync work |
-| **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against today's base, after 0.4.178 has published (the probe waits out the release's queue) | **PR #2999** green (CI + the integration lane); **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size** (§2.4 v3) |
+| **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against 0.4.178's tree (§2.4 v3); the field proof is 0.4.180's rehearsal build steps (AC1) and its MSI size notice (AC2) | **merged** 2026-10-27, #2999 → master `ae5ca6f6e`; **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size**; the release proof open |
 | **P3** | `roomler-node-media` (§3.5), in a merge window FR-118/119 agree to | same-runner A/B, sibling by sibling | after P2 |
 | **P4** | `roomler-node-host` (§3.7) | same-runner A/B | after P3 (or before, if P3's window is late) |
 | **P5** | Hive's crate — FR-90 P8-1, with the dependency property of §3.1 | FR-90's | FR-90's schedule |
@@ -587,14 +588,20 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
   each ≥ 30 % shorter than 0.4.173's rehearsal (13.8 min and 18.2 min for the whole build step on
   0.4.171's; the daemon's lib + bin 494 s on Windows, 674–793 s on macOS) on three consecutive
   releases, and each phase's same-runner A/B (§4) shows its own share.
-- [ ] **AC2 — the binary is the same size.** `roomlerd.exe`, the macOS `roomlerd`, the `.deb`'s
-  `roomlerd` and both MSIs are within ±1 % of the release before each phase (the MSI size step's
-  `::notice::` lines; the `.deb`/`.pkg` asset sizes on the release).
+  *P2's share, measured (§2.4 v3, 2026-10-27, the release runners, one per OS): the daemon's lib + bin
+  719 → 617 s on Windows (−14.3 %), 977 → 679 s on macOS (−30.5 %). The release-side half — the
+  rehearsal's MSI and `.pkg` build steps — is 0.4.180's and after; open until it is read off three.*
+- [ ] **AC2 — the binary is no larger.** `roomlerd.exe`, the macOS `roomlerd`, the `.deb`'s
+  `roomlerd` and both MSIs are within +1 % of the release before each phase, and smaller is fine (the
+  MSI size step's `::notice::` lines; the `.deb`/`.pkg` asset sizes on the release). *Reworded
+  2026-10-27 from "within ±1 %": P2 made the binary smaller — −5.6 % on Windows, −11.6 % on macOS
+  (§2.4 v3) — which the old wording would have failed. The release-side reading is 0.4.180's.*
 - [ ] **AC3 — no behaviour change.** Every CI lane green on every PR, including the `--features full`
   clippy step, the Windows and macOS lanes and the integration lane dispatched on the branch; then one
   real release carrying each phase installs on the fleet through the normal update, and the post-roll
   check passes: version on the online agents, a remote-desktop session, an overlay pair, a tunnel
-  forward.
+  forward. *P2: every lane green on #2999 (23 pass) and the integration lane on the branch (run
+  40558500035, 242 pass); the release and the post-roll check are 0.4.180's.*
 - [ ] **AC4 — the anchors hold.** For every PR: `anchor-xcheck.pl` reports no MISMATCH over all of
   `docs/` and `ui/docs/`, `scripts/anchor-range-audit.sh` reports no fault, dated field-log rows keep
   their anchors, and moved files' bodies are byte-identical to their base (rule 2).
@@ -666,3 +673,4 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-27 12:40Z | The operator decided 5 and 7: A is P2; P1 is held and re-measured on top of A | recorded in §3.6, §4, §6 |
 | 2026-10-27 | P2-A cut on master `208e42385` (0.4.178): `git mv src/main.rs src/app.rs` (7 lines changed in 6,987, every anchor keeps its number), the bin `src/bin/roomlerd.rs` one call, `extern crate self as roomlerd;`, 59 anchors re-pathed in 30 docs plus the two pinned inverted ranges' baseline lines; `app::tests` run locally for the first time (see the PR) | **PR #2999** open (17 `app::tests` pass on both feature sets, the Windows-line lib suite 2,487 pass); the same-runner probe (base vs A vs A + P1) waits for 0.4.178 to publish |
 | 2026-10-27 14:32Z | Probe v3 (run 40515195900): base → A → A + P1 on one runner per OS, 0.4.178 published 13:06Z/13:47Z | Windows 719.2 → 616.5 s (A, −14.3 %) / 612.5 (A + P1); macOS 976.6 → 678.7 (−30.5 %) / 668.9. Size: A −5.6 % / −11.6 %; A + P1 −1.7 % / −7.9 % (+4.1 % over A). Table and reading in §2.4; #2941 comment 6444750780 |
+| 2026-10-27 18:43Z | P2 merged: #2999 → master `ae5ca6f6e` (rebased three times under 0.4.179's freeze: #2940's anchor shifts, #3000's `main.rs` hunks carried into `app.rs` by the rename, the 0.4.179 bump); CI 23 pass, the integration lane on the branch green (run 40558500035, 242 pass); GitHub MERGEABLE / CLEAN before the merge | the daemon compiles as one unit on master; the release proof (AC1, AC2, AC3's post-roll check) is 0.4.180's |
