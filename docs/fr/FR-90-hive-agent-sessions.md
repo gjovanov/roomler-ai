@@ -4198,6 +4198,36 @@ sequenceDiagram
 ⚠️ On Windows the flow's end admits the daemon's own process alone. P8-2b admits the worker's pid
 there.
 
+**P8-2a-7, as built** (`agents/roomlerd/src/hive/worker/memory.rs`, Linux): a worker's memory,
+bounded, as P8-0's point 4 designed it and decision 66 sizes it. Where the service delegates a
+cgroup with the memory controller to the daemon's unit (systemd's `Delegate=`), each worker runs in
+a cgroup of its own below the unit's. A worker that runs away is then ended by the kernel inside
+its own cgroup, and costs only its own work (AC28). Where the service delegates none, the worker
+runs without a bound, and the daemon says so:
+
+```mermaid
+flowchart TB
+    U["roomlerd.service: the unit's cgroup<br/>no process of its own; hands memory down"] --> L["roomlerd: the daemon's leaf<br/>the daemon and its other children"]
+    U --> W1["hive-worker-1<br/>memory.max 512 MiB, swap 0"]
+    U --> W2["hive-worker-2<br/>memory.max 512 MiB, swap 0"]
+```
+
+| Piece | As built |
+|---|---|
+| where | only where the daemon's own unit, as `run` identified it, answers `Delegate=yes` with `memory` among its `DelegateControllers`, asked of systemd within 5 s. As root a cgroup write succeeds without any delegation, so nothing is tried on a guess |
+| the daemon | moved, with every process in the unit's cgroup, into a leaf of its own as the first worker starts: cgroup v2 hands a controller down only from a cgroup with no processes of its own. The unit's cgroup then hands `memory` down |
+| a worker | `hive-worker-<n>`, `memory.max` 512 MiB and `memory.swap.max` 0, since its memory holds the leases' values (as P8-2a-3's core limit keeps them out of a dump). It joins between fork and exec, writing itself into the cgroup's `cgroup.procs`, so it never runs a step outside it |
+| its end | its cgroup's `memory.events` read for an OOM kill, which is logged as what ended it; the cgroup removed |
+| a failure | delegated, and the cgroups cannot be made: no worker runs, as a worker that cannot set its limits never runs (P8-2a-3) |
+| no `oom_score_adj` | considered and left out: a worker that is the hog is the kernel's choice anyway, and one that is not would be killed in the hog's place |
+
+⚠️ `supervision::detect_here` reads `/proc/self/cgroup` once, at the daemon's start, before any
+worker exists. After the move the path's last component is the leaf, which it would not take for
+the unit.
+
+⚠️ The packaged units delegate nothing (decision 66), so a system install has the bound once its
+owner adds `Delegate=memory` (`docs/installation.md`, "A Hive session's worker and its memory").
+
 Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
 has the vault.
 
@@ -4465,7 +4495,8 @@ has the vault.
 | P8-2a-4a | the egress proxy's seams (§3i "P8-2a-4a, as built"): `Bindings` (the run's placeholders toward a host, and the same with each value read for one request) and `Leaves` (the run's CA's leaves) beside `Decide` and `Dial`, so nothing of the proxy reaches the daemon but through `Seams`; a request reads its audience's values once, and only when it carries an `Authorization`; no change of behaviour. 1 new test (a value read only for a request with an `Authorization`, and once) and the seams of 3 adapted; 5 negative controls, each caught at its own assertion | none (a refactor) | **merged** #2979 `cc7e4b3b4` |
 | P8-2a-4b | the egress proxy served in the session's worker (§3i "P8-2a-4b, as built"), Unix: the fronts bound as the run starts, from the device's `hive_worker`, and handed (two listeners across fd 4, a `Spec`) to each worker the run has, and at once to one already up; the daemon serves none of their connections and answers the worker's `decide` (its own decision, kept for the run; a host not in its one spelling refused), `bound`, `valued` (base64) and `leaf` (only for an audience of a placeholder the run holds; the CA's key never crosses), each on a task of its own; the run's end tells the worker to let go. Found: the worker logged nowhere (P8-2a-5's). 6 new tests (the calls round-trip whole, with no leaf's key and no value in a `Debug`; the daemon's answers from the run's own, a decision asked once and a host not in its one spelling refused, a leaf for an audience and none for another host; the device's setting choosing the worker or the daemon; the daemon serving no front itself; a placeholder swapped end to end through an in-process worker, under the daemon's leaf and with its value; a worker already up handed the fronts and letting go at their end) and P8-2a-1's and P8-2a-2's real-binary harnesses passing unchanged; 11 negative controls, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2980 `8ef7a4e32` |
 | P8-2a-5 | the worker's log in the daemon's (§3i "P8-2a-5, as built"), Unix: each of its lines, kept by the daemon's own filter, a `log` frame from its `ready` on, its queue never waited on (1024 lines; a line says how many were dropped); the daemon writes each at the worker's level, asked of its filter where the worker logged it (five callsites of its own, as `tracing-log` makes), beside the worker's process, as one line with its control characters escaped, at most 200 a second from one worker; a panic logged as it happens. 9 new tests (a line: its message, fields, level, and where it was logged, a `log` record's too; a line cut at its bound, on a character; a full queue dropping and counting, the count said after the next line; the daemon's bound a second; a line kept by the daemon's filter where the worker logged it; one line, its control characters escaped; a value logged by mistake naming nothing; the log crossing only from `ready` on; a worker's line written into the daemon's log) and both real-binary harnesses extended (the worker's `up` line after `ready`, and none at INFO under `RUST_LOG=warn`; a connection from another account refused in the worker, the refusal crossing as a line of its log, and no line holding the value); 13 negative controls, each caught at its own assertion. Found on the way: a probe test's closed port was bound and let go, and a listener beside it was given the port once; it is held now | device `hive_worker = false` (default) | **merged** #2981 `d36895a6e` |
-| P8-2a-6 | an endpoint through another device served in the session's worker too (§3i "P8-2a-6, as built"), Unix: the handed `Spec` names the flow's end, a loopback port the daemon's account alone may use, as the worker is; the worker dials it, TLS still verified against the upstream's own host; an end off this host refused; the flow stays the daemon's. 2 new tests (a spec through a flow naming its end and crossing whole, the worker dialling that end and refusing one off this host; an endpoint through a flow handed to the run's worker and served there, the upstream's own address answering nobody) and P8-2a-2's real-binary harness extended (the real worker reaching the upstream only through the flow's end, with the daemon's value, and refusing an end off this host); 5 negative controls, each caught at its own assertion. Found on the way: the P4-6-1b-2 test's closed port was bound and let go; it is held now | device `hive_worker = false` (default) | **in review** |
+| P8-2a-6 | an endpoint through another device served in the session's worker too (§3i "P8-2a-6, as built"), Unix: the handed `Spec` names the flow's end, a loopback port the daemon's account alone may use, as the worker is; the worker dials it, TLS still verified against the upstream's own host; an end off this host refused; the flow stays the daemon's. 2 new tests (a spec through a flow naming its end and crossing whole, the worker dialling that end and refusing one off this host; an endpoint through a flow handed to the run's worker and served there, the upstream's own address answering nobody) and P8-2a-2's real-binary harness extended (the real worker reaching the upstream only through the flow's end, with the daemon's value, and refusing an end off this host); 5 negative controls, each caught at its own assertion. Found on the way: the P4-6-1b-2 test's closed port was bound and let go; it is held now | device `hive_worker = false` (default) | **merged** #2982 `8b4bacc29` |
+| P8-2a-7 | a worker's memory, bounded (§3i "P8-2a-7, as built"), Linux: where the daemon's unit delegates a cgroup with the memory controller (asked of systemd, never guessed: as root a cgroup write succeeds without delegation), each worker in `hive-worker-<n>` below the unit's, `memory.max` 512 MiB and `memory.swap.max` 0, joined by the child itself between fork and exec; the daemon moved into a leaf of its own as the first worker starts; an OOM kill read from `memory.events` and logged; delegated and not made, no worker runs; decision 66 as recommended. 4 new tests (a unit delegates memory only with the controller named; the daemon's cgroup its v2 line, the unit's above its leaf; bounded only where the unit delegates memory, never on a guess, and an error where it does on cgroup v1 alone; an OOM kill read from `memory.events`) and one run in a real delegated cgroup, which CI has not (the daemon's processes in their leaf, the worker in its own cgroup at 512 MiB with no swap, the cgroup gone at its end; `#[ignore]`d in CI); 9 negative controls, each caught at its own assertion, four of them in the delegated cgroup | device `hive_worker = false` (default); no `Delegate=` (the packaged units) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
@@ -5701,6 +5732,20 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       customer's ask. Another answer changes P8-3 alone.
     - **Confirmed by the operator as recommended** (2026-10-27: "59-65 per your
       recommendation"): P8-3 waits for a customer's ask.
+66. **A worker's memory bound on Linux** (P8-2a-7), the operator's to confirm.
+    - *Recommended: 512 MiB and no swap, in a cgroup of its own, where the service delegates one;
+      the packaged units unchanged, and `docs/installation.md` naming the drop-in.*
+      - What it costs: a system install has no bound until its owner adds `Delegate=memory`. The
+        bound is not a key, so a worker that needs more is ended by the kernel until a release
+        raises it.
+    - *Or: the packaged units delegate* (`Delegate=memory` in `roomlerd.service` and
+      `roomler.service`), so every install that runs workers has the bound.
+      - What it costs: every Linux install's unit changes with an update. The daemon still moves
+        itself into its leaf only as its first worker starts.
+    - *Or: a device key for the bound* (`hive_worker_memory_mb`), beside either.
+      - What it costs: one more key, which an agent older than it drops (#2972).
+    - *Built as recommended* (2026-10-27), on the operator's "go next". Another answer changes
+      P8-2a-7's constant or the packaged units alone.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
