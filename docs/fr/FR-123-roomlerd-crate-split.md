@@ -304,6 +304,29 @@ measuring on one machine). "Critical path" is from the first of our units to sta
 - Pipelining did its part: the lib's front end started 3.8 s / 5.7 s in, the moment the sibling's
   metadata was out, and ran beside the sibling's codegen.
 
+**v3, after 0.4.178 published (run 40515195900, 2026-10-27, base = master `208e42385`; base → A → A + P1 back
+to back on one runner per OS):**
+
+| runner · variant | sibling | `roomlerd` lib: front end + codegen | bin | critical path | Δ time vs base | binary (gzip -9) | Δ size vs base |
+|---|---|---|---|---|---|---|---|
+| Windows · base | — | 90.5 + 369.6 = 460.1 s | 259.1 s | **719.2 s** | — | 65,310,720 (22,653,080) | — |
+| Windows · A | — | 68.4 + 545.8 = 614.2 s | 2.3 s | **616.5 s** | **−14.3 %** | 61,656,576 (21,467,569) | **−5.6 % (−5.2 %)** |
+| Windows · A + P1 | `roomler-node-tunnel` 3.7 + 47.8 = 51.5 s, beside the lib | 69.1 + 537.3 = 606.4 s, starting 3.8 s after the sibling | 2.3 s | **612.5 s** | **−14.8 %** (−0.6 % vs A) | 64,184,832 (22,281,882) | **−1.7 % (−1.6 %)**, +4.1 % vs A |
+| macOS · base | — | 105.2 + 572.8 = 678.0 s | 298.7 s | **976.6 s** | — | 55,191,184 (22,096,436) | — |
+| macOS · A | — | 110.7 + 564.2 = 674.9 s | 3.8 s | **678.7 s** | **−30.5 %** | 48,812,928 (19,723,284) | **−11.6 % (−10.7 %)** |
+| macOS · A + P1 | 5.6 + 54.6 = 60.2 s | 93.2 + 565.4 = 658.6 s | 4.7 s | **668.9 s** | **−31.5 %** (−1.4 % vs A) | 50,811,072 (20,522,873) | **−7.9 % (−7.1 %)**, +4.1 % vs A |
+
+- **A holds on today's tree**: −14.3 % / −30.5 % of the daemon's compile, −5.6 % / −11.6 % of binary. The
+  bin is 2–5 s; the former bin's 259–299 s are gone, not moved (the lib grew 154 s on Windows and not at
+  all on macOS: the duplicated instantiation vanishing).
+- **A + P1 is smaller than today on both OSes** (−1.7 % Windows, −7.9 % macOS), as decision 7 expected.
+  But P1's own share on top of A is −0.6 % / −1.4 % of time for +4.1 % of size: with the app inside the
+  lib, the hub instantiates the tunnel plane's generics whichever crate holds the files, so the sibling's
+  48–55 s of codegen overlap only the hub's front end, and the hub barely shrinks (614 → 606 s,
+  675 → 659 s). The v2 gain came from the lib losing those generics while the bin still carried its own
+  copies; A already collapses that. P1 stays held; its recipe is what a sibling with real sync work (the
+  media plane) reuses.
+
 ## 3. Key design
 
 ### 3.1 The target shape
@@ -551,8 +574,8 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | Phase | What | Measured by | Status |
 |---|---|---|---|
 | **P0** | this spec, the claim, the Phase 0 measurements (§2.2) and the probes (§2.4, §8) | runs 40303391151 (v1), 40308429566 (v2) | spec PR #2942; v1 measured 2026-10-26, v2 in flight |
-| **P1** | `roomler-node-tunnel` (§3.4): the crate, the registry inversion, the licence tables, the CI lanes, the anchor pass | the v2 probe's same-runner A/B, Windows + macOS; then **re-measured on top of P2** (base vs A vs A + P1, one runner per OS) | PR #2944, every lane green, **measured −6.7 % / −12.6 % time and +3.4 % / +3.1 % size**; **held** (decision 7, 2026-10-27): a draft until A lands, then re-measured on top of A |
-| **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against today's base, after 0.4.178 has published (the probe waits out the release's queue) | **PR #2999** open; the probe owed |
+| **P1** | `roomler-node-tunnel` (§3.4): the crate, the registry inversion, the licence tables, the CI lanes, the anchor pass | the v2 probe's same-runner A/B, Windows + macOS; then **re-measured on top of P2** (base vs A vs A + P1, one runner per OS) | PR #2944, every lane green; alone: −6.7 % / −12.6 % time, +3.4 % / +3.1 % size; **on top of A: −0.6 % / −1.4 % time, +4.1 % size** (§2.4 v3) — **held** (decision 7): A + P1 is still smaller than today (−1.7 % / −7.9 %), but P1 earns ~1 % now; the recipe waits for a sibling with sync work |
+| **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against today's base, after 0.4.178 has published (the probe waits out the release's queue) | **PR #2999** green (CI + the integration lane); **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size** (§2.4 v3) |
 | **P3** | `roomler-node-media` (§3.5), in a merge window FR-118/119 agree to | same-runner A/B, sibling by sibling | after P2 |
 | **P4** | `roomler-node-host` (§3.7) | same-runner A/B | after P3 (or before, if P3's window is late) |
 | **P5** | Hive's crate — FR-90 P8-1, with the dependency property of §3.1 | FR-90's | FR-90's schedule |
@@ -642,3 +665,4 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-26 11:35Z | P1 PR #2944: every CI lane green (23 pass, 1 skip), the integration lane dispatched on the branch green (run 40308764338); locally on Windows: 72 tests on both feature sets, clippy clean on three feature sets, `fmt`, SPDX, name audit, registry and range audits | **parked as a draft on the size finding** (decision 7); the recipe is proven |
 | 2026-10-27 12:40Z | The operator decided 5 and 7: A is P2; P1 is held and re-measured on top of A | recorded in §3.6, §4, §6 |
 | 2026-10-27 | P2-A cut on master `208e42385` (0.4.178): `git mv src/main.rs src/app.rs` (7 lines changed in 6,987, every anchor keeps its number), the bin `src/bin/roomlerd.rs` one call, `extern crate self as roomlerd;`, 59 anchors re-pathed in 30 docs plus the two pinned inverted ranges' baseline lines; `app::tests` run locally for the first time (see the PR) | **PR #2999** open (17 `app::tests` pass on both feature sets, the Windows-line lib suite 2,487 pass); the same-runner probe (base vs A vs A + P1) waits for 0.4.178 to publish |
+| 2026-10-27 14:32Z | Probe v3 (run 40515195900): base → A → A + P1 on one runner per OS, 0.4.178 published 13:06Z/13:47Z | Windows 719.2 → 616.5 s (A, −14.3 %) / 612.5 (A + P1); macOS 976.6 → 678.7 (−30.5 %) / 668.9. Size: A −5.6 % / −11.6 %; A + P1 −1.7 % / −7.9 % (+4.1 % over A). Table and reading in §2.4; #2941 comment 6444750780 |
