@@ -4263,8 +4263,73 @@ sequenceDiagram
 | its end | the job ended, and the process waited for (5 s). A peak at the bound is logged as what ended it |
 | the shared code | one supervisor and one worker loop for both systems: the channel's two halves are whatever each system's channel is. Each system keeps its own spawn and its own channels, and the vault's hand-overs stay Unix-only (`cfg(worker_calls)`, from `build.rs`) |
 
-⚠️ Before values cross to a Windows worker (P8-2b-2), its crash dump must carry no heap, as
-P8-2a-3 keeps a Unix worker's memory out of a core.
+⚠️ A Windows worker's crash keeps nothing of its memory, as P8-2a-3 keeps a Unix worker's out of a
+core — but by `SEM_NOGPFAULTERRORBOX`, not a heap-free dump (P8-2b-2, below): a `LocalDumps` full
+dump ignores `WerSetFlags(NOHEAP)`.
+
+**P8-2b-2, as built** (`agents/roomlerd/src/hive/worker/win.rs`,
+[`no_crash_dump`](../../agents/roomlerd/src/hive/worker/win.rs); `worker.rs`'s Windows
+`worker_main`). A Windows worker's crash keeps nothing of its memory. A worker holds the opened
+values of the leases it serves (once P8-2b-3 hands it endpoints), as a Unix worker does, and
+P8-2a-3 keeps a Unix worker's out of a core with a one-byte `RLIMIT_CORE`. Windows has no core
+limit; it has Windows Error Reporting, which an administrator or a vendor driver can point at a
+full on-disk dump (`LocalDumps`), and which by default writes a triage minidump and uploads a
+report. So the worker suppresses WER for itself.
+
+```mermaid
+sequenceDiagram
+    participant D as the daemon (SYSTEM)
+    participant W as roomlerd hive-worker
+    Note over W: worker_main, first of all: no_crash_dump
+    W->>W: SetErrorMode(mode | SEM_NOGPFAULTERRORBOX), read back
+    Note over W: not set? exit 3, never serve (as P8-2a-3's limits)
+    W-->>D: ready (so it armed the mode before it served)
+    Note over W: it faults
+    W--xW: no WER dump, no event 1000, no upload
+    W-->>D: exit code = the fault's NTSTATUS
+    Note over D: nothing else on the box recorded it, so the daemon names it
+```
+
+What was measured, as SYSTEM, with a full `LocalDumps` for the crashing process (any heap or stack
+marker found in a dump is a leak; "dump" = a full dump carrying both):
+
+| crash path | nothing set | `WerSetFlags(NOHEAP)` | top-level filter → `TerminateProcess` | job `DIE_ON_UNHANDLED_EXCEPTION` | own `SEM_NOGPFAULTERRORBOX` |
+|---|---|---|---|---|---|
+| access violation (main / spawned / pre-existing thread) | dump | dump | nothing | nothing | **nothing** |
+| `abort` → fail-fast `__fastfail` (main / spawned / pre-existing) | dump | dump | **dump** | **dump** | **nothing** |
+| out of memory at the bound (→ `handle_alloc_error` → abort) | dump | dump | dump | dump | **nothing** |
+| stack overflow | dump | — | nothing | — | **nothing** |
+| panic unwinding to exit 101 | nothing | — | — | — | — |
+
+Only the process's own `SEM_NOGPFAULTERRORBOX` held on every path and every thread. What follows,
+and what is built:
+
+| Piece | As built |
+|---|---|
+| the mechanism | the worker sets `SEM_NOGPFAULTERRORBOX` (`no_crash_dump`): WER then writes no dump, logs no Application Error event (1000) and uploads nothing when it faults. The bit is per process, so a thread that already runs is covered |
+| why not the others | `WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)` does not keep heap out of a `LocalDumps` dump; a top-level `SetUnhandledExceptionFilter` and the job's `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` are both skipped by a fail-fast, which is what Rust's `abort` raises — so by every OOM at the memory bound, the likeliest crash under a starve (AC28) |
+| when | before the worker takes its channel, and read back. A worker that cannot set it does not run (exit 3), as a Unix worker that cannot set its limits does not (P8-2a-3). Its stderr is `NUL`, so the refusal shows only as that exit code, which the daemon names |
+| the inherited mode is not relied on | the daemon under the SCM has error mode `0x8001` (no `SEM_NOGPFAULTERRORBOX`), and Rust's std does not set the bit (measured). The bit is OR'd in, so a `SEM_FAILCRITICALERRORS`/`SEM_NOOPENFILEERRORBOX` a launcher left on stays |
+| no trace but the daemon's | with the mode set, nothing else on the box records a worker's crash, so the daemon reads the exit code and names it (`InJob::ended`): `0xC0000005` an access violation, `0xC00000FD` a stack overflow, `0xC0000409` a fail-fast (a panic past its handler, or memory out at the bound — told apart by the job's peak), `0xC0000017` no memory. The daemon ends a worker's job with code `1`, which `TerminateJobObject` cannot write over a process that already faulted, so an ordinary end never reads as a crash |
+| the daemon's own dumps | left alone. `roomlerd` keeps reaching WER — its only trace of a native crash (a real 0.4.163 daemon crash sits in `ReportArchive` with a Microsoft bucket today). Whether the daemon too should keep its memory off disk is #2977, the operator's call; this step changes only the worker |
+
+Tests: one unit test in CI (the guard arms the bit and keeps the others; two negative controls, each
+caught at its own assertion — one where it does not set the bit, one where it overwrites the
+others). The real worker reaching `ready` proves it armed the mode before it served, since its
+read-back refuses otherwise (exit 3). The behavioral end to end — the real binary's crash writing no
+dump across the default, a machine-wide `LocalDumps` and an `AeDebug` postmortem debugger — runs on
+a throwaway Windows host (§8), since a reliable dump needs an administrator's `LocalDumps` key, which
+this step does not set on a working machine.
+
+⚠️ **The pagefile.** Windows has no per-process opt-out from paging, where Linux has
+`memory.swap.max 0` (P8-2a-7), so a worker's value could reach the pagefile while it runs. The
+levers are machine-wide (BitLocker, or `EncryptPagingFile`) or per-buffer (`VirtualLock` on the
+values later). Posed to the operator as **decision 67**: document it now, lock values in a later
+step only if asked.
+
+⚠️ **A dump an administrator takes on purpose** — Task Manager, procdump, a kernel memory dump, an
+IFEO `SilentProcessExit` on the image — is not suppressed, and is not meant to be: an administrator
+can read SYSTEM's memory anyway. What this closes is the dump that happens *without* anyone asking.
 
 Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
 has the vault.
@@ -4535,7 +4600,8 @@ has the vault.
 | P8-2a-5 | the worker's log in the daemon's (§3i "P8-2a-5, as built"), Unix: each of its lines, kept by the daemon's own filter, a `log` frame from its `ready` on, its queue never waited on (1024 lines; a line says how many were dropped); the daemon writes each at the worker's level, asked of its filter where the worker logged it (five callsites of its own, as `tracing-log` makes), beside the worker's process, as one line with its control characters escaped, at most 200 a second from one worker; a panic logged as it happens. 9 new tests (a line: its message, fields, level, and where it was logged, a `log` record's too; a line cut at its bound, on a character; a full queue dropping and counting, the count said after the next line; the daemon's bound a second; a line kept by the daemon's filter where the worker logged it; one line, its control characters escaped; a value logged by mistake naming nothing; the log crossing only from `ready` on; a worker's line written into the daemon's log) and both real-binary harnesses extended (the worker's `up` line after `ready`, and none at INFO under `RUST_LOG=warn`; a connection from another account refused in the worker, the refusal crossing as a line of its log, and no line holding the value); 13 negative controls, each caught at its own assertion. Found on the way: a probe test's closed port was bound and let go, and a listener beside it was given the port once; it is held now | device `hive_worker = false` (default) | **merged** #2981 `d36895a6e` |
 | P8-2a-6 | an endpoint through another device served in the session's worker too (§3i "P8-2a-6, as built"), Unix: the handed `Spec` names the flow's end, a loopback port the daemon's account alone may use, as the worker is; the worker dials it, TLS still verified against the upstream's own host; an end off this host refused; the flow stays the daemon's. 2 new tests (a spec through a flow naming its end and crossing whole, the worker dialling that end and refusing one off this host; an endpoint through a flow handed to the run's worker and served there, the upstream's own address answering nobody) and P8-2a-2's real-binary harness extended (the real worker reaching the upstream only through the flow's end, with the daemon's value, and refusing an end off this host); 5 negative controls, each caught at its own assertion. Found on the way: the P4-6-1b-2 test's closed port was bound and let go; it is held now | device `hive_worker = false` (default) | **merged** #2982 `8b4bacc29` |
 | P8-2a-7 | a worker's memory, bounded (§3i "P8-2a-7, as built"), Linux: where the daemon's unit delegates a cgroup with the memory controller (asked of systemd, never guessed: as root a cgroup write succeeds without delegation), each worker in `hive-worker-<n>` below the unit's, `memory.max` 512 MiB and `memory.swap.max` 0, joined by the child itself between fork and exec; the daemon moved into a leaf of its own as the first worker starts; an OOM kill read from `memory.events` and logged; delegated and not made, no worker runs; decision 66 as recommended. 4 new tests (a unit delegates memory only with the controller named; the daemon's cgroup its v2 line, the unit's above its leaf; bounded only where the unit delegates memory, never on a guess, and an error where it does on cgroup v1 alone; an OOM kill read from `memory.events`) and one run in a real delegated cgroup, which CI has not (the daemon's processes in their leaf, the worker in its own cgroup at 512 MiB with no swap, the cgroup gone at its end; `#[ignore]`d in CI); 9 negative controls, each caught at its own assertion, four of them in the delegated cgroup | device `hive_worker = false` (default); no `Delegate=` (the packaged units) | **merged** #2983 `76e8b1eb3` |
-| P8-2b-1 | the worker on Windows (§3i "P8-2b-1, as built"), its process and its channel: a pipe of its own, its DACL the daemon's account alone, its client end the one handle the worker inherits (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, beside `NUL`), found by `ROOMLERD_HIVE_WORKER_CHANNEL`; started suspended into a job of its own (`KILL_ON_JOB_CLOSE`, 512 MiB a process) as the daemon's identity, then resumed; the same supervisor, handshake, heartbeat, restarts and log as on Unix; no endpoint served there yet (P8-2b-2). 3 new tests on Windows (a worker's pipe has its two ends alone, one instance, a frame either way; the daemon keeps a worker up over its pipe; a worker starts into a job of its own, in it before it runs, the job ending what is in it, 512 MiB a process, and ended at once at its end) and the real `roomlerd.exe` started as the daemon starts it (its pipe found, `ready` with its own pid at this build's version, each beat answered, its end at `bye`; `#[ignore]`d in CI, which builds no binary for a lib test); the Unix suite unchanged (607); 6 negative controls on Windows, each caught at its own assertion | device `hive_worker = false` (default) | **in review** |
+| P8-2b-1 | the worker on Windows (§3i "P8-2b-1, as built"), its process and its channel: a pipe of its own, its DACL the daemon's account alone, its client end the one handle the worker inherits (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, beside `NUL`), found by `ROOMLERD_HIVE_WORKER_CHANNEL`; started suspended into a job of its own (`KILL_ON_JOB_CLOSE`, 512 MiB a process) as the daemon's identity, then resumed; the same supervisor, handshake, heartbeat, restarts and log as on Unix; no endpoint served there yet (P8-2b-3). 3 new tests on Windows (a worker's pipe has its two ends alone, one instance, a frame either way; the daemon keeps a worker up over its pipe; a worker starts into a job of its own, in it before it runs, the job ending what is in it, 512 MiB a process, and ended at once at its end) and the real `roomlerd.exe` started as the daemon starts it (its pipe found, `ready` with its own pid at this build's version, each beat answered, its end at `bye`; `#[ignore]`d in CI, which builds no binary for a lib test); the Unix suite unchanged (607); 6 negative controls on Windows, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2984 `aee65c269` |
+| P8-2b-2 | a Windows worker's crash keeps nothing of its memory (§3i "P8-2b-2, as built"): `SEM_NOGPFAULTERRORBOX` set in `worker_main` before the channel (`no_crash_dump`), so WER writes no dump, no Application Error event and no upload for the worker, on every fault path and thread; a worker that cannot set it does not run (exit 3). Measured as SYSTEM with a full `LocalDumps` (§8): `WerSetFlags(NOHEAP)`, a top-level filter and the job's `DIE_ON_UNHANDLED_EXCEPTION` each leak on some path (a fail-fast — Rust's `abort`, so every OOM at the bound — skips the filter and the flag); only the own-process mode held on every one. With it, nothing on the box records a worker's crash, so the daemon reads the exit code and names the fault (`InJob::ended`), ending the job with a code that never reads as one. 1 new unit test on Windows (the guard arms the bit, keeps the others; 2 negative controls, each caught at its own assertion) and the real worker's `ready` proving it armed the mode before serving; the behavioral matrix (the real binary, machine-wide `LocalDumps`, `AeDebug`) on a throwaway Windows host (§8). Decision 67 (the pagefile) posed. The daemon's own dumps are #2977 | device `hive_worker = false` (default) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
