@@ -449,7 +449,7 @@ impl ScreenCapture for SyntheticCapture {
             height: self.height,
             stride: self.width * 4,
             pixel_format: PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (captured - self.start).as_micros() as u64,
             monitor: 0,
             // P8a — the shifting gradient repaints EVERY pixel each
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(f.height, FRAME_H);
         assert_eq!(f.stride, FRAME_STRIDE);
         assert_eq!(f.pixel_format, PixelFormat::Bgra);
-        assert_eq!(f.data.len(), (FRAME_W * FRAME_H * 4) as usize);
+        assert_eq!(f.cpu().len(), (FRAME_W * FRAME_H * 4) as usize);
         assert_eq!(f.monitor, 0);
     }
 

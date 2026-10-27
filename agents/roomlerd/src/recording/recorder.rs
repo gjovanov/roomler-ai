@@ -1099,13 +1099,13 @@ mod tests {
             height: 769,
             stride: 1368 * 4,
             pixel_format: crate::capture::PixelFormat::Bgra,
-            data: vec![0; 1368 * 4 * 769],
+            data: vec![0; 1368 * 4 * 769].into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
             source: None,
         };
-        let ptr = f.data.as_ptr();
+        let ptr = f.cpu().as_ptr();
         let e = even(f);
         assert_eq!((e.width, e.height), (1366, 768));
         assert_eq!(
@@ -1113,7 +1113,7 @@ mod tests {
             1368 * 4,
             "the stride still describes the source rows"
         );
-        assert_eq!(e.data.as_ptr(), ptr);
+        assert_eq!(e.cpu().as_ptr(), ptr);
     }
 
     #[test]

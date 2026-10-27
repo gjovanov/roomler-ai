@@ -937,7 +937,7 @@ fn dxgi_to_frame(f: DxgiFrame, start: Instant) -> Frame {
         height: f.height,
         stride: f.stride,
         pixel_format: PixelFormat::Bgra,
-        data: f.bytes,
+        data: f.bytes.into(),
         monotonic_us: start.elapsed().as_micros() as u64,
         monitor: 0,
         // P8a — the DXGI-direct backend reads the duplication metadata
@@ -955,7 +955,7 @@ fn gdi_to_frame(f: GdiFrame, start: Instant) -> Frame {
         height: f.height,
         stride: f.stride,
         pixel_format: PixelFormat::Bgra,
-        data: f.bytes,
+        data: f.bytes.into(),
         monotonic_us: start.elapsed().as_micros() as u64,
         monitor: 0,
         // GDI BitBlt has no damage concept — and it emits a frame on
