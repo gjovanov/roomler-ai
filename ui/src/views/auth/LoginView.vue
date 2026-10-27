@@ -89,6 +89,7 @@ import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
 import { useBrand } from '@/composables/useBrand'
 import { carriedQuery, signupAttribution, startOAuth, type Landing } from '@/utils/attribution'
+import { PAIR_PATH, takePendingPair } from '@/utils/pairing'
 
 const auth = useAuthStore()
 // Provider buttons are a real touch target on a phone (28 px at `small`).
@@ -149,6 +150,11 @@ async function handleLogin() {
     ) {
       sessionStorage.removeItem('pending_redirect')
       router.push(pendingRedirect)
+    } else if (takePendingPair()) {
+      // FR-129 A2 — a pairing started in this browser is waiting; this is
+      // the tab an email activation came back in, where sessionStorage
+      // carried nothing. A literal path, never a stored one.
+      router.push(PAIR_PATH)
     } else {
       router.push({ name: 'dashboard' })
     }
