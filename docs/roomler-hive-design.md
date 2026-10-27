@@ -1151,7 +1151,7 @@ the request, comes from the replica (§5.2), because that step is where an injec
 would show.
 
 `vault_audit` records every decision, allow and deny, with the same 90-day TTL and
-indexes as the other audit collections (`crates/modules/network/src/lib.rs:738-785`).
+indexes as the other audit collections (`crates/modules/network/src/lib.rs:771-840`).
 The server's decision and the device's report of use stay in separate collections, as
 `ssh_audit` and `ssh_activity` do. Dynamic secrets are preferred everywhere;
 `secret:read` on a prod path needs a second approver.

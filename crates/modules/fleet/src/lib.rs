@@ -316,11 +316,27 @@ impl Module for FleetState {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    for entry in tokens.iter() {
-                        let (agent_id, token) = (*entry.key(), entry.value().clone());
+                    // The KEYS, snapshotted; never the live iterator: it holds
+                    // its shard's guard, and this loop awaits Redis per agent,
+                    // so an agent arriving or leaving meanwhile (a write to
+                    // that shard) would park a tokio worker THREAD for the
+                    // round trip. Two of them on a 2-CPU pod and the runtime
+                    // stops (FR-127 P1.1; `clippy.toml` at the root holds the
+                    // rule).
+                    let agents: Vec<ObjectId> = tokens.iter().map(|entry| *entry.key()).collect();
+                    for agent_id in agents {
                         if !hub.is_agent_online(agent_id) {
                             continue;
                         }
+                        // The token is read live, right before its refresh, as
+                        // the iterator read it: `refresh_if_mine` re-sets a
+                        // missing key, so refreshing a token released since the
+                        // snapshot would resurrect its record, and a reconnect
+                        // on this pod carries a new token that the stale one
+                        // would report as a foreign owner.
+                        let Some(token) = tokens.get(&agent_id).map(|t| t.value().clone()) else {
+                            continue;
+                        };
                         let key = roomler_core::cluster::directory::agent_key(&agent_id.to_hex());
                         match dir.refresh_if_mine(&key, &token, 90).await {
                             Ok(true) => {}
