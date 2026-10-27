@@ -103,6 +103,11 @@ fn main() {
             // FR-102 P3b — the opt-in diagnostics box and the page boundaries.
             commands::cmd_diagnostics_opt_in,
             commands::cmd_diagnostics_page,
+            // FR-129 A3 — device pairing: start, poll, open the page, cancel.
+            commands::cmd_pair_start,
+            commands::cmd_pair_poll,
+            commands::cmd_pair_open,
+            commands::cmd_pair_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");

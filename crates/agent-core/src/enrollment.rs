@@ -746,7 +746,10 @@ pub fn apply_service_install_defaults(cfg: &mut AgentConfig) {
 /// loopback (the integration `TestApp` binds `http://127.0.0.1:<port>`). Forcing
 /// TLS there just breaks the enroll POST with a `wrong version number` SSL error.
 /// A remote host (the production case) is still upgraded.
-fn normalize_server_url(raw: &str) -> String {
+///
+/// `pub(crate)`: FR-129's pairing client ([`crate::pairing`]) posts the
+/// pairing's secret the same way, and must apply the same rule.
+pub(crate) fn normalize_server_url(raw: &str) -> String {
     // FR-101 P1b — the same rule every reader of a server URL applies now
     // (`roomler_ai_remote_control::server_url`), which reads the URL as
     // reqwest will: `HTTP:roomler.ai` is plaintext too. No plaintext escape
@@ -761,7 +764,9 @@ fn normalize_server_url(raw: &str) -> String {
     secured.url.trim_end_matches('/').to_string()
 }
 
-fn detect_os() -> OsKind {
+/// `pub(crate)`: the pairing start names the OS with the same spelling the
+/// enroll does ([`crate::pairing::StartRequest`]).
+pub(crate) fn detect_os() -> OsKind {
     match std::env::consts::OS {
         "linux" => OsKind::Linux,
         "macos" => OsKind::Macos,

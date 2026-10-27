@@ -2,12 +2,13 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Tauri invoke handlers for the unified setup wizard.
 //!
-//! 11 handlers — the union of the two legacy wizards' surfaces
-//! behind ONE command vocabulary. Each handler returns
-//! `Result<T, String>` (or a plain value) so Tauri marshals errors as
-//! rejected promises the SPA renders verbatim. The raw enrollment
-//! token NEVER flows back from any command — only parsed metadata
-//! (H5, inherited from both legacy wizards).
+//! 17 handlers — the union of the two legacy wizards' surfaces, the
+//! diagnostics pair (FR-102) and the pairing four (FR-129) behind ONE
+//! command vocabulary. Each handler returns `Result<T, String>` (or a
+//! plain value) so Tauri marshals errors as rejected promises the SPA
+//! renders verbatim. The raw enrollment token NEVER flows back from any
+//! command — only parsed metadata (H5, inherited from both legacy
+//! wizards); a paired token never reaches the webview at all.
 //!
 //! All payload structs serialise camelCase so the SPA binds
 //! `view.expiresAtUnix` / `report.principalId` etc. without a
@@ -307,6 +308,15 @@ pub struct DoneReport {
 /// perMachine install ran end-to-end but the Done page rendered
 /// blank because the Channel was null + the orchestrator received
 /// `device_name = ""`.
+///
+/// FR-129 A3 — `usePaired: true` installs with the token the pairing
+/// delivered ([`crate::pairing::PairStore::token_for`]) instead of the
+/// pasted one; the SPA then passes `token: ""`. Everything from the
+/// orchestrators on is the same call with the same token argument — a
+/// paired token is an ordinary single-use enrollment token. The session
+/// is cleared only when the install SUCCEEDS, so a Retry after a failure
+/// before the enroll reads the same token again. Absent or `false` is the
+/// pasted path, byte for byte as before.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn cmd_install(
     role: Role,
@@ -314,9 +324,12 @@ pub async fn cmd_install(
     token: String,
     device_name: String,
     advanced: Option<crate::orchestrator_agent::AdvancedOptions>,
+    use_paired: Option<bool>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
 ) -> Result<DoneReport, String> {
-    match role {
+    let store = crate::pairing::PairStore::global();
+    let (token, paired) = resolve_install_token(store, role, &server, token, use_paired)?;
+    let report = match role {
         Role::TunnelClient => {
             // Advanced options are daemon-config keys — the SPA hides the
             // section for this role; ignore whatever arrives.
@@ -334,6 +347,30 @@ pub async fn cmd_install(
             )
             .await
         }
+    };
+    if paired && report.is_ok() {
+        store.finish();
+    }
+    report
+}
+
+/// Which token `cmd_install` enrolls with: the pasted one as given, or —
+/// `use_paired` — the one the pairing delivered for this role and server,
+/// cloned out of the store. Returns the token and whether it came from the
+/// pairing (so a success can close the session). A pasted call never reads
+/// the store, so a pairing left behind cannot leak into a paste.
+fn resolve_install_token(
+    store: &crate::pairing::PairStore,
+    role: Role,
+    server: &str,
+    pasted: String,
+    use_paired: Option<bool>,
+) -> Result<(String, bool), String> {
+    if use_paired.unwrap_or(false) {
+        let token = store.token_for(role, server)?;
+        Ok((token, true))
+    } else {
+        Ok((pasted, false))
     }
 }
 
@@ -400,6 +437,130 @@ pub fn cmd_diagnostics_page(step: String, outcome: String, elapsed_ms: u64) {
 #[tauri::command]
 pub fn cmd_exit_wizard(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+// ─── FR-129 A3: device pairing ───────────────────────────────────────────────
+
+/// What `cmd_pair_start` answers the SPA: the user code, the page to open,
+/// and the clock — never the device code, which stays in
+/// [`crate::pairing::PairStore`]. `unavailable` is the server's 404 (the
+/// `[pairing] enabled = false` switch, or a server from before FR-129): the
+/// SPA then hides the pairing action and shows the paste box alone.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PairStartView {
+    Started {
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+        interval: u64,
+    },
+    Unavailable,
+}
+
+/// Open a pairing against `server` for `role`, named `device_name`. The
+/// device code the server answers is held in the store; the SPA gets the
+/// rest. A pairing already held is replaced (its token dropped) — a Start
+/// again is this call.
+///
+/// The verification URI must be a web address: the wizard opens it with
+/// the shell plugin, and a server that answered anything else is refused
+/// here rather than handed to the OS.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_pair_start(
+    server: String,
+    role: Role,
+    device_name: String,
+) -> Result<PairStartView, String> {
+    use roomlerd::pairing::{StartOutcome, StartRequest, host_arch, host_os};
+    let request = StartRequest {
+        machine_name: device_name,
+        os: host_os(),
+        arch: host_arch(),
+        role: role.pair_role(),
+        halves: 1,
+        client: "wizard".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let outcome = roomlerd::pairing::start(&server, &request)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let started = match outcome {
+        StartOutcome::Unavailable => return Ok(PairStartView::Unavailable),
+        StartOutcome::Started(s) => s,
+    };
+    if !is_web_address(&started.verification_uri) {
+        return Err(
+            "the server's pairing page is not a web address; paste a token instead".to_string(),
+        );
+    }
+    let view = PairStartView::Started {
+        user_code: started.user_code.clone(),
+        verification_uri: started.verification_uri.clone(),
+        expires_in: started.expires_in,
+        interval: started.interval,
+    };
+    crate::pairing::PairStore::global().begin(server, role, started);
+    Ok(view)
+}
+
+/// One poll of the held pairing. The device code is copied out of the
+/// store before the request and the answer applied after it — the lock is
+/// never held across the await ([`crate::pairing`]). With no pairing held
+/// the call refuses, which ends a loop that outlived its session.
+#[tauri::command]
+pub async fn cmd_pair_poll() -> Result<crate::pairing::PairPollView, String> {
+    let store = crate::pairing::PairStore::global();
+    let snapshot = store
+        .snapshot()
+        .ok_or_else(|| "no pairing in progress".to_string())?;
+    let outcome = roomlerd::pairing::poll(&snapshot.server, &snapshot.device_code)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(store.apply_poll(snapshot.generation, outcome))
+}
+
+/// Open the held pairing's page in the default browser. The URL comes from
+/// the store, never from the SPA, and carries no code (operator decision
+/// 1): the person types the code the wizard shows.
+#[tauri::command]
+pub fn cmd_pair_open(app: tauri::AppHandle) -> Result<(), String> {
+    let uri = crate::pairing::PairStore::global()
+        .verification_uri()
+        .ok_or_else(|| "no pairing in progress".to_string())?;
+    open_in_browser(&app, &uri)
+}
+
+/// Forget the held pairing: its device code and any delivered token. The
+/// Cancel on the approval card, Back, and a paste-path install call this.
+/// There is nothing to tell the server — the row expires on its own.
+#[tauri::command]
+pub fn cmd_pair_cancel() {
+    crate::pairing::PairStore::global().cancel();
+}
+
+/// `http://` or `https://` — the only schemes the wizard hands to the OS.
+fn is_web_address(uri: &str) -> bool {
+    let lower = uri.trim().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && lower.len() > "https://".len()
+}
+
+/// The default browser through the shell plugin, as the desktop companion
+/// opens its links (`shell::open` is deprecated for tauri-plugin-opener,
+/// but the shell plugin is already shipped and initialised here).
+fn open_in_browser(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    #[allow(deprecated)]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .open(url, None)
+            .map_err(|e| format!("opening the browser: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +733,133 @@ mod tests {
     fn default_device_name_returns_non_empty() {
         let n = cmd_default_device_name();
         assert!(!n.is_empty());
+    }
+
+    // ---- FR-129 A3: pairing ------------------------------------------------
+
+    /// The SPA binds `kind` plus camelCase fields; `unavailable` is a bare
+    /// tag. Neither variant has a place for the device code.
+    #[test]
+    fn pair_start_view_serialises_camel_case_with_a_kind_tag() {
+        let v = PairStartView::Started {
+            user_code: "BCDF-GHJK".into(),
+            verification_uri: "https://roomler.ai/pair".into(),
+            expires_in: 900,
+            interval: 5,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""kind":"started""#), "{json}");
+        assert!(json.contains(r#""userCode":"BCDF-GHJK""#), "{json}");
+        assert!(
+            json.contains(r#""verificationUri":"https://roomler.ai/pair""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""expiresIn":900"#), "{json}");
+        assert!(json.contains(r#""interval":5"#), "{json}");
+        assert!(!json.contains("user_code"), "{json}");
+        assert!(!json.contains("device"), "{json}");
+
+        let json = serde_json::to_string(&PairStartView::Unavailable).unwrap();
+        assert_eq!(json, r#"{"kind":"unavailable"}"#);
+    }
+
+    /// Only a web address is handed to the OS to open.
+    #[test]
+    fn pair_page_must_be_a_web_address() {
+        assert!(is_web_address("https://roomler.ai/pair"));
+        assert!(is_web_address("http://127.0.0.1:3000/pair"));
+        assert!(is_web_address(" HTTPS://Example.invalid/pair "));
+        assert!(!is_web_address("file:///etc/passwd"));
+        assert!(!is_web_address("javascript:alert(1)"));
+        assert!(!is_web_address("roomler.ai/pair"));
+        assert!(!is_web_address("https://"));
+        assert!(!is_web_address(""));
+    }
+
+    /// `cmd_install`'s token choice: a pasted call never touches the store
+    /// (a pairing left behind cannot leak into a paste), and a paired call
+    /// reads the delivered token for its role and server — or refuses.
+    #[test]
+    fn install_token_resolution_keeps_the_paths_apart() {
+        use roomlerd::pairing::{Approved, DeviceCode, PollOutcome, Started};
+        let store = crate::pairing::PairStore::new();
+        let server = "https://example.invalid";
+
+        // Pasted, with no pairing at all: the pasted token, untouched.
+        let (t, paired) =
+            resolve_install_token(&store, Role::DaemonSystem, server, "pasted".into(), None)
+                .unwrap();
+        assert_eq!((t.as_str(), paired), ("pasted", false));
+        let (t, paired) = resolve_install_token(
+            &store,
+            Role::DaemonSystem,
+            server,
+            "pasted".into(),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!((t.as_str(), paired), ("pasted", false));
+
+        // Paired, with nothing delivered: refused, and the pasted argument
+        // is not used as a fallback.
+        let e = resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
+            .unwrap_err();
+        assert!(e.contains("no pairing in progress"), "{e}");
+
+        let generation = store.begin(
+            server.to_string(),
+            Role::DaemonSystem,
+            Started {
+                device_code: DeviceCode::new("dc"),
+                user_code: "BCDF-GHJK".into(),
+                verification_uri: "https://example.invalid/pair".into(),
+                expires_in: 900,
+                interval: 5,
+            },
+        );
+        let e = resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
+            .unwrap_err();
+        assert!(e.contains("not been approved"), "{e}");
+
+        store.apply_poll(
+            generation,
+            PollOutcome::Approved(Approved {
+                tokens: vec!["eyJ.paired.sig".into()],
+                org_name: "Acme".into(),
+                approver_name: "Dana".into(),
+            }),
+        );
+        let (t, paired) =
+            resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
+                .unwrap();
+        assert_eq!((t.as_str(), paired), ("eyJ.paired.sig", true));
+
+        // A pasted call beside a delivered pairing still takes the paste.
+        let (t, paired) = resolve_install_token(
+            &store,
+            Role::DaemonSystem,
+            server,
+            "pasted".into(),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!((t.as_str(), paired), ("pasted", false));
+
+        // The role and the server must be the pairing's.
+        assert!(
+            resolve_install_token(&store, Role::TunnelClient, server, "".into(), Some(true))
+                .is_err()
+        );
+        assert!(
+            resolve_install_token(
+                &store,
+                Role::DaemonSystem,
+                "https://other.invalid",
+                "".into(),
+                Some(true)
+            )
+            .is_err()
+        );
     }
 
     #[test]
