@@ -30,6 +30,7 @@ fn bearer(port: u16, ca: &str) -> Spec {
         user: None,
         ca: Some(ca.into()),
         at: At::Loopback { peer: me() },
+        through: None,
     }
 }
 
@@ -383,6 +384,32 @@ fn a_spec_crosses_whole_and_an_unknown_one_is_refused() {
         ..bearer(443, "")
     };
     assert!(Conf::of_spec(&unknown_auth).is_err(), "an auth not known");
+}
+
+/// P8-2a-6 — a spec through another device carries the flow's end, and
+/// crosses whole; the worker dials that end, and an end off this host is no
+/// flow's and is refused. A spec without one dials the upstream itself.
+#[test]
+fn a_spec_through_a_flow_names_its_end_and_only_one_on_this_host() {
+    let direct = Spec {
+        ca: None,
+        ..bearer(443, "")
+    };
+    let end = SocketAddr::from(([127, 0, 0, 1], 41_234));
+    let through = Spec {
+        through: Some(end),
+        ..direct.clone()
+    };
+    let wire = serde_json::to_string(&through).unwrap();
+    assert_eq!(serde_json::from_str::<Spec>(&wire).unwrap(), through);
+    assert_eq!(Conf::of_spec(&through).unwrap().dial, Dial::Through(end));
+    assert_eq!(Conf::of_spec(&direct).unwrap().dial, Dial::Direct);
+    let off = Spec {
+        through: Some(SocketAddr::from(([192, 0, 2, 7], 41_234))),
+        ..direct
+    };
+    let refused = Conf::of_spec(&off).map(|_| ()).unwrap_err();
+    assert!(refused.contains("off this host"), "{refused}");
 }
 
 /// A value never shows in a log line: `Debug` names none.
