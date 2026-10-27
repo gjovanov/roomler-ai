@@ -721,6 +721,109 @@ H.264 is the safe default — every browser decodes it. AV1 only if the controll
 - **Variable framerate, idle skip**: when nothing on screen changes (the capturer's per-frame `Damage`, `capture/mod.rs`: WGC's dirty regions, DXGI's no-new-frame, XDamage on X11; `scrap` on macOS reports none, so there every frame counts as changed), the encoder emits a 1 fps keepalive instead of a full 60 fps stream. This is the single biggest battery and bandwidth win.
 - IDR on demand: the controller sends `{"t":"keyframe"}` over the control DC if it detects decode errors after a packet loss spike; agent issues an immediate keyframe.
 
+### 5.4 Above 60 fps: the viewer asks, the host proves it (FR-119)
+
+A viewer on a high-refresh screen can ask for 120 or 144 fps. The host grants a
+rate only where the path is direct, its screen refreshes that fast, nothing
+denies the rate, the host has shown it can sustain it, and the pipe covers the
+higher ceiling. All of it is per session and per rate class, and an agent
+without the switch behaves exactly as before. Spec and field log:
+[FR-119](fr/FR-119-high-refresh-streaming.md).
+
+**The switch and the wire.** `fps_high` in the config (or `ROOMLERD_FPS_HIGH`),
+default off. With it on, the hello's `AgentCaps.video` carries `fps-high` and
+`fps-retry` ([`caps.rs:1335`](../agents/roomlerd/src/encode/caps.rs#L1335)).
+Without them the viewer never offers above 60 and never sends `rc:fps`.
+
+| Message | Direction | Fields |
+|---|---|---|
+| `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
+| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5341`](../agents/roomlerd/src/peer.rs#L5341)) |
+
+**The grant** ([`frame_rate.rs:286`](../agents/roomlerd/src/encode/frame_rate.rs#L286)).
+It runs in the FFmpeg data-channel pump
+([`peer.rs:8215`](../agents/roomlerd/src/peer.rs#L8215)) whenever the ask, the
+base rate, the transport or the class moves, and once a second for the pipe's
+belief. Each rate is checked in the order a viewer can see and act on
+([`frame_rate.rs:229`](../agents/roomlerd/src/encode/frame_rate.rs#L229)):
+
+| `fps_reason` | When | Steps down? |
+|---|---|---|
+| `constrained` | the session is relayed: above 60 there waits for FR-17 stage C, FR-63 and FR-70 M3 | no: a relay refuses every rate above its cap |
+| `refresh` | the captured screen refreshes slower than the rate | yes |
+| `denied` | `fps_deny` names this encoder at this rate | yes |
+| `unproven` | this rate class's last trial failed, within the hour | yes |
+| `pipe` | the session's pipe push-back is below the ceiling at this rate | yes |
+
+A refused ask **steps down one rate at a time** (P2b-18): the highest offered
+rate below the ask that nothing refuses runs instead, and the viewer is still
+told why the ask was refused, as "120 fps (144 fps not granted: …)". The pump
+checks each of those rates against its own deny entry and its own ceiling
+([`peer.rs:8277`](../agents/roomlerd/src/peer.rs#L8277)).
+
+```mermaid
+flowchart TD
+    A["rc:fps 144"] --> G144{"144 refused?<br/>constrained · refresh · denied ·<br/>unproven · pipe"}
+    G144 -->|no| P144{"144 proven?"}
+    P144 -->|yes| R144["run 144"]
+    P144 -->|no verdict| T144["run 144 as a trial"]
+    T144 -->|Proven| R144
+    T144 -->|Failed| G120
+    G144 -->|yes| G120{"120 refused?"}
+    G120 -->|no| P120{"120 proven?"}
+    P120 -->|yes| R120["run 120<br/>fps_asked 144 + fps_reason"]
+    P120 -->|no verdict| T120["run 120 as a trial"]
+    T120 -->|Proven| R120
+    T120 -->|Failed| R60["run at the cap, 60"]
+    G120 -->|yes| R60
+```
+
+**The rate class and its trial.** A class is the capture backend, the screen's
+refresh rate, the encoder, the geometry's long-edge bucket and the rate
+([`frame_rate.rs:94`](../agents/roomlerd/src/encode/frame_rate.rs#L94)). A class
+with no verdict runs as a trial. It is `Proven` once 10 s of moving content
+reached 90 % of the rate with the p99 inter-frame time under two periods. It is
+`Failed` only when the encoder itself was the limit: its p90 time per frame at
+90 % of a period, while it spaced the frames
+([`frame_rate.rs:435`](../agents/roomlerd/src/encode/frame_rate.rs#L435)).
+Content slower than the rate concludes nothing, and a frame the pump drops for
+the viewer or the link breaks the stretch, so a viewer that cannot decode the
+rate yields no verdict at all. Verdicts persist in `fps-class-cache.json`, keyed
+on the build, the hardware and the knobs: `Proven` holds a week and `Failed` an
+hour ([`fps_class_cache.rs:34`](../agents/roomlerd/src/encode/fps_class_cache.rs#L34),
+[`fps_class_cache.rs:40`](../agents/roomlerd/src/encode/fps_class_cache.rs#L40)).
+A new agent release starts with an empty cache.
+
+**Try again** ([`frame_rate.rs:556`](../agents/roomlerd/src/encode/frame_rate.rs#L556)).
+The picker offers "Try N fps again" for an `unproven` refusal from an agent that
+advertises `fps-retry` ([`ui.md`](ui.md)). The retry forgets the session's
+failed verdicts from the ask down to the cap, so the step-down is walked again
+from the top. A proven rate stays proven.
+
+**What holds the rate up on Windows.** Above 60, the WGC capture session's
+`MinUpdateInterval` is lowered from Windows' 16 ms default
+([`gate.rs:115`](../agents/roomlerd/src/capture/gate.rs#L115)), without which
+every Windows session ran at about 58 fps. An NVENC session holds the GPU clock
+pin, graphics and memory, from the moment the grant wants the rate
+([`gpu_clock.rs:506`](../agents/roomlerd/src/gpu_clock.rs#L506),
+[`peer.rs:8315`](../agents/roomlerd/src/peer.rs#L8315)). Under an encoder-only
+load the driver otherwise drops the memory clock, and NVENC's time per frame
+doubles.
+
+⚠️ **A trial proves the host, not the delivery.** Its 10 s show the host can
+capture and encode the rate. Whether the viewer receives it is read at the
+viewer, from the arrival of every frame (FR-119 §8.1).
+
+⚠️ **The refusal line is a live session's answer.** With no session open, the
+picker shows its default hint, never a stale refusal.
+
+| Cell (FR-119 §8) | Result |
+|---|---|
+| The MacBook (VideoToolbox, ProMotion) → Edge, direct, 120 | proven at 119.7 fps; every 60 s window at the viewer 119.8–120.1 fps |
+| neo16 (RTX 5090) → the MacBook, HEVC 4:4:4 2560×1600, 120 | proven at 112.4 fps with the clock pin |
+| neo16, AV1 2560×1600, 144 | proven at 141.4 fps |
+| neo16, HEVC 4:4:4 2560×1600, 144 | encoder-bound: four trials at 101–131 fps (2026-10-26), each of which took the stream to 60 before P2b-18 |
+
 ## 6. Input injection
 
 Three input planes, all over a single SCTP-unreliable data channel labeled `input`:
