@@ -170,7 +170,7 @@ first draft's claim that demux is *"unambiguous without a magic number"*; it is 
 | `0x01`–`0x04` (Opt Len 1–4) | **WireGuard types 1–4, every one of them** |
 
 What actually keeps WireGuard disjoint on the existing plane is a **four**-byte test —
-`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2460`) requires `pkt[1..4] == 0`, and
+`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2511`) requires `pkt[1..4] == 0`, and
 Geneve's bytes 2–3 carry a nonzero Protocol Type. One byte is not enough, and
 `payload_is_wg_or_disco` (`crates/remote_control/src/derp_frame.rs:39`) classifies on the
 first byte alone.
@@ -292,7 +292,7 @@ this, a customer's HQ box is a DDoS reflector at roughly 3×.
 
 Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
 (`crates/tunnel-core/src/overlay/carrier_plane.rs:705`; `UNKNOWN_INIT_MIN_INTERVAL = 2 s`,
-`UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:716`), with a counter and a reader.
+`UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:725`), with a counter and a reader.
 
 ### Construction details that are security-relevant
 
@@ -318,7 +318,7 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   serialise identically (IPv4 vs IPv6 forms; digits sliding into the adjacent field).
 - **Constant-time comparison, using `subtle`.** ⚠️ Every MAC compare in this tree today is a
   plain slice compare — `disco.rs:222` (whose comment says *"Constant-time-ish"* and is not),
-  `wg.rs:2499`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
+  `wg.rs:2550`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
   *"a ROUTER's pre-filter … not an authenticator"*. Here the MAC **is** the authenticator, so
   "model it on the existing one" would propagate the defect.
 - **Membership.** A node may bind only into a session naming its own key in `members`.
@@ -623,8 +623,8 @@ So the design is:
   over Turn/Derp when a session exists.
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
-`send_ip_packet` (`wg.rs:929`) as *"the send path that must learn 'via peer X'"*. It is not:
-relay carriers already get a dedicated per-peer recv task (`wg.rs:1498`) and never touch the
+`send_ip_packet` (`wg.rs:938`) as *"the send path that must learn 'via peer X'"*. It is not:
+relay carriers already get a dedicated per-peer recv task (`wg.rs:1539`) and never touch the
 carrier plane's shape demux. `send_ip_packet`, `send_to_peer`, `SendPeer` and the `Router`
 need **zero changes**. The first draft also pointed the receive arm at
 `CarrierPlane::route_by_index` (`carrier_plane.rs:738`) — which takes a WireGuard receiver
@@ -722,9 +722,9 @@ Verified against `origin/master`, 2026-08-28.
 | Wire model | `crates/remote_control/src/signaling.rs:3304` `NetmapPeer`; `:3282` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:283` `sweep_carrier_health` |
-| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2460`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
+| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2511`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
-| Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
+| Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
 | Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
