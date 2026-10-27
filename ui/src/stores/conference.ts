@@ -107,6 +107,14 @@ export const useConferenceStore = defineStore('conference', () => {
   let viewSeq = 0
   let viewTimer: ReturnType<typeof setTimeout> | null = null
   const VIEW_DEBOUNCE_MS = 100
+  // Self-healing: a report the socket dropped (it sends only while OPEN) or a
+  // forward the owner pod never got (best-effort on the bus) would leave the
+  // view stale until the next tile change. So the current view goes out again
+  // every VIEW_RESEND_MS while in a call, and when the tab comes back to the
+  // foreground; `seq` keeps it idempotent and the server plans nothing for a
+  // report that changes nothing (found in review).
+  const VIEW_RESEND_MS = 15_000
+  let viewResend: ReturnType<typeof setInterval> | null = null
 
   // Active speaker internals
   let audioContext: AudioContext | null = null
@@ -146,9 +154,13 @@ export const useConferenceStore = defineStore('conference', () => {
     let transportPromise = ws.waitForMessage('media:transport_created')
 
     // FR-127 P1 — `caps: ["view"]`: this client reports what it renders, so
-    // the server may pause the video it does not show. An older server reads
+    // the server may pause the video it does not show. Declared only where
+    // the tiles CAN report (an IntersectionObserver): a declared viewer that
+    // never reported would have every camera paused. An older server reads
     // past the field and resumes everything, as before.
-    ws.send('media:join', { room_id: rid, caps: ['view'] })
+    const canReportView = typeof IntersectionObserver !== 'undefined'
+    const joinData = canReportView ? { room_id: rid, caps: ['view'] } : { room_id: rid }
+    ws.send('media:join', joinData)
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let capsMsg: any
@@ -179,7 +191,7 @@ export const useConferenceStore = defineStore('conference', () => {
         .catch(() => {})
       capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
       transportPromise = ws.waitForMessage('media:transport_created')
-      ws.send('media:join', { room_id: rid, caps: ['view'] })
+      ws.send('media:join', joinData)
       capsMsg = await capabilitiesPromise
       transportMsg = await transportPromise
       console.warn('[conference] join retry succeeded on the reconnected socket')
@@ -193,7 +205,10 @@ export const useConferenceStore = defineStore('conference', () => {
     // FR-127 P1 — which levers this server runs (absent on an older server:
     // both off, today's behaviour).
     const levers = transportMsg.meeting
-    meeting.value = { view: levers?.view === true, audioDtx: levers?.audio_dtx === true }
+    meeting.value = {
+      view: canReportView && levers?.view === true,
+      audioDtx: levers?.audio_dtx === true,
+    }
     // ⚠️ Drop entries with no usable URL before they reach RTCPeerConnection.
     // A server configured with a BLANK turn url used to advertise `urls: [""]`,
     // and the constructor rejects the whole thing —
@@ -331,6 +346,7 @@ export const useConferenceStore = defineStore('conference', () => {
     // fresh page; the tiles still mounted, on a re-join. The server holds a
     // new view client's video paused until a report names it.
     scheduleView()
+    startViewResend()
   }
 
   async function produceLocalMedia() {
@@ -621,6 +637,7 @@ export const useConferenceStore = defineStore('conference', () => {
 
     // FR-127 P1 — the view belongs to the call that just ended. `viewSeq`
     // stays: it only ever grows.
+    stopViewResend()
     if (viewTimer) {
       clearTimeout(viewTimer)
       viewTimer = null
@@ -686,6 +703,34 @@ export const useConferenceStore = defineStore('conference', () => {
     const video = buildViewReport(visible, videoProducerByStreamKey)
     viewSeq += 1
     useWsStore().send('media:view', { room_id: roomId.value, seq: viewSeq, video })
+  }
+
+  function onVisibilityChange() {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') scheduleView()
+  }
+
+  function startViewResend() {
+    stopViewResend()
+    if (!meeting.value.view) return
+    viewResend = setInterval(() => sendView(), VIEW_RESEND_MS)
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    }
+  }
+
+  function stopViewResend() {
+    if (viewResend) {
+      clearInterval(viewResend)
+      viewResend = null
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }
+
+  /** Is this stream key on screen by at least one reporter? (The tests read it.) */
+  function isTileOnScreen(streamKey: string): boolean {
+    return (tilesOnScreen.get(streamKey)?.n ?? 0) > 0
   }
 
   // ============ Active Speaker Detection ============
@@ -841,5 +886,6 @@ export const useConferenceStore = defineStore('conference', () => {
     startActiveSpeaker,
     stopActiveSpeaker,
     reportTileVisible,
+    isTileOnScreen,
   }
 })

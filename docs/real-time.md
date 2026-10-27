@@ -141,33 +141,42 @@ consumer's own `paused`. Nothing in P1 reads or writes the owner's flag, and the
 input (`view::ConsumerLine`, `view.rs:80`) has no field for it, so the two cannot be
 confused: a viewer hiding a tile changes nothing another viewer sees, and an owner's pause
 reaches every viewer whatever their view says. Locked against a real worker by
-`crates/tests/src/conference_view_tests.rs:437`.
+`crates/tests/src/conference_view_tests.rs:439`.
 
 **What "visible" is.** Each remote `VideoTile` runs an `IntersectionObserver` on its root
-(`ui/src/components/conference/VideoTile.vue:486`), which applies the clip of every
+(`ui/src/components/conference/VideoTile.vue:507`), which applies the clip of every
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
-unmount (`:520`), while its parent still listens. Every layout forwards it with the stream
+unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
 call page hands it to the store (`ConferenceView.vue:427`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
-(`ui/src/stores/conference.ts:412`) and sends one `media:view` at most every 100 ms
-(`:655-682`). A tile never reports for the local stream: nothing is received for it.
+(`ui/src/stores/conference.ts:428`) and sends one `media:view` at most every 100 ms
+(`:672-734`) — and again every 15 s while in the call and when the tab returns to the
+foreground, so a report the socket dropped or a forward the owner pod never got heals
+within the period (`seq` keeps the re-send idempotent, and the server plans nothing for a
+report that changes nothing). A tile never reports for the local stream: nothing is received
+for it. The cap is declared on the join only where an `IntersectionObserver` exists: a
+declared viewer that never reported would have every camera paused.
 
 | Layout | Rendered | In the view |
 |---|---|---|
 | tiled | `primary`, at most `tiledMaxTiles` (`useConferenceLayout.ts:306`), no scrolling | exactly the rendered remote tiles |
 | spotlight | the big tile, a 120 px filmstrip that scrolls sideways | the big tile plus the strip tiles inside the strip's viewport |
 | sidebar | the big tile, a 280 px column that scrolls | the same rule |
-| the mini view (another page of the app) | no `VideoTile` at all | empty — every video consumer paused until the call page is back; audio flows |
+| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows |
 
 A tile scrolled into view plays within a second: one debounce, one round trip, and the
 worker requests a key frame the moment a consumer resumes (`SimpleConsumer::UserOnResumed`
 in mediasoup-sys 0.10.0). FR-124's black-picture detector needs three black samples, about
-3 s, so a resumed tile paints long before it could be judged; a paused tile keeps its last
-frame and is off screen, where no detector runs.
+3 s, so a resumed tile paints long before it could be judged. Its sampler keeps running on a
+paused tile too — safely: `sampleLuma` answers `null` until the element has a frame
+(`ui/src/utils/blackPicture.ts:82`), and once a tile has painted, pausing its consumer
+leaves the last frame on screen, which is not black unless the camera was. A tile in
+picture-in-picture reports itself visible even when its strip has scrolled it out, so the
+floating window keeps playing.
 
 **Opus DTX.** When `meeting.audio_dtx` is true the microphone producer is created with
-`codecOptions: { opusDtx: true }` (`ui/src/stores/conference.ts:355`); Chrome then sends
+`codecOptions: { opusDtx: true }` (`ui/src/stores/conference.ts:371`); Chrome then sends
 about one packet every 400 ms while the microphone hears silence, and the SFU forwards
 exactly what it gets. FR-127's P0 arithmetic is why: fifty people unmuted and quiet cost
 more packets than one worker carries without it.

@@ -138,6 +138,28 @@ describe('VideoTile — on screen or not (FR-127 P1)', () => {
     expect(reports(w)).toEqual([])
   })
 
+  it('a tile in picture-in-picture stays reported on screen while its strip scrolls it out (review)', async () => {
+    const w = mountTile()
+    await flushPromises()
+    const io = FakeObserver.all[0]
+    const video = w.find('video').element as HTMLVideoElement
+    io.fire(true, 160, 90)
+    expect(reports(w).map((r) => r.visible)).toEqual([true])
+
+    // The floating window opens on this tile, then the strip scrolls it out:
+    // the picture is still on the user's screen.
+    Object.defineProperty(document, 'pictureInPictureElement', { configurable: true, get: () => video })
+    video.dispatchEvent(new Event('enterpictureinpicture'))
+    io.fire(false, 0, 0)
+    expect(reports(w).map((r) => r.visible)).toEqual([true])
+
+    // The window closes while the tile is still scrolled out: now it is off.
+    Object.defineProperty(document, 'pictureInPictureElement', { configurable: true, get: () => null })
+    video.dispatchEvent(new Event('leavepictureinpicture'))
+    expect(reports(w).map((r) => r.visible)).toEqual([true, false])
+    w.unmount()
+  })
+
   it('a local tile never observes: nothing is received for it', async () => {
     const w = mountTile({ isLocal: true, streamKey: 'local', displayName: 'Me' })
     await flushPromises()

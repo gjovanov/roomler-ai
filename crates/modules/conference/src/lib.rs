@@ -116,13 +116,19 @@ impl ConferenceState {
         for room in self.room_manager.rooms_ref().iter() {
             let participants = room.participants.len();
             let consumers: usize = room.participants.iter().map(|p| p.consumers.len()).sum();
+            // A handle the worker closed (its producer left) is not a held-back
+            // stream, whatever its last flag said.
             let video_paused: usize = room
                 .participants
                 .iter()
                 .map(|p| {
                     p.consumers
                         .iter()
-                        .filter(|c| c.kind() == mediasoup::prelude::MediaKind::Video && c.paused())
+                        .filter(|c| {
+                            c.kind() == mediasoup::prelude::MediaKind::Video
+                                && c.paused()
+                                && !c.closed()
+                        })
                         .count()
                 })
                 .sum();

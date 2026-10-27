@@ -26,8 +26,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
+use roomler_ai_api::cluster::directory::{ClaimOutcome, media_key};
 use roomler_ai_mod_conference::ConferenceState;
 use roomler_ai_mod_conference::media::room_manager::ConsumerSnapshot;
+use roomler_ai_mod_conference::media_cluster::forward_media_cmd;
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -581,6 +583,138 @@ async fn a_long_report_is_truncated_at_view_max() {
     a.ws.close(None).await.ok();
     d.ws.close(None).await.ok();
     b.ws.close(None).await.ok();
+}
+
+/// A producer its owner closed leaves a dead consumer handle in every other
+/// participant (`close_producer` drops only the owner's entry). A report must
+/// not plan a pause or resume on it — every report would then ask the worker
+/// to touch a closed consumer, for the participant's lifetime — and the gauge
+/// must not count it.
+#[tokio::test]
+async fn a_closed_producers_consumer_is_dropped_from_the_plan_and_the_gauge() {
+    let app = TestApp::spawn().await;
+    let (tenant, room_id) = started_call(&app, "view8").await;
+    let rid = oid(&room_id);
+
+    let mut a = connect(&app, &tenant.admin.access_token).await;
+    join(&mut a, &room_id, None).await;
+    let a_video = produce(&mut a, &room_id, "video", 18_001).await;
+    let a_audio = produce(&mut a, &room_id, "audio", 18_002).await;
+
+    let mut b = connect(&app, &tenant.member.access_token).await;
+    let (caps, _) = join(&mut b, &room_id, Some(&["view"])).await;
+    consume(&mut b, &room_id, &a_video, &caps).await;
+    consume(&mut b, &room_id, &a_audio, &caps).await;
+    // B shows nothing: its video consumer is paused, and the gauge counts it.
+    assert!(consumer_of(&app, &room_id, &b.conn, &a_video).paused);
+    assert_eq!(conf(&app).media_gauges().video_paused_total, 1);
+    assert_eq!(conf(&app).room_manager.consumer_handles(&rid, &b.conn), 2);
+
+    // A closes its camera: the worker closes B's consumer of it.
+    send(
+        &mut a,
+        "media:producer_close",
+        json!({ "room_id": room_id, "producer_id": a_video }),
+    )
+    .await;
+    let closed = next_of(&mut b, "media:producer_closed").await;
+    assert_eq!(closed["data"]["producer_id"], a_video);
+    wait_for("the worker marks B's consumer closed", || {
+        !conf(&app)
+            .room_manager
+            .consumer_states(&rid, &b.conn)
+            .iter()
+            .any(|c| c.producer_id == a_video)
+    })
+    .await;
+    // The handle lingers until a report, and the gauge no longer counts it.
+    assert_eq!(conf(&app).room_manager.consumer_handles(&rid, &b.conn), 2);
+    assert_eq!(conf(&app).media_gauges().video_paused_total, 0);
+
+    // A report drops the dead handle instead of planning on it; the live
+    // audio consumer is untouched.
+    view(&mut b, &room_id, 1, &[]).await;
+    barrier(&mut b, &room_id, &caps).await;
+    assert_eq!(
+        conf(&app).room_manager.consumer_handles(&rid, &b.conn),
+        1,
+        "only the audio consumer's handle remains"
+    );
+    assert!(!consumer_of(&app, &room_id, &b.conn, &a_audio).paused);
+    assert_eq!(conf(&app).media_gauges().video_paused_total, 0);
+
+    a.ws.close(None).await.ok();
+    b.ws.close(None).await.ok();
+}
+
+/// A forwarded `media:view` the bus cannot deliver (a deadline, a Redis error)
+/// is best-effort: the next report heals it, so it neither tells the viewer
+/// the conference broke nor prunes the owner's claim — which every other
+/// command's failure does (the presumed-dead-owner rule), and which a viewer
+/// scrolling on the non-owner pod would otherwise trip on every report.
+#[tokio::test]
+async fn a_failed_forwarded_view_does_not_prune_the_owners_claim() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let Some(dir) = app2.state.cluster_directory.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let _ = &app1;
+    let uid = ObjectId::new();
+    let rid = ObjectId::new();
+    let key = media_key(&rid.to_hex());
+    // An owner that will never answer: a record in the directory's own
+    // `pod/epoch/extra/since` shape, naming a pod that does not exist. The
+    // forward then runs into the bus deadline, today's "presumed dead" case.
+    let ghost = || {
+        format!(
+            "ghost-pod/0/media/{}",
+            bson::DateTime::now().timestamp_millis()
+        )
+    };
+    let planted = |outcome: ClaimOutcome| assert!(matches!(outcome, ClaimOutcome::Won));
+
+    // Positive control — the rule for every other command: a deadline toward
+    // the presumed owner prunes its record.
+    planted(dir.claim_nx(&key, &ghost(), 30).await.unwrap());
+    let consume = json!({ "room_id": rid.to_hex(), "producer_id": "x", "rtp_capabilities": {} });
+    assert!(
+        !forward_media_cmd(
+            conf(&app2),
+            "ghost-pod",
+            &uid,
+            "conn-x",
+            "media:consume",
+            Some(&consume)
+        )
+        .await
+    );
+    assert_eq!(
+        dir.get(&key).await.unwrap(),
+        None,
+        "a failed consume prunes the presumed-dead owner's record"
+    );
+
+    // The view: the same failure, the record stays.
+    planted(dir.claim_nx(&key, &ghost(), 30).await.unwrap());
+    let report = json!({ "room_id": rid.to_hex(), "seq": 1, "video": [] });
+    assert!(
+        !forward_media_cmd(
+            conf(&app2),
+            "ghost-pod",
+            &uid,
+            "conn-x",
+            "media:view",
+            Some(&report)
+        )
+        .await
+    );
+    let kept = dir.get(&key).await.unwrap();
+    assert!(
+        kept.as_deref().is_some_and(|r| r.starts_with("ghost-pod/")),
+        "a failed view prunes nothing: {kept:?}"
+    );
+    let _ = dir.release(&key, kept.as_deref().unwrap_or("")).await;
 }
 
 /// Multi-pod (C-4): a viewer whose socket is on the non-owner pod sends

@@ -575,6 +575,13 @@ impl RoomManager {
             if !view.apply(seq, tiles, max) {
                 return ViewOutcome::Stale;
             }
+            // A consumer the worker closed (its producer left, or its owner
+            // closed it) keeps its handle in this Vec: `close_producer` drops
+            // only the OWNER's entry. Planning it would ask the worker to
+            // pause or resume a dead consumer on every report, for the
+            // participant's lifetime. Dropped here, the one place the Vec is
+            // held mutably on the view path.
+            consumers.retain(|c| !c.closed());
             let lines: Vec<view::ConsumerLine> = consumers
                 .iter()
                 .map(|c| view::ConsumerLine {
@@ -612,8 +619,9 @@ impl RoomManager {
         ViewOutcome::Applied { resumed, paused }
     }
 
-    /// FR-127 P1 — one participant's consumers, as plain data (the tests and
-    /// the gauges read this; it names no worker type).
+    /// FR-127 P1 — one participant's LIVE consumers, as plain data (the tests
+    /// and the gauges read this; it names no worker type). A handle the
+    /// worker closed is left out; `consumer_handles` counts it.
     pub fn consumer_states(
         &self,
         room_id: &ObjectId,
@@ -625,6 +633,7 @@ impl RoomManager {
                 room.participants.get(connection_id).map(|p| {
                     p.consumers
                         .iter()
+                        .filter(|c| !c.closed())
                         .map(|c| ConsumerSnapshot {
                             producer_id: c.producer_id().to_string(),
                             kind: kind_str(c.kind()),
@@ -635,6 +644,20 @@ impl RoomManager {
                 })
             })
             .unwrap_or_default()
+    }
+
+    /// FR-127 P1 — how many consumer HANDLES a participant holds, closed ones
+    /// included: the tests read it to show a dead handle lingering after its
+    /// producer closed, and gone after the next report.
+    pub fn consumer_handles(&self, room_id: &ObjectId, connection_id: &str) -> usize {
+        self.rooms
+            .get(room_id)
+            .and_then(|room| {
+                room.participants
+                    .get(connection_id)
+                    .map(|p| p.consumers.len())
+            })
+            .unwrap_or(0)
     }
 
     /// FR-127 P1 — one participant's producers, as plain data.

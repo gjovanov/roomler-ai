@@ -87,11 +87,11 @@ const transportCreated = (meeting?: Record<string, unknown>) => ({
 
 const views = () => wire.sent.filter((m) => m.type === 'media:view')
 
-async function join(meeting?: Record<string, unknown>) {
+async function join(meeting?: Record<string, unknown>, roomId = 'r1') {
   wire.answers.set('media:router_capabilities', { rtp_capabilities: {} })
   wire.answers.set('media:transport_created', transportCreated(meeting))
   const store = useConferenceStore()
-  await store.joinRoom('t1', 'r1', 'Room')
+  await store.joinRoom('t1', roomId, 'Room')
   return store
 }
 
@@ -114,6 +114,16 @@ async function peerVideo(connectionId: string, producerId: string) {
   await flushPromises()
 }
 
+/** The browser has the observer the tiles report through (jsdom has not). */
+class FakeIntersectionObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+  takeRecords() {
+    return []
+  }
+}
+
 beforeEach(() => {
   setActivePinia(createPinia())
   vi.useFakeTimers()
@@ -121,6 +131,7 @@ beforeEach(() => {
   wire.handlers.clear()
   wire.answers.clear()
   media.produced.length = 0
+  vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver)
   // jsdom has no MediaStream; the store builds one per remote peer.
   class FakeMediaStream {
     tracks: unknown[]
@@ -142,6 +153,10 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  // A store left in a call keeps its re-send interval and its visibility
+  // listener, as it should; end the active one so it does not answer the
+  // next test's clock.
+  useConferenceStore().leaveRoom()
   vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
@@ -216,7 +231,10 @@ describe('conference store — receive what is visible (FR-127 P1)', () => {
       setActivePinia(createPinia())
       media.produced.length = 0
       const store = await join({ view: true, audio_dtx: dtx, simulcast: null })
-      const tracks = [{ kind: 'audio' }, { kind: 'video' }]
+      const tracks = [
+        { kind: 'audio', stop: () => {} },
+        { kind: 'video', stop: () => {} },
+      ]
       vi.stubGlobal('navigator', {
         mediaDevices: {
           getUserMedia: async () => ({
@@ -232,6 +250,46 @@ describe('conference store — receive what is visible (FR-127 P1)', () => {
       const video = media.produced.find((p) => (p.track as { kind: string }).kind === 'video')
       expect(video?.codecOptions).toBeUndefined()
     }
+  })
+
+  it('declares the cap only in a browser whose tiles can report (IntersectionObserver), else stays legacy', async () => {
+    vi.stubGlobal('IntersectionObserver', undefined)
+    const store = await join({ view: true, audio_dtx: true, simulcast: null })
+    const joinMsg = wire.sent.find((m) => m.type === 'media:join')
+    expect(joinMsg?.data).toEqual({ room_id: 'r1' })
+    // The server would pause everything a declared viewer never reports, so
+    // without the cap the client is legacy on both sides: no view is sent.
+    expect(store.meeting.view).toBe(false)
+    expect(store.meeting.audioDtx).toBe(true)
+    store.reportTileVisible('c1', { visible: true, w: 320, h: 240 })
+    vi.advanceTimersByTime(500)
+    expect(views()).toHaveLength(0)
+  })
+
+  it('re-sends the current view every 15 s in a call and when the tab becomes visible, and stops on leave', async () => {
+    // Its own room id: the mocked socket is shared with every store this
+    // file left in a call, and those answer the clock too, as they should.
+    const store = await join({ view: true, audio_dtx: true, simulcast: null }, 'r-resend')
+    const mine = () => views().filter((v) => v.data.room_id === 'r-resend')
+    vi.advanceTimersByTime(100)
+    expect(mine().map((v) => v.data.seq)).toEqual([1])
+
+    // Nothing changed on screen: the view goes out again anyway, so a report
+    // the socket dropped is healed inside the period.
+    vi.advanceTimersByTime(15000)
+    expect(mine().map((v) => v.data.seq)).toEqual([1, 2])
+    expect(mine()[1].data.video).toEqual([])
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    vi.advanceTimersByTime(100)
+    expect(mine().map((v) => v.data.seq)).toEqual([1, 2, 3])
+
+    store.leaveRoom()
+    vi.advanceTimersByTime(60000)
+    document.dispatchEvent(new Event('visibilitychange'))
+    vi.advanceTimersByTime(500)
+    expect(mine()).toHaveLength(3)
   })
 
   it('forgets the view on leave, and the next call continues the seq', async () => {

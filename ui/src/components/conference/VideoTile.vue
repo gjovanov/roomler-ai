@@ -466,6 +466,13 @@ const showBlackNotice = computed(
 // Only a remote tile reports; a local one receives nothing.
 let visibilityObserver: IntersectionObserver | null = null
 let reportedVisible = false
+// The observer's last word, and whether this tile's picture is in the
+// floating picture-in-picture window: a tile its strip has scrolled out is
+// still on the user's screen while it is the PiP element, so it stays in the
+// view and keeps playing there (found in review).
+let intersecting = false
+let intersectingRect: DOMRectReadOnly | undefined
+let inPictureInPicture = false
 
 function reportVisibility(visible: boolean, rect?: DOMRectReadOnly) {
   if (visible === reportedVisible) return
@@ -478,15 +485,39 @@ function reportVisibility(visible: boolean, rect?: DOMRectReadOnly) {
   })
 }
 
+function recomputeVisibility() {
+  reportVisibility(intersecting || inPictureInPicture, intersectingRect)
+}
+
+function onEnterPictureInPicture() {
+  inPictureInPicture = true
+  recomputeVisibility()
+}
+
+function onLeavePictureInPicture() {
+  inPictureInPicture = false
+  recomputeVisibility()
+}
+
 onMounted(() => {
   attachStream()
   if (fullscreenSupported) document.addEventListener('fullscreenchange', onFullscreenChange)
   const root = tileRef.value?.$el
   if (!props.isLocal && root && typeof IntersectionObserver !== 'undefined') {
     visibilityObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) reportVisibility(entry.isIntersecting, entry.boundingClientRect)
+      for (const entry of entries) {
+        intersecting = entry.isIntersecting
+        intersectingRect = entry.boundingClientRect
+        recomputeVisibility()
+      }
     })
     visibilityObserver.observe(root)
+    const video = videoRef.value
+    if (video) {
+      inPictureInPicture = document.pictureInPictureElement === video
+      video.addEventListener('enterpictureinpicture', onEnterPictureInPicture)
+      video.addEventListener('leavepictureinpicture', onLeavePictureInPicture)
+    }
   }
   // Also listen for track changes if stream is already set
   if (props.stream) {
@@ -517,6 +548,8 @@ onBeforeUnmount(() => {
   stopBlackWatch = null
   visibilityObserver?.disconnect()
   visibilityObserver = null
+  videoRef.value?.removeEventListener('enterpictureinpicture', onEnterPictureInPicture)
+  videoRef.value?.removeEventListener('leavepictureinpicture', onLeavePictureInPicture)
   reportVisibility(false)
   disarmGestureRetry()
   if (fullscreenSupported) document.removeEventListener('fullscreenchange', onFullscreenChange)
