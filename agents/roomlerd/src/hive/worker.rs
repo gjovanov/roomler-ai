@@ -330,15 +330,20 @@ pub(crate) async fn serve(ch: UnixStream, descriptors: Option<UnixStream>) -> st
             Msg::Ready { .. } => Ok(()),
             #[cfg(feature = "vault")]
             Msg::Call { id, call } => {
-                // A serve's listener came just before its frame, so it is
+                // A serve's listener came just before its frame (P8-2a-4b:
+                // the egress fronts' two, the HTTP one's first), so they are
                 // taken here, in order, before the next frame is read.
-                let listener = match (&call, &descriptors) {
-                    (Call::Serve { .. }, Some(ch)) => Some(fds::recv(ch).await),
-                    _ => None,
+                let listeners = match (&call, &descriptors) {
+                    (Call::Serve { .. }, Some(ch)) => vec![fds::recv(ch).await],
+                    (Call::Egress { .. }, Some(ch)) => {
+                        let http = fds::recv(ch).await;
+                        vec![http, fds::recv(ch).await]
+                    }
+                    _ => Vec::new(),
                 };
                 let (link, serving) = (Arc::clone(&link), Arc::clone(&serving));
                 tokio::spawn(async move {
-                    let answer = answer_call(&link, &serving, call, listener);
+                    let answer = answer_call(&link, &serving, call, listeners);
                     let _ = link.answer(id, answer).await;
                 });
                 Ok(())
@@ -363,22 +368,43 @@ fn answer_call(
     link: &Arc<link::Link>,
     serving: &Arc<super::vault_connect::handed::Serving>,
     call: Call,
-    listener: Option<std::io::Result<std::os::fd::OwnedFd>>,
+    listeners: Vec<std::io::Result<std::os::fd::OwnedFd>>,
 ) -> Answer {
     use super::vault_connect::handed;
+    let mut listeners = listeners.into_iter();
+    let mut next = || match listeners.next() {
+        Some(Ok(fd)) => Ok(fd),
+        Some(Err(e)) => Err(Answer::Refused {
+            why: format!("its listener did not come: {e}"),
+        }),
+        None => Err(Answer::Refused {
+            why: "no listener came with it".into(),
+        }),
+    };
     match call {
-        Call::Serve { endpoint, spec } => match listener {
-            Some(Ok(fd)) => handed::serve_handed(serving, Arc::clone(link), endpoint, &spec, fd),
-            Some(Err(e)) => Answer::Refused {
-                why: format!("its listener did not come: {e}"),
-            },
-            None => Answer::Refused {
-                why: "no listener came with it".into(),
-            },
+        Call::Serve { endpoint, spec } => match next() {
+            Ok(fd) => handed::serve_handed(serving, Arc::clone(link), endpoint, &spec, fd),
+            Err(refused) => refused,
+        },
+        // P8-2a-4b — the run's egress fronts.
+        Call::Egress { endpoint, spec } => match (next(), next()) {
+            (Ok(http), Ok(socks)) => super::egress::handed::serve_handed(
+                serving,
+                Arc::clone(link),
+                endpoint,
+                &spec,
+                http,
+                socks,
+            ),
+            (Err(refused), _) | (_, Err(refused)) => refused,
         },
         Call::Close { endpoint } => handed::close_handed(serving, endpoint),
-        Call::Values { .. } => Answer::Refused {
-            why: "the daemon answers `values`, never a worker".into(),
+        Call::Values { .. }
+        | Call::Decide { .. }
+        | Call::Bound { .. }
+        | Call::Valued { .. }
+        | Call::Leaf { .. } => Answer::Refused {
+            why: "the daemon answers that, never a worker".into(),
         },
     }
 }
@@ -799,9 +825,11 @@ async fn life(
         // On a task of its own: the hand-overs' answers come through the
         // loop below.
         let link = Arc::clone(&link);
-        tokio::spawn(
-            async move { super::vault_connect::handed::rehand(session, fence, &link).await },
-        );
+        tokio::spawn(async move {
+            super::vault_connect::handed::rehand(session, fence, &link).await;
+            // P8-2a-4b — and the run's egress fronts.
+            super::egress::handed::rehand(session, fence, &link).await;
+        });
     }
     let ended = beats(run, &link, &mut frames, timing, stop).await;
     #[cfg(feature = "vault")]
@@ -867,20 +895,29 @@ async fn beats(
     }
 }
 
-/// FR-90 P8-2a-2 — the daemon's answer to one of its worker's calls, sent
-/// on a task of its own, so the heartbeat never waits on it.
+/// FR-90 P8-2a-2 — the daemon's answer to one of its worker's calls, made
+/// and sent on a task of its own, so the heartbeat never waits on it
+/// (P8-2a-4b: a decision can wait on the vault). Each is answered for the
+/// run this worker serves, whatever the call names.
 #[cfg(feature = "vault")]
 fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
-    let answer = match call {
-        Call::Values { endpoint } => {
-            super::vault_connect::handed::values(run.session, run.fence, endpoint)
-        }
-        Call::Serve { .. } | Call::Close { .. } => Answer::Refused {
-            why: "a worker asks the daemon for values alone".into(),
-        },
-    };
+    use super::egress::handed as egress;
+    let (session, fence) = (run.session, run.fence);
     let link = Arc::clone(link);
     tokio::spawn(async move {
+        let answer = match call {
+            Call::Values { endpoint } => {
+                super::vault_connect::handed::values(session, fence, endpoint)
+            }
+            Call::Decide { host, port } => egress::decide((session, fence), &host, port).await,
+            Call::Bound { host, port } => egress::bound((session, fence), &host, port).await,
+            Call::Valued { host, port } => egress::valued((session, fence), &host, port).await,
+            Call::Leaf { host } => egress::leaf((session, fence), &host).await,
+            Call::Serve { .. } | Call::Close { .. } | Call::Egress { .. } => Answer::Refused {
+                why: "a worker asks the daemon for values and the egress proxy's answers alone"
+                    .into(),
+            },
+        };
         let _ = link.answer(id, answer).await;
     });
 }

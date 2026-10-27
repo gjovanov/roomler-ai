@@ -429,12 +429,8 @@ async fn a_run_asks_about_at_most_so_many_hosts() {
     let vault = FakeVault::default();
     let run = run_key();
     let state = RunState {
-        stop: CancellationToken::new(),
-        decisions: Mutex::default(),
         open: Arc::new(Semaphore::new(1)),
-        ca: Arc::new(ca::SessionCa::new(run.0).unwrap()),
-        upstream: OnceCell::new(),
-        bodies: Arc::new(Semaphore::new(MAX_BODIES)),
+        ..RunState::new(Some(Arc::new(ca::SessionCa::new(run.0).unwrap())))
     };
     for i in 0..MAX_HOSTS {
         let _ = decided(&state, run, &format!("h{i}.example"), 443, &vault).await;

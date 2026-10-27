@@ -819,4 +819,4 @@ fn header_of(bytes: &[u8]) -> Result<HeaderValue, String> {
 mod aws;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::hive::egress) mod tests;

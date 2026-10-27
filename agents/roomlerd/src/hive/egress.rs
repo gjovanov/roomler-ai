@@ -51,6 +51,10 @@ use super::placeholder;
 
 /// FR-90 P3b-3b — the run's own CA, and the trust the session is told of.
 pub mod ca;
+/// FR-90 P8-2a-4b — the fronts served by the session's worker, the daemon
+/// answering what they ask.
+#[cfg(unix)]
+pub(crate) mod handed;
 /// FR-90 P3b-3c-1 — TLS terminated for a placeholder's audience, and the
 /// placeholder swapped for its value.
 mod swap;
@@ -91,7 +95,8 @@ const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_REFUSED: u8 = 0x05;
 
 /// What the vault answered about one host for one run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "d", content = "word", rename_all = "snake_case")]
 pub enum Decision {
     /// Allowed; kept for the run.
     Allowed,
@@ -290,17 +295,41 @@ struct RunState {
     /// Each host and port asked about.
     decisions: Mutex<HashMap<HostPort, Kept>>,
     open: Arc<Semaphore>,
-    /// FR-90 P3b-3b — made with the run, gone with it.
-    ca: Arc<ca::SessionCa>,
+    /// FR-90 P3b-3b — made with the run, gone with it. FR-90 P8-2a-4b — the
+    /// daemon's alone: a worker's state has none, and asks for its leaves.
+    ca: Option<Arc<ca::SessionCa>>,
     /// FR-90 P3b-3c-1 — the TLS the run's audiences are verified with, made
     /// at its first termination.
     upstream: OnceCell<Arc<ClientConfig>>,
     /// FR-90 P3b-4-2 — a permit for each body read whole, held until it is
     /// sent.
     bodies: Arc<Semaphore>,
+    /// FR-90 P8-2a-4b — where the run's worker serves the fronts: the
+    /// daemon's seams, which answer its calls, and the fronts' listeners,
+    /// kept to hand to each worker the run has.
+    #[cfg(unix)]
+    seams: Option<Seams>,
+    #[cfg(unix)]
+    handed: Option<handed::Kept>,
 }
 
 impl RunState {
+    /// A run's state, with `ca` where it is the daemon's.
+    fn new(ca: Option<Arc<ca::SessionCa>>) -> Self {
+        Self {
+            stop: CancellationToken::new(),
+            decisions: Mutex::default(),
+            open: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            ca,
+            upstream: OnceCell::new(),
+            bodies: Arc::new(Semaphore::new(MAX_BODIES)),
+            #[cfg(unix)]
+            seams: None,
+            #[cfg(unix)]
+            handed: None,
+        }
+    }
+
     /// FR-90 P3b-3c-1 — the run's TLS to its audiences: made once, at its
     /// first termination, from `roots`. The system's are read off the
     /// runtime's threads: a keychain can be slow to read.
@@ -348,6 +377,26 @@ pub fn start(
     decide: Arc<dyn Decide>,
     dial: Arc<dyn Dial>,
 ) -> Result<Fronts, String> {
+    // FR-90 P8-2a-4b — the device's own setting (`hive_worker`), read as
+    // `supervisor::archive_enabled` reads its own: the run's worker starts
+    // only once its harness has.
+    #[cfg(unix)]
+    let in_worker = super::supervisor::global().is_some_and(|s| s.cfg.worker);
+    #[cfg(not(unix))]
+    let in_worker = false;
+    start_with(run, peer, decide, dial, in_worker)
+}
+
+/// [`start`], told whether the run's worker serves the fronts.
+fn start_with(
+    run: RunKey,
+    peer: Peer,
+    decide: Arc<dyn Decide>,
+    dial: Arc<dyn Dial>,
+    in_worker: bool,
+) -> Result<Fronts, String> {
+    // Also what refuses a front where this system cannot say who connects,
+    // wherever it is served: a `Peer` is a uid on Unix, so `peer` stays.
     let admit = super::vault_connect::session_admit(peer)?;
     // FR-90 P3b-3c-1 — a placeholder's value from the daemon's leases, its
     // audience verified against this device's roots.
@@ -358,7 +407,50 @@ pub fn start(
         leaves: Arc::new(RunLeaves),
         roots: Roots::System,
     };
+    // FR-90 P8-2a-4b — where the device runs a worker beside each session,
+    // served there or not at all: the daemon serves none of the fronts'
+    // connections.
+    #[cfg(unix)]
+    if in_worker {
+        return start_handed(run, peer, seams);
+    }
+    #[cfg(not(unix))]
+    let _ = in_worker;
     start_admitting(run, admit, seams)
+}
+
+/// FR-90 P8-2a-4b — [`start`] where the run has a worker: the fronts bound
+/// here, at the ports the session's settings name, and kept to hand to each
+/// worker the run has, which serves their connections and asks `seams`
+/// through the daemon. Nothing here accepts on them.
+#[cfg(unix)]
+fn start_handed(run: RunKey, peer: Peer, seams: Seams) -> Result<Fronts, String> {
+    let bind = |front: &str| {
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|l| l.local_addr().map(|at| (l, at)))
+            .map_err(|e| format!("the egress proxy's {front} front: {e}"))
+    };
+    let (http, http_at) = bind("HTTP")?;
+    let (socks, socks_at) = bind("SOCKS5")?;
+    let mut state = RunState::new(Some(Arc::new(ca::SessionCa::new(run.0)?)));
+    state.seams = Some(seams);
+    state.handed = Some(handed::Kept::new(http.into(), socks.into(), peer));
+    if let Some(old) = runs().insert(run, Arc::new(state)) {
+        old.stop.cancel();
+    }
+    // A worker already up is handed the fronts now; one that comes up later
+    // is handed them as it does. Handed twice, they are served once.
+    if let Some(link) = super::worker::link_of(run.0, run.1) {
+        tokio::spawn(async move { handed::rehand(run.0, run.1, &link).await });
+    }
+    info!(
+        session = %run.0, fence = run.1, http = %http_at, socks = %socks_at,
+        "hive: the session's egress proxy is kept for its worker to serve"
+    );
+    Ok(Fronts {
+        http: http_at,
+        socks: socks_at,
+    })
 }
 
 /// A loopback listener at a port the system picks, for the runtime.
@@ -381,14 +473,7 @@ fn start_admitting(run: RunKey, admit: Admit, seams: Seams) -> Result<Fronts, St
             .local_addr()
             .map_err(|e| format!("the egress proxy's SOCKS5 front: {e}"))?,
     };
-    let state = Arc::new(RunState {
-        stop: CancellationToken::new(),
-        decisions: Mutex::default(),
-        open: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-        ca: Arc::new(ca::SessionCa::new(run.0)?),
-        upstream: OnceCell::new(),
-        bodies: Arc::new(Semaphore::new(MAX_BODIES)),
-    });
+    let state = Arc::new(RunState::new(Some(Arc::new(ca::SessionCa::new(run.0)?))));
     if let Some(old) = runs().insert(run, state.clone()) {
         old.stop.cancel();
     }
@@ -413,7 +498,7 @@ fn start_admitting(run: RunKey, admit: Admit, seams: Seams) -> Result<Fronts, St
 pub fn ca_of(session: ObjectId, fence: u64) -> Option<Arc<ca::SessionCa>> {
     runs()
         .get(&(session, fence))
-        .map(|state| Arc::clone(&state.ca))
+        .and_then(|state| state.ca.clone())
 }
 
 /// FR-90 P3b-3c-2 — whether `run`'s proxy is serving it: where it is, the
@@ -460,14 +545,17 @@ pub(crate) fn serve_for_test(session: ObjectId, fence: u64) -> Fronts {
 /// Stop serving `run`: both fronts close and every connection on them ends.
 /// Answers whether it was served.
 pub fn drop_run(session: ObjectId, fence: u64) -> bool {
-    match runs().remove(&(session, fence)) {
-        Some(state) => {
-            state.stop.cancel();
-            info!(session = %session, fence, "hive: the session's egress proxy stopped");
-            true
-        }
-        None => false,
+    let Some(state) = runs().remove(&(session, fence)) else {
+        return false;
+    };
+    state.stop.cancel();
+    // FR-90 P8-2a-4b — the worker serving the fronts stops serving them.
+    #[cfg(unix)]
+    if let Some(kept) = &state.handed {
+        handed::closed(session, fence, kept);
     }
+    info!(session = %session, fence, "hive: the session's egress proxy stopped");
+    true
 }
 
 /// One front's listener, until the run ends.

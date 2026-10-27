@@ -123,14 +123,15 @@ impl Link {
     }
 
     /// `call`, and its answer: an error once the channel is gone, and past
-    /// [`CALL_WAIT`]. `descriptor` goes on the second channel just before the
-    /// call's frame (the daemon's side alone has one). A call that cannot be
-    /// sent, or goes unanswered within the bound, takes the link for lost.
+    /// [`CALL_WAIT`]. `descriptors` go on the second channel just before the
+    /// call's frame, in order (the daemon's side alone has one). A call that
+    /// cannot be sent, or goes unanswered within the bound, takes the link
+    /// for lost.
     #[cfg(feature = "vault")]
     pub(crate) async fn call(
         &self,
         call: Call,
-        descriptor: Option<OwnedFd>,
+        descriptors: Vec<OwnedFd>,
     ) -> Result<Answer, String> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -145,17 +146,22 @@ impl Link {
         // frame naming it: the channel is gone then, and so is this link.
         let sent = {
             let mut w = self.writer.lock().await;
-            let descriptor_sent = match (&descriptor, &w.descriptors) {
-                (Some(fd), Some(ch)) => super::fds::send(ch, fd.as_raw_fd()).await,
-                (Some(_), None) => Err(std::io::Error::other("no channel for descriptors here")),
-                (None, _) => Ok(()),
-            };
-            match descriptor_sent {
+            let mut descriptors_sent = Ok(());
+            for fd in &descriptors {
+                descriptors_sent = match &w.descriptors {
+                    Some(ch) => super::fds::send(ch, fd.as_raw_fd()).await,
+                    None => Err(std::io::Error::other("no channel for descriptors here")),
+                };
+                if descriptors_sent.is_err() {
+                    break;
+                }
+            }
+            match descriptors_sent {
                 Ok(()) => send(&mut w.frames, &Msg::Call { id, call }).await,
                 Err(e) => Err(e),
             }
         };
-        drop(descriptor);
+        drop(descriptors);
         if let Err(e) = sent {
             self.forget(id);
             let why = format!("the worker's channel refused a call: {e}");
