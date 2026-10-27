@@ -356,6 +356,37 @@ by hand or pushed to the per-user row. For a kill switch that is the point, sinc
 one account must not undo a switch set for the machine. To give the per-user row
 its own value, clear the root's.
 
+### A worker never outlives its daemon (#2987, 2026-10-27)
+
+The process group that lets `stop_worker` take the whole chain down is also why
+the chain survived a daemon that never reached `stop_worker`: the watchdog's
+`exit(2)` after a 69 s stall, on the operator's MacBook on 2026-10-26. The
+orphaned 0.4.174 worker kept the person's single-instance lock through the
+0.4.175 and 0.4.177 updates. Every new worker exited 0 on that lock, the
+supervisor gave up naming "no per-user enrollment", and the orphan's re-attach
+was refused as a `secret mismatch` every 30 s.
+
+| | as built |
+|---|---|
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:630`, `:514`, `:347`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:389`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:460`, `:504`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:799`, `:441`). |
+| **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:459`). |
+
+The proposal on the issue was different, and both changes were deliberate:
+
+- **Not "exit on delegation EOF plus `secret mismatch`".** The refusal is silent
+  by design (`delegate::serve` sends no reason), so the worker cannot tell a
+  refusal from a restart that is still in progress. The pipe's end-of-file is
+  certain: the kernel closes the write end when the daemon process ends, however
+  it ends.
+- **Not "record the pgid in a runtime file".** A daemon from before #2987 never
+  wrote one, so the workers already stranded in the field would stay stranded.
+  Matching the exact command line also finds those workers, and it carries no
+  stale-pid risk.
+
+Operator-facing detail, the mixed-version matrix and the remedy for a stuck
+Mac: `docs/installation.md`, "The GUI worker never outlives its daemon".
+
 ### Components
 
 | where | change |

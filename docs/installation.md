@@ -572,6 +572,64 @@ The Overview's **Service** line reads the root daemon too (`System daemon
 and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — read
 "not installed".
 
+### The GUI worker never outlives its daemon (#2987)
+
+The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
+… roomlerd run --supervised`, in a process group of its own, so that it can stop
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:571`). The same
+group is why launchd's teardown of the daemon never reaches the worker. Before
+#2987, a daemon that ended any way other than its clean shutdown (the watchdog's
+`exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
+worker stayed on the old release, its delegation was refused (`secret
+mismatch`), and it held the person's single-instance lock. Each worker the next
+daemon spawned then exited 0 within seconds, and after five the supervisor gave
+up. Measured on the operator's MacBook on 2026-10-26: a 0.4.174 worker outlived
+the 0.4.175 and 0.4.177 updates.
+
+```mermaid
+sequenceDiagram
+  participant L as launchd
+  participant D as root daemon
+  participant W as GUI worker (the person)
+  D->>W: spawn - stdin carries the secret, then roomler-lifeline/1
+  Note over D,W: the daemon keeps its end of the pipe open for the worker's life
+  D->>D: dies without its clean shutdown - exit(2), a crash, kill -9
+  Note over W: the pipe closes - end-of-file on stdin
+  W->>W: internal shutdown, marked clean
+  L->>D: KeepAlive starts a new daemon
+  D->>D: reap - stop any worker still running run --supervised
+  D->>W: spawn a fresh worker on the current release
+```
+
+| Mechanism | How | Catches |
+|---|---|---|
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:630`, `:514`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:460`, `:504`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person: SIGTERM, 2 s, then SIGKILL (`macos_supervisor.rs:799`, `:441`). It runs at start, and again after a worker exits 0 within 30 s. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:459`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+
+⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
+own after the secret. A worker from before #2987 reads one line, as it always
+did, and never sees the offer. A new worker under an older daemon reads
+end-of-file where the offer would be, arms nothing and behaves as before. Which
+release is on disk is never known at spawn time, because an update replaces the
+binary under a running daemon.
+
+⚠️ **The worker leaves as an update would, not as an OS stop.** The run is
+marked clean, so the crash-and-rollback counter never counts it. An ephemeral
+device does not unenroll, and the next daemon's worker comes up on the same
+enrollment.
+
+⚠️ The reap matches the whole command line, and nothing else: `--supervised` is
+on no command line but the one `spawn_worker` builds. A hand-run `roomlerd run`,
+launchd's own worker (`… run`) and the daemon (`… --config … run`) never match,
+and neither does a root process.
+
+**If a Mac is stuck anyway**, the daemon's log ends with `the GUI worker died
+on arrival too many times — NOT retrying: each worker exited 0 at once: another
+roomlerd holds this person's single-instance lock`. The holder is then not a
+supervised worker: `pgrep -lU <uid> roomlerd` names it. Stop it, then run
+`sudo launchctl kickstart -k system/com.roomler.daemon`.
+
 ### Paths, logs, limits
 
 | | Path |
