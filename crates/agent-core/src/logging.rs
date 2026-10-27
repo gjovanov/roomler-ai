@@ -505,6 +505,14 @@ pub fn read_tail(path: &Path, cap: u64) -> std::io::Result<(u64, String)> {
 /// S1b: with a [`ServiceLogRole`] set, resolves to the machine-global
 /// `service-logs` dir instead of the per-profile data dir.
 pub fn resolve_log_dir() -> Option<PathBuf> {
+    // #2994 — never the operator's real log dir from this crate's own unit
+    // tests. `init_is_idempotent` calls the real `init`, which would add a
+    // file layer writing into the live daemon log, a panic hook that turns
+    // a failing test into a crash of this device (the daemon uploads it),
+    // and a prune of the real dir. `None` takes init's stdout-only branch.
+    if cfg!(test) {
+        return None;
+    }
     #[cfg(target_os = "windows")]
     if SERVICE_ROLE.get().is_some() {
         return Some(crate::appdirs::machine_global_dir().join("service-logs"));
@@ -760,6 +768,17 @@ mod tests {
         // calls fall through the `GUARD.get().is_some()` early return.
         init();
         init();
+    }
+
+    /// #2994 — this crate's unit tests never reach the operator's real log
+    /// dir, so `init` stays stdout-only: no file layer in the live daemon
+    /// log, and no panic hook recording a failing test as this device's
+    /// crash.
+    #[test]
+    fn unit_tests_never_touch_the_real_log_dir() {
+        assert_eq!(resolve_log_dir(), None);
+        init();
+        assert_eq!(log_dir(), None);
     }
 
     #[test]
