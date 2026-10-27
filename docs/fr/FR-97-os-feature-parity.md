@@ -777,7 +777,7 @@ test of the SIGKILL property itself.
   value of each (FR-43's `WORKER_ENV_FORWARD`, #2758); a per-user half's own LaunchAgent environment is unchanged.
 - **P2f, a microphone for recordings.** cpal on macOS, `NSMicrophoneUsageDescription` in the bundle (a missing key
   ends the process at first access), and the audio-input entitlement.
-  *As built (P2f):* cpal is a macOS dependency for the microphone only (`agents/roomlerd/Cargo.toml:409-415`; a
+  *As built (P2f):* cpal is a macOS dependency for the microphone only (`agents/roomlerd/Cargo.toml:414-420`; a
   Mac's computer audio stays ScreenCaptureKit's), and the recorder child's `open_microphone` opens CoreAudio's
   default input through the same `cpal_backend` Linux and Windows use. One thing the platform added: macOS records
   **silence** from a microphone the person turned off, and the stream opens and runs. So

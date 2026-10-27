@@ -2859,8 +2859,10 @@ sequenceDiagram
 | a leaf | made by the daemon's CA, and only for an audience of a placeholder the run holds: the session's tools trust the CA, and it signs for whatever host it is asked |
 | no worker up | nothing serves the fronts: a connection waits, and a run whose worker the daemon gives up on ends |
 
-> ⚠️ The worker's own log lines do not reach the daemon's log yet (FR-90 P8-2a-5). A refusal the
-> worker makes is enforced, but logged nowhere.
+A refusal the worker makes is logged in the daemon's log, as the daemon's own lines are (FR-90
+P8-2a-5): at its level, beside the worker's process (`worker=`) and where it was logged
+(`origin=`). So `RUST_LOG=roomlerd=info,roomlerd::hive::egress=debug,warn` turns the proxy up
+wherever it runs.
 
 Detail: [`hive/egress/handed.rs`](../agents/roomlerd/src/hive/egress/handed.rs), and the FR-90
 spec's §3i, "P8-2a-4b, as built".

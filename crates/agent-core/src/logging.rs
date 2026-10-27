@@ -173,59 +173,7 @@ pub fn init() {
         return;
     }
 
-    // Default filter. `RUST_LOG` (env, or the SCM service Environment
-    // block for the SystemContext service) overrides wholesale when
-    // set. The fallback keeps `roomler_agent` at info + everything
-    // else at warn, with ONE addition: `tunnel_core=info`.
-    //
-    // rc.74: `tunnel_core=info` surfaces the per-flow throughput
-    // logger (`tunnel flow throughput (2s window) …` + the
-    // flow-closed totals) added in rc.66. Those live in the
-    // `tunnel_core` target, so under the old `roomler_agent=info,warn`
-    // default they were filtered out of BOTH the on-disk rolling log
-    // AND the centralized upload layer — invisible unless an operator
-    // hand-set `RUST_LOG`. The throughput lines are low-volume (one
-    // per active flow per 2 s, only when bytes moved) and are exactly
-    // the signal we need to diagnose tunnel stalls remotely via the
-    // admin-UI log viewer, so they belong on by default. Everything
-    // else in `tunnel_core` is debug/trace and stays suppressed; the
-    // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
-    let env_filter = std::env::var("RUST_LOG")
-        .ok()
-        .map(|spec| EnvFilter::new(mirror_legacy_log_target(&spec)))
-        .unwrap_or_else(|| {
-            // S1b follow-up: `roomlerd=info` — events emitted from the BIN
-            // (target = the binary crate name) were silently capped at warn,
-            // hiding the migration notes + DPI/timer diagnostics the code
-            // clearly intended to be visible.
-            EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
-        })
-        // rc.181 — silence the `turn` crate's periodic refresh-failure warns
-        // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
-        // Now that the overlay re-allocates a dead relay carrier on the send-error
-        // signal (wg.rs `Carrier::dead` → `sweep_carrier_health`), these are
-        // transient noise — one every ~5–10 min per corp-VPN host — and they
-        // dominate the error/warn-biased agent_logs upload. Appended
-        // UNCONDITIONALLY (even when the SCM service sets `RUST_LOG` wholesale) so
-        // it lands fleet-wide on the next binary, not just fresh installs. The
-        // sweep's own `relay carrier … — re-allocating` warn is the actionable
-        // signal that replaces them.
-        .add_directive(
-            "turn::client::relay_conn=error"
-                .parse()
-                .expect("static EnvFilter directive is valid"),
-        )
-        // FR-110 — each carrier socket's granted buffer sizes, said once per
-        // bind (startup and plane rebuilds: a handful of lines a day). On
-        // Windows nothing like `ss -m` exists, so the line is the only evidence
-        // of the size. The packaged Linux units set `RUST_LOG=roomlerd=info,warn`,
-        // which drops `tunnel_core` INFO, so this is appended UNCONDITIONALLY,
-        // like the directive above.
-        .add_directive(
-            "tunnel_core::overlay::sockbuf=info"
-                .parse()
-                .expect("static EnvFilter directive is valid"),
-        );
+    let env_filter = filter();
 
     let stdout = fmt::layer().with_target(false).compact();
 
@@ -272,6 +220,65 @@ pub fn init() {
         // fallback for cargo-test and ad-hoc `cargo run` from a
         // checkout where `directories` couldn't resolve a home.
     }
+}
+
+/// The filter this binary's logs are kept by: [`init`]'s, and (FR-90
+/// P8-2a-5) a session's worker's, so its lines are kept as the daemon's own
+/// would be.
+pub fn filter() -> EnvFilter {
+    // Default filter. `RUST_LOG` (env, or the SCM service Environment
+    // block for the SystemContext service) overrides wholesale when
+    // set. The fallback keeps `roomler_agent` at info + everything
+    // else at warn, with ONE addition: `tunnel_core=info`.
+    //
+    // rc.74: `tunnel_core=info` surfaces the per-flow throughput
+    // logger (`tunnel flow throughput (2s window) …` + the
+    // flow-closed totals) added in rc.66. Those live in the
+    // `tunnel_core` target, so under the old `roomler_agent=info,warn`
+    // default they were filtered out of BOTH the on-disk rolling log
+    // AND the centralized upload layer — invisible unless an operator
+    // hand-set `RUST_LOG`. The throughput lines are low-volume (one
+    // per active flow per 2 s, only when bytes moved) and are exactly
+    // the signal we need to diagnose tunnel stalls remotely via the
+    // admin-UI log viewer, so they belong on by default. Everything
+    // else in `tunnel_core` is debug/trace and stays suppressed; the
+    // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
+    std::env::var("RUST_LOG")
+        .ok()
+        .map(|spec| EnvFilter::new(mirror_legacy_log_target(&spec)))
+        .unwrap_or_else(|| {
+            // S1b follow-up: `roomlerd=info` — events emitted from the BIN
+            // (target = the binary crate name) were silently capped at warn,
+            // hiding the migration notes + DPI/timer diagnostics the code
+            // clearly intended to be visible.
+            EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
+        })
+        // rc.181 — silence the `turn` crate's periodic refresh-failure warns
+        // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
+        // Now that the overlay re-allocates a dead relay carrier on the send-error
+        // signal (wg.rs `Carrier::dead` → `sweep_carrier_health`), these are
+        // transient noise — one every ~5–10 min per corp-VPN host — and they
+        // dominate the error/warn-biased agent_logs upload. Appended
+        // UNCONDITIONALLY (even when the SCM service sets `RUST_LOG` wholesale) so
+        // it lands fleet-wide on the next binary, not just fresh installs. The
+        // sweep's own `relay carrier … — re-allocating` warn is the actionable
+        // signal that replaces them.
+        .add_directive(
+            "turn::client::relay_conn=error"
+                .parse()
+                .expect("static EnvFilter directive is valid"),
+        )
+        // FR-110 — each carrier socket's granted buffer sizes, said once per
+        // bind (startup and plane rebuilds: a handful of lines a day). On
+        // Windows nothing like `ss -m` exists, so the line is the only evidence
+        // of the size. The packaged Linux units set `RUST_LOG=roomlerd=info,warn`,
+        // which drops `tunnel_core` INFO, so this is appended UNCONDITIONALLY,
+        // like the directive above.
+        .add_directive(
+            "tunnel_core::overlay::sockbuf=info"
+                .parse()
+                .expect("static EnvFilter directive is valid"),
+        )
 }
 
 /// Claim the consumer end of the log-upload channel. Returns `None`
