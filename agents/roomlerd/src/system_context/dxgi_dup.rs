@@ -169,6 +169,10 @@ pub struct DxgiFrame {
     /// Phase B — native dims when the backend GPU-scaled before the
     /// readback; `None` = the frame is native-sized.
     pub source: Option<(u32, u32)>,
+    /// FR-118 P0 — how long this frame's copy of the desktop surface into
+    /// CPU memory took, in microseconds. The adapter-bound direct backend
+    /// times it; `None` from the scrap-wrapped one, which copies inside scrap.
+    pub readback_us: Option<u64>,
 }
 
 /// Uniform interface over the two DXGI Desktop Duplication backends —
@@ -276,6 +280,7 @@ impl DxgiDupBackend {
                     stride,
                     damage: crate::capture::Damage::Unknown,
                     source: None,
+                    readback_us: None,
                 })
             }
             Err(e) => Err(BackendBail::from_io(e)),

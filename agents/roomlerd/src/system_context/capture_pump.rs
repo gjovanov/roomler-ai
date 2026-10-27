@@ -45,6 +45,8 @@
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
 use anyhow::{Result, anyhow};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -178,6 +180,33 @@ struct CaptureCmd {
     output_cap: Option<(u32, u32)>,
 }
 
+/// FR-118 P0 — the DXGI arm's copies of the desktop surface into CPU memory,
+/// cumulative for this capture: frames measured and the microseconds they
+/// took. The worker thread adds to it; `readback_totals` reads it.
+#[derive(Default)]
+struct ReadbackTotals {
+    frames: AtomicU64,
+    us: AtomicU64,
+}
+
+impl ReadbackTotals {
+    /// Count one frame's readback, when its backend measured one.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+    fn record(&self, us: Option<u64>) {
+        if let Some(us) = us {
+            self.us.fetch_add(us, Ordering::Relaxed);
+            self.frames.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.frames.load(Ordering::Relaxed),
+            self.us.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Async-side handle. `cmd_tx` posts capture requests to the worker
 /// thread; the worker fills the embedded oneshot.
 pub struct SystemContextCapture {
@@ -187,6 +216,7 @@ pub struct SystemContextCapture {
     /// Phase B — the pump's latest `set_output_cap`, attached to every
     /// subsequent request.
     output_cap: Option<(u32, u32)>,
+    readback: Arc<ReadbackTotals>,
 }
 
 impl SystemContextCapture {
@@ -197,11 +227,13 @@ impl SystemContextCapture {
     pub fn primary(_target_fps: u32, _downscale: DownscalePolicy) -> Result<Self> {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
+        let readback = Arc::new(ReadbackTotals::default());
+        let worker_readback = Arc::clone(&readback);
 
         thread::Builder::new()
             .name("roomlerd-system-capture".into())
             .spawn(move || {
-                worker_main(ready_tx, cmd_rx);
+                worker_main(ready_tx, cmd_rx, worker_readback);
             })
             .map_err(|e| anyhow!("spawning system-context capture thread: {e}"))?;
 
@@ -214,6 +246,7 @@ impl SystemContextCapture {
             width,
             height,
             output_cap: None,
+            readback,
         })
     }
 
@@ -255,6 +288,12 @@ impl ScreenCapture for SystemContextCapture {
         "system-context"
     }
 
+    /// FR-118 P0 — timed on the capture thread, like WGC's. Unlike WGC's, the
+    /// pump waits for this one, so it is also a part of `avg_capture_ms`.
+    fn readback_totals(&self) -> Option<(u64, u64)> {
+        Some(self.readback.totals())
+    }
+
     fn monitor_count(&self) -> u8 {
         // M3 A1 captures the primary monitor only — see plan §4.
         // Multi-monitor capture stays in the user-context worker
@@ -268,6 +307,7 @@ impl ScreenCapture for SystemContextCapture {
 fn worker_main(
     ready_tx: std_mpsc::Sender<Result<(u32, u32)>>,
     cmd_rx: std_mpsc::Receiver<CaptureCmd>,
+    readback: Arc<ReadbackTotals>,
 ) {
     // 1. Bootstrap window-station attachment. Skipped under user-mode
     //    test runs (already on WinSta0); idempotent on the real
@@ -377,6 +417,7 @@ fn worker_main(
             &mut first_frame_primed,
             start,
             cmd.output_cap,
+            &readback,
         );
         worker_capture_us += cap_start.elapsed().as_micros() as u64;
         worker_capture_calls += 1;
@@ -628,6 +669,8 @@ fn capture_one_blocking(
         u32,
         u32,
     )>,
+    // FR-118 P0 — where a DXGI frame's measured readback is counted.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] readback: &ReadbackTotals,
 ) -> CaptureReply {
     // rc.108 — NON-PERMANENT GDI fallback. The doc-comment has claimed
     // since M3 A1 that "every successful GDI frame also re-tries DXGI"
@@ -665,6 +708,7 @@ fn capture_one_blocking(
                 *consecutive_access_lost = 0;
                 *consecutive_empty = 0;
                 *delivered_since_build = true;
+                readback.record(frame.readback_us);
                 Ok(Some(dxgi_to_frame(frame, start)))
             }
             Err(BackendBail::Transient) => {
@@ -968,6 +1012,22 @@ fn gdi_to_frame(f: GdiFrame, start: Instant) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-118 P0 — only a frame whose backend measured its readback counts:
+    /// the scrap-wrapped backend's frames (`None`) must not dilute the average
+    /// with zeros. The heartbeat then reports the time per measured frame.
+    #[test]
+    fn readback_totals_count_only_measured_frames() {
+        let totals = ReadbackTotals::default();
+        totals.record(None);
+        assert_eq!(totals.totals(), (0, 0));
+        totals.record(Some(4_000));
+        totals.record(None);
+        totals.record(Some(6_000));
+        assert_eq!(totals.totals(), (2, 10_000));
+        let ms = crate::capture::readback_window_ms(totals.totals(), (0, 0));
+        assert_eq!(ms, 5.0);
+    }
 
     /// FR-34 — the stuck-vs-idle decision, the whole point of which is that a
     /// backend that has EVER delivered a frame is never treated as stuck (that

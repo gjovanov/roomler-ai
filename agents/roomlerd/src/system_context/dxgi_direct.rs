@@ -681,6 +681,8 @@ impl DxgiDirectBackend {
                 // still held — same flow as the native path.
                 damage: Damage::Unknown,
                 source: Some((self.width, self.height)),
+                // Timed by read_acquired, which owns the whole readback.
+                readback_us: None,
             }),
             Err(e) => {
                 tracing::warn!(
@@ -859,6 +861,8 @@ impl DxgiDirectBackend {
     /// read out a tightly-packed BGRA8 buffer. Called between
     /// AcquireNextFrame and ReleaseFrame.
     fn read_acquired(&mut self, resource: Option<IDXGIResource>) -> Result<DxgiFrame, BackendBail> {
+        // FR-118 P0 — the whole readback is timed, a GPU scale's included.
+        let started = std::time::Instant::now();
         let resource = resource.ok_or_else(|| {
             BackendBail::HardError(io::Error::other(
                 "DXGI-direct: AcquireNextFrame returned a null resource",
@@ -870,7 +874,8 @@ impl DxgiDirectBackend {
         // smaller box and the path is available. Any refusal or failure
         // falls through to the native readback below unchanged.
         if let Some(f) = self.try_gpu_scaled(&src) {
-            return Ok(f);
+            let readback_us = Some(started.elapsed().as_micros() as u64);
+            return Ok(DxgiFrame { readback_us, ..f });
         }
 
         self.ensure_staging(&src)?;
@@ -948,6 +953,7 @@ impl DxgiDirectBackend {
             stride: stride as u32,
             damage: Damage::Unknown,
             source: None,
+            readback_us: Some(started.elapsed().as_micros() as u64),
         })
     }
 }
