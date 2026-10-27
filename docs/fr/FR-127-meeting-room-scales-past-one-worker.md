@@ -106,10 +106,10 @@ sequenceDiagram
   S-->>V: media:new_producer ×(N−1)
   V->>S: media:view {video: []}  (nothing rendered yet)
   V->>S: media:consume (one per producer, serialised by consumeChain)
-  S->>W: Consumer paused:true for video not in the view; audio resumed
+  S->>W: Consumer paused:true for video not in the view, audio resumed
   Note over V: the layout mounts 16 tiles
   V->>S: media:view {video: [16 × {producer_id,w,h}]}
-  S->>W: resume those 16 (+ preferred layers, P2); pause the rest
+  S->>W: resume those 16 (+ preferred layers, P2), pause the rest
   W-->>V: key frame for each resumed consumer (the worker requests it on resume)
 ```
 
