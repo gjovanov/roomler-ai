@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -58,23 +59,26 @@ const CHILD_ENV: &str = "ROOMLERD_HIVE_WORKER";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The descriptor a worker's channel arrives on.
+#[cfg(unix)]
 const CHANNEL_FD: std::os::fd::RawFd = 3;
 
 /// FR-90 P8-2a-2 — the descriptor its second channel arrives on: the one
-/// the daemon hands listeners across ([`fds`]).
+/// the daemon hands listeners across (`fds`).
+#[cfg(unix)]
 const DESCRIPTORS_FD: std::os::fd::RawFd = 4;
 
 /// FR-90 P8-2a-3 — the most descriptors a worker holds open. Each connection
 /// it serves is one or two, so a worker that leaks them stops here, long
 /// before the host's ephemeral ports run out: a leak of sockets once took a
 /// host's name resolution down while every address still answered.
+#[cfg(unix)]
 const MAX_OPEN_FILES: libc::rlim_t = 4096;
 
 /// How long a hand-over waits for a starting worker to be up.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 const UP_WAIT: Duration = Duration::from_secs(10);
 
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 pub(crate) use super::vault_connect::handed::{Answer, Call};
 
 /// The largest frame either side sends or takes.
@@ -101,9 +105,9 @@ pub(crate) enum Msg {
     },
     /// FR-90 P8-2a-2 — either side: a call, which the other answers with
     /// the `answer` of the same id ([`link`]).
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     Call { id: u64, call: Call },
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     Answer { id: u64, answer: Answer },
 }
 
@@ -209,9 +213,29 @@ fn is_worker(
         && child_env.is_some()
 }
 
+/// FR-90 P8-2b-1 — a worker's life on Windows, from the pipe its daemon
+/// handed it ([`win`]): as on Unix, but its limits are its job's, set by the
+/// daemon before it ran a step.
+#[cfg(windows)]
+pub async fn worker_main() -> i32 {
+    let (layer, lines) = log::layer();
+    log::install(layer);
+    let Some(pipe) = win::inherited_channel() else {
+        return 2;
+    };
+    match serve(pipe, Some(lines)).await {
+        Ok(()) => 0,
+        Err(e) => {
+            crate::logging::say_on_stderr(format_args!("roomlerd hive-worker: {e}"));
+            1
+        }
+    }
+}
+
 /// A worker's life, from its channel on fd 3: answer the handshake and each
 /// heartbeat, and end at `bye` or the channel's end. The process's exit
 /// code.
+#[cfg(unix)]
 pub async fn worker_main() -> i32 {
     // Linux runs this as `/proc/self/exe`, whose name the kernel takes for
     // the process's: named as the daemon's every other child is.
@@ -264,6 +288,7 @@ pub async fn worker_main() -> i32 {
 /// channels: it never dumps core, since its memory holds the values of the
 /// endpoints it serves; and it holds at most [`MAX_OPEN_FILES`] descriptors.
 /// A worker that cannot set them does not run.
+#[cfg(unix)]
 fn limit() -> std::io::Result<()> {
     // 1, not 0: where the system pipes a dump to a helper (systemd-coredump,
     // apport, WSL's), a limit of 0 is dumped all the same (measured on Linux
@@ -299,6 +324,7 @@ fn limit() -> std::io::Result<()> {
 
 /// The open-file limit a worker runs with, soft and hard, from the daemon's
 /// hard limit: at most [`MAX_OPEN_FILES`], all of it usable, never raised.
+#[cfg(unix)]
 fn open_files(hard: libc::rlim_t) -> libc::rlim_t {
     hard.min(MAX_OPEN_FILES)
 }
@@ -307,21 +333,47 @@ fn open_files(hard: libc::rlim_t) -> libc::rlim_t {
 /// (P8-2a-2, with the vault) the daemon's calls, each serve's listener taken
 /// from `descriptors` as its frame arrives, until `bye` or the channel's end.
 /// P8-2a-5 — `lines`, the process's log, crosses from its `ready` on.
+#[cfg(unix)]
 pub(crate) async fn serve(
     ch: UnixStream,
     descriptors: Option<UnixStream>,
     lines: Option<log::Lines>,
 ) -> std::io::Result<()> {
-    #[cfg(not(feature = "vault"))]
+    #[cfg(not(worker_calls))]
     drop(descriptors);
+    let (rd, wr) = ch.into_split();
+    #[cfg(worker_calls)]
+    let served = serve_halves(rd, wr, descriptors, lines);
+    #[cfg(not(worker_calls))]
+    let served = serve_halves(rd, wr, lines);
+    served.await
+}
+
+/// FR-90 P8-2b-1 — [`serve`] on Windows: its channel a pipe, and no second
+/// one, since no listener is handed to a worker there yet (P8-2b-2).
+#[cfg(windows)]
+pub(crate) async fn serve(
+    ch: tokio::net::windows::named_pipe::NamedPipeClient,
+    lines: Option<log::Lines>,
+) -> std::io::Result<()> {
+    let (rd, wr) = tokio::io::split(ch);
+    serve_halves(rd, wr, lines).await
+}
+
+/// [`serve`], on the channel's two halves.
+async fn serve_halves(
+    mut rd: impl AsyncRead + Unpin,
+    wr: impl AsyncWrite + Send + Unpin + 'static,
+    #[cfg(worker_calls)] descriptors: Option<UnixStream>,
+    lines: Option<log::Lines>,
+) -> std::io::Result<()> {
     let mut lines = lines;
-    let (mut rd, wr) = ch.into_split();
     let link = Arc::new(link::Link::worker(wr));
     // What this worker serves: stopped all at once as its loop ends, or is
     // dropped.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     let serving = Arc::new(super::vault_connect::handed::Serving::default());
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     let _stops_all = serving.all.clone().drop_guard();
     let ended = loop {
         let m = match recv(&mut rd).await {
@@ -352,7 +404,7 @@ pub(crate) async fn serve(
             Msg::Beat { n } => link.send(&Msg::Beat { n }).await,
             Msg::Bye => break Ok(()),
             Msg::Ready { .. } | Msg::Log { .. } => Ok(()),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             Msg::Call { id, call } => {
                 // A serve's listener came just before its frame (P8-2a-4b:
                 // the egress fronts' two, the HTTP one's first), so they are
@@ -372,7 +424,7 @@ pub(crate) async fn serve(
                 });
                 Ok(())
             }
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             Msg::Answer { id, answer } => {
                 link.answered(id, answer);
                 Ok(())
@@ -387,7 +439,7 @@ pub(crate) async fn serve(
 }
 
 /// FR-90 P8-2a-2 — the worker's answer to one of the daemon's calls.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 fn answer_call(
     link: &Arc<link::Link>,
     serving: &Arc<super::vault_connect::handed::Serving>,
@@ -444,16 +496,55 @@ pub(crate) trait Running: Send {
     async fn kill(&mut self);
 }
 
+/// FR-90 P8-2b-1 — a worker's ends of its channels, as its spawner hands
+/// them to it.
+pub(crate) struct Theirs {
+    /// The channel, and the second one the daemon's listeners come across.
+    #[cfg(unix)]
+    pub(crate) ch: std::os::unix::net::UnixStream,
+    #[cfg(unix)]
+    pub(crate) descriptors: std::os::unix::net::UnixStream,
+    /// Windows: the client end of the channel's pipe, inheritable.
+    #[cfg(windows)]
+    pub(crate) pipe: std::os::windows::io::OwnedHandle,
+}
+
+/// FR-90 P8-2b-1 — the daemon's ends of one worker's channels.
+struct Ours {
+    #[cfg(unix)]
+    ch: std::os::unix::net::UnixStream,
+    #[cfg(unix)]
+    descriptors: std::os::unix::net::UnixStream,
+    #[cfg(windows)]
+    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+/// A worker's channels, made before its spawn: two socketpairs.
+#[cfg(unix)]
+fn channels() -> std::io::Result<(Ours, Theirs)> {
+    let (ch, theirs_ch) = std::os::unix::net::UnixStream::pair()?;
+    let (descriptors, theirs_d) = std::os::unix::net::UnixStream::pair()?;
+    Ok((
+        Ours { ch, descriptors },
+        Theirs {
+            ch: theirs_ch,
+            descriptors: theirs_d,
+        },
+    ))
+}
+
+/// A worker's channel, made before its spawn: a pipe of its own ([`win`]).
+#[cfg(windows)]
+fn channels() -> std::io::Result<(Ours, Theirs)> {
+    let (pipe, client) = win::channel()?;
+    Ok((Ours { pipe }, Theirs { pipe: client }))
+}
+
 /// How a worker is started: a child of a program (this binary's, or a
 /// test's), or a test's task.
 pub(crate) trait Spawn: Send + Sync {
-    /// A worker with `theirs` as its channel, and `descriptors` as the second
-    /// one, the daemon's listeners come across.
-    fn spawn(
-        &self,
-        theirs: std::os::unix::net::UnixStream,
-        descriptors: std::os::unix::net::UnixStream,
-    ) -> std::io::Result<Box<dyn Running>>;
+    /// A worker with `theirs` as its channels.
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>>;
 
     /// P8-2a-7 — what has to be ready before this spawner's first worker:
     /// nothing, for a test's.
@@ -502,18 +593,26 @@ impl Running for tokio::process::Child {
     }
 }
 
+/// FR-90 P8-2b-1 — on Windows: as the daemon's own identity, into a job of
+/// its own, its pipe's client end the one handle it inherits ([`win`]).
+#[cfg(windows)]
 impl Spawn for Program {
-    fn spawn(
-        &self,
-        theirs: std::os::unix::net::UnixStream,
-        descriptors: std::os::unix::net::UnixStream,
-    ) -> std::io::Result<Box<dyn Running>> {
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
+        let worker = win::spawn(&self.exe, self.arg0.as_deref(), &self.args, theirs.pipe)?;
+        Ok(Box::new(worker))
+    }
+}
+
+#[cfg(unix)]
+impl Spawn for Program {
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
         use std::os::fd::AsRawFd;
         // Both moved above the descriptors they land on, before the fork:
         // then neither move in the child can overwrite the other, nor land on
         // a standard descriptor the child's stdio is set up on (a daemon
         // started with one closed can be handed a channel as one).
-        let theirs = above(theirs)?;
+        let Theirs { ch, descriptors } = theirs;
+        let theirs = above(ch)?;
         let descriptors = above(descriptors)?;
         let (fd, desc) = (theirs.as_raw_fd(), descriptors.as_raw_fd());
         let mut cmd = tokio::process::Command::new(&self.exe);
@@ -576,6 +675,7 @@ impl Spawn for Program {
 
 /// `s` on a descriptor above the two a worker's channels land on, its copy
 /// close-on-exec.
+#[cfg(unix)]
 fn above(s: std::os::unix::net::UnixStream) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::{AsRawFd, FromRawFd};
     if s.as_raw_fd() > DESCRIPTORS_FD {
@@ -647,7 +747,7 @@ pub(crate) struct Worker {
     seen: Arc<Mutex<Seen>>,
     /// FR-90 P8-2a-2 — the link of the worker that is up now, the one an
     /// endpoint is handed through.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     published: Published,
     /// Its supervisor, which the run's end leaves to finish on its own: only
     /// [`Worker::stop`] waits for it, and only the tests stop a worker so.
@@ -656,7 +756,7 @@ pub(crate) struct Worker {
 }
 
 /// FR-90 P8-2a-2 — the link of a run's worker while one is up.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 type Published = Arc<Mutex<Option<Arc<link::Link>>>>;
 
 /// FR-90 P8-2a-2 — what the daemon does once it gives up on a run's
@@ -675,13 +775,13 @@ impl Worker {
     ) -> Self {
         let stop = CancellationToken::new();
         let seen = Arc::new(Mutex::new(Seen::default()));
-        #[cfg(feature = "vault")]
+        #[cfg(worker_calls)]
         let published: Published = Arc::default();
         let task = tokio::spawn(supervise(
             Run {
                 session,
                 fence,
-                #[cfg(feature = "vault")]
+                #[cfg(worker_calls)]
                 published: Arc::clone(&published),
             },
             spawner,
@@ -693,7 +793,7 @@ impl Worker {
         Self {
             stop,
             seen,
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             published,
             task: Some(task),
         }
@@ -735,7 +835,7 @@ enum Ended {
 struct Run {
     session: ObjectId,
     fence: u64,
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     published: Published,
 }
 
@@ -774,20 +874,14 @@ async fn supervise(
         }
         starts.push(Instant::now());
         note(&|s| s.starts += 1);
-        let pairs = std::os::unix::net::UnixStream::pair()
-            .and_then(|channel| std::os::unix::net::UnixStream::pair().map(|d| (channel, d)));
-        let ended = match pairs {
-            Ok(((ours, theirs), (ours_d, theirs_d))) => match spawner.spawn(theirs, theirs_d) {
+        let ended = match channels() {
+            Ok((ours, theirs)) => match spawner.spawn(theirs) {
                 Ok(mut running) => {
                     let pid = running.pid();
                     note(&|s| s.pid = pid);
-                    let tokio_of = |s: std::os::unix::net::UnixStream| {
-                        s.set_nonblocking(true)
-                            .and_then(|()| UnixStream::from_std(s))
-                    };
-                    let ended = match (tokio_of(ours), tokio_of(ours_d)) {
-                        (Ok(ch), Ok(d)) => life(&run, ch, d, &timing, &stop, &seen).await,
-                        _ => Ended::Lost("its channel could not be served".into()),
+                    let ended = match daemon_end(ours).await {
+                        Ok((link, frames)) => life(&run, link, frames, &timing, &stop, &seen).await,
+                        Err(_) => Ended::Lost("its channel could not be served".into()),
                     };
                     note(&|s| s.up = false);
                     running.kill().await;
@@ -832,22 +926,44 @@ fn wait_before(timing: &Timing, recent: usize) -> Duration {
         .min(timing.backoff_max)
 }
 
+/// The daemon's link and frames on a worker's channels: the channel split
+/// into its two halves, and the second channel the link's.
+#[cfg(unix)]
+async fn daemon_end(ours: Ours) -> std::io::Result<(Arc<link::Link>, Frames)> {
+    let tokio_of = |s: std::os::unix::net::UnixStream| {
+        s.set_nonblocking(true)
+            .and_then(|()| UnixStream::from_std(s))
+    };
+    let (ch, descriptors) = (tokio_of(ours.ch)?, tokio_of(ours.descriptors)?);
+    let (rd, wr) = ch.into_split();
+    Ok((
+        Arc::new(link::Link::daemon(wr, descriptors)),
+        Frames::read(rd),
+    ))
+}
+
+/// FR-90 P8-2b-1 — [`daemon_end`] on Windows: its pipe, whose client end
+/// was opened as the pipe was made, so it is connected already.
+#[cfg(windows)]
+async fn daemon_end(ours: Ours) -> std::io::Result<(Arc<link::Link>, Frames)> {
+    ours.pipe.connect().await?;
+    let (rd, wr) = tokio::io::split(ours.pipe);
+    Ok((Arc::new(link::Link::daemon(wr)), Frames::read(rd)))
+}
+
 /// One worker's life on its channel: the handshake, then the heartbeat and
 /// (P8-2a-2, with the vault) the calls either way, until stopped or lost.
 /// While it is up its link is published, for the run's endpoints, and every
 /// endpoint handed to the run's workers so far is handed to it.
 async fn life(
     run: &Run,
-    ch: UnixStream,
-    descriptors: UnixStream,
+    link: Arc<link::Link>,
+    mut frames: Frames,
     timing: &Timing,
     stop: &CancellationToken,
     seen: &Arc<Mutex<Seen>>,
 ) -> Ended {
     let (session, fence) = (run.session, run.fence);
-    let (rd, wr) = ch.into_split();
-    let mut frames = Frames::read(rd);
-    let link = Arc::new(link::Link::daemon(wr, descriptors));
     let hello = Msg::Hello {
         session: session.to_hex(),
         fence,
@@ -876,7 +992,7 @@ async fn life(
         Ok(Err(e)) => return Ended::Lost(format!("its channel failed: {e}")),
         Err(_) => return Ended::Lost("it was not ready in time".into()),
     };
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     {
         *published(run) = Some(Arc::clone(&link));
         // On a task of its own: the hand-overs' answers come through the
@@ -890,14 +1006,14 @@ async fn life(
     }
     let mut relay = log::Relay::new(pid);
     let ended = beats(run, &link, &mut frames, timing, stop, &mut relay).await;
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     published(run).take();
     link.end();
     ended
 }
 
 /// The run's published link.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 fn published(run: &Run) -> std::sync::MutexGuard<'_, Option<Arc<link::Link>>> {
     run.published.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -912,7 +1028,7 @@ async fn beats(
     stop: &CancellationToken,
     relay: &mut log::Relay,
 ) -> Ended {
-    #[cfg(not(feature = "vault"))]
+    #[cfg(not(worker_calls))]
     let _ = run;
     let mut n: u64 = 0;
     let mut missed: u32 = 0;
@@ -937,11 +1053,11 @@ async fn beats(
                     target,
                     line,
                 }))) => relay.write(&level, &target, &line),
-                #[cfg(feature = "vault")]
+                #[cfg(worker_calls)]
                 Ok(Ok(Some(Msg::Answer { id, answer }))) => {
                     link.answered(id, answer);
                 }
-                #[cfg(feature = "vault")]
+                #[cfg(worker_calls)]
                 Ok(Ok(Some(Msg::Call { id, call }))) => answer_worker(run, link, id, call),
                 Ok(Ok(Some(_))) => continue,
                 Ok(Ok(None)) => return Ended::Lost("its channel ended".into()),
@@ -964,7 +1080,7 @@ async fn beats(
 /// and sent on a task of its own, so the heartbeat never waits on it
 /// (P8-2a-4b: a decision can wait on the vault). Each is answered for the
 /// run this worker serves, whatever the call names.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
     use super::egress::handed as egress;
     let (session, fence) = (run.session, run.fence);
@@ -1052,13 +1168,13 @@ pub(crate) fn run_started_with(
 
 /// FR-90 P8-2a-2 — whether the run has a worker: its device's owner turned
 /// workers on.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 pub(crate) fn has(session: ObjectId, fence: u64) -> bool {
     runs().contains_key(&(session, fence))
 }
 
 /// FR-90 P8-2a-2 — the link of the run's worker, while one is up.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 pub(crate) fn link_of(session: ObjectId, fence: u64) -> Option<Arc<link::Link>> {
     let published = runs()
         .get(&(session, fence))
@@ -1068,7 +1184,7 @@ pub(crate) fn link_of(session: ObjectId, fence: u64) -> Option<Arc<link::Link>> 
 
 /// FR-90 P8-2a-2 — [`link_of`], waiting up to [`UP_WAIT`] for a worker that
 /// is starting: none once the daemon gave up on it.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 pub(crate) async fn up(session: ObjectId, fence: u64) -> Option<Arc<link::Link>> {
     let deadline = Instant::now() + UP_WAIT;
     loop {
@@ -1087,7 +1203,7 @@ pub(crate) async fn up(session: ObjectId, fence: u64) -> Option<Arc<link::Link>>
 
 /// FR-90 P8-2a-2 — a test's: the run's worker on a task of this process,
 /// running the worker's own loop, so a test can follow what is handed to it.
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 pub(crate) fn run_in_process(session: ObjectId, fence: u64, give_up: GiveUp) {
     let spawner = InProcess {
         first_lost_after: None,
@@ -1106,7 +1222,7 @@ pub(crate) fn run_in_process(session: ObjectId, fence: u64, give_up: GiveUp) {
 /// FR-90 P8-2a-2 — a test's: as [`run_in_process`], its first worker lost
 /// `after` it started (its loop dropped, as a process's end drops it), the
 /// next one staying, at [`Timing::quick`]'s bounds.
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 pub(crate) fn run_in_process_lost_after(session: ObjectId, fence: u64, after: Duration) {
     let spawner = InProcess {
         first_lost_after: Some(after),
@@ -1120,7 +1236,7 @@ pub(crate) fn run_in_process_lost_after(session: ObjectId, fence: u64, after: Du
 /// FR-90 P8-2a-2 — a test's: as [`run_in_process`], its first worker's
 /// descriptor channel gone from its start while its frames are still
 /// served, the next one whole, at [`Timing::quick`]'s bounds.
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 pub(crate) fn run_in_process_first_without_descriptors(session: ObjectId, fence: u64) {
     let spawner = InProcess {
         first_lost_after: None,
@@ -1133,7 +1249,7 @@ pub(crate) fn run_in_process_first_without_descriptors(session: ObjectId, fence:
 
 /// FR-90 P8-2a-2 — a test's: a run whose worker never starts, soon given up
 /// on (at [`Timing::quick`]'s bounds), `give_up` called then.
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 pub(crate) fn run_never_up(session: ObjectId, fence: u64, give_up: GiveUp) {
     run_started_with(session, fence, Arc::new(NeverUp), Timing::quick(), give_up);
 }
@@ -1155,31 +1271,27 @@ impl Timing {
     }
 }
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 struct NeverUp;
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 impl Spawn for NeverUp {
-    fn spawn(
-        &self,
-        _theirs: std::os::unix::net::UnixStream,
-        _descriptors: std::os::unix::net::UnixStream,
-    ) -> std::io::Result<Box<dyn Running>> {
+    fn spawn(&self, _theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
         Err(std::io::Error::other("no worker in this test"))
     }
 }
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 struct InProcess {
     first_lost_after: Option<Duration>,
     first_without_descriptors: bool,
     started: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 struct OnTask(tokio::task::JoinHandle<std::io::Result<()>>);
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 #[async_trait::async_trait]
 impl Running for OnTask {
     fn pid(&self) -> Option<u32> {
@@ -1191,18 +1303,14 @@ impl Running for OnTask {
     }
 }
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 impl Spawn for InProcess {
-    fn spawn(
-        &self,
-        theirs: std::os::unix::net::UnixStream,
-        descriptors: std::os::unix::net::UnixStream,
-    ) -> std::io::Result<Box<dyn Running>> {
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
         let tokio_of = |s: std::os::unix::net::UnixStream| {
             s.set_nonblocking(true)
                 .and_then(|()| UnixStream::from_std(s))
         };
-        let (ch, d) = (tokio_of(theirs)?, tokio_of(descriptors)?);
+        let (ch, d) = (tokio_of(theirs.ch)?, tokio_of(theirs.descriptors)?);
         let first = self
             .started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1222,7 +1330,7 @@ impl Spawn for InProcess {
 }
 
 /// What the run's worker has seen, while it has one.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn seen(session: ObjectId, fence: u64) -> Option<Seen> {
     runs().get(&(session, fence)).map(Worker::seen)
 }
@@ -1240,7 +1348,7 @@ pub(crate) fn drop_run(session: ObjectId, fence: u64) -> bool {
 }
 
 /// FR-90 P8-2a-2 — the second channel: listeners from the daemon.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 mod fds;
 /// FR-90 P8-2a-2 — one side's end of the channel, and the calls across it.
 pub(crate) mod link;
@@ -1250,6 +1358,9 @@ mod log;
 /// cgroup.
 #[cfg(target_os = "linux")]
 mod memory;
+/// FR-90 P8-2b-1 — a worker on Windows: its pipe, its job, its start.
+#[cfg(windows)]
+mod win;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

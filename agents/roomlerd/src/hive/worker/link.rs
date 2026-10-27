@@ -12,46 +12,46 @@
 //! | the end | every call still waiting fails at once, as the channel goes, and every later one at its start |
 //! | lost | a call that cannot be sent, or that goes unanswered within its bound, takes the link for lost, with why ([`Link::lost`]): the daemon's side then ends that worker's life, as a channel that failed ends it, rather than hand it what it can no longer serve |
 
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::collections::HashMap;
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::os::fd::{AsRawFd, OwnedFd};
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::sync::Mutex;
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::time::Duration;
 
-#[cfg(feature = "vault")]
+use tokio::io::AsyncWrite;
+#[cfg(worker_calls)]
 use tokio::net::UnixStream;
-use tokio::net::unix::OwnedWriteHalf;
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use super::{Answer, Call};
 use super::{Msg, send};
 
 /// How long a call waits for its answer.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
 
 /// What one side writes with: its half of the channel and, the daemon's,
 /// the second channel, the one descriptors go on.
 struct Writer {
-    frames: OwnedWriteHalf,
-    #[cfg(feature = "vault")]
+    frames: Box<dyn AsyncWrite + Send + Unpin>,
+    #[cfg(worker_calls)]
     descriptors: Option<UnixStream>,
 }
 
 /// One side's end of a worker's channel.
 pub(crate) struct Link {
     writer: tokio::sync::Mutex<Writer>,
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     waiting: Mutex<Option<HashMap<u64, oneshot::Sender<Answer>>>>,
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     next: AtomicU64,
     /// Cancelled as a call takes the link for lost, `why` set first.
     lost: CancellationToken,
@@ -61,18 +61,21 @@ pub(crate) struct Link {
 impl Link {
     /// The daemon's side: its writing half and (with the vault) the second
     /// channel.
-    pub(crate) fn daemon(frames: OwnedWriteHalf, descriptors: tokio::net::UnixStream) -> Self {
-        #[cfg(not(feature = "vault"))]
+    pub(crate) fn daemon(
+        frames: impl AsyncWrite + Send + Unpin + 'static,
+        #[cfg(unix)] descriptors: tokio::net::UnixStream,
+    ) -> Self {
+        #[cfg(all(unix, not(worker_calls)))]
         drop(descriptors);
         Self {
             writer: tokio::sync::Mutex::new(Writer {
-                frames,
-                #[cfg(feature = "vault")]
+                frames: Box::new(frames),
+                #[cfg(worker_calls)]
                 descriptors: Some(descriptors),
             }),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             waiting: Mutex::new(Some(HashMap::new())),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             next: AtomicU64::new(1),
             lost: CancellationToken::new(),
             why: std::sync::Mutex::new(None),
@@ -80,16 +83,16 @@ impl Link {
     }
 
     /// A worker's side: it writes frames alone.
-    pub(crate) fn worker(frames: OwnedWriteHalf) -> Self {
+    pub(crate) fn worker(frames: impl AsyncWrite + Send + Unpin + 'static) -> Self {
         Self {
             writer: tokio::sync::Mutex::new(Writer {
-                frames,
-                #[cfg(feature = "vault")]
+                frames: Box::new(frames),
+                #[cfg(worker_calls)]
                 descriptors: None,
             }),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             waiting: Mutex::new(Some(HashMap::new())),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             next: AtomicU64::new(1),
             lost: CancellationToken::new(),
             why: std::sync::Mutex::new(None),
@@ -108,7 +111,7 @@ impl Link {
     }
 
     /// Take the link for lost: the first reason stays.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     fn lose(&self, why: &str) {
         self.why
             .lock()
@@ -127,7 +130,7 @@ impl Link {
     /// call's frame, in order (the daemon's side alone has one). A call that
     /// cannot be sent, or goes unanswered within the bound, takes the link
     /// for lost.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     pub(crate) async fn call(
         &self,
         call: Call,
@@ -182,7 +185,7 @@ impl Link {
 
     /// The answer to call `id`, as it arrives: `false` when nothing waits
     /// for it (it timed out, or was never made).
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     pub(crate) fn answered(&self, id: u64, answer: Answer) -> bool {
         let tx = self
             .waiting
@@ -194,7 +197,7 @@ impl Link {
     }
 
     /// Answer the other side's call `id`.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     pub(crate) async fn answer(&self, id: u64, answer: Answer) -> std::io::Result<()> {
         self.send(&Msg::Answer { id, answer }).await
     }
@@ -203,14 +206,14 @@ impl Link {
     /// later one at its start.
     pub(crate) fn end(&self) {
         // Dropping each waiter's sender is what fails it.
-        #[cfg(feature = "vault")]
+        #[cfg(worker_calls)]
         self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
     }
 
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     fn forget(&self, id: u64) {
         if let Some(w) = self
             .waiting
@@ -223,5 +226,5 @@ impl Link {
     }
 }
 
-#[cfg(all(test, feature = "vault"))]
+#[cfg(all(test, worker_calls))]
 mod tests;

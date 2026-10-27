@@ -1333,9 +1333,9 @@ async fn daemon_main() -> Result<()> {
     }
 
     // FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's worker, which the
-    // daemon starts as its own supervised child with the channel on fd 3. It
-    // runs none of the setup below.
-    #[cfg(all(hive_host, unix))]
+    // daemon starts as its own supervised child with its channel (fd 3; P8-2b-1
+    // on Windows, an inherited pipe). It runs none of the setup below.
+    #[cfg(hive_host)]
     if roomlerd::hive::worker_args() {
         std::process::exit(roomlerd::hive::worker_main().await);
     }
