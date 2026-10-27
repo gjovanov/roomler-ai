@@ -4137,11 +4137,37 @@ sequenceDiagram
 | a failed call | safe either way: no placeholder known means the host is carried as it comes, never decrypted, and no value means a placeholder goes out as itself |
 | the end | the run's: the daemon lets go of its listeners and tells the worker to stop serving them |
 
-⚠️ **The worker logs nowhere yet.** `roomlerd hive-worker` runs none of the daemon's start-up,
-its logging among it (`main.rs`), so the worker's own lines are dropped: an endpoint's or the
-egress proxy's refusal there is enforced and logged nowhere. P8-2a-2's endpoints have the same gap.
-The next step, P8-2a-5, forwards the worker's lines into the daemon's log. Until then nothing that
-runs a worker is released: `hive_worker` is off by default, and no release build has the vault.
+**P8-2a-5, as built** (`agents/roomlerd/src/hive/worker/log.rs`, Unix): the worker's log, in the
+daemon's. `roomlerd hive-worker` runs none of the daemon's start-up, its logging among it
+(`main.rs`), so until this step its own lines were dropped: an endpoint's or the egress proxy's
+refusal there was enforced, and logged nowhere. Each of its lines now crosses the channel as a `log`
+frame, and the daemon writes it into its own log, so its file and its upload carry it, beside the
+worker's process:
+
+```mermaid
+flowchart LR
+    E["an event in the worker<br/>(its filter: the daemon's)"] --> Q["its queue, 1024 lines<br/>full: dropped and counted"]
+    Q -->|"from its ready on"| F["a log frame:<br/>level, target, line"]
+    F --> R["the daemon's relay<br/>200 a second from one worker"]
+    R -->|"its filter, asked about<br/>where the worker logged it"| L["the daemon's log:<br/>file, upload, stdout"]
+```
+
+| Piece | As built |
+|---|---|
+| the worker's lines | what its filter keeps, which is the daemon's own (`logging::filter`, from the same `RUST_LOG`). Each event's message and fields make one line of at most 8 KiB. A `log` crate's record keeps the target where it was logged |
+| the queue | 1024 lines, never waited on. A line that finds it full is dropped and counted, and after the next line that crosses, a line says how many were |
+| when they go | from the worker's `ready` on, so the handshake is never a log line. The daemon takes nothing else for its answer to `hello` |
+| a panic | logged as it happens, and on the worker's stderr as before |
+| the daemon's side | each line at the worker's level, beside `worker` (its process) and `origin` (where it was logged), as one line with its control characters escaped. At most 200 lines a second from one worker: the rest are counted, and a line says how many once that second is over |
+
+⚠️ **The daemon asks its filter about `origin`, never about the module that writes the line.**
+The `tracing` macros ask about the module they are written in. A `RUST_LOG` that turns up one of
+the worker's modules (`tunnel_core=debug`, a recipe in these docs) would then keep the line in the
+worker and drop it in the daemon. So the relay has five callsites of its own, one for each level,
+made as `tracing-log` makes its own for the `log` crate's records.
+
+Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
+has the vault.
 
 | Step | Builds | Kill switch | AC |
 |---|---|---|---|
@@ -4405,7 +4431,8 @@ runs a worker is released: `hive_worker` is off by default, and no release build
 | P8-2a-2 | the credential endpoints served in the session's worker (§3i "P8-2a-2, as built"), Unix: the endpoint's listener handed across the worker's second channel (fd 4, `SCM_RIGHTS`), its `Spec` (none of it secret) beside it, its values asked of the daemon as each connection starts; calls either way over the channel, frames wiped after use; a new worker handed every endpoint again; served in the worker or not at all (refused while none is up, the run ended when the daemon gives up on it); a person's endpoint and one through another device stay the daemon's; a call the daemon cannot send its worker, or that goes unanswered, ends that worker's life. 20 new tests (the second channel's 3, the link's 5, the hand-over's 10, the toolbelt's 2) and 3 of the worker's adapted; the real binary driven through the endpoint path (10 checks) and P8-2a-1's harness again (15); 26 negative controls, 25 caught at their own assertion on the final code, the real binary's stopped by the host's memory before it ended (on its first run the same mutation failed the harness at the hand-over, which found the gap a lost link closes); no field run while prod's vault is unmounted (P3k) | device `hive_worker = false` (default) | **merged** #2975 `b9933cb1a` |
 | P8-2a-3 | the worker's limits (§3i "P8-2a-3, as built"), Unix, P8-0's point 4: set as it starts, before it takes its channels, and a worker that cannot set them does not run; `RLIMIT_CORE` 1 byte, since a limit of 0 is dumped all the same through a pipe helper (measured); `RLIMIT_NOFILE` at most 4096, from the daemon's hard limit, never raised; no address-space limit, and memory by cgroup later. 2 new tests (the bound, and the limits set in a child of the test) and the real binary's limits read from `/proc` (2 checks); 5 negative controls, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2978 `50e67ec1b` |
 | P8-2a-4a | the egress proxy's seams (§3i "P8-2a-4a, as built"): `Bindings` (the run's placeholders toward a host, and the same with each value read for one request) and `Leaves` (the run's CA's leaves) beside `Decide` and `Dial`, so nothing of the proxy reaches the daemon but through `Seams`; a request reads its audience's values once, and only when it carries an `Authorization`; no change of behaviour. 1 new test (a value read only for a request with an `Authorization`, and once) and the seams of 3 adapted; 5 negative controls, each caught at its own assertion | none (a refactor) | **merged** #2979 `cc7e4b3b4` |
-| P8-2a-4b | the egress proxy served in the session's worker (§3i "P8-2a-4b, as built"), Unix: the fronts bound as the run starts, from the device's `hive_worker`, and handed (two listeners across fd 4, a `Spec`) to each worker the run has, and at once to one already up; the daemon serves none of their connections and answers the worker's `decide` (its own decision, kept for the run; a host not in its one spelling refused), `bound`, `valued` (base64) and `leaf` (only for an audience of a placeholder the run holds; the CA's key never crosses), each on a task of its own; the run's end tells the worker to let go. ⚠️ the worker logs nowhere yet (P8-2a-5). 6 new tests (the calls round-trip whole, with no leaf's key and no value in a `Debug`; the daemon's answers from the run's own, a decision asked once and a host not in its one spelling refused, a leaf for an audience and none for another host; the device's setting choosing the worker or the daemon; the daemon serving no front itself; a placeholder swapped end to end through an in-process worker, under the daemon's leaf and with its value; a worker already up handed the fronts and letting go at their end) and P8-2a-1's and P8-2a-2's real-binary harnesses passing unchanged; 11 negative controls, each caught at its own assertion | device `hive_worker = false` (default) | **in review** |
+| P8-2a-4b | the egress proxy served in the session's worker (§3i "P8-2a-4b, as built"), Unix: the fronts bound as the run starts, from the device's `hive_worker`, and handed (two listeners across fd 4, a `Spec`) to each worker the run has, and at once to one already up; the daemon serves none of their connections and answers the worker's `decide` (its own decision, kept for the run; a host not in its one spelling refused), `bound`, `valued` (base64) and `leaf` (only for an audience of a placeholder the run holds; the CA's key never crosses), each on a task of its own; the run's end tells the worker to let go. Found: the worker logged nowhere (P8-2a-5's). 6 new tests (the calls round-trip whole, with no leaf's key and no value in a `Debug`; the daemon's answers from the run's own, a decision asked once and a host not in its one spelling refused, a leaf for an audience and none for another host; the device's setting choosing the worker or the daemon; the daemon serving no front itself; a placeholder swapped end to end through an in-process worker, under the daemon's leaf and with its value; a worker already up handed the fronts and letting go at their end) and P8-2a-1's and P8-2a-2's real-binary harnesses passing unchanged; 11 negative controls, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2980 `8ef7a4e32` |
+| P8-2a-5 | the worker's log in the daemon's (§3i "P8-2a-5, as built"), Unix: each of its lines, kept by the daemon's own filter, a `log` frame from its `ready` on, its queue never waited on (1024 lines; a line says how many were dropped); the daemon writes each at the worker's level, asked of its filter where the worker logged it (five callsites of its own, as `tracing-log` makes), beside the worker's process, as one line with its control characters escaped, at most 200 a second from one worker; a panic logged as it happens. 9 new tests (a line: its message, fields, level, and where it was logged, a `log` record's too; a line cut at its bound, on a character; a full queue dropping and counting, the count said after the next line; the daemon's bound a second; a line kept by the daemon's filter where the worker logged it; one line, its control characters escaped; a value logged by mistake naming nothing; the log crossing only from `ready` on; a worker's line written into the daemon's log) and both real-binary harnesses extended (the worker's `up` line after `ready`, and none at INFO under `RUST_LOG=warn`; a connection from another account refused in the worker, the refusal crossing as a line of its log, and no line holding the value); 13 negative controls, each caught at its own assertion. Found on the way: a probe test's closed port was bound and let go, and a listener beside it was given the port once; it is held now | device `hive_worker = false` (default) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design

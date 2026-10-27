@@ -92,6 +92,13 @@ pub(crate) enum Msg {
     Beat { n: u64 },
     /// The daemon: end.
     Bye,
+    /// FR-90 P8-2a-5 — the worker: one line of its log, which the daemon
+    /// writes into its own ([`log`]).
+    Log {
+        level: String,
+        target: String,
+        line: String,
+    },
     /// FR-90 P8-2a-2 — either side: a call, which the other answers with
     /// the `answer` of the same id ([`link`]).
     #[cfg(feature = "vault")]
@@ -219,6 +226,10 @@ pub async fn worker_main() -> i32 {
         ));
         return 3;
     }
+    // FR-90 P8-2a-5 — its log, into the daemon's: this process runs none of
+    // the daemon's start-up, its logging among it.
+    let (layer, lines) = log::layer();
+    log::install(layer);
     // The channels are this process's alone: nothing it starts inherits
     // them, so the daemon's end sees them end as this process does. A failure
     // here also says fd 3 or fd 4 is not open.
@@ -240,7 +251,7 @@ pub async fn worker_main() -> i32 {
     let (Ok(stream), Ok(descriptors)) = (take(CHANNEL_FD), take(DESCRIPTORS_FD)) else {
         return 2;
     };
-    match serve(stream, Some(descriptors)).await {
+    match serve(stream, Some(descriptors), Some(lines)).await {
         Ok(()) => 0,
         Err(e) => {
             crate::logging::say_on_stderr(format_args!("roomlerd hive-worker: {e}"));
@@ -295,9 +306,15 @@ fn open_files(hard: libc::rlim_t) -> libc::rlim_t {
 /// The worker's side of the channel: the handshake, each heartbeat and
 /// (P8-2a-2, with the vault) the daemon's calls, each serve's listener taken
 /// from `descriptors` as its frame arrives, until `bye` or the channel's end.
-pub(crate) async fn serve(ch: UnixStream, descriptors: Option<UnixStream>) -> std::io::Result<()> {
+/// P8-2a-5 — `lines`, the process's log, crosses from its `ready` on.
+pub(crate) async fn serve(
+    ch: UnixStream,
+    descriptors: Option<UnixStream>,
+    lines: Option<log::Lines>,
+) -> std::io::Result<()> {
     #[cfg(not(feature = "vault"))]
     drop(descriptors);
+    let mut lines = lines;
     let (mut rd, wr) = ch.into_split();
     let link = Arc::new(link::Link::worker(wr));
     // What this worker serves: stopped all at once as its loop ends, or is
@@ -323,11 +340,18 @@ pub(crate) async fn serve(ch: UnixStream, descriptors: Option<UnixStream>) -> st
                     pid: std::process::id(),
                     version: VERSION.to_string(),
                 };
-                link.send(&ready).await
+                let sent = link.send(&ready).await;
+                // P8-2a-5 — its log crosses from its `ready` on, so the
+                // handshake is never a log line.
+                if let Some(lines) = lines.take() {
+                    tokio::spawn(log::forward(lines, Arc::clone(&link)));
+                }
+                info!(%session, fence, "hive: the session's worker is up");
+                sent
             }
             Msg::Beat { n } => link.send(&Msg::Beat { n }).await,
             Msg::Bye => break Ok(()),
-            Msg::Ready { .. } => Ok(()),
+            Msg::Ready { .. } | Msg::Log { .. } => Ok(()),
             #[cfg(feature = "vault")]
             Msg::Call { id, call } => {
                 // A serve's listener came just before its frame (P8-2a-4b:
@@ -804,12 +828,13 @@ async fn life(
             frames.next().await
         }) => r,
     };
-    match ready {
+    let pid = match ready {
         Ok(Ok(Some(Msg::Ready { pid, version }))) if version == VERSION => {
             info!(%session, fence, pid, "hive: a session's worker is up");
             let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
             s.up = true;
             s.pid = Some(pid);
+            pid
         }
         Ok(Ok(Some(Msg::Ready { version, .. }))) => {
             return Ended::Foreign(format!("it is version {version}, the daemon {VERSION}"));
@@ -818,7 +843,7 @@ async fn life(
         Ok(Ok(None)) => return Ended::Lost("it ended before it was ready".into()),
         Ok(Err(e)) => return Ended::Lost(format!("its channel failed: {e}")),
         Err(_) => return Ended::Lost("it was not ready in time".into()),
-    }
+    };
     #[cfg(feature = "vault")]
     {
         *published(run) = Some(Arc::clone(&link));
@@ -831,7 +856,8 @@ async fn life(
             super::egress::handed::rehand(session, fence, &link).await;
         });
     }
-    let ended = beats(run, &link, &mut frames, timing, stop).await;
+    let mut relay = log::Relay::new(pid);
+    let ended = beats(run, &link, &mut frames, timing, stop, &mut relay).await;
     #[cfg(feature = "vault")]
     published(run).take();
     link.end();
@@ -852,6 +878,7 @@ async fn beats(
     frames: &mut Frames,
     timing: &Timing,
     stop: &CancellationToken,
+    relay: &mut log::Relay,
 ) -> Ended {
     #[cfg(not(feature = "vault"))]
     let _ = run;
@@ -872,6 +899,12 @@ async fn beats(
             };
             match got {
                 Ok(Ok(Some(Msg::Beat { n: m }))) if m == n => answered = true,
+                // P8-2a-5 — a line of its log, into the daemon's.
+                Ok(Ok(Some(Msg::Log {
+                    level,
+                    target,
+                    line,
+                }))) => relay.write(&level, &target, &line),
                 #[cfg(feature = "vault")]
                 Ok(Ok(Some(Msg::Answer { id, answer }))) => {
                     link.answered(id, answer);
@@ -1144,7 +1177,7 @@ impl Spawn for InProcess {
             == 0;
         // Dropped here, where its first worker goes without it.
         let d = (!(first && self.first_without_descriptors)).then_some(d);
-        let served = serve(ch, d);
+        let served = serve(ch, d, None);
         let task = match self.first_lost_after {
             Some(after) if first => tokio::spawn(async move {
                 let _ = tokio::time::timeout(after, served).await;
@@ -1179,6 +1212,8 @@ pub(crate) fn drop_run(session: ObjectId, fence: u64) -> bool {
 mod fds;
 /// FR-90 P8-2a-2 — one side's end of the channel, and the calls across it.
 pub(crate) mod link;
+/// FR-90 P8-2a-5 — the worker's log, in the daemon's.
+mod log;
 
 #[cfg(test)]
 mod tests;

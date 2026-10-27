@@ -585,10 +585,13 @@ mod tests {
         (port, seen)
     }
 
-    /// A port nothing listens on: bound, then let go.
-    async fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+    /// A port nothing listens on, held while what it returns lives: bound and
+    /// never listening, so no test beside this one is given it meanwhile. One
+    /// bound and let go was given to a listener once, and answered the probe.
+    fn closed_port() -> (u16, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (socket.local_addr().unwrap().port(), socket)
     }
 
     /// A `tcp` probe within the list connects, says where and how long, and
@@ -606,7 +609,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(seen.load(Ordering::SeqCst), 1);
 
-        let shut = closed_port().await;
+        let (shut, _held) = closed_port();
         let rules = list(&[format!("127.0.0.1:{shut}")]);
         let (outcome, address, rtt, _, detail) =
             read(&measure(&asked("tcp", "127.0.0.1", shut), &rules).await);

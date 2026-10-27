@@ -102,6 +102,11 @@ serde_json = { workspace = true }
 # Tracing
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# FR-90 P8-2a-5: a session's worker's lines, written into the daemon's log
+# at the level and under the filter of where the worker logged them — the
+# callsites `tracing-log` makes for the `log` crate's records, made the same
+# way (`hive/worker/log.rs`). Already in the tree, under `tracing`.
+tracing-core = "0.1"
 # Daily-rolling file appender for the persistent logs that survive a
 # Scheduled-Task / systemd / launchd run where stdout is /dev/null.
 # Pinned to the same minor as tracing-subscriber 0.3 so the

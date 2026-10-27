@@ -44,7 +44,7 @@ struct Daemon {
 async fn daemon(token: String, held: Arc<AtomicBool>) -> Daemon {
     let (ours, theirs) = UnixStream::pair().unwrap();
     let (ours_d, theirs_d) = UnixStream::pair().unwrap();
-    tokio::spawn(crate::hive::worker::serve(theirs, Some(theirs_d)));
+    tokio::spawn(crate::hive::worker::serve(theirs, Some(theirs_d), None));
     let (mut rd, wr) = ours.into_split();
     let link = Arc::new(Link::daemon(wr, ours_d));
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));

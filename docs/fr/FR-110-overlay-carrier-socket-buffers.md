@@ -87,7 +87,7 @@ flowchart LR
   ⚠️ The packaged Linux units set `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO. The first
   candidate's buffers were in place (`ss`: `rb14680064`) while the line never reached the journal. So the
   logger appends `tunnel_core::overlay::sockbuf=info` unconditionally
-  (`crates/agent-core/src/logging.rs:225`), as it already does for the `turn` crate's refresh warnings.
+  (`crates/agent-core/src/logging.rs:278`), as it already does for the `turn` crate's refresh warnings.
 - **Kill switch:** `ROOMLERD_OVERLAY_SOCKBUF=0` skips the tuning, so the sockets keep the OS default as
   before FR-110.
 - **What it costs.** The kernel charges a socket's buffer only for datagrams actually queued, so an idle
