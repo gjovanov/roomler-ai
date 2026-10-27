@@ -452,7 +452,7 @@ fn encode_one(
     }
 
     let yuv = bgra_to_yuv_buffer(
-        &frame.data,
+        frame.cpu(),
         frame.width as usize,
         frame.height as usize,
         frame.stride as usize,
@@ -672,7 +672,7 @@ mod tests {
             height,
             stride,
             pixel_format: PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,

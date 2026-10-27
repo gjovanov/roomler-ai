@@ -197,7 +197,7 @@ flowchart LR
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from WGC's capture thread (the DXGI arm is split with P4). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1), ships with the next agent release; the fleet read is AC1 |
-| P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | — |
+| P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, WGC → QSV, the first cell.** The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | — |
 | P3 | NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
 | P4 | The SystemContext DXGI arm (the lock screen and UAC) | the same | — |
@@ -236,6 +236,35 @@ what the pump does.
 - **Negative controls:** run together, each fails exactly its target, 2 failed / 3 passed. In NC1 the window
   ignores the encoder id: `left: None, right: Some([12.0, 1.0, 2.0, 0.5])`. In NC2 the readback window loses its
   reopen rule and panics on the u64 underflow the rule prevents.
+
+### 5.2 P1 — C0, the contract, as built (2026-10-28)
+
+`Frame.data` is now a `FrameData` (`agents/roomlerd/src/capture/mod.rs`), and every consumer reads the pixels
+through `Frame::cpu()`. Only `FrameData::Cpu` exists, so nothing changes at run time.
+
+| Piece | What it is |
+|---|---|
+| `FrameData::Cpu(Vec<u8>)` | the one variant today. The GPU forms of §4.1 arrive with their cells, each as a variant |
+| `Frame::cpu() -> &[u8]` | the bytes, laid out as `pixel_format` with `stride` per row. On a GPU frame it will read them back once and keep them |
+| `Frame::cpu_mut() -> &mut Vec<u8>` | the bytes to change in place: the recorder draws its pointer into a frame, and tests paint one |
+| `From<Vec<u8>> for FrameData` | so a backend that captures into memory builds a frame with `data: bytes.into()` |
+
+- **Every accessor destructures without a wildcard** (`let FrameData::Cpu(bytes) = …`). A new variant
+  therefore fails to compile until each accessor handles it, so a GPU frame can never be read as an empty or
+  stale CPU buffer by accident.
+- **Where it changed:** 21 files. Every capture backend that builds a frame (WGC, the SystemContext pump,
+  scrap, DRM, the portal, the synthetic source), the resample, every encoder's input (FFmpeg, libvpx,
+  openh264, Media Foundation), the encoder thread, the recorder and its pointer layer, the idle detector, the
+  lock overlay, and two integration tests. All the edits are the same two shapes: `data: bytes.into()` where a
+  frame is built, and `frame.cpu()` / `frame.cpu_mut()` where one is read. Nineteen of the files are
+  line-neutral.
+- **Tests:** a new one, `a_cpu_frame_reads_back_the_bytes_it_was_built_with`. The bytes a frame is built with
+  come back unchanged, a `cpu_mut` write lands in place, and a clone carries the same bytes. The agent's lib
+  suite (2374 with the Windows hardware features) and the recorder and export integration tests pass unchanged.
+- **Negative control:** a `cpu()` that drops the first byte fails 11 tests, the new one and 10 of the
+  recorder's pointer tests, which draw through these accessors.
+- **AC2's GPU half** (a GPU frame's `cpu()` equals today's readback, on a Windows CI device) waits for the
+  first GPU variant (P2). Its L0 half reads the `l4_latency` cells on this change's CI run against master's.
 
 ## 6. Acceptance criteria
 

@@ -310,7 +310,7 @@ impl MfPipeline {
 
         // BGRA → NV12 on the CPU. Phase 2 replaces this with
         // VideoProcessorMFT chained upstream (per-plan 1C.3).
-        let nv12 = color::bgra_to_nv12(&frame.data, frame.width, frame.height, frame.stride)
+        let nv12 = color::bgra_to_nv12(frame.cpu(), frame.width, frame.height, frame.stride)
             .map_err(|e| anyhow!("bgra_to_nv12: {e}"))?;
 
         let frame_index = self.frame_count;

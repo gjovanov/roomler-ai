@@ -1455,7 +1455,7 @@ impl FfmpegEncoder {
                 height: H,
                 stride: W * 4,
                 pixel_format: PixelFormat::Bgra,
-                data,
+                data: data.into(),
                 monotonic_us: i as u64 * 33_333,
                 monitor: 0,
                 damage: crate::capture::Damage::Unknown,
@@ -2752,10 +2752,10 @@ fn convert_bgra_planes<const N: usize>(
     let what = dst_format.pixel_format;
     // The bands below slice the source by rows; a short buffer is an error,
     // never a panic on an encoder thread.
-    if stride < w * 4 || frame.data.len() < stride * h {
+    if stride < w * 4 || frame.cpu().len() < stride * h {
         return Err(anyhow!(
             "BGRA frame of {} bytes, stride {stride}, cannot hold {w}x{h}",
-            frame.data.len()
+            frame.cpu().len()
         ));
     }
     if bands <= 1 {
@@ -2765,7 +2765,7 @@ fn convert_bgra_planes<const N: usize>(
             h as u32,
             &src_format,
             Some(&[stride]),
-            &[&frame.data],
+            &[frame.cpu()],
             dst_format,
             Some(&strides),
             &mut planes,
@@ -2791,7 +2791,7 @@ fn convert_bgra_planes<const N: usize>(
             bh as u32,
             &src_format,
             Some(&[stride]),
-            &[&frame.data[r0 * stride..]],
+            &[&frame.cpu()[r0 * stride..]],
             dst_format,
             Some(&strides),
             &mut band,
@@ -3597,7 +3597,7 @@ mod tests {
             height: h as u32,
             stride: (w * 4) as u32,
             pixel_format: PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
@@ -3617,7 +3617,7 @@ mod tests {
                 h as u32,
                 &src_format,
                 Some(&[w * 4]),
-                &[&frame.data],
+                &[frame.cpu()],
                 dst_format,
                 Some(&strides),
                 &mut slices,
@@ -3786,7 +3786,7 @@ mod tests {
                 height: h,
                 stride: stride as u32,
                 pixel_format: PixelFormat::Bgra,
-                data: frames[n % frames.len()].clone(),
+                data: frames[n % frames.len()].clone().into(),
                 monotonic_us: n as u64 * period_us,
                 monitor: 0,
                 damage: crate::capture::Damage::Unknown,
