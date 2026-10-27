@@ -70,7 +70,7 @@ flowchart LR
 - **One seam.** Every direct carrier socket is bound by `bind_direct_socket`
   (`crates/tunnel-core/src/overlay/direct.rs:1570`). That covers the shared carrier plane's `lan` and
   `public-dial` sockets (`carrier_plane.rs:338`, `:362`) and the per-runtime binds kept behind
-  `overlay_shared_carrier = false` (`runtime/establish.rs:834`, `:874`). Tuning right after the bind covers
+  `overlay_shared_carrier = false` (`runtime/establish.rs:856`, `:896`). Tuning right after the bind covers
   both modes, every org and every OS.
 - **The size: 7 MiB, receive and send.** That is what wireguard-go and Tailscale ask for. A burst at
   1 Gbit/s fills 208 KB in under 2 ms.
