@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/main.rs:3035`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3035`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -1272,7 +1272,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`main.rs:6167`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:6167`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2073,7 +2073,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`main.rs:3498-3486`, `watchdog.rs:493`) and it forced
+watchdog's 90 s window (`app.rs:3498-3486`, `watchdog.rs:493`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a
@@ -2117,4 +2117,4 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/peer.rs` | the notice (`media_waiting_payload` `:5037`, `media_waiting_hook` `:5313`); FR-93 P3e/P5f: a running capture's wait in the pumps (`CaptureWait` `:5162`), told after a quiet spell (`QUIET_BEFORE_TELL` `:5183`), and the hold that yields so the pump stays abortable (`:2527`, `:3980`, `:7194`); FR-93 P6c: a stop at the screen ends the session, a shared pipeline's followers first, and never reopens (`end_stopped_at_screen` `:5456`) |
 | `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | FR-45 P4 and FR-93 P4: the helper's `Notify*` mapping (`plan` `:123`, mutter's `mutter_call` `:274`); FR-93 P4b's KDE correction (`for_backend` `:224`) and the awaited portal calls (`Target::delivery` `:348`); the arbiter-side per-event route (`try_route` `:113`) and whose session it feeds (`active` `:97`) |
 | `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:1131-1202`) |
-| `agents/roomlerd/src/main.rs` | `capture-smoke` (`capture_smoke_cmd` `:5694`, the portal line `:5721`); the virtual desktop (`maybe_start_virtual_desktop` `:2759`) |
+| `agents/roomlerd/src/app.rs` | `capture-smoke` (`capture_smoke_cmd` `:5694`, the portal line `:5721`); the virtual desktop (`maybe_start_virtual_desktop` `:2759`) |

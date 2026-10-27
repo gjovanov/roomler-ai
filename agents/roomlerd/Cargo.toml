@@ -22,7 +22,11 @@ path = "src/lib.rs"
 # surface, not a leftover. See wix/main.wxs `AgentExeAlias` +
 # release-agent.yml Copy-Item.
 name = "roomlerd"
-path = "src/main.rs"
+# FR-123 P2: the bin is one call into the lib's `app` module (the former
+# `src/main.rs`, renamed to `src/app.rs`), so the daemon compiles as one
+# unit. There is no `src/main.rs` on purpose: with the old path gone, git
+# pairs the rename and carries an in-flight edit onto `app.rs`.
+path = "src/bin/roomlerd.rs"
 
 [[example]]
 # FR-52 — the device half of a cross-implementation OPAQUE login, for proving a

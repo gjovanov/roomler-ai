@@ -1198,7 +1198,7 @@ fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
 /// `main` RETURNING to end the process would not. Nothing does: the daemon's
 /// clean shutdown is a `process::exit` after its drain.
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     // The embedded CLI must still short-circuit before any of this — and it
     // must NOT hand the main thread to AppKit, since a CLI call has to be able
     // to return an exit code.
@@ -1240,11 +1240,11 @@ fn main() -> Result<()> {
     // the Dock and the app switcher — the bundle already sets `LSUIElement`,
     // and this makes it true for a non-bundled dev run too.
     //
-    // ⚠️ `roomlerd::`, NOT `crate::`. This file is a SEPARATE crate root from
-    // the lib, so a `cfg`-gated path here that reads like an intra-crate one
-    // compiles nowhere — and, being macOS-only, nowhere is exactly where it
-    // would have been noticed. Same trap as rc.454's `tcc` block; the `--bins`
-    // in the macOS CI job exists for it and caught this on the first push.
+    // `roomlerd::` is this lib's own name (`extern crate self as roomlerd`
+    // in lib.rs). This file was the bin's crate root until FR-123 P2 made it
+    // the lib's `app` module, and it keeps the spelling it had so an edit in
+    // flight across that move still applies and compiles. The `--bins` check
+    // in the macOS CI job (rc.454's `tcc` trap) still covers this arm.
     roomlerd::indicator::mac::run_main_loop();
 }
 
@@ -1276,7 +1276,7 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// SIGTERM) already gets. And the runtime is shut down within a budget rather
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
