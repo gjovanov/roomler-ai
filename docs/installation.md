@@ -372,6 +372,31 @@ root-mode Mac ("Two configurations", below). A Linux **per-user** install and a
 Windows machine-wide install are unaffected: there the daemon's socket admits the
 signed-in user to those verbs, and the card edits as before.
 
+### A Hive session's worker and its memory (FR-90 P8-2a-7)
+
+Where the device's owner turned workers on (`hive_worker`, `docs/hive.md`), each
+Hive session's worker runs in a cgroup of its own, its memory bounded at 512 MiB
+and kept off swap, **only where systemd delegates a cgroup with the memory
+controller to the daemon's unit**. The packaged units do not. To give a system
+install the bound:
+
+```bash
+sudo systemctl edit roomlerd      # a drop-in, with these two lines:
+#   [Service]
+#   Delegate=memory
+sudo systemctl restart roomlerd
+```
+
+As the first worker starts, the daemon moves its own processes into a leaf of the
+unit's cgroup (`roomlerd.service/roomlerd`), since cgroup v2 hands a controller
+down only from a cgroup with no processes of its own, and logs `hive: a session's
+worker runs in a cgroup of its own, its memory bounded`. Without the drop-in it
+logs that the worker runs without one. A per-user install takes the same two
+lines through `systemctl --user edit roomler`.
+
+⚠️ Delegated, and the cgroups cannot be made: no worker runs. A worker that
+cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why.
+
 ## macOS
 
 > **Requires macOS 15 (Sequoia) or later, on Apple silicon (arm64).** The
