@@ -54,6 +54,17 @@ pub struct ParticipantMedia {
     /// shows nothing: every video consumer is paused. Never collapse them
     /// (`media/view.rs`).
     pub view: Option<ViewState>,
+    /// FR-127 P1.1 — orders this participant's operations that span a worker
+    /// round trip and read or write its view: `consume` decides a consumer's
+    /// flag before creating it and records it after, `apply_view` plans every
+    /// consumer's flag and then sets them. A report applied in between would
+    /// be lost to the consumer being created, so each holds this for its whole
+    /// run. It is an async mutex, so a waiter yields its thread, and it also
+    /// names the participant: a re-join on the same connection gets a new one,
+    /// and an operation that finds another one recorded stops there.
+    ///
+    /// ⚠️ Never a DashMap guard across an await instead (see `tests` below).
+    ops: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// FR-127 P1 — what `RoomManager::apply_view` did with a report.
@@ -203,9 +214,11 @@ impl RoomManager {
     /// Creates a mediasoup Router for a room and stores it.
     /// Returns the router's RTP capabilities (serialized).
     pub async fn create_room(&self, room_id: ObjectId) -> anyhow::Result<serde_json::Value> {
-        if self.rooms.contains_key(&room_id) {
-            let room = self.rooms.get(&room_id).unwrap();
-            let caps = room.router.rtp_capabilities().clone();
+        let existing = self
+            .rooms
+            .get(&room_id)
+            .map(|room| room.router.rtp_capabilities().clone());
+        if let Some(caps) = existing {
             return Ok(serde_json::to_value(caps)?);
         }
 
@@ -218,17 +231,26 @@ impl RoomManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create router: {}", e))?;
 
-        let caps = router.rtp_capabilities().clone();
-        info!(?room_id, "mediasoup room created");
-
-        self.rooms.insert(
-            room_id,
-            MediaRoom {
-                router,
-                participants: DashMap::new(),
-                rtp_taps: DashMap::new(),
-            },
-        );
+        // FR-127 P1.1 — two joins can both find no room above and both build a
+        // router across the await. The first to get here keeps the room; the
+        // other answers with that room's capabilities and drops its router
+        // unused. An `insert` would replace a room that may already hold the
+        // first joiner's transports.
+        let caps = match self.rooms.entry(room_id) {
+            dashmap::mapref::entry::Entry::Occupied(room) => {
+                room.get().router.rtp_capabilities().clone()
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                let caps = router.rtp_capabilities().clone();
+                slot.insert(MediaRoom {
+                    router,
+                    participants: DashMap::new(),
+                    rtp_taps: DashMap::new(),
+                });
+                info!(?room_id, "mediasoup room created");
+                caps
+            }
+        };
 
         Ok(serde_json::to_value(caps)?)
     }
@@ -279,28 +301,42 @@ impl RoomManager {
         connection_id: String,
         view_capable: bool,
     ) -> anyhow::Result<TransportPair> {
-        let room = self
+        // FR-127 P1.1 — the router is a cheap handle: clone it and release the
+        // rooms guard before the two worker round trips (see `tests`).
+        let router = self
             .rooms
             .get(&room_id)
+            .map(|room| room.router.clone())
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
-        let send_transport = self.create_webrtc_transport(&room.router).await?;
-        let recv_transport = self.create_webrtc_transport(&room.router).await?;
+        let send_transport = self.create_webrtc_transport(&router).await?;
+        let recv_transport = self.create_webrtc_transport(&router).await?;
 
         let send_opts = transport_to_options(&send_transport);
         let recv_opts = transport_to_options(&recv_transport);
 
-        room.participants.insert(
-            connection_id.clone(),
-            ParticipantMedia {
-                user_id,
-                send_transport,
-                recv_transport,
-                producers: Vec::new(),
-                consumers: Vec::new(),
-                view: view_capable.then(ViewState::default),
-            },
-        );
+        {
+            // The room may have closed meanwhile, or closed and been created
+            // again with another router (a fold, then a rejoin): transports
+            // made on the old router are dropped here, which closes them.
+            let room = self
+                .rooms
+                .get(&room_id)
+                .filter(|room| room.router.id() == router.id())
+                .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
+            room.participants.insert(
+                connection_id.clone(),
+                ParticipantMedia {
+                    user_id,
+                    send_transport,
+                    recv_transport,
+                    producers: Vec::new(),
+                    consumers: Vec::new(),
+                    view: view_capable.then(ViewState::default),
+                    ops: Arc::default(),
+                },
+            );
+        }
 
         self.connection_rooms.insert(connection_id.clone(), room_id);
 
@@ -320,33 +356,36 @@ impl RoomManager {
         transport_id: &str,
         dtls_parameters: DtlsParameters,
     ) -> anyhow::Result<()> {
-        let room = self
-            .rooms
-            .get(room_id)
-            .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
-
-        let participant = room
-            .participants
-            .get(connection_id)
-            .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
-
-        let tid = TransportId::from_str(transport_id)
-            .map_err(|e| anyhow::anyhow!("Invalid transport_id: {}", e))?;
-
-        let remote_params = WebRtcTransportRemoteParameters { dtls_parameters };
-
-        let transport = if participant.send_transport.id() == tid {
-            participant.send_transport.clone()
-        } else if participant.recv_transport.id() == tid {
-            participant.recv_transport.clone()
-        } else {
-            return Err(anyhow::anyhow!("Transport not found for this participant"));
-        };
         // Connect on a cloned handle with the shard guards released — holding
         // a DashMap guard across an await can deadlock against join/leave
-        // writers on the same shard (see sample_transports).
-        drop(participant);
-        drop(room);
+        // writers on the same shard (see `tests`). FR-127 P1.1 — the guards
+        // live in this block rather than being `drop`ped: a local that was
+        // borrowed stays in the future's state until its scope ends, so the
+        // await gate (`clippy.toml`) cannot see an explicit drop.
+        let transport = {
+            let room = self
+                .rooms
+                .get(room_id)
+                .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
+
+            let participant = room
+                .participants
+                .get(connection_id)
+                .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
+
+            let tid = TransportId::from_str(transport_id)
+                .map_err(|e| anyhow::anyhow!("Invalid transport_id: {}", e))?;
+
+            if participant.send_transport.id() == tid {
+                participant.send_transport.clone()
+            } else if participant.recv_transport.id() == tid {
+                participant.recv_transport.clone()
+            } else {
+                return Err(anyhow::anyhow!("Transport not found for this participant"));
+            }
+        };
+
+        let remote_params = WebRtcTransportRemoteParameters { dtls_parameters };
 
         transport
             .connect(remote_params)
@@ -415,34 +454,51 @@ impl RoomManager {
         rtp_parameters: RtpParameters,
         source: String,
     ) -> anyhow::Result<ProducerId> {
-        let room = self
-            .rooms
-            .get(room_id)
-            .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
-
-        let mut participant = room
-            .participants
-            .get_mut(connection_id)
+        // FR-127 P1.1 — produce on a cloned handle with every guard released,
+        // then record the producer under a short guard (see `tests`).
+        let (send_transport, ops) = self
+            .participant(room_id, connection_id, |p| {
+                (p.send_transport.clone(), p.ops.clone())
+            })
             .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
 
         let producer_options = ProducerOptions::new(kind, rtp_parameters);
-        let producer = participant
-            .send_transport
+        let producer = send_transport
             .produce(producer_options)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to produce: {}", e))?;
 
         let producer_id = producer.id();
-        participant.producers.push(ProducerEntry {
-            producer,
-            source: source.clone(),
-        });
+        // The participant may have left meanwhile, or left and joined again
+        // on this connection. A producer of the old one is dropped
+        // unrecorded, which closes it.
+        let recorded = self
+            .participant_mut(room_id, connection_id, |p| {
+                if !Arc::ptr_eq(&p.ops, &ops) {
+                    return false;
+                }
+                p.producers.push(ProducerEntry {
+                    producer,
+                    source: source.clone(),
+                });
+                true
+            })
+            .unwrap_or(false);
+        if !recorded {
+            return Err(anyhow::anyhow!("Participant not found"));
+        }
 
         debug!(?room_id, %connection_id, %producer_id, ?kind, %source, "producer created");
         Ok(producer_id)
     }
 
     /// Creates a Consumer on the participant's recv transport for a given producer.
+    ///
+    /// FR-127 P1.1 — decided under short guards, created with every guard
+    /// released, then recorded under a short guard again, all inside the
+    /// participant's `ops` turn, so a view report cannot land between the
+    /// decision and the record. This method once held the participant's entry
+    /// across both worker round trips and froze a pod (see `tests`).
     pub async fn consume(
         &self,
         room_id: &ObjectId,
@@ -450,57 +506,75 @@ impl RoomManager {
         producer_id: ProducerId,
         rtp_capabilities: &RtpCapabilities,
     ) -> anyhow::Result<ConsumerInfo> {
-        let room = self
-            .rooms
-            .get(room_id)
-            .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
+        let ops = {
+            let room = self
+                .rooms
+                .get(room_id)
+                .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
-        // Check if the router can consume this producer
-        if !room.router.can_consume(&producer_id, rtp_capabilities) {
-            return Err(anyhow::anyhow!("Cannot consume: incompatible capabilities"));
-        }
+            // Check if the router can consume this producer
+            if !room.router.can_consume(&producer_id, rtp_capabilities) {
+                return Err(anyhow::anyhow!("Cannot consume: incompatible capabilities"));
+            }
 
-        // FR-30 P4 — read the source producer's pause state (and, FR-127 P1,
-        // its kind) HERE, while only `room` is held. ⚠️ Not below:
-        // `participants.get_mut()` is taken a few lines down, and iterating
-        // the same DashMap while holding a mutable entry deadlocks it.
-        let source = room
-            .participants
-            .iter()
-            .flat_map(|entry| {
-                entry
-                    .value()
-                    .producers
-                    .iter()
-                    .find(|pe| pe.producer.id() == producer_id)
-                    .map(|pe| (pe.producer.paused(), pe.producer.kind()))
-            })
-            .next();
+            room.participants
+                .get(connection_id)
+                .map(|p| p.ops.clone())
+                .ok_or_else(|| anyhow::anyhow!("Participant not found"))?
+        };
+        let _turn = ops.lock().await;
+
+        let (recv_transport, source, wanted) = {
+            let room = self
+                .rooms
+                .get(room_id)
+                .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
+
+            // FR-30 P4 — read the source producer's pause state (and, FR-127
+            // P1, its kind) HERE, before this participant's entry is taken.
+            // ⚠️ Iterating the map while holding one of its entries deadlocks
+            // it: the iterator waits on the entry's shard for good.
+            let source = room
+                .participants
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .value()
+                        .producers
+                        .iter()
+                        .find(|pe| pe.producer.id() == producer_id)
+                        .map(|pe| (pe.producer.paused(), pe.producer.kind()))
+                })
+                .next();
+
+            let participant = room
+                .participants
+                .get(connection_id)
+                .filter(|p| Arc::ptr_eq(&p.ops, &ops))
+                .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
+
+            // FR-127 P1 — a video consumer a view client does not show starts
+            // paused, and resumes when a `media:view` names its producer (a
+            // report that named it before this consume counts). Audio, and
+            // everything for a legacy client, flows as before. A producer the
+            // scan did not find (it is not a participant's — nothing in P1) is
+            // treated as wanted: the budget is a load lever, never a reason to
+            // withhold a picture.
+            let wanted = match source {
+                Some((_, kind)) => view::wants(participant.view.as_ref(), kind, &producer_id),
+                None => true,
+            };
+            (participant.recv_transport.clone(), source, wanted)
+        };
         let producer_paused = source.map(|(paused, _)| paused).unwrap_or(false);
 
-        let mut participant = room
-            .participants
-            .get_mut(connection_id)
-            .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
-
-        // FR-127 P1 — a video consumer a view client does not show starts
-        // paused, and resumes when a `media:view` names its producer (a report
-        // that named it before this consume counts). Audio, and everything for
-        // a legacy client, flows as before. A producer the scan did not find
-        // (it is not a participant's — nothing in P1) is treated as wanted:
-        // the budget is a load lever, never a reason to withhold a picture.
-        let wanted = match source {
-            Some((_, kind)) => view::wants(participant.view.as_ref(), kind, &producer_id),
-            None => true,
-        };
         let mut consumer_options = ConsumerOptions::new(producer_id, rtp_capabilities.clone());
         // ⚠️ `ConsumerOptions.paused` defaults to FALSE (mediasoup 0.20.0): a
         // consumer is created resumed unless asked otherwise. The crate's own
         // doc recommends `paused: true` for video so the first key frame does
         // not race the client's consumer — which is what a view client gets.
         consumer_options.paused = !wanted;
-        let consumer = participant
-            .recv_transport
+        let consumer = recv_transport
             .consume(consumer_options)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to consume: {}", e))?;
@@ -525,7 +599,21 @@ impl RoomManager {
             producer_paused,
         };
 
-        participant.consumers.push(consumer);
+        // The participant may have left meanwhile, or left and joined again on
+        // this connection. A consumer of the old one is dropped unrecorded,
+        // which closes it.
+        let recorded = self
+            .participant_mut(room_id, connection_id, |p| {
+                if !Arc::ptr_eq(&p.ops, &ops) {
+                    return false;
+                }
+                p.consumers.push(consumer);
+                true
+            })
+            .unwrap_or(false);
+        if !recorded {
+            return Err(anyhow::anyhow!("Participant not found"));
+        }
 
         debug!(
             ?room_id,
@@ -547,7 +635,9 @@ impl RoomManager {
     /// handles are cloned out and every guard dropped before an await, the
     /// pattern `set_producer_paused` established. A consumer that closed
     /// meanwhile (its producer left) answers an error, which is logged and
-    /// skipped — the next report will not name it.
+    /// skipped — the next report will not name it. FR-127 P1.1 — all inside
+    /// the participant's `ops` turn, so a `consume` cannot decide a new
+    /// consumer's flag from the view this report is replacing.
     pub async fn apply_view(
         &self,
         room_id: &ObjectId,
@@ -556,11 +646,20 @@ impl RoomManager {
         tiles: Vec<(ProducerId, (u32, u32))>,
         max: usize,
     ) -> ViewOutcome {
+        let Some(ops) = self.participant(room_id, connection_id, |p| p.ops.clone()) else {
+            return ViewOutcome::NotFound;
+        };
+        let _turn = ops.lock().await;
+
         let changes: Vec<(Consumer, view::Change)> = {
             let Some(room) = self.rooms.get(room_id) else {
                 return ViewOutcome::NotFound;
             };
-            let Some(mut participant) = room.participants.get_mut(connection_id) else {
+            let Some(mut participant) = room
+                .participants
+                .get_mut(connection_id)
+                .filter(|p| Arc::ptr_eq(&p.ops, &ops))
+            else {
                 return ViewOutcome::NotFound;
             };
             let ParticipantMedia {
@@ -617,6 +716,32 @@ impl RoomManager {
         }
         debug!(?room_id, %connection_id, seq, resumed, paused, "view applied");
         ViewOutcome::Applied { resumed, paused }
+    }
+
+    /// FR-127 P1.1 — `f` on one participant, under DashMap guards that are
+    /// released before this returns. What `f` returns is owned (a cloned
+    /// handle, plain data), so a caller that awaits next holds no guard.
+    fn participant<T>(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        f: impl FnOnce(&ParticipantMedia) -> T,
+    ) -> Option<T> {
+        let room = self.rooms.get(room_id)?;
+        let participant = room.participants.get(connection_id)?;
+        Some(f(&participant))
+    }
+
+    /// FR-127 P1.1 — [`Self::participant`], mutably.
+    fn participant_mut<T>(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        f: impl FnOnce(&mut ParticipantMedia) -> T,
+    ) -> Option<T> {
+        let room = self.rooms.get(room_id)?;
+        let mut participant = room.participants.get_mut(connection_id)?;
+        Some(f(&mut participant))
     }
 
     /// FR-127 P1 — one participant's LIVE consumers, as plain data (the tests
@@ -911,19 +1036,21 @@ impl RoomManager {
         room_id: &ObjectId,
         producer_id: ProducerId,
     ) -> anyhow::Result<mpsc::Receiver<Vec<u8>>> {
-        let room = self
+        // FR-127 P1.1 — on a cloned router, with the rooms guard released
+        // before the worker round trips (see `tests`).
+        let router = self
             .rooms
             .get(room_id)
+            .map(|room| room.router.clone())
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
-        let direct_transport = room
-            .router
+        let direct_transport = router
             .create_direct_transport(DirectTransportOptions::default())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create DirectTransport: {}", e))?;
 
         // Convert RtpCapabilitiesFinalized → RtpCapabilities via serde (same JSON schema)
-        let caps_finalized = room.router.rtp_capabilities();
+        let caps_finalized = router.rtp_capabilities();
         let rtp_capabilities: RtpCapabilities = serde_json::from_value(
             serde_json::to_value(caps_finalized)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize capabilities: {}", e))?,
@@ -951,14 +1078,21 @@ impl RoomManager {
             })
             .detach();
 
-        // Store to keep alive
-        room.rtp_taps.insert(
-            producer_id.to_string(),
-            RtpTap {
-                _direct_transport: direct_transport,
-                _consumer: consumer,
-            },
-        );
+        // Store to keep alive, in the room this router still serves: if the
+        // room closed meanwhile (or closed and was created again), the tap is
+        // dropped here, which closes it and ends the receiver.
+        self.rooms
+            .get(room_id)
+            .filter(|room| room.router.id() == router.id())
+            .ok_or_else(|| anyhow::anyhow!("Room not found"))?
+            .rtp_taps
+            .insert(
+                producer_id.to_string(),
+                RtpTap {
+                    _direct_transport: direct_transport,
+                    _consumer: consumer,
+                },
+            );
 
         debug!(?room_id, %producer_id, "RTP tap created and resumed");
         Ok(rx)
@@ -1072,4 +1206,246 @@ pub fn media_codecs() -> Vec<RtpCodecCapability> {
             ],
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! FR-127 P1.1 — the meeting that froze a pod (2026-10-27).
+    //!
+    //! A DashMap guard held across an `.await` does not park the task holding
+    //! it: it parks the THREAD of every other task that wants that shard. A
+    //! production pod has 2 CPUs, so tokio runs 2 worker threads, and once two
+    //! tasks are parked behind a guard whose holder is waiting on its mediasoup
+    //! worker, no thread is left to poll the holder. The whole runtime stops,
+    //! `/health` with it, until the liveness probe kills the pod. `consume`
+    //! held the participant's entry across two worker round trips while every
+    //! other `consume` in the room scanned the same map for its producer, so a
+    //! few joins at once were enough.
+    //!
+    //! The storm below is that burst in production's shape: one task per
+    //! connection, because the WS loop awaits each message in turn, each one
+    //! consuming every producer it does not own and, for a view client,
+    //! reporting a view after each consume. It runs on exactly 2 worker
+    //! threads, from a plain `#[test]` with a watchdog, so a freeze FAILS the
+    //! test instead of hanging the suite.
+    use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    /// What a 2-CPU pod gives tokio.
+    const WORKER_THREADS: usize = 2;
+    const PARTICIPANTS: usize = 12;
+    /// Participants `0..SENDERS` publish audio and a camera.
+    const SENDERS: usize = 4;
+    /// The storm takes about a second; a freeze never ends.
+    const DEADLINE: Duration = Duration::from_secs(60);
+
+    fn settings() -> MediasoupSettings {
+        MediasoupSettings {
+            num_workers: 1,
+            listen_ip: "127.0.0.1".to_string(),
+            announced_ip: String::new(),
+            announced_ip_map: None,
+            rtc_min_port: 40000,
+            rtc_max_port: 49999,
+        }
+    }
+
+    /// Parameters the worker accepts for a producer on a transport that never
+    /// DTLS-connects, as `crates/tests/src/conference_view_tests.rs` sends them.
+    fn rtp_parameters(kind: MediaKind, ssrc: u32) -> RtpParameters {
+        let codec = match kind {
+            MediaKind::Audio => serde_json::json!({
+                "mimeType": "audio/opus", "payloadType": 111, "clockRate": 48000,
+                "channels": 2, "parameters": {}, "rtcpFeedback": []
+            }),
+            MediaKind::Video => serde_json::json!({
+                "mimeType": "video/VP8", "payloadType": 96, "clockRate": 90000,
+                "parameters": {}, "rtcpFeedback": []
+            }),
+        };
+        serde_json::from_value(serde_json::json!({
+            "codecs": [codec],
+            "headerExtensions": [],
+            "encodings": [{ "ssrc": ssrc }],
+            "rtcp": { "cname": format!("cname-{ssrc}"), "reducedSize": true }
+        }))
+        .expect("producer parameters")
+    }
+
+    fn conn(i: usize) -> String {
+        format!("conn-{i}")
+    }
+
+    /// Half the room are view clients (`caps: ["view"]`), half legacy.
+    fn view_client(i: usize) -> bool {
+        i.is_multiple_of(2)
+    }
+
+    /// The cameras participant `i`'s report number `step` names: a set that
+    /// shifts with every report, so each report pauses some consumers and
+    /// resumes others, and names cameras not consumed yet.
+    fn named(i: usize, step: usize, cameras: &[(usize, ProducerId)]) -> Vec<ProducerId> {
+        cameras
+            .iter()
+            .filter(|(sender, _)| *sender != i && (sender + i + step).is_multiple_of(2))
+            .map(|(_, producer)| *producer)
+            .collect()
+    }
+
+    async fn storm() -> Result<(), String> {
+        let pool = WorkerPool::new(&settings())
+            .await
+            .map_err(|e| e.to_string())?;
+        let rm = Arc::new(RoomManager::new(Arc::new(pool), &settings()));
+        let rid = ObjectId::new();
+        rm.create_room(rid).await.map_err(|e| e.to_string())?;
+        let caps: RtpCapabilities = {
+            let room = rm.rooms.get(&rid).ok_or("the room exists")?;
+            let finalized =
+                serde_json::to_value(room.router.rtp_capabilities()).map_err(|e| e.to_string())?;
+            serde_json::from_value(finalized).map_err(|e| e.to_string())?
+        };
+
+        // Everyone joins at once.
+        let joins: Vec<_> = (0..PARTICIPANTS)
+            .map(|i| {
+                let rm = rm.clone();
+                tokio::spawn(async move {
+                    rm.create_transports(rid, ObjectId::new(), conn(i), view_client(i))
+                        .await
+                })
+            })
+            .collect();
+        for join in joins {
+            join.await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("join: {e}"))?;
+        }
+
+        // The senders publish at once.
+        let publishes: Vec<_> = (0..SENDERS)
+            .flat_map(|s| [MediaKind::Audio, MediaKind::Video].map(move |kind| (s, kind)))
+            .enumerate()
+            .map(|(n, (s, kind))| {
+                let rm = rm.clone();
+                tokio::spawn(async move {
+                    let source = match kind {
+                        MediaKind::Audio => "audio",
+                        MediaKind::Video => "camera",
+                    };
+                    let parameters = rtp_parameters(kind, 1000 + n as u32);
+                    rm.produce(&rid, &conn(s), kind, parameters, source.to_string())
+                        .await
+                        .map(|producer| (s, kind, producer))
+                })
+            })
+            .collect();
+        let mut producers = Vec::new();
+        for publish in publishes {
+            producers.push(
+                publish
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("produce: {e}"))?,
+            );
+        }
+        let cameras: Vec<(usize, ProducerId)> = producers
+            .iter()
+            .filter(|(_, kind, _)| *kind == MediaKind::Video)
+            .map(|(s, _, producer)| (*s, *producer))
+            .collect();
+
+        // The storm: every connection consumes everything it does not own.
+        let connections: Vec<_> = (0..PARTICIPANTS)
+            .map(|i| {
+                let (rm, caps) = (rm.clone(), caps.clone());
+                let (producers, cameras) = (producers.clone(), cameras.clone());
+                tokio::spawn(async move {
+                    let mut step = 0;
+                    for (_, _, producer) in producers.iter().filter(|(s, ..)| *s != i) {
+                        rm.consume(&rid, &conn(i), *producer, &caps)
+                            .await
+                            .map_err(|e| format!("{} consume: {e}", conn(i)))?;
+                        step += 1;
+                        if view_client(i) {
+                            let tiles = named(i, step, &cameras)
+                                .into_iter()
+                                .map(|producer| (producer, (320, 240)))
+                                .collect();
+                            let outcome =
+                                rm.apply_view(&rid, &conn(i), step as u64, tiles, 49).await;
+                            if !matches!(outcome, ViewOutcome::Applied { .. }) {
+                                return Err(format!("{} report {step}: {outcome:?}", conn(i)));
+                            }
+                        }
+                    }
+                    Ok::<_, String>(step)
+                })
+            })
+            .collect();
+        let mut last_report = Vec::new();
+        for connection in connections {
+            last_report.push(connection.await.map_err(|e| e.to_string())??);
+        }
+
+        // Every connection holds one live consumer per producer it does not
+        // own, and each one's flag is what that connection's last report asked
+        // for: a view client's unnamed cameras paused, everything else flowing.
+        for (i, last) in last_report.into_iter().enumerate() {
+            let states = rm.consumer_states(&rid, &conn(i));
+            let expected = producers.iter().filter(|(s, ..)| *s != i).count();
+            let handles = rm.consumer_handles(&rid, &conn(i));
+            if states.len() != expected || handles != expected {
+                return Err(format!(
+                    "{}: {} live consumers and {handles} handles, expected {expected}",
+                    conn(i),
+                    states.len()
+                ));
+            }
+            let shown: Vec<String> = named(i, last, &cameras)
+                .iter()
+                .map(|producer| producer.to_string())
+                .collect();
+            for c in &states {
+                let paused = view_client(i) && c.kind == "video" && !shown.contains(&c.producer_id);
+                if c.paused != paused {
+                    return Err(format!(
+                        "{}: the {} consumer of {} has paused={}, expected {paused}",
+                        conn(i),
+                        c.kind,
+                        c.producer_id,
+                        c.paused
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_burst_of_joins_on_two_worker_threads_does_not_freeze_the_runtime() {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("storm".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(WORKER_THREADS)
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                let _ = done.send(runtime.block_on(storm()));
+            })
+            .expect("the storm thread");
+        match outcome.recv_timeout(DEADLINE) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{e}"),
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "the room manager froze: the storm did not finish within {} s on {WORKER_THREADS} \
+                 worker threads, so a DashMap guard is held across an await",
+                DEADLINE.as_secs()
+            ),
+            Err(RecvTimeoutError::Disconnected) => panic!("the storm thread panicked"),
+        }
+    }
 }
