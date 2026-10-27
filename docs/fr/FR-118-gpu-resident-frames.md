@@ -237,7 +237,7 @@ what the pump does.
   ignores the encoder id: `left: None, right: Some([12.0, 1.0, 2.0, 0.5])`. In NC2 the readback window loses its
   reopen rule and panics on the u64 underflow the rule prevents.
 
-### 5.2 P1 — C0, the contract, as built (2026-10-28)
+### 5.2 P1 — C0, the contract, as built (2026-10-27)
 
 `Frame.data` is now a `FrameData` (`agents/roomlerd/src/capture/mod.rs`), and every consumer reads the pixels
 through `Frame::cpu()`. Only `FrameData::Cpu` exists, so nothing changes at run time.
