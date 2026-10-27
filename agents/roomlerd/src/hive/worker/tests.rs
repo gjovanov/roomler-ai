@@ -481,3 +481,57 @@ async fn a_program_gets_its_channel_on_fd_3() {
     }
     running.kill().await;
 }
+
+/// P8-2a-3 — a worker's open files are bounded from the daemon's hard
+/// limit: at most `MAX_OPEN_FILES`, a lower one kept, never raised.
+#[test]
+fn a_workers_open_files_are_bounded_and_never_raised() {
+    assert_eq!(open_files(libc::RLIM_INFINITY), MAX_OPEN_FILES, "unlimited");
+    assert_eq!(open_files(MAX_OPEN_FILES * 4), MAX_OPEN_FILES, "higher");
+    assert_eq!(open_files(1024), 1024, "lower");
+}
+
+/// P8-2a-3 — a worker's limits are the process's, so they are set in a
+/// child of the test: a core limit of 1 byte (no dump, even through a
+/// helper), and both open-file limits at the bound.
+#[test]
+fn a_worker_never_dumps_core_and_holds_files_to_its_bound() {
+    // The resources' type differs by platform: a macro, not a cast.
+    macro_rules! now {
+        ($resource:expr) => {{
+            let mut r = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit into a valid rlimit.
+            unsafe { libc::getrlimit($resource, &mut r) };
+            (r.rlim_cur, r.rlim_max)
+        }};
+    }
+    let bound = open_files(now!(libc::RLIMIT_NOFILE).1);
+    // SAFETY: the child makes system calls alone, then `_exit`s.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "forked");
+    if pid == 0 {
+        let set = limit().is_ok();
+        let core = now!(libc::RLIMIT_CORE);
+        let files = now!(libc::RLIMIT_NOFILE);
+        let code = match (set, core, files) {
+            (false, ..) => 2,
+            (true, (1, 1), files) if files == (bound, bound) => 0,
+            (true, (1, 1), _) => 4,
+            _ => 3,
+        };
+        // SAFETY: the end of the child, its destructors not run.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: waitpid on the child forked above.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    let code = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+    assert_eq!(
+        code,
+        Some(0),
+        "0 = both set; 2 = not set; 3 = the core limit; 4 = the open files"
+    );
+}
