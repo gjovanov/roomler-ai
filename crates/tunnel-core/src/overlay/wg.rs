@@ -1462,7 +1462,10 @@ impl WgDevice {
     /// sees the other and the wake fires exactly when it is due. Firing twice
     /// costs one empty sweep.
     fn insert_probe(&mut self, peer_public: [u8; 32], peer: Peer) {
-        let _ = peer.stats.latch_wake.set(self.probe_latched.clone());
+        // A session is filed as a probe once, when it is built; an armed one
+        // coming back here would mean some path re-files a probe it took out.
+        let armed = peer.stats.latch_wake.set(self.probe_latched.clone());
+        debug_assert!(armed.is_ok(), "a probe session armed twice");
         fence(Ordering::SeqCst);
         if peer.stats.handshake.load(Ordering::Relaxed) {
             self.probe_latched.notify_one();
@@ -3011,6 +3014,54 @@ mod tests {
             "filing a probe that already latched wakes the sweep"
         );
         assert_eq!(dev.probe_handshake_done(&pk), Some(true));
+    }
+
+    /// #2952 — the wake fires from the RECEIVE path, with no test helper
+    /// latching anything: A's direct probe toward B handshakes over real
+    /// loopback sockets, and A's runtime wake completes. Promoted, the session
+    /// never fires it again, even when a rekey completes a fresh handshake
+    /// (the latch is set-once).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_probe_handshake_wakes_from_the_receive_path_once() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, _rx_b) = WgDevice::new(b.secret.clone());
+        let pk_b = b.public.to_bytes();
+
+        // B knows A as an ordinary installed peer; A probes B directly.
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        dev_a.ensure_direct_demux(sock_a.clone());
+        let wake = dev_a.probe_latch_wake();
+        dev_a
+            .start_direct_probe(sock_a, pk_b, IP_B, addr_b, true)
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), wake.notified())
+                .await
+                .is_ok(),
+            "the probe's handshake latched on the receive path and woke the runtime"
+        );
+        assert_eq!(dev_a.probe_handshake_done(&pk_b), Some(true));
+        assert!(dev_a.promote_direct_probe(&pk_b));
+
+        assert!(dev_a.poke_handshake(&pk_b), "a rekey toward B");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), wake.notified())
+                .await
+                .is_err(),
+            "a promoted session never wakes the probe sweep again"
+        );
     }
 
     /// #2820 — a probe over a carrier with its own receive loop (`/derp`) is

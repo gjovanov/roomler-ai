@@ -3219,7 +3219,7 @@ impl OverlayRuntime {
                     let t0 = Instant::now();
                     self.sweep_upgrade_probes(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut upgrade_probes, &mut relay_bq,
+                        &mut upgrade_probes, &mut relay_bq, SweepCause::Tick,
                     ).await;
                     warn_if_slow("sweep_upgrade_probes", t0);
                     // D8 — periodic direct re-upgrade (~every 6th tick ≈ 30 s).
@@ -3275,15 +3275,19 @@ impl OverlayRuntime {
                 // ends' 5 s sweeps (2.6 s measured on 0.4.175), at the latch
                 // it is about one round trip. The tick still sweeps
                 // (deadlines, and the floor for a wake never delivered), so
-                // this only ever shortens the wait. The same post-promote
-                // steps as the tick, in its order: exit routing re-reconciled
-                // before the refreshed view.
+                // this only ever shortens THIS end's wait. Not every pair's
+                // gap: while the peer is an agent that still promotes on its
+                // tick (≤ 0.4.177), the gap is that end's whole tick phase
+                // (mean ~2.5 s, max 5 s, the same max as before) instead of
+                // the distance between two phases (mean ~1.7 s), until it
+                // updates. The same post-promote steps as the tick, in its
+                // order: exit routing re-reconciled before the refreshed view.
                 _ = probe_wake.notified() => {
                     let t_arm = Instant::now();
                     let in_flight = upgrade_probes.len();
                     self.sweep_upgrade_probes(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut upgrade_probes, &mut relay_bq,
+                        &mut upgrade_probes, &mut relay_bq, SweepCause::Latch,
                     ).await;
                     // A wake whose probe the tick already settled sweeps
                     // nothing; only a probe settled HERE changed a carrier.
@@ -6126,6 +6130,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut test_relay_bq(),
+            SweepCause::Tick,
         )
         .await;
 
@@ -6210,6 +6215,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut test_relay_bq(),
+            SweepCause::Tick,
         )
         .await;
 
@@ -6246,6 +6252,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut test_relay_bq(),
+            SweepCause::Tick,
         )
         .await;
 
