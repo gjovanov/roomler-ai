@@ -386,6 +386,10 @@ mod child {
                 return None;
             }
         };
+        // #2717 — the child ends with this process: a worker told to stop
+        // mid-probe leaves without waiting it out (`signaling::run`).
+        #[cfg(windows)]
+        let _ends_with_us = tie_to_this_process(&childp);
 
         // Read stdout on this thread while waiting, so a chatty child cannot
         // fill the pipe and deadlock against our own wait.
@@ -568,6 +572,47 @@ mod child {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// #2717 — a job that ends the probe child when this process ends, held
+    /// for as long as [`run_child`] waits on it.
+    ///
+    /// A worker told to stop while it probes leaves without waiting the probe
+    /// out (`signaling::run`). Untied, its probe child, a `roomlerd.exe`,
+    /// would outlive it. It could hold the very binary an update is replacing,
+    /// or, hung in a driver, run on with nobody left to enforce [`TIMEOUT`].
+    /// Windows has no process group to take down with a parent; a
+    /// `KILL_ON_JOB_CLOSE` job is the equivalent, and its last handle closes
+    /// when this process ends. `None` (logged) when the job cannot be made:
+    /// the probe then runs as it always did.
+    #[cfg(windows)]
+    pub(super) fn tie_to_this_process(
+        child: &std::process::Child,
+    ) -> Option<crate::win_service::supervisor::JobObject> {
+        use std::os::windows::io::AsRawHandle;
+        let job = match crate::win_service::supervisor::JobObject::kill_on_close() {
+            Ok(job) => job,
+            Err(e) => {
+                tracing::warn!(%e, "caps probe: no job for the probe child; a stop mid-probe can leave it running");
+                return None;
+            }
+        };
+        // SAFETY: both handles are live: the job's is ours, and the child's
+        // process handle lives as long as `child`.
+        let joined = unsafe {
+            windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                job.raw(),
+                child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            )
+        };
+        if joined == 0 {
+            tracing::warn!(
+                err = ?std::io::Error::last_os_error().raw_os_error(),
+                "caps probe: the probe child could not join its job; a stop mid-probe can leave it running"
+            );
+            return None;
+        }
+        Some(job)
     }
 }
 
@@ -3689,5 +3734,45 @@ mod tests {
             std::env::remove_var(child::PHASE_ENV);
             std::env::remove_var(child::NAMES_444_ENV);
         }
+    }
+
+    /// #2717 — a probe child tied to this process ends with its job's last
+    /// handle. Dropping the job here is what the process's exit does to it
+    /// when a worker leaves a probe behind.
+    #[cfg(windows)]
+    #[test]
+    fn a_probe_child_ends_when_its_job_closes() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        let mut probe = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in probe");
+        let job = child::tie_to_this_process(&probe).expect("the probe joins a job");
+
+        // The control: while the job is open, the probe runs.
+        std::thread::sleep(Duration::from_millis(300));
+        let ran_on = probe.try_wait().expect("try_wait").is_none();
+
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ended = loop {
+            if probe.try_wait().expect("try_wait").is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if !ended {
+            let _ = probe.kill();
+            let _ = probe.wait();
+        }
+        assert!(ran_on, "the control: the probe runs while its job is open");
+        assert!(ended, "the probe outlived its job's last handle");
     }
 }
