@@ -179,6 +179,75 @@ at every one of the 193: the blocked-send source was live in 2 % of the
 constrained windows and the prior in none. That absence is the V3b finding,
 below.
 
+### The ceiling learner (FR-35 P1) — growth above the nominal
+
+On a constrained (relayed) session the AIMD runs under a ceiling, and that
+ceiling used to be a fleet constant: `relay_max_bps` = 3 Mbps (`mod.rs:786`,
+env `ROOMLERD_RELAY_MAX_KBPS`), the encoder opened at 85 % of it. One constant
+cannot be right for the fleet. The real `neo16 → CORPLAP-2` DERP path, measured
+2026-08-29, sustains ~6–9 Mbps and absorbs short bursts far above; other corp
+relays measured ~2 Mbps. At 2.55 Mbps that first pair's opening keyframe is a
+5.6 KB max-QP smear repaired by inter frames over ~1.2 s; at a 25.5 Mbps cap the
+whole desktop arrived as one 680 KB frame at +0.3 s — yet 12.8 Mbps *sustained*
+choked it with a 7.9 s stall. So the cap must be **learned per pair**, and —
+because every NVENC rate change *down* forces a starved keyframe that replaces
+the picture (FR-31) — within a session it may only ever **climb**.
+
+`encode::ceiling_learn::CeilingLearner` (`ceiling_learn.rs:89`) sits between the
+plan's nominal ceiling and the AIMD. `RateGovernor::effective_ceiling`
+(`governor.rs:543`) returns `plan.max(learned.min(hi))` on a constrained
+session, so the learned ceiling only ever RAISES the plan's, never past `hi`
+(`relay_max_hi_bps` = 8 Mbps, `mod.rs:844`). Once per viewer window the governor
+hands the learner that window's evidence (`governor.rs:1388` → `on_window`,
+`ceiling_learn.rs:190`), and it steps the ceiling up only when **all five** gates
+pass:
+
+```mermaid
+flowchart TB
+    WIN["viewer window (1 s)<br/>governor.rs:1388 → on_window"] --> G{"all five gates?"}
+    G --> P["PINNED — AIMD target ≥ 90 % of the ceiling<br/>(it wants more)"]
+    G --> CAR["CARRIED — the window delivered ≥ 70 % of the ceiling<br/>(you cannot measure capacity you are not using)"]
+    G --> CL["CLEAN — no decrease and no stall in the last 10 s"]
+    G --> AGE["AGE — viewer paint age ≤ 2× its learned floor<br/>(when the viewer reports it)"]
+    G --> SP["SPACED — ≥ 5 s since the last step"]
+    P & CAR & CL & AGE & SP --> STEP["step up: ceiling += max(ceiling/16, 150 kbps),<br/>capped at hi — logs 'the pair carried the ceiling'"]
+    G -- any fails --> HOLD["hold"]
+    DEC["a DECREASE (full channel · overflow ·<br/>stall · age excess)"] --> PULL["the learned ceiling follows it down to the<br/>post-decrease target, never below the nominal"]
+    HS["a send blocked ≥ 1 s (HARD_STALL)"] --> MD["×0.5 at the window boundary, not the ×0.85<br/>ladder (the 7.9 s P0 stall took three ×0.85 over 4 s)"]
+    MEAS["a held goodput measurement < ceiling / 2<br/>(CONTRADICTION_FACTOR)"] --> AB["ABANDON the learned ceiling back to the nominal<br/>(FR-59 P6 — a relay-keyed fast day carried onto a slow one)"]
+```
+
+| gate / rule | constant | anchor |
+|---|---|---|
+| pinned | `PINNED_PCT` 90 | `ceiling_learn.rs:55` |
+| carried | `CARRIED_PCT` 70 | `ceiling_learn.rs:57` |
+| clean | `GROW_CLEAN` 10 s (decrease **and** stall) | `ceiling_learn.rs:51` |
+| age | `AGE_FLOOR_FACTOR_PCT` 200 — was 150, until the first field run's 66–80 ms over a 43 ms floor turned out to BE the evidence | `ceiling_learn.rs:62` |
+| spaced | `GROW_INTERVAL` 5 s | `ceiling_learn.rs:53` |
+| step | `max(ceiling / 16, 150 kbps)`, capped at `hi` | `ceiling_learn.rs:69`, `:236` |
+| hard stall | `HARD_STALL` 1 s ⇒ ×0.5, applied at the window boundary (FR-79: only there is it known the block was the pipe, not a pass the runtime stalled under) | `ceiling_learn.rs:64`, `governor.rs:1188` |
+| contradiction | learned > 2 × a held measurement ⇒ abandon to the nominal, exactly once | `ceiling_learn.rs:172`, `:79` |
+
+The session's **stable rate** — the highest target that held 10 s
+(`STABLE_HOLD`) with no decrease — is what the pair memory persists
+(`ceiling_learn.rs:66`; next section), so the next session opens at 85 % of what
+the pair proved and the learner climbs from that floor instead of the constant.
+Kill switches: `relay_ceiling_learn` (tribool, default on; off ⇒ `hi` = 0 ⇒ the
+plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
+(`config_surface.rs:1236`; `mod.rs:844`). Direct sessions never touch the
+learner (`governor.rs:543` gates on `constrained`).
+
+> **Field, 0.4.179, `CORPLAP-2` over `relay:derp/tcp` (2026-10-27).** A carrying
+> session opened seeded at 0.85 × a 4.75 M memory (`opener_maxrate_bps`
+> = 4,038,075 vs the 2.55 M a cold pair gets) and the learner stepped the ceiling
+> 4.04 → 4.29 → 4.56 → 4.84 → 5.15 M across ~70 s of motion, each step logged
+> `the pair carried the ceiling`. Over the whole session `send_wait_max` stayed
+> 0.06–0.50 ms (one 52 ms blip at a step), viewer paint age ran 55–130 ms, and
+> the ceiling never approached `hi` (8 M). The pair settles at its **sustainable**
+> ~5 M, so the opener is ~1.6× the cold one — crisper, but short of the 2.5× the
+> burst-rate measurement suggested; that gap is the learner correctly refusing an
+> unsustainable cap, not a regression.
+
 ### The write-back and the seed (V2 + V4) — the pair memory
 
 FR-35 P2 remembers a pair's rate so the next session opens at 85 % of it
@@ -604,7 +673,9 @@ All keys live in the agent config (`roomler config set …`) with
 | `constrained_cq_relief` | 4 | CQ softening at a sub-native rung on relay — only reachable via explicit picks / restored rungs |
 | `idle_refine_settle_constrained_ms` | 1200 | Up-flip settle on relay when a rung exists |
 | `gpu_scale` / `scale_threads` | on / 1 | HW-downscale Phase A/B levers (only active when something scales) |
-| `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp |
+| `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp (the nominal the learner grows above) |
+| `relay_ceiling_learn` / `ROOMLERD_RELAY_CEILING_LEARN` | on | FR-35 — the constrained ceiling learns the pair; off ⇒ the fixed clamp and no rate memory ([§ The ceiling learner](#the-ceiling-learner-fr-35-p1--growth-above-the-nominal)) |
+| `relay_max_hi_kbps` / `ROOMLERD_RELAY_MAX_HI_KBPS` | 8000 | FR-35 — the ceiling the learned rate may reach; `0` = nominal only (= `relay_ceiling_learn` off) |
 | `ROOMLERD_SMOOTH_MAX_EDGE` / `RELAY_MAX_EDGE` | 1024 / 1280 | Rung sizes when `priority_res_cap` is on |
 | `direct_queue_ms` | 150 | FR-74 P1/P1b — the direct gate's **lag bound**: bytes over 150 ms of the ceiling gate only once the measured send wait has also crossed 150 ms; 0 disables the gate ([§ The direct path](#the-direct-path-fr-74--a-ceiling-that-is-a-bound-a-gate-that-measures-lag)) |
 | `direct_hrd_pct` | 100 | HRD window for direct sessions, % of maxrate ([25, 200]); also the gate's hard budget. ⚠ `av1_*` encoders stay at 200 regardless (the rc.443 hang) |
