@@ -3,7 +3,8 @@
 **Issue:** [#2985](https://github.com/gjovanov/roomler-ai/issues/2985) · **Status:** P0 done 2026-10-27 — the design below
 is read against the code, and each phase is specified so that a separate worker builds it from this document ·
 **Owner:** conference (the mediasoup SFU and the call UI) · **Anchors:** master `aee65c269`, every one verified by P0 on
-2026-10-27 · **Builds on:** [FR-115](FR-115-pricing-reshape.md) (*O4, measured*; the plan caps), FR-30 (producer pause),
+2026-10-27 — §2 and §3 read the code as it stood before P1; what P1 built is anchored from
+[`docs/real-time.md`](../real-time.md#a-meeting-receives-what-is-visible-fr-127-p1) · **Builds on:** [FR-115](FR-115-pricing-reshape.md) (*O4, measured*; the plan caps), FR-30 (producer pause),
 FR-32 (the participant cap), FR-124 (the black-tile detector, which P1 must not trip)
 
 ## 1. Goal
@@ -162,8 +163,9 @@ keys into video producer ids (it has them from `media:new_producer`, and `consum
 `conference.ts:366-367`) and sends `media:view`. A tile that is rendered but whose owner paused the camera (FR-30) stays
 in the set: the producer is paused anyway, and the moment the owner resumes, the tile shows. A screen share is always
 `primary`, so always in the set. ⚠️ FR-124's black detector (`VideoTile.vue:465-473`) flags after three black samples,
-about 3 s; a resumed tile paints its key frame well inside that, and a paused tile is off screen, where no detector runs.
-P1's e2e test asserts no `picture-black` fires on a scroll-in.
+about 3 s; a resumed tile paints its key frame well inside that, and the sampler is safe on a paused tile (`sampleLuma`
+answers `null` until the element has a frame, and a tile that has painted keeps its last frame). That no `picture-black`
+fires on a scroll-in is read off the hand-run field rig (§8), not an e2e spec; the e2e-namespace run is P4c's.
 
 **Key frames.** Nothing to add on the server: the worker requests a key frame when a video consumer resumes
 (`SimpleConsumer::UserOnResumed`, mediasoup-sys 0.10.0 `src/RTC/SimpleConsumer.cpp:711`; the simulcast one re-evaluates
@@ -410,7 +412,7 @@ the silent participants' audio packet rate returns to 50/s. A measurement whose 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | P0 | the design deepened, with anchors: the view and its signalling, the layer ladder, the pipe topology, how each lever is modelled in the bench, how the field run is built | — (docs) | ✅ 2026-10-27, this document (the P0 branch) |
-| P1 | receive what is visible: `caps` on the join, `media:view`, video consumers paused unless shown, audio always; Opus DTX, with the levers announced in `media:transport_created.meeting` | `[meetings] visible_tiles = false`: every consumer stays resumed, as today; `[meetings] audio_dtx = false` | — |
+| P1 | receive what is visible: `caps` on the join, `media:view`, video consumers paused unless shown, audio always; Opus DTX, with the levers announced in `media:transport_created.meeting` | `[meetings] visible_tiles = false`: every consumer stays resumed, as today; `[meetings] audio_dtx = false` | built 2026-10-27, the P1 PR (`fr-127-p1-view`): server + client + the switches, 11 unit + 7 integration + 20 Vitest tests, `docs/real-time.md`; red and green measured with real browsers against a local server (§8). The production field run at N = 25/50 is P4c's |
 | P2 | simulcast: the camera publishes two VP8 layers with three temporal layers each (decision 1); each consumer is given the layer its tile's size maps to, and a pinned tile a higher priority | `[meetings] simulcast = false`: the client publishes one encoding, as today | — |
 | P3 | a room across a pod's workers: `RoomRouters`, a router per 12 participants up to the worker count, each producer piped to the room's other routers under its own id | `[meetings] pipe_rooms = false`: one router per room, as today (the default until P4 measures it) | — |
 | P3b | pipes gated by demand: a pipe consumer runs only while someone on its router watches | rides `visible_tiles` | — |
@@ -421,12 +423,19 @@ the silent participants' audio packet rate returns to 50/s. A measurement whose 
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (P1):** in a meeting larger than the grid, a view client receives video for its rendered tiles only (the
+- [x] **AC1 (P1):** in a meeting larger than the grid, a view client receives video for its rendered tiles only (the
   grid in tiled; the big tile plus the on-screen strip in spotlight and sidebar) and audio from everyone. Shown by the
   client's inbound-RTP stats and the server's resumed-consumer gauge. A tile scrolled into view plays within 1 s and
-  FR-124's black notice does not appear. Red first: today every tile's consumer delivers.
-- [ ] **AC2 (P1, P3b):** a producer its owner paused (FR-30) stays paused for every viewer, and a viewer's off-screen
-  pause never pauses it for anyone else — also when the viewer and the owner sit on different routers.
+  FR-124's black notice does not appear. Red first: today every tile's consumer delivers. *Verified 2026-10-27 with
+  real browsers against a local server, red then green (§8): the grid-dropped tile went from 85 KB / 30 frames in 5 s
+  to 944 B / 0 frames, the gauge from absent to `media_video_paused: 1` (4 with a second, narrow viewer), a filmstrip
+  tile played 383 ms after its scroll-in with no black notice, audio on every peer both times. The e2e-namespace run at
+  production's shape is AC6's.*
+- [~] **AC2 (P1, P3b):** a producer its owner paused (FR-30) stays paused for every viewer, and a viewer's off-screen
+  pause never pauses it for anyone else — also when the viewer and the owner sit on different routers. *Met on one
+  router (P1): `conference_view_tests::an_owners_pause_and_a_viewers_pause_never_merge` against a real worker — the
+  owner's pause shows as `producer_paused` on every viewer whatever its view, a viewer's view moves only its own flag,
+  and no `media:producer_paused` fans out of a view. Missing: the different-routers half, which exists only with P3b.*
 - [ ] **AC3 (P2):** a camera publishes two layers; a grid tile receives the half layer and a spotlit or pinned tile the
   full one, read from `currentLayers`; a layer switch completes within 1 s and the tile does not freeze.
 - [ ] **AC4 (P3):** a room's participants land on more than one worker, every producer reaches every consumer through
@@ -440,9 +449,12 @@ the silent participants' audio packet rate returns to 50/s. A measurement whose 
 - [ ] **AC7 (no regression):** a 2–4 person meeting keeps today's quality and latency with every lever on, and stays on
   one router.
 - [ ] **AC8 (P5):** the published caps match what was measured (decision 4), and FR-115's O4 is closed by it.
-- [ ] **AC9 (docs):** `docs/real-time.md` documents the three levers in the house style (a mermaid diagram, tables,
+- [~] **AC9 (docs):** `docs/real-time.md` documents the three levers in the house style (a mermaid diagram, tables,
   `file:line` anchors, each kill switch, the `meeting` object), `docs/testing.md` the bench's flags and the capacity
-  lane, and `docs/README.md`'s index row for `real-time.md` names them.
+  lane, and `docs/README.md`'s index row for `real-time.md` names them. *P1's part is in the P1 PR:
+  [*A meeting receives what is visible*](../real-time.md#a-meeting-receives-what-is-visible-fr-127-p1) — the diagram,
+  the three states, the two pauses, the `meeting` object, the switches, the gauge — and the index row names it.
+  Missing: the simulcast and pipe levers (P2, P3) and the bench flags and capacity lane (P4).*
 
 ## 6. Open decisions (defaults in bold)
 
@@ -487,3 +499,7 @@ the silent participants' audio packet rate returns to 50/s. A measurement whose 
 |---|---|---|---|
 | 2026-10-26 | `examples/room_capacity.rs` on master `d016f81d2` (FR-115 O4) | the red: one room on one worker | **100 % to N = 20 cameras, 60 % at 25**; audio-only about 40. Pro sells 50 and Business 100 |
 | 2026-10-27 | master `aee65c269`, mediasoup 0.20.0, mediasoup-client 3.21.0 (P0, read, not run) | every anchor and API the design names | all present in the pinned versions. Corrections to the claim spec: consumers are **not** created paused (`ConsumerOptions.paused` defaults to false); the capture is 640×480, so the ladder is relative; audio alone exceeds a worker at N = 50 unmuted, so P1 carries DTX; a piped producer keeps its id, so the client never learns about routers; the tiled layout never scrolls, the strips do; the composition baseline holds no `media:*` name |
+| 2026-10-27 | **red**: master `dd1451a89` (the current deploy's code), a debug build in WSL, one mediasoup worker, the SPA from `bun run dev`; 5 senders + 2 viewers in headless Chromium 151 with a fake camera and a silent fake microphone, driven by Playwright; `getStats()` over a 5 s window | AC1's red: a meeting larger than the grid (viewer A tiled at `tiledMaxTiles = 4`, 5 remote cameras) | **every consumer delivers**: A rendered 4 tiles and received video on 5 — the grid-dropped sender still shipped 85 KB / 30 decoded frames in the window; `/api/cluster/status` has no `media_video_paused` field; `media_consumers = 60` for 6 participants (6 × 5 × 2). A sender's microphone: **50.1 packets/s** while silent (no DTX) |
+| 2026-10-27 | **green**: the P1 branch, the same rig, run twice | AC1 and the DTX half of §3.0 | **only the rendered tiles flow**: the 4 rendered tiles received 47–49 KB / 15 frames each, the grid-dropped one **944 B / 0 frames** (1.6 KB / 0 in the first run); `media_video_paused = 1` for A alone and **4** with a second viewer in a 420 px spotlight window (A's 2 dropped + B's 2 filmstrip tiles past the viewport); audio on 5/5 both times. **A filmstrip tile scrolled into view decoded its first frame 383 ms later** and flowed 45 KB / 13 frames over the next 4 s, with no FR-124 black notice anywhere on the page. A sender's microphone: **4.8 packets/s** silent with DTX. The sender's video was undisturbed by the paused viewers (30 frames encoded / 10 s, 98 packets): the worker forwards a consumer's PLI only while `IsActive()`, which `paused` and `producerPaused` both clear (`SimpleConsumer.cpp:638-641`), so a hidden tile never asks the camera for a key frame. Positive control for the switch: `conference_view_tests::the_kill_switch_keeps_todays_shape` (`visible_tiles = false`, `audio_dtx = false`) — created resumed, `meeting: {view: false, audio_dtx: false}`, a report ignored. Decoded-frame counts are low on both runs (5 encoders on one laptop core budget), so the red and the green compare like for like, not against 30 fps |
+| 2026-10-27 | **after review** — the mini view, the same rig: viewer A leaves the call page for the dashboard mid-call (a client-side navigation), the app bar's mini widget shows three remote cameras | the widget's tiles are plain `<video>`s and reported nothing, so the page's empty view paused them too | **red** (the PR's first head `1e4a61610`): the 3 mini tiles received **0 frames** in 5 s, every remote camera paused (`media_video_paused = 5` of 5), frozen last frames under a moving speaker outline. **green** (`MiniConference.vue` reports what it shows, the per-key count tolerating its report overlapping a tile's during the page switch): the 3 mini tiles received **48 KB / 15 frames each**, the other 2 paused (`media_video_paused = 2`); back on the call page the grid's 4 resumed and the gauge read 1 again. Also from the review, in the same push: a forwarded `media:view` is best-effort (a bus failure neither prunes a live owner's claim nor tells the viewer the conference broke — a test plants a "ghost" owner and shows the consume path pruning it and the view path not); a consumer the worker closed is dropped from the plan and the gauge (a test closes a producer, then reports); a picture-in-picture tile stays in the view while its strip scrolls it out; the cap is declared only where an `IntersectionObserver` exists; the view is re-sent every 15 s and on the tab's return |
+| 2026-10-27 | the local integration lane (WSL, throwaway Mongo and Redis) | what did NOT go to plan | the box's shared Redis wants a password, so the two-pod tests took the belt fallback and built a second island — the fixture now honours `ROOMLER__REDIS__URL` (CI sets neither); `cluster_tests::media_join_routes_to_owner_pod_single_router` then passed 2 of 5 runs of one binary (it reads `remote_media_conns` right after `transport_created`, which the docker Redis lets the push beat) — a timing read this diff does not touch; the other three cluster media tests and the new multi-pod view test pass every time. A debug-build server overflows a tokio worker's stack on the first join without `RUST_MIN_STACK=8388608`, the harness's own setting |

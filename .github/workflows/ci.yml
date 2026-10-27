@@ -493,6 +493,12 @@ jobs:
       # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
       # an attribute have one spelling, and a person's change to one fact
       # keeps every other fact's provenance.
+      # `roomler-ai-mod-conference` (FR-127 P1) with its first unit tests: a
+      # viewer's view keeps `None` (a legacy client, everything flows) apart
+      # from `Some(empty)` (a view client showing nothing), an older report
+      # is dropped, and the plan reads only the viewer's own pause flag. It
+      # links the mediasoup worker, which this job already builds for the
+      # api crate's unit tests above (the api crate depends on it).
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -503,6 +509,7 @@ jobs:
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
           -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
           -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
+          -p roomler-ai-mod-conference
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above

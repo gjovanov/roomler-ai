@@ -101,6 +101,7 @@
               @request-pip="handlePiP"
               @spotlight="handleSpotlight"
               @picture-black="handlePictureBlack"
+              @visible="handleTileVisible"
             />
 
             <!-- FR-124 — YOUR camera is sending a black picture: said where you
@@ -253,6 +254,7 @@ import { useAudioPlayback } from '@/composables/useAudioPlayback'
 import { useConferenceLayout } from '@/composables/useConferenceLayout'
 import { usePictureInPicture } from '@/composables/usePictureInPicture'
 import { useBlackPictureTiles } from '@/composables/useBlackPictureTiles'
+import type { TileVisibility } from '@/utils/viewReport'
 import LayoutSwitcher from '@/components/conference/LayoutSwitcher.vue'
 import ConferenceFilesPanel from '@/components/conference/ConferenceFilesPanel.vue'
 import MessageBubble from '@/components/chat/MessageBubble.vue'
@@ -417,6 +419,13 @@ const blackWarningClosed = ref(false)
 
 function handlePictureBlack(streamKey: string, black: boolean) {
   blackPictures.report(streamKey, black)
+}
+
+// FR-127 P1 — receive what is visible: the tiles on screen, from the tiles
+// themselves, go to the store, which tells the server which video to send.
+// Off screen means the server pauses that video; audio always flows.
+function handleTileVisible(streamKey: string, report: TileVisibility) {
+  conferenceStore.reportTileVisible(streamKey, report)
 }
 
 // A warning closed by hand stays closed only for this black spell: once the
