@@ -124,6 +124,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
 | 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
+| 31 | 10-28 | **The companion builds log why cargo rebuilds** (diagnostic). The macOS companion recompiled `roomler-desktop` on every reused same-tree run read so far (0.4.179's and 0.4.180's tag runs, 0.4.180's reseed), and five read-only probes could not reproduce it (field log, 2026-10-27 evening). The four companion build steps now set `CARGO_LOG=cargo::core::compiler::fingerprint=info`: a fresh unit prints nothing, a dirty one prints `fingerprint dirty for …` and the stale file or env var with both mtimes. Log-only, and removed once a reused run has named the reason | PR_NUMBER |
 
 ## Acceptance criteria
 
@@ -971,3 +972,9 @@ itself on the affected run's page. Baseline when the program started: releases t
   - FR-123's reading of the same rehearsal is in its spec, §8.1: −19 % and −12 % of the
     daemon's compile on the two Linux lanes. The MSI build step took 542 s, the fastest of
     the 40 release runs since 10-24.
+- 2026-10-28: **wave 31 (PR_NUMBER), the operator's go: the four companion build steps log
+  cargo's fingerprint decisions.**
+  - The reseed its merge dispatches builds a new tree, so it recompiles our crates by design.
+    Its companion logs are the positive control: each dirty unit must print its reason.
+  - The first reused same-tree run after it names the macOS companion's reason: the next tag
+    run, or the reseed after a release. Its read goes here.
