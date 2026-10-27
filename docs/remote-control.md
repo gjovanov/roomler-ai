@@ -822,7 +822,8 @@ picker shows its default hint, never a stale refusal.
 | The MacBook (VideoToolbox, ProMotion) → Edge, direct, 120 | proven at 119.7 fps; every 60 s window at the viewer 119.8–120.1 fps |
 | neo16 (RTX 5090) → the MacBook, HEVC 4:4:4 2560×1600, 120 | proven at 112.4 fps with the clock pin |
 | neo16, AV1 2560×1600, 144 | proven at 141.4 fps |
-| neo16, HEVC 4:4:4 2560×1600, 144 | encoder-bound: four trials at 101–131 fps (2026-10-26), each of which took the stream to 60 before P2b-18 |
+| neo16, HEVC 4:4:4 2560×1600, 144 | encoder-bound: 101–131 fps over six trials. Since P2b-18 the session steps down to 120, proven at 117.0 fps (2026-10-27), where before it fell to 60 |
+| neo16, AV1 scaled to 1704×1066, 144 | 44–61 fps: the pump's CPU resample takes 14.7 ms a frame, so a scaled session cannot reach 144 there until FR-118's GPU scale |
 
 ## 6. Input injection
 

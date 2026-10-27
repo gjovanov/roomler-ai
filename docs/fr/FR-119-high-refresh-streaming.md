@@ -908,10 +908,18 @@ go to 60".
   is red under its planted fault: α applied below 60 broke the table (`left: 3050564, right: 3000000`), and a
   linear law above 60 broke the α test. In the field the agent asked a ceiling of 96.7 Mbit/s for AV1 at 144 and
   2560×1600 (2026-10-27), the class top the law gives.
-- [ ] **AC6 — trial and denial.** A host that cannot sustain a rate steps down one rate at a time (144 → 120 → 60;
+- [x] **AC6 — trial and denial.** A host that cannot sustain a rate steps down one rate at a time (144 → 120 → 60;
   P2b-18, §4.19; straight to the cap before) once each trial has seen 10 s of moving content, reports `unproven`
   for the ask, and does not trial a failed rate again for an hour (P2b-17a, §4.17; a week before), or until its
   build, hardware or knobs change. A denied class is never granted, at either entry point. Tests on both.
+  **Verified** 2026-10-27 on agent 0.4.180 (§8). On neo16, HEVC 4:4:4 at 144 failed its trial after 10 s of
+  motion and stepped to 120, telling the viewer `fps_reason: "unproven"` for the ask. That 120 failed in turn
+  and the session went to 60. A retry walked the steps again, and 120 was proven and held. Within the hour a
+  failed rate is refused without a trial: each HEVC session at 144 after 10-26's 19:30 verdict was refused
+  `unproven` (§8). The tests cover the grant, where a denial is checked before the verdict, so a denied class
+  is never trialled (`each_refusal_names_its_reason_in_order`); the step-down past each reason, `denied`
+  included (`each_reason_about_the_rate_steps_down_and_a_relay_does_not`); both branches and the retry
+  (§4.19); and the deny list's parse, which only ever removes.
 - [ ] **AC7 — latency does not get worse.** L4 on AC4's pair at 120 vs 60: p50 and p95 no higher at 120.
 - [x] **AC8 — docs.** `docs/remote-control.md` (the frame-rate classes, the gate, the wire), `docs/rate-control.md`
   (the ceiling law above 60), `docs/ui.md` (the picker). Linked from `docs/README.md`. **Done** for D1
@@ -938,6 +946,13 @@ go to 60".
    Decided in part: P2b-17a gives `Failed` an hour (§4.17), and P2b-17b lets the viewer try again (§4.18). Still open: telling
    another process's load apart from ours, so a starved trial records nothing (NVML's per-process utilization, on
    NVIDIA only).
+7. **A trial that never concludes (raised 2026-10-27).** A trial fails only when the encoder is the limit. When
+   another stage is, it concludes nothing and holds the rate as a trial for the whole session. On neo16 a session
+   scaled to 1704×1066 spent 14.7 ms a frame in the pump's CPU resample, ran 44–61 fps at a granted 144, and read
+   "144 fps, on trial" for over two minutes (§8). Options: count the pump's whole per-frame time as host-bound
+   evidence, not the encoder's alone; or end a trial that has not concluded after a few windows below the rate,
+   unproven but uncached. Recommended: the first, because the resample is the host's work as much as the encode
+   is. FR-118's GPU scale removes this case on Windows.
 
 ## 7. Out of scope
 
@@ -976,6 +991,8 @@ go to 60".
 | 2026-10-26 | agent 0.4.177; Chrome on neo16 viewing neo16 (a local pair) | P2b-17b's "Try 144 fps again", HEVC at 144 after the 19:30 verdict | **The retry, end to end.** 19:56:27: refused `unproven`; the viewer read "60 fps (144 fps not granted: this host hasn't shown it can sustain that rate yet)" with the button. 19:57:00: the button. The agent logged `FR-119: the viewer asked to trial this rate again fps=144`, decided `want=144`, and moved in place (the replacement opened in 181 ms; the picture never froze). 19:58:45: `Failed` (101.5 fps, p99 20.5 ms, p90 encode 8.22 ms; a viewer on the host adds decode and composition to the GPU being measured). Back to 60, with the refusal and the button. **Wrong turn:** the MacBook's six sessions above sent no retry, so the button pressed there was not this one: this one sends whenever a session is up. The page's own blue "Try again" after a failed session carries the same icon. A "no '144 not granted'" read at 19:52 was taken with no session open; the refusal line is a live session's answer |
 | 2026-10-26 | agent 0.4.177; the MacBook's Chrome, direct and then overlay direct; before the GPU's overnight render | HEVC at 144: a fresh trial, then the retry from the MacBook | **The retry from the MacBook.** 23:06:58: with no verdict cached, a trial, `Failed` (118.5 fps, p90 encode 7.36 ms). 23:09:18 and 23:09:35: the viewer's retries arrived, and the second's trial `Failed` at 23:10:11 (109.8 fps, p90 encode 9.13 ms). That day's four HEVC trials at 144, 130.6, 101.5, 118.5 and 109.8 fps, each took the stream to 60, though the same host had proven 120 at 112 fps: **P2b-18** |
 | 2026-10-27 | agent 0.4.179 on neo16 (P2b-18); an MCP-driven Chrome whose WebRTC lists H.264 alone; the GPU free | an attempt at P2b-18's field check: AV1 at 144, 2560×1600, a square moving | **No verdict, correctly: a viewer that cannot decode the rate is no viewer for a trial.** The session negotiated AV1 decoded in software. The viewer reported 21–55 fps and struggled, so the viewer-rate cap held 24–93 fps (`skip_divisor` 2–6). Every frame dropped for the viewer ends the trial's stretch, so in the 80 s the session ran, the trial never gathered 10 s of motion. The check needs a viewer that decodes HEVC 4:4:4 in hardware: the MacBook, or another Chrome profile |
+| 2026-10-27 | agent 0.4.180 on neo16 (it carries P2b-18); Chrome on neo16 viewing neo16 (a local pair), which decodes HEVC 4:4:4 in hardware; the GPU free, a video playing on screen during the first pass | **P2b-18 in the field.** HEVC 4:4:4 at 2560×1600 asked at 144, a square moved on every composition; then "Try 144 fps again" | **Both branches of the step-down, and the retry.** 22:19:13: with no verdict cached (0.4.180 started an empty cache), 144 ran as a trial. 22:19:23: `Failed` (118.7 fps, p99 19.7 ms, p90 encode 7.32 ms against a 6.94 ms period), and the decision read `want=120`, not 60. The viewer was told `"fps":120,"fps_asked":144,"fps_reason":"unproven"`, with 120 on its own trial. 22:19:43: 120 `Failed` too (109.1 fps, p99 20.8 ms, p90 encode 8.03 ms against 7.5 ms), so the session went to the cap: 144 → 120 → 60. 22:23:51: the retry. The agent forgot both failures, 144 `Failed` again at 22:24:02 (110.4 fps, p90 encode 7.18 ms), and **120 was `Proven`** at 22:24:12: 1171 frames in 10.000 s (117.0 fps), p99 14.5 ms, p90 encode 6.91 ms. The stream stayed at 120 (heartbeat ~118 fps), and the viewer read "120 fps (144 fps not granted: this host hasn't shown it can sustain that rate yet)". The first pass's 120 failed narrowly, with the viewer's own decode and the video on the same GPU |
+| 2026-10-27 | agent 0.4.180; the same viewer with its own settings, AV1 and "Fit to local viewport" (1704×1066 from 2560×1600) | AV1 at 144, the square moving | **A scaled session cannot reach 144 on this host, and its trial never concludes.** The pump's CPU resample took 14.7 ms a frame (`avg_scale_ms`), and encoding 3.6 ms. So the pump took 44–61 frames a second, and WGC dropped 38–41 % of the ~92 that arrived. The encoder was not the limit, so in over two minutes the trial concluded nothing, and the viewer read "144 fps, on trial until this host has shown it can keep up" throughout: open decision 7. FR-118's GPU scale removes the stage |
 
 ### 8.1 How AC4 is read
 
