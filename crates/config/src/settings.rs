@@ -397,6 +397,20 @@ pub struct MeetingsSettings {
     /// maximum is 49), not a policy. Env: `ROOMLER__MEETINGS__VIEW_MAX`.
     #[serde(default = "meetings_default_view_max")]
     pub view_max: usize,
+    /// FR-127 P2 — simulcast: the camera publishes a ladder of VP8 layers
+    /// (handed to the client as `meeting.simulcast` in
+    /// `media:transport_created`), and each video consumer is given the layer
+    /// its tile's reported size needs, a spotlit tile a higher priority.
+    /// `false`: `meeting.simulcast = null`, the client publishes one encoding
+    /// and the server selects nothing — today's shape. Default **on**.
+    /// Env: `ROOMLER__MEETINGS__SIMULCAST`.
+    #[serde(default = "meetings_default_on")]
+    pub simulcast: bool,
+    /// FR-127 P2 — how many spatial layers the ladder has: **2** (÷2 and ÷1
+    /// of the capture, decision 1) or 3 (÷4 as well). Any other value is read
+    /// as 2. Env: `ROOMLER__MEETINGS__SIMULCAST_LAYERS`.
+    #[serde(default = "meetings_default_simulcast_layers")]
+    pub simulcast_layers: u8,
 }
 
 fn meetings_default_on() -> bool {
@@ -407,6 +421,10 @@ fn meetings_default_view_max() -> usize {
     49
 }
 
+fn meetings_default_simulcast_layers() -> u8 {
+    2
+}
+
 impl Default for MeetingsSettings {
     fn default() -> Self {
         Self {
@@ -414,6 +432,8 @@ impl Default for MeetingsSettings {
             visible_tiles: meetings_default_on(),
             audio_dtx: meetings_default_on(),
             view_max: meetings_default_view_max(),
+            simulcast: meetings_default_on(),
+            simulcast_layers: meetings_default_simulcast_layers(),
         }
     }
 }

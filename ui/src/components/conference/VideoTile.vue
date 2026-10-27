@@ -473,16 +473,35 @@ let reportedVisible = false
 let intersecting = false
 let intersectingRect: DOMRectReadOnly | undefined
 let inPictureInPicture = false
+// FR-127 P2 — the server gives this tile's consumer the simulcast layer its
+// HEIGHT needs, so a tile on screen that changes size (a window resize, a
+// layout step, the tile spotlit into the big slot) reports its new size as
+// `resized`: the size moves, the count of reporters does not. The last size
+// reported, so a resize that lands on the same pixels says nothing.
+let resizeObserver: ResizeObserver | null = null
+let reportedSize = { w: 0, h: 0 }
+
+function deviceSize(rect?: { width: number; height: number }) {
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+  return {
+    w: rect ? Math.round(rect.width * dpr) : 0,
+    h: rect ? Math.round(rect.height * dpr) : 0,
+  }
+}
 
 function reportVisibility(visible: boolean, rect?: DOMRectReadOnly) {
   if (visible === reportedVisible) return
   reportedVisible = visible
-  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
-  emit('visible', {
-    visible,
-    w: rect ? Math.round(rect.width * dpr) : 0,
-    h: rect ? Math.round(rect.height * dpr) : 0,
-  })
+  reportedSize = deviceSize(rect)
+  emit('visible', { visible, ...reportedSize })
+}
+
+function reportResize(rect: { width: number; height: number }) {
+  if (!reportedVisible) return
+  const size = deviceSize(rect)
+  if (size.w === reportedSize.w && size.h === reportedSize.h) return
+  reportedSize = size
+  emit('visible', { visible: true, ...size, resized: true })
 }
 
 function recomputeVisibility() {
@@ -518,6 +537,10 @@ onMounted(() => {
       video.addEventListener('enterpictureinpicture', onEnterPictureInPicture)
       video.addEventListener('leavepictureinpicture', onLeavePictureInPicture)
     }
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => reportResize(root.getBoundingClientRect()))
+      resizeObserver.observe(root)
+    }
   }
   // Also listen for track changes if stream is already set
   if (props.stream) {
@@ -548,6 +571,8 @@ onBeforeUnmount(() => {
   stopBlackWatch = null
   visibilityObserver?.disconnect()
   visibilityObserver = null
+  resizeObserver?.disconnect()
+  resizeObserver = null
   videoRef.value?.removeEventListener('enterpictureinpicture', onEnterPictureInPicture)
   videoRef.value?.removeEventListener('leavepictureinpicture', onLeavePictureInPicture)
   reportVisibility(false)

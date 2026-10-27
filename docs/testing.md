@@ -45,7 +45,11 @@ reaction · recording · file · invite · notification · oauth · billing ·
 multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · conference
 (+messages, +the FR-127 view: a view client's video consumers against its `media:view`
 reports, the viewer's pause against the owner's, the kill switch, a report through the
-other pod) · cluster · stats · relay-region · remote-control · agent
+other pod; +the FR-127 simulcast layers: a camera published as a ladder, each consumer's
+layer ceiling from its tile's height and its priority from its spotlit flag read off the
+worker's own dump, a plain stream left alone, the switch, the pause lever off with the
+layer map on, a three-rung ladder — the socket helpers shared in
+`fixtures/media_ws.rs`) · cluster · stats · relay-region · remote-control · agent
 (+e2e, +crash, +exec, +presence) · overlay · tunnel · hive.
 
 > [!NOTE]

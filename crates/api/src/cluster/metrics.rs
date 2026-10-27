@@ -21,7 +21,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
     // Media gauges: per-room participant/consumer counts (the
     // PipeTransport trigger inputs). FR-69 P4 — conference's; a build
     // without the module reports zero rooms.
-    let (media_rooms, participants_total, consumers_total, video_paused_total) =
+    let (media_rooms, participants_total, consumers_total, video_paused_total, video_layers) =
         state.modules.media_gauges();
 
     // Alive pods per the advisory directory records.
@@ -84,6 +84,10 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             // FR-127 P1 — video consumers paused by their viewer's view (the
             // owner's FR-30 pause is a different flag and not counted here).
             "media_video_paused": video_paused_total,
+            // FR-127 P2 — the flowing video consumers by the spatial layer the
+            // worker forwards: `{"0": n, "1": m, "none": k}`; all under
+            // `"none"` with simulcast off, which is the switch's control.
+            "media_video_layers": video_layers,
             "media_rooms_detail": media_rooms,
         },
     })

@@ -177,3 +177,82 @@ describe('VideoTile — on screen or not (FR-127 P1)', () => {
     expect(reports(w)).toEqual([])
   })
 })
+
+// FR-127 P2 — the server gives the tile's consumer the layer its HEIGHT
+// needs, so a tile on screen that changes size says so, as `resized`: the
+// size moves, the count of reporters does not.
+class FakeResizeObserver {
+  static all: FakeResizeObserver[] = []
+  targets: Element[] = []
+  disconnected = false
+  constructor(private cb: () => void) {
+    FakeResizeObserver.all.push(this)
+  }
+  observe(el: Element) {
+    this.targets.push(el)
+  }
+  unobserve() {}
+  disconnect() {
+    this.disconnected = true
+  }
+  /** The root is now `width`×`height` CSS px, and the observer fires. */
+  fire(width: number, height: number) {
+    for (const el of this.targets) {
+      el.getBoundingClientRect = () => ({ width, height }) as DOMRect
+    }
+    this.cb()
+  }
+}
+
+describe('VideoTile — a tile on screen reports its new size (FR-127 P2)', () => {
+  beforeEach(() => {
+    FakeResizeObserver.all.length = 0
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver)
+  })
+
+  it('a resize while on screen is reported as resized, in device pixels, once per new size', async () => {
+    const w = mountTile()
+    await flushPromises()
+    const io = FakeObserver.all[0]
+    const ro = FakeResizeObserver.all[0]
+    expect(ro.targets).toHaveLength(1)
+    io.fire(true, 160, 90)
+    ro.fire(320, 180)
+    ro.fire(320, 180) // the same pixels again: nothing new
+    ro.fire(160, 90)
+    expect(reports(w)).toEqual([
+      { visible: true, w: 320, h: 180 },
+      { visible: true, w: 640, h: 360, resized: true },
+      { visible: true, w: 320, h: 180, resized: true },
+    ])
+    w.unmount()
+    expect(ro.disconnected).toBe(true)
+  })
+
+  it('a resize while off screen says nothing: there is nothing to re-size on the server', async () => {
+    const w = mountTile()
+    await flushPromises()
+    const ro = FakeResizeObserver.all[0]
+    ro.fire(320, 180)
+    expect(reports(w)).toEqual([])
+    // Once on screen, the size that comes with the visibility report is the
+    // one the resize observer compares against.
+    FakeObserver.all[0].fire(true, 320, 180)
+    ro.fire(320, 180)
+    expect(reports(w)).toEqual([{ visible: true, w: 640, h: 360 }])
+    w.unmount()
+  })
+
+  it('a local tile and a browser without ResizeObserver observe no size', async () => {
+    const local = mountTile({ isLocal: true, streamKey: 'local', displayName: 'Me' })
+    await flushPromises()
+    expect(FakeResizeObserver.all).toHaveLength(0)
+    local.unmount()
+    vi.stubGlobal('ResizeObserver', undefined)
+    const w = mountTile()
+    await flushPromises()
+    FakeObserver.all.at(-1)!.fire(true, 160, 90)
+    expect(reports(w)).toEqual([{ visible: true, w: 320, h: 180 }])
+    w.unmount()
+  })
+})

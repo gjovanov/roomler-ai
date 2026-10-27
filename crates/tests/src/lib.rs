@@ -10,6 +10,11 @@ mod channel_crud_tests;
 mod channel_tests;
 #[cfg(test)]
 mod conference_message_tests;
+/// FR-127 P2 — simulcast: a camera published as a ladder, each consumer's
+/// layer ceiling from its tile's height and its priority from its spotlit
+/// flag (read off the worker), a plain stream left alone, the switch.
+#[cfg(test)]
+mod conference_simulcast_tests;
 #[cfg(test)]
 mod conference_tests;
 /// FR-127 P1 — receive what is visible: `caps: ["view"]`, `media:view`, the

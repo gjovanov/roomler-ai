@@ -22,12 +22,13 @@
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
         @picture-black="$emit('picture-black', p.streamKey, $event)"
-        @visible="$emit('visible', p.streamKey, $event)"
+        @visible="$emit('visible', p.streamKey, { ...$event, spotlit: true })"
       />
     </div>
 
     <!-- Filmstrip — scrolls sideways: a tile past its edge is off screen,
-         and its IntersectionObserver says so (FR-127 P1). -->
+         and its IntersectionObserver says so (FR-127 P1). A strip tile is
+         never spotlit (P2); the big tile above is. -->
     <div v-if="secondary.length > 0" class="spotlight-filmstrip">
       <VideoTile
         v-for="p in secondary"

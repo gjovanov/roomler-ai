@@ -210,7 +210,54 @@ describe('conference layouts — a tile on screen is reported with its stream ke
 
       const reported = (wrapper.emitted('visible') ?? []) as [string, typeof report][]
       expect(reported.map(([key]) => key).sort()).toEqual(['other:cam', 'them:cam'])
-      expect(reported.every(([, r]) => r === report)).toBe(true)
+      expect(reported.every(([, r]) => r.visible === report.visible && r.w === report.w && r.h === report.h)).toBe(true)
     })
   }
+})
+
+// FR-127 P2 — the layout, not the tile, knows which tile is spotlit: the
+// big tile of spotlight and sidebar, and a pinned grid tile. Its report
+// carries `spotlit: true`; a strip tile's and a plain grid tile's carry
+// nothing, so an older server reads past the field.
+describe('conference layouts — the spotlit tile is marked in its report (FR-127 P2)', () => {
+  const report = { visible: true, w: 320, h: 240 }
+  const reportsByKey = (wrapper: ReturnType<typeof mount>) => {
+    const out = new Map<string, Record<string, unknown>>()
+    for (const [key, r] of (wrapper.emitted('visible') ?? []) as [string, Record<string, unknown>][]) {
+      out.set(key, r)
+    }
+    return out
+  }
+  const emitAll = (wrapper: ReturnType<typeof mount>) => {
+    for (const tile of wrapper.findAllComponents(visibleStub)) tile.vm.$emit('visible', report)
+  }
+
+  for (const c of [
+    { name: 'SpotlightLayout', component: SpotlightLayout, props: { ...cases[1].props, secondary: [remote2] } },
+    { name: 'SidebarLayout', component: SidebarLayout, props: { ...cases[2].props, secondary: [remote2] } },
+  ]) {
+    it(`${c.name} marks the big tile spotlit and the strip tile not`, () => {
+      const wrapper = mount(c.component, {
+        props: c.props as never,
+        global: { plugins: [vuetify], stubs: { VideoTile: visibleStub } },
+      })
+      emitAll(wrapper)
+      const byKey = reportsByKey(wrapper)
+      expect(byKey.get('them:cam')).toEqual({ ...report, spotlit: true })
+      expect(byKey.get('other:cam')).toEqual(report)
+      expect(byKey.get('other:cam')).not.toHaveProperty('spotlit')
+    })
+  }
+
+  it('TiledLayout marks a pinned tile spotlit and a plain one not', () => {
+    const pinned = participant({ streamKey: 'pinned:cam', userId: 'pinned', displayName: 'Pinned', isPinned: true })
+    const wrapper = mount(TiledLayout, {
+      props: { ...cases[0].props, participants: [remote, pinned] } as never,
+      global: { plugins: [vuetify], stubs: { VideoTile: visibleStub } },
+    })
+    emitAll(wrapper)
+    const byKey = reportsByKey(wrapper)
+    expect(byKey.get('pinned:cam')).toEqual({ ...report, spotlit: true })
+    expect(byKey.get('them:cam')).toBe(report)
+  })
 })

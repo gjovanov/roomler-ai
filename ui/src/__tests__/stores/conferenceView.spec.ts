@@ -167,7 +167,7 @@ describe('conference store — receive what is visible (FR-127 P1)', () => {
     const store = await join({ view: true, audio_dtx: true, simulcast: null })
     const joinMsg = wire.sent.find((m) => m.type === 'media:join')
     expect(joinMsg?.data).toEqual({ room_id: 'r1', caps: ['view'] })
-    expect(store.meeting).toEqual({ view: true, audioDtx: true })
+    expect(store.meeting).toEqual({ view: true, audioDtx: true, simulcast: null })
 
     expect(views()).toHaveLength(0)
     vi.advanceTimersByTime(100)
@@ -216,7 +216,7 @@ describe('conference store — receive what is visible (FR-127 P1)', () => {
       setActivePinia(createPinia())
       wire.sent.length = 0
       const store = await join(meeting)
-      expect(store.meeting).toEqual({ view: false, audioDtx: false })
+      expect(store.meeting).toEqual({ view: false, audioDtx: false, simulcast: null })
       store.reportTileVisible('c1', { visible: true, w: 320, h: 240 })
       vi.advanceTimersByTime(500)
       expect(views()).toHaveLength(0)
@@ -299,7 +299,7 @@ describe('conference store — receive what is visible (FR-127 P1)', () => {
     store.leaveRoom()
     vi.advanceTimersByTime(500)
     expect(views()).toHaveLength(1)
-    expect(store.meeting).toEqual({ view: false, audioDtx: false })
+    expect(store.meeting).toEqual({ view: false, audioDtx: false, simulcast: null })
 
     await store.joinRoom('t1', 'r1', 'Room')
     vi.advanceTimersByTime(100)

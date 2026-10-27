@@ -36,6 +36,7 @@
 //! heartbeat are wired in [`Module::init`] — they need only this state, so the
 //! "registered on the built AppState" step the host used to run is gone.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -107,6 +108,13 @@ pub struct MediaGauges {
     /// "receive what is visible" is holding back right now. `consumers_total`
     /// minus this, minus the audio consumers, is what the workers forward.
     pub video_paused_total: usize,
+    /// FR-127 P2 — the video consumers that flow (not paused by their
+    /// viewer, not closed), by the spatial layer the worker is forwarding
+    /// right now (`Consumer::current_layers`): `"0"`, `"1"`, … and `"none"`
+    /// for a plain stream or one nothing has arrived on yet. With
+    /// `simulcast = false` every entry is under `"none"` — the positive
+    /// control the field run reads.
+    pub video_layers_total: BTreeMap<String, usize>,
 }
 
 impl ConferenceState {
@@ -132,14 +140,30 @@ impl ConferenceState {
                         .count()
                 })
                 .sum();
+            let mut video_layers: BTreeMap<String, usize> = BTreeMap::new();
+            for p in room.participants.iter() {
+                for c in p.consumers.iter().filter(|c| {
+                    c.kind() == mediasoup::prelude::MediaKind::Video && !c.paused() && !c.closed()
+                }) {
+                    let key = c
+                        .current_layers()
+                        .map(|l| l.spatial_layer.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    *video_layers.entry(key).or_default() += 1;
+                }
+            }
             gauges.participants_total += participants;
             gauges.consumers_total += consumers;
             gauges.video_paused_total += video_paused;
+            for (k, n) in &video_layers {
+                *gauges.video_layers_total.entry(k.clone()).or_default() += n;
+            }
             gauges.rooms.push(serde_json::json!({
                 "room_id": room.key().to_hex(),
                 "participants": participants,
                 "consumers": consumers,
                 "video_paused": video_paused,
+                "video_layers": video_layers,
             }));
         }
         gauges

@@ -23,6 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::ConferenceState;
+use crate::media::room_manager::ViewLevers;
+use crate::media::simulcast;
+use crate::media::view::Tile;
 
 /// The namespace handler the module registers for `Role::User` / `media`.
 pub struct Media {
@@ -307,10 +310,12 @@ async fn handle_media_join(
     // a report names them, audio always flows. Absent → a legacy client, every
     // consumer resumed as before. The flag rides the join so the server knows
     // the client's generation before its first `media:consume`, with no
-    // ordering to get wrong. ⚠️ Read only while the lever is on: with
-    // `[meetings] visible_tiles = false` the server keeps today's shape
-    // whatever the client says, and tells it so in `meeting.view` below.
-    let view_capable = state.settings.meetings.visible_tiles
+    // ordering to get wrong. ⚠️ Read only while a lever is on: with
+    // `[meetings] visible_tiles = false` AND `simulcast = false` the server
+    // keeps today's shape whatever the client says, and tells it so in
+    // `meeting` below. P2 — with only `simulcast` on, the reports still
+    // carry the tile sizes the layer map reads, and nothing is paused.
+    let view_capable = ViewLevers::from_settings(&state.settings.meetings).any()
         && data
             .and_then(|d| d.get("caps"))
             .and_then(|c| c.as_array())
@@ -579,10 +584,24 @@ async fn handle_media_produce(
             return;
         }
     };
+    // FR-127 P2 — the camera's capture size, `capture: { w, h }`, so the
+    // layer map is relative to what the camera actually opened at. Absent
+    // (an older client, a screen share): Chrome's 640×480 is assumed.
+    let capture = data.get("capture").and_then(|c| {
+        let dim = |key: &str| c.get(key)?.as_u64().and_then(|v| u32::try_from(v).ok());
+        Some((dim("w")?, dim("h")?))
+    });
 
     match state
         .room_manager
-        .produce(&rid, connection_id, kind, rtp_parameters, source.clone())
+        .produce(
+            &rid,
+            connection_id,
+            kind,
+            rtp_parameters,
+            source.clone(),
+            capture,
+        )
         .await
     {
         Ok(producer_id) => {
@@ -687,7 +706,13 @@ async fn handle_media_consume(
 
     match state
         .room_manager
-        .consume(&rid, connection_id, producer_id, &rtp_capabilities)
+        .consume(
+            &rid,
+            connection_id,
+            producer_id,
+            &rtp_capabilities,
+            ViewLevers::from_settings(&state.settings.meetings),
+        )
         .await
     {
         Ok(consumer_info) => {
@@ -722,22 +747,30 @@ async fn handle_media_consume(
 /// FR-127 P1 — the `meeting` object of `media:transport_created`: the levers
 /// this server runs. `view` — the server pauses what a view client does not
 /// show, so the client reports its view; `audio_dtx` — the client produces
-/// its microphone with Opus DTX; `simulcast` — `null` until P2 hands the
-/// client a layer ladder here. A server switch turned off turns the client's
-/// half off too, with no client release.
+/// its microphone with Opus DTX; `simulcast` (P2) — the ladder the camera
+/// publishes, `{ encodings: [{ scale_resolution_down_by, max_bitrate,
+/// scalability_mode }] }` lowest rung first, or `null` for one encoding. A
+/// server switch turned off turns the client's half off too, with no client
+/// release — and the ladder itself travels here, so it changes without one.
 pub fn meeting_levers(meetings: &roomler_ai_config::MeetingsSettings) -> serde_json::Value {
     serde_json::json!({
         "view": meetings.visible_tiles,
         "audio_dtx": meetings.audio_dtx,
-        "simulcast": serde_json::Value::Null,
+        "simulcast": if meetings.simulcast {
+            simulcast::ladder_json(meetings.simulcast_layers)
+        } else {
+            serde_json::Value::Null
+        },
     })
 }
 
 /// FR-127 P1 — a viewer's report of what it renders: `{ room_id, seq,
-/// video: [{ producer_id, w, h }] }`, the WHOLE set, not a delta. The video
-/// consumers it names are resumed, the rest paused; audio is never touched
-/// (`media/view.rs`). No reply: the report is idempotent and the next one
-/// supersedes it, so there is nothing for the client to wait for.
+/// video: [{ producer_id, w, h, spotlit? }] }`, the WHOLE set, not a delta.
+/// The video consumers it names are resumed, the rest paused; audio is never
+/// touched (`media/view.rs`). P2 — a named consumer is also given the layer
+/// its tile's height maps to, and a `spotlit` tile's a higher priority. No
+/// reply: the report is idempotent and the next one supersedes it, so there
+/// is nothing for the client to wait for.
 ///
 /// Dispatched where `media:consume` is — through the placement gate, so a
 /// viewer whose socket is on another pod reaches the owner's
@@ -748,11 +781,12 @@ async fn handle_media_view(
     connection_id: &str,
     data: Option<&serde_json::Value>,
 ) {
-    // The kill switch: the server never joined this client as view-capable
-    // (`view = None`), so its report would be ignored anyway — say so once
-    // at debug and skip the parse.
-    if !state.settings.meetings.visible_tiles {
-        debug!(?user_id, %connection_id, "media:view ignored: visible_tiles is off");
+    // The kill switches: with both off the server never joined this client
+    // as view-capable (`view = None`), so its report would be ignored anyway
+    // — say so once at debug and skip the parse.
+    let levers = ViewLevers::from_settings(&state.settings.meetings);
+    if !levers.any() {
+        debug!(?user_id, %connection_id, "media:view ignored: visible_tiles and simulcast are off");
         return;
     }
     let Some(data) = data else { return };
@@ -765,7 +799,7 @@ async fn handle_media_view(
     let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
     // A tile whose producer id does not parse is skipped, not an error: the
     // producer may have closed between the client's render and this report.
-    let tiles: Vec<(ProducerId, (u32, u32))> = data
+    let tiles: Vec<(ProducerId, Tile)> = data
         .get("video")
         .and_then(|v| v.as_array())
         .map(|tiles| {
@@ -779,7 +813,15 @@ async fn handle_media_view(
                             .and_then(|v| u32::try_from(v).ok())
                             .unwrap_or(0)
                     };
-                    Some((pid, (dim("w"), dim("h"))))
+                    let spotlit = t.get("spotlit").and_then(|v| v.as_bool()).unwrap_or(false);
+                    Some((
+                        pid,
+                        Tile {
+                            w: dim("w"),
+                            h: dim("h"),
+                            spotlit,
+                        },
+                    ))
                 })
                 .collect()
         })
@@ -793,6 +835,7 @@ async fn handle_media_view(
             seq,
             tiles,
             state.settings.meetings.view_max,
+            levers,
         )
         .await;
     debug!(?user_id, %connection_id, ?rid, seq, ?outcome, "media:view");

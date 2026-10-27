@@ -2,13 +2,16 @@
 // Copyright (C) 2026 G ROX EOOD
 use bson::oid::ObjectId;
 use dashmap::DashMap;
+use mediasoup::consumer::ConsumerType;
 use mediasoup::prelude::*;
+use mediasoup::producer::ProducerType;
 use mediasoup::types::data_structures::DtlsState;
 use mediasoup::webrtc_transport::{
     WebRtcTransportListenInfos, WebRtcTransportOptions, WebRtcTransportRemoteParameters,
 };
-use roomler_ai_config::MediasoupSettings;
+use roomler_ai_config::{MediasoupSettings, MeetingsSettings};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZero;
 use std::str::FromStr;
@@ -16,7 +19,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::view::{self, ViewState};
+use super::simulcast::{self, LayerShape};
+use super::view::{self, Tile, ViewState};
 use super::worker_pool::WorkerPool;
 
 /// Holds the DirectTransport + Consumer for an RTP tap (transcription).
@@ -39,6 +43,46 @@ pub struct MediaRoom {
 pub struct ProducerEntry {
     pub producer: Producer,
     pub source: String,
+    /// FR-127 P2 — the camera's capture size `(w, h)` as the client reported
+    /// it on `media:produce`; the layer map reads the height. `None`, or a
+    /// zero height: Chrome's 640×480 is assumed.
+    pub capture: Option<(u32, u32)>,
+}
+
+impl ProducerEntry {
+    /// The capture height the layer map works from.
+    fn capture_h(&self) -> u32 {
+        self.capture
+            .map(|(_, h)| h)
+            .filter(|h| *h > 0)
+            .unwrap_or(simulcast::DEFAULT_CAPTURE_H)
+    }
+}
+
+/// FR-127 P2 — which halves of the view handler run, from `[meetings]`:
+/// `pause` is P1's lever (`visible_tiles`), `layers` P2's (`simulcast`).
+/// Each is its own switch, so either runs while the other is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewLevers {
+    /// P1 — a video consumer the view does not name is paused.
+    pub pause: bool,
+    /// P2 — a video consumer the view names is given the layer its tile's
+    /// height maps to, and a spotlit tile's consumer a higher priority.
+    pub layers: bool,
+}
+
+impl ViewLevers {
+    pub fn from_settings(meetings: &MeetingsSettings) -> Self {
+        Self {
+            pause: meetings.visible_tiles,
+            layers: meetings.simulcast,
+        }
+    }
+
+    /// Is there anything for a view report to do?
+    pub fn any(self) -> bool {
+        self.pause || self.layers
+    }
 }
 
 /// Media state for a single participant (one WebSocket connection).
@@ -59,8 +103,14 @@ pub struct ParticipantMedia {
 /// FR-127 P1 — what `RoomManager::apply_view` did with a report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewOutcome {
-    /// The report is now the participant's view; this many consumers changed.
-    Applied { resumed: usize, paused: usize },
+    /// The report is now the participant's view; this many consumers changed
+    /// their pause flag, and (P2) this many settings — a layer ceiling or a
+    /// priority — were applied.
+    Applied {
+        resumed: usize,
+        paused: usize,
+        tuned: usize,
+    },
     /// Older than the report held: dropped, nothing changed.
     Stale,
     /// The participant never declared `caps: ["view"]`: ignored, everything
@@ -80,6 +130,33 @@ pub struct ConsumerSnapshot {
     pub kind: &'static str,
     pub paused: bool,
     pub producer_paused: bool,
+    /// FR-127 P2 — a consumer of a simulcast producer (`ConsumerType::Simulcast`).
+    pub simulcast: bool,
+    /// FR-127 P2 — the layer ceiling this process last set or was told, as
+    /// `(spatial, temporal)`; `None` for a plain stream.
+    pub preferred: Option<(u8, Option<u8>)>,
+    /// FR-127 P2 — the layers the worker is forwarding right now, from its
+    /// `layerschange` notifications; `None` while nothing flows.
+    pub current: Option<(u8, Option<u8>)>,
+    /// FR-127 P2 — the consumer's priority (the worker's default is 1).
+    pub priority: u8,
+}
+
+/// FR-127 P2 — the worker's OWN account of one consumer's layers (a `dump()`
+/// round trip), so a claim about a layer is read off the worker and not off
+/// this process's copy: what it holds as preferred, target and current
+/// spatial and temporal layers (`-1` = none), its type and its priority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerLayersDump {
+    pub kind_type: String,
+    pub priority: u8,
+    pub preferred: (i16, i16),
+    pub target: (i16, i16),
+    pub current: (i16, i16),
+}
+
+fn layers_tuple(layers: Option<ConsumerLayers>) -> Option<(u8, Option<u8>)> {
+    layers.map(|l| (l.spatial_layer, l.temporal_layer))
 }
 
 /// FR-127 P1 — one producer's flags as plain data; `paused` is the owner's
@@ -406,7 +483,9 @@ impl RoomManager {
         self.announced_ip.as_deref()
     }
 
-    /// Creates a Producer on the participant's send transport.
+    /// Creates a Producer on the participant's send transport. `capture` is
+    /// the camera's size as the client reported it (FR-127 P2), kept for the
+    /// layer map.
     pub async fn produce(
         &self,
         room_id: &ObjectId,
@@ -414,6 +493,7 @@ impl RoomManager {
         kind: MediaKind,
         rtp_parameters: RtpParameters,
         source: String,
+        capture: Option<(u32, u32)>,
     ) -> anyhow::Result<ProducerId> {
         let room = self
             .rooms
@@ -433,22 +513,27 @@ impl RoomManager {
             .map_err(|e| anyhow::anyhow!("Failed to produce: {}", e))?;
 
         let producer_id = producer.id();
+        let simulcast = producer.r#type() == ProducerType::Simulcast;
         participant.producers.push(ProducerEntry {
             producer,
             source: source.clone(),
+            capture,
         });
 
-        debug!(?room_id, %connection_id, %producer_id, ?kind, %source, "producer created");
+        debug!(?room_id, %connection_id, %producer_id, ?kind, %source, simulcast, ?capture, "producer created");
         Ok(producer_id)
     }
 
-    /// Creates a Consumer on the participant's recv transport for a given producer.
+    /// Creates a Consumer on the participant's recv transport for a given
+    /// producer. `levers` says which halves of the view apply (FR-127 P1's
+    /// pause, P2's layers).
     pub async fn consume(
         &self,
         room_id: &ObjectId,
         connection_id: &str,
         producer_id: ProducerId,
         rtp_capabilities: &RtpCapabilities,
+        levers: ViewLevers,
     ) -> anyhow::Result<ConsumerInfo> {
         let room = self
             .rooms
@@ -460,10 +545,17 @@ impl RoomManager {
             return Err(anyhow::anyhow!("Cannot consume: incompatible capabilities"));
         }
 
-        // FR-30 P4 — read the source producer's pause state (and, FR-127 P1,
-        // its kind) HERE, while only `room` is held. ⚠️ Not below:
-        // `participants.get_mut()` is taken a few lines down, and iterating
-        // the same DashMap while holding a mutable entry deadlocks it.
+        // FR-30 P4 — read the source producer's pause state (and, FR-127, its
+        // kind, its layer shape and its capture height) HERE, while only
+        // `room` is held. ⚠️ Not below: `participants.get_mut()` is taken a
+        // few lines down, and iterating the same DashMap while holding a
+        // mutable entry deadlocks it.
+        struct Source {
+            paused: bool,
+            kind: MediaKind,
+            shape: Option<LayerShape>,
+            capture_h: u32,
+        }
         let source = room
             .participants
             .iter()
@@ -473,10 +565,15 @@ impl RoomManager {
                     .producers
                     .iter()
                     .find(|pe| pe.producer.id() == producer_id)
-                    .map(|pe| (pe.producer.paused(), pe.producer.kind()))
+                    .map(|pe| Source {
+                        paused: pe.producer.paused(),
+                        kind: pe.producer.kind(),
+                        shape: LayerShape::of(&pe.producer.rtp_parameters().encodings),
+                        capture_h: pe.capture_h(),
+                    })
             })
             .next();
-        let producer_paused = source.map(|(paused, _)| paused).unwrap_or(false);
+        let producer_paused = source.as_ref().map(|s| s.paused).unwrap_or(false);
 
         let mut participant = room
             .participants
@@ -489,16 +586,36 @@ impl RoomManager {
         // a legacy client, flows as before. A producer the scan did not find
         // (it is not a participant's — nothing in P1) is treated as wanted:
         // the budget is a load lever, never a reason to withhold a picture.
-        let wanted = match source {
-            Some((_, kind)) => view::wants(participant.view.as_ref(), kind, &producer_id),
-            None => true,
-        };
+        // With the pause lever off, everything is wanted, whatever the view.
+        let wanted = !levers.pause
+            || match &source {
+                Some(s) => view::wants(participant.view.as_ref(), s.kind, &producer_id),
+                None => true,
+            };
         let mut consumer_options = ConsumerOptions::new(producer_id, rtp_capabilities.clone());
         // ⚠️ `ConsumerOptions.paused` defaults to FALSE (mediasoup 0.20.0): a
         // consumer is created resumed unless asked otherwise. The crate's own
         // doc recommends `paused: true` for video so the first key frame does
         // not race the client's consumer — which is what a view client gets.
         consumer_options.paused = !wanted;
+        // FR-127 P2 — the layer ceiling from the tile's height when the view
+        // already names this producer, so the first key frame is the right
+        // layer's; else the top, which is also the worker's default. Only a
+        // stream with layers (a simulcast camera), and only while the lever
+        // is on. A spotlit tile's priority follows below, once the consumer
+        // exists — there is no option for it.
+        let tile = participant
+            .view
+            .as_ref()
+            .and_then(|v| v.wanted.get(&producer_id))
+            .copied()
+            .filter(|_| levers.layers);
+        if let (Some(tile), Some(s)) = (tile, &source)
+            && let Some(shape) = s.shape
+        {
+            consumer_options.preferred_layers =
+                Some(simulcast::layers_for(s.capture_h, tile.h, shape));
+        }
         let consumer = participant
             .recv_transport
             .consume(consumer_options)
@@ -513,6 +630,12 @@ impl RoomManager {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to resume consumer: {}", e))?;
         }
+        if tile.is_some_and(|t| t.spotlit) && consumer.kind() == MediaKind::Video {
+            let priority = simulcast::priority_for(true);
+            if let Err(e) = consumer.set_priority(priority).await {
+                debug!(?room_id, %connection_id, consumer_id = %consumer.id(), error = %e, "priority not set at consume");
+            }
+        }
 
         let info = ConsumerInfo {
             id: consumer.id().to_string(),
@@ -525,6 +648,7 @@ impl RoomManager {
             producer_paused,
         };
 
+        let (consumer_type, preferred) = (consumer.r#type(), consumer.preferred_layers());
         participant.consumers.push(consumer);
 
         debug!(
@@ -533,6 +657,8 @@ impl RoomManager {
             consumer_id = %info.id,
             %producer_id,
             wanted,
+            ?consumer_type,
+            ?preferred,
             "consumer created"
         );
         Ok(info)
@@ -541,7 +667,10 @@ impl RoomManager {
     /// FR-127 P1 — apply a viewer's `media:view` report: the WHOLE set of
     /// video producers it renders, with `seq` ordering the reports. A video
     /// consumer the report names is resumed, every other video consumer is
-    /// paused, audio is never touched (`media/view.rs`).
+    /// paused, audio is never touched (`media/view.rs`). P2 — and a consumer
+    /// the report names is given the layer ceiling its tile's height maps to
+    /// and the priority its spotlit flag maps to, where they changed. Each
+    /// half runs under its own lever.
     ///
     /// Decided under the DashMap guards, acted on after them: the consumer
     /// handles are cloned out and every guard dropped before an await, the
@@ -553,12 +682,31 @@ impl RoomManager {
         room_id: &ObjectId,
         connection_id: &str,
         seq: u64,
-        tiles: Vec<(ProducerId, (u32, u32))>,
+        tiles: Vec<(ProducerId, Tile)>,
         max: usize,
+        levers: ViewLevers,
     ) -> ViewOutcome {
-        let changes: Vec<(Consumer, view::Change)> = {
+        let (changes, tunes): (Vec<(Consumer, view::Change)>, Vec<(Consumer, view::Tune)>) = {
             let Some(room) = self.rooms.get(room_id) else {
                 return ViewOutcome::NotFound;
+            };
+            // P2 — every producer's capture height, read while only `room` is
+            // held (the scan iterates `participants`; a `get_mut` on the same
+            // map is taken below, and iterating under it deadlocks).
+            let captures: HashMap<ProducerId, u32> = if levers.layers {
+                room.participants
+                    .iter()
+                    .flat_map(|entry| {
+                        entry
+                            .value()
+                            .producers
+                            .iter()
+                            .map(|pe| (pe.producer.id(), pe.capture_h()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
             };
             let Some(mut participant) = room.participants.get_mut(connection_id) else {
                 return ViewOutcome::NotFound;
@@ -588,13 +736,67 @@ impl RoomManager {
                     producer_id: c.producer_id(),
                     kind: c.kind(),
                     paused: c.paused(),
+                    shape: LayerShape::of(&c.rtp_parameters().encodings),
+                    preferred: c.preferred_layers(),
+                    priority: c.priority(),
                 })
                 .collect();
-            view::plan(view, &lines)
+            let changes = if levers.pause {
+                view::plan(view, &lines)
+                    .into_iter()
+                    .map(|(i, change)| (consumers[i].clone(), change))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let tunes = if levers.layers {
+                view::tune_plan(view, &lines, |pid| {
+                    captures
+                        .get(pid)
+                        .copied()
+                        .unwrap_or(simulcast::DEFAULT_CAPTURE_H)
+                })
                 .into_iter()
-                .map(|(i, change)| (consumers[i].clone(), change))
+                .map(|(i, tune)| (consumers[i].clone(), tune))
                 .collect()
+            } else {
+                Vec::new()
+            };
+            (changes, tunes)
         };
+
+        // The tunes first: a consumer about to resume then asks the sender
+        // for the key frame of the layer it will show, not of the top one
+        // and then of another.
+        let mut tuned = 0;
+        for (consumer, tune) in tunes {
+            if let Some(layers) = tune.layers {
+                match consumer.set_preferred_layers(layers).await {
+                    Ok(()) => tuned += 1,
+                    Err(e) => debug!(
+                        ?room_id,
+                        %connection_id,
+                        consumer_id = %consumer.id(),
+                        ?layers,
+                        error = %e,
+                        "view: layers not set (closed meanwhile?)"
+                    ),
+                }
+            }
+            if let Some(priority) = tune.priority {
+                match consumer.set_priority(priority).await {
+                    Ok(()) => tuned += 1,
+                    Err(e) => debug!(
+                        ?room_id,
+                        %connection_id,
+                        consumer_id = %consumer.id(),
+                        priority,
+                        error = %e,
+                        "view: priority not set (closed meanwhile?)"
+                    ),
+                }
+            }
+        }
 
         let (mut resumed, mut paused) = (0, 0);
         for (consumer, change) in changes {
@@ -615,8 +817,55 @@ impl RoomManager {
                 ),
             }
         }
-        debug!(?room_id, %connection_id, seq, resumed, paused, "view applied");
-        ViewOutcome::Applied { resumed, paused }
+        debug!(?room_id, %connection_id, seq, resumed, paused, tuned, "view applied");
+        ViewOutcome::Applied {
+            resumed,
+            paused,
+            tuned,
+        }
+    }
+
+    /// FR-127 P2 — one consumer's layers as the WORKER holds them (a `dump()`
+    /// round trip on a handle cloned out under the guards), for the tests.
+    pub async fn dump_consumer_layers(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        producer_id: &str,
+    ) -> anyhow::Result<ConsumerLayersDump> {
+        let consumer = self
+            .rooms
+            .get(room_id)
+            .and_then(|room| {
+                room.participants.get(connection_id).and_then(|p| {
+                    p.consumers
+                        .iter()
+                        .find(|c| c.producer_id().to_string() == producer_id)
+                        .cloned()
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("no consumer of {producer_id} for {connection_id}"))?;
+        let dump = consumer
+            .dump()
+            .await
+            .map_err(|e| anyhow::anyhow!("consumer dump failed: {e}"))?;
+        let or_none = |v: Option<i16>| v.unwrap_or(-1);
+        Ok(ConsumerLayersDump {
+            kind_type: format!("{:?}", dump.r#type).to_lowercase(),
+            priority: dump.priority,
+            preferred: (
+                or_none(dump.preferred_spatial_layer),
+                or_none(dump.preferred_temporal_layer),
+            ),
+            target: (
+                or_none(dump.target_spatial_layer),
+                or_none(dump.target_temporal_layer),
+            ),
+            current: (
+                or_none(dump.current_spatial_layer),
+                or_none(dump.current_temporal_layer),
+            ),
+        })
     }
 
     /// FR-127 P1 — one participant's LIVE consumers, as plain data (the tests
@@ -639,6 +888,10 @@ impl RoomManager {
                             kind: kind_str(c.kind()),
                             paused: c.paused(),
                             producer_paused: c.producer_paused(),
+                            simulcast: c.r#type() == ConsumerType::Simulcast,
+                            preferred: layers_tuple(c.preferred_layers()),
+                            current: layers_tuple(c.current_layers()),
+                            priority: c.priority(),
                         })
                         .collect()
                 })

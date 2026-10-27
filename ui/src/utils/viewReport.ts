@@ -10,6 +10,9 @@
  * pixels; the store keeps the set of tiles on screen by stream key, turns it
  * into the video producer ids it consumes, and sends the WHOLE set — never a
  * delta — so a lost or reordered report heals with the next one.
+ *
+ * P2 reads the size: the server gives each consumer the simulcast layer its
+ * tile's height needs, and a spotlit tile's consumer a higher priority.
  */
 
 /** What one tile reports: on screen or not, and its size in device pixels. */
@@ -17,6 +20,18 @@ export interface TileVisibility {
   visible: boolean
   w: number
   h: number
+  /**
+   * FR-127 P2 — the big tile of a spotlight or sidebar layout, or a pinned
+   * one: its consumer gets a higher priority. The LAYOUT sets it when it
+   * forwards the report; a tile does not know where it is rendered.
+   */
+  spotlit?: boolean
+  /**
+   * FR-127 P2 — a tile already on screen changed size (a window resize, a
+   * layout step, a tile spotlit): the size is updated, the count of
+   * reporters is not.
+   */
+  resized?: boolean
 }
 
 /** One entry of a `media:view` report. */
@@ -24,6 +39,8 @@ export interface ViewTile {
   producer_id: string
   w: number
   h: number
+  /** FR-127 P2 — present only when true, so an older server reads past it. */
+  spotlit?: boolean
 }
 
 /**
@@ -42,7 +59,7 @@ export function buildViewReport(
     if (!tile.visible) continue
     const producer_id = videoProducerByStreamKey.get(streamKey)
     if (!producer_id) continue
-    out.push({ producer_id, w: tile.w, h: tile.h })
+    out.push({ producer_id, w: tile.w, h: tile.h, ...(tile.spotlit ? { spotlit: true } : {}) })
   }
   return out
 }

@@ -20,7 +20,7 @@
       @request-pip="$emit('request-pip', p.streamKey)"
       @spotlight="$emit('spotlight', p.streamKey)"
       @picture-black="$emit('picture-black', p.streamKey, $event)"
-      @visible="$emit('visible', p.streamKey, $event)"
+      @visible="$emit('visible', p.streamKey, p.isPinned ? { ...$event, spotlit: true } : $event)"
     />
 
     <!-- Floating self-view -->

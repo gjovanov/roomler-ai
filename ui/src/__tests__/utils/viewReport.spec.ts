@@ -51,4 +51,24 @@ describe('buildViewReport (FR-127 P1)', () => {
   it('is empty when nothing is on screen', () => {
     expect(buildViewReport(new Map(), new Map([['c1', 'vp-1']]))).toEqual([])
   })
+
+  // FR-127 P2 — the spotlit flag rides the report only when true, so an
+  // older server reads past it and a plain tile's entry is P1's exactly.
+  it('marks a spotlit tile, and only a spotlit one', () => {
+    const visible = new Map<string, TileVisibility>([
+      ['c1', { ...on(1280, 720), spotlit: true }],
+      ['c2', { ...on(160, 90), spotlit: false }],
+      ['c3', on(160, 90)],
+    ])
+    const producers = new Map([
+      ['c1', 'vp-1'],
+      ['c2', 'vp-2'],
+      ['c3', 'vp-3'],
+    ])
+    expect(buildViewReport(visible, producers)).toEqual([
+      { producer_id: 'vp-1', w: 1280, h: 720, spotlit: true },
+      { producer_id: 'vp-2', w: 160, h: 90 },
+      { producer_id: 'vp-3', w: 160, h: 90 },
+    ])
+  })
 })

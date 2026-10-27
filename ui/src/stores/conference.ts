@@ -5,6 +5,7 @@ import { shallowRef, ref, reactive } from 'vue'
 import { Device, type types as msTypes } from 'mediasoup-client'
 import { useWsStore } from './ws'
 import { buildViewReport, type TileVisibility } from '@/utils/viewReport'
+import { cameraEncodings, captureSize, type CameraEncoding } from '@/utils/simulcast'
 
 interface RemoteStream {
   userId: string
@@ -46,11 +47,22 @@ export const useConferenceStore = defineStore('conference', () => {
   const remoteAudioPaused = reactive<Map<string, boolean>>(new Map())
   // FR-127 P1 — the levers the server runs, from `media:transport_created`'s
   // `meeting` object: `view` — it pauses the video we do not show, so we
-  // report what we show; `audioDtx` — produce the microphone with Opus DTX.
-  // Both false until a join answers, and false against an older server that
-  // sends no `meeting`: then nothing is reported and audio is produced as
-  // before, which is exactly what that server expects.
-  const meeting = ref<{ view: boolean; audioDtx: boolean }>({ view: false, audioDtx: false })
+  // report what we show; `audioDtx` — produce the microphone with Opus DTX;
+  // P2 — `simulcast`: the ladder the camera publishes, or null for one
+  // encoding (the lever off, an older server, a ladder we could not read).
+  // All off until a join answers, and off against an older server that
+  // sends no `meeting`: then nothing is reported and audio and video are
+  // produced as before, which is exactly what that server expects.
+  const meeting = ref<{ view: boolean; audioDtx: boolean; simulcast: CameraEncoding[] | null }>({
+    view: false,
+    audioDtx: false,
+    simulcast: null,
+  })
+  // P2 — whether the tiles' reports go out at all: the server reads them for
+  // its pausing (`view`) and for its layer selection (`simulcast`), so either
+  // lever asks for them; neither is worth a report in a browser whose tiles
+  // cannot observe themselves.
+  let reportsView = false
   const localStream = shallowRef<MediaStream | null>(null)
   const isMuted = ref(false)
   const isVideoOn = ref(true)
@@ -102,7 +114,7 @@ export const useConferenceStore = defineStore('conference', () => {
   // ever grows so the server can drop a report that arrives after a newer one.
   // `seq` is never reset: a re-join on this page continues it, and the
   // server's fresh participant accepts any first seq.
-  const tilesOnScreen = new Map<string, { n: number; w: number; h: number }>()
+  const tilesOnScreen = new Map<string, { n: number; w: number; h: number; spotlit: boolean }>()
   const videoProducerByStreamKey = new Map<string, string>()
   let viewSeq = 0
   let viewTimer: ReturnType<typeof setTimeout> | null = null
@@ -203,12 +215,15 @@ export const useConferenceStore = defineStore('conference', () => {
 
     const forceRelay = !!transportMsg.force_relay
     // FR-127 P1 — which levers this server runs (absent on an older server:
-    // both off, today's behaviour).
+    // all off, today's behaviour). P2 — the ladder is published whatever
+    // this browser's tiles can do: the layers serve the OTHER viewers.
     const levers = transportMsg.meeting
     meeting.value = {
       view: canReportView && levers?.view === true,
       audioDtx: levers?.audio_dtx === true,
+      simulcast: cameraEncodings(levers?.simulcast),
     }
+    reportsView = canReportView && (levers?.view === true || meeting.value.simulcast !== null)
     // ⚠️ Drop entries with no usable URL before they reach RTCPeerConnection.
     // A server configured with a BLANK turn url used to advertise `urls: [""]`,
     // and the constructor rejects the whole thing —
@@ -289,11 +304,15 @@ export const useConferenceStore = defineStore('conference', () => {
     st.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
       try {
         const resultPromise = ws.waitForMessage('media:produce_result')
+        // FR-127 P2 — the camera's capture size rides the produce, so the
+        // server's layer map is relative to what the camera opened at.
+        const capture = appData?.capture as { w: number; h: number } | undefined
         ws.send('media:produce', {
           room_id: rid,
           kind,
           rtp_parameters: rtpParameters,
           source: appData?.source || (kind === 'audio' ? 'audio' : 'camera'),
+          ...(capture ? { capture } : {}),
         })
         const result = await resultPromise
         callback({ id: result.id })
@@ -375,10 +394,28 @@ export const useConferenceStore = defineStore('conference', () => {
 
     const videoTrack = stream.getVideoTracks()[0]
     if (videoTrack) {
-      const videoProducer = await sendTransport.value.produce({
-        track: videoTrack,
-        appData: { source: 'camera' },
-      })
+      // FR-127 P2 — the camera publishes the server's ladder (two VP8 layers
+      // relative to the capture, three temporal layers each) when the server
+      // announced one, and tells it the capture size the ladder is relative
+      // to. A browser that refuses the ladder (a handler without simulcast,
+      // an encoder that cannot scale) publishes one encoding, as before: the
+      // layers are a budget lever, never a reason to have no camera.
+      const capture = captureSize(videoTrack)
+      const appData = { source: 'camera', ...(capture ? { capture } : {}) }
+      const encodings = meeting.value.simulcast
+      let videoProducer: msTypes.Producer
+      try {
+        videoProducer = await sendTransport.value.produce({
+          track: videoTrack,
+          appData,
+          // A copy: mediasoup-client writes `rid`s into the array it is given.
+          ...(encodings ? { encodings: encodings.map((e) => ({ ...e })) } : {}),
+        })
+      } catch (err) {
+        if (!encodings) throw err
+        console.warn('[conference] the simulcast ladder was refused; publishing one encoding:', err)
+        videoProducer = await sendTransport.value.produce({ track: videoTrack, appData })
+      }
       producers.set('video', videoProducer)
     }
 
@@ -644,7 +681,8 @@ export const useConferenceStore = defineStore('conference', () => {
     }
     tilesOnScreen.clear()
     videoProducerByStreamKey.clear()
-    meeting.value = { view: false, audioDtx: false }
+    meeting.value = { view: false, audioDtx: false, simulcast: null }
+    reportsView = false
 
     // Remove WS listeners
     ws.offMediaMessage('media:new_producer')
@@ -671,8 +709,19 @@ export const useConferenceStore = defineStore('conference', () => {
    */
   function reportTileVisible(streamKey: string, report: TileVisibility) {
     const cur = tilesOnScreen.get(streamKey)
-    if (report.visible) {
-      tilesOnScreen.set(streamKey, { n: (cur?.n ?? 0) + 1, w: report.w, h: report.h })
+    if (report.resized) {
+      // FR-127 P2 — a tile already on screen changed size: the size (and
+      // whether it is spotlit) moves, the count of reporters does not; a
+      // tile that is not on screen has nothing to resize.
+      if (!cur || !report.visible) return
+      tilesOnScreen.set(streamKey, { ...cur, w: report.w, h: report.h, spotlit: report.spotlit === true })
+    } else if (report.visible) {
+      tilesOnScreen.set(streamKey, {
+        n: (cur?.n ?? 0) + 1,
+        w: report.w,
+        h: report.h,
+        spotlit: report.spotlit === true,
+      })
     } else if (cur) {
       if (cur.n <= 1) tilesOnScreen.delete(streamKey)
       else tilesOnScreen.set(streamKey, { ...cur, n: cur.n - 1 })
@@ -685,10 +734,10 @@ export const useConferenceStore = defineStore('conference', () => {
    * and reading the state as it is when it fires: a scroll keeps reporting
    * every 100 ms while it lasts, and a layout change that touches sixteen
    * tiles costs one message. Nothing is sent while the server has not asked
-   * (`meeting.view`) or outside a call.
+   * (neither `meeting.view` nor `meeting.simulcast`) or outside a call.
    */
   function scheduleView() {
-    if (!meeting.value.view || !roomId.value) return
+    if (!reportsView || !roomId.value) return
     if (viewTimer) return
     viewTimer = setTimeout(() => {
       viewTimer = null
@@ -697,9 +746,11 @@ export const useConferenceStore = defineStore('conference', () => {
   }
 
   function sendView() {
-    if (!meeting.value.view || !roomId.value) return
+    if (!reportsView || !roomId.value) return
     const visible = new Map<string, TileVisibility>()
-    for (const [key, t] of tilesOnScreen) visible.set(key, { visible: t.n > 0, w: t.w, h: t.h })
+    for (const [key, t] of tilesOnScreen) {
+      visible.set(key, { visible: t.n > 0, w: t.w, h: t.h, spotlit: t.spotlit })
+    }
     const video = buildViewReport(visible, videoProducerByStreamKey)
     viewSeq += 1
     useWsStore().send('media:view', { room_id: roomId.value, seq: viewSeq, video })
@@ -711,7 +762,7 @@ export const useConferenceStore = defineStore('conference', () => {
 
   function startViewResend() {
     stopViewResend()
-    if (!meeting.value.view) return
+    if (!reportsView) return
     viewResend = setInterval(() => sendView(), VIEW_RESEND_MS)
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', onVisibilityChange)

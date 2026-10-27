@@ -809,9 +809,19 @@ impl Modules {
 
     /// The live media gauges for the cluster status snapshot:
     /// `(per-room rows, participants_total, consumers_total,
-    /// video_paused_total)` — the last one FR-127 P1's "video consumers held
-    /// back by their viewer's view". Empty when the module is not mounted.
-    pub fn media_gauges(&self) -> (Vec<serde_json::Value>, usize, usize, usize) {
+    /// video_paused_total, video_layers_total)` — the fourth FR-127 P1's
+    /// "video consumers held back by their viewer's view", the fifth P2's
+    /// flowing video consumers by the spatial layer the worker forwards
+    /// (`{"0": n, "1": m, "none": k}`). Empty when the module is not mounted.
+    pub fn media_gauges(
+        &self,
+    ) -> (
+        Vec<serde_json::Value>,
+        usize,
+        usize,
+        usize,
+        serde_json::Value,
+    ) {
         #[cfg(feature = "conference")]
         if let Some(conference) = &self.conference {
             let g = conference.media_gauges();
@@ -820,9 +830,10 @@ impl Modules {
                 g.participants_total,
                 g.consumers_total,
                 g.video_paused_total,
+                serde_json::json!(g.video_layers_total),
             );
         }
-        (Vec::new(), 0, 0, 0)
+        (Vec::new(), 0, 0, 0, serde_json::json!({}))
     }
 
     /// P6 — one `rc:*` text frame from a controller browser tab, with the
