@@ -12,6 +12,43 @@ use super::super::{
 };
 use super::*;
 
+/// FR-90 P8-2b-2 — the guard arms `SEM_NOGPFAULTERRORBOX`, so a crash writes
+/// no dump, event or upload of the worker's memory; and it keeps the other
+/// error-mode bits its launcher may have set, rather than clearing them.
+#[test]
+fn no_crash_dump_arms_the_error_mode() {
+    // SAFETY: GetErrorMode/SetErrorMode on this (the test) process.
+    let before = unsafe { GetErrorMode() };
+    // Clear the bit first, so this shows the GUARD sets it, not that the
+    // launcher left it on: a Rust process on a dev box often already carries
+    // it, while the daemon under the SCM does not. Keep the other bits, to
+    // prove the guard OR's its bit in rather than overwriting.
+    // SAFETY: as above.
+    unsafe { SetErrorMode(before & !SEM_NOGPFAULTERRORBOX) };
+    let cleared = unsafe { GetErrorMode() };
+    assert_eq!(
+        cleared & SEM_NOGPFAULTERRORBOX,
+        0,
+        "cleared before the guard runs: {cleared:#x}"
+    );
+
+    no_crash_dump().expect("the mode takes");
+
+    let after = unsafe { GetErrorMode() };
+    assert!(
+        after & SEM_NOGPFAULTERRORBOX != 0,
+        "the GP-fault report is suppressed: {after:#x}"
+    );
+    assert_eq!(
+        after & cleared,
+        cleared,
+        "the bits it had stay, not cleared: cleared {cleared:#x}, after {after:#x}"
+    );
+    // Restore, so a later test's own crash still reports as its harness expects.
+    // SAFETY: as above.
+    unsafe { SetErrorMode(before) };
+}
+
 const WAIT: Duration = Duration::from_secs(10);
 
 /// The worker's end of a channel, taken as a worker takes it.
