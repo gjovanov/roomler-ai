@@ -19,6 +19,7 @@
 //! | a restart | after a wait that doubles with each start still inside [`Timing::loop_window`], to a ceiling; [`Timing::loop_max`] starts within it, and the daemon gives up on this run's worker rather than start another |
 //! | the stop | `bye`, and the channel's end awaited within a grace, then a kill |
 //! | the daemon's end | the worker's too: it ends at its channel's end, and the channel is close-on-exec on both sides, so only the daemon holds the other end |
+//! | limits | P8-2a-3 — set as it starts: a core limit of 1 byte, so it never dumps core, even where a helper takes the dump; at most [`MAX_OPEN_FILES`] descriptors. No limit on address space: glibc reserves 64 MiB a thread for its arenas, so a cap fails healthy threads long before a runaway |
 //!
 //! ⚠️ Giving up ends the run, with the reason: where the device's owner
 //! turned workers on, what has moved runs in a worker or not at all, never
@@ -62,6 +63,12 @@ const CHANNEL_FD: std::os::fd::RawFd = 3;
 /// FR-90 P8-2a-2 — the descriptor its second channel arrives on: the one
 /// the daemon hands listeners across ([`fds`]).
 const DESCRIPTORS_FD: std::os::fd::RawFd = 4;
+
+/// FR-90 P8-2a-3 — the most descriptors a worker holds open. Each connection
+/// it serves is one or two, so a worker that leaks them stops here, long
+/// before the host's ephemeral ports run out: a leak of sockets once took a
+/// host's name resolution down while every address still answered.
+const MAX_OPEN_FILES: libc::rlim_t = 4096;
 
 /// How long a hand-over waits for a starting worker to be up.
 #[cfg(feature = "vault")]
@@ -206,6 +213,12 @@ pub async fn worker_main() -> i32 {
     unsafe {
         libc::prctl(libc::PR_SET_NAME, c"roomlerd".as_ptr());
     }
+    if let Err(e) = limit() {
+        crate::logging::say_on_stderr(format_args!(
+            "roomlerd hive-worker: its limits could not be set: {e}"
+        ));
+        return 3;
+    }
     // The channels are this process's alone: nothing it starts inherits
     // them, so the daemon's end sees them end as this process does. A failure
     // here also says fd 3 or fd 4 is not open.
@@ -234,6 +247,49 @@ pub async fn worker_main() -> i32 {
             1
         }
     }
+}
+
+/// FR-90 P8-2a-3 — a worker's limits, set as it starts, before it takes its
+/// channels: it never dumps core, since its memory holds the values of the
+/// endpoints it serves; and it holds at most [`MAX_OPEN_FILES`] descriptors.
+/// A worker that cannot set them does not run.
+fn limit() -> std::io::Result<()> {
+    // 1, not 0: where the system pipes a dump to a helper (systemd-coredump,
+    // apport, WSL's), a limit of 0 is dumped all the same (measured on Linux
+    // 6.6). The kernel keeps 1 for a helper's own crash, and dumps nothing
+    // at it; a dump to a file needs more than a byte.
+    let core = libc::rlimit {
+        rlim_cur: 1,
+        rlim_max: 1,
+    };
+    // SAFETY: getrlimit and setrlimit on this process, with valid limits.
+    unsafe {
+        if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut files = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut files) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let bound = open_files(files.rlim_max);
+        let files = libc::rlimit {
+            rlim_cur: bound,
+            rlim_max: bound,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The open-file limit a worker runs with, soft and hard, from the daemon's
+/// hard limit: at most [`MAX_OPEN_FILES`], all of it usable, never raised.
+fn open_files(hard: libc::rlim_t) -> libc::rlim_t {
+    hard.min(MAX_OPEN_FILES)
 }
 
 /// The worker's side of the channel: the handshake, each heartbeat and
