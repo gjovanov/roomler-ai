@@ -883,9 +883,15 @@ go to 60".
 
 - [ ] **AC1 — P0 measured.** The pts test is red on master and green after P2. L0's 120 and 144 cells hold their
   cadence. The data-channel ceiling and α are recorded in §8 with how they were measured.
-- [ ] **AC2 — the wire is additive.** An agent without `fps-high` never receives `rc:fps`; a viewer without the
+- [x] **AC2 — the wire is additive.** An agent without `fps-high` never receives `rc:fps`; a viewer without the
   picker never sends it; an unknown value is dropped. Tests on both sides. An old viewer with a new agent and a
-  new viewer with an old agent both stream at today's rate.
+  new viewer with an old agent both stream at today's rate. **Verified** 2026-10-27 (§8). The prod viewer opened
+  a session to an agent without `fps-high` (0.4.179, Linux, X11). Its Video tab had no Frame rate picker, its
+  `rc:video-info` carried no frame-rate fields, the session streamed at its usual rate, and the agent's journal
+  for the two hours around it held one session and no `rc:fps` at all. Tests on both sides (§4.1): the agent
+  drops an ask that is not 60, 120 or 144 (`only_the_offered_rates_are_an_ask`) and advertises `fps-high` only
+  when it is on; the viewer offers above 60, and sends an ask, only to an agent advertising it. An old viewer
+  sends no ask, and an agent with no ask runs at its cap (`an_ask_the_cap_covers_wants_the_cap`).
 - [x] **AC3 — constrained paths stay where they are.** A constrained session never exceeds its current cap,
   whatever the viewer asks. Unit-tested on the grant, and seen on one relay cell in the field answering at its
   current cap (30 on a relayed FFmpeg DC session today) with `reason:"constrained"`. **Verified** 2026-10-23 on
@@ -993,6 +999,7 @@ go to 60".
 | 2026-10-27 | agent 0.4.179 on neo16 (P2b-18); an MCP-driven Chrome whose WebRTC lists H.264 alone; the GPU free | an attempt at P2b-18's field check: AV1 at 144, 2560×1600, a square moving | **No verdict, correctly: a viewer that cannot decode the rate is no viewer for a trial.** The session negotiated AV1 decoded in software. The viewer reported 21–55 fps and struggled, so the viewer-rate cap held 24–93 fps (`skip_divisor` 2–6). Every frame dropped for the viewer ends the trial's stretch, so in the 80 s the session ran, the trial never gathered 10 s of motion. The check needs a viewer that decodes HEVC 4:4:4 in hardware: the MacBook, or another Chrome profile |
 | 2026-10-27 | agent 0.4.180 on neo16 (it carries P2b-18); Chrome on neo16 viewing neo16 (a local pair), which decodes HEVC 4:4:4 in hardware; the GPU free, a video playing on screen during the first pass | **P2b-18 in the field.** HEVC 4:4:4 at 2560×1600 asked at 144, a square moved on every composition; then "Try 144 fps again" | **Both branches of the step-down, and the retry.** 22:19:13: with no verdict cached (0.4.180 started an empty cache), 144 ran as a trial. 22:19:23: `Failed` (118.7 fps, p99 19.7 ms, p90 encode 7.32 ms against a 6.94 ms period), and the decision read `want=120`, not 60. The viewer was told `"fps":120,"fps_asked":144,"fps_reason":"unproven"`, with 120 on its own trial. 22:19:43: 120 `Failed` too (109.1 fps, p99 20.8 ms, p90 encode 8.03 ms against 7.5 ms), so the session went to the cap: 144 → 120 → 60. 22:23:51: the retry. The agent forgot both failures, 144 `Failed` again at 22:24:02 (110.4 fps, p90 encode 7.18 ms), and **120 was `Proven`** at 22:24:12: 1171 frames in 10.000 s (117.0 fps), p99 14.5 ms, p90 encode 6.91 ms. The stream stayed at 120 (heartbeat ~118 fps), and the viewer read "120 fps (144 fps not granted: this host hasn't shown it can sustain that rate yet)". The first pass's 120 failed narrowly, with the viewer's own decode and the video on the same GPU |
 | 2026-10-27 | agent 0.4.180; the same viewer with its own settings, AV1 and "Fit to local viewport" (1704×1066 from 2560×1600) | AV1 at 144, the square moving | **A scaled session cannot reach 144 on this host, and its trial never concludes.** The pump's CPU resample took 14.7 ms a frame (`avg_scale_ms`), and encoding 3.6 ms. So the pump took 44–61 frames a second, and WGC dropped 38–41 % of the ~92 that arrived. The encoder was not the limit, so in over two minutes the trial concluded nothing, and the viewer read "144 fps, on trial until this host has shown it can keep up" throughout: open decision 7. FR-118's GPU scale removes the stage |
+| 2026-10-27 | agent 0.4.179 without `fps-high`, on neo16's WSL distro (Linux, X11 capture, relayed); the prod viewer | **AC2's field half**: a session from today's viewer to an agent that does not advertise `fps-high` | **The wire stays additive.** The Video tab had no Frame rate picker. `rc:video-info` carried no `fps`, `fps_asked` or `fps_reason`. The session streamed at its usual rate, and the agent's journal for the two hours around it held 1 session and 0 `rc:fps` lines |
 
 ### 8.1 How AC4 is read
 
