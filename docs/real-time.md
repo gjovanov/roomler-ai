@@ -156,7 +156,7 @@ P1 first shipped with `consume` holding the participant's entry across both of i
 trips, and on 2026-10-27 a field run's joins froze a production pod that way twice before
 it was rolled back. Two nets now catch it, and neither catches everything:
 
-- **A build error for the common shape.** The crate's `clippy.toml` lists dashmap's guard
+- **A build error for the common shape.** The root `clippy.toml` lists dashmap's guard
   types for `clippy::await_holding_invalid_type`, which CI's `-D warnings` denies. A guard
   dropped with `drop()` still counts, because a value that was borrowed stays in the future
   until its scope ends, so a guard lives in a block that ends before the await
