@@ -63,7 +63,8 @@ impl<'de> Deserialize<'de> for Secret {
     }
 }
 
-/// A call across a worker's channel: an endpoint's, the only calls so far.
+/// A call across a worker's channel: an endpoint's, and (P8-2a-4b) the
+/// egress proxy's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "c", rename_all = "snake_case")]
 pub(crate) enum Call {
@@ -75,6 +76,22 @@ pub(crate) enum Call {
     /// The worker: `endpoint`'s values, read from its leases now, for one
     /// connection.
     Values { endpoint: u64 },
+    /// P8-2a-4b — the daemon: serve the run's egress fronts as `endpoint`,
+    /// on the two listeners sent just before this frame, the HTTP front's
+    /// first.
+    Egress {
+        endpoint: u64,
+        spec: Box<crate::hive::egress::handed::Spec>,
+    },
+    /// P8-2a-4b — the worker: the vault's decision for `host:port`.
+    Decide { host: String, port: u16 },
+    /// P8-2a-4b — the worker: the run's placeholders toward `host:port`.
+    Bound { host: String, port: u16 },
+    /// P8-2a-4b — the worker: the same, each value read from its lease now,
+    /// for one request.
+    Valued { host: String, port: u16 },
+    /// P8-2a-4b — the worker: the leaf the run's CA makes for `host`.
+    Leaf { host: String },
 }
 
 /// The answer to a [`Call`].
@@ -89,6 +106,23 @@ pub(crate) enum Answer {
     /// go.
     Values {
         values: Option<Vec<Secret>>,
+    },
+    /// P8-2a-4b — the vault's decision.
+    Decision {
+        decision: crate::hive::egress::Decision,
+    },
+    /// P8-2a-4b — the run's placeholders toward a host.
+    Bound {
+        bound: Vec<crate::hive::placeholder::Bound>,
+    },
+    /// P8-2a-4b — the same, each with its value: none once its lease is let
+    /// go.
+    Valued {
+        valued: Vec<(crate::hive::placeholder::Bound, Option<Secret>)>,
+    },
+    /// P8-2a-4b — a leaf, its key among it.
+    Leaf {
+        leaf: crate::hive::egress::handed::Leaf,
     },
 }
 
@@ -208,6 +242,12 @@ type Runs = HashMap<(ObjectId, u64), HashMap<u64, Kept>>;
 static KEPT: LazyLock<Mutex<Runs>> = LazyLock::new(Mutex::default);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+/// A new endpoint's id, from the one counter: P8-2a-4b — the egress fronts
+/// take theirs from it too, so no two things a worker serves share one.
+pub(crate) fn next_endpoint() -> u64 {
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn kept() -> std::sync::MutexGuard<'static, Runs> {
     KEPT.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -243,7 +283,7 @@ pub(crate) async fn hand(
     let failed = |e: std::io::Error| format!("the endpoint's listener: {e}");
     let ours = listener.as_fd().try_clone_to_owned().map_err(failed)?;
     let theirs = ours.try_clone().map_err(failed)?;
-    let endpoint = NEXT.fetch_add(1, Ordering::Relaxed);
+    let endpoint = next_endpoint();
     kept().entry((session, fence)).or_default().insert(
         endpoint,
         Kept {
@@ -263,7 +303,7 @@ pub(crate) async fn hand(
                 endpoint,
                 spec: Box::new(spec),
             },
-            Some(theirs),
+            vec![theirs],
         )
         .await
     {
@@ -294,7 +334,7 @@ impl Handed {
             let call = Call::Close {
                 endpoint: self.endpoint,
             };
-            if let Err(why) = link.call(call, None).await {
+            if let Err(why) = link.call(call, Vec::new()).await {
                 debug!(session = %self.session, fence = self.fence, endpoint = self.endpoint, %why, "vault: an endpoint's close went unanswered");
             }
         }
@@ -330,7 +370,7 @@ pub(crate) async fn rehand(session: ObjectId, fence: u64, link: &Link) {
                         endpoint,
                         spec: Box::new(spec),
                     },
-                    Some(fd),
+                    vec![fd],
                 )
                 .await
             }
@@ -453,14 +493,9 @@ pub(crate) fn serve_handed(
 /// answered at once, each on a task of its own. A place not served drops
 /// here, and its copy of the listener with it.
 fn claim<P: Place>(serving: &Arc<Serving>, endpoint: u64, place: P, asked: Asked) -> Answer {
-    let stop = serving.all.child_token();
-    {
-        let mut endpoints = serving.endpoints();
-        if endpoints.closed.contains(&endpoint) || endpoints.stops.contains_key(&endpoint) {
-            return Answer::Done;
-        }
-        endpoints.stops.insert(endpoint, stop.clone());
-    }
+    let Some(stop) = claimed(serving, endpoint) else {
+        return Answer::Done;
+    };
     let live = Live::new(&stop);
     let end = {
         let serving = Arc::clone(serving);
@@ -470,6 +505,20 @@ fn claim<P: Place>(serving: &Arc<Serving>, endpoint: u64, place: P, asked: Asked
     };
     tokio::spawn(serve(place, Arc::new(asked), stop, live, end));
     Answer::Done
+}
+
+/// `endpoint` claimed for this worker, in one look: its stop, a child of
+/// [`Serving::all`]. `None` where this worker serves it already (a
+/// hand-over that crossed a new worker's) or has closed it (one that
+/// crossed its close). P8-2a-4b — the egress fronts are claimed so too.
+pub(crate) fn claimed(serving: &Serving, endpoint: u64) -> Option<CancellationToken> {
+    let stop = serving.all.child_token();
+    let mut endpoints = serving.endpoints();
+    if endpoints.closed.contains(&endpoint) || endpoints.stops.contains_key(&endpoint) {
+        return None;
+    }
+    endpoints.stops.insert(endpoint, stop.clone());
+    Some(stop)
 }
 
 /// The daemon's `close`: the endpoint stops, its connections cut, and a
@@ -503,7 +552,7 @@ impl Sessions for Asked {
         let call = Call::Values {
             endpoint: self.endpoint,
         };
-        match self.link.call(call, None).await {
+        match self.link.call(call, Vec::new()).await {
             Ok(Answer::Values {
                 values: Some(values),
             }) => self.conf.session(|i| values.get(i).map(|v| v.0.clone())),

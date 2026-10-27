@@ -565,7 +565,7 @@ mod retain;
 mod stream;
 
 pub struct Supervisor {
-    cfg: HiveConfig,
+    pub(crate) cfg: HiveConfig,
     /// Per-session settings files (`<runtime>/<sid>/settings.json`): written
     /// by the daemon, readable by the session's account, writable only here.
     runtime: PathBuf,

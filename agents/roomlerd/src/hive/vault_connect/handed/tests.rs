@@ -103,7 +103,7 @@ async fn a_handed_endpoint_is_served_with_the_values_the_daemon_answers() {
                 endpoint: 11,
                 spec: Box::new(bearer(port, &ca)),
             },
-            Some(OwnedFd::from(listener)),
+            vec![OwnedFd::from(listener)],
         )
         .await
         .unwrap();
@@ -132,7 +132,7 @@ async fn a_handed_endpoint_is_served_with_the_values_the_daemon_answers() {
 
     let closed = d
         .link
-        .call(Call::Close { endpoint: 11 }, None)
+        .call(Call::Close { endpoint: 11 }, Vec::new())
         .await
         .unwrap();
     assert_eq!(closed, Answer::Done);
@@ -162,7 +162,7 @@ async fn an_endpoint_handed_twice_is_served_once() {
                     endpoint: 12,
                     spec: Box::new(bearer(port, &ca)),
                 },
-                Some(OwnedFd::from(listener)),
+                vec![OwnedFd::from(listener)],
             )
             .await
             .unwrap();
@@ -175,7 +175,7 @@ async fn an_endpoint_handed_twice_is_served_once() {
         TcpStream::connect(("127.0.0.1", ports[1])).await.is_err(),
         "the second listener is not served"
     );
-    let _ = d.link.call(Call::Close { endpoint: 12 }, None).await;
+    let _ = d.link.call(Call::Close { endpoint: 12 }, Vec::new()).await;
 }
 
 /// Two hand-overs of one endpoint answered at once, each on a task of its
@@ -201,7 +201,7 @@ async fn two_hand_overs_of_one_endpoint_at_once_serve_it_once() {
                     endpoint: 14,
                     spec: Box::new(spec),
                 };
-                link.call(serve, Some(OwnedFd::from(l))).await
+                link.call(serve, vec![OwnedFd::from(l)]).await
             })
         })
         .collect();
@@ -215,7 +215,7 @@ async fn two_hand_overs_of_one_endpoint_at_once_serve_it_once() {
         }
     }
     assert_eq!(served, 1, "one of the two listeners, never both");
-    let _ = d.link.call(Call::Close { endpoint: 14 }, None).await;
+    let _ = d.link.call(Call::Close { endpoint: 14 }, Vec::new()).await;
 }
 
 /// A hand-over that crossed its endpoint's close (a new worker's, listed
@@ -227,7 +227,7 @@ async fn a_hand_over_that_crosses_its_close_is_not_served() {
     let d = daemon(made(), Arc::new(AtomicBool::new(true))).await;
     let closed = d
         .link
-        .call(Call::Close { endpoint: 13 }, None)
+        .call(Call::Close { endpoint: 13 }, Vec::new())
         .await
         .unwrap();
     assert_eq!(closed, Answer::Done);
@@ -240,7 +240,7 @@ async fn a_hand_over_that_crosses_its_close_is_not_served() {
                 endpoint: 13,
                 spec: Box::new(bearer(port, &ca)),
             },
-            Some(OwnedFd::from(listener)),
+            vec![OwnedFd::from(listener)],
         )
         .await
         .unwrap();

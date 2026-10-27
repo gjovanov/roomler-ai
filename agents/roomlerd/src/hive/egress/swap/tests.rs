@@ -27,18 +27,18 @@ use super::super::{
 use super::*;
 
 /// The audience's host, and another name its certificate also carries.
-const HOST: &str = "api.test";
+pub(in crate::hive::egress) const HOST: &str = "api.test";
 const OTHER: &str = "other.test";
 /// What a client offers, as curl and Go do.
-const H1: &[&[u8]] = &[b"h2", b"http/1.1"];
+pub(in crate::hive::egress) const H1: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// One request, as the audience was sent it.
 #[derive(Debug, Clone)]
-struct Seen {
+pub(in crate::hive::egress) struct Seen {
     method: Method,
     target: String,
     host: String,
-    authorization: Vec<String>,
+    pub(in crate::hive::egress) authorization: Vec<String>,
     api_key: Option<String>,
     agent: Option<String>,
     /// Every header, as AWS would read them (P3b-4-2).
@@ -49,15 +49,15 @@ struct Seen {
 /// A test audience: TLS under a CA of its own, for both names; HTTP/1.1,
 /// each request recorded and answered `200`, its connection closed after
 /// each where `close` says so.
-struct Audience {
-    addr: SocketAddr,
-    ca: CertificateDer<'static>,
+pub(in crate::hive::egress) struct Audience {
+    pub(in crate::hive::egress) addr: SocketAddr,
+    pub(in crate::hive::egress) ca: CertificateDer<'static>,
     seen: Arc<Mutex<Vec<Seen>>>,
     connections: Arc<AtomicUsize>,
 }
 
 impl Audience {
-    async fn start(close: bool) -> Self {
+    pub(in crate::hive::egress) async fn start(close: bool) -> Self {
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -113,7 +113,7 @@ impl Audience {
         }
     }
 
-    fn seen(&self) -> Vec<Seen> {
+    pub(in crate::hive::egress) fn seen(&self) -> Vec<Seen> {
         lock(&self.seen).clone()
     }
 
@@ -166,7 +166,7 @@ async fn answered(
 }
 
 /// Allows every host.
-struct AllowAll;
+pub(in crate::hive::egress) struct AllowAll;
 
 #[async_trait::async_trait]
 impl Decide for AllowAll {
@@ -176,7 +176,7 @@ impl Decide for AllowAll {
 }
 
 /// Dials the audience, whatever the host.
-struct ToAudience(SocketAddr);
+pub(in crate::hive::egress) struct ToAudience(pub(in crate::hive::egress) SocketAddr);
 
 #[async_trait::async_trait]
 impl Dial for ToAudience {
@@ -189,7 +189,10 @@ impl Dial for ToAudience {
 
 /// Each lease's value, and (P8-2a-4a) how many times one was read.
 #[derive(Default)]
-struct Leases(Mutex<HashMap<String, Vec<u8>>>, AtomicUsize);
+pub(in crate::hive::egress) struct Leases(
+    pub(in crate::hive::egress) Mutex<HashMap<String, Vec<u8>>>,
+    pub(in crate::hive::egress) AtomicUsize,
+);
 
 impl Values for Leases {
     fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
@@ -206,7 +209,7 @@ struct Rig {
     fronts: Fronts,
     leases: Arc<Leases>,
     /// The run's CA.
-    ca: CertificateDer<'static>,
+    pub(in crate::hive::egress) ca: CertificateDer<'static>,
 }
 
 impl Rig {
@@ -276,7 +279,7 @@ async fn status_line<S: AsyncRead + Unpin>(tcp: &mut S) -> String {
 /// Through the HTTP front (`CONNECT connect`), then TLS as `name`, trusting
 /// `trust` alone and offering `alpn`: the stream, or the front's status line
 /// or TLS's error.
-async fn through(
+pub(in crate::hive::egress) async fn through(
     front: SocketAddr,
     connect: &str,
     name: &str,
@@ -337,7 +340,7 @@ async fn socks_connect(front: SocketAddr, host: &str, port: u16) -> (u8, TcpStre
 }
 
 /// HTTP/1.1 over `tls`, its connection driven aside.
-async fn http(tls: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
+pub(in crate::hive::egress) async fn http(tls: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
     let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
         .await
         .unwrap();
@@ -348,7 +351,7 @@ async fn http(tls: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
 }
 
 /// One request: its status, and its body.
-async fn ask(
+pub(in crate::hive::egress) async fn ask(
     send: &mut SendRequest<Full<Bytes>>,
     req: Request<Full<Bytes>>,
 ) -> (StatusCode, String) {
@@ -363,7 +366,11 @@ async fn ask(
 }
 
 /// `GET path`, its `Host`, and its `Authorization` where it has one.
-fn get(path: &str, host: &str, authorization: Option<&str>) -> Request<Full<Bytes>> {
+pub(in crate::hive::egress) fn get(
+    path: &str,
+    host: &str,
+    authorization: Option<&str>,
+) -> Request<Full<Bytes>> {
     let mut req = Request::get(path).header(header::HOST, host);
     if let Some(a) = authorization {
         req = req.header(header::AUTHORIZATION, a);
