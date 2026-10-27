@@ -7306,7 +7306,7 @@ async fn media_pump_ffmpeg_dc(
                         %session_id,
                         codec_label,
                         opened_fps,
-                        "FR-119: the replacement at the granted rate did not open — back to the session's rate for this session"
+                        "FR-119: the replacement at the granted rate did not open — that rate is out for this session, and the grant steps down"
                     );
                 }
             }
@@ -8236,9 +8236,9 @@ async fn media_pump_ffmpeg_dc(
                 fps_decided_on = Some(on);
                 fps_decided_at = std::time::Instant::now();
                 let above = asked.filter(|&a| a > base_fps);
-                // The ceiling the asked rate would get here, by the chain the
-                // replacement opens at, against what the pipe pushed back.
-                let ceiling_at_ask = above.map(|a| {
+                // The ceiling at a rate (P2b-18: each rate from the ask down),
+                // by the chain the replacement opens at.
+                let ceiling_at = |a: u32| {
                     crate::encode::policy::rate_plan(
                         enc_dims.0,
                         enc_dims.1,
@@ -8258,10 +8258,9 @@ async fn media_pump_ffmpeg_dc(
                         ),
                     )
                     .ceiling_bps
-                });
+                };
                 let capacity_bps = governor.belief_bps(std::time::Instant::now()).2;
-                let pipe_covers = ceiling_at_ask
-                    .is_none_or(|c| crate::encode::frame_rate::pipe_covers(capacity_bps, c));
+                let ceiling_at_ask = above.map(ceiling_at);
                 let class = crate::encode::frame_rate::ClassKey {
                     backend: capturer.backend().to_string(),
                     // P2b-3 — unknown is 0, and decides nothing.
@@ -8275,11 +8274,12 @@ async fn media_pump_ffmpeg_dc(
                     cap: base_fps,
                     constrained,
                     refresh_hz: capturer.refresh_hz(),
-                    denied: above.is_some_and(|a| {
-                        crate::encode::frame_rate::fps_denied(&fps_deny, enc.name(), a)
-                    }),
-                    verdict: None,
-                    pipe_covers,
+                    rates: crate::encode::frame_rate::rate_facts(
+                        asked,
+                        base_fps,
+                        |r| crate::encode::frame_rate::fps_denied(&fps_deny, enc.name(), r),
+                        |r| crate::encode::frame_rate::pipe_covers(capacity_bps, ceiling_at(r)),
+                    ),
                 };
                 if state.decide_with_retry(inputs, class, viewer_report.take_retrial()) {
                     // FR-119 P2b-12 — the decision's refusal, not the

@@ -88,7 +88,8 @@ export interface FrameRateAnswer {
   /** Why not, in the agent's word (`unproven`, `constrained`, …). */
   reason: string | null
   /** FR-119 P2b — the rate runs as a trial: the host has not shown it can
-   *  sustain it yet, and goes back to its usual rate if it cannot. */
+   *  sustain it yet, and steps down if it cannot. P2b-18: a refused ask can
+   *  run one rate lower as a trial (144 refused, 120 on trial). */
   trial: boolean
 }
 
@@ -146,7 +147,10 @@ export function describeFrameRateReason(word: string): string {
 export function frameRateSummary(answer: FrameRateAnswer | null): string | null {
   if (!answer) return null
   if (answer.asked !== null && answer.reason !== null) {
-    return `${answer.fps} fps (${answer.asked} fps not granted: ${describeFrameRateReason(answer.reason)})`
+    // FR-119 P2b-18 — the agent steps a refused ask down one rate at a time,
+    // so the rate below it may itself be on trial.
+    const running = answer.trial ? `${answer.fps} fps on trial` : `${answer.fps} fps`
+    return `${running} (${answer.asked} fps not granted: ${describeFrameRateReason(answer.reason)})`
   }
   if (answer.trial) {
     return `${answer.fps} fps, on trial until this host has shown it can keep up`

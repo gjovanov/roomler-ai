@@ -103,6 +103,15 @@ describe('FR-119 P2b — a trial, the new reasons, the host refresh rate', () =>
     expect(frameRateSummary({ fps: 60, asked: 144, reason: 'pipe', trial: true })).toContain('not granted')
   })
 
+  it('P2b-18: says when the rate below a refused ask is itself on trial', () => {
+    expect(frameRateSummary({ fps: 120, asked: 144, reason: 'unproven', trial: true })).toBe(
+      "120 fps on trial (144 fps not granted: this host hasn't shown it can sustain that rate yet)",
+    )
+    expect(frameRateSummary({ fps: 120, asked: 144, reason: 'unproven', trial: false })).toBe(
+      "120 fps (144 fps not granted: this host hasn't shown it can sustain that rate yet)",
+    )
+  })
+
   it('words the reasons P2b added', () => {
     expect(describeFrameRateReason('refresh')).toBe("the host's screen refreshes slower than that")
     expect(describeFrameRateReason('denied')).toContain('turned that rate off')

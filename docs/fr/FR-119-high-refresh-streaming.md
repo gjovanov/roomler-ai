@@ -75,6 +75,11 @@ The agent answers every ask in `rc:video-info` with what the stream runs at and,
 why: `fps_reason` is `constrained` or `unproven` in P1, and P2 adds `refresh`, `pipe` and `denied`. A viewer
 that asked for 120 and sees 60 is told why, as FR-108 tells the display-match refusal.
 
+Since P2b-18 (§4.19) a refused ask **steps down one rate at a time** instead of falling back to the cap. A refused
+144 runs at 120 when nothing refuses 120, as a trial if 120 has no verdict yet, and the viewer is still told why
+144 was not granted. A 120 that is refused too goes to the cap. A relay refuses every rate above its cap, so it
+never steps down.
+
 ### 3.3 The rate class: proven by a session, never assumed
 
 What fps a host sustains depends on its capture backend, panel refresh, encoder and geometry. It is a **cell**,
@@ -90,11 +95,12 @@ and as with encoder cells, the probe proves an open and only a session proves th
   window whose content changed slower than the rate (a 60 fps video, a browser page held at 60 on a 120 Hz panel)
   while the encoder kept up concludes nothing and starts over (P2b-2, §4.4). (The first draft said 60 s at
   ≥ 0.9 × the target; P2b-1 measured that rule against event-driven capture and replaced it, §4.3.)
-- A class that fails is not granted again until the build, the hardware or the knobs change.
+- A class that fails is not granted again for an hour (P2b-17a, §4.17), or until the build, the hardware or the
+  knobs change.
 - `fps_deny` (`name:fps`, the `encoder_cells_deny` shape) removes classes. It is honoured at **every** entry
   point (the grant and the trial), pushable through remote config with `MANAGE_AGENTS`, and only ever removes.
 - The first grant on an unproven host is a **trial**, never a promise. The viewer's picker says "trial", and
-  the stream goes back to 60 if the trial fails.
+  if the trial fails the stream steps down one rate (P2b-18, §4.19): 144 to 120, then 60.
 
 ### 3.4 The encoder and the rate law
 
@@ -149,7 +155,7 @@ sequenceDiagram
 |---|---|---|---|
 | P0 | **Measure first.** (a) A µs pts unit test that is red on master's ms rule (two frames 0.5 ms apart). (b) L0 cells at 120 and 144 fps on the synthetic source: cadence and pts. (c) The vendored webrtc-rs data-channel throughput ceiling, measured in process over loopback (`agents/roomlerd/tests/dc_throughput.rs`), which decides D2's transport. (d) α, from a constant-quality run at 60 and 120 fps. (a) and (b) need P2's changes to mean anything, so they land with P2 as red → green tests | none: tests and measurements | **(c) measured** (§4.1, §8); **(d) measured offline** (§8): α ≈ 0–0.8, and 0.8 is used; **(a) red → green with P2a** (§4.2); (b) owed with P2b |
 | P1 | **The wire.** `fps-high`, `rc:fps`, and the answer in `rc:video-info`, plus the viewer's picker. The agent grants nothing above today's cap yet: every ask is answered at that cap, with `fps_reason` `"unproven"` (or `"constrained"`) | `ROOMLERD_FPS_HIGH`, or the `fps_high` config key since P2b-3 (default OFF): no `fps-high` in the hello, so no viewer asks | **built** (§4.1); the host's `refresh_hz` is reported since P2b-3 (§4.5) |
-| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. **P2b-9 built** (§4.11): the macOS daemon's launchd job is Interactive, so the session worker it spawns no longer runs throttled; found on AC4's fourth attempt. **P2b-10 to P2b-12 built** (§4.12): NVENC splits a frame across its engines above 60 fps, the conversion writes straight into a pooled frame on a persistent pool, and the decision's log line names its refusal; found on the first Windows run. **P2b-13 built** (§4.13): on a direct path, a window whose only blocked sends were keyframes is not a capacity measurement; found on the same run. **P2b-14 built** (§4.14): a direct window with any blocked keyframe is not one either, and a trial fails only when the encoder spaced the frames; both found on the second Windows run. **P2b-15 built** (§4.15): above 60 the Windows capture session's `MinUpdateInterval` is lowered from Windows' 16 ms, which had held every Windows session at ~58 fps; found on the third. **P2b-16 built** (§4.16): an NVENC session above 60 holds the GPU clock pin, graphics and now memory, by default; an SCM worker leases it from the SYSTEM host; found on the fourth, proven on the fifth (§8). **P2b-17a built** (§4.17): a `Failed` trial holds for an hour, not the cache's week. **P2b-17b built** (§4.18): the viewer can ask to try a refused rate again (`fps-retry`). Its field proof is P3 |
+| P2 | **The encoder and the gate.** µs pts, the fps swap, the ceiling law, the slot-first gate above 60, the rate-class cache and trial, `fps_deny` | the same switch; `fps_deny` | **P2a built** (§4.2): µs pts and the rate law, both byte-identical at and below 60. **P2b-1 built** (§4.3): the grant, the rate class and its trial, `fps_deny`, the rate-class cache. **P2b-2 built** (§4.4): the fps swap, a capture pace that moves without a reopen, the slot-first gate above 60, the wiring. **P2b-3 built** (§4.5): the screen's refresh rate, `fps_deny` in config and remote config, the viewer's words. **P2b-4 built** (§4.6): the viewer-rate cap follows a rate move up, found on P3's first direct run. **P2b-5 built** (§4.7): the macOS capture period runs from the ask, found on the same run. **P2b-6 built** (§4.8): above 60 the scrap backend paces its asks with the bucket, found on P2b-5's first after. **P2b-7 built** (§4.9): the viewer measures decode health in time, not frames. **P2b-8 built** (§4.10): the evidence gate runs on every window, rejects the transport's opening, and reads whole windows. Both found on AC4's third attempt. **P2b-9 built** (§4.11): the macOS daemon's launchd job is Interactive, so the session worker it spawns no longer runs throttled; found on AC4's fourth attempt. **P2b-10 to P2b-12 built** (§4.12): NVENC splits a frame across its engines above 60 fps, the conversion writes straight into a pooled frame on a persistent pool, and the decision's log line names its refusal; found on the first Windows run. **P2b-13 built** (§4.13): on a direct path, a window whose only blocked sends were keyframes is not a capacity measurement; found on the same run. **P2b-14 built** (§4.14): a direct window with any blocked keyframe is not one either, and a trial fails only when the encoder spaced the frames; both found on the second Windows run. **P2b-15 built** (§4.15): above 60 the Windows capture session's `MinUpdateInterval` is lowered from Windows' 16 ms, which had held every Windows session at ~58 fps; found on the third. **P2b-16 built** (§4.16): an NVENC session above 60 holds the GPU clock pin, graphics and now memory, by default; an SCM worker leases it from the SYSTEM host; found on the fourth, proven on the fifth (§8). **P2b-17a built** (§4.17): a `Failed` trial holds for an hour, not the cache's week. **P2b-17b built** (§4.18): the viewer can ask to try a refused rate again (`fps-retry`). **P2b-18 built** (§4.19): a refused ask steps down one rate at a time, 144 → 120 → 60, each rate on a trial of its own, and a retry walks the step down again (the operator's rule, 2026-10-27). Its field proof is P3 |
 | P3 | **D1, the first cells.** The MacBook host (VideoToolbox, ProMotion) to a 120 Hz-or-faster viewer, direct. Then the Windows cells as FR-118 lands them | the same | **run 1, 2026-10-23** (§8): AC3's relay half verified on the MacBook. AC4 not run, because that viewer relayed every session. On a two-half Mac, `fps_high` reaches the session only with FR-43's #2758 (0.4.155). **Run 2, 2026-10-23** (§8): #2758 verified on 0.4.155. AC4 attempt 2, direct from Edge at the Mac's native size, was granted 120 and then taken back by the pipe; it found P2b-4 and P2b-5. **Run 3** (§8): AC4 attempt 3 on 0.4.158 found P2b-7 and P2b-8. **Run 4, 2026-10-23/24** (§8): on 0.4.160 the grant held 120 for 15 minutes, but read at the viewer (§8.1) the cadence missed (p99 19–20 ms). A launchd experiment found P2b-9; with it, 65 of 76 windows passed both clauses. **Run 5, 2026-10-24** (§8): on 0.4.162, which ships P2b-9, **AC4 met**: 120 fps in every 60 s window, p99 at the viewer 14.4–17.3 ms, 65 of 104 windows under 16.7 |
 | P4 | **D2: 4K at 144**, after FR-118's cells and P0(c)'s transport verdict | the same | — |
 | P5 | Docs and the final field table | — | — |
@@ -844,6 +850,35 @@ P2b-17a bounds a starved trial's refusal at an hour. This lets the person end it
   verdict a retry could change: a relay, the screen's refresh, a denial and the pipe all stand. It re-sends the
   current pick with `retry` (`setFrameRate(pick, true)`).
 
+### 4.19 P2b-18 — a refused ask steps down one rate at a time, as built (2026-10-27)
+
+Found on the MacBook's runs of 2026-10-26 (§8). HEVC at 2560×1600 cannot hold 144 on neo16: four trials reached
+101–131 fps. The same host proved 120 that morning, yet each failed 144 trial dropped the stream to 60, half the
+rate the host had shown it can hold. The operator's rule, 2026-10-27: "from 144 go down to 120, if still unstable,
+go to 60".
+
+- **The grant walks down `CHOICES`** (`encode/frame_rate.rs`, `grant` and `GrantInputs::refusal_at`). When the ask
+  is refused, the highest offered rate below it and above the cap that nothing refuses is granted instead. The
+  viewer is still told why the ask was refused: `"fps":120,"fps_asked":144,"fps_reason":"unproven"`.
+- **Each rate proves itself.** A rate with no verdict runs as a trial of its own class (`ClassKey::at`), and its
+  verdict is cached under that rate. A 120 that fails steps down again, to the cap. A proven 120 runs without a
+  trial, so the next session starts at 120 at once.
+- **Every reason about the rate steps down; the path does not.** A 120 Hz screen, a deny entry naming 144, or a
+  pipe that covers 120's ceiling but not 144's each run the session at 120. A relay refuses every rate above its
+  cap.
+- **The pump checks each rate from the ask down** (`rate_facts`): that rate's deny entry, and its own ceiling
+  against the pipe's push-back. The edit to `peer.rs` is line-neutral.
+- **A failed open steps down too** (`RateState::open_failed`): the rate that did not open is the granted one.
+- **A retry walks the step down again from the top** (`decide_with_retry`). "Try 144 fps again" forgets the failed
+  verdicts of every rate from the ask down to the cap, so a 144 that falls short again tries 120 before the cap. A
+  proven rate stays proven.
+- **The viewer** (`frameRate.ts`) reads "120 fps on trial (144 fps not granted: …)" while the rate below a refused
+  ask runs as a trial.
+- **Tests.** Six new and two changed in `frame_rate.rs`. Planted faults turn them red: the step down turned off
+  (six red), a retry that forgets only the asked rate (one), and a trial that judges the asked rate's class (two).
+- **Not built:** using a failed trial's measured rate to skip a rate, although a 144 trial at 101 fps says 120
+  would fail too. Each rate pays its own 10 s trial instead, which is simpler and is the operator's rule.
+
 ## 5. Acceptance criteria
 
 - [ ] **AC1 — P0 measured.** The pts test is red on master and green after P2. L0's 120 and 144 cells hold their
@@ -868,9 +903,10 @@ P2b-17a bounds a starved trial's refusal at an hour. This lets the person end it
   p99 of 19–20 ms at the viewer (AC4 attempt 4).
 - [ ] **AC5 — the rate law.** At 60 fps the ceiling is byte-identical to today's at every geometry (a table
   test). At 120 and 144 it follows the measured α and the class band top.
-- [ ] **AC6 — trial and denial.** A host that cannot sustain 120 falls back to 60 once its trial has seen 10 s of
-  moving content, reports `unproven`, and is not trialled again for an hour (P2b-17a, §4.17; a week before), or until
-  its build, hardware or knobs change. A denied class is never granted, at either entry point. Tests on both.
+- [ ] **AC6 — trial and denial.** A host that cannot sustain a rate steps down one rate at a time (144 → 120 → 60;
+  P2b-18, §4.19; straight to the cap before) once each trial has seen 10 s of moving content, reports `unproven`
+  for the ask, and does not trial a failed rate again for an hour (P2b-17a, §4.17; a week before), or until its
+  build, hardware or knobs change. A denied class is never granted, at either entry point. Tests on both.
 - [ ] **AC7 — latency does not get worse.** L4 on AC4's pair at 120 vs 60: p50 and p95 no higher at 120.
 - [ ] **AC8 — docs.** `docs/remote-control.md` (the frame-rate classes, the gate, the wire), `docs/rate-control.md`
   (the ceiling law above 60), `docs/ui.md` (the picker). Linked from `docs/README.md`.
