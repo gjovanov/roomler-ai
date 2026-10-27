@@ -10,6 +10,14 @@
 # warnings, so holding one of these across an await fails the build for this
 # crate. Clippy reads the nearest clippy.toml upward from the crate's manifest,
 # so this file binds this crate only.
+#
+# A guard released with `drop()` still counts: a value that was borrowed stays in
+# the future's state until its scope ends. Put the guard in a block that ends
+# before the await.
+#
+# ⚠️ clippy 1.95 can panic while rendering this lint's findings when stderr is
+# not a terminal (the build still fails). `cargo clippy --message-format=short`
+# lists every finding without the snippets.
 await-holding-invalid-types = [
     { path = "dashmap::mapref::one::Ref", reason = "clone what the await needs and drop the guard first (FR-127 P1.1)" },
     { path = "dashmap::mapref::one::RefMut", reason = "clone what the await needs and drop the guard first (FR-127 P1.1)" },
