@@ -5802,7 +5802,7 @@ async fn encoder_smoke_cmd(
             height: h,
             stride: w * 4,
             pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (i as u64) * 33_333,
             monitor: 0,
             damage: roomlerd::capture::Damage::Unknown,
@@ -5927,7 +5927,7 @@ async fn encoder_reconfigure_sweep_cmd(
             height: h,
             stride: w * 4,
             pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (n as u64) * 33_333,
             monitor: 0,
             damage: roomlerd::capture::Damage::Unknown,
@@ -6370,7 +6370,7 @@ async fn capture_smoke_cmd(
         let mut out = Vec::with_capacity(w * h * 3 + 32);
         out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
         for y in 0..h {
-            let row = &frame.data[y * stride..y * stride + w * 4];
+            let row = &frame.cpu()[y * stride..y * stride + w * 4];
             for x in 0..w {
                 // BGRA in memory -> RGB on the wire.
                 out.push(row[x * 4 + 2]);

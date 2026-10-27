@@ -496,7 +496,7 @@ fn payload_to_frame(payload: FramePayload, monitor: u8, start: Instant) -> Frame
         height: payload.height,
         stride: payload.stride,
         pixel_format: PixelFormat::Bgra,
-        data: payload.bgra,
+        data: payload.bgra.into(),
         monotonic_us,
         monitor,
         damage: payload.damage,
@@ -1068,7 +1068,7 @@ mod tests {
         assert!(frame.width > 0);
         assert!(frame.height > 0);
         assert_eq!(frame.pixel_format, PixelFormat::Bgra);
-        assert_eq!(frame.data.len(), (frame.width * frame.height * 4) as usize);
+        assert_eq!(frame.cpu().len(), (frame.width * frame.height * 4) as usize);
         assert_eq!(frame.stride, frame.width * 4);
     }
 
