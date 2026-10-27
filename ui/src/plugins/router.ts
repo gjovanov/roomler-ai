@@ -5,6 +5,7 @@ import type { RouteRecordRaw } from 'vue-router'
 import { looksSignedIn } from '@/api/session'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useHiveStore } from '@/stores/hive'
+import { PAIR_PATH, takePendingPair } from '@/utils/pairing'
 import type { ModuleId } from '@/modules/registry'
 
 declare module 'vue-router' {
@@ -104,6 +105,22 @@ const routes: RouteRecordRaw[] = [
     path: '/invite/:code',
     name: 'invite',
     component: () => import('@/views/invite/InviteLandingView.vue'),
+  },
+  {
+    // FR-129 A2 — where an installer sends the person: "open roomler.ai/pair
+    // and type the code on your screen". No `meta.auth`: someone with no
+    // account yet lands here, and the page itself offers sign-in and
+    // sign-up (the invite landing's shape). No `meta.guest`: a signed-in
+    // user is the one who approves. Gated on `fleet`, which owns pairing,
+    // exactly as the consent landing below is.
+    // ⚠️ No `:code` param and no query: the link never carries the code
+    // (decision 1) — a pre-filled link is what a phishing message carries,
+    // and typing the eight letters is the person saying "this is the device
+    // in front of me".
+    path: '/pair',
+    name: 'pair',
+    component: () => import('@/views/pair/PairView.vue'),
+    meta: { module: 'fleet' },
   },
   {
     // Public owner-consent landing (Phase 4). No `meta.auth` — the token in the
@@ -427,6 +444,11 @@ router.beforeEach((to, _from, next) => {
     ) {
       sessionStorage.removeItem('pending_redirect')
       next(pendingRedirect)
+    } else if (takePendingPair()) {
+      // FR-129 A2 — a pairing is waiting for this browser (localStorage, so
+      // it survives the tab change an email activation makes). The
+      // destination is a literal, not a stored URL: nothing to validate.
+      next(PAIR_PATH)
     } else {
       next({ name: 'dashboard' })
     }
