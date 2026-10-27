@@ -157,8 +157,7 @@ mod vault_render;
 mod vault_request;
 pub mod view;
 /// FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's worker, the
-/// daemon's supervised child (Unix first; Windows is P8-2b).
-#[cfg(unix)]
+/// daemon's supervised child (P8-2b-1: on Windows too).
 mod worker;
 mod workspace;
 
@@ -186,5 +185,4 @@ pub use view::{
     SearchGrant, ViewGrant, handle_search_grant, handle_view_close, handle_view_grant,
     handle_view_ice, handle_view_offer, handle_view_renew,
 };
-#[cfg(unix)]
 pub use worker::{worker_args, worker_main};

@@ -2,9 +2,11 @@
 // Copyright (C) 2026 G ROX EOOD
 use std::sync::Mutex;
 
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tracing_subscriber::layer::SubscriberExt;
 
+#[cfg(unix)]
 use super::super::recv;
 use super::*;
 
@@ -140,6 +142,7 @@ fn a_line_past_its_bound_is_cut_at_a_character() {
 
 /// A line that finds the worker's queue full is dropped, never waited on,
 /// and counted; after the next line that crosses, a line says how many.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_full_queue_drops_a_line_and_after_the_next_a_line_says_how_many() {
     let lines = logged(1, || {
@@ -250,7 +253,7 @@ fn a_workers_line_is_one_line_in_the_daemons_log() {
 
 /// A value the worker holds names nothing in a line, logged by mistake as
 /// it may be.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 #[test]
 fn a_value_logged_by_mistake_names_nothing() {
     use crate::hive::vault_connect::handed::Secret;

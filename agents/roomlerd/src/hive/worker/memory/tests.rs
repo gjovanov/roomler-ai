@@ -119,7 +119,11 @@ async fn a_worker_runs_in_a_bounded_cgroup_of_its_own_where_the_unit_delegates_o
     };
     let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let (_ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
-    let mut running = super::super::Spawn::spawn(&program, theirs, theirs_d).unwrap();
+    let theirs = super::super::Theirs {
+        ch: theirs,
+        descriptors: theirs_d,
+    };
+    let mut running = super::super::Spawn::spawn(&program, theirs).unwrap();
     let pid = running.pid().unwrap();
     let theirs = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
     let path = v2_path(&theirs).unwrap().to_string();
