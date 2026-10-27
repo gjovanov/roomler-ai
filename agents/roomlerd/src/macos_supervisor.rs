@@ -353,6 +353,22 @@ pub fn stdin_handoff(secret: &str) -> String {
     format!("{secret}\n{LIFELINE_LINE}\n")
 }
 
+/// #2987 — how long a worker whose daemon is gone gives its own graceful stop
+/// before it forces the exit. That stop takes a few seconds at most (the
+/// runtime alone has a 3 s budget). Nothing else will ever stop the process,
+/// because its supervisor is what is gone.
+pub const LIFELINE_BACKSTOP: Duration = Duration::from_secs(15);
+
+/// #2987 — how long the reap waits after its SIGTERM before a SIGKILL. Longer
+/// than [`LIFELINE_BACKSTOP`] on purpose. When the next daemon reaps a worker
+/// of this release, that worker is already in its own clean stop, and it does
+/// not hear the SIGTERM, because the select that listened for it has ended.
+/// Killing it before that stop writes the clean-run mark would count a crash
+/// on the person's own config, and three crashes in ten minutes start a
+/// rollback there.
+pub const REAP_GRACE: Duration = Duration::from_secs(LIFELINE_BACKSTOP.as_secs() + 5);
+const _: () = assert!(REAP_GRACE.as_secs() > LIFELINE_BACKSTOP.as_secs());
+
 /// How a worker's watch over its stdin ended (#2987).
 #[derive(Debug)]
 pub enum LinkEnd {
@@ -815,6 +831,17 @@ mod imp {
         pids.len()
     }
 
+    /// #2987 — the reap, plus what it owes launchd. While a stale worker held
+    /// the lock, launchd's own worker may have exited 0, and
+    /// `KeepAlive{SuccessfulExit=false}` never retries that. With the
+    /// LaunchAgent loaded, the next poll is `LaunchdOwns`, which kickstarts
+    /// only a debt. So a reap that stopped anything owes one.
+    async fn reap_and_owe(exe: &std::path::Path, kickstart_debt: &mut u32) {
+        if reap_stale_workers(exe).await > 0 && console_uid().is_some_and(launch_agent_loaded) {
+            *kickstart_debt = KICKSTART_RETRIES;
+        }
+    }
+
     /// `ps` once, read through [`stale_workers`]. If `ps` fails, nothing is
     /// found, which leaves things as they were before #2987.
     fn find_processes(command: &str) -> Vec<(u32, u32)> {
@@ -848,9 +875,9 @@ mod imp {
         }
     }
 
-    /// SIGTERM, then the same 2 s grace [`stop_worker`] gives, then SIGKILL
-    /// for whatever is left. These processes are not our children, so we
-    /// cannot wait for them: `kill(pid, 0)` tells us whether they are alive.
+    /// SIGTERM, then up to [`REAP_GRACE`], then SIGKILL for whatever is left.
+    /// These processes are not our children, so we cannot wait for them:
+    /// `kill(pid, 0)` tells us whether they are alive.
     async fn stop_processes(pids: &[u32]) {
         // SAFETY: signal 0 delivers nothing; it only asks whether the pid
         // exists.
@@ -861,7 +888,7 @@ mod imp {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
         }
-        for _ in 0..20 {
+        for _ in 0..REAP_GRACE.as_millis() / 100 {
             if !pids.iter().any(|&p| alive(p)) {
                 return;
             }
@@ -870,6 +897,7 @@ mod imp {
         for &pid in pids.iter().filter(|&&p| alive(p)) {
             tracing::warn!(
                 pid,
+                grace_secs = REAP_GRACE.as_secs(),
                 "macOS supervisor: a stale GUI worker outlived SIGTERM; killing it"
             );
             // SAFETY: as above.
@@ -918,12 +946,6 @@ mod imp {
             exe = %exe.display(),
             "macOS GUI-worker supervisor ON (FR-43 P1) — stands down whenever the LaunchAgent is loaded"
         );
-        // #2987 — a worker a previous daemon left behind holds the person's
-        // single-instance lock, and every worker we spawn would exit 0 at once.
-        // We hold none yet, so every supervised worker running now is someone
-        // else's.
-        reap_stale_workers(&exe).await;
-
         let mut worker: Option<(u32, Child, Instant)> = None;
         let mut backoff = BACKOFF_MIN;
         let mut fast_exits: u32 = 0;
@@ -936,6 +958,11 @@ mod imp {
         // comment on a `let` is an `unused_doc_comments` warning, and this
         // module compiles only in the macOS lane, where warnings are denied.)
         let mut kickstart_debt: u32 = 0;
+        // #2987 — a worker a previous daemon left behind holds the person's
+        // single-instance lock, and every worker we spawn would exit 0 at once.
+        // We hold none yet, so every supervised worker running now is someone
+        // else's.
+        reap_and_owe(&exe, &mut kickstart_debt).await;
 
         loop {
             // Reap first, so `worker_uid` reflects reality this tick.
@@ -982,15 +1009,13 @@ mod imp {
                 hold_lifeline(None);
                 // #2987 — a worker that exits 0 at once found another roomlerd
                 // holding the person's single-instance lock. If that one is a
-                // worker a previous daemon left behind, stop it: the lock is
-                // then free, and this exit was not the worker's fault, so it
-                // does not count towards giving up.
-                if ran < HEALTHY_RUN
-                    && end == Some(WorkerEnd::Code(0))
-                    && reap_stale_workers(&exe).await > 0
-                {
-                    fast_exits = 0;
-                    backoff = BACKOFF_MIN;
+                // worker a previous daemon left behind, stop it, so the next
+                // spawn finds the lock free. The exit still counts towards
+                // giving up: resetting the count after a reap would let two
+                // spawners of `run --supervised` (two root daemons on
+                // different configs) stop each other's workers forever.
+                if ran < HEALTHY_RUN && end == Some(WorkerEnd::Code(0)) {
+                    reap_and_owe(&exe, &mut kickstart_debt).await;
                 }
                 last_end = end;
                 wait_until = Some(Instant::now() + backoff);

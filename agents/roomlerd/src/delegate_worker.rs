@@ -80,7 +80,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::delegate::DelegateFrame;
 use crate::delegate::WorkerInbound;
 use crate::delegate::write_frame;
-use crate::macos_supervisor::LinkEnd;
+use crate::macos_supervisor::{LIFELINE_BACKSTOP, LinkEnd};
 use roomler_ai_remote_control::signaling::ClientMsg;
 
 /// How often the worker proves the channel is alive.
@@ -97,12 +97,6 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 /// a minute of a feature not working.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// #2987 — how long the worker's own graceful stop may take, once its daemon
-/// is gone, before it forces the exit. That stop takes a few seconds at most
-/// (the runtime alone has a 3 s budget). Nothing else will ever stop this
-/// process, because its supervisor is what is gone.
-const LIFELINE_BACKSTOP: Duration = Duration::from_secs(15);
 
 /// What this worker tells the daemon it can do: the capture grants it holds
 /// (FR-43 P2c) and, FR-85 P1e-mac, its `record` caps — the DEVICE's row
@@ -498,9 +492,13 @@ fn start_stdin_link(
 /// The daemon that held the other end of our stdin is gone (#2987).
 ///
 /// Leave through the agent's own graceful door, the internal shutdown an
-/// update uses. It marks the run clean, so the crash-and-rollback ladder never
-/// counts it. It is not an OS stop, so an ephemeral device does not unenroll:
-/// the next daemon spawns a fresh worker on the same enrollment.
+/// update uses. A stop that completes marks the run clean, so the
+/// crash-and-rollback ladder never counts it. It is not an OS stop, so an
+/// ephemeral device does not unenroll: the next daemon spawns a fresh worker
+/// on the same enrollment. The backstop's exit is unclean, and is meant to
+/// be: it fires only when the stop wedged. The next daemon's reap waits longer
+/// than the backstop ([`crate::macos_supervisor::REAP_GRACE`]), so it never
+/// cuts a stop that is still running.
 fn daemon_gone(stop: &tokio::sync::watch::Sender<bool>) -> ! {
     tracing::warn!(
         "delegation: our daemon is gone (its end of our stdin closed); stopping, so the next \
