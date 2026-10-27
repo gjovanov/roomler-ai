@@ -43,7 +43,9 @@ TestApp — enrollment, sessions, tunnels, overlay joins, exec.
 Coverage areas: auth · tenant (+archive) · member · role · room/channel · message ·
 reaction · recording · file · invite · notification · oauth · billing ·
 multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · conference
-(+messages) · cluster · stats · relay-region · remote-control · agent
+(+messages, +the FR-127 view: a view client's video consumers against its `media:view`
+reports, the viewer's pause against the owner's, the kill switch, a report through the
+other pod) · cluster · stats · relay-region · remote-control · agent
 (+e2e, +crash, +exec, +presence) · overlay · tunnel · hive.
 
 > [!NOTE]

@@ -55,8 +55,8 @@ The media protocol already has a close pair, and this is the same shape:
 | `media:producer_closed` (server→peers) `crates/api/src/ws/handler.rs:1355` | `media:producer_paused` |
 | `handle_media_producer_close` `crates/api/src/ws/handler.rs:1311` | `handle_media_producer_pause` |
 | `RoomManager::close_producer` `crates/services/src/media/room_manager.rs:439` | `pause_producer` |
-| client sends at `ui/src/stores/conference.ts:456` | alongside `toggleVideo` |
-| client handles at `ui/src/stores/conference.ts:111` | `handleProducerPaused` |
+| client sends at `ui/src/stores/conference.ts:521` | alongside `toggleVideo` |
+| client handles at `ui/src/stores/conference.ts:499` | `handleProducerPaused` |
 
 Wire (kind-agnostic, so it covers the mic indicator too):
 

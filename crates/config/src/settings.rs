@@ -365,7 +365,9 @@ impl Default for DiagSettings {
     }
 }
 
-/// FR-115 P5 — `[meetings]`, env `ROOMLER__MEETINGS__*`.
+/// FR-115 P5 — `[meetings]`, env `ROOMLER__MEETINGS__*`. FR-127 adds the
+/// levers that let a meeting grow past one mediasoup worker, each its own
+/// switch, so a lever can be turned off per deployment without a release.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MeetingsSettings {
     /// A plan's meeting-length cap: a Free meeting is warned five minutes
@@ -374,16 +376,44 @@ pub struct MeetingsSettings {
     /// Env: `ROOMLER__MEETINGS__FREE_CAP`.
     #[serde(default = "meetings_default_on")]
     pub free_cap: bool,
+    /// FR-127 P1 — receive what is visible: a client that declares
+    /// `caps: ["view"]` on its `media:join` has its video consumers paused
+    /// unless its `media:view` report names the producer; audio always flows.
+    /// `false`: the server ignores `caps` and every `media:view`, every
+    /// consumer is resumed at creation as before, and the client is told
+    /// `meeting.view = false` so it stops reporting. Default **on**.
+    /// Env: `ROOMLER__MEETINGS__VISIBLE_TILES`.
+    #[serde(default = "meetings_default_on")]
+    pub visible_tiles: bool,
+    /// FR-127 P1 — Opus DTX on the client's microphone producer, announced
+    /// as `meeting.audio_dtx` in `media:transport_created`: a silent
+    /// participant then costs the worker about one packet every 400 ms
+    /// instead of fifty a second. `false`: the client produces as before.
+    /// Default **on**. Env: `ROOMLER__MEETINGS__AUDIO_DTX`.
+    #[serde(default = "meetings_default_on")]
+    pub audio_dtx: bool,
+    /// FR-127 P1 — the most tiles one `media:view` report may name; a longer
+    /// report is truncated in the order sent. A load guard (the UI's own grid
+    /// maximum is 49), not a policy. Env: `ROOMLER__MEETINGS__VIEW_MAX`.
+    #[serde(default = "meetings_default_view_max")]
+    pub view_max: usize,
 }
 
 fn meetings_default_on() -> bool {
     true
 }
 
+fn meetings_default_view_max() -> usize {
+    49
+}
+
 impl Default for MeetingsSettings {
     fn default() -> Self {
         Self {
             free_cap: meetings_default_on(),
+            visible_tiles: meetings_default_on(),
+            audio_dtx: meetings_default_on(),
+            view_max: meetings_default_view_max(),
         }
     }
 }

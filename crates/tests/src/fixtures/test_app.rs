@@ -94,6 +94,13 @@ impl TestApp {
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
             settings.database.url = url;
         }
+        // FR-127 P1 — Redis too: a dev box whose `:6379` is another project's
+        // password-protected instance runs the cluster tests against a
+        // throwaway one on another port (`NOAUTH` on the directory read made
+        // every two-pod media test build a second island). CI sets neither.
+        if let Ok(url) = std::env::var("ROOMLER__REDIS__URL") {
+            settings.redis.url = url;
+        }
         settings.database.name = db_name.clone();
 
         let mut client_options = ClientOptions::parse(&settings.database.url)
@@ -199,6 +206,13 @@ impl TestApp {
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
             settings.database.url = url;
         }
+        // FR-127 P1 — Redis too: a dev box whose `:6379` is another project's
+        // password-protected instance runs the cluster tests against a
+        // throwaway one on another port (`NOAUTH` on the directory read made
+        // every two-pod media test build a second island). CI sets neither.
+        if let Ok(url) = std::env::var("ROOMLER__REDIS__URL") {
+            settings.redis.url = url;
+        }
         settings.database.name = db_name.clone();
 
         // Apply caller's customizations
@@ -274,6 +288,13 @@ impl TestApp {
         let mut settings = Settings::load().unwrap_or_else(|_| test_settings());
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
             settings.database.url = url;
+        }
+        // FR-127 P1 — Redis too: a dev box whose `:6379` is another project's
+        // password-protected instance runs the cluster tests against a
+        // throwaway one on another port (`NOAUTH` on the directory read made
+        // every two-pod media test build a second island). CI sets neither.
+        if let Ok(url) = std::env::var("ROOMLER__REDIS__URL") {
+            settings.redis.url = url;
         }
         settings.database.name = db_name.clone();
 
