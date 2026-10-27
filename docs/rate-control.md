@@ -521,6 +521,39 @@ crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50, five moves in ten
 once and up only when the encoder clears the higher step by 2.5 fps. The hardware pace keeps margin 0 until it
 is measured on hardware ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 
+## Above 60 fps (FR-119) — the ceiling law and the pipe, per rate
+
+A viewer may ask for 120 or 144 fps, and the agent grants a rate only where the host has shown it can sustain
+it ([`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119)).
+Here is what the rate controller does differently above 60. At and below 60, every ceiling is byte-identical
+to before.
+
+**The rate law.** The ceiling is computed at `rate_law_fps` (`encode/rate_profile.rs:184`): the rate itself up to
+60, and above that the 60 fps rate scaled by `(fps / 60)^α`, with `HIGH_FPS_ALPHA = 0.8`
+(`encode/rate_profile.rs:179`). The band's top grows the same way. α is the upper envelope of FR-119 P0(d)'s
+offline measurement, where α ran from about 0 to 0.8 by codec and content. A linear law would double the bits
+at 120; a fixed band would halve them per frame.
+
+| Rate | `rate_law_fps` | Bits per frame, as a share of 60 fps |
+|---|---|---|
+| 60 | 60.0 | 1.00 |
+| 120 | 104.5 | 0.87 |
+| 144 | 120.9 | 0.84 |
+
+So 1080p at 144 gets 62.7 Mbit/s where the linear law clamped it to 48, and 2560×1600 or 4K at 144 reach the
+class top, 96.7 Mbit/s.
+
+**The pipe, per rate.** Before granting a rate the agent checks that rate's own ceiling against the session's
+pipe push-back (`pipe_covers`, `encode/frame_rate.rs:263`). Since P2b-18, a pipe that covers 120's ceiling but
+not 144's runs the session at 120 instead of the base rate. Only a push-back refuses: the FR-79 belief's
+`capacity_bps`. The belief's floor is never read as a limit. At 60 fps the floor is the content's weight at 60,
+which is always under the ceiling at 120, so read as a limit it would refuse every healthy session.
+
+⚠️ **A keyframe is not a capacity measurement** (P2b-13, P2b-14, `Reason::KeyframeBurst`,
+`encode/evidence.rs:90`). On a direct path, a window holding a blocked keyframe send is rejected as evidence.
+Before that, one ~625 KB keyframe whose send blocked for 72 ms read as 70 Mbit/s of capacity on a mesh that
+carried 311, and took 120 back on `pipe`.
+
 ## The media plan, in shadow (FR-70 M3a)
 
 FR-70's M3 moves every rate and geometry decision out of the media loop into a
