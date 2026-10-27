@@ -894,3 +894,24 @@ itself on the affected run's page. Baseline when the program started: releases t
     0.4.174.
   - Wave 30 bounds both cached-apt steps (8 min + `continue-on-error`) into the existing
     fallback. A hang now costs at most ~8 min plus a direct apt-get, and never the job.
+- 2026-10-27: **wave 30 field-verified on agent-v0.4.179** (cut by the stardesk session, with
+  #2940 on board, on one SHA for rehearsal and tag).
+  - Tag run 40554147480: the tag was pushed at 17:49:08Z and the release published at
+    17:58:18Z, **9 min 10 s** from tag to publish. That is under the ≤10 min target for the
+    second time, after 0.4.174.
+  - None of the four companion jobs has a `Compiling roomler-desktop` line: Windows EXE
+    5 min, Linux x86_64 1 min, aarch64 1 min, macOS 3 min. On 0.4.174's tag they had spent
+    114–149 s on it.
+  - Both cached-apt steps finished well inside their new bound: 7 s for the daemon .deb
+    and 6 s for the companion .deb. The aarch64 jobs use the uncached step (22 s and 43 s).
+  - All 8 build jobs carry the reuse notice. The four daemon jobs printed `reused build
+    reports 'roomlerd 0.4.179' (want 0.4.179): OK`. The MSI's ProductVersion reads 0.4.179,
+    and its G ROX LTD Authenticode signature is valid.
+  - Tags in between, all with the reuse held, as their cutters reported:
+    - 0.4.176 (2e) lost its first MSI attempt at "Sign MSIs": `azure/login` could not fetch
+      the OIDC token. A re-run of the failed jobs published it.
+    - 0.4.178 (df) took 15.0 min from tag to publish, before wave 30: MSI 6.8 min,
+      companion EXE 5.8.
+  - Next on this lane is FR-123 P2 (#2999, merged as `ae5ca6f6e`): the daemon compiles as
+    one unit, measured −14 % on Windows and −30 % on macOS on the rehearsal's critical
+    path. Its field check is 0.4.180's rehearsal.
