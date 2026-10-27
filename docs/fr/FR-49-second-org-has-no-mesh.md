@@ -44,8 +44,8 @@ device is genuinely, silently absent from the second org's mesh, and:
 
 | Surface | What it shows | What it omits |
 |---|---|---|
-| `roomlerd enroll` output (`main.rs:1821`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
-| `roomlerd org ls` (`main.rs:2000`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
+| `roomlerd enroll` output (`main.rs:1824`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
+| `roomlerd org ls` (`main.rs:2003`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
 | `roomler status` (`localapi::OrgStatus`) | label · agent id · enabled · connected · stopped · update-ignored | **no overlay field** — the org's WS *is* connected, so it reads healthy |
 | `roomler peers` (`localclient.rs:1417`) | one `── org: <label> ──` section per org **that has peers** | an overlay-off org produces **no section at all** — identical to an org whose peers are simply offline |
 | the dashboard | the device row, online | it is the server's view; the server was never told |

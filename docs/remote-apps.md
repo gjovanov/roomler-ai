@@ -446,7 +446,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1092`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:6038`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:6041`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
