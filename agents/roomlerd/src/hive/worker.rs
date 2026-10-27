@@ -19,7 +19,7 @@
 //! | a restart | after a wait that doubles with each start still inside [`Timing::loop_window`], to a ceiling; [`Timing::loop_max`] starts within it, and the daemon gives up on this run's worker rather than start another |
 //! | the stop | `bye`, and the channel's end awaited within a grace, then a kill |
 //! | the daemon's end | the worker's too: it ends at its channel's end, and the channel is close-on-exec on both sides, so only the daemon holds the other end |
-//! | limits | P8-2a-3 — set as it starts: a core limit of 1 byte, so it never dumps core, even where a helper takes the dump; at most [`MAX_OPEN_FILES`] descriptors. No limit on address space: glibc reserves 64 MiB a thread for its arenas, so a cap fails healthy threads long before a runaway |
+//! | limits | P8-2a-3 — set as it starts: a core limit of 1 byte, so it never dumps core, even where a helper takes the dump; at most [`MAX_OPEN_FILES`] descriptors. No limit on address space: glibc reserves 64 MiB a thread for its arenas, so a cap fails healthy threads long before a runaway. P8-2a-7 — on Linux, where the service delegates a cgroup, its memory in a cgroup of its own, bounded and off swap (`worker/memory.rs`) |
 //!
 //! ⚠️ Giving up ends the run, with the reason: where the device's owner
 //! turned workers on, what has moved runs in a worker or not at all, never
@@ -454,6 +454,12 @@ pub(crate) trait Spawn: Send + Sync {
         theirs: std::os::unix::net::UnixStream,
         descriptors: std::os::unix::net::UnixStream,
     ) -> std::io::Result<Box<dyn Running>>;
+
+    /// P8-2a-7 — what has to be ready before this spawner's first worker:
+    /// nothing, for a test's.
+    fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 /// A worker as a child process: `program` with `args`, its channel dup'ed
@@ -523,12 +529,23 @@ impl Spawn for Program {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
-        // SAFETY: between fork and exec only an async-signal-safe call:
-        // dup2. Every descriptor the daemon makes is close-on-exec, so the
-        // channels, moved onto fd 3 and fd 4 without that flag, are the ones
-        // that cross.
+        // P8-2a-7 — the cgroup it runs in, where its memory is bounded: made
+        // now, joined by the child itself before it runs a step of its own.
+        #[cfg(target_os = "linux")]
+        let mut slot = memory::slot()?;
+        #[cfg(target_os = "linux")]
+        let join = slot.as_ref().map_or(-1, memory::Slot::procs_fd);
+        // SAFETY: between fork and exec only async-signal-safe calls: write
+        // and dup2. Every descriptor the daemon makes is close-on-exec, so
+        // the channels, moved onto fd 3 and fd 4 without that flag, are the
+        // ones that cross.
         unsafe {
             cmd.pre_exec(move || {
+                // "0" names the writer: the child moves itself.
+                #[cfg(target_os = "linux")]
+                if join >= 0 && libc::write(join, b"0".as_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::dup2(fd, CHANNEL_FD) < 0 || libc::dup2(desc, DESCRIPTORS_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -539,7 +556,21 @@ impl Spawn for Program {
         // The daemon's copies of the worker's ends go now: they are the
         // worker's, so the channels end when the worker does.
         drop((theirs, descriptors));
+        #[cfg(target_os = "linux")]
+        let child = {
+            if let Some(slot) = slot.as_mut() {
+                slot.spawned();
+            }
+            memory::Bounded { child, slot }
+        };
         Ok(Box::new(child))
+    }
+
+    fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {
+            #[cfg(target_os = "linux")]
+            memory::prepare().await;
+        })
     }
 }
 
@@ -730,6 +761,7 @@ async fn supervise(
         });
         end_run(format!("its worker kept failing ({why})"));
     };
+    spawner.prepare().await;
     let mut starts: Vec<Instant> = Vec::new();
     loop {
         if stop.is_cancelled() {
@@ -1214,6 +1246,10 @@ mod fds;
 pub(crate) mod link;
 /// FR-90 P8-2a-5 — the worker's log, in the daemon's.
 mod log;
+/// FR-90 P8-2a-7 — a worker's memory, bounded where the service delegates a
+/// cgroup.
+#[cfg(target_os = "linux")]
+mod memory;
 
 #[cfg(test)]
 mod tests;
