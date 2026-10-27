@@ -1654,14 +1654,14 @@ mod endpoint {
             }
             drop(slot);
         };
-        // FR-90 P8-2a-2 — a session's endpoint, dialled directly, served by
-        // the session's worker where the device's owner turned workers on:
-        // the daemon keeps the listener, the leases and the close.
+        // FR-90 P8-2a-2 — a session's endpoint, served by the session's
+        // worker where the device's owner turned workers on: the daemon
+        // keeps the listener, the leases and the close. P8-2a-6 — one
+        // through another device too: the daemon keeps its flow, and the
+        // worker dials the flow's end.
         #[cfg(unix)]
         let handed = match (run, bound.handover()) {
-            (Some((session, fence)), Some((listener, at)))
-                if req.dial == crate::vault_proxy::Dial::Direct =>
-            {
+            (Some((session, fence)), Some((listener, at))) => {
                 let spec = super::handed::Spec::of(&endpoint.conf, at);
                 let reader = endpoint.reader(h.values);
                 match super::handed::hand(session, fence, spec, &listener, reader).await {
