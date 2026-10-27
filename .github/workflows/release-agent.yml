@@ -843,6 +843,10 @@ jobs:
       # prompt and no "being viewed" indicator at all (the daemon's native
       # overlay is Windows-only).
       - name: Build the desktop companion
+        # FR-6 wave 31: CARGO_LOG logs why cargo rebuilds a unit (diagnostic;
+        # see build-macos-companion).
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: cargo build -p roomler-desktop --release
 
       # FR-6 wave 29: after the job's last cargo build (cargo deb and
@@ -981,6 +985,10 @@ jobs:
           command -v cargo-generate-rpm >/dev/null || cargo install cargo-generate-rpm --locked
 
       - name: Build the desktop companion
+        # FR-6 wave 31: CARGO_LOG logs why cargo rebuilds a unit (diagnostic;
+        # see build-macos-companion).
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: cargo build -p roomler-desktop --release
 
       # FR-6 wave 29, as in build-linux-companion.
@@ -2288,8 +2296,11 @@ jobs:
         # otherwise (field report 2026-07-28). The tray graph is pure
         # Rust (agent DEFAULT features, no vcpkg /MD libs), so
         # +crt-static is safe; link-verified against the Tauri 2 stack.
+        # FR-6 wave 31: CARGO_LOG logs why cargo rebuilds a unit (diagnostic;
+        # see build-macos-companion).
         env:
           RUSTFLAGS: -C target-feature=+crt-static
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: cargo build -p roomler-desktop --release
 
       # FR-6 wave 29, as in build-linux-companion.
@@ -2415,7 +2426,17 @@ jobs:
       # `custom-protocol` is on unconditionally in its Cargo.toml, so a plain
       # `cargo build` embeds the frontend and no Tauri toolchain is needed on
       # the runner (the same reason the Windows lane uses `cargo build`).
+      #
+      # FR-6 wave 31, diagnostic only: CARGO_LOG makes cargo print WHY it
+      # rebuilds a unit ("fingerprint dirty for …", then the stale file or
+      # env var with both mtimes) and stays quiet for a fresh one. This job
+      # recompiled roomler-desktop (~2.5 min) on reused same-tree runs
+      # (0.4.179's and 0.4.180's tag runs, 0.4.180's reseed), while five
+      # probes rebuilding the same kind of seed stayed fresh. Remove it from
+      # the four companion builds once a reused run has named the reason.
       - name: Build the desktop companion
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: cargo build -p roomler-desktop --release --target aarch64-apple-darwin
 
       # FR-6 wave 29, as in build-linux-companion.
