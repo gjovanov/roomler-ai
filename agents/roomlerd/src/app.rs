@@ -4500,6 +4500,8 @@ async fn run_cmd(
         supervised,
         worker_channels,
         shutdown_rx.clone(),
+        // #2987 — a worker whose daemon is gone stops through this door.
+        shutdown_tx.clone(),
     ));
     #[cfg(not(unix))]
     let _ = supervised;

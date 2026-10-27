@@ -356,6 +356,45 @@ by hand or pushed to the per-user row. For a kill switch that is the point, sinc
 one account must not undo a switch set for the machine. To give the per-user row
 its own value, clear the root's.
 
+### A worker never outlives its daemon (#2987, 2026-10-27)
+
+The process group that lets `stop_worker` take the whole chain down is also why
+the chain survived a daemon that never reached `stop_worker`: the watchdog's
+`exit(2)` after a 69 s stall, on the operator's MacBook on 2026-10-26. The
+orphaned 0.4.174 worker kept the person's single-instance lock through the
+0.4.175 and 0.4.177 updates. Every new worker exited 0 on that lock, the
+supervisor gave up naming "no per-user enrollment", and the orphan's re-attach
+was refused as a `secret mismatch` every 30 s.
+
+| | as built |
+|---|---|
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:646`, `:530`, `:347`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:405`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:815`, `:457`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
+| **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:475`). |
+
+An adversarial review before the merge found three edges, all fixed in the same PR:
+
+| Edge | Fix |
+|---|---|
+| With a 2 s grace, the next daemon's reap could SIGKILL a worker of this release that was still in its own clean stop. The worker no longer hears the SIGTERM, so the kill came before its clean-run mark and counted a crash on the person's config. | `REAP_GRACE` exceeds `LIFELINE_BACKSTOP`, and a compile-time assert holds the order |
+| A reap that stopped something reset the give-up count. Two spawners of `run --supervised` (two root daemons on different `--config`s, each with its own lock) would then stop each other's workers forever. | The exit still counts: `MAX_FAST_EXITS` bounds it |
+| A reap with the LaunchAgent loaded left no user half. launchd's worker had exited 0 on the held lock and is never retried, and `LaunchdOwns` kickstarts only a debt. | A reap that stopped anything while the LaunchAgent is loaded owes `KICKSTART_RETRIES` |
+
+The proposal on the issue was different, and both changes were deliberate:
+
+- **Not "exit on delegation EOF plus `secret mismatch`".** The refusal is silent
+  by design (`delegate::serve` sends no reason), so the worker cannot tell a
+  refusal from a restart that is still in progress. The pipe's end-of-file is
+  certain: the kernel closes the write end when the daemon process ends, however
+  it ends.
+- **Not "record the pgid in a runtime file".** A daemon from before #2987 never
+  wrote one, so the workers already stranded in the field would stay stranded.
+  Matching the exact command line also finds those workers, and it carries no
+  stale-pid risk.
+
+Operator-facing detail, the mixed-version matrix and the remedy for a stuck
+Mac: `docs/installation.md`, "The GUI worker never outlives its daemon".
+
 ### Components
 
 | where | change |
