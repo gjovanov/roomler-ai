@@ -285,9 +285,9 @@ impl RoomManager {
 
     /// Returns a reference to the rooms DashMap (for WS handler to read router capabilities).
     ///
-    /// FR-127 P1.1 — crate-private, so every caller sits behind this crate's
-    /// await gate (`clippy.toml`). ⚠️ The gate sees only a BARE guard held across
-    /// an await; it misses one inside an `Option`, a tuple or an iterator
+    /// FR-127 P1.1 — crate-private: every caller is in this crate. ⚠️ The await
+    /// gate (the root `clippy.toml`) sees only a BARE guard held across an
+    /// await; it misses one inside an `Option`, a tuple or an iterator
     /// adapter. Read what you need into owned values in a block that ends
     /// before the await.
     pub(crate) fn rooms_ref(&self) -> &DashMap<ObjectId, MediaRoom> {
