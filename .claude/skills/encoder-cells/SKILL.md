@@ -33,6 +33,12 @@ purpose** so per-codec probe lines land in the daemon log next to the verdict.
 closed pipe, and `println!` panics there: the panic hook then filed an agent
 crash on every such update. A closed pipe now exits `EXIT_PARENT_GONE` (3) and
 records nothing.
+⚠️ **The child ends with the worker** (#2717). On Windows it joins a
+`KILL_ON_JOB_CLOSE` job that the parent holds while it waits
+(`child::tie_to_this_process`). A worker that dies mid-probe (terminated,
+crashed, or leaving at its 3 s runtime-shutdown budget, #2718) must not orphan
+a `roomlerd.exe caps-probe`. It would hold the binary an update replaces, and
+nobody would enforce the 60 s bound on a child hung in a driver.
 
 ### Anything derived from CONFIG belongs in the PARENT
 
