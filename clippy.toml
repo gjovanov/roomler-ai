@@ -1,0 +1,39 @@
+# No DashMap guard may be held across an `.await`, in any crate of the
+# workspace.
+#
+# Such a guard does not park the task holding it. It parks the THREAD of every
+# task that wants the same shard (dashmap's lock sleeps in parking_lot_core).
+# A production pod has 2 CPUs, so tokio runs 2 worker threads. Once two tasks
+# are parked behind a guard whose holder is waiting on I/O, no thread is left
+# to poll the holder, and the whole runtime stops, `/health` with it, until the
+# liveness probe kills the pod. A daemon on a 2-core device stops the same
+# way. On 2026-10-27 a burst of meeting joins did this to production through
+# `RoomManager::consume` (FR-127 P1.1, `docs/real-time.md`).
+#
+# Clone or collect what the await needs under the guard, drop the guard, then
+# await. A guard released with `drop()` still counts: a value that was borrowed
+# stays in the future's state until its scope ends, so put the guard in a block
+# that ends before the await.
+#
+# `clippy::await_holding_invalid_type` is warn-by-default and CI denies
+# warnings, so this is a build error. Clippy reads the nearest clippy.toml
+# upward from each crate's manifest, so a crate that adds its own clippy.toml
+# must repeat this list. A path that names a crate a package does not depend on
+# is ignored.
+#
+# ⚠️ clippy 1.95 can panic while rendering this lint's findings when stderr is
+# not a terminal (the build still fails). `cargo clippy --message-format=short`
+# lists every finding without the snippets.
+await-holding-invalid-types = [
+    { path = "dashmap::mapref::one::Ref", reason = "clone what the await needs and drop the guard first (root clippy.toml)" },
+    { path = "dashmap::mapref::one::RefMut", reason = "clone what the await needs and drop the guard first (root clippy.toml)" },
+    { path = "dashmap::mapref::one::MappedRef", reason = "clone what the await needs and drop the guard first (root clippy.toml)" },
+    { path = "dashmap::mapref::one::MappedRefMut", reason = "clone what the await needs and drop the guard first (root clippy.toml)" },
+    { path = "dashmap::mapref::multiple::RefMulti", reason = "collect what the await needs and drop the iterator first (root clippy.toml)" },
+    { path = "dashmap::mapref::multiple::RefMutMulti", reason = "collect what the await needs and drop the iterator first (root clippy.toml)" },
+    { path = "dashmap::mapref::entry::Entry", reason = "finish the entry before awaiting (root clippy.toml)" },
+    { path = "dashmap::mapref::entry::OccupiedEntry", reason = "finish the entry before awaiting (root clippy.toml)" },
+    { path = "dashmap::mapref::entry::VacantEntry", reason = "finish the entry before awaiting (root clippy.toml)" },
+    { path = "dashmap::iter::Iter", reason = "collect what the await needs and drop the iterator first (root clippy.toml)" },
+    { path = "dashmap::iter::IterMut", reason = "collect what the await needs and drop the iterator first (root clippy.toml)" },
+]

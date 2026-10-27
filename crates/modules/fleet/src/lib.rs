@@ -316,8 +316,17 @@ impl Module for FleetState {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    for entry in tokens.iter() {
-                        let (agent_id, token) = (*entry.key(), entry.value().clone());
+                    // A snapshot, never the live map: an iterator holds its
+                    // shard's guard, and this loop awaits Redis per agent, so
+                    // an agent arriving or leaving meanwhile (a write to that
+                    // shard) would park a tokio worker THREAD for the round
+                    // trip. Two of them on a 2-CPU pod and the runtime stops
+                    // (FR-127 P1.1; `clippy.toml` at the root holds the rule).
+                    let held: Vec<(ObjectId, String)> = tokens
+                        .iter()
+                        .map(|entry| (*entry.key(), entry.value().clone()))
+                        .collect();
+                    for (agent_id, token) in held {
                         if !hub.is_agent_online(agent_id) {
                             continue;
                         }
