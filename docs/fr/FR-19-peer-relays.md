@@ -170,7 +170,7 @@ first draft's claim that demux is *"unambiguous without a magic number"*; it is 
 | `0x01`–`0x04` (Opt Len 1–4) | **WireGuard types 1–4, every one of them** |
 
 What actually keeps WireGuard disjoint on the existing plane is a **four**-byte test —
-`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2511`) requires `pkt[1..4] == 0`, and
+`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2514`) requires `pkt[1..4] == 0`, and
 Geneve's bytes 2–3 carry a nonzero Protocol Type. One byte is not enough, and
 `payload_is_wg_or_disco` (`crates/remote_control/src/derp_frame.rs:39`) classifies on the
 first byte alone.
@@ -318,7 +318,7 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   serialise identically (IPv4 vs IPv6 forms; digits sliding into the adjacent field).
 - **Constant-time comparison, using `subtle`.** ⚠️ Every MAC compare in this tree today is a
   plain slice compare — `disco.rs:222` (whose comment says *"Constant-time-ish"* and is not),
-  `wg.rs:2550`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
+  `wg.rs:2553`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
   *"a ROUTER's pre-filter … not an authenticator"*. Here the MAC **is** the authenticator, so
   "model it on the existing one" would propagate the defect.
 - **Membership.** A node may bind only into a session naming its own key in `members`.
@@ -624,7 +624,7 @@ So the design is:
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
 `send_ip_packet` (`wg.rs:938`) as *"the send path that must learn 'via peer X'"*. It is not:
-relay carriers already get a dedicated per-peer recv task (`wg.rs:1539`) and never touch the
+relay carriers already get a dedicated per-peer recv task (`wg.rs:1542`) and never touch the
 carrier plane's shape demux. `send_ip_packet`, `send_to_peer`, `SendPeer` and the `Router`
 need **zero changes**. The first draft also pointed the receive arm at
 `CarrierPlane::route_by_index` (`carrier_plane.rs:738`) — which takes a WireGuard receiver
@@ -636,10 +636,10 @@ A new tier would additionally have required navigating four hazards, three of th
 
 | hazard | anchor | why it fails silently |
 |---|---|---|
-| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2779` makes **both ends initiate** the WG handshake, `:2745` books a direct-tier failure on demote-follow |
+| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2804` makes **both ends initiate** the WG handshake, `:2770` books a direct-tier failure on demote-follow |
 | `is_sticky` `_ =>` catch-all | `path.rs:825` | silently inherits LAN/public's 2-strike escalation |
 | `suppression_half_life` `_ =>` catch-all | `path.rs:285` | same |
-| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1409`, `:1497`, `:1569`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
+| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1431`, `:1519`, `:1591`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
@@ -666,7 +666,7 @@ evidence that justifies it.
   `relay_max_bitrate_per_session`; the relay's own carriers are exempt from its forwarding
   budget. An org must not be able to cost its HQ box its own remote access.
 - **Failure is a downgrade, never a black hole**, convicted by `sweep_carrier_health`
-  (`runtime/establish.rs:283`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
+  (`runtime/establish.rs:305`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
   failed", it was *"both ends held a hold-down and went mutually deaf"* (#746).
 - **Revocation is a push, not an expiry.** ⚠️ The first draft had no unmint at all, so
   flipping `peer_relay_mode` to `off` would have left live sessions forwarding indefinitely
@@ -721,8 +721,8 @@ Verified against `origin/master`, 2026-08-28.
 | Netmap shaping | `overlay.rs:2058` `shape_peer` |
 | Wire model | `crates/remote_control/src/signaling.rs:3304` `NetmapPeer`; `:3282` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
-| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:283` `sweep_carrier_health` |
-| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2511`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
+| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:305` `sweep_carrier_health` |
+| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2514`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
