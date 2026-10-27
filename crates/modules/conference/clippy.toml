@@ -15,6 +15,16 @@
 # the future's state until its scope ends. Put the guard in a block that ends
 # before the await.
 #
+# ⚠️ This catches the common shape, not every shape. The lint matches the type of
+# the value held, so it sees a bare guard (`let r = map.get(k)?`, `if let Some(r)`,
+# `for e in map.iter()`) but NOT a guard inside an `Option` (a `map.get(k)` kept
+# unwrapped), a `Result`, a tuple, a struct, or an iterator adapter
+# (`map.iter().map(..)`). Measured in the P1.1 review: `consume` holding an
+# `Option<RefMut>` across its worker awaits passed clippy and froze the storm
+# test. Read what the await needs into owned values first. The storm and turn
+# tests in `src/media/room_manager.rs` are the second net, for the paths they
+# drive.
+#
 # ⚠️ clippy 1.95 can panic while rendering this lint's findings when stderr is
 # not a terminal (the build still fails). `cargo clippy --message-format=short`
 # lists every finding without the snippets.

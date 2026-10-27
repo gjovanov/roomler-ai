@@ -284,7 +284,13 @@ impl RoomManager {
     }
 
     /// Returns a reference to the rooms DashMap (for WS handler to read router capabilities).
-    pub fn rooms_ref(&self) -> &DashMap<ObjectId, MediaRoom> {
+    ///
+    /// FR-127 P1.1 — crate-private, so every caller sits behind this crate's
+    /// await gate (`clippy.toml`). ⚠️ The gate sees only a BARE guard held across
+    /// an await; it misses one inside an `Option`, a tuple or an iterator
+    /// adapter. Read what you need into owned values in a block that ends
+    /// before the await.
+    pub(crate) fn rooms_ref(&self) -> &DashMap<ObjectId, MediaRoom> {
         &self.rooms
     }
 
@@ -336,9 +342,10 @@ impl RoomManager {
                     ops: Arc::default(),
                 },
             );
+            // Still under the room's guard, so a `remove_room` cannot run
+            // between the two inserts and leave this mapping behind.
+            self.connection_rooms.insert(connection_id.clone(), room_id);
         }
-
-        self.connection_rooms.insert(connection_id.clone(), room_id);
 
         debug!(?room_id, ?user_id, %connection_id, "transports created");
 
@@ -456,11 +463,17 @@ impl RoomManager {
     ) -> anyhow::Result<ProducerId> {
         // FR-127 P1.1 — produce on a cloned handle with every guard released,
         // then record the producer under a short guard (see `tests`).
-        let (send_transport, ops) = self
-            .participant(room_id, connection_id, |p| {
-                (p.send_transport.clone(), p.ops.clone())
-            })
-            .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
+        let (send_transport, ops) = {
+            let room = self
+                .rooms
+                .get(room_id)
+                .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
+            let participant = room
+                .participants
+                .get(connection_id)
+                .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
+            (participant.send_transport.clone(), participant.ops.clone())
+        };
 
         let producer_options = ProducerOptions::new(kind, rtp_parameters);
         let producer = send_transport
@@ -695,12 +708,24 @@ impl RoomManager {
                 .collect()
         };
 
+        // All the flag changes at once, not one round trip after another: the
+        // turn is held until they land, and a `media:consume` forwarded from
+        // the other pod for this viewer waits on it within the bus deadline
+        // (`RPC_DEADLINE`, 2 s). One at a time, a report flipping 49 tiles on a
+        // busy worker could outlast that, and a missed deadline prunes a live
+        // owner's claim. The requests touch different consumers, so their order
+        // does not matter.
+        let results =
+            futures::future::join_all(changes.into_iter().map(|(consumer, change)| async move {
+                let result = match change {
+                    view::Change::Resume => consumer.resume().await,
+                    view::Change::Pause => consumer.pause().await,
+                };
+                (consumer, change, result)
+            }))
+            .await;
         let (mut resumed, mut paused) = (0, 0);
-        for (consumer, change) in changes {
-            let result = match change {
-                view::Change::Resume => consumer.resume().await,
-                view::Change::Pause => consumer.pause().await,
-            };
+        for (consumer, change, result) in results {
             match result {
                 Ok(()) if change == view::Change::Resume => resumed += 1,
                 Ok(()) => paused += 1,
@@ -1293,19 +1318,59 @@ mod tests {
             .collect()
     }
 
-    async fn storm() -> Result<(), String> {
+    /// A room manager over one production-configured worker.
+    async fn manager() -> Result<Arc<RoomManager>, String> {
         let pool = WorkerPool::new(&settings())
             .await
             .map_err(|e| e.to_string())?;
-        let rm = Arc::new(RoomManager::new(Arc::new(pool), &settings()));
+        Ok(Arc::new(RoomManager::new(Arc::new(pool), &settings())))
+    }
+
+    /// The router's capabilities as a client sends them back to consume with.
+    fn client_caps(rm: &RoomManager, rid: &ObjectId) -> Result<RtpCapabilities, String> {
+        let room = rm.rooms.get(rid).ok_or("the room exists")?;
+        let finalized =
+            serde_json::to_value(room.router.rtp_capabilities()).map_err(|e| e.to_string())?;
+        serde_json::from_value(finalized).map_err(|e| e.to_string())
+    }
+
+    /// Runs `body` on a runtime of exactly [`WORKER_THREADS`] threads, in a
+    /// thread of its own, and fails the test if it has not finished within
+    /// [`DEADLINE`]: a freeze FAILS instead of hanging the suite. A body reports
+    /// a failure as an `Err`, so its message survives.
+    fn on_two_threads<F>(body: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("two-threads".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(WORKER_THREADS)
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                let _ = done.send(runtime.block_on(body()));
+            })
+            .expect("the test's thread");
+        match outcome.recv_timeout(DEADLINE) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{e}"),
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "the room manager froze: the test did not finish within {} s on {WORKER_THREADS} \
+                 worker threads, so a DashMap guard is held across an await",
+                DEADLINE.as_secs()
+            ),
+            Err(RecvTimeoutError::Disconnected) => panic!("the test's thread panicked"),
+        }
+    }
+
+    async fn storm() -> Result<(), String> {
+        let rm = manager().await?;
         let rid = ObjectId::new();
         rm.create_room(rid).await.map_err(|e| e.to_string())?;
-        let caps: RtpCapabilities = {
-            let room = rm.rooms.get(&rid).ok_or("the room exists")?;
-            let finalized =
-                serde_json::to_value(room.router.rtp_capabilities()).map_err(|e| e.to_string())?;
-            serde_json::from_value(finalized).map_err(|e| e.to_string())?
-        };
+        let caps = client_caps(&rm, &rid)?;
 
         // Everyone joins at once.
         let joins: Vec<_> = (0..PARTICIPANTS)
@@ -1425,27 +1490,179 @@ mod tests {
 
     #[test]
     fn a_burst_of_joins_on_two_worker_threads_does_not_freeze_the_runtime() {
-        let (done, outcome) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("storm".to_string())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(WORKER_THREADS)
-                    .enable_all()
-                    .build()
-                    .expect("a runtime");
-                let _ = done.send(runtime.block_on(storm()));
-            })
-            .expect("the storm thread");
-        match outcome.recv_timeout(DEADLINE) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => panic!("{e}"),
-            Err(RecvTimeoutError::Timeout) => panic!(
-                "the room manager froze: the storm did not finish within {} s on {WORKER_THREADS} \
-                 worker threads, so a DashMap guard is held across an await",
-                DEADLINE.as_secs()
-            ),
-            Err(RecvTimeoutError::Disconnected) => panic!("the storm thread panicked"),
+        on_two_threads(storm);
+    }
+
+    /// How long a test watches for an operation that must be waiting on a
+    /// participant's turn. Any return within it is a failure; a correct one
+    /// waits until the turn is released.
+    const WAITING: Duration = Duration::from_millis(300);
+
+    /// A room with a sender (`conn(0)`) publishing a camera and a view client
+    /// (`conn(1)`) that has not consumed it yet.
+    async fn one_camera_one_viewer()
+    -> Result<(Arc<RoomManager>, ObjectId, RtpCapabilities, ProducerId), String> {
+        let rm = manager().await?;
+        let rid = ObjectId::new();
+        rm.create_room(rid).await.map_err(|e| e.to_string())?;
+        let caps = client_caps(&rm, &rid)?;
+        for i in 0..2 {
+            rm.create_transports(rid, ObjectId::new(), conn(i), true)
+                .await
+                .map_err(|e| format!("join: {e}"))?;
         }
+        let camera = rm
+            .produce(
+                &rid,
+                &conn(0),
+                MediaKind::Video,
+                rtp_parameters(MediaKind::Video, 2000),
+                "camera".to_string(),
+            )
+            .await
+            .map_err(|e| format!("produce: {e}"))?;
+        Ok((rm, rid, caps, camera))
+    }
+
+    /// The turn orders one viewer's operations: a report that arrives while a
+    /// `consume` holds it waits, rather than landing between that consume's
+    /// decision and its record, where the new consumer would miss it. The test
+    /// holds the viewer's turn itself, as a consume mid-flight would.
+    #[test]
+    fn a_view_report_waits_for_the_viewers_turn() {
+        on_two_threads(|| async {
+            let (rm, rid, _, camera) = one_camera_one_viewer().await?;
+            let ops = rm
+                .participant(&rid, &conn(1), |p| p.ops.clone())
+                .ok_or("the viewer")?;
+            let turn = ops.lock().await;
+            let report = {
+                let rm = rm.clone();
+                tokio::spawn(async move {
+                    rm.apply_view(&rid, &conn(1), 1, vec![(camera, (320, 240))], 49)
+                        .await
+                })
+            };
+            tokio::time::sleep(WAITING).await;
+            if report.is_finished() {
+                return Err("a view report ran while the viewer's turn was taken".into());
+            }
+            drop(turn);
+            match report.await.map_err(|e| e.to_string())? {
+                ViewOutcome::Applied { .. } => Ok(()),
+                other => Err(format!("the report, once its turn came: {other:?}")),
+            }
+        });
+    }
+
+    /// The same order from the other side: a consume waits for a report (or
+    /// another consume) holding the viewer's turn.
+    #[test]
+    fn a_consume_waits_for_the_viewers_turn() {
+        on_two_threads(|| async {
+            let (rm, rid, caps, camera) = one_camera_one_viewer().await?;
+            let ops = rm
+                .participant(&rid, &conn(1), |p| p.ops.clone())
+                .ok_or("the viewer")?;
+            let turn = ops.lock().await;
+            let consume = {
+                let rm = rm.clone();
+                tokio::spawn(async move { rm.consume(&rid, &conn(1), camera, &caps).await })
+            };
+            tokio::time::sleep(WAITING).await;
+            if consume.is_finished() {
+                return Err("a consume ran while the viewer's turn was taken".into());
+            }
+            drop(turn);
+            consume
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("the consume, once its turn came: {e}"))?;
+            match rm.consumer_handles(&rid, &conn(1)) {
+                1 => Ok(()),
+                n => Err(format!("{n} consumers recorded, expected 1")),
+            }
+        });
+    }
+
+    /// The turn also names the participant. A consume that started for one
+    /// participant and resumes after the connection joined again (a new
+    /// participant, a new turn) records nothing: its consumer would belong to
+    /// the old participant's closed transport.
+    #[test]
+    fn a_consume_across_a_rejoin_records_nothing_for_the_new_participant() {
+        on_two_threads(|| async {
+            let (rm, rid, caps, camera) = one_camera_one_viewer().await?;
+            let ops = rm
+                .participant(&rid, &conn(1), |p| p.ops.clone())
+                .ok_or("the viewer")?;
+            let turn = ops.lock().await;
+            let consume = {
+                let rm = rm.clone();
+                tokio::spawn(async move { rm.consume(&rid, &conn(1), camera, &caps).await })
+            };
+            tokio::time::sleep(WAITING).await;
+            if consume.is_finished() {
+                return Err("a consume ran while the viewer's turn was taken".into());
+            }
+            // The viewer joins again on the same connection.
+            rm.create_transports(rid, ObjectId::new(), conn(1), true)
+                .await
+                .map_err(|e| format!("re-join: {e}"))?;
+            drop(turn);
+            match consume.await.map_err(|e| e.to_string())? {
+                Err(e) if e.to_string() == "Participant not found" => {}
+                Err(e) => return Err(format!("the old participant's consume: {e}")),
+                Ok(_) => return Err("the old participant's consume succeeded".into()),
+            }
+            match rm.consumer_handles(&rid, &conn(1)) {
+                0 => Ok(()),
+                n => Err(format!(
+                    "the new participant holds {n} consumers, expected 0"
+                )),
+            }
+        });
+    }
+
+    /// Two joins that both find no room both build a router; the first to
+    /// record its room keeps it. Before P1.1 the second's `insert` replaced a
+    /// room that could already hold the first joiner's transports.
+    #[test]
+    fn two_joins_racing_to_create_a_room_keep_one_room() {
+        on_two_threads(|| async {
+            let rm = manager().await?;
+            for round in 0..50 {
+                let rid = ObjectId::new();
+                let first = {
+                    let rm = rm.clone();
+                    tokio::spawn(async move {
+                        rm.create_room(rid).await.map_err(|e| e.to_string())?;
+                        rm.create_transports(rid, ObjectId::new(), conn(0), true)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>(())
+                    })
+                };
+                let second = {
+                    let rm = rm.clone();
+                    tokio::spawn(async move { rm.create_room(rid).await.map(|_| ()) })
+                };
+                first
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("round {round}, the first joiner: {e}"))?;
+                second
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("round {round}, the second joiner: {e}"))?;
+                let present = rm.get_participant_user_ids(&rid).len();
+                if present != 1 {
+                    return Err(format!(
+                        "round {round}: {present} participants, expected the first joiner's 1"
+                    ));
+                }
+            }
+            Ok(())
+        });
     }
 }

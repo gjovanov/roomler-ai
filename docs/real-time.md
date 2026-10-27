@@ -110,7 +110,7 @@ sequenceDiagram
 |---|---|---|
 | `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:313` |
 | `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:459`, `meeting_levers` at `:735` |
-| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:196`, the handler at `:752`, applied by `RoomManager::apply_view` (`media/room_manager.rs:641`) |
+| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:196`, the handler at `:752`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
 
 It is dispatched where `media:consume` is — through the C-4 placement gate — so a viewer
 whose socket is on the other pod reaches the owner's participant state over `media.cmd`
@@ -122,13 +122,13 @@ to end because the WS loop awaits each message in turn.
 
 | `ParticipantMedia.view` | Who | Video consumers | Audio consumers |
 |---|---|---|---|
-| `None` | a legacy client — no `caps` on its join, or the lever off | all resumed, as before P1; a `media:view` from it is ignored (`room_manager.rs:672`), never read as "show nothing" | resumed |
+| `None` | a legacy client — no `caps` on its join, or the lever off | all resumed, as before P1; a `media:view` from it is ignored (`room_manager.rs:685`), never read as "show nothing" | resumed |
 | `Some(empty)` | a view client that renders nothing yet (just joined, navigated to the mini view, its grid empty) | all paused | resumed |
 | `Some(set)` | a view client showing `set` | the named ones resumed, every other paused | resumed |
 
 The decision is pure and unit-tested (`view::wants`, `view.rs:68`; `view::plan`,
 `view.rs:97`): a consumer is created with `ConsumerOptions.paused = !wanted`
-(`room_manager.rs:576` — ⚠️ mediasoup 0.20.0 creates consumers *resumed* by default,
+(`room_manager.rs:589` — ⚠️ mediasoup 0.20.0 creates consumers *resumed* by default,
 whatever the old comment there said), and a report that names a producer before its
 consumer exists is kept and honoured at the consume.
 
@@ -154,23 +154,33 @@ sequenceDiagram
 
 P1 first shipped with `consume` holding the participant's entry across both of its round
 trips, and on 2026-10-27 a field run's joins froze a production pod that way twice before
-it was rolled back. The rule is now a build error: the crate's `clippy.toml` lists
-dashmap's guard types for `clippy::await_holding_invalid_type`, which CI's
-`-D warnings` denies. A guard dropped with `drop()` still counts, because a value that was
-borrowed stays in the future until its scope ends, so a guard lives in a block that ends
-before the await (`connect_transport`, `room_manager.rs:352`). The freeze is reproduced
-by `room_manager.rs`'s `tests` (`:1427`): a burst of joins, publishes, consumes and view
-reports in one room on exactly 2 worker threads, behind a watchdog. On the old code both
-threads park in dashmap's lock and the test fails at 60 s; fixed, the conference unit
-suite finishes in under 2 s.
+it was rolled back. Two nets now catch it, and neither catches everything:
+
+- **A build error for the common shape.** The crate's `clippy.toml` lists dashmap's guard
+  types for `clippy::await_holding_invalid_type`, which CI's `-D warnings` denies. A guard
+  dropped with `drop()` still counts, because a value that was borrowed stays in the future
+  until its scope ends, so a guard lives in a block that ends before the await
+  (`connect_transport`, `room_manager.rs:359`). ⚠️ The lint matches the type of the value
+  held, so it sees a bare guard but **not** one inside an `Option` (a `map.get(k)` kept
+  unwrapped), a `Result`, a tuple, a struct or an iterator adapter. The review measured
+  it: `consume` holding an `Option<RefMut>` across its awaits passed clippy. Read what the
+  await needs into owned values first, and `rooms_ref()` is crate-private so every caller
+  is behind the same gate.
+- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1492`). A burst of
+  joins, publishes, consumes and view reports in one room, behind a watchdog: on the old
+  code both threads park in dashmap's lock and the test fails at 60 s, and the review's
+  `Option<RefMut>` variant froze it too. Fixed, the conference unit suite finishes in under
+  2 s. Three more tests hold a participant's turn from the outside, so dropping the turn
+  or its identity check fails them deterministically, and a 50-round race of two room
+  creators checks `create_room`.
 
 What the held guards used to serialise as a side effect, three pieces now hold explicitly:
 
 | Piece | Rule | Where |
 |---|---|---|
-| the participant's `ops` turn | an async mutex that `consume` and `apply_view` hold from decision to record, so a report cannot land between a new consumer's `wanted` and its push into `consumers`; a waiter yields its thread | `room_manager.rs:67`, taken at `:525` and `:652` |
-| "the same participant" | a record step re-reads the participant and compares its `ops` to the one it started with: a participant that left meanwhile, or left and joined again on the same connection, gets nothing recorded, and the new producer or consumer is dropped, which closes it | `:475`, `:605` |
-| one room per id | two joins that both found no room each build a router, and the first to insert keeps the room; an `insert` would have replaced a room that may already hold the first joiner's transports | `create_room`, `:243` |
+| the participant's `ops` turn | an async mutex that `consume` and `apply_view` hold from decision to record, so a report cannot land between a new consumer's `wanted` and its push into `consumers`; a waiter yields its thread | `room_manager.rs:67`, taken at `:538` and `:665` |
+| "the same participant" | a record step re-reads the participant and compares its `ops` to the one it started with: a participant that left meanwhile, or left and joined again on the same connection, gets nothing recorded, and the new producer or consumer is dropped, which closes it | `room_manager.rs:488`, `:618` |
+| one room per id | two joins that both found no room each build a router, and the first to insert keeps the room; an `insert` would have replaced a room that may already hold the first joiner's transports | `create_room`, `room_manager.rs:243` |
 
 **Two pauses, two flags.** FR-30's owner pause is `Producer::pause()`, which the worker
 mirrors into every consumer's `producer_paused` and which `media:consumer_created` and the
