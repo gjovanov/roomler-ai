@@ -89,7 +89,7 @@ each a module behind the FR-69 contract (`crates/core/src/module.rs:23`); new `E
 `crates/core/src/graph.rs:15`, the forbidden pairs untouched; `hive` first in `HOOK_ORDER`
 (`crates/core/src/hooks.rs:37`), because it holds sessions. The node side is a `roomlerd` feature,
 and its user-level half is `roomlerd hive-host`, re-exec'd as the mapped user like `portal-helper`
-(`agents/roomlerd/src/main.rs:229`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
+(`agents/roomlerd/src/app.rs:229`) — no second binary. Wire frames are `rc:hive.*`, `rc:vault.*`,
 `rc:knowhow.*` owned through `namespace()` (`crates/remote_control/src/signaling.rs:2292`); new
 `RpcCap` verbs `hive`, `hive-view` (P0d-2), `hive-replica`, `vault`, `knowhow-scan`, equality-matched
 (`crates/remote_control/src/models.rs:765,757`).
@@ -1437,7 +1437,7 @@ which ran in no lane before. Nothing calls them yet. The supervisor is wired to 
 | the mapping | `hive_win.rs:564` `names_console_user` and `:577` `check_mapping`: `name`, `DOMAIN\name` or `.\name`, case-insensitively. Anything else is `no_account`, naming who is at the console | a table of 15, including `CORP\dev` ≠ `WS-1\dev`, and `.` against a domain account |
 | the harness | `hive_win.rs:604` `harness_candidates`, `:620` `resolve_harness` | `hive_harness` alone when set; else `claude.exe`, then npm's `claude.cmd`; a directory of that name is no harness |
 | its command line | `hive_win.rs:690` `harness_command_line`: an `.exe` quoted for the C runtime; a `.cmd` through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`, an argument holding one of cmd's metacharacters (`:676`, `:680`) refused, never escaped | every argument reads back exactly through `CommandLineToArgvW`; eleven metacharacters are refused |
-| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `main.rs:1148` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
+| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `app.rs:1148` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
 
 Three decisions differ from the table above:
 
@@ -3824,7 +3824,7 @@ What runs where today, and where P8 puts it:
 
 | Part | Today | Under P8 |
 |---|---|---|
-| Claude Code, `hive-checkpoint` (`agents/roomlerd/src/main.rs:1345`), `hive-materialize` (`:1353`), `hive-import` (`:1370`) | children, as the session's account | unchanged |
+| Claude Code, `hive-checkpoint` (`agents/roomlerd/src/app.rs:1345`), `hive-materialize` (`:1353`), `hive-import` (`:1370`) | children, as the session's account | unchanged |
 | `knowhow-scan` (`:1378`) | a child per root, as the account that owns it | unchanged |
 | the toolbelt (the model's tool calls), the model sidecar (the harness's HTTP, holding the provider key), the credential proxies (database, HTTP, Kubernetes and SSH-agent wire, holding leased values), the egress proxy (TLS termination and HTTP, P3b) | inside the daemon | a worker (step 1) |
 | the replica store and stream (frames from other devices), the viewer's WebRTC peer, the knowhow prober (certificates) | inside the daemon | a worker, after the session-facing parts (decision 64) |
