@@ -2687,6 +2687,15 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     assert!(ended.is_ok(), "the connection ended with the lease");
 }
 
+/// A port nothing listens on, held while what it returns lives: bound and
+/// never listening, so no test beside this one is given it meanwhile.
+#[cfg(feature = "vault")]
+fn closed_port() -> (u16, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    (socket.local_addr().unwrap().port(), socket)
+}
+
 /// FR-90 P4-6-1b-2 — an endpoint `roomler_connect` opens through another
 /// device: its upstream connections dial the flow's end, never the
 /// upstream's own address, while TLS is verified against the upstream's host
@@ -2700,11 +2709,7 @@ async fn an_endpoint_through_a_flow_dials_its_end_and_a_call_cannot_say_where() 
     let token = made();
     let (ca, port, mut saw) = fake_http().await;
     // The upstream's own address answers nobody: only the flow's end does.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (closed, _held) = closed_port();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("run")).unwrap();
     let vault = Arc::new(FakeVault {
@@ -2774,6 +2779,86 @@ async fn an_endpoint_through_a_flow_dials_its_end_and_a_call_cannot_say_where() 
         .unwrap();
     assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
     assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+}
+
+/// FR-90 P8-2a-6 — where the run has a worker, an endpoint through another
+/// device is handed to it as a direct one is, and the worker dials the
+/// flow's end the daemon holds: the upstream's own address answers nobody,
+/// so only that end reaches it, with the secret's token and the host the
+/// call named.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_run_has_a_worker_an_endpoint_through_a_flow_is_served_there() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let (closed, _held) = closed_port();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let vault = Arc::new(FakeVault {
+        values: [
+            ("git/bot#token".to_string(), token.as_bytes().to_vec()),
+            ("pki/git-ca".to_string(), ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    });
+    let target = super::super::vault_exec::ExecTarget {
+        account: None,
+        home: dir.path().to_path_buf(),
+        folder: dir.path().to_path_buf(),
+        session_dir: dir.path().join("run"),
+        owner: None,
+    };
+    let end = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let args = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": format!("https://localhost:{closed}"),
+        "auth": "bearer",
+        "ca": "pki/git-ca",
+        "ttl_s": 60,
+    });
+    let sid = ObjectId::new();
+    super::super::worker::run_in_process(sid, 5, Arc::new(|_| {}));
+    let answer = super::super::vault_connect::call_through(
+        vault,
+        sid,
+        5,
+        Some(&target),
+        &me(),
+        &args,
+        crate::vault_proxy::Dial::Through(end),
+    )
+    .await
+    .expect("an endpoint through a flow, from the run's worker");
+    assert_eq!(
+        kept_for(sid, 5),
+        1,
+        "one through a flow, handed to the worker"
+    );
+    let at = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", at))
+        .await
+        .unwrap();
+    h.write_all(b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let response = http_response(&mut h).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "through the flow's end, from the worker: {response}"
+    );
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+    drop(h);
+    super::super::worker::drop_run(sid, 5);
 }
 
 /// FR-90 P4-6-1b-2 — which refusals of a path through another device the

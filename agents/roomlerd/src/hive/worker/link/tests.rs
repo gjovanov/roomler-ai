@@ -27,6 +27,7 @@ fn spec(port: u16) -> Spec {
         user: None,
         ca: None,
         at: At::Loopback { peer: 0 },
+        through: None,
     }
 }
 

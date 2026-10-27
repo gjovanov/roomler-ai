@@ -16,9 +16,10 @@
 //! | the values | zeroized where either side drops them, in the frames that carry them too |
 //! | a new worker | handed every endpoint again, on the same listeners: a connection the lost one held is gone, the address is not |
 //! | no worker up | the endpoint is refused: where the owner turned workers on, it runs in the worker or not at all |
+//! | through another device (P4-6-1b-2; P8-2a-6) | served in the worker too: the daemon keeps the flow toward the upstream, and the worker dials its end, a loopback port the daemon's account alone may use, which on Unix the worker is (P8-0's point 6); an end off this host is refused |
 //!
-//! ⚠️ A through-device dial (P4-6-1b-2) stays the daemon's: the flow's end
-//! admits the daemon's own process alone (P8-0's point 6 comes later).
+//! ⚠️ On Windows the flow's end admits the daemon's own process alone, so
+//! the worker's pid is admitted there with P8-2b.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, SocketAddrV4};
@@ -141,6 +142,11 @@ pub(crate) struct Spec {
     /// system's and this.
     pub(crate) ca: Option<String>,
     pub(crate) at: At,
+    /// P8-2a-6 — through another device (P4-6-1b-2): the end of the flow
+    /// the daemon holds toward the upstream, a loopback port its account
+    /// alone may use, as the worker is. `None` dials the upstream itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) through: Option<SocketAddr>,
 }
 
 /// Where an endpoint's listener serves, and whom.
@@ -184,16 +190,28 @@ impl Spec {
             user: conf.user.clone(),
             ca: conf.ca.clone(),
             at,
+            through: match conf.dial {
+                Dial::Direct => None,
+                Dial::Through(end) => Some(end),
+            },
         }
     }
 }
 
 impl Conf {
     /// The worker's: what `spec` names, its roots made again from the
-    /// system's and the spec's CA, its upstream dialled directly.
+    /// system's and the spec's CA, its upstream dialled directly or (P8-2a-6)
+    /// through the flow's end the spec names.
     pub(crate) fn of_spec(spec: &Spec) -> Result<Self, String> {
         let engine = Engine::of(&spec.engine)
             .ok_or_else(|| format!("an engine this build does not know: {}", spec.engine))?;
+        // A flow's end is the daemon's own loopback listener: an end
+        // anywhere else is no flow's, and is refused.
+        let dial = match spec.through {
+            None => Dial::Direct,
+            Some(end) if end.ip().is_loopback() => Dial::Through(end),
+            Some(end) => return Err(format!("a flow's end off this host: {end}")),
+        };
         let auth = match spec.auth.as_deref() {
             Some(raw) => Some(auth_of(raw).ok_or_else(|| format!("an unknown auth: {raw}"))?),
             None => None,
@@ -217,7 +235,7 @@ impl Conf {
             front: spec.front.clone(),
             secret: spec.secret.clone(),
             user: spec.user.clone(),
-            dial: Dial::Direct,
+            dial,
         })
     }
 }

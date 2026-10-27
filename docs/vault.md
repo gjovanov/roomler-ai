@@ -1693,11 +1693,14 @@ starts, read from the leases then.
 
 - Where the owner turned workers on, the endpoint is served there or not at all: one opened while
   no worker is up is refused, never served by the daemon instead.
-- A person's endpoint (`roomler connect`) and one dialled through another device (below) stay the
-  daemon's.
+- One dialled through another device (below) is served there too (P8-2a-6). The daemon keeps the
+  flow toward the upstream, and the worker dials the flow's end, a loopback port only the daemon's
+  account may use. On Unix the worker runs as that account. ⚠️ On Windows the flow's end admits
+  the daemon's own process alone, until P8-2b admits the worker's.
+- A person's endpoint (`roomler connect`) stays the daemon's.
 
 Detail: [`hive/vault_connect/handed.rs`](../agents/roomlerd/src/hive/vault_connect/handed.rs), and
-the FR-90 spec's §3i, "P8-2a-2, as built".
+the FR-90 spec's §3i, "P8-2a-2, as built" and "P8-2a-6, as built".
 
 ### An endpoint through another device (FR-90 P4-6-1b-2)
 
