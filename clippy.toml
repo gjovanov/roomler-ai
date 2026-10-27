@@ -15,6 +15,14 @@
 # stays in the future's state until its scope ends, so put the guard in a block
 # that ends before the await.
 #
+# ⚠️ This catches the common shape, not every shape. The lint matches the type of
+# the value held, so it sees a bare guard (`let r = map.get(k)?`, `if let Some(r)`,
+# `for e in map.iter()`) but NOT a guard inside an `Option` (a `map.get(k)` kept
+# unwrapped), a `Result`, a tuple, a struct, or an iterator adapter
+# (`map.iter().map(..)`). Measured in FR-127 P1.1's review: an `Option<RefMut>`
+# held across the worker awaits passed clippy and froze the room manager's
+# storm test. Read what the await needs into owned values first.
+#
 # `clippy::await_holding_invalid_type` is warn-by-default and CI denies
 # warnings, so this is a build error. Clippy reads the nearest clippy.toml
 # upward from each crate's manifest, so a crate that adds its own clippy.toml
