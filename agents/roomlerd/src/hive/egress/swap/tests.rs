@@ -19,9 +19,10 @@ use tokio::net::TcpListener;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
+use super::super::super::placeholder;
 use super::super::{
-    Admit, Decide, Decision, Dial, Fronts, Roots, Seams, Values, ca_of, drop_run, socks5,
-    start_admitting,
+    Admit, Decide, Decision, Dial, Fronts, Roots, RunBindings, RunLeaves, Seams, Values, ca_of,
+    drop_run, socks5, start_admitting,
 };
 use super::*;
 
@@ -186,12 +187,13 @@ impl Dial for ToAudience {
     }
 }
 
-/// Each lease's value.
+/// Each lease's value, and (P8-2a-4a) how many times one was read.
 #[derive(Default)]
-struct Leases(Mutex<HashMap<String, Vec<u8>>>);
+struct Leases(Mutex<HashMap<String, Vec<u8>>>, AtomicUsize);
 
 impl Values for Leases {
     fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         lock(&self.0)
             .get(lease_id)
             .map(|v| Zeroizing::new(v.clone()))
@@ -216,7 +218,8 @@ impl Rig {
         let seams = Seams {
             decide: Arc::new(AllowAll),
             dial: Arc::new(ToAudience(audience.addr)),
-            values: leases.clone(),
+            bindings: Arc::new(RunBindings(leases.clone())),
+            leaves: Arc::new(RunLeaves),
             roots: Roots::Given(Arc::new(roots)),
         };
         let admit: Admit = Arc::new(|_: &TcpStream, _: SocketAddr| Ok(()));
@@ -409,6 +412,40 @@ async fn an_audiences_placeholder_is_swapped_in_authorization_under_the_runs_ca(
         1,
         "one connection to the audience carried both"
     );
+}
+
+/// FR-90 P8-2a-4a — a value is read only for a request with an
+/// `Authorization`, the one header it goes into or signs: a request to the
+/// placeholder's audience without one reads none, and one with it reads it
+/// once.
+#[tokio::test]
+async fn a_value_is_read_only_for_a_request_with_an_authorization() {
+    let audience = Audience::start(false).await;
+    let rig = Rig::new(&audience, &audience.ca).await;
+    let token = rig.hold(HOST, b"the-value");
+    let tls = through(rig.fronts.http, "api.test:443", HOST, &rig.ca, H1)
+        .await
+        .expect("terminated under the run's CA");
+    let mut send = http(tls).await;
+    let (status, _) = ask(&mut send, get("/user", HOST, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rig.leases.1.load(Ordering::SeqCst),
+        0,
+        "no value read for a request without an Authorization"
+    );
+    let (status, _) = ask(
+        &mut send,
+        get("/user", HOST, Some(&format!("token {token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rig.leases.1.load(Ordering::SeqCst),
+        1,
+        "read once, for the request that carries one"
+    );
+    assert_eq!(audience.seen()[1].authorization, ["token the-value"]);
 }
 
 /// A placeholder anywhere but `Authorization` (the URL, another header, the

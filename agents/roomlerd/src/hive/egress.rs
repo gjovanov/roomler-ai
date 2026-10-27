@@ -16,6 +16,7 @@
 //! | the bytes | relayed as they are, never decrypted, but to a host the run holds a placeholder for (P3b-3c-1, [`swap`]): there TLS is terminated under the run's CA, and the placeholder swapped for its value in `Authorization` |
 //! | its CA | made with the run (P3b-3b, [`ca`]): what P3b-3c terminates TLS under, and what the session's tools are told to trust ([`ca_of`]) |
 //! | its end | the run's ([`drop_run`]): both listeners close, and every connection on them ends |
+//! | the seams | FR-90 P8-2a-4a — everything the proxy asks of the daemon goes through [`Seams`]: the decision, the dial, the run's placeholders and their values ([`Bindings`]), and its CA's leaves ([`Leaves`]), so a session's worker can serve the fronts while the daemon keeps the vault, the placeholders and the CA's key |
 //!
 //! ⚠️ A front admits the session's account and nobody else. On Linux the
 //! sandbox's bridge, running as that account, is what connects; a command
@@ -122,6 +123,30 @@ pub trait Values: Send + Sync + 'static {
     fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>>;
 }
 
+/// FR-90 P8-2a-4a — the run's placeholders toward one host, and their
+/// values: what the proxy terminates TLS for, swaps and signs with. The
+/// daemon's: its own bindings and leases ([`RunBindings`]).
+#[async_trait::async_trait]
+pub trait Bindings: Send + Sync + 'static {
+    /// The run's placeholders whose audience is `host:port`, `host` in its
+    /// one spelling.
+    async fn bound(&self, run: RunKey, host: &str, port: u16) -> Vec<placeholder::Bound>;
+    /// The same, each with its value read from its lease now: `None` once
+    /// that lease is let go.
+    async fn valued(&self, run: RunKey, host: &str, port: u16) -> Vec<Valued>;
+}
+
+/// FR-90 P8-2a-4a — one placeholder, with its value as it was read for one
+/// request.
+pub type Valued = (placeholder::Bound, Option<Zeroizing<Vec<u8>>>);
+
+/// FR-90 P8-2a-4a — the leaf the run's CA makes for one host: the daemon's
+/// ([`RunLeaves`]), where the CA's key stays.
+#[async_trait::async_trait]
+pub trait Leaves: Send + Sync + 'static {
+    async fn leaf(&self, run: RunKey, host: &str) -> Result<Arc<ca::Leaf>, String>;
+}
+
 /// FR-90 P3b-3c-1 — what a host the run holds a placeholder for is verified
 /// against, where the proxy terminates its connection.
 #[derive(Clone)]
@@ -141,8 +166,11 @@ pub struct Seams {
     pub decide: Arc<dyn Decide>,
     /// The dial ([`SystemDialer`]).
     pub dial: Arc<dyn Dial>,
-    /// FR-90 P3b-3c-1 — a placeholder's value ([`LeaseValues`]).
-    pub values: Arc<dyn Values>,
+    /// FR-90 P3b-3c-1 — the run's placeholders and (P8-2a-4a) their values
+    /// ([`RunBindings`]).
+    pub bindings: Arc<dyn Bindings>,
+    /// FR-90 P8-2a-4a — the run's CA's leaves ([`RunLeaves`]).
+    pub leaves: Arc<dyn Leaves>,
     /// FR-90 P3b-3c-1 — what a placeholder's audience is verified against.
     pub roots: Roots,
 }
@@ -326,7 +354,8 @@ pub fn start(
     let seams = Seams {
         decide,
         dial,
-        values: Arc::new(LeaseValues),
+        bindings: Arc::new(RunBindings(Arc::new(LeaseValues))),
+        leaves: Arc::new(RunLeaves),
         roots: Roots::System,
     };
     start_admitting(run, admit, seams)
@@ -420,7 +449,8 @@ pub(crate) fn serve_for_test(session: ObjectId, fence: u64) -> Fronts {
     let seams = Seams {
         decide: nothing.clone(),
         dial: nothing.clone(),
-        values: nothing,
+        bindings: Arc::new(RunBindings(nothing)),
+        leaves: Arc::new(RunLeaves),
         roots: Roots::System,
     };
     let admit: Admit = Arc::new(|_: &TcpStream, _: SocketAddr| Ok(()));
@@ -528,7 +558,7 @@ async fn carry(front: Front, mut tcp: TcpStream, run: RunKey, state: Arc<RunStat
     // FR-90 P3b-3c-1 — a host the run holds a placeholder for: TLS
     // terminated under the run's CA, and the placeholder swapped in. Every
     // other host is carried as it comes, never decrypted.
-    if !placeholder::bound(run.0, run.1, &host, port).is_empty() {
+    if !seams.bindings.bound(run, &host, port).await.is_empty() {
         let target = swap::Target { host, port, shown };
         swap::carry(front, tcp, upstream, early, target, run, state, seams).await;
         return;
@@ -844,6 +874,45 @@ pub struct LeaseValues;
 impl Values for LeaseValues {
     fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
         crate::vault::CLIENT.with_value(lease_id, |v| Zeroizing::new(v.to_vec()))
+    }
+}
+
+/// FR-90 P8-2a-4a — the daemon's bindings: the run's placeholders
+/// ([`placeholder::bound`]), each value read with its [`Values`].
+pub struct RunBindings(pub Arc<dyn Values>);
+
+#[async_trait::async_trait]
+impl Bindings for RunBindings {
+    async fn bound(
+        &self,
+        (session, fence): RunKey,
+        host: &str,
+        port: u16,
+    ) -> Vec<placeholder::Bound> {
+        placeholder::bound(session, fence, host, port)
+    }
+
+    async fn valued(&self, (session, fence): RunKey, host: &str, port: u16) -> Vec<Valued> {
+        placeholder::bound(session, fence, host, port)
+            .into_iter()
+            .map(|b| {
+                let value = self.0.value(&b.lease_id);
+                (b, value)
+            })
+            .collect()
+    }
+}
+
+/// FR-90 P8-2a-4a — the daemon's leaves: made by the run's own CA
+/// ([`ca_of`]), whose key never leaves the daemon.
+pub struct RunLeaves;
+
+#[async_trait::async_trait]
+impl Leaves for RunLeaves {
+    async fn leaf(&self, (session, fence): RunKey, host: &str) -> Result<Arc<ca::Leaf>, String> {
+        ca_of(session, fence)
+            .ok_or_else(|| "the session's egress proxy has stopped".to_string())?
+            .leaf_for(host)
     }
 }
 

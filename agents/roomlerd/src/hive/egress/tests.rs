@@ -91,7 +91,8 @@ fn seams(vault: Arc<FakeVault>, dial: impl Dial) -> Seams {
     Seams {
         decide: vault,
         dial: Arc::new(dial),
-        values: Arc::new(NoValues),
+        bindings: Arc::new(RunBindings(Arc::new(NoValues))),
+        leaves: Arc::new(RunLeaves),
         roots: Roots::System,
     }
 }
