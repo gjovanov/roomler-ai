@@ -2558,8 +2558,8 @@ pub unsafe fn spawn_into_job(
 
 /// A `STARTUPINFOEXW` whose handle list bounds inheritance to the handles
 /// given, and only those.
-struct InheritOnly {
-    si: STARTUPINFOEXW,
+pub(crate) struct InheritOnly {
+    pub(crate) si: STARTUPINFOEXW,
     // `si.lpAttributeList` points into this.
     _attrs: Vec<u8>,
     // The handle-list attribute points at this.
@@ -2567,7 +2567,7 @@ struct InheritOnly {
 }
 
 impl InheritOnly {
-    fn new(handles: Vec<HANDLE>) -> Result<Self> {
+    pub(crate) fn new(handles: Vec<HANDLE>) -> Result<Self> {
         let mut bytes: usize = 0;
         // SAFETY: the sizing call, DOCUMENTED to fail and write the size.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };

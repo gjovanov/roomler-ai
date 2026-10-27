@@ -87,11 +87,11 @@ impl Running for Task {
 }
 
 impl Spawn for Fake {
-    fn spawn(
-        &self,
-        theirs: std::os::unix::net::UnixStream,
-        descriptors: std::os::unix::net::UnixStream,
-    ) -> std::io::Result<Box<dyn Running>> {
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
+        let Theirs {
+            ch: theirs,
+            descriptors,
+        } = theirs;
         let k = self.started.fetch_add(1, Ordering::SeqCst);
         let part = *self.plan.get(k).or(self.plan.last()).unwrap();
         theirs.set_nonblocking(true)?;
@@ -485,7 +485,11 @@ async fn a_program_gets_its_channel_on_fd_3() {
     };
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let (ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
-    let mut running = program.spawn(theirs, theirs_d).unwrap();
+    let theirs = Theirs {
+        ch: theirs,
+        descriptors: theirs_d,
+    };
+    let mut running = program.spawn(theirs).unwrap();
     assert!(running.pid().is_some());
     for (ch, want) in [(ours, "on-fd-3"), (ours_d, "on-fd-4")] {
         ch.set_nonblocking(true).unwrap();

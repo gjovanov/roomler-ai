@@ -4072,8 +4072,8 @@ impl Supervisor {
         // FR-90 P3b-3a — and every placeholder it held.
         #[cfg(feature = "vault")]
         super::placeholder::drop_run(session, fence);
-        // FR-90 P8-2a-1 — and its worker, told `bye`.
-        #[cfg(unix)]
+        // FR-90 P8-2a-1 — and its worker, told `bye` (P8-2b-1: on Windows
+        // too).
         super::worker::drop_run(session, fence);
     }
 
@@ -4253,12 +4253,12 @@ impl Supervisor {
             },
         );
         // FR-90 P8-2a-1 — a worker beside the run, where the owner said so.
-        #[cfg(unix)]
+        // P8-2b-1 — on Windows too, in a job of its own: there it serves its
+        // heartbeats and its log, and none of the session's endpoints yet,
+        // which the daemon serves until a listener can cross to it (P8-2b-2).
+        // On Linux, where the service delegates a cgroup, it runs in one of
+        // its own (P8-2a-7).
         super::worker::run_started(order.session_id, order.fence, self.cfg.worker);
-        #[cfg(not(unix))]
-        if self.cfg.worker {
-            info!(session = %order.session_id, "hive: no worker beside the session: `hive_worker` is Linux and macOS only so far");
-        }
         if prior.is_some() {
             self.hosted_update(order.session_id, order.fence, |h| {
                 h.harness_pid = pid;

@@ -1464,7 +1464,7 @@ allowed; the mapping's domain ignored; memory copied over what is there; and the
 a closing quote not doubled.
 
 **P1i-2, sessions on Windows, wired.** `cfg(hive_host)` covers Windows now
-(`agents/roomlerd/build.rs:92`): a build made with `hive` hosts sessions there. The Windows
+(`agents/roomlerd/build.rs:93`): a build made with `hive` hosts sessions there. The Windows
 release build gains `hive` only in P1i-3, and a device's `hive_enabled` stays off by default, so
 no device changes yet. Two rows of the design table above were wrong, and the code follows what
 is true:
@@ -4228,6 +4228,44 @@ the unit.
 ⚠️ The packaged units delegate nothing (decision 66), so a system install has the bound once its
 owner adds `Delegate=memory` (`docs/installation.md`, "A Hive session's worker and its memory").
 
+**P8-2b-1, as built** (`agents/roomlerd/src/hive/worker/win.rs`): the worker on Windows, as P8-0's
+points 3 and 4 designed it. Where the device's owner turned workers on, a Windows run now has its
+worker too: the same supervisor, handshake, heartbeat, restarts and log as on Unix, over a pipe of
+its own, in a job of its own. It serves none of the session's endpoints yet. The daemon serves them
+on Windows until a listening socket can cross to a worker as `WSADuplicateSocketW`'s protocol info
+(P8-2b-2):
+
+```mermaid
+sequenceDiagram
+    participant D as the daemon (SYSTEM)
+    participant J as the worker's job
+    participant W as roomlerd hive-worker
+    Note over D: the pipe made, its DACL the daemon's account alone, its client end opened here
+    D->>J: CreateProcessW, suspended: the client end and NUL in the handle list, nothing else
+    D->>J: assigned to the job: KILL_ON_JOB_CLOSE, 512 MiB a process
+    D->>W: resumed: it finds its pipe by ROOMLERD_HIVE_WORKER_CHANNEL
+    D->>W: hello
+    W-->>D: ready, its own pid, this build's version
+    loop each heartbeat
+        D->>W: beat
+        W-->>D: beat, and its log as log frames
+    end
+    D->>J: its end: the job ended, the process waited for
+```
+
+| Piece | As built |
+|---|---|
+| the channel | `\\.\pipe\roomler-hive-worker-<pid>-<n>`: one instance, local clients only, its DACL protected and naming the daemon's own account alone. Its client end is opened by the daemon, overlapped and inheritable, before any other process could take the one instance |
+| what it inherits | that client end and `NUL` for its standard handles, named in `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and nothing else the daemon holds (#2836) |
+| who it runs as | the daemon's own identity, as P8-0's point 4 says. A session never does: `SpawnAs` still has no way to start one as SYSTEM, and the worker's start is a path of its own |
+| the start | suspended, assigned to its job, then resumed, so it runs no instruction outside the job. One that cannot join is ended, never resumed |
+| its job | `KILL_ON_JOB_CLOSE`, so the daemon's end is the worker's, and a per-process memory limit of 512 MiB: an allocation past it fails in the worker, and the worker alone ends |
+| its end | the job ended, and the process waited for (5 s). A peak at the bound is logged as what ended it |
+| the shared code | one supervisor and one worker loop for both systems: the channel's two halves are whatever each system's channel is. Each system keeps its own spawn and its own channels, and the vault's hand-overs stay Unix-only (`cfg(worker_calls)`, from `build.rs`) |
+
+⚠️ Before values cross to a Windows worker (P8-2b-2), its crash dump must carry no heap, as
+P8-2a-3 keeps a Unix worker's memory out of a core.
+
 Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
 has the vault.
 
@@ -4496,7 +4534,8 @@ has the vault.
 | P8-2a-4b | the egress proxy served in the session's worker (§3i "P8-2a-4b, as built"), Unix: the fronts bound as the run starts, from the device's `hive_worker`, and handed (two listeners across fd 4, a `Spec`) to each worker the run has, and at once to one already up; the daemon serves none of their connections and answers the worker's `decide` (its own decision, kept for the run; a host not in its one spelling refused), `bound`, `valued` (base64) and `leaf` (only for an audience of a placeholder the run holds; the CA's key never crosses), each on a task of its own; the run's end tells the worker to let go. Found: the worker logged nowhere (P8-2a-5's). 6 new tests (the calls round-trip whole, with no leaf's key and no value in a `Debug`; the daemon's answers from the run's own, a decision asked once and a host not in its one spelling refused, a leaf for an audience and none for another host; the device's setting choosing the worker or the daemon; the daemon serving no front itself; a placeholder swapped end to end through an in-process worker, under the daemon's leaf and with its value; a worker already up handed the fronts and letting go at their end) and P8-2a-1's and P8-2a-2's real-binary harnesses passing unchanged; 11 negative controls, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2980 `8ef7a4e32` |
 | P8-2a-5 | the worker's log in the daemon's (§3i "P8-2a-5, as built"), Unix: each of its lines, kept by the daemon's own filter, a `log` frame from its `ready` on, its queue never waited on (1024 lines; a line says how many were dropped); the daemon writes each at the worker's level, asked of its filter where the worker logged it (five callsites of its own, as `tracing-log` makes), beside the worker's process, as one line with its control characters escaped, at most 200 a second from one worker; a panic logged as it happens. 9 new tests (a line: its message, fields, level, and where it was logged, a `log` record's too; a line cut at its bound, on a character; a full queue dropping and counting, the count said after the next line; the daemon's bound a second; a line kept by the daemon's filter where the worker logged it; one line, its control characters escaped; a value logged by mistake naming nothing; the log crossing only from `ready` on; a worker's line written into the daemon's log) and both real-binary harnesses extended (the worker's `up` line after `ready`, and none at INFO under `RUST_LOG=warn`; a connection from another account refused in the worker, the refusal crossing as a line of its log, and no line holding the value); 13 negative controls, each caught at its own assertion. Found on the way: a probe test's closed port was bound and let go, and a listener beside it was given the port once; it is held now | device `hive_worker = false` (default) | **merged** #2981 `d36895a6e` |
 | P8-2a-6 | an endpoint through another device served in the session's worker too (§3i "P8-2a-6, as built"), Unix: the handed `Spec` names the flow's end, a loopback port the daemon's account alone may use, as the worker is; the worker dials it, TLS still verified against the upstream's own host; an end off this host refused; the flow stays the daemon's. 2 new tests (a spec through a flow naming its end and crossing whole, the worker dialling that end and refusing one off this host; an endpoint through a flow handed to the run's worker and served there, the upstream's own address answering nobody) and P8-2a-2's real-binary harness extended (the real worker reaching the upstream only through the flow's end, with the daemon's value, and refusing an end off this host); 5 negative controls, each caught at its own assertion. Found on the way: the P4-6-1b-2 test's closed port was bound and let go; it is held now | device `hive_worker = false` (default) | **merged** #2982 `8b4bacc29` |
-| P8-2a-7 | a worker's memory, bounded (§3i "P8-2a-7, as built"), Linux: where the daemon's unit delegates a cgroup with the memory controller (asked of systemd, never guessed: as root a cgroup write succeeds without delegation), each worker in `hive-worker-<n>` below the unit's, `memory.max` 512 MiB and `memory.swap.max` 0, joined by the child itself between fork and exec; the daemon moved into a leaf of its own as the first worker starts; an OOM kill read from `memory.events` and logged; delegated and not made, no worker runs; decision 66 as recommended. 4 new tests (a unit delegates memory only with the controller named; the daemon's cgroup its v2 line, the unit's above its leaf; bounded only where the unit delegates memory, never on a guess, and an error where it does on cgroup v1 alone; an OOM kill read from `memory.events`) and one run in a real delegated cgroup, which CI has not (the daemon's processes in their leaf, the worker in its own cgroup at 512 MiB with no swap, the cgroup gone at its end; `#[ignore]`d in CI); 9 negative controls, each caught at its own assertion, four of them in the delegated cgroup | device `hive_worker = false` (default); no `Delegate=` (the packaged units) | **in review** |
+| P8-2a-7 | a worker's memory, bounded (§3i "P8-2a-7, as built"), Linux: where the daemon's unit delegates a cgroup with the memory controller (asked of systemd, never guessed: as root a cgroup write succeeds without delegation), each worker in `hive-worker-<n>` below the unit's, `memory.max` 512 MiB and `memory.swap.max` 0, joined by the child itself between fork and exec; the daemon moved into a leaf of its own as the first worker starts; an OOM kill read from `memory.events` and logged; delegated and not made, no worker runs; decision 66 as recommended. 4 new tests (a unit delegates memory only with the controller named; the daemon's cgroup its v2 line, the unit's above its leaf; bounded only where the unit delegates memory, never on a guess, and an error where it does on cgroup v1 alone; an OOM kill read from `memory.events`) and one run in a real delegated cgroup, which CI has not (the daemon's processes in their leaf, the worker in its own cgroup at 512 MiB with no swap, the cgroup gone at its end; `#[ignore]`d in CI); 9 negative controls, each caught at its own assertion, four of them in the delegated cgroup | device `hive_worker = false` (default); no `Delegate=` (the packaged units) | **merged** #2983 `76e8b1eb3` |
+| P8-2b-1 | the worker on Windows (§3i "P8-2b-1, as built"), its process and its channel: a pipe of its own, its DACL the daemon's account alone, its client end the one handle the worker inherits (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, beside `NUL`), found by `ROOMLERD_HIVE_WORKER_CHANNEL`; started suspended into a job of its own (`KILL_ON_JOB_CLOSE`, 512 MiB a process) as the daemon's identity, then resumed; the same supervisor, handshake, heartbeat, restarts and log as on Unix; no endpoint served there yet (P8-2b-2). 3 new tests on Windows (a worker's pipe has its two ends alone, one instance, a frame either way; the daemon keeps a worker up over its pipe; a worker starts into a job of its own, in it before it runs, the job ending what is in it, 512 MiB a process, and ended at once at its end) and the real `roomlerd.exe` started as the daemon starts it (its pipe found, `ready` with its own pid at this build's version, each beat answered, its end at `bye`; `#[ignore]`d in CI, which builds no binary for a lib test); the Unix suite unchanged (607); 6 negative controls on Windows, each caught at its own assertion | device `hive_worker = false` (default) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
