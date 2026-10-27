@@ -532,19 +532,33 @@ latch on the receive path wakes the runtime (`PeerStats::latch_wake`, armed on e
 probe by `WgDevice::insert_probe`), which runs the same post-promote steps as the
 fallback tick. The tick (`FALLBACK_TICK`, 5 s) still sweeps, for deadlines and as
 the floor. Which direction pays depends on who probes:
-- **Both ends probe** (both on an agent with #2952, so the stamp reaches them in the
-  same fan, the common case once a fleet has updated): the two latches are about a
-  round trip apart, and so is the loss, on the later end's outbound.
-- **The peer follows** (an older agent): the follower drops its TURN leg on the
-  nudge, so the **prober's** outbound is lost until its probe latches: the 500 ms
-  the initiation waits, plus a round trip. The follower's traffic flows through the
-  probe session meanwhile.
+- **Both ends probe:** the two latches are about a round trip apart, and so is the
+  loss, on the later end's outbound.
+- **The peer follows:** the follower drops its TURN leg on the nudge, so the
+  **prober's** outbound is lost until its probe latches: the 500 ms the initiation
+  waits, plus a round trip. The follower's traffic flows through the probe session
+  meanwhile. An older agent always follows. Two agents with #2952 can land here too:
+  the stamp reaches both in one fan, and if one end's nudge arrives before the other
+  end has acted on its own stamp, that end follows instead of probing. Which case a
+  pair gets is that race.
 - **One end on 0.4.175–0.4.177**, which still promotes on its tick: both probe,
   and the gap is however far that end's tick falls behind the latch, up to 5 s.
 
-Field 2026-10-26, on the published 0.4.175 (before #2952): the stamp reached both
-ends in the same millisecond, they promoted on their own ticks 2.6 s apart
-(`probe_ms` 1641 and 4274), and a ping every 200 ms lost exactly that window.
+Field, on two nodes holding a live TURN pair, with a ping across the move (every 200 ms
+on 2026-10-26, every 50 ms on 2026-10-27):
+
+| Build | Case | Promotions | Lost |
+|---|---|---|---|
+| published 0.4.175 (2026-10-26) | both probe, on their ticks | 2.6 s apart (`probe_ms` 1641, 4274) | 2.6 s |
+| published 0.4.177 (2026-10-27) | both probe, on their ticks | 0.73 s apart (916, 1644) | 0.70 s |
+| a tick-promoting prober (#2820 case C, 2026-10-26) | the peer follows | the prober's next tick (`probe_ms` 5002) | ≈ 5 s, from the logs (no ping that run) |
+| #2952 (2026-10-27) | both probe, at the latch (`via="latch"`) | 1.4 ms apart (503, 503) | **nothing** |
+| #2952 (2026-10-27) | one end's nudge won the race; the peer follows | the prober at its latch (504) | **0.57 s** |
+
+Sending the initiation sooner (or again, early) would shrink the follower case
+toward a round trip as well. The 500 ms exists so a follower's DERP carrier is up
+before the initiation arrives; a dropped initiation waits out boringtun's 5 s
+retransmit.
 
 The same applies to every make-before-break upgrade: a relay → direct probe was
 also promoted on the tick, and now promotes at its latch.
