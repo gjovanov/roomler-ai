@@ -26,6 +26,8 @@ enum Part {
     Foreign,
     /// The worker's own loop for this many milliseconds, then gone.
     LiveFor(u64),
+    /// P8-2a-5 — ready, a line of its log, and then each beat answered.
+    Logs,
 }
 
 /// A run nobody ends.
@@ -101,7 +103,7 @@ impl Spawn for Fake {
         let task = tokio::spawn(async move {
             match part {
                 Part::Serve => {
-                    let ended = serve(ch, Some(descriptors)).await;
+                    let ended = serve(ch, Some(descriptors), None).await;
                     note(format!("served: {ended:?}"));
                 }
                 Part::DieAfterReady => {
@@ -136,9 +138,25 @@ impl Spawn for Fake {
                     std::future::pending::<()>().await;
                 }
                 Part::LiveFor(ms) => {
-                    let served = serve(ch, Some(descriptors));
+                    let served = serve(ch, Some(descriptors), None);
                     let _ = tokio::time::timeout(Duration::from_millis(ms), served).await;
                     note("lived".into());
+                }
+                Part::Logs => {
+                    let _ = recv(&mut ch).await;
+                    let _ = send(&mut ch, &ready()).await;
+                    let line = Msg::Log {
+                        level: "WARN".into(),
+                        target: "roomlerd::hive::egress".into(),
+                        line: "hive: refused, in the worker".into(),
+                    };
+                    let _ = send(&mut ch, &line).await;
+                    note("logged".into());
+                    while let Ok(Some(Msg::Beat { n })) = recv(&mut ch).await {
+                        if send(&mut ch, &Msg::Beat { n }).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -229,7 +247,7 @@ fn a_worker_is_the_subcommand_alone_in_a_process_the_daemon_started() {
 #[tokio::test]
 async fn a_worker_answers_its_hello_and_each_beat_and_ends_at_bye() {
     let (mut daemon, worker) = UnixStream::pair().unwrap();
-    let served = tokio::spawn(serve(worker, None));
+    let served = tokio::spawn(serve(worker, None, None));
     send(
         &mut daemon,
         &Msg::Hello {
@@ -256,7 +274,7 @@ async fn a_worker_answers_its_hello_and_each_beat_and_ends_at_bye() {
     assert_eq!(recv(&mut daemon).await.unwrap(), None, "and closed its end");
 
     let (daemon, worker) = UnixStream::pair().unwrap();
-    let served = tokio::spawn(serve(worker, None));
+    let served = tokio::spawn(serve(worker, None, None));
     drop(daemon);
     let ended = tokio::time::timeout(Duration::from_secs(5), served).await;
     ended
@@ -534,4 +552,62 @@ fn a_worker_never_dumps_core_and_holds_files_to_its_bound() {
         Some(0),
         "0 = both set; 2 = not set; 3 = the core limit; 4 = the open files"
     );
+}
+
+/// P8-2a-5 — the worker's log crosses from its `ready` on: nothing comes
+/// before its hello is answered, and a line it logged before then comes
+/// after its `ready`.
+#[tokio::test]
+async fn a_workers_log_crosses_from_its_ready_on() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (layer, lines) = log::layer();
+    // Two dispatchers, never one (`log`'s tests).
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+        tracing::warn!("hive: before the hello");
+    });
+    let (mut daemon, worker) = UnixStream::pair().unwrap();
+    let served = tokio::spawn(serve(worker, None, Some(lines)));
+    let early = tokio::time::timeout(Duration::from_millis(200), recv(&mut daemon)).await;
+    assert!(early.is_err(), "it said {early:?} before its hello");
+    let hello = Msg::Hello {
+        session: ObjectId::new().to_hex(),
+        fence: 2,
+    };
+    send(&mut daemon, &hello).await.unwrap();
+    let first = recv(&mut daemon).await.unwrap();
+    assert!(matches!(first, Some(Msg::Ready { .. })), "{first:?}");
+    assert_eq!(
+        recv(&mut daemon).await.unwrap(),
+        Some(Msg::Log {
+            level: "WARN".into(),
+            target: module_path!().into(),
+            line: "hive: before the hello".into(),
+        })
+    );
+    send(&mut daemon, &Msg::Bye).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), served).await;
+    ended.expect("it ended at bye").unwrap().unwrap();
+}
+
+/// P8-2a-5 — a line the run's worker logs is written into the daemon's
+/// log, at its level, beside the worker's process and where the worker
+/// logged it.
+#[tokio::test]
+async fn a_workers_line_is_written_into_the_daemons_log() {
+    let logs = log::tests::Logs::default();
+    let (_second, _guard) = logs.capture("info");
+    let fake = Fake::new(&[Part::Logs]);
+    let w = Worker::start(ObjectId::new(), 1, fake.clone(), quick(), nobody());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !logs.text().contains("refused, in the worker") && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    w.stop().await;
+    let text = logs.text();
+    assert!(
+        text.contains("WARN hive: refused, in the worker worker=1 origin=roomlerd::hive::egress"),
+        "{text}"
+    );
+    assert_eq!(fake.log(), vec!["#0 logged".to_string()]);
 }

@@ -254,7 +254,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:225`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:278`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
