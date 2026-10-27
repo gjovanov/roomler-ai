@@ -751,7 +751,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/main.rs:2016`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/main.rs:2019`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
