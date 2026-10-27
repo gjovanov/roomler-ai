@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::view::{self, ViewState};
 use super::worker_pool::WorkerPool;
 
 /// Holds the DirectTransport + Consumer for an RTP tap (transcription).
@@ -47,6 +48,55 @@ pub struct ParticipantMedia {
     pub recv_transport: WebRtcTransport,
     pub producers: Vec<ProducerEntry>,
     pub consumers: Vec<Consumer>,
+    /// FR-127 P1 — what this viewer renders, from its `media:view` reports.
+    /// ⚠️ `None` is a legacy client that never declared `caps: ["view"]`:
+    /// every consumer flows, as before. `Some(empty)` is a view client that
+    /// shows nothing: every video consumer is paused. Never collapse them
+    /// (`media/view.rs`).
+    pub view: Option<ViewState>,
+}
+
+/// FR-127 P1 — what `RoomManager::apply_view` did with a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOutcome {
+    /// The report is now the participant's view; this many consumers changed.
+    Applied { resumed: usize, paused: usize },
+    /// Older than the report held: dropped, nothing changed.
+    Stale,
+    /// The participant never declared `caps: ["view"]`: ignored, everything
+    /// keeps flowing.
+    Legacy,
+    /// No such room or participant.
+    NotFound,
+}
+
+/// FR-127 P1 — one consumer's flags as plain data, for the tests and the
+/// gauges: `paused` is the VIEWER's own flag (`Consumer::paused`),
+/// `producer_paused` the OWNER's (FR-30, `Consumer::producer_paused`). Two
+/// fields because they are two states inside the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerSnapshot {
+    pub producer_id: String,
+    pub kind: &'static str,
+    pub paused: bool,
+    pub producer_paused: bool,
+}
+
+/// FR-127 P1 — one producer's flags as plain data; `paused` is the owner's
+/// FR-30 pause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerSnapshot {
+    pub producer_id: String,
+    pub kind: &'static str,
+    pub source: String,
+    pub paused: bool,
+}
+
+fn kind_str(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Audio => "audio",
+        MediaKind::Video => "video",
+    }
 }
 
 /// Transport connection details sent to the client.
@@ -217,11 +267,17 @@ impl RoomManager {
     }
 
     /// Creates send + recv WebRtcTransport pair for a participant.
+    ///
+    /// FR-127 P1 — `view_capable`: the client declared `caps: ["view"]` on
+    /// its join (and the lever is on), so it starts with an empty view and its
+    /// video consumers are created paused until a `media:view` names them. A
+    /// legacy client starts with no view at all, and everything flows.
     pub async fn create_transports(
         &self,
         room_id: ObjectId,
         user_id: ObjectId,
         connection_id: String,
+        view_capable: bool,
     ) -> anyhow::Result<TransportPair> {
         let room = self
             .rooms
@@ -242,6 +298,7 @@ impl RoomManager {
                 recv_transport,
                 producers: Vec::new(),
                 consumers: Vec::new(),
+                view: view_capable.then(ViewState::default),
             },
         );
 
@@ -403,11 +460,11 @@ impl RoomManager {
             return Err(anyhow::anyhow!("Cannot consume: incompatible capabilities"));
         }
 
-        // FR-30 P4 — read the source producer's pause state HERE, while only
-        // `room` is held. ⚠️ Not below: `participants.get_mut()` is taken a few
-        // lines down, and iterating the same DashMap while holding a mutable
-        // entry deadlocks it.
-        let producer_paused = room
+        // FR-30 P4 — read the source producer's pause state (and, FR-127 P1,
+        // its kind) HERE, while only `room` is held. ⚠️ Not below:
+        // `participants.get_mut()` is taken a few lines down, and iterating
+        // the same DashMap while holding a mutable entry deadlocks it.
+        let source = room
             .participants
             .iter()
             .flat_map(|entry| {
@@ -416,28 +473,46 @@ impl RoomManager {
                     .producers
                     .iter()
                     .find(|pe| pe.producer.id() == producer_id)
-                    .map(|pe| pe.producer.paused())
+                    .map(|pe| (pe.producer.paused(), pe.producer.kind()))
             })
-            .next()
-            .unwrap_or(false);
+            .next();
+        let producer_paused = source.map(|(paused, _)| paused).unwrap_or(false);
 
         let mut participant = room
             .participants
             .get_mut(connection_id)
             .ok_or_else(|| anyhow::anyhow!("Participant not found"))?;
 
-        let consumer_options = ConsumerOptions::new(producer_id, rtp_capabilities.clone());
+        // FR-127 P1 — a video consumer a view client does not show starts
+        // paused, and resumes when a `media:view` names its producer (a report
+        // that named it before this consume counts). Audio, and everything for
+        // a legacy client, flows as before. A producer the scan did not find
+        // (it is not a participant's — nothing in P1) is treated as wanted:
+        // the budget is a load lever, never a reason to withhold a picture.
+        let wanted = match source {
+            Some((_, kind)) => view::wants(participant.view.as_ref(), kind, &producer_id),
+            None => true,
+        };
+        let mut consumer_options = ConsumerOptions::new(producer_id, rtp_capabilities.clone());
+        // ⚠️ `ConsumerOptions.paused` defaults to FALSE (mediasoup 0.20.0): a
+        // consumer is created resumed unless asked otherwise. The crate's own
+        // doc recommends `paused: true` for video so the first key frame does
+        // not race the client's consumer — which is what a view client gets.
+        consumer_options.paused = !wanted;
         let consumer = participant
             .recv_transport
             .consume(consumer_options)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to consume: {}", e))?;
 
-        // mediasoup consumers are created paused — must resume to deliver RTP
-        consumer
-            .resume()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to resume consumer: {}", e))?;
+        // Resumed on creation, as before this phase, for everything a view
+        // client shows and for all of a legacy client's consumers.
+        if wanted {
+            consumer
+                .resume()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to resume consumer: {}", e))?;
+        }
 
         let info = ConsumerInfo {
             id: consumer.id().to_string(),
@@ -457,9 +532,133 @@ impl RoomManager {
             %connection_id,
             consumer_id = %info.id,
             %producer_id,
+            wanted,
             "consumer created"
         );
         Ok(info)
+    }
+
+    /// FR-127 P1 — apply a viewer's `media:view` report: the WHOLE set of
+    /// video producers it renders, with `seq` ordering the reports. A video
+    /// consumer the report names is resumed, every other video consumer is
+    /// paused, audio is never touched (`media/view.rs`).
+    ///
+    /// Decided under the DashMap guards, acted on after them: the consumer
+    /// handles are cloned out and every guard dropped before an await, the
+    /// pattern `set_producer_paused` established. A consumer that closed
+    /// meanwhile (its producer left) answers an error, which is logged and
+    /// skipped — the next report will not name it.
+    pub async fn apply_view(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        seq: u64,
+        tiles: Vec<(ProducerId, (u32, u32))>,
+        max: usize,
+    ) -> ViewOutcome {
+        let changes: Vec<(Consumer, view::Change)> = {
+            let Some(room) = self.rooms.get(room_id) else {
+                return ViewOutcome::NotFound;
+            };
+            let Some(mut participant) = room.participants.get_mut(connection_id) else {
+                return ViewOutcome::NotFound;
+            };
+            let ParticipantMedia {
+                view, consumers, ..
+            } = &mut *participant;
+            // ⚠️ `None` is a legacy client: its consumers all flow, and a
+            // report from it (a client that never declared `caps`) is ignored
+            // rather than read as "show nothing".
+            let Some(view) = view.as_mut() else {
+                return ViewOutcome::Legacy;
+            };
+            if !view.apply(seq, tiles, max) {
+                return ViewOutcome::Stale;
+            }
+            let lines: Vec<view::ConsumerLine> = consumers
+                .iter()
+                .map(|c| view::ConsumerLine {
+                    producer_id: c.producer_id(),
+                    kind: c.kind(),
+                    paused: c.paused(),
+                })
+                .collect();
+            view::plan(view, &lines)
+                .into_iter()
+                .map(|(i, change)| (consumers[i].clone(), change))
+                .collect()
+        };
+
+        let (mut resumed, mut paused) = (0, 0);
+        for (consumer, change) in changes {
+            let result = match change {
+                view::Change::Resume => consumer.resume().await,
+                view::Change::Pause => consumer.pause().await,
+            };
+            match result {
+                Ok(()) if change == view::Change::Resume => resumed += 1,
+                Ok(()) => paused += 1,
+                Err(e) => debug!(
+                    ?room_id,
+                    %connection_id,
+                    consumer_id = %consumer.id(),
+                    ?change,
+                    error = %e,
+                    "view: consumer flag not changed (closed meanwhile?)"
+                ),
+            }
+        }
+        debug!(?room_id, %connection_id, seq, resumed, paused, "view applied");
+        ViewOutcome::Applied { resumed, paused }
+    }
+
+    /// FR-127 P1 — one participant's consumers, as plain data (the tests and
+    /// the gauges read this; it names no worker type).
+    pub fn consumer_states(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+    ) -> Vec<ConsumerSnapshot> {
+        self.rooms
+            .get(room_id)
+            .and_then(|room| {
+                room.participants.get(connection_id).map(|p| {
+                    p.consumers
+                        .iter()
+                        .map(|c| ConsumerSnapshot {
+                            producer_id: c.producer_id().to_string(),
+                            kind: kind_str(c.kind()),
+                            paused: c.paused(),
+                            producer_paused: c.producer_paused(),
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// FR-127 P1 — one participant's producers, as plain data.
+    pub fn producer_states(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+    ) -> Vec<ProducerSnapshot> {
+        self.rooms
+            .get(room_id)
+            .and_then(|room| {
+                room.participants.get(connection_id).map(|p| {
+                    p.producers
+                        .iter()
+                        .map(|pe| ProducerSnapshot {
+                            producer_id: pe.producer.id().to_string(),
+                            kind: kind_str(pe.producer.kind()),
+                            source: pe.source.clone(),
+                            paused: pe.producer.paused(),
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
     }
 
     /// Closes a specific producer by ID.

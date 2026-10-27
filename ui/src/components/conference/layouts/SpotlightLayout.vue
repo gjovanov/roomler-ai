@@ -22,10 +22,12 @@
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
         @picture-black="$emit('picture-black', p.streamKey, $event)"
+        @visible="$emit('visible', p.streamKey, $event)"
       />
     </div>
 
-    <!-- Filmstrip -->
+    <!-- Filmstrip — scrolls sideways: a tile past its edge is off screen,
+         and its IntersectionObserver says so (FR-127 P1). -->
     <div v-if="secondary.length > 0" class="spotlight-filmstrip">
       <VideoTile
         v-for="p in secondary"
@@ -46,6 +48,7 @@
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
         @picture-black="$emit('picture-black', p.streamKey, $event)"
+        @visible="$emit('visible', p.streamKey, $event)"
       />
     </div>
 
@@ -73,6 +76,7 @@
 import { computed } from 'vue'
 import VideoTile from '@/components/conference/VideoTile.vue'
 import type { LayoutParticipant, SelfViewMode } from '@/composables/useConferenceLayout'
+import type { TileVisibility } from '@/utils/viewReport'
 
 const props = defineProps<{
   primary: LayoutParticipant[]
@@ -92,6 +96,9 @@ defineEmits<{
   spotlight: [streamKey: string]
   /** FR-124 — a tile's picture turned black (or stopped being black). */
   'picture-black': [streamKey: string, black: boolean]
+  /** FR-127 P1 — a remote tile came on screen or left it: the big tile, and
+      the filmstrip tiles inside the strip's viewport. */
+  visible: [streamKey: string, report: TileVisibility]
 }>()
 
 const primaryGridStyle = computed(() => {

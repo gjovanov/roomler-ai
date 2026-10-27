@@ -102,6 +102,11 @@ pub struct MediaGauges {
     pub rooms: Vec<serde_json::Value>,
     pub participants_total: usize,
     pub consumers_total: usize,
+    /// FR-127 P1 — video consumers paused by their VIEWER's view
+    /// (`Consumer::paused`, never the owner's FR-30 pause): how many streams
+    /// "receive what is visible" is holding back right now. `consumers_total`
+    /// minus this, minus the audio consumers, is what the workers forward.
+    pub video_paused_total: usize,
 }
 
 impl ConferenceState {
@@ -111,12 +116,24 @@ impl ConferenceState {
         for room in self.room_manager.rooms_ref().iter() {
             let participants = room.participants.len();
             let consumers: usize = room.participants.iter().map(|p| p.consumers.len()).sum();
+            let video_paused: usize = room
+                .participants
+                .iter()
+                .map(|p| {
+                    p.consumers
+                        .iter()
+                        .filter(|c| c.kind() == mediasoup::prelude::MediaKind::Video && c.paused())
+                        .count()
+                })
+                .sum();
             gauges.participants_total += participants;
             gauges.consumers_total += consumers;
+            gauges.video_paused_total += video_paused;
             gauges.rooms.push(serde_json::json!({
                 "room_id": room.key().to_hex(),
                 "participants": participants,
                 "consumers": consumers,
+                "video_paused": video_paused,
             }));
         }
         gauges

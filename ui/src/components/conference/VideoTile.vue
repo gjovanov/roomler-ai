@@ -182,6 +182,7 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { watchBlackPicture } from '@/utils/blackPicture'
+import type { TileVisibility } from '@/utils/viewReport'
 
 const props = withDefaults(defineProps<{
   stream: MediaStream | null
@@ -219,6 +220,11 @@ const emit = defineEmits<{
   /** FR-124 — this tile's picture turned black, or stopped being black. Sent
       once per change, and `false` on unmount if it was black. */
   'picture-black': [black: boolean]
+  /** FR-127 P1 — this remote tile came on screen (with its size in device
+      pixels) or left it. Sent once per change, and `visible: false` on
+      unmount if it was on screen. A local tile never reports: nothing is
+      received for it. */
+  visible: [report: TileVisibility]
 }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -451,9 +457,37 @@ const showBlackNotice = computed(
   () => pictureBlack.value && hasVideoTrack.value && !props.videoPaused && !props.isScreenShare,
 )
 
+// FR-127 P1 — is this tile on screen? An IntersectionObserver against the
+// viewport, which also applies the clip of every scrolling ancestor: a tile
+// scrolled out of the spotlight filmstrip or the sidebar strip is not
+// intersecting, a grid tile always is. The server pauses the video of a tile
+// that is not on screen, so the report must flip the moment the tile shows —
+// and `visible: false` goes out on unmount, while the parent still listens.
+// Only a remote tile reports; a local one receives nothing.
+let visibilityObserver: IntersectionObserver | null = null
+let reportedVisible = false
+
+function reportVisibility(visible: boolean, rect?: DOMRectReadOnly) {
+  if (visible === reportedVisible) return
+  reportedVisible = visible
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+  emit('visible', {
+    visible,
+    w: rect ? Math.round(rect.width * dpr) : 0,
+    h: rect ? Math.round(rect.height * dpr) : 0,
+  })
+}
+
 onMounted(() => {
   attachStream()
   if (fullscreenSupported) document.addEventListener('fullscreenchange', onFullscreenChange)
+  const root = tileRef.value?.$el
+  if (!props.isLocal && root && typeof IntersectionObserver !== 'undefined') {
+    visibilityObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) reportVisibility(entry.isIntersecting, entry.boundingClientRect)
+    })
+    visibilityObserver.observe(root)
+  }
   // Also listen for track changes if stream is already set
   if (props.stream) {
     props.stream.onaddtrack = () => {
@@ -476,9 +510,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   // Before anything else, while the parent still listens: a black tile
-  // that goes away must say so, or the call page keeps its warning up.
+  // that goes away must say so, or the call page keeps its warning up —
+  // and a tile that was on screen must leave the view, or the server keeps
+  // sending its video to a page that no longer shows it.
   stopBlackWatch?.()
   stopBlackWatch = null
+  visibilityObserver?.disconnect()
+  visibilityObserver = null
+  reportVisibility(false)
   disarmGestureRetry()
   if (fullscreenSupported) document.removeEventListener('fullscreenchange', onFullscreenChange)
   if (recheckTimer) {

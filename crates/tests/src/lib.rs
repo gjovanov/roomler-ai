@@ -12,6 +12,10 @@ mod channel_tests;
 mod conference_message_tests;
 #[cfg(test)]
 mod conference_tests;
+/// FR-127 P1 — receive what is visible: `caps: ["view"]`, `media:view`, the
+/// viewer's pause against the owner's (AC2), the kill switch, the other pod.
+#[cfg(test)]
+mod conference_view_tests;
 #[cfg(test)]
 mod export_tests;
 #[cfg(test)]
