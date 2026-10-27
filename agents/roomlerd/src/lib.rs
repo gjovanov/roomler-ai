@@ -177,6 +177,9 @@ pub mod replaced_binary;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
+/// #2718 — the daemon's runtime is shut down with a budget, so a blocking
+/// read an exec left behind cannot hold the process past a stop.
+pub mod runtime_exit;
 /// FR-84 D5b — the companion's Devices page: the org's device list and mesh,
 /// asked of the server with the org's agent token.
 pub mod self_view;
