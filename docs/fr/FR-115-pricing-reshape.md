@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
-| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; still open, and the FR waits on O4's decision. **#2820 is fixed** (agent 0.4.175, verified on the published build, the field log): a pair riding TURN leaves it while live once a probe over `/derp` proves the peer, at the cost of up to one 5 s tick in one direction (#2952). **O4 is measured** (2026-10-26, *O4, measured*): one room carries about 20 people with cameras on. **O3 is complete** (2026-10-25, the field log). Free's and the paid rate keep typing, kernel-TCP bulk and a remote-desktop session over the overlay usable. roomler SSH's collapse under both was #2876, fixed by #2899, which shipped in agent 0.4.171 and was verified on the published build |
+| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; still open, and the FR waits on O4's decision. **#2820 is fixed** (agent 0.4.175, verified on the published build, the field log): a pair riding TURN leaves it while live once a probe over `/derp` proves the peer, at the cost of a short one-way window: up to a 5 s tick on 0.4.175–0.4.177, about a round trip (or 0.5 s when one end follows) with #2952; a node with no `/derp` open does not move (#2992). **O4 is measured** (2026-10-26, *O4, measured*): one room carries about 20 people with cameras on. **O3 is complete** (2026-10-25, the field log). Free's and the paid rate keep typing, kernel-TCP bulk and a remote-desktop session over the overlay usable. roomler SSH's collapse under both was #2876, fixed by #2899, which shipped in agent 0.4.171 and was verified on the published build |
 | **Arc** | P3 of the pricing sequence in [`../business-model.md`](../business-model.md) §5 (enforce → meter → **reshape** → keys) |
 | **Related** | [FR-32](FR-32-plan-limit-enforcement.md) (the one decision point), [FR-20](FR-20-per-tenant-relay-cost-metering.md) (the ledger), [FR-19](FR-19-peer-relays.md) (org relays), [FR-52](FR-52-cross-org-remote-access.md) (support sessions to other orgs), [FR-102](FR-102-growth-observability.md) (revenue view) |
 | **Private annex** | `roomler-ai-docs/gtm/pricing/FR-115-annex-census-2026-10-19.md` — per-org census, account counts, competitor detail |
@@ -665,7 +665,10 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:421`,
   the TURN carrier only once a handshake over `/derp` latches. A peer that does not answer
   within 15 s keeps the pair on TURN. One end on 0.4.175 is enough, since an older peer follows
   it. Back under the allowance, the pair stays on DERP until it next re-establishes. The move
-  costs one direction up to one 5 s tick: 2.6 s measured on the published build (#2952).
+  costs one direction a short window. On 0.4.175–0.4.177 it is up to one 5 s tick (2.6 s and
+  0.70 s measured). With #2952, which promotes at the latch, it is about a round trip when both
+  ends probe (nothing lost to a 20/s ping) and about 0.5 s when one end follows (0.57 s). A node
+  with no `/derp` connection open does not move at all (#2992).
 
 ### P4d, as built: exit nodes on Free
 
