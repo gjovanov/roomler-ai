@@ -289,7 +289,7 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
 ### 7b. Two hazards found while executing, both blocking their phase
 
 1. **P2a would silently rename the Debian package.** `[package.metadata.deb]` in
-   `agents/roomlerd/Cargo.toml:596` sets no `name`, so cargo-deb derives `Package:` from the
+   `agents/roomlerd/Cargo.toml:964` sets no `name`, so cargo-deb derives `Package:` from the
    crate name — and `docs/installation.md:240` documents `apt remove roomler-agent`, confirming
    it. Renaming the crate therefore makes dpkg see a *different* package: the old one stays
    installed beside the new one, or the upgrade simply does not happen. **P2a must either pin

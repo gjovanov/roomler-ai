@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-90 P8-2b-1 — a session's worker on Windows (the FR-90 spec's P8-0,
-//! points 3 and 4): its channel a named pipe of its own, whose client end is
-//! the one handle it inherits; started into a job of its own, as the
-//! daemon's identity, its memory bounded there.
+//! FR-90 P8-2b-1 and P8-2b-2 — a session's worker on Windows (the FR-90
+//! spec's P8-0, points 3 and 4): its channel a named pipe of its own, whose
+//! client end is the one handle it inherits; started into a job of its own, as
+//! the daemon's identity, its memory bounded there — and kept out of every
+//! crash dump, since Windows Error Reporting would otherwise write the lease
+//! values it holds to disk (P8-2b-2).
 //!
 //! | Piece | As built |
 //! |---|---|
@@ -12,12 +14,18 @@
 //! | how it finds the channel | the handle's value in [`CHANNEL_ENV`], beside `ROOMLERD_HIVE_WORKER` |
 //! | its job | `KILL_ON_JOB_CLOSE`, so the daemon's end is the worker's, and a per-process memory limit of [`MAX_MEMORY`]: an allocation past it fails in the worker, and the worker alone ends |
 //! | the start | suspended, assigned to the job, then resumed, so it runs no instruction outside the job; one that cannot join is ended, never resumed |
-//! | its end | the job ended, and the process waited for; a peak at the bound is logged as what ended it |
+//! | its crash | nothing of its memory kept ([`no_crash_dump`], P8-2b-2): set before it takes its channel, `SEM_NOGPFAULTERRORBOX` makes WER write no dump, no event and no upload for the worker, on every fault path and thread. A worker that cannot set it does not run, as one that cannot set its Unix limits does not (P8-2a-3) |
+//! | its end | the job ended with a code of its own, the process waited for, then its exit code read and classified ([`InJob::ended`]): with crash reporting suppressed, nothing else on the box records how a worker ended, so the daemon logs it — a fault named, a peak at the bound read as out-of-memory |
 //!
 //! ⚠️ No endpoint is served here yet: the daemon serves them on Windows until
 //! a listening socket can cross as `WSADuplicateSocketW`'s protocol info
-//! (P8-2b-2). ⚠️ Before then, too, a worker's crash dump must carry no heap,
-//! as P8-2a-3 keeps a Unix worker's memory out of a core.
+//! (P8-2b-3). ⚠️ The crash-privacy mechanism was the one that held: measured
+//! as SYSTEM with a full `LocalDumps` config, `WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)`
+//! did not keep heap out of the dump, and a top-level exception filter and the
+//! job's `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` were each skipped by a
+//! fail-fast (Rust's `abort`, so every OOM at the bound). Only the process's
+//! own `SEM_NOGPFAULTERRORBOX` suppressed WER on every fault and thread (§3i
+//! "P8-2b-2, as built").
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
@@ -35,6 +43,9 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    GetErrorMode, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -43,8 +54,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    TerminateProcess, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, TerminateProcess, WaitForSingleObject,
 };
 
 use super::Running;
@@ -55,6 +66,25 @@ pub(crate) const CHANNEL_ENV: &str = "ROOMLERD_HIVE_WORKER_CHANNEL";
 pub(crate) const MAX_MEMORY: usize = 512 << 20;
 /// How long a worker's end is waited for, once its job is ended.
 const END_WAIT: Duration = Duration::from_secs(5);
+
+/// The exit code the daemon ends a worker's job with, so an ordinary end is
+/// never read as a crash: the worker itself returns only 0–3, and a native
+/// fault is a `0xC…` NTSTATUS, so none of those collide with it.
+const ENDED_BY_DAEMON: u32 = 1;
+
+/// What `GetExitCodeProcess` reports for a process that has not exited.
+const STILL_ACTIVE: u32 = 259;
+
+// The native fault codes the daemon names in its log. With crash reporting
+// suppressed ([`no_crash_dump`]) nothing else on the box records how a worker
+// ended, so its exit code is the only account of it.
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
+/// A fail-fast (`__fastfail`), which is what Rust's `abort` raises: a panic
+/// past its handler, or an allocation that failed at the memory bound
+/// (`handle_alloc_error`). The two are told apart by the job's peak.
+const STATUS_FATAL_APP_EXIT: u32 = 0xC000_0409;
+const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -130,6 +160,47 @@ pub(crate) fn inherited_channel() -> Option<NamedPipeClient> {
     // SAFETY: the daemon handed this process this handle, overlapped, and
     // nothing else owns it: this is the one place it is taken.
     unsafe { NamedPipeClient::from_raw_handle(raw as RawHandle) }.ok()
+}
+
+/// FR-90 P8-2b-2 — a worker keeps nothing of its memory in a crash dump. It
+/// sets `SEM_NOGPFAULTERRORBOX`, so when it faults Windows Error Reporting
+/// writes no dump, logs no Application Error event and uploads nothing — on
+/// every fault path (an access violation, a stack overflow, a fail-fast — the
+/// `abort` every OOM at the bound ends in) and every thread, since the mode is
+/// per process and covers one that already runs. A worker's memory holds the
+/// opened values of the leases it serves, as a Unix worker's does (P8-2a-3's
+/// one-byte core limit); a `LocalDumps` config — an administrator's, or a
+/// vendor driver's — would otherwise write all of it to disk in a full dump,
+/// and the default triage upload would carry a Microsoft bucket of it.
+///
+/// Measured as SYSTEM with a full `LocalDumps`: this was the one mechanism that
+/// held. `WerSetFlags(NOHEAP)` did not keep heap out of a `LocalDumps` dump,
+/// and a top-level exception filter and the job's
+/// `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` were each skipped by a
+/// fail-fast (§3i "P8-2b-2, as built").
+///
+/// Set before the worker takes its channel, and read back: a worker that
+/// cannot set it does not run, as one that cannot set its Unix limits does not
+/// (P8-2a-3). The bit is OR'd in, so a `SEM_FAILCRITICALERRORS` or
+/// `SEM_NOOPENFILEERRORBOX` the worker's launcher left on stays. The worker
+/// spawns no child; one that ever did would carry this mode into it unless
+/// started with `CREATE_DEFAULT_ERROR_MODE`.
+pub(crate) fn no_crash_dump() -> std::io::Result<()> {
+    // SAFETY: GetErrorMode and SetErrorMode read and set this process's own
+    // error mode; neither takes a pointer. GetErrorMode (not SetErrorMode(0))
+    // reads the current bits, so no fault in another thread meets a cleared
+    // mode in the window between the read and the set.
+    let armed = unsafe {
+        let current = GetErrorMode();
+        SetErrorMode(current | SEM_NOGPFAULTERRORBOX);
+        GetErrorMode()
+    };
+    if armed & SEM_NOGPFAULTERRORBOX == 0 {
+        return Err(std::io::Error::other(
+            "SEM_NOGPFAULTERRORBOX did not take: a crash could dump the worker's memory",
+        ));
+    }
+    Ok(())
 }
 
 /// A job of a worker's own: what it starts dies with it, and with the
@@ -345,6 +416,79 @@ impl InJob {
         };
         (ok != 0).then_some(info.PeakProcessMemoryUsed)
     }
+
+    /// FR-90 P8-2b-2 — log how the worker ended, from its exit code. With
+    /// crash reporting suppressed ([`no_crash_dump`]) nothing else on the box
+    /// records a worker's crash, so the daemon names it. `peak` is the job's
+    /// high-water mark, which tells a fail-fast at the memory bound (an OOM)
+    /// from one past a panic. The daemon ends the job with [`ENDED_BY_DAEMON`],
+    /// which `TerminateJobObject` cannot write over a process that already
+    /// faulted, so a real fault is read as itself and an ordinary end is not.
+    fn ended(&self, peak: Option<usize>) {
+        let mut code = 0u32;
+        // SAFETY: a live process handle; `code` is a valid out-param.
+        if unsafe { GetExitCodeProcess(self.process.as_raw_handle() as HANDLE, &mut code) } == 0 {
+            warn!(
+                pid = self.pid,
+                "hive: a session's worker ended; its exit code could not be read"
+            );
+            return;
+        }
+        if code == STILL_ACTIVE {
+            // It had not ended; the wait above already warned.
+            return;
+        }
+        let at_bound = peak.is_some_and(|p| p + (1 << 20) >= MAX_MEMORY);
+        let shown = format!("{code:#010x}");
+        match code {
+            0 | ENDED_BY_DAEMON => {
+                // A clean return, or the daemon's own job-end: not a crash.
+                tracing::debug!(pid = self.pid, code = %shown, "hive: a session's worker ended");
+            }
+            2 | 3 => warn!(
+                pid = self.pid,
+                code = %shown,
+                "hive: a session's worker refused to run (0x2 = no channel; 0x3 = could not keep its memory out of a crash dump)"
+            ),
+            STATUS_ACCESS_VIOLATION => warn!(
+                pid = self.pid,
+                code = %shown,
+                "hive: a session's worker crashed: an access violation"
+            ),
+            STATUS_STACK_OVERFLOW => warn!(
+                pid = self.pid,
+                code = %shown,
+                "hive: a session's worker crashed: a stack overflow"
+            ),
+            STATUS_FATAL_APP_EXIT if at_bound => warn!(
+                pid = self.pid,
+                max_mib = MAX_MEMORY >> 20,
+                code = %shown,
+                "hive: a session's worker ended: out of memory at its bound, an allocation past it aborted"
+            ),
+            STATUS_FATAL_APP_EXIT => warn!(
+                pid = self.pid,
+                code = %shown,
+                "hive: a session's worker crashed: a fail-fast — a panic past its handler, or an aborted allocation"
+            ),
+            STATUS_NO_MEMORY => warn!(
+                pid = self.pid,
+                code = %shown,
+                "hive: a session's worker crashed: out of memory"
+            ),
+            _ if at_bound => warn!(
+                pid = self.pid,
+                max_mib = MAX_MEMORY >> 20,
+                code = %shown,
+                "hive: a session's worker ended at its memory bound"
+            ),
+            _ => warn!(
+                pid = self.pid,
+                code = %shown,
+                "hive: a session's worker ended with an unexpected exit code"
+            ),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -356,8 +500,10 @@ impl Running for InJob {
     async fn kill(&mut self) {
         let peak = self.peak();
         if let Some(job) = self.job.as_ref() {
-            // SAFETY: a live job handle.
-            unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, 1) };
+            // SAFETY: a live job handle. ENDED_BY_DAEMON marks an ordinary end;
+            // it cannot write over the code of a process that already faulted,
+            // so `ended` never reads the daemon's own kill as a crash.
+            unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, ENDED_BY_DAEMON) };
         }
         let process = self.process.as_raw_handle() as usize;
         let ms = END_WAIT.as_millis() as u32;
@@ -373,15 +519,11 @@ impl Running for InJob {
                 "hive: a session's worker did not end with its job in time"
             );
         }
+        // Read before the job's last handle drops: the process handle is still
+        // this struct's, and the worker has ended (or the wait warned).
+        self.ended(peak);
         // The job's last handle: KILL_ON_JOB_CLOSE ends anything left in it.
         self.job = None;
-        if peak.is_some_and(|p| p + (1 << 20) >= MAX_MEMORY) {
-            warn!(
-                pid = self.pid,
-                max_mib = MAX_MEMORY >> 20,
-                "hive: a session's worker reached its memory bound: what it allocated past it failed"
-            );
-        }
     }
 }
 
