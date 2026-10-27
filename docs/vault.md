@@ -2632,7 +2632,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:317`](../agents/roomlerd/src/hive/egress.rs#L317)), `drop_run` ([`:432`](../agents/roomlerd/src/hive/egress.rs#L432)), a connection ([`carry`, `:480`](../agents/roomlerd/src/hive/egress.rs#L480)), the decision kept per run ([`decided`, `:575`](../agents/roomlerd/src/hive/egress.rs#L575)), `dialable` ([`:765`](../agents/roomlerd/src/hive/egress.rs#L765)), what is kept ([`decision_of`, `:853`](../agents/roomlerd/src/hive/egress.rs#L853)) |
+| the proxy | [`hive/egress.rs`](../agents/roomlerd/src/hive/egress.rs): `start` ([`:345`](../agents/roomlerd/src/hive/egress.rs#L345)), `drop_run` ([`:462`](../agents/roomlerd/src/hive/egress.rs#L462)), a connection ([`carry`, `:510`](../agents/roomlerd/src/hive/egress.rs#L510)), the decision kept per run ([`decided`, `:605`](../agents/roomlerd/src/hive/egress.rs#L605)), `dialable` ([`:795`](../agents/roomlerd/src/hive/egress.rs#L795)), what is kept ([`decision_of`, `:922`](../agents/roomlerd/src/hive/egress.rs#L922)) |
 | the ask | the lease client's `egress` ([`vault.rs:909`](../agents/roomlerd/src/vault.rs#L909)) and `on_egress_allowed` ([`:1107`](../agents/roomlerd/src/vault.rs#L1107)), which refuses an allow for anything but what was asked |
 | the run's | P3b-1b-2, below: started before the harness, so its ports are in the settings, and stopped with the run |
 
@@ -2899,13 +2899,13 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| which connections: a host the run holds a placeholder for | `carry` in [`hive/egress.rs:531`](../agents/roomlerd/src/hive/egress.rs#L531) |
-| the run's TLS to its audiences, made once | `RunState::upstream_tls` ([`egress.rs:279`](../agents/roomlerd/src/hive/egress.rs#L279)) |
-| a placeholder's value | `Values` ([`egress.rs:120`](../agents/roomlerd/src/hive/egress.rs#L120)), `LeaseValues` ([`:842`](../agents/roomlerd/src/hive/egress.rs#L842)) |
+| which connections: a host the run holds a placeholder for | `carry` in [`hive/egress.rs:561`](../agents/roomlerd/src/hive/egress.rs#L561) |
+| the run's TLS to its audiences, made once | `RunState::upstream_tls` ([`egress.rs:307`](../agents/roomlerd/src/hive/egress.rs#L307)) |
+| a placeholder's value | `Values` ([`egress.rs:121`](../agents/roomlerd/src/hive/egress.rs#L121)), `LeaseValues` ([`:872`](../agents/roomlerd/src/hive/egress.rs#L872)) |
 | the order: the audience verified, the client told, its hello read, its TLS | `carry` in [`hive/egress/swap.rs:136`](../agents/roomlerd/src/hive/egress/swap.rs#L136) |
-| the hello, read and judged | `read_hello` ([`:295`](../agents/roomlerd/src/hive/egress/swap.rs#L295)), `judge` ([`:343`](../agents/roomlerd/src/hive/egress/swap.rs#L343)) |
-| a request's names | `outbound` ([`:540`](../agents/roomlerd/src/hive/egress/swap.rs#L540)), `names` ([`:613`](../agents/roomlerd/src/hive/egress/swap.rs#L613)) |
-| the swap | `swap` ([`:650`](../agents/roomlerd/src/hive/egress/swap.rs#L650)), `swap_authorization` ([`:691`](../agents/roomlerd/src/hive/egress/swap.rs#L691)) |
+| the hello, read and judged | `read_hello` ([`:296`](../agents/roomlerd/src/hive/egress/swap.rs#L296)), `judge` ([`:344`](../agents/roomlerd/src/hive/egress/swap.rs#L344)) |
+| a request's names | `outbound` ([`:550`](../agents/roomlerd/src/hive/egress/swap.rs#L550)), `names` ([`:623`](../agents/roomlerd/src/hive/egress/swap.rs#L623)) |
+| the swap | `swap` ([`:660`](../agents/roomlerd/src/hive/egress/swap.rs#L660)), `swap_authorization` ([`:710`](../agents/roomlerd/src/hive/egress/swap.rs#L710)) |
 | the tests | [`hive/egress/swap/tests.rs`](../agents/roomlerd/src/hive/egress/swap/tests.rs): 17, against a test audience under a CA of its own |
 
 ### The tool, and its audiences (P3b-3c-2)
@@ -3067,11 +3067,11 @@ never sent:
 
 | Piece | Where |
 |---|---|
-| the step, before the swap | `forward` in [`hive/egress/swap.rs:481`](../agents/roomlerd/src/hive/egress/swap.rs#L481) |
-| which requests, the check, signed again | `resign` in [`hive/egress/swap/aws.rs:89`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L89) |
-| the pair | `pair` ([`:271`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L271)); a binding's secret and field, `Bound` ([`hive/placeholder.rs:59`](../agents/roomlerd/src/hive/placeholder.rs#L59)) |
-| the body's hash, and its bound | `payload` ([`:339`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L339)), `MAX_BODIES` ([`hive/egress.rs:74`](../agents/roomlerd/src/hive/egress.rs#L74)) |
-| a signed `Expect` kept | `outbound` ([`hive/egress/swap.rs:540`](../agents/roomlerd/src/hive/egress/swap.rs#L540)) |
+| the step, before the swap | `forward` in [`hive/egress/swap.rs:482`](../agents/roomlerd/src/hive/egress/swap.rs#L482) |
+| which requests, the check, signed again | `resign` in [`hive/egress/swap/aws.rs:90`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L90) |
+| the pair | `pair` ([`:275`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L275)); a binding's secret and field, `Bound` ([`hive/placeholder.rs:59`](../agents/roomlerd/src/hive/placeholder.rs#L59)) |
+| the body's hash, and its bound | `payload` ([`:343`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L343)), `MAX_BODIES` ([`hive/egress.rs:75`](../agents/roomlerd/src/hive/egress.rs#L75)) |
+| a signed `Expect` kept | `outbound` ([`hive/egress/swap.rs:550`](../agents/roomlerd/src/hive/egress/swap.rs#L550)) |
 | the secret key, never swapped | `signs_only` ([`hive/egress/swap/aws.rs:67`](../agents/roomlerd/src/hive/egress/swap/aws.rs#L67)), which `swap` reads |
 | the tests | [`hive/egress/swap/tests/aws.rs`](../agents/roomlerd/src/hive/egress/swap/tests/aws.rs): 8, against the swap's test audience |
 
