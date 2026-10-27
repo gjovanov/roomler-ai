@@ -5851,6 +5851,22 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: one more key, which an agent older than it drops (#2972).
     - *Built as recommended* (2026-10-27), on the operator's "go next". Another answer changes
       P8-2a-7's constant or the packaged units alone.
+67. **A Windows worker's value on the pagefile** (P8-2b-2), the operator's to confirm. P8-2b-2
+    keeps a worker's memory out of a crash dump, but Windows pages memory to disk while it runs,
+    and has no per-process opt-out — where Linux has `memory.swap.max 0` (P8-2a-7). So a lease
+    value could reach the pagefile for as long as the worker holds it.
+    - *Recommended: document it now, lock values later only if asked.* The exposure is narrow
+      (a value lives in the worker only while a connection uses it, and the pagefile is cleared
+      on a clean shutdown where `ClearPageFileAtShutdown` is set), and the per-buffer lock is
+      work better spent once a value's lifetime in the worker is longer than a request.
+      - What it costs: nothing now; a value on a running box's pagefile is readable by an
+        administrator, who can read the worker's live memory anyway.
+    - *Or: `VirtualLock` the value buffers* in the worker (and the daemon), so they never page.
+      - What it costs: locked pages come off the working-set quota, and every lease value's
+        buffer must be found and wrapped; a later step (`zeroize` already marks them).
+    - *Or: ask for a machine-wide encrypted pagefile* (`EncryptPagingFile`, or BitLocker) in the
+      docs, as a deployment note.
+      - What it costs: machine-wide, the operator's or the customer's call, not the daemon's.
 
 Decided on 2026-10-07 (design §0.1): transcripts on a replicaset, never on the server; Windows runs
 sessions as the console user only; Hive is the Business tier's "AI"; the brain is central; the
