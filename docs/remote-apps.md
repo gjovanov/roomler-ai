@@ -446,7 +446,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1092`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:6038`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6038`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -478,7 +478,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1612`, `:1618`), assigned by `with_config_lists` (`:777`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1657`, `:1664`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:789`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
-| `agents/roomlerd/src/main.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
+| `agents/roomlerd/src/app.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
 | `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1446`, `:988`) |
 | `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1105`, `parseAppsUnavailable` `:1181`), the request path (`:5474`, `refreshApps` `:5512`), the reply arm (`:8515`), the no-reason wording (`:890`) |

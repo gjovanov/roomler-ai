@@ -286,7 +286,7 @@ cells passed (0.4.139, §8 row 16). Now a **fresh Windows service install** is w
 `lock_on_end = auto`. That covers the wizard's SystemContext flavour and `roomlerd enroll
 --machine-global` (`install.ps1 -Role daemon-system`). Both call one helper,
 [`enrollment.rs:731`](../../crates/agent-core/src/enrollment.rs#L731) `apply_service_install_defaults`,
-from [`main.rs:2584`](../../agents/roomlerd/src/main.rs#L2584) and
+from [`app.rs:2584`](../../agents/roomlerd/src/app.rs#L2584) and
 [`orchestrator_agent.rs:574`](../../agents/roomler-setup/src/orchestrator_agent.rs#L574):
 
 | Install | Starts at | Why |

@@ -452,7 +452,8 @@ Suites, harnesses and the nightly lane: **`docs/testing.md`**.
   you understand the failure — re-test it or delete it.
 - **Unit**: Vitest (`ui/src/`), plus in-crate `#[cfg(test)]` tests in
   `remote_control`, `roomlerd` and `services::auth`.
-  ⚠️ `roomlerd`'s `main.rs` tests **never run** — CI is `--lib`.
+  `roomlerd`'s CLI tests (`src/app.rs`, the former `main.rs`) run under `--lib` as
+  `app::tests` since FR-123 P2; before that the bin's tests ran in no lane.
 
 ## Environment
 

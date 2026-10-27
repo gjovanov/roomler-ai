@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Library crate for `roomlerd`. The binary at `src/main.rs` is a thin
-//! CLI shell around these modules; exposing them here lets integration
+//! Library crate for `roomlerd`. The binary at `src/bin/roomlerd.rs` is one
+//! call into [`app::main`]; exposing the modules here lets integration
 //! tests drive the agent in-process against a `TestApp` server.
+
+// FR-123 P2 — the daemon's CLI and every subcommand, the former `src/main.rs`
+// (now `src/app.rs`, a pure rename). It lives in the lib so the daemon
+// compiles as ONE unit: an `async fn`'s body is emitted in the crate that
+// polls it, so a bin that polled `daemon_main` itself instantiated the
+// daemon's whole async tree a second time, after the lib and on one core
+// (measured: lib + bin 610 → 516 s on Windows, 702 → 548 s on macOS, and the
+// binary 5.5 % / 11.5 % smaller, FR-123 §2.4). The self alias keeps that
+// file's `roomlerd::` spelling valid inside the lib, so an edit in flight on
+// the old file still applies and compiles once its branch rebases.
+extern crate self as roomlerd;
+pub mod app;
 
 // P3e lever E: the daemon-free building blocks (appdirs, machine, config,
 // config_surface, enrollment, logging, logs_upload, crash_recorder, the
