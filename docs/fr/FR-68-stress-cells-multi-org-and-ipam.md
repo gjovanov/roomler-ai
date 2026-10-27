@@ -1,8 +1,10 @@
 # FR-68: Stress cells for multi-org guard contention and IPAM growth
 
 **Status**: shipped and field-verified — **every AC met except AC2**, which is
-deliberately deferred (see "Is AC2 worth its cost?"). All PRs merged, both
-repos. · **Owner**: overlay/networking ·
+deliberately deferred and is the operator's call to build or drop (see "Is AC2
+worth its cost?"). The P1 tail (AC3, AC4, AC9's emitted WARN) landed
+2026-10-27 with tests that were RED first; AC6 was re-read the same day on two
+two-org hosts running 0.4.179. · **Owner**: overlay/networking ·
 **Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272)
 
 ## Goal
@@ -147,22 +149,43 @@ the next reader does not assume back-off exists.
 
 ## Acceptance criteria
 
-- [ ] **AC1** A pre-P5d `OverlayNetworkInfo` decodes a real grown-org netmap without error
+- [x] **AC1** A pre-P5d `OverlayNetworkInfo` decodes a real grown-org netmap without error
       and ignores `cidrs` — proven with the struct copied verbatim from `agent-v0.4.42`.
+      (`a_grown_org_netmap_decodes_on_a_pinned_pre_p5d_agent`, unit, RED-first `a35720b6`;
+      `overlay_growth_tests` against a server-produced netmap, `182a4121`; both re-run
+      2026-10-27 — field log below.)
 - [ ] **AC2** A real `agent-v0.4.42` daemon meshes in a grown org, and its **subnet-router**
       limitation is demonstrated rather than assumed (block-1 → block-0-router LAN).
-- [ ] **AC3** A cross-tenant carve racing a grow does not silently refuse the joiner.
-- [ ] **AC4** Renumber against a grown org does not duplicate a `seq`.
-- [ ] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
-- [~] **AC6** (half — counters live and read on 3 hosts; the `spared` half needs a multi-org host) `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
-      read on two real multi-org hosts, **as a diff of two readings**.
+      (**Deferred — the operator's call**: the population it protects is zero while
+      `multi_block_enabled` is off everywhere; see "Is AC2 worth its cost?".)
+- [x] **AC3** A cross-tenant carve racing a grow does not silently refuse the joiner.
+      (`a_cross_tenant_carve_racing_a_grow_is_retried_above_the_winner`, RED on the
+      shipped discriminator, GREEN on the `seq`-scoped one — field log 2026-10-27.)
+- [x] **AC4** Renumber against a grown org does not duplicate a `seq`.
+      (`renumber_refuses_a_grown_network_before_touching_it` + the `(network_id, seq)`
+      assigned-unique guard, `flipping_multi_block_on_installs_the_position_guard` —
+      field log 2026-10-27.)
+- [x] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
+      (`turning_multi_block_off_after_a_grow_fails_the_boot_loudly`, RED-first `044f08f2`,
+      re-run 2026-10-27.)
+- [x] **AC6** `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
+      read on two real multi-org hosts, **as a diff of two readings**. (2026-09-04 on
+      0.4.63 — neo16 + CORPLAP-1, #1272; re-read 2026-10-27 on 0.4.179 — neo16 +
+      CORPLAP-1, both `primary` + `jovanov` on `overlay tun`, 6 min 12 s apart, no
+      decrease — field log below.)
 - [x] **AC7** With C2(a)+C2(b), a two-org Windows guest shows **zero sibling evictions**
-      over a sustained window.
+      over a sustained window. (`multiorg` cell, 2026-09-04: `evicted +0` over 80 waves.)
 - [x] **AC8** The negative control (`OVERLAY_SIBLING_EXEMPT=0`) **reproduces** the war —
-      i.e. AC7 is not passing vacuously.
-- [ ] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
-      overlap WARN.
+      i.e. AC7 is not passing vacuously. (`multiorg-war` cell, 2026-09-04: `evicted +67`,
+      `+66` in the full matrix.)
+- [x] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
+      overlap WARN. (The decision: `nested_blocks_count_as_overlapping` and the
+      `overlapping_sibling` vectors, #1303. The emitted line, captured:
+      `a_nested_legacy_and_carved_pair_emits_the_overlap_warn`, 2026-10-27. The field
+      condition is unreachable on today's fleet by construction — every org is carved —
+      so a test is the strongest evidence available, stated as such.)
 - [x] **AC10** The 18 pre-existing vmtest cells are unchanged by the two-tenant plumbing.
+      (Full 20-cell matrix 2026-09-04: `pass=92 fail=0`.)
 
 ## Open decisions
 
@@ -177,6 +200,33 @@ the next reader does not assume back-off exists.
 - The structural fix for nested blocks (FR-47 reconciler).
 - The pump-loop stall detector and the other items from the blocking-work analysis.
 - Anything that mutates grox / demo / jovanov: the fleet arm is **read-only**.
+
+## Where this stands — 2026-10-27
+
+Everything agent-reachable is done; the card is parked at *ready* for two
+operator decisions, neither of which a worker may take:
+
+1. **AC2** — build the IPAM VM cell (a disposable `roomler-ai-ipam` namespace
+   with `MULTI_BLOCK_ENABLED`, an org, an anchor, a pinned `agent-v0.4.42`
+   acting as a block-0 subnet router, a block-1 node) or drop the criterion.
+   The recommendation below ("Is AC2 worth its cost?") stands: the population
+   it protects is zero until an org approaches 1 022 devices, and the L1 tests
+   now cover the decoder, the netmask, the door and both allocator races.
+2. **`multi_block_enabled`** — flip it for an org that needs it, or leave it
+   dark. The P1 tail closed the two allocator races the flip would have
+   exposed (a lost slot race on a grow refusing the joiner; twin blocks at one
+   position), and the renumber route now refuses a grown network instead of
+   corrupting its list — so the door is safer to walk through than it was, but
+   it is still one-way.
+
+What the P1 tail changed, and why the 09-03 handover's "resists a
+deterministic test" no longer holds: the allocator is now two halves
+(`next_free_slot` / `claim_slot`, `crates/services/src/dao/overlay_block.rs`),
+so the interleaving — another tenant's carve landing on the slot a grow just
+read — is staged by calling the read, letting a stranger carve, then calling
+the write. The hook the handover said did not exist is the seam the test
+needed, and the seam made the bug plain: the collision arm re-read "any
+assigned block of this network", which on a grow is always block 0.
 
 ## Where this stands — handover, 2026-09-03
 
@@ -473,3 +523,29 @@ minutes later: its daemon had restarted, and counters reset at process start.
 "Diff two readings" is necessary but not sufficient — **a decrease invalidates
 the diff**, and computing it anyway yields a confident negative rate. Check for
 a decrease before trusting any delta.
+
+### 2026-10-27 — AC6 re-read on 0.4.179: two two-org hosts, diffed, no decrease
+
+Both multi-org hosts are back (neo16's `jovanov` enrollment was re-done since
+09-03): `roomler status` on each lists `primary … overlay tun (primary)` and
+`jovanov … overlay tun`. Two readings 6 min 12 s apart — neo16 locally,
+CORPLAP-1 and CORPLAP-3 via `roomler exec <host> -- "roomler status"`:
+
+| host | orgs | 19:58:39Z | 20:04:51Z | Δevicted | Δspared | Δwaves `[tick/pulled/event]` | Δreval |
+|---|---|---|---|---|---|---|---|
+| neo16 | 2 | `ev=0 sp=0 w=549 [297/39/252] rv=1736` | `ev=0 sp=0 w=593 [325/47/268] rv=1828` | **0** | **0** | +44 `[+28/+8/+16]` | +92 |
+| CORPLAP-1 | 2 | `ev=0 sp=0 w=483 [467/5/16] rv=72` | `ev=0 sp=0 w=511 [489/5/22] rv=72` | **0** | **0** | +28 `[+22/0/+6]` | 0 |
+| CORPLAP-3 | 1 | `ev=89 sp=0 w=306 [273/70/33] rv=148 yielded=33` | `ev=97 sp=0 w=323 [284/70/39] rv=151 yielded=33` | +8 | 0 | +17 `[+11/0/+6]` | +3 |
+
+No counter went down on any host, so no daemon restarted inside the window and
+every diff is valid. The two two-org hosts show the healthy **pair** — evictions
+flat *and* spares static — which is what C2(a)+C2(b) predict: narrowing keeps
+the per-org prefixes disjoint, so the sibling exemption is never consulted.
+CORPLAP-3 (single-org, AnyConnect) is the known foreign war, bounded: +8
+evictions in 17 waves with `yielded` static at 33 — the #1328 brake holding.
+
+Not over-read: neo16's `revalidations` climbs ~15/min with `evicted=0` — forced
+carrier re-measurement after route events, on the dev box that was starting
+Docker containers and runs WSL during the window (`event +16`). It is churn
+cost, not a sibling war, and not this FR's; noted so the next reader does not
+mistake it for one.
