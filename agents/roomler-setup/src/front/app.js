@@ -1036,7 +1036,8 @@ async function runInstall() {
     document.getElementById("token-input").value = "";
     if (paired) {
       // The session in Rust is already gone (cmd_install's success path);
-      // this page's view of it goes too, keeping the org name for Done.
+      // this page's view of it goes too, keeping only the org name, which
+      // the Done page's lead shows (renderDone).
       const orgName = state.pair.orgName;
       stopPairingLoop();
       state.pair.phase = "idle";
@@ -1235,6 +1236,9 @@ function renderDone() {
     if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
     if (done.anchored === true) lead += " It is anchored: commands can run as SYSTEM here.";
   }
+  // FR-129: a paired install names the org it joined (runInstall keeps the
+  // name after the pairing's own view is cleared).
+  if (state.pair.orgName) lead += ` It joined ${state.pair.orgName}.`;
   document.getElementById("done-lead").textContent = lead;
 
   // FR-104 — the anchor step ran and did not anchor: the manual command,
