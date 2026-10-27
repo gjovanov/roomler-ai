@@ -901,7 +901,8 @@ itself on the affected run's page. Baseline when the program started: releases t
     second time, after 0.4.174.
   - None of the four companion jobs has a `Compiling roomler-desktop` line: Windows EXE
     5 min, Linux x86_64 1 min, aarch64 1 min, macOS 3 min. On 0.4.174's tag they had spent
-    114–149 s on it.
+    114–149 s on it. ⚠️ **Wrong, corrected in the next entry:** the Windows EXE and macOS
+    jobs did compile it (4 min 03 s, 2 min 26 s). This grep could not match a colour-coded line.
   - Both cached-apt steps finished well inside their new bound: 7 s for the daemon .deb
     and 6 s for the companion .deb. The aarch64 jobs use the uncached step (22 s and 43 s).
   - All 8 build jobs carry the reuse notice. The four daemon jobs printed `reused build
@@ -915,3 +916,58 @@ itself on the affected run's page. Baseline when the program started: releases t
   - Next on this lane is FR-123 P2 (#2999, merged as `ae5ca6f6e`): the daemon compiles as
     one unit, measured −14 % on Windows and −30 % on macOS on the rehearsal's critical
     path. Its field check is 0.4.180's rehearsal.
+- 2026-10-27, evening: **agent-v0.4.180 (cut by roomler-ai-2e) published 5 min 28 s after its
+  tag, the fastest yet. Also a correction to the 0.4.179 entry.**
+  - Rehearsal 40574588069 and tag run 40577974956 both ran at `9aab8f703`, the first release
+    with FR-123 P2. The run was created at 20:25:51Z and the release published at
+    20:31:19Z.
+    - All 8 build jobs carry the reuse notice. The four daemon jobs compiled nothing and
+      printed `reused build reports 'roomlerd 0.4.180' (want 0.4.180): OK`.
+    - Three jobs ended together at 20:30:11Z, so they share the critical path:
+      - the Windows companion EXE: signing 62 s, then its post step 40 s;
+      - the MSI: payload signing 47 s, MSI signing 34 s;
+      - the `.pkg`, which waited 119 s for the macOS companion.
+  - **Correction to the 0.4.179 entry: two of the four companion jobs did compile
+    `roomler-desktop`.** The Windows EXE took 4 min 03 s and the macOS companion 2 min 26 s;
+    the two Linux jobs compiled nothing.
+    - That check grepped the raw logs. Cargo writes `Compiling\x1b[0m roomler-desktop`, and
+      the colour reset between the words means a plain grep for `Compiling roomler-desktop`
+      can never match: it counted 0 whatever happened. The cutter's check for 0.4.180 had
+      the same blind spot.
+    - With colours stripped: on 0.4.180's tag run only the macOS companion compiled it
+      (2 min 30 s). The reseed after it (40578859007) did the same (142 s). No Linux
+      companion compiled it on either run, nor did 0.4.180's Windows one.
+    - ⚠️ Prove a "none" count with a positive control: run the same grep on a log where the
+      answer must be at least 1, such as the rehearsal's.
+  - **Why the macOS companion recompiles is not yet known.** Probe branch
+    `exp/fr6-w31-companion-probe` restores the seed read-only and rebuilds with `-v` and
+    cargo's fingerprint log. It never stamps or saves a seed.
+    - Runs: v1 40583704652, v2 40584382028, v3 40585289155, v4 40586307513,
+      v5 40587490912.
+    - v1: the reseed's seed, rebuilt as a tag run does on another runner, was fresh (4.4 s).
+    - v2 to v4 each did a rehearsal-style build, then a tag-style rebuild on the same
+      runner. All were fresh (0.9–1.5 s), including:
+      - with the gitignored `gen/` removed, as a fresh checkout has it;
+      - with the seed's own `tar --zstd` round trip in between.
+    - v5 had the field's exact shape: a rehearsal-style build on runner A, the target
+      packed with `tar --zstd`, restored on runner B, then rebuilt as a tag run does. It was
+      fresh too (5.3 s, 0 of the dep-info's 48 inputs newer than its reference).
+    - Measured on the way:
+      - macOS bsdtar 3.5.3 stores mtimes to the whole second, cargo's reference included
+        (`…387.712610` → `…387.000000`). Windows' bsdtar 3.8.9 does the same to a 72- and a
+        167-character path, so no input can overtake its reference in the round trip.
+      - None of the tauri `OUT_DIR` inputs in the companion's dep-info is missing after a
+        restore.
+    - So the trigger lives in something only the real release jobs carry: their
+      environment (`SEED_REUSE_SAME_TREE`, `ROOMLER_SEED_REUSED_TREE`, the rehearsal branch
+      against the tag ref), or the steps around the build (stamp, artifact upload, seed
+      save). The way to read it is cargo's own answer in a real job:
+      `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the companion build steps, a
+      log-only change. It is not on today's critical path: the Windows companion and the
+      MSI ended at the same second as the `.pkg`.
+  - The reseed's MSI job compiled from scratch: 586 crates, 21 min 38 s. Its restored seed
+    held 3,042 MB, over the 3,000 MB cap, and was dropped whole by design. A reseed absorbs
+    that cold build, so the next rehearsal starts from a fresh seed.
+  - FR-123's reading of the same rehearsal is in its spec, §8.1: −19 % and −12 % of the
+    daemon's compile on the two Linux lanes. The MSI build step took 542 s, the fastest of
+    the 40 release runs since 10-24.
