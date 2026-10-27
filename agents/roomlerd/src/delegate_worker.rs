@@ -30,6 +30,22 @@
 //! actually useful to an operator reading `ps`; only the secret is on the
 //! pipe.
 //!
+//! ## The pipe is also the lifeline (#2987)
+//!
+//! After the secret, a supervisor of this release writes
+//! `macos_supervisor::LIFELINE_LINE` and keeps its end of the pipe open for as
+//! long as the worker lives. The worker therefore reads stdin on a thread of
+//! its own until the pipe closes, which happens when the daemon is gone,
+//! however it ended. The worker then stops through its own graceful door, so
+//! the next daemon's worker finds the person's single-instance lock free.
+//! Before this, a daemon that died without `stop_worker` (the watchdog's
+//! `exit(2)`) left its worker running on the old release, holding the lock,
+//! for good.
+//!
+//! The thread does not use tokio's `stdin`: tokio reads it on a blocking task
+//! that cannot be cancelled, and the runtime's shutdown waits for that task. A
+//! read that lasts the whole life of the process would hold every exit hostage.
+//!
 //! ## Why a DEDICATED socket, and not the LocalAPI one
 //!
 //! Because an unprivileged worker cannot open the control socket, and must not
@@ -64,6 +80,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::delegate::DelegateFrame;
 use crate::delegate::WorkerInbound;
 use crate::delegate::write_frame;
+use crate::macos_supervisor::LinkEnd;
 use roomler_ai_remote_control::signaling::ClientMsg;
 
 /// How often the worker proves the channel is alive.
@@ -80,6 +97,12 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 /// a minute of a feature not working.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// #2987 — how long the worker's own graceful stop may take, once its daemon
+/// is gone, before it forces the exit. That stop takes a few seconds at most
+/// (the runtime alone has a 3 s budget). Nothing else will ever stop this
+/// process, because its supervisor is what is gone.
+const LIFELINE_BACKSTOP: Duration = Duration::from_secs(15);
 
 /// What this worker tells the daemon it can do: the capture grants it holds
 /// (FR-43 P2c) and, FR-85 P1e-mac, its `record` caps — the DEVICE's row
@@ -142,6 +165,9 @@ pub async fn run(
         tokio::sync::mpsc::Receiver<ClientMsg>,
     )>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    // #2987 — the agent's internal shutdown, which the stdin thread sends when
+    // the daemon holding the other end of the pipe is gone.
+    stop: tokio::sync::watch::Sender<bool>,
 ) {
     if !supervised {
         tracing::debug!("delegation: not a supervised worker; not attaching");
@@ -151,7 +177,7 @@ pub async fn run(
         tracing::warn!("delegation: --supervised but no signalling channels; not attaching");
         return;
     };
-    let Some(secret) = read_secret_from_stdin().await else {
+    let Some(secret) = read_secret(start_stdin_link(stop)).await else {
         // LOUD, not silent: `--supervised` with no secret means the supervisor
         // and the worker disagree about how the secret travels, which is
         // exactly the failure that made P1's env marker a no-op for three
@@ -428,32 +454,79 @@ async fn attach_once(
     }
 }
 
-/// Read the attach secret: one line on stdin, bounded.
+/// Start the thread that owns stdin (#2987). It reads the attach secret, then
+/// watches the pipe for the close of the end the daemon holds. Returns where
+/// the secret arrives.
+fn start_stdin_link(
+    stop: tokio::sync::watch::Sender<bool>,
+) -> tokio::sync::oneshot::Receiver<Option<String>> {
+    let (secret_tx, secret_rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-lifeline".into())
+        .spawn(move || {
+            let end = crate::macos_supervisor::stdin_link(std::io::stdin().lock(), |secret| {
+                // The attach side may have stopped waiting; nothing to do then.
+                let _ = secret_tx.send(secret);
+            });
+            match end {
+                LinkEnd::Cut => daemon_gone(&stop),
+                LinkEnd::NotOffered => tracing::info!(
+                    "delegation: the supervisor closed our stdin after the secret (a daemon \
+                     from before #2987), so this worker cannot notice the daemon ending"
+                ),
+                LinkEnd::Unknown => tracing::warn!(
+                    "delegation: the supervisor offered a lifeline this worker does not know; \
+                     not watching stdin"
+                ),
+                LinkEnd::Lost(e) => tracing::warn!(
+                    error = %e,
+                    "delegation: lost the watch on stdin; this worker will not notice the \
+                     daemon ending"
+                ),
+                // `run` reports it: it is the side that waited for a secret.
+                LinkEnd::NoSecret => {}
+            }
+        });
+    if let Err(e) = spawned {
+        // The closure is dropped with the sender in it, and the attach side
+        // reads that as no secret.
+        tracing::warn!(error = %e, "delegation: could not start the stdin thread");
+    }
+    secret_rx
+}
+
+/// The daemon that held the other end of our stdin is gone (#2987).
+///
+/// Leave through the agent's own graceful door, the internal shutdown an
+/// update uses. It marks the run clean, so the crash-and-rollback ladder never
+/// counts it. It is not an OS stop, so an ephemeral device does not unenroll:
+/// the next daemon spawns a fresh worker on the same enrollment.
+fn daemon_gone(stop: &tokio::sync::watch::Sender<bool>) -> ! {
+    tracing::warn!(
+        "delegation: our daemon is gone (its end of our stdin closed); stopping, so the next \
+         daemon's worker finds the single-instance lock free (#2987)"
+    );
+    let _ = stop.send(true);
+    std::thread::sleep(LIFELINE_BACKSTOP);
+    tracing::error!(
+        backstop_secs = LIFELINE_BACKSTOP.as_secs(),
+        "delegation: the graceful stop did not finish; forcing the exit (#2987)"
+    );
+    std::process::exit(1);
+}
+
+/// Wait for the attach secret, bounded.
 ///
 /// Bounded because a worker that hangs waiting for a line that will never come
 /// is worse than one that gives up — the supervisor would see a process that
 /// starts and does nothing, and the operator would see a remote-desktop half
 /// that is running and useless. Five seconds is far longer than a parent that
 /// already has the secret in hand needs.
-async fn read_secret_from_stdin() -> Option<String> {
-    use tokio::io::AsyncBufReadExt;
-    let mut line = String::new();
-    let read = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::io::BufReader::new(tokio::io::stdin())
-            .read_line(&mut line)
-            .await
-    })
-    .await;
-    match read {
-        Ok(Ok(n)) if n > 0 => {
-            let secret = line.trim().to_string();
-            (!secret.is_empty()).then_some(secret)
-        }
-        Ok(Ok(_)) => None,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "delegation: could not read the secret from stdin");
-            None
-        }
+async fn read_secret(secret: tokio::sync::oneshot::Receiver<Option<String>>) -> Option<String> {
+    match tokio::time::timeout(Duration::from_secs(5), secret).await {
+        Ok(Ok(secret)) => secret,
+        // The stdin thread never started.
+        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!("delegation: timed out waiting for the secret on stdin");
             None
