@@ -811,7 +811,7 @@ install_daemon_macos() {
         say "      mesh does not (creating a utun needs root). To add the root half, pair it"
         say "      as root afterwards (a second approval), then install its service:"
         say "        sudo $daemon_bin --config $MACOS_DAEMON_CONFIG enroll --pair --server $SERVER --name \"$NAME-daemon\" --overlay"
-        say "        sudo roomlerd service install --as-service"
+        say "        sudo $daemon_bin service install --as-service"
     else
         say "NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
         say "      mesh does not (creating a utun needs root). Pass --daemon-token <a second"
