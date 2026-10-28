@@ -373,7 +373,7 @@ pub(crate) async fn serve(
 async fn serve_halves(
     mut rd: impl AsyncRead + Unpin,
     wr: impl AsyncWrite + Send + Unpin + 'static,
-    #[cfg(worker_calls)] descriptors: Option<UnixStream>,
+    #[cfg(all(worker_calls, unix))] descriptors: Option<UnixStream>,
     lines: Option<log::Lines>,
 ) -> std::io::Result<()> {
     let mut lines = lines;
@@ -413,7 +413,7 @@ async fn serve_halves(
             Msg::Beat { n } => link.send(&Msg::Beat { n }).await,
             Msg::Bye => break Ok(()),
             Msg::Ready { .. } | Msg::Log { .. } => Ok(()),
-            #[cfg(worker_calls)]
+            #[cfg(all(worker_calls, unix))]
             Msg::Call { id, call } => {
                 // A serve's listener came just before its frame (P8-2a-4b:
                 // the egress fronts' two, the HTTP one's first), so they are
@@ -429,6 +429,18 @@ async fn serve_halves(
                 let (link, serving) = (Arc::clone(&link), Arc::clone(&serving));
                 tokio::spawn(async move {
                     let answer = answer_call(&link, &serving, call, listeners);
+                    let _ = link.answer(id, answer).await;
+                });
+                Ok(())
+            }
+            // FR-90 P8-2b-3 — Windows: no second channel, so nothing is
+            // taken before the call; a `Serve`'s listener already rode
+            // inside `call` itself, as its `info`.
+            #[cfg(all(worker_calls, windows))]
+            Msg::Call { id, call } => {
+                let (link, serving) = (Arc::clone(&link), Arc::clone(&serving));
+                tokio::spawn(async move {
+                    let answer = answer_call(&link, &serving, call);
                     let _ = link.answer(id, answer).await;
                 });
                 Ok(())
@@ -453,10 +465,12 @@ fn answer_call(
     link: &Arc<link::Link>,
     serving: &Arc<super::vault_connect::handed::Serving>,
     call: Call,
-    listeners: Vec<std::io::Result<std::os::fd::OwnedFd>>,
+    #[cfg(unix)] listeners: Vec<std::io::Result<std::os::fd::OwnedFd>>,
 ) -> Answer {
     use super::vault_connect::handed;
+    #[cfg(unix)]
     let mut listeners = listeners.into_iter();
+    #[cfg(unix)]
     let mut next = || match listeners.next() {
         Some(Ok(fd)) => Ok(fd),
         Some(Err(e)) => Err(Answer::Refused {
@@ -467,11 +481,20 @@ fn answer_call(
         }),
     };
     match call {
+        #[cfg(unix)]
         Call::Serve { endpoint, spec } => match next() {
             Ok(fd) => handed::serve_handed(serving, Arc::clone(link), endpoint, &spec, fd),
             Err(refused) => refused,
         },
-        // P8-2a-4b — the run's egress fronts.
+        // FR-90 P8-2b-3 — Windows: the listener rode inside the call itself.
+        #[cfg(windows)]
+        Call::Serve {
+            endpoint,
+            spec,
+            info,
+        } => handed::serve_handed(serving, Arc::clone(link), endpoint, &spec, info),
+        // P8-2a-4b — the run's egress fronts. Unix only so far.
+        #[cfg(unix)]
         Call::Egress { endpoint, spec } => match (next(), next()) {
             (Ok(http), Ok(socks)) => super::egress::handed::serve_handed(
                 serving,
@@ -484,13 +507,15 @@ fn answer_call(
             (Err(refused), _) | (_, Err(refused)) => refused,
         },
         Call::Close { endpoint } => handed::close_handed(serving, endpoint),
-        Call::Values { .. }
-        | Call::Decide { .. }
-        | Call::Bound { .. }
-        | Call::Valued { .. }
-        | Call::Leaf { .. } => Answer::Refused {
+        Call::Values { .. } => Answer::Refused {
             why: "the daemon answers that, never a worker".into(),
         },
+        #[cfg(unix)]
+        Call::Decide { .. } | Call::Bound { .. } | Call::Valued { .. } | Call::Leaf { .. } => {
+            Answer::Refused {
+                why: "the daemon answers that, never a worker".into(),
+            }
+        }
     }
 }
 
@@ -1009,7 +1034,8 @@ async fn life(
         let link = Arc::clone(&link);
         tokio::spawn(async move {
             super::vault_connect::handed::rehand(session, fence, &link).await;
-            // P8-2a-4b — and the run's egress fronts.
+            // P8-2a-4b — and the run's egress fronts. Unix only so far.
+            #[cfg(unix)]
             super::egress::handed::rehand(session, fence, &link).await;
         });
     }
@@ -1091,6 +1117,7 @@ async fn beats(
 /// run this worker serves, whatever the call names.
 #[cfg(worker_calls)]
 fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
+    #[cfg(unix)]
     use super::egress::handed as egress;
     let (session, fence) = (run.session, run.fence);
     let link = Arc::clone(link);
@@ -1099,11 +1126,21 @@ fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
             Call::Values { endpoint } => {
                 super::vault_connect::handed::values(session, fence, endpoint)
             }
+            Call::Serve { .. } | Call::Close { .. } => Answer::Refused {
+                why: "a worker asks the daemon for values and the egress proxy's answers alone"
+                    .into(),
+            },
+            // P8-2a-4b — the egress proxy's. Unix only so far.
+            #[cfg(unix)]
             Call::Decide { host, port } => egress::decide((session, fence), &host, port).await,
+            #[cfg(unix)]
             Call::Bound { host, port } => egress::bound((session, fence), &host, port).await,
+            #[cfg(unix)]
             Call::Valued { host, port } => egress::valued((session, fence), &host, port).await,
+            #[cfg(unix)]
             Call::Leaf { host } => egress::leaf((session, fence), &host).await,
-            Call::Serve { .. } | Call::Close { .. } | Call::Egress { .. } => Answer::Refused {
+            #[cfg(unix)]
+            Call::Egress { .. } => Answer::Refused {
                 why: "a worker asks the daemon for values and the egress proxy's answers alone"
                     .into(),
             },
@@ -1191,6 +1228,15 @@ pub(crate) fn link_of(session: ObjectId, fence: u64) -> Option<Arc<link::Link>> 
     published.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// FR-90 P8-2b-3 — the pid of the run's worker while one is up: Windows's
+/// `hand`/`rehand` target `WSADuplicateSocketW` at it. Set in the same look
+/// as what makes [`link_of`] answer `Some` (both come from the one `Ready`),
+/// so this is `Some` whenever that is.
+#[cfg(all(worker_calls, windows))]
+pub(crate) fn pid_of(session: ObjectId, fence: u64) -> Option<u32> {
+    runs().get(&(session, fence))?.seen().pid
+}
+
 /// FR-90 P8-2a-2 — [`link_of`], waiting up to [`UP_WAIT`] for a worker that
 /// is starting: none once the daemon gave up on it.
 #[cfg(worker_calls)]
@@ -1212,7 +1258,10 @@ pub(crate) async fn up(session: ObjectId, fence: u64) -> Option<Arc<link::Link>>
 
 /// FR-90 P8-2a-2 — a test's: the run's worker on a task of this process,
 /// running the worker's own loop, so a test can follow what is handed to it.
-#[cfg(all(test, worker_calls))]
+/// Unix: it runs the worker's loop over real Unix sockets; Windows has no
+/// in-process stand-in yet, and leans on the real-binary tests instead
+/// (P8-2b-1, P8-2b-3).
+#[cfg(all(test, worker_calls, unix))]
 pub(crate) fn run_in_process(session: ObjectId, fence: u64, give_up: GiveUp) {
     let spawner = InProcess {
         first_lost_after: None,
@@ -1231,7 +1280,7 @@ pub(crate) fn run_in_process(session: ObjectId, fence: u64, give_up: GiveUp) {
 /// FR-90 P8-2a-2 — a test's: as [`run_in_process`], its first worker lost
 /// `after` it started (its loop dropped, as a process's end drops it), the
 /// next one staying, at [`Timing::quick`]'s bounds.
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 pub(crate) fn run_in_process_lost_after(session: ObjectId, fence: u64, after: Duration) {
     let spawner = InProcess {
         first_lost_after: Some(after),
@@ -1245,7 +1294,7 @@ pub(crate) fn run_in_process_lost_after(session: ObjectId, fence: u64, after: Du
 /// FR-90 P8-2a-2 — a test's: as [`run_in_process`], its first worker's
 /// descriptor channel gone from its start while its frames are still
 /// served, the next one whole, at [`Timing::quick`]'s bounds.
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 pub(crate) fn run_in_process_first_without_descriptors(session: ObjectId, fence: u64) {
     let spawner = InProcess {
         first_lost_after: None,
@@ -1258,7 +1307,7 @@ pub(crate) fn run_in_process_first_without_descriptors(session: ObjectId, fence:
 
 /// FR-90 P8-2a-2 — a test's: a run whose worker never starts, soon given up
 /// on (at [`Timing::quick`]'s bounds), `give_up` called then.
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 pub(crate) fn run_never_up(session: ObjectId, fence: u64, give_up: GiveUp) {
     run_started_with(session, fence, Arc::new(NeverUp), Timing::quick(), give_up);
 }
@@ -1280,27 +1329,27 @@ impl Timing {
     }
 }
 
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 struct NeverUp;
 
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 impl Spawn for NeverUp {
     fn spawn(&self, _theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
         Err(std::io::Error::other("no worker in this test"))
     }
 }
 
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 struct InProcess {
     first_lost_after: Option<Duration>,
     first_without_descriptors: bool,
     started: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 struct OnTask(tokio::task::JoinHandle<std::io::Result<()>>);
 
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 #[async_trait::async_trait]
 impl Running for OnTask {
     fn pid(&self) -> Option<u32> {
@@ -1312,7 +1361,7 @@ impl Running for OnTask {
     }
 }
 
-#[cfg(all(test, worker_calls))]
+#[cfg(all(test, worker_calls, unix))]
 impl Spawn for InProcess {
     fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
         let tokio_of = |s: std::os::unix::net::UnixStream| {
@@ -1356,8 +1405,9 @@ pub(crate) fn drop_run(session: ObjectId, fence: u64) -> bool {
     true
 }
 
-/// FR-90 P8-2a-2 — the second channel: listeners from the daemon.
-#[cfg(worker_calls)]
+/// FR-90 P8-2a-2 — the second channel: listeners from the daemon. Unix
+/// only: Windows has no fd-4 channel (P8-2b-3).
+#[cfg(all(worker_calls, unix))]
 mod fds;
 /// FR-90 P8-2a-2 — one side's end of the channel, and the calls across it.
 pub(crate) mod link;
@@ -1368,8 +1418,9 @@ mod log;
 #[cfg(target_os = "linux")]
 mod memory;
 /// FR-90 P8-2b-1 — a worker on Windows: its pipe, its job, its start.
+/// P8-2b-3 — `win::sock`, crossed to it listeners held.
 #[cfg(windows)]
-mod win;
+pub(crate) mod win;
 
 #[cfg(all(test, unix))]
 mod tests;

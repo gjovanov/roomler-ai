@@ -14,7 +14,7 @@
 
 #[cfg(worker_calls)]
 use std::collections::HashMap;
-#[cfg(worker_calls)]
+#[cfg(all(worker_calls, unix))]
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(worker_calls)]
 use std::sync::Mutex;
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::AsyncWrite;
-#[cfg(worker_calls)]
+#[cfg(all(worker_calls, unix))]
 use tokio::net::UnixStream;
 #[cfg(worker_calls)]
 use tokio::sync::oneshot;
@@ -38,11 +38,12 @@ use super::{Msg, send};
 #[cfg(worker_calls)]
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
 
-/// What one side writes with: its half of the channel and, the daemon's,
-/// the second channel, the one descriptors go on.
+/// What one side writes with: its half of the channel and, the daemon's, the
+/// second channel, the one descriptors go on. Windows has no second channel
+/// (P8-2b-3): a listener rides inside the call's own frame there.
 struct Writer {
     frames: Box<dyn AsyncWrite + Send + Unpin>,
-    #[cfg(worker_calls)]
+    #[cfg(all(worker_calls, unix))]
     descriptors: Option<UnixStream>,
 }
 
@@ -65,12 +66,12 @@ impl Link {
         frames: impl AsyncWrite + Send + Unpin + 'static,
         #[cfg(unix)] descriptors: tokio::net::UnixStream,
     ) -> Self {
-        #[cfg(all(unix, not(worker_calls)))]
+        #[cfg(all(unix, not(all(worker_calls, unix))))]
         drop(descriptors);
         Self {
             writer: tokio::sync::Mutex::new(Writer {
                 frames: Box::new(frames),
-                #[cfg(worker_calls)]
+                #[cfg(all(worker_calls, unix))]
                 descriptors: Some(descriptors),
             }),
             #[cfg(worker_calls)]
@@ -87,7 +88,7 @@ impl Link {
         Self {
             writer: tokio::sync::Mutex::new(Writer {
                 frames: Box::new(frames),
-                #[cfg(worker_calls)]
+                #[cfg(all(worker_calls, unix))]
                 descriptors: None,
             }),
             #[cfg(worker_calls)]
@@ -125,26 +126,59 @@ impl Link {
         send(&mut self.writer.lock().await.frames, m).await
     }
 
+    /// A call's id, registered among those awaiting an answer: `None` where
+    /// the channel is already gone.
+    #[cfg(worker_calls)]
+    fn register(&self) -> Option<(u64, oneshot::Receiver<Answer>)> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.as_mut()?.insert(id, tx);
+        Some((id, rx))
+    }
+
+    /// Once a call's frame is sent (or failed): its answer, within
+    /// [`CALL_WAIT`]. A failed send, or one unanswered in time, takes the
+    /// link for lost.
+    #[cfg(worker_calls)]
+    async fn finish_call(
+        &self,
+        id: u64,
+        rx: oneshot::Receiver<Answer>,
+        sent: std::io::Result<()>,
+    ) -> Result<Answer, String> {
+        if let Err(e) = sent {
+            self.forget(id);
+            let why = format!("the worker's channel refused a call: {e}");
+            self.lose(&why);
+            return Err(why);
+        }
+        match tokio::time::timeout(CALL_WAIT, rx).await {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(_)) => Err("the worker's channel went before it answered".into()),
+            Err(_) => {
+                self.forget(id);
+                let why = format!("a call went unanswered within {CALL_WAIT:?}");
+                self.lose(&why);
+                Err(why)
+            }
+        }
+    }
+
     /// `call`, and its answer: an error once the channel is gone, and past
     /// [`CALL_WAIT`]. `descriptors` go on the second channel just before the
     /// call's frame, in order (the daemon's side alone has one). A call that
     /// cannot be sent, or goes unanswered within the bound, takes the link
     /// for lost.
-    #[cfg(worker_calls)]
+    #[cfg(all(worker_calls, unix))]
     pub(crate) async fn call(
         &self,
         call: Call,
         descriptors: Vec<OwnedFd>,
     ) -> Result<Answer, String> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(waiting) = waiting.as_mut() else {
-                return Err("the worker's channel is gone".into());
-            };
-            waiting.insert(id, tx);
-        }
+        let Some((id, rx)) = self.register() else {
+            return Err("the worker's channel is gone".into());
+        };
         // A descriptor sent and its frame not would leave the next call's
         // frame naming it: the channel is gone then, and so is this link.
         let sent = {
@@ -165,22 +199,22 @@ impl Link {
             }
         };
         drop(descriptors);
-        if let Err(e) = sent {
-            self.forget(id);
-            let why = format!("the worker's channel refused a call: {e}");
-            self.lose(&why);
-            return Err(why);
-        }
-        match tokio::time::timeout(CALL_WAIT, rx).await {
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(_)) => Err("the worker's channel went before it answered".into()),
-            Err(_) => {
-                self.forget(id);
-                let why = format!("a call went unanswered within {CALL_WAIT:?}");
-                self.lose(&why);
-                Err(why)
-            }
-        }
+        self.finish_call(id, rx, sent).await
+    }
+
+    /// FR-90 P8-2b-3 — [`call`](Self::call) on Windows: no second channel, so
+    /// what a Unix call hands across as a descriptor rides inside `call`
+    /// itself (a listener's `WSAPROTOCOL_INFOW`, in its `Spec`).
+    #[cfg(all(worker_calls, windows))]
+    pub(crate) async fn call(&self, call: Call) -> Result<Answer, String> {
+        let Some((id, rx)) = self.register() else {
+            return Err("the worker's channel is gone".into());
+        };
+        let sent = {
+            let mut w = self.writer.lock().await;
+            send(&mut w.frames, &Msg::Call { id, call }).await
+        };
+        self.finish_call(id, rx, sent).await
     }
 
     /// The answer to call `id`, as it arrives: `false` when nothing waits
@@ -226,5 +260,8 @@ impl Link {
     }
 }
 
-#[cfg(all(test, worker_calls))]
+/// Unix: a real end-to-end harness over `UnixStream`, descriptors included.
+/// Windows has no in-process stand-in yet (P8-2b-3, as `worker.rs`'s
+/// `run_in_process` does not either); it leans on the real-binary tests.
+#[cfg(all(test, worker_calls, unix))]
 mod tests;
