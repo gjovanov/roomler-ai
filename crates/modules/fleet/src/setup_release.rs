@@ -12,7 +12,8 @@
 //! `GET /api/setup/{latest-release,{platform}/health,{platform}}` —
 //! latest-release returns the `setup-v*`-filtered list; health
 //! resolves a platform asset manifest; the bare platform route
-//! streams the artifact bytes.
+//! streams the artifact bytes. `GET /api/setup/features` (FR-129 B1-s)
+//! is the server's word on which install paths a client may offer.
 //!
 //! Parallel to [`crate::tunnel_release`] (bare CLI tarball)
 //! and [`crate::agent_release`] (agent MSIs).
@@ -78,6 +79,57 @@ pub async fn setup_latest_release(
         .filter(|r| r.tag_name.starts_with("setup-v"))
         .collect();
     Ok(Json(filtered))
+}
+
+/// The answer of [`setup_features`]: booleans only, every one of them
+/// present, so no consumer ever has to default a missing key — and a new
+/// key is additive, which an older consumer ignores.
+#[derive(Debug, Serialize)]
+pub struct SetupFeatures {
+    /// `[pairing] enabled` (FR-129 A1): `/api/pair/*` is mounted, so a wizard
+    /// may offer "sign in from your browser" instead of a pasted token.
+    pub pairing: bool,
+    /// `[setup] wizard_unix_daemon` (FR-129 B1-s): the released Roomler Setup
+    /// installs the full daemon on Linux and macOS.
+    pub wizard_unix_daemon: bool,
+}
+
+/// `GET /api/setup/features` — the server-wide switches a client reads before
+/// offering an install path (FR-129 B1-s; AC14's server half). Public,
+/// unauthenticated, a plain JSON object:
+///
+/// ```json
+/// {"pairing": true, "wizard_unix_daemon": false}
+/// ```
+///
+/// * `pairing` mirrors `[pairing] enabled`: whether `/api/pair/*` answers, so
+///   a wizard or the homepage can say "sign in from your browser" up front
+///   rather than discover the empty 404 on `start`.
+/// * `wizard_unix_daemon` is `[setup] wizard_unix_daemon`, default off: the
+///   operator's assertion that the released Roomler Setup installs the full
+///   daemon on Linux and macOS (B1) and that AC11's field run is on record.
+///   The SPA's enrollment dialog, both homepages and a B1 wizard show the
+///   Linux and macOS daemon cards only on `true`, so the cards can be turned
+///   off without a release (key design B.6).
+///
+/// ⚠️ Every consumer reads anything but a JSON `true` as **false**: an older
+/// server (404), a server with the fleet module unmounted (503), a proxy's
+/// HTML error page, a timeout, a string `"true"`. Absent means "offer what
+/// the client could do before this route existed" — the daemon wizard on
+/// Windows only, the token lead — which is the safe direction: a card the
+/// released wizard cannot honour is the failure this switch exists to
+/// prevent, and an older server never advertises one.
+///
+/// Deliberately NOT a field on `/api/setup/latest-release`: that route
+/// answers a bare JSON array every shipped wizard parses as
+/// `Vec<AgentRelease>`, and a wrapper object would strand them all. Not
+/// counted by `install_trace` either: the SPA reads it on every homepage
+/// view, which is not a fetch of anything installable.
+pub async fn setup_features(State(state): State<FleetState>) -> Json<SetupFeatures> {
+    Json(SetupFeatures {
+        pairing: state.settings.pairing.enabled,
+        wizard_unix_daemon: state.settings.setup.wizard_unix_daemon,
+    })
 }
 
 /// `GET /api/setup/{platform}/health` — manifest for the unified

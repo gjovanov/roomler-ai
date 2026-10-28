@@ -147,8 +147,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { useSetupFeaturesStore } from '@/stores/setupFeatures'
 import {
   enrollCommands,
   type DaemonScope,
@@ -199,6 +200,20 @@ const scopeHint = computed(() => SCOPE_HINTS[scope.value])
 // FR-104 — only a machine-wide Windows install has a SYSTEM service to anchor.
 const anchorOffered = computed(() => props.kind === 'agent' && scope.value !== 'user')
 
+// FR-129 B1-s — the wizard block off Windows follows the server's
+// `wizard_unix_daemon` (`GET /api/setup/features`), fetched once, when the
+// dialog first opens, and read as false until the server has said true: the
+// Linux and macOS tabs then show the script and the manual path only, as
+// before FR-129.
+const setupFeatures = useSetupFeaturesStore()
+watch(
+  () => props.modelValue,
+  (open) => {
+    if (open) void setupFeatures.load()
+  },
+  { immediate: true },
+)
+
 const commands = computed(() =>
   enrollCommands(
     props.kind,
@@ -206,6 +221,7 @@ const commands = computed(() =>
     props.token,
     scope.value,
     props.anchor === true,
+    { wizardUnixDaemon: setupFeatures.wizardUnixDaemon },
   ),
 )
 

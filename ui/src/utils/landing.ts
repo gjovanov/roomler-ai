@@ -145,11 +145,24 @@ export const PILLARS: LandingPillar[] = [
 ]
 
 /** The install section's copy. Its cards, the wizard among them, come from
- *  `installCards` in `enrollCommands.ts`, which offers the wizard only where it
- *  installs the agent (FR-97 D5). */
+ *  `installCards` in `enrollCommands.ts`, which offers the wizard where it
+ *  installs the agent: Windows (FR-97 D5), and Linux and macOS once the server
+ *  advertises `wizard_unix_daemon` on `GET /api/setup/features` (FR-129
+ *  B1-s). The lead follows the same endpoint's `pairing`: `downloadLead`. */
 export const DOWNLOAD = {
   title: 'Set up a device in minutes',
   lead: 'Paste one command, or on Windows run the graphical installer. Enrollment tokens come from your workspace (Devices → Enroll device).',
+  /** FR-129 — with pairing on, the wizard needs no token to copy. The wording
+   *  was agreed with the homepage film (2026-10-28): character for character. */
+  leadPairing:
+    'Run Roomler Setup and sign in from your browser, with no token to copy. Or paste one command with a token from your workspace (Devices → Enroll device).',
+}
+
+/** FR-129 B1-s — the install section's lead for what the server advertises:
+ *  `pairing` from `GET /api/setup/features`, read as false until it has said
+ *  `true` (an older server, a failed request, the first paint). */
+export function downloadLead(pairing: boolean): string {
+  return pairing ? DOWNLOAD.leadPairing : DOWNLOAD.lead
 }
 
 export const PRICING = {

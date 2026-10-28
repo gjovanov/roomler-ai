@@ -5,12 +5,22 @@
 // enroll COMMAND counts, copying the bare token does not, a failed clipboard
 // write does not, and without purestat the copy still works.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createPinia, setActivePinia } from 'pinia'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createVuetify } from 'vuetify'
 import * as components from 'vuetify/components'
 import * as directives from 'vuetify/directives'
-import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 
+// FR-129 B1-s — the dialog reads `GET /api/setup/features` through the
+// setup-features store; the client is mocked so no request leaves jsdom.
+vi.mock('@/api/client', () => ({
+  api: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn() },
+}))
+
+import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
+import { api } from '@/api/client'
+
+const mockApi = vi.mocked(api)
 const vuetify = createVuetify({ components, directives })
 type W = Window & { purestat?: unknown }
 const purestat = vi.fn()
@@ -32,6 +42,10 @@ const buttons = (label: string) =>
   [...document.body.querySelectorAll('button')].filter((b) => b.textContent!.trim() === label) as HTMLButtonElement[]
 
 beforeEach(() => {
+  setActivePinia(createPinia())
+  // The shipped default: pairing on, the Linux/macOS daemon wizard off.
+  mockApi.get.mockReset()
+  mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: false })
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -170,5 +184,67 @@ describe('EnrollmentDialog — the anchor box (FR-104)', () => {
     const t = await mountWith({ kind: 'tunnel', anchor: false })
     expect(box()).toBeNull()
     t.unmount()
+  })
+})
+
+// FR-129 B1-s — the wizard block off Windows follows the server's
+// `wizard_unix_daemon`, read when the dialog opens and false until it has
+// said true. The Linux tab is the one under test; the default tab follows
+// the visitor's platform.
+describe('EnrollmentDialog — the Linux and macOS wizard (FR-129 B1-s)', () => {
+  async function mountOnLinux(props: Record<string, unknown> = {}) {
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (X11; Linux x86_64)')
+    const w = mount(EnrollmentDialog, {
+      props: {
+        modelValue: true,
+        kind: 'agent',
+        token: 'tok-123',
+        expiresIn: 600,
+        loading: false,
+        error: null,
+        ...props,
+      },
+      global: { plugins: [vuetify], stubs: { VDialog: { template: '<div><slot /></div>' } } },
+      attachTo: document.body,
+    })
+    await flushPromises()
+    return w
+  }
+  const wizardLink = (os: string) =>
+    document.body.querySelector(`a[href$="/api/setup/${os}"]`) as HTMLAnchorElement | null
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('offers the script and the manual path only while the server has not said so', async () => {
+    const w = await mountOnLinux()
+    expect(mockApi.get).toHaveBeenCalledWith('/setup/features')
+    expect(wizardLink('linux')).toBeNull()
+    expect(document.body.textContent).toContain('/api/setup/install.sh')
+    w.unmount()
+  })
+
+  it('offers Roomler Setup on the Linux tab once the server advertises wizard_unix_daemon', async () => {
+    mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: true })
+    const w = await mountOnLinux()
+    const link = wizardLink('linux')
+    expect(link).not.toBeNull()
+    expect(link!.textContent).toContain('Download Roomler Setup')
+    w.unmount()
+  })
+
+  it('keeps the Linux tab as it was when the request fails (an older server)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockApi.get.mockRejectedValue(Object.assign(new Error('API error 404'), { status: 404 }))
+    const w = await mountOnLinux()
+    expect(wizardLink('linux')).toBeNull()
+    expect(document.body.textContent).toContain('/api/setup/install.sh')
+    expect(warn).not.toHaveBeenCalled()
+    w.unmount()
+  })
+
+  it('a tunnel client is offered the wizard everywhere, as before', async () => {
+    const w = await mountOnLinux({ kind: 'tunnel' })
+    expect(wizardLink('linux')).not.toBeNull()
+    w.unmount()
   })
 })

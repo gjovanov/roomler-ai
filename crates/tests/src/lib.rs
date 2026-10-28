@@ -323,6 +323,11 @@ mod session_carrier_tests;
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
 #[cfg(test)]
 mod session_feedback_tests;
+/// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch
+/// (`wizard_unix_daemon`, default off) and `pairing`, each following its
+/// setting, read by a guest and a member alike.
+#[cfg(test)]
+mod setup_features_tests;
 #[cfg(test)]
 mod ssh_grant_ack_tests;
 #[cfg(test)]
