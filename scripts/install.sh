@@ -33,6 +33,23 @@
 #   --no-enroll       install without enrolling (no token needed); prints the
 #                     enroll command to run later.
 #
+#   Or pair in the browser instead of pasting a token (FR-129 A4):
+#
+#   curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+#       --role daemon --pair [--pair-org <org-slug>] [--server …] [--name …]
+#
+#   --pair            prints a code and the page to type it on; sign in there
+#                     (or create an account and an org), type the code, approve.
+#                     The daemon then shows the org and the approver — name AND
+#                     unique slug, name AND unique username — and asks
+#                     "Join …? [y/N]" on this terminal before it enrolls. The
+#                     token the approval delivers stays inside the daemon's
+#                     own process: never on a command line, never on disk
+#                     outside the enrolled config.
+#   --pair-org SLUG   with --pair: the org the approval must name. It stands in
+#                     for the question (the check, stated in advance), and with
+#                     no terminal to ask on it is the only way to enroll.
+#
 # The desktop companion (roomler-desktop) rides IN the macOS .pkg. On Linux it
 # is a SEPARATE .deb (FR-27), or .rpm on Fedora, the RHEL family and openSUSE
 # (FR-93 P6d) — installed automatically when this box has a
@@ -84,6 +101,9 @@ set -eu
 SERVER="https://roomler.ai"
 ROLE=""
 TOKEN=""
+# FR-129 A4 — pair in the browser instead of pasting a token (see the header).
+PAIR=0
+PAIR_ORG=""
 NAME="$(hostname 2>/dev/null || echo roomler-device)"
 DOWNLOAD_ONLY=0
 SYSTEM=0
@@ -123,14 +143,21 @@ CONFIG_FROM=""
 DIGEST_REQUIRED=0
 
 usage() {
-    sed -n '2,32p' "$0" 2>/dev/null || true
-    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
-    echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    sed -n '2,51p' "$0" 2>/dev/null || true
+    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT | --pair [--pair-org SLUG]]"
+    echo "                  [--name NAME] [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
     echo "       install.sh --privileged-steps --role daemon [--system] [--config-from FILE]"
     echo "                  [--server URL] [--name NAME] [--desktop|--no-desktop]"
     echo "       install.sh --user-steps --role daemon [--system]"
     echo "       install.sh --uninstall [--keep-config]"
+    echo
+    echo "  --pair          Pair in the browser instead of pasting a token: prints a code and the"
+    echo "                  page to type it on, waits for the approval, shows the org and the"
+    echo "                  approver (name AND slug, name AND username) and asks before it"
+    echo "                  enrolls. The token never touches a command line. --pair-org SLUG"
+    echo "                  names the org the approval must name; with no terminal to ask on"
+    echo "                  it is the only way to enroll. Daemon role only today."
     echo
     echo "  --privileged-steps / --user-steps"
     echo "                  The two halves of a daemon install, for a GUI that elevates ONCE"
@@ -168,6 +195,8 @@ while [ $# -gt 0 ]; do
         --role) ROLE="$2"; shift 2 ;;
         --server) SERVER="$2"; shift 2 ;;
         --token) TOKEN="$2"; shift 2 ;;
+        --pair) PAIR=1; shift ;;
+        --pair-org) PAIR_ORG="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
         --daemon-token) DAEMON_TOKEN="$2"; shift 2 ;;
         --system) SYSTEM=1; shift ;;
@@ -191,7 +220,8 @@ if [ "$UNINSTALL" = 1 ]; then
     # of the install options.
     if [ -n "$ROLE" ] || [ -n "$TOKEN" ] || [ -n "$DAEMON_TOKEN" ] || [ "$SYSTEM" = 1 ] ||
         [ "$DOWNLOAD_ONLY" = 1 ] || [ "$NO_ENROLL" = 1 ] || [ -n "$DESKTOP" ] ||
-        [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ] || [ -n "$CONFIG_FROM" ]; then
+        [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ] || [ -n "$CONFIG_FROM" ] ||
+        [ "$PAIR" = 1 ] || [ -n "$PAIR_ORG" ]; then
         echo "error: --uninstall removes every Roomler part on this machine and takes no install options (only --keep-config)" >&2
         exit 1
     fi
@@ -223,6 +253,47 @@ if [ -n "$DAEMON_TOKEN" ] && { [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; }; 
     exit 1
 fi
 
+# ─── FR-129 A4: --pair ──────────────────────────────────────────────────────
+#
+# One enrollment, two ways to its token: a pasted --token, or a pairing the
+# daemon runs on this terminal (`roomlerd enroll --pair`). The pairing is the
+# daemon's own process end to end — the code, the poll, the "Join …?" question
+# on /dev/tty, the enroll — so no token reaches a command line here either.
+if [ "$PAIR" = 1 ] && [ "$UNINSTALL" != 1 ]; then
+    if [ -n "$TOKEN" ]; then
+        echo "error: --pair and --token are two ways to the same enrollment: pass one of them" >&2
+        exit 1
+    fi
+    if [ "$NO_ENROLL" = 1 ]; then
+        echo "error: --pair enrolls; it cannot be combined with --no-enroll" >&2
+        exit 1
+    fi
+    if [ "$ROLE" != daemon ]; then
+        echo "error: --pair is for '--role daemon' today: the roomler CLI has no --pair yet, so a tunnel client pairs in the roomler-setup wizard or enrolls with --token <tunnel-enrollment-jwt>" >&2
+        exit 1
+    fi
+    if [ -n "$DAEMON_TOKEN" ]; then
+        # The root half is its own enrollment (FR-43). One approval for both
+        # halves is FR-129 B2; until then a paired Mac gets its root half from
+        # a second pairing run as root, which the per-user install prints.
+        echo "error: --pair pairs the per-user half; the macOS root half is a second enrollment, paired afterwards as root (the install prints the command) or taken from --token <jwt> --daemon-token <second-jwt>. One approval for both halves is FR-129 B2." >&2
+        exit 1
+    fi
+elif [ -n "$PAIR_ORG" ] && [ "$UNINSTALL" != 1 ]; then
+    echo "error: --pair-org applies to --pair only" >&2
+    exit 1
+fi
+# The slug as the admin UI makes it. The daemon matches it byte for byte, so
+# this only catches an org's display name typed in its place before anybody
+# approves anything. The class is spelled out: a range like a-z follows the
+# locale's collation in some shells and can let capitals through.
+case "$PAIR_ORG" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+        echo "error: --pair-org takes the org's slug (lowercase letters, digits and dashes), got '$PAIR_ORG'" >&2
+        exit 1
+        ;;
+esac
+
 # ─── FR-129 B0: the halves ──────────────────────────────────────────────────
 #
 # A GUI elevates ONCE, through the desktop's own prompt, for exactly the steps
@@ -243,6 +314,9 @@ if [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ]; then
     fi
     if [ -n "$TOKEN" ] || [ -n "$DAEMON_TOKEN" ]; then
         half_err "a half never takes a token — enroll in your own process between the halves (a token on a command line is readable by every process on the host)"
+    fi
+    if [ "$PAIR" = 1 ]; then
+        half_err "a half never pairs — pair and enroll in your own process between the halves, as the wizard does (FR-129 A3)"
     fi
     if [ "$PRIV_STEPS" = 1 ]; then
         if [ "$(id -u)" != 0 ]; then
@@ -353,6 +427,15 @@ download() {
     url="$1"; out="$2"
     say "downloading $(basename "$out")"
     curl -fsSL -o "$out" "$url"
+}
+
+# FR-129 A4 — how the dry run spells the enroll's credential.
+enroll_cred_hint() {
+    if [ "$PAIR" = 1 ]; then
+        printf '%s' "--pair${PAIR_ORG:+ --pair-org $PAIR_ORG}"
+    else
+        printf '%s' "--token <token>"
+    fi
 }
 
 # ─── daemon role ────────────────────────────────────────────────────────────
@@ -545,11 +628,11 @@ install_daemon_linux() {
             say "download-only: would run: sudo tar -xzf $deb --strip-components=1 -C /"
         fi
         if [ "$SYSTEM" = 1 ]; then
-            say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
             say "download-only: would run: sudo systemctl disable --now roomler-update.timer roomler-update.path (only if a per-user install left them enabled)"
             say "download-only: would run: sudo systemctl enable --now roomlerd.service"
         else
-            say "download-only: would run: roomlerd enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: roomlerd enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
             say "download-only: would run: sudo systemctl enable --now roomler-update.timer roomler-update.path (when the release's daemon lists step-aside)"
             say "download-only: would run: systemctl --user enable --now roomler.service"
         fi
@@ -683,7 +766,7 @@ install_daemon_macos() {
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"
-        say "download-only: would run: $daemon_bin enroll --server $SERVER --token <token> --name $NAME"
+        say "download-only: would run: $daemon_bin enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
         [ -n "$DAEMON_TOKEN" ] && say "download-only: would also enroll the privileged half at $MACOS_DAEMON_CONFIG"
         return 0
     fi
@@ -720,6 +803,15 @@ install_daemon_macos() {
     # ── the privileged half: overlay/mesh, as root, its own enrollment ──
     if [ -n "$DAEMON_TOKEN" ] || [ -n "$CONFIG_FROM" ]; then
         install_macos_privileged_half "$daemon_bin"
+    elif [ "$PAIR" = 1 ]; then
+        # FR-129 A4 — the root half is its own enrollment, so until B2 pairs
+        # both halves from one approval it is paired afterwards, as root, in
+        # a second run: the daemon's own process again, no token anywhere.
+        say "NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
+        say "      mesh does not (creating a utun needs root). To add the root half, pair it"
+        say "      as root afterwards (a second approval), then install its service:"
+        say "        sudo $daemon_bin --config $MACOS_DAEMON_CONFIG enroll --pair --server $SERVER --name \"$NAME-daemon\" --overlay"
+        say "        sudo roomlerd service install --as-service"
     else
         say "NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
         say "      mesh does not (creating a utun needs root). Pass --daemon-token <a second"
@@ -835,9 +927,34 @@ enroll_daemon() {
         enroll_bin="$daemon_bin"
         enroll_trace="$(install_trace per-user)"
     fi
-    if [ "$NO_ENROLL" = 1 ] || [ -z "$TOKEN" ]; then
-        [ "$NO_ENROLL" = 1 ] || warn "no --token given — skipping enrollment"
-        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\""
+    if [ "$NO_ENROLL" = 1 ] || { [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; }; then
+        [ "$NO_ENROLL" = 1 ] || warn "no --token or --pair given — skipping enrollment"
+        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\"   (or --pair in place of --token)"
+        return 0
+    fi
+    if [ "$PAIR" = 1 ]; then
+        # FR-129 A4 — the daemon pairs in its own process: it prints the code,
+        # polls, asks "Join …?" on /dev/tty and enrolls with the token the
+        # approval delivered, which therefore never appears on a command line.
+        # A refusal — a no, a --pair-org the approval did not name, no
+        # terminal and no --pair-org — exits 1 with nothing enrolled, and the
+        # install stops here, as it stops when a pasted token is refused.
+        #
+        # stdin is /dev/null on purpose. Under `curl … | sh` this script's
+        # stdin IS the rest of the script, still being read. Nothing on this
+        # path reads stdin today — the daemon asks on /dev/tty, and sudo
+        # 1.9.15 passed a piped script through untouched even with log_stdin
+        # set (measured, FR-129 A4) — and the redirect keeps it that way for
+        # whatever stands between the two tomorrow. The question and sudo's
+        # own password prompt both use /dev/tty, so nothing needs stdin.
+        say "pairing this machine as '$NAME' with $SERVER — open the page below and type the code"
+        set -- enroll --pair --server "$SERVER" --name "$NAME"
+        [ -z "$PAIR_ORG" ] || set -- "$@" --pair-org "$PAIR_ORG"
+        # shellcheck disable=SC2086
+        if ! $enroll_sudo $enroll_trace $enroll_bin "$@" </dev/null; then
+            echo "error: not enrolled (see above). Run this again with --pair, or enroll later with: $enroll_sudo $enroll_bin enroll --pair${PAIR_ORG:+ --pair-org $PAIR_ORG} --server $SERVER --name \"$NAME\"" >&2
+            exit 1
+        fi
         return 0
     fi
     say "enrolling this machine as '$NAME' against $SERVER (token is single-use, never echoed)"
@@ -1666,6 +1783,7 @@ fi
 HALF=""
 [ "$PRIV_STEPS" = 1 ] && HALF=" half=privileged"
 [ "$USER_STEPS" = 1 ] && HALF=" half=user"
+[ "$PAIR" = 1 ] && HALF="$HALF enroll=pair"
 say "roomler install.sh — role=$ROLE os=$OS server=$SERVER$HALF"
 
 # FR-129 B0 — the user half is the tail of a daemon install, run on its own
