@@ -123,6 +123,11 @@ pub struct FleetState {
     /// the ceiling that account's lookups, approvals and denials answer
     /// 429 for the rest of the hour. Per pod, in memory.
     pub pairing_miss_limiter: Arc<WindowLimiter<ObjectId>>,
+    /// FR-129 A1 (F4) — the refusals an anonymous caller can repeat at
+    /// will are written to `pairing_audit` once per `(action, reason,
+    /// address)` per hour; this remembers which sources have had their
+    /// row. Per pod, in memory, bounded (`pairing::AUDIT_DEDUPE_MAX_KEYS`).
+    pub pairing_audit_dedupe: Arc<WindowLimiter<(&'static str, &'static str, std::net::IpAddr)>>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
     /// FR-94 — commands waiting for a Windows device's SYSTEM service to
@@ -310,6 +315,7 @@ impl Module for FleetState {
             pairing_audit: Arc::new(PairingAuditDao::new(db)),
             pairing_start_limiter: Arc::new(WindowLimiter::hourly()),
             pairing_miss_limiter: Arc::new(WindowLimiter::hourly()),
+            pairing_audit_dedupe: Arc::new(WindowLimiter::hourly()),
             exec_audit: Arc::new(ExecAuditDao::new(db)),
             exec_pending: Arc::new(ExecPendingDao::new(db)),
             external_rc_audit: Arc::new(ExternalRcAuditDao::new(db)),

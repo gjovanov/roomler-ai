@@ -101,8 +101,10 @@ pub struct PairingSettings {
     pub poll_interval_secs: u64,
     /// How many pairings one client address may start per hour, on top of
     /// the global per-IP governor; past it `start` answers 429 (audited).
-    /// `0` disables this ceiling. Per pod, in memory. Default 20.
-    /// Env: `ROOMLER__PAIRING__START_PER_IP_PER_HOUR`.
+    /// `0` disables this ceiling. Per pod, in memory. Default 60: a
+    /// corporate NAT rolling out a floor of machines must not be refused
+    /// at install #21, and sixty is still a bound on the user-code space
+    /// one address can fill. Env: `ROOMLER__PAIRING__START_PER_IP_PER_HOUR`.
     #[serde(default = "pairing_default_start_per_ip_per_hour")]
     pub start_per_ip_per_hour: u32,
     /// How many misses (a lookup or deny of a code that names no live
@@ -127,7 +129,7 @@ fn pairing_default_poll_interval_secs() -> u64 {
 }
 
 fn pairing_default_start_per_ip_per_hour() -> u32 {
-    20
+    60
 }
 
 fn pairing_default_misses_per_account_per_hour() -> u32 {
@@ -2043,7 +2045,7 @@ mod pairing_settings_tests {
         assert!(d.enabled);
         assert_eq!(d.ttl_secs, 900);
         assert_eq!(d.poll_interval_secs, 5);
-        assert_eq!(d.start_per_ip_per_hour, 20);
+        assert_eq!(d.start_per_ip_per_hour, 60);
         assert_eq!(d.misses_per_account_per_hour, 10);
         let absent: PairingSettings = toml::from_str("").expect("every key defaults");
         assert!(absent.enabled, "a file without the key");
