@@ -504,6 +504,20 @@ async fn run_install_inner(
         keep_after_privileged(&ids);
         return Err(e);
     }
+    // The per-user unit cannot start, wherever its sandbox applies, until the
+    // daemon's folders exist; `roomlerd enroll` would have made them, this
+    // process's enrollment does not (`ud::unit_folders`). Here rather than at
+    // the save, so that a Retry that reuses the enrollment makes them too.
+    if scope == Scope::PerUser
+        && let Err(e) = ud::make_unit_folders()
+    {
+        warn(
+            on_event,
+            format!(
+                "{e}. The service cannot start where its sandbox applies until that folder exists."
+            ),
+        );
+    }
     emit(
         on_event,
         ProgressEvent::ScriptHalfStarted {

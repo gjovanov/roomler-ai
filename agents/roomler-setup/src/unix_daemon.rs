@@ -209,6 +209,40 @@ pub fn per_user_config_path() -> Result<PathBuf, String> {
     roomlerd::config::default_config_path().map_err(|e| format!("resolve config path: {e}"))
 }
 
+/// The folders the per-user daemon's unit needs before it can start: the
+/// config folder (`config::save` makes it) and the data folder, where the
+/// daemon keeps its logs.
+///
+/// `roomlerd enroll` makes the data folder as a side effect, because its
+/// logging opens a file there. An enrollment made in this process does not,
+/// so the wizard makes it before the user half starts the unit. The packaged
+/// `roomler.service` lists both folders in `ReadWritePaths=` without `-`, and
+/// wherever a user manager applies that sandbox a missing one fails the unit
+/// with 226/NAMESPACE, restarted every 5 s, forever. Fedora 44's user manager
+/// applies it. Ubuntu 24.04's skips the mounts (AppArmor's unprivileged-userns
+/// restriction), which is why only the Fedora cell found this.
+///
+/// Both folders come from the same `appdirs` resolution as the config path,
+/// never a fixed `~/.local/share/roomler`. On a pre-rename host that keeps
+/// its legacy tree, a new-segment folder made beside it would turn the
+/// daemon's new-then-old resolution away from its enrolled config.
+pub fn unit_folders(dirs: &directories::ProjectDirs) -> [PathBuf; 2] {
+    [
+        dirs.config_dir().to_path_buf(),
+        dirs.data_local_dir().to_path_buf(),
+    ]
+}
+
+/// Make [`unit_folders`] for the person running the wizard.
+pub fn make_unit_folders() -> Result<(), String> {
+    let dirs = roomlerd::appdirs::project_dirs()
+        .ok_or_else(|| "resolve the daemon's folders: no home directory".to_string())?;
+    for dir in unit_folders(&dirs) {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("make {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// `roomlerd --version` → `0.4.181`, or nothing.
 pub fn installed_version(binary: &Path) -> Option<String> {
     let out = std::process::Command::new(binary)
@@ -1221,6 +1255,53 @@ mod tests {
                 INSTALL_SH.matches(dispatch).count(),
                 1,
                 "one call site: {dispatch}"
+            );
+        }
+    }
+
+    /// The Fedora cell's finding: the packaged per-user unit names folders in
+    /// `ReadWritePaths=` without `-`, and a user manager that applies the
+    /// sandbox will not start the unit until they exist. Every such folder
+    /// under the home is one the wizard makes, and it makes them before the
+    /// user half starts the unit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_folder_the_user_unit_requires_is_made_before_it_starts() {
+        const UNIT: &str = include_str!("../../roomlerd/packaging/linux/roomler.service");
+        const ORCHESTRATOR: &str = include_str!("orchestrator_unix.rs");
+        let required: Vec<&str> = UNIT
+            .lines()
+            .filter_map(|l| l.strip_prefix("ReadWritePaths="))
+            .flat_map(str::split_whitespace)
+            .filter_map(|p| p.strip_prefix("%h/"))
+            .collect();
+        assert!(!required.is_empty(), "the unit's ReadWritePaths= lines");
+
+        let made = ORCHESTRATOR
+            .find("ud::make_unit_folders()")
+            .expect("the orchestrator makes the unit's folders");
+        let half = ORCHESTRATOR.find("ud::user_args(").expect("the user half");
+        assert!(made < half, "the folders are made before the user half");
+
+        // The unit's `%h/.config` and `%h/.local/share` are the XDG defaults;
+        // a person who moved them is outside this comparison. The new segment
+        // is the one the unit requires (a pre-rename host resolves its legacy
+        // tree, and the unit lists that one with `-`).
+        if std::env::var_os("XDG_CONFIG_HOME").is_some()
+            || std::env::var_os("XDG_DATA_HOME").is_some()
+        {
+            return;
+        }
+        let home = directories::BaseDirs::new()
+            .expect("a home")
+            .home_dir()
+            .to_path_buf();
+        let dirs = directories::ProjectDirs::from("live", "roomler", "roomler").expect("a home");
+        let folders = unit_folders(&dirs);
+        for rel in required {
+            assert!(
+                folders.contains(&home.join(rel)),
+                "the unit requires %h/{rel}; the wizard makes {folders:?}"
             );
         }
     }
