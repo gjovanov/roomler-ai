@@ -3,7 +3,8 @@
 **Anchors:** master `c5a9e480b` (FR-129 A1 [#3040](https://github.com/gjovanov/roomler-ai/pull/3040),
 A2 [#3026](https://github.com/gjovanov/roomler-ai/pull/3026), A3
 [#3027](https://github.com/gjovanov/roomler-ai/pull/3027) and B1-s
-[#3044](https://github.com/gjovanov/roomler-ai/pull/3044) merged; A4 in progress) ·
+[#3044](https://github.com/gjovanov/roomler-ai/pull/3044) merged; §13, terminal pairing: master
+`f37b2c74a`, A4 [#3045](https://github.com/gjovanov/roomler-ai/pull/3045)) ·
 **Spec:** [FR-129](fr/FR-129-guided-cross-platform-installer.md)
 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022)) · **Routes:** [api.md](api.md) ·
 **Collections:** [data-model.md](data-model.md)
@@ -458,19 +459,69 @@ The homepages word the install lead as "sign in from your browser" only on
 **`pairing && wizard_pairing`** (`ui/docs/theme/home.js:195`, `ui/src/views/LandingView.vue:287`):
 `pairing` alone is on by default, and a server image promoted before the first `setup-v*`
 that carries A3 would otherwise promise a flow the download cannot do. Every consumer reads
-anything but a JSON `true` as **false** — a 404 from an older server, a 503 with fleet
-unmounted, a proxy's HTML error page, a string `"true"` — so absent means the token lead and
+anything but a JSON `true` as **false** — an older server's **400** (measured on production
+before B1-s shipped: its `/api/setup/{platform}` route takes "features" as an unknown platform),
+a 404, a 503 with fleet unmounted, a proxy's HTML error page, a string `"true"` — so absent means the token lead and
 the Windows-only daemon wizard, which is the safe direction. The route is deliberately not a
 field on `/api/setup/latest-release` (a bare array every shipped wizard parses), and is not
 counted by the install trace. As merged, the wizard itself does not read it: A3 learns
 whether the server pairs from `start`'s answer.
 
-## 13 · Terminal pairing (A4, in progress)
+## 13 · Terminal pairing
 
-A4 brings the same flow to a terminal: `roomlerd enroll --pair`, `install.sh --pair` and
-`install.ps1 -Pair` print the code and the page, poll the same two endpoints through the
-shared client (`crates/agent-core/src/pairing.rs`), and enroll in-process with the delivered
-token — never in argv. This section is completed when A4 merges.
+*Anchors in this section: master `f37b2c74a` (A4,
+[#3045](https://github.com/gjovanov/roomler-ai/pull/3045)).*
+
+The same flow without a GUI — a server, an SSH session, a script. `roomlerd enroll --pair` runs
+the whole pairing in the daemon's own process: the code, the poll, the question, the enroll.
+The two install scripts call it where they used to pass `--token`, so the delivered token
+never reaches a command line or a file other than the enrolled config.
+
+```text
+$ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon --pair
+==> pairing this machine as 'my-server' with https://roomler.ai — open the page below and type the code
+
+To pair this device, open   https://roomler.ai/pair
+and type the code           BCDF-GHJK
+
+(The code expires in 15 minutes. Waiting for the approval…)
+
+Approved in the browser.
+  Organization: Acme  (slug: acme)
+  Approved by:  Dana  (username: dana)
+Join «Acme» (acme) as approved by «Dana» (@dana)? [y/N]
+```
+
+| | What it does | Where |
+|---|---|---|
+| **The flags** | `--pair` stands in for `--token`: one of the two is required, and both together are refused. `--pair-org SLUG` belongs to `--pair`, and a blank one is refused rather than read as absent, because a scripted `--pair-org "$SLUG"` with an empty variable must not quietly turn into the question. `--pair` also refuses `--ephemeral` | `enroll_token_source`, `agents/roomlerd/src/app.rs:2480-2507` |
+| **When it pairs** | after every preflight (the target path, the install trace, the archive replica's), so a refusal costs nobody an approval; and **before** the existing config is read, because a daemon running on this machine saves its own config during the wait, and a copy read earlier would be merged and saved over those changes. From that read on, the enroll is exactly the `--token` path: the same machine id, the same `apply_enrollment` merge, the same save | `app.rs:2577-2620` |
+| **The code** | the page and the user code, printed. The device code never is (`code_block`, `crates/agent-core/src/pairing_terminal.rs:308`) | |
+| **The poll** | the shared client's RFC 8628 back-off, as in the wizard (§6). A poll that fails on the network retries with its own back-off, capped at 30 s, until the pairing's own clock runs out, rather than giving up early (`interval_after_poll_error`, `:100`; `poll_until`, `:512`) | |
+| **The guard** | the org's name **and** slug, and the approver's name **and** username. A warning sits beside a slug the admin UI could not have made, or a username with spaces or non-ASCII characters — what a lookalike has to use (`approved_block`, `:320`). Every server-sent string is shown with its control and invisible characters escaped (ESC, CR, bidi overrides, zero-width marks), so a display name cannot repaint the line the person is reading (`shown`, `:277`) | |
+| **The question** | `Join «org» (slug) as approved by «name» (@username)? [y/N]` (`question`, `:364`), asked on `/dev/tty` on Unix and on the console (`CONIN$` / `CONOUT$`, written with `WriteConsoleW` so non-ASCII names read right) on Windows (`TtyConsole`, `:152`, `:244`). It is never asked on stdin: under `curl … \| sh`, stdin is the script the shell is still reading. Only `y` or `yes` is yes (`is_yes`, `:265-267`) | |
+| **`--pair-org SLUG`** | the approval's slug must equal it **byte for byte**, and then it replaces the question. A server that sends no slug is refused, rather than trusting a display name (`decide`, `:455`) | |
+| **No terminal** | with no console and no `--pair-org`, it refuses **before** starting a pairing, so nobody approves one that could never be confirmed (`no_console_before_start`, `:425-427`) | |
+| **A refusal** | a no, a mismatched org, no console: nothing is enrolled, the pairing stays `delivered` and its token goes unused, expiring in ten minutes. Each refusal says so (`leaves_behind`, `:392`) | |
+| **An older server** | `start` answering 404: "this server does not support pairing … use --token" (`unavailable_message`, `:384`), and a non-zero exit | |
+| **The install trace** | `client` on `start` is `script-sh`, `script-ps1` or `roomlerd`, from the install trace's method (`client_for`, `:109`); the enroll records the method as `--token` does | |
+
+> ⚠️ `--pair-org` takes the slug **exactly** as the admin UI shows it. The server accepts any
+> string as a slug, so `ACME` or `acme` with a Cyrillic `а` is a *different* org. That is the
+> reason for the byte-for-byte match, and an early draft that case-folded let exactly such a
+> lookalike through on the dev stack.
+
+**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:256-295`) is refused
+beside `--token` or `--no-enroll`, for the tunnel role (the `roomler` CLI has no `--pair` yet),
+beside `--daemon-token`, and on a B0 half. The slug is checked against a spelled-out character
+class, because a range like `a-z` follows the locale's collation in some shells. The enroll
+then runs where `--token` ran: as the console user for a per-user install, as root into
+`/etc/roomler/config.toml` for `--system`, with stdin from `/dev/null` (`:936-957`). On macOS
+the root half is a second enrollment, so a paired per-user install prints the two commands
+that pair it afterwards, as root (`:806-814`); one approval for both halves is B2.
+`install.ps1 -Pair [-PairOrg SLUG]` has the same refusals (`scripts/install.ps1:207-221`, a
+case-sensitive `-cnotmatch`) and enrolls with the role's own elevation and `--machine-global`
+logic (`:298`).
 
 ## 14 · Troubleshooting
 
