@@ -2539,9 +2539,26 @@ impl FfmpegEncoder {
         {
             self.gpu = opened.gpu;
         }
-        self.input = opened.input;
+        self.adopt_input(opened.input);
         self.frame_count = 0;
         self.force_keyframe = true;
+    }
+
+    /// FR-118 #3071 — the input form after an adoption: the opened encoder's,
+    /// except that a refused capture device's reason outlives a replacement
+    /// opened without that device (`gpu_hint::adopted_input`).
+    fn adopt_input(&mut self, opened: super::gpu_hint::InputForm) {
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        let refused = self.refused_device.is_some();
+        #[cfg(not(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        )))]
+        let refused = false;
+        self.input = super::gpu_hint::adopted_input(self.input, refused, opened);
     }
 
     /// FR-118 P2-2 — the capture device this encoder takes GPU frames from.
@@ -2585,7 +2602,7 @@ impl FfmpegEncoder {
         {
             self.gpu = rebuilt.gpu;
         }
-        self.input = rebuilt.input;
+        self.adopt_input(rebuilt.input);
         self.width = spec.width;
         self.height = spec.height;
         // FR-119 P2b — and the frame rate it was opened at, which every later

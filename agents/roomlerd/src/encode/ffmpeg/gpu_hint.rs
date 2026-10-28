@@ -119,6 +119,26 @@ impl InputForm {
     }
 }
 
+/// FR-118 #3071 — the input form an encoder reports once it adopts an encoder
+/// opened in `opened`. A replacement is opened from the encoder's own device,
+/// which is none while it runs CPU frames, so it reads `cpu_frames` even when
+/// the encoder runs CPU frames because the capture's device was refused: FR-119's
+/// frame-rate replacement, spawned at session start before the device follow,
+/// and a rebuild-bound encoder's rate rebuild. The follow never retries a
+/// refused device, so the refusal's reason has to outlive the replacement, or
+/// the heartbeat names the wrong cause for the rest of the session.
+pub(crate) fn adopted_input(
+    current: InputForm,
+    device_refused: bool,
+    opened: InputForm,
+) -> InputForm {
+    if device_refused && !current.gpu && !opened.gpu && opened.reason == "cpu_frames" {
+        current
+    } else {
+        opened
+    }
+}
+
 /// FR-118 — the GPU-input cells the operator denied: `ROOMLERD_ZERO_COPY_DENY`
 /// (config `zero_copy_deny`), entries `name:gpu` (the encoder and the input
 /// path), the `encoder_cells_deny` shape and parser (`none` = empty). Read at
@@ -174,5 +194,39 @@ mod tests {
         );
         assert!(!is_denied(&deny, "h264_qsv"));
         assert!(crate::encode::cells::parse_denylist("none").is_empty());
+    }
+
+    /// #3071, neo16 on 0.4.183: NVENC refused the Radeon's frames
+    /// (`adapter_mismatch`), then FR-119's replacement, opened before the
+    /// refusal and with no device, was adopted. The refusal's reason stays.
+    #[test]
+    fn a_replacement_opened_without_the_device_keeps_the_refusal_s_reason() {
+        let refused = InputForm::cpu("adapter_mismatch");
+        let replacement = InputForm::cpu("cpu_frames");
+        assert_eq!(adopted_input(refused, true, replacement), refused);
+        // And a rate rebuild that fails its own open the same way.
+        let failed = InputForm::cpu("open_failed");
+        assert_eq!(adopted_input(failed, true, replacement), failed);
+    }
+
+    /// Everything else takes the opened form: no device was refused (the frames
+    /// really are in memory), the opened encoder names its own refusal, or it
+    /// takes GPU frames.
+    #[test]
+    fn an_opened_encoder_s_own_form_wins_otherwise() {
+        let cpu_frames = InputForm::cpu("cpu_frames");
+        let refused = InputForm::cpu("adapter_mismatch");
+        assert_eq!(adopted_input(cpu_frames, false, cpu_frames), cpu_frames);
+        assert_eq!(adopted_input(refused, false, cpu_frames), cpu_frames);
+        assert_eq!(
+            adopted_input(refused, true, InputForm::cpu("denied")),
+            InputForm::cpu("denied")
+        );
+        assert_eq!(adopted_input(refused, true, InputForm::GPU), InputForm::GPU);
+        assert_eq!(
+            adopted_input(InputForm::GPU, true, cpu_frames),
+            cpu_frames,
+            "an encoder on GPU frames has no refusal to keep"
+        );
     }
 }
