@@ -21,7 +21,7 @@ Both ends logged `direct probe did not handshake within deadline; kept relay` ~4
 
 Getting from that to the cause took `Find-NetRoute` on the device over Fleet RPC, a Mongo
 histogram over both agents' logs, and the AnyConnect precedent from FR-9. A daemon that already
-samples the effective route by LOOKUP (`crates/tunnel-core/src/overlay/netstate.rs:122` —
+samples the effective route by LOOKUP (`crates/tunnel-core/src/overlay/netstate.rs:128` —
 `GetBestRoute2` / `ip route get` / `route get`, precisely because "a corp capture rarely touches
 `/0`") can answer this in one more lookup.
 
@@ -36,14 +36,14 @@ stays out of scope (operator's standing rule).
 ## Key design
 
 1. **Detection (netstate, all three OSes).** For every LAN interface address in
-   `NetSnapshot.ifaces` (`netstate.rs:134`), look up the route to another address inside the
+   `NetSnapshot.ifaces` (`netstate.rs:140`), look up the route to another address inside the
    same prefix — a fixed neighbour address (our own address with its lowest bit flipped, off
    the network/broadcast edges), so the answer never depends on a peer existing. If the
    selected interface ≠ the owning interface, record
    `LanCapture { prefix, owner_ifref, via_ifref, via_name }`. Sampled where the default-route
-   lookup already runs (`sample_snapshot`, `netstate.rs:438`): one lookup per LAN interface per
+   lookup already runs (`sample_snapshot`, `netstate.rs:444`): one lookup per LAN interface per
    snapshot. Onset and clear each produce ONE `NetDelta` with a one-line `summary`
-   (`netstate.rs:160`) — the "LOG every silent drop" rule — never a per-snapshot line.
+   (`netstate.rs:166`) — the "LOG every silent drop" rule — never a per-snapshot line.
 2. **`roomler status`** gains a line next to `srflx`, using the same shape
    (`agents/roomler-cli/src/localclient.rs:1256`):
    `lan         CAPTURED — 192.168.68.0/24 leaves via "Ethernet 3" (Check Point Virtual

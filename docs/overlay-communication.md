@@ -799,6 +799,16 @@ server. Detail and the negative-control test:
   with a capped backoff (250 ms → 30 s), and each respawn sends one synthetic
   wake-up, so whatever changed while nothing was watching is re-sampled and
   re-asserted.
+* **The sample after a burst runs on the blocking pool** (#3018). It is two
+  to six `route -n get` processes on macOS (~2.5 ms each on an idle Mac),
+  `ip route get` on Linux, and on Windows a route-table read that can also
+  repair a LAN route (`lan_repair`). It used to run inline on a tokio worker,
+  so every burst of a carrier flap held a worker for the whole sample. It now
+  runs under `spawn_blocking` (`crates/tunnel-core/src/overlay/netstate.rs:529`),
+  the monitor's log lines carry `sample_ms`, and a sample over 1 s is a WARN.
+  A sample that panics still stops the monitor, as it did inline: the panic
+  hook records one crash, and a sampler that panicked on every burst would
+  otherwise record one per burst.
 * **Evict a competing route only when it wins, and stop when it is futile**
   (#1405, Windows). AnyConnect mirrors our prefixes onto its miniport: every
   peer `/32`, the floor `/24`s, and the derived ULA `/96`. It re-adds a
