@@ -561,6 +561,10 @@ impl Module for FleetState {
         // `/{platform}/health` and is refused there as before.
         let public_setup = Router::new()
             .route("/latest-release", get(setup_release::setup_latest_release))
+            // FR-129 B1-s — the switches a client reads before offering an
+            // install path (`pairing`, `wizard_unix_daemon`, `wizard_pairing`);
+            // static, so it wins over `/{platform}` like the others.
+            .route("/features", get(setup_release::setup_features))
             .route("/install.sh", get(setup_release::install_script_sh))
             .route("/install.ps1", get(setup_release::install_script_ps1))
             .route(
