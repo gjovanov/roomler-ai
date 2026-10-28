@@ -112,8 +112,9 @@ pub(crate) fn gpu_cell(name: &str, chroma444: bool) -> bool {
 
 /// FR-118 P2-2 — the pool a `name` encoder opens on, or why it opens on CPU
 /// frames. Every gate is read here, at the open: the switch, the device the
-/// pump named (a GPU frame's), the cell, the denylist; then the pool itself,
-/// which fails on an adapter without QSV (`adapter_mismatch`).
+/// pump named (a GPU frame's), the cell, the denylist, the probe's proof
+/// (P2-3); then the pool itself, which fails on an adapter without QSV
+/// (`adapter_mismatch`).
 pub(crate) fn plan(
     name: &str,
     chroma444: bool,
@@ -132,7 +133,29 @@ pub(crate) fn plan(
     if super::gpu_hint::is_denied(&super::gpu_hint::denied(), name) {
         return Err(Refused::because("denied"));
     }
+    if !proven(name) {
+        return Err(Refused::because("unproven"));
+    }
     QsvGpuInput::open(&device, width, height)
+}
+
+/// FR-118 P2-3 — the encoders whose GPU-input form the capability probe proved
+/// in its child process. `caps::detect` installs them once, before any session.
+static PROVEN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub(crate) fn install_proven(names: Vec<String>) {
+    let _ = PROVEN.set(names);
+}
+
+/// Whether `name`'s GPU-input form may open in this process: the probe child
+/// proved it, or this process IS the probe child, whose job is proving it. A
+/// form no child has opened never opens in the daemon (`encoder-cells` §1: a
+/// fault in a driver belongs in a process that can die).
+fn proven(name: &str) -> bool {
+    crate::encode::caps::in_probe_child()
+        || PROVEN
+            .get()
+            .is_some_and(|names| names.iter().any(|n| n == name))
 }
 
 /// A QSV encoder's input on the capture's D3D11 device: the frame pool the
@@ -918,15 +941,16 @@ mod tests {
     }
 
     /// `plan` reads its gates at the open, in order: the switch, the device the
-    /// pump named, the cell, the denylist, then the pool itself. Runs on WARP,
-    /// so in CI too: the pool's last step fails there for want of a video
-    /// processor, which `open_failed` reports.
+    /// pump named, the cell, the denylist, the probe's proof. No probe runs in a
+    /// test process, so a cell past the denylist stops at `unproven`.
     #[test]
     fn plan_reads_every_gate_at_the_open() {
         use super::super::gpu_hint::opening_on;
         use tunnel_core::env::test_env::{Saved, set};
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The lock every test that sets these knobs (or the cell denylist) takes.
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _switch = Saved::cleared("ZERO_COPY");
         let _deny = Saved::cleared("ZERO_COPY_DENY");
         let mut warp: Option<ID3D11Device> = None;
@@ -964,10 +988,12 @@ mod tests {
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "hevc_qsv:gpu") };
         assert_eq!(reason(Some(&warp), "hevc_qsv", false), "denied");
-        assert_eq!(reason(Some(&warp), "av1_qsv", false), "open_failed");
+        // FR-118 P2-3 — no probe has proven a form in this process.
+        assert_eq!(reason(Some(&warp), "av1_qsv", false), "unproven");
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "none") };
-        assert_eq!(reason(Some(&warp), "hevc_qsv", false), "open_failed");
+        assert_eq!(reason(Some(&warp), "hevc_qsv", false), "unproven");
+        // The pool itself, the gate after the proof, has its own test below.
     }
 
     /// The QSV pool opens only where QSV runs (an Intel adapter); elsewhere

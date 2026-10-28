@@ -186,23 +186,31 @@ mistaken for the cell that was asked for.
 A capability probe is untrusted third-party code by definition — vendor drivers
 and, through them, GPU firmware — so it does not run in the daemon's address
 space. `encode::caps::detect()` (`agents/roomlerd/src/encode/caps.rs`) answers
-from the cache when it can, and otherwise spawns `roomlerd caps-probe` twice:
+from the cache when it can, and otherwise spawns `roomlerd caps-probe` two or
+three times:
 
 ```mermaid
 flowchart TD
     S([daemon start]) --> K{cache key?<br/>build × hardware × knobs}
     K -- "macOS: no fingerprint<br/>ROOMLERD_CAPS_CACHE=0" --> B
     K --> L{caps-cache.json<br/>same key, < 7 days?}
-    L -- hit --> M[merge: driver-derived fields from the cache,<br/>permissions / verbs recomputed now<br/>probe_cached = true]
+    L -- hit --> M[merge: driver-derived fields from the cache,<br/>permissions / verbs recomputed now<br/>probe_cached = true; the proven<br/>GPU-input forms installed]
     L -- "miss (reason logged)" --> B["child 1 — ROOMLERD_CAPS_PHASE=base<br/>every 4:2:0 cell, the software cells,<br/>the vp9_qsv IDR verdict"]
     B -- "died / hung / unparseable" --> F[driver-free caps,<br/>no hardware advertised]
     B -- ROOMLER_CAPS_JSON --> C{candidates_444:<br/>hardware NVENC / QSV / VAAPI cells<br/>on the 4:4:4-capable list, minus the denylist}
-    C -- none --> H
+    C -- none --> P
     C -- some --> T["child 2 — PHASE=444<br/>ROOMLERD_CAPS_444_NAMES=…<br/>announces each open on stdout first"]
     T -- ROOMLER_CAPS_444 --> G[merge_444: the named cells gain yuv444;<br/>hevc_chroma follows the legacy rule]
     T -- "died / hung" --> H2["the 4:2:0 matrix, and the log names<br/>the last open — the entry for encoder_cells_deny"]
-    G --> W{any hardware cell?}
-    H2 --> W
+    G --> P
+    H2 --> P
+    P{candidates_gpu:<br/>zero_copy on? the QSV 4:2:0 cells<br/>the GPU input covers, minus both denylists}
+    P -- "none: the switch is off, or no QSV cell" --> W
+    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on the capture<br/>adapter, two GPU frames encoded"]
+    U -- ROOMLER_CAPS_GPU --> V[gpu_input: the forms<br/>a session may open]
+    U -- "died / hung" --> V2["no GPU-input form, and the log names<br/>the last open — the entry for zero_copy_deny"]
+    V --> W{any hardware cell?}
+    V2 --> W
     W -- yes --> ST[store caps-cache.json atomically]
     W -- no --> N[not cached: a boot-time<br/>driver race must not be frozen]
     ST --> H([hello: video_cells, probe_ms, probe_cached])
@@ -213,7 +221,7 @@ flowchart TD
 
 | Outcome of a child | Verdict |
 |---|---|
-| non-zero exit, or killed by a signal | phase base: no hardware advertised (logged at ERROR with the status) · phase 444: the 4:2:0 matrix, the last announced open named |
+| non-zero exit, or killed by a signal | phase base: no hardware advertised (logged at ERROR with the status) · phase 444: the 4:2:0 matrix, the last announced open named · phase gpu: every cell as before, no GPU-input form, the last announced open named |
 | still running after 60 s | killed; as above |
 | could not spawn / output unparseable | as above |
 | clean exit with a marked line | those caps, as reported |
@@ -225,6 +233,16 @@ gone for a cell no session needed. A faulting 4:4:4 open now costs only the
 4:4:4 forms. The second child announces every open on stdout first
 (`ROOMLER_CAPS_PROGRESS:`, line-buffered so it survives the crash) because on a
 service host its stderr reaches no log.
+
+Why a third (FR-118 P2-3): a QSV encoder that takes GPU frames
+(`zero_copy`, [FR-118](fr/FR-118-gpu-resident-frames.md) §5.4) opens on a frame
+pool of the capture's own D3D11 device, an open no other cell makes. The `gpu`
+child makes it first, on a device of the adapter the SystemContext DXGI arm
+captures on, and encodes two GPU frames through it. A session opens that form
+only for an encoder the child proved (`input_reason=unproven` otherwise), so a
+driver that faults on it takes down a child, never the daemon. With
+`zero_copy` off there are no candidates and no third child. The proven names
+(`gpu_input`) ride the cache with the caps; they are not a wire capability.
 
 Why a cache (P3a): the matrix probe costs 4–6 s on a Windows host with two GPUs,
 paid on every daemon start for an answer that changes only when the GPU, its

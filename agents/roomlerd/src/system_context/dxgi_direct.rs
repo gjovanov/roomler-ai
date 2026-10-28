@@ -1261,6 +1261,21 @@ impl DxgiCapture for DxgiDirectBackend {
     }
 }
 
+/// FR-118 P2-3 — a D3D11 device on the adapter that owns the primary output:
+/// the adapter this arm captures on, so the capability probe opens the GPU
+/// input form where a session will. `None` when no adapter owns a primary
+/// output, or the device would not open.
+pub(crate) fn primary_output_device() -> Option<ID3D11Device> {
+    // SAFETY: DXGI enumeration, then a device on the live adapter it found.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let (adapter, _output, _name) = find_primary_output(&factory)?;
+        create_device_on(&adapter)
+            .ok()
+            .map(|(device, _context)| device)
+    }
+}
+
 /// Walk every DXGI adapter + output; return the (adapter, output, adapter
 /// name) that owns the primary output — the one whose desktop rect top-left
 /// is the virtual-desktop origin (0,0). Software adapters are skipped. This

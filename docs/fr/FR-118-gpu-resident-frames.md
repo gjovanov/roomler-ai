@@ -208,7 +208,7 @@ flowchart LR
 |---|---|---|---|
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b rides the next agent release; the fleet read is AC1 |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
-| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4); P2-3 and the field test next |
+| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); the field test next (AC3) |
 | P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
@@ -367,8 +367,76 @@ flowchart LR
   - a BT.709 output colour space fails the colour test, at max |GPU − CPU| Y 28 / UV 12 on the Radeon;
   - a `plan` that skips the denylist fails the gate test (`left: "open_failed"`, `right: "denied"`);
   - a denylist that also matches a bare name fails the exact-entry test.
-- **Not yet:** the probe's GPU-input open (P2-3, so AC6's probe half is still owed), `input_path` on
-  `rc:video-info`, and any run on a QSV host. With the switch OFF (the default), every path is today's.
+- **Not yet:** the probe's GPU-input open (P2-3, built next: §5.5), `input_path` on `rc:video-info`, and any
+  run on a QSV host. With the switch OFF (the default), every path is today's.
+
+### 5.5 P2-3 — the probe proves the GPU-input form, as built (2026-10-28)
+
+After P2-2, the first open of a QSV encoder's GPU-input form would have happened in the daemon, in a session.
+The `encoder-cells` rules forbid that order. A driver is untrusted code, and a fault inside one in the daemon's
+address space takes `roomlerd` down, and with it the operator's remote access to a corp laptop. Now the
+capability probe's child opens the form first, and a session opens it only on a host where the child did.
+
+```mermaid
+flowchart LR
+  D[caps::detect<br/>cache miss] --> B[child base] --> Q[child 444]
+  Q --> C{candidates_gpu}
+  C -->|"switch off, or no QSV cell"| X[no third child]
+  C -->|"hevc_qsv, av1_qsv, h264_qsv<br/>minus both denylists"| G["child gpu<br/>open each GPU-input form on the capture adapter,<br/>encode two GPU frames"]
+  G -->|"ROOMLER_CAPS_GPU:[…]"| P[gpu_input<br/>process-wide, and in caps-cache.json]
+  G -->|died or hung| N["none proven<br/>the log names name:gpu for zero_copy_deny"]
+  P --> S[session open: plan]
+  N --> S
+  X --> S
+  S -->|proven| GPU[GPU input]
+  S -->|"not proven: input_reason=unproven"| CPU[CPU frames]
+```
+
+| Piece | What it is | Where |
+|---|---|---|
+| the `gpu` phase | a third child, `ROOMLERD_CAPS_PHASE=gpu`, after `base` and `444`, given its names in `ROOMLERD_CAPS_GPU_NAMES`. For each name it announces `ROOMLER_CAPS_PROGRESS:<name>:gpu`, opens the encoder in the GPU-input form on a D3D11 device of the adapter that owns the primary output (the adapter the DXGI arm captures on), checks that the encoder really took GPU input rather than falling back to CPU frames, and encodes two moving 480×270 GPU frames, which must produce packets. It answers `ROOMLER_CAPS_GPU:[…]` | `probe_gpu`, `agents/roomlerd/src/encode/caps.rs` |
+| `candidates_gpu` | what the phase tries: the base matrix's QSV cells that the GPU input covers (`hevc_qsv`, `av1_qsv`, `h264_qsv` at 4:2:0), minus `encoder_cells_deny` and `zero_copy_deny`. With the switch off there are none, so no third child is spawned, and a probe costs what it did before | the same |
+| the proof gate | `gpu_input::plan` adds `unproven` after `denied`: a session opens the GPU-input form only for a name the child proved. The probe child is the only process where an unproven form may open, because proving it is its job | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
+| the cache | `gpu_input` rides the probe report and `caps-cache.json`, and a cache hit installs it the way a probe does. It is not a wire capability, so the hello does not change. The knob hash already covers `ROOMLERD_ZERO_COPY` and `ROOMLERD_ZERO_COPY_DENY` (env and config), so turning the switch on or editing the denylist re-probes | `agents/roomlerd/src/encode/caps_cache.rs` |
+| a dying child | the log names the open it was inside (`<name>:gpu`, the entry to add to `zero_copy_deny`). It costs only the GPU forms: sessions take CPU frames, and the daemon and every cell are unaffected. A hung child is killed at the probe's 60 s bound | `caps.rs` |
+| `primary_output_device` | the device the phase opens on: the primary output's adapter, and a device there | `agents/roomlerd/src/system_context/dxgi_direct.rs` |
+| `zero_copy` and `zero_copy_deny` in config | P2-1 and P2-2 shipped both as env vars only, although the code's comments already named the config keys. Both are now config keys: `roomler config set zero_copy true`, and `zero_copy_deny` validated as `name:gpu` entries or `none`. They are bridged to the env names through the config fallbacks, so they reach the probe child, and a Windows service, without editing the service's environment. Local only: `zero_copy_deny` is not pushable through remote config yet | `crates/agent-core/src/config.rs`, `crates/agent-core/src/config_surface.rs` |
+
+- **What the field test reads:** the probe's `caps probe: GPU-input phase reported` line, with `tried` and
+  `proven`, then each session's `input_path` and `input_reason`. On a QSV host with the switch on, `unproven`
+  means the child did not prove the form, and its own `GPU-input form not proven` line says why.
+- **What it costs:** nothing with the switch off. With it on, one more child on a probe-cache miss: at most
+  three QSV opens (0.6–0.9 s each, §5.4) and six small frames.
+- **A cached "none proven" lasts as long as the cache**, like a 4:4:4 answer. A child that died or proved
+  nothing is not retried until the cache expires (7 days), a knob changes, or the build or the driver changes.
+  To re-probe sooner, delete `caps-cache.json` or set `caps_cache = false`.
+- **Tests:**
+  - `the_gpu_phase_tries_only_what_a_session_may_open` (AC6's probe half): nothing with the switch off;
+    `hevc_qsv`, `av1_qsv` and `h264_qsv` with it on, never `vp9_qsv` or NVENC; a `zero_copy_deny` entry and a
+    4:2:0 `encoder_cells_deny` entry each remove their cell.
+  - `plan_reads_every_gate_at_the_open` (AC6's session half) now stops at `unproven` once past the denylist,
+    because no probe runs in a test process.
+  - The probe envelope's round trip carries `gpu_input`.
+  - `zero_copy_and_its_denylist_set_echo_clear_and_bridge` and `env_fallbacks_carry_every_bridged_kind` cover
+    the config keys.
+  - The agent's lib suite is 2386 with the Windows hardware features, and agent-core's is 276.
+  - Like P2-2's, the Windows tests run locally only: no Windows CI lane builds FFmpeg.
+- **Negative controls**, each failing only its own tests:
+  - `candidates_gpu` ignoring the switch fails the phase test (`the switch is off`);
+  - `plan` skipping the proof fails the gate test (`left: "open_failed"`, `right: "unproven"`);
+  - a `zero_copy_deny` validator that accepts any input path fails the config test
+    (`"hevc_qsv:cpu" must be refused`);
+  - a denylist that never reaches the fallback map fails the config test and the fallback map's test
+    (`left: None`).
+- **The child, run by hand** on this build's debug binary on neo16, which has no Intel graphics:
+  `ROOMLERD_CAPS_CHILD=1 ROOMLERD_CAPS_PHASE=gpu ROOMLERD_CAPS_GPU_NAMES=hevc_qsv,av1_qsv ROOMLERD_ZERO_COPY=1
+  roomlerd caps-probe`. For each name, `plan` refused with `adapter_mismatch` ("no QSV on this device"), the
+  CPU form did not open either, and the name was not proven (29–32 ms each). The child printed
+  `ROOMLER_CAPS_GPU:[]` and exited 0. ⚠️ A debug binary run by the signed-in user logs into the live worker's
+  daily file: the 15 lines at 2026-10-28T02:59:11.197–.348Z in neo16's `roomlerd.log` are this run, not the
+  daemon.
+- **Not yet:** a run on a QSV host (AC3, which needs a release carrying P2-1 to P2-3), `input_path` on
+  `rc:video-info`, and pushing `zero_copy_deny` through remote config.
 
 ## 6. Acceptance criteria
 
@@ -390,7 +458,9 @@ flowchart LR
 - [ ] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
 - [ ] **AC6 — the gate holds at every entry point.** With the switch off, or the cell denied, neither the probe
-  nor a session opens the GPU-input form. Tested at both entry points.
+  nor a session opens the GPU-input form. Tested at both entry points. *(Both halves unit-tested in P2-3, §5.5,
+  locally; AC3's switch-off run on a QSV host is the field read: no `gpu` child in the probe's log, and
+  `input_reason=switch_off` on the session.)*
 - [ ] **AC7 — every further cell, or its reason.** NVENC, AMF, the WGC arm, VideoToolbox and VAAPI are each
   field-verified like AC3, or deferred with the measurement that deferred them.
 - [ ] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and

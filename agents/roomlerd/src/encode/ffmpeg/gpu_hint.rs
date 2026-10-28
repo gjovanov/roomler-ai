@@ -86,6 +86,7 @@ pub(crate) fn current() -> Option<GpuDevice> {
 /// frames and why. The reasons: `switch_off` (`ROOMLERD_ZERO_COPY` is off),
 /// `cpu_frames` (the capture delivered frames in memory), `no_gpu_cell` (this
 /// encoder or chroma takes no GPU frames yet), `denied` (`zero_copy_deny`),
+/// `unproven` (the capability probe's child did not open this form),
 /// `adapter_mismatch` (the capture's adapter has no QSV), `open_failed`. The
 /// heartbeat carries both: without the reason, "zero-copy did nothing" cannot
 /// be told apart from any of these.
