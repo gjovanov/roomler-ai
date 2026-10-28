@@ -512,8 +512,12 @@ pub async fn cmd_pair_start(
 /// store before the request and the answer applied after it — the lock is
 /// never held across the await ([`crate::pairing`]). With no pairing held
 /// the call refuses, which ends a loop that outlived its session.
-#[tauri::command]
-pub async fn cmd_pair_poll() -> Result<crate::pairing::PairPollView, String> {
+///
+/// `interval_secs` is what the SPA polled with; a `slow_down` or a 429
+/// answers the next interval from it (never shorter), so the back-off
+/// arithmetic lives — and is tested — on this side.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_pair_poll(interval_secs: u64) -> Result<crate::pairing::PairPollView, String> {
     let store = crate::pairing::PairStore::global();
     let snapshot = store
         .snapshot()
@@ -521,7 +525,7 @@ pub async fn cmd_pair_poll() -> Result<crate::pairing::PairPollView, String> {
     let outcome = roomlerd::pairing::poll(&snapshot.server, &snapshot.device_code)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    Ok(store.apply_poll(snapshot.generation, outcome))
+    Ok(store.apply_poll(snapshot.generation, outcome, interval_secs))
 }
 
 /// Open the held pairing's page in the default browser. The URL comes from
@@ -826,8 +830,11 @@ mod tests {
             PollOutcome::Approved(Approved {
                 tokens: vec!["eyJ.paired.sig".into()],
                 org_name: "Acme".into(),
+                org_slug: Some("acme".into()),
                 approver_name: "Dana".into(),
+                approver_username: Some("dana".into()),
             }),
+            5,
         );
         let (t, paired) =
             resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
