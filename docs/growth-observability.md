@@ -492,6 +492,24 @@ Compatibility, both directions, is what the shape is built around:
 The row is shown on the device (`GET …/agent/{id}` → `install`), which is what a field check
 reads (AC9).
 
+### A paired install (FR-129)
+
+A pairing ([device-pairing.md](device-pairing.md)) changes how the token reaches the installer,
+not what the trace records. The token is minted at delivery by the admin route's own call:
+`pairing::deliver` mints with `issue_enrollment_token_with` and writes
+`enroll_tokens.record_issued(jti, tenant_id, approver, now)`
+(`crates/modules/fleet/src/pairing.rs:992-1011`), the same call `POST …/agent/enroll-token`
+makes (`agent.rs:115-126`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
+approver>, issued_at, kind: standard}`, one per half, and "tokens issued → redeemed" counts a
+paired token like any other. The tunnel kind writes no ledger row, as the tunnel route never
+has. The enroll is the ordinary one, so `agents.install` says who installed: `method: wizard`
+for the wizard's paired install (A3 runs the same `cmd_install`), and the scripts' own methods
+once A4 lands. The fetch counters see the wizard's User-Agent as before, and
+`GET /api/setup/features` is deliberately not counted (the SPA reads it on every homepage
+view). What says a token was *paired* rather than pasted is not on this plane: it is the
+`deliver` row in `pairing_audit` (by tenant and approver) and the `device_pairings` row's
+`client` and `client_version`, neither of which the digest reads.
+
 ### The wizard's opt-in diagnostics (P3b)
 
 Where a wizard run gets to, and where it stops — **only for runs whose operator ticked the
