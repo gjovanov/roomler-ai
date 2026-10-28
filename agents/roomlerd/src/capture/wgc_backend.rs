@@ -682,19 +682,24 @@ fn worker_main(
                 return Ok(());
             };
 
-            let data = if let Some(pool) = handler_pool.as_deref() {
-                // FR-118 P3 — on the GPU: a copy into a texture from the pool,
-                // handed on as a GPU frame. The frame's own surface goes back to
-                // WGC when `frame` drops, as it always has; the copy is queued
-                // on this device first, so it reads the surface before WGC's
-                // next write into it.
+            // FR-118 P3 — on the GPU: a copy into a texture from the pool,
+            // handed on as a GPU frame. The frame's own surface goes back to
+            // WGC when `frame` drops, as it always has; the copy is queued on
+            // this device first, so it reads the surface before WGC's next
+            // write into it. A copy that fails (the pool could not make a
+            // texture) reads this frame back instead, as the DXGI arm falls
+            // back: an encoder on GPU input uploads a CPU frame into its pool.
+            let gpu = handler_pool.as_deref().and_then(|pool| {
                 match copy_to_pool(pool, &handler_d3d_context, &gpu_tex, w, h) {
-                    Ok(gpu) => FrameData::Gpu(gpu),
+                    Ok(gpu) => Some(gpu),
                     Err(e) => {
-                        tracing::debug!(%e, "wgc: GPU copy failed");
-                        return Ok(());
+                        tracing::debug!(%e, "wgc: GPU copy failed — this frame is read back");
+                        None
                     }
                 }
+            });
+            let data = if let Some(gpu) = gpu {
+                FrameData::Gpu(gpu)
             } else {
                 // Copy to staging (allocated on first use / size change).
                 let readback_started = Instant::now();

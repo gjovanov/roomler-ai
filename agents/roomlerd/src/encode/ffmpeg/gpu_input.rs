@@ -44,15 +44,14 @@ use ffmpeg_next::sys as ff;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET, D3D11_BOX, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11Texture2D, ID3D11VideoContext,
-    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11Texture2D,
+    ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
@@ -1367,9 +1366,21 @@ mod tests {
                 context.CopySubresourceRegion(&single, 0, 0, 0, 0, array, slice, None);
                 read_nv12(&device, &single, (width, height), width, height)
             };
-            let (out_y, out_uv) = read_nv12(&device, input.converter.output(), (width, height), width, height);
-            assert_eq!(slice_y, out_y, "{name}: the slice's luma is the converter's");
-            assert_eq!(slice_uv, out_uv, "{name}: the slice's chroma is the converter's");
+            let (out_y, out_uv) = read_nv12(
+                &device,
+                input.converter.output(),
+                (width, height),
+                width,
+                height,
+            );
+            assert_eq!(
+                slice_y, out_y,
+                "{name}: the slice's luma is the converter's"
+            );
+            assert_eq!(
+                slice_uv, out_uv,
+                "{name}: the slice's chroma is the converter's"
+            );
             eprintln!("{name}: NVENC pool opened; a GPU frame and a CPU frame both entered it");
             opened += 1;
         }

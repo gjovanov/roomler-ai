@@ -864,9 +864,8 @@ fn probe_gpu(names: &[String]) -> Vec<String> {
             continue;
         };
         let source = if name.ends_with("_nvenc") {
-            nvenc_source.get_or_insert_with(|| {
-                make(crate::capture::gpu_frame::device_on_vendor(0x10de))
-            })
+            nvenc_source
+                .get_or_insert_with(|| make(crate::capture::gpu_frame::device_on_vendor(0x10de)))
         } else {
             qsv_source.get_or_insert_with(|| {
                 make(crate::system_context::dxgi_direct::primary_output_device())
