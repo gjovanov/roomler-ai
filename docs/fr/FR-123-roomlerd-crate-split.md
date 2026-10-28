@@ -3,7 +3,7 @@
 **Issue:** [#2941](https://github.com/gjovanov/roomler-ai/issues/2941) · **Status:** P2 merged 2026-10-27
 (#2999, master `ae5ca6f6e`), released in 0.4.180: the daemon compiles as one unit. Probe v3 measured −14.3 % /
 −30.5 % of its compile; 0.4.180's rehearsal reads −19 % / −12 % on the two Linux lanes, the only ones steady
-enough to read from one release (§8.1); every artifact is 3.2–7.8 % smaller; P1 (#2944) held, a draft · **Owner:** the agent's build shape (with FR-6 for the lane and
+enough to read from one release (§8.1); every artifact is 3.2–7.8 % smaller, and its post-roll check passed; P1 (#2944) held, a draft · **Owner:** the agent's build shape (with FR-6 for the lane and
 FR-90 P8 for Hive's crate) · **Anchors:** master `12a0edc81` (2026-10-26) unless a row says otherwise ·
 **Parent:** [FR-6](FR-6-ci-release-build-speed-slo.md) (#773), whose residual lever this is
 
@@ -580,7 +580,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 |---|---|---|---|
 | **P0** | this spec, the claim, the Phase 0 measurements (§2.2) and the probes (§2.4, §8) | runs 40303391151 (v1), 40308429566 (v2) | spec PR #2942; v1 measured 2026-10-26, v2 in flight |
 | **P1** | `roomler-node-tunnel` (§3.4): the crate, the registry inversion, the licence tables, the CI lanes, the anchor pass | the v2 probe's same-runner A/B, Windows + macOS; then **re-measured on top of P2** (base vs A vs A + P1, one runner per OS) | PR #2944, every lane green; alone: −6.7 % / −12.6 % time, +3.4 % / +3.1 % size; **on top of A: −0.6 % / −1.4 % time, +4.1 % size** (§2.4 v3) — **held** (decision 7): A + P1 is still smaller than today (−1.7 % / −7.9 %), but P1 earns ~1 % now; the recipe waits for a sibling with sync work |
-| **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against 0.4.178's tree (§2.4 v3); the field proof is 0.4.180's rehearsal build steps (AC1) and its MSI size notice (AC2) | **merged** 2026-10-27, #2999 → master `ae5ca6f6e`; **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size**; **released in 0.4.180** (§8.1): the bin's 132–303 s are gone on all four lanes, the daemon's compile is −19 % / −12 % on the steady Linux lanes, every artifact 3.2–7.8 % smaller; owed: AC1's three releases, AC3's post-roll check |
+| **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against 0.4.178's tree (§2.4 v3); the field proof is 0.4.180's rehearsal build steps (AC1) and its MSI size notice (AC2) | **merged** 2026-10-27, #2999 → master `ae5ca6f6e`; **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size**; **released in 0.4.180** (§8.1): the bin's 132–303 s are gone on all four lanes, the daemon's compile is −19 % / −12 % on the steady Linux lanes, every artifact 3.2–7.8 % smaller; its post-roll check passed on 2026-10-28 (AC3's half); owed: AC1's three releases |
 | **P3** | `roomler-node-media` (§3.5), in a merge window FR-118/119 agree to | same-runner A/B, sibling by sibling | after P2 |
 | **P4** | `roomler-node-host` (§3.7) | same-runner A/B | after P3 (or before, if P3's window is late) |
 | **P5** | Hive's crate — FR-90 P8-1, with the dependency property of §3.1 | FR-90's | FR-90's schedule |
@@ -615,6 +615,13 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
   40558500035, 242 pass); the release and the post-roll check are 0.4.180's.*
   *0.4.180 published 2026-10-27 20:31:19Z. In its tag run the four reused daemon builds each answered
   `roomlerd 0.4.180` to `--version`; the post-roll check follows the fleet's update.*
+  *Post-roll check passed on 0.4.180 (2026-10-28, §8). By the server's listing, 20 of 20 online
+  agents in four orgs run 0.4.180; the three seen in the last 24 h but offline are on 0.4.178 and
+  0.4.179. Over exec, `roomlerd --version` reads 0.4.180 on two Linux servers and two Windows
+  corporate laptops. A remote-desktop session to a Linux server ran H.265 4:2:0 in hardware (VAAPI),
+  direct, at 15 fps and ~17 ms. An overlay pair answered 3 of 3 pings at 31 ms, and two SOCKS5
+  tunnel listeners each returned 200 from the API's health endpoint in 0.31–0.33 s. P2's half holds;
+  the box waits for the phases after it.*
 - [ ] **AC4 — the anchors hold.** For every PR: `anchor-xcheck.pl` reports no MISMATCH over all of
   `docs/` and `ui/docs/`, `scripts/anchor-range-audit.sh` reports no fault, dated field-log rows keep
   their anchors, and moved files' bodies are byte-identical to their base (rule 2).
@@ -689,6 +696,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-27 18:43Z | P2 merged: #2999 → master `ae5ca6f6e` (rebased three times under 0.4.179's freeze: #2940's anchor shifts, #3000's `main.rs` hunks carried into `app.rs` by the rename, the 0.4.179 bump); CI 23 pass, the integration lane on the branch green (run 40558500035, 242 pass); GitHub MERGEABLE / CLEAN before the merge | the daemon compiles as one unit on master; the release proof (AC1, AC2, AC3's post-roll check) is 0.4.180's |
 | 2026-10-27 20:03Z | **0.4.180's rehearsal (run 40574588069, `9aab8f703`), the first release with P2**, against 0.4.179's (40527141713); each daemon lane's compile split at the markers cargo prints (§8.1) | the bin's 132–303 s are gone on all four lanes (0–5 s left). On the Linux lanes, whose runners were equally fast both days, the lib absorbed 40–62 % of that time and the daemon's compile fell **−19 % (aarch64) and −12 % (x86_64)**. Windows (−44 %) and macOS (+10 %) are one noisy sample each; per second of its own front end, the macOS compile fell −13 %. Build steps: MSI 947 → 542 s, `.pkg` 892 → 987, `.deb` 454 → 403 and 569 → 464. Every artifact smaller (AC2) |
 | 2026-10-27 20:25Z | 0.4.180's tag run (40577974956), the same SHA | all 8 build jobs reused the rehearsal's compile, and the four daemon builds answered `roomlerd 0.4.180` to `--version`; published 20:31:19Z, 5 min 28 s after the run was created (FR-6's log) |
+| 2026-10-28 01:35Z | 0.4.180's post-roll check (AC3, P2's half): the server's agent listing, exec, one remote-desktop session, an overlay ping, a tunnel request | 20 of 20 online agents in four orgs on 0.4.180; exec reads 0.4.180 on two Linux servers and two Windows corporate laptops; the session ran H.265 4:2:0 hardware (VAAPI), direct, 15 fps, ~17 ms, and was closed; overlay 3/3 at 31 ms; two SOCKS5 listeners returned 200 in 0.31–0.33 s |
 
 ### 8.1 Reading the release side (0.4.180)
 
