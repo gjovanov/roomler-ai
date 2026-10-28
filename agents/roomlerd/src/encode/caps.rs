@@ -625,11 +625,11 @@ mod child {
     }
 
     /// FR-118 P2-3 — the encoders whose GPU-input form the third phase should
-    /// try: the base matrix's QSV cells the GPU input covers (4:2:0), minus
-    /// the cell denylist and `zero_copy_deny`; none at all with the switch off
-    /// or on a build without GPU frames. A gate the probe honours is a gate
-    /// only if the session honours it too: `gpu_input::plan` reads the same
-    /// two lists at every open.
+    /// try: the base matrix's QSV and (P3) NVENC cells the GPU input covers
+    /// (4:2:0), minus the cell denylist and `zero_copy_deny`; none at all with
+    /// the switch off or on a build without GPU frames. A gate the probe
+    /// honours is a gate only if the session honours it too: `gpu_input::plan`
+    /// reads the same two lists at every open.
     pub(super) fn candidates_gpu(caps: &AgentCaps) -> Vec<String> {
         #[cfg(all(
             target_os = "windows",
@@ -644,7 +644,7 @@ mod child {
             let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
             let mut names: Vec<String> = Vec::new();
             for cell in caps.typed_cells() {
-                if cell.backend != VideoBackend::Qsv {
+                if !matches!(cell.backend, VideoBackend::Qsv | VideoBackend::Nvenc) {
                     continue;
                 }
                 let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
@@ -820,11 +820,14 @@ fn probe_444(_names: &[String]) -> Vec<String> {
 }
 
 /// FR-118 P2-3 — the GPU-input phase: open each named encoder's GPU-input form
-/// on a device of the adapter the SystemContext DXGI arm captures on, and
-/// encode two GPU frames through it. A name is proven only if the encoder took
-/// the GPU input (not a fallback to CPU frames) and packets came out. Every
-/// attempt is announced on stdout first, so a dying process names the open it
-/// was inside (`<name>:gpu`, the `zero_copy_deny` entry).
+/// on a device of the adapter its frames would come from, and encode two GPU
+/// frames through it. QSV's forms open on the adapter the SystemContext DXGI
+/// arm captures on (the primary output's); P3, NVENC's on the NVIDIA adapter,
+/// where WGC puts its device for them (`gpu_frame::capture_adapter`). A name is
+/// proven only if the encoder took the GPU input (not a fallback to CPU frames)
+/// and packets came out. Every attempt is announced on stdout first, so a dying
+/// process names the open it was inside (`<name>:gpu`, the `zero_copy_deny`
+/// entry).
 #[cfg(all(
     target_os = "windows",
     feature = "system-context",
@@ -835,23 +838,44 @@ fn probe_444(_names: &[String]) -> Vec<String> {
 fn probe_gpu(names: &[String]) -> Vec<String> {
     use crate::capture::gpu_frame::TexturePool;
     use crate::encode::ffmpeg::FfmpegEncoder;
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
     let mut proven = Vec::new();
     if !crate::encode::ffmpeg::available() {
         return proven;
     }
-    let Some(device) = crate::system_context::dxgi_direct::primary_output_device() else {
-        tracing::info!("caps probe: no device on the primary output's adapter — no GPU-input form");
-        return proven;
-    };
-    let pool = match TexturePool::new(&device) {
-        Ok(pool) => pool,
-        Err(e) => {
-            tracing::info!(%e, "caps probe: no texture pool on the capture adapter — no GPU-input form");
-            return proven;
+    // One device, with its texture pool, per adapter the frames would come
+    // from, made on first need: QSV's on the primary output's adapter, NVENC's
+    // on the NVIDIA adapter (P3). `None` inside = no such device here.
+    type Source = Option<(ID3D11Device, TexturePool)>;
+    let make = |device: Option<ID3D11Device>| -> Source {
+        let device = device?;
+        match TexturePool::new(&device) {
+            Ok(pool) => Some((device, pool)),
+            Err(e) => {
+                tracing::info!(%e, "caps probe: no texture pool on that adapter's device — no GPU-input form there");
+                None
+            }
         }
     };
+    let mut qsv_source: Option<Source> = None;
+    let mut nvenc_source: Option<Source> = None;
     for name in names {
         let Some(name) = FfmpegEncoder::static_name(name) else {
+            continue;
+        };
+        let source = if name.ends_with("_nvenc") {
+            nvenc_source
+                .get_or_insert_with(|| make(crate::capture::gpu_frame::device_on_vendor(0x10de)))
+        } else {
+            qsv_source.get_or_insert_with(|| {
+                make(crate::system_context::dxgi_direct::primary_output_device())
+            })
+        };
+        let Some((device, pool)) = source.as_ref() else {
+            tracing::info!(
+                encoder = name,
+                "caps probe: no device on this encoder's adapter — no GPU-input form"
+            );
             continue;
         };
         child::emit(&format!("{}{name}:gpu", child::PROGRESS));
@@ -866,7 +890,7 @@ fn probe_gpu(names: &[String]) -> Vec<String> {
             }
             let mut bytes = 0usize;
             for i in 0..2u64 {
-                let frame = probe_gpu_frame(&device, &pool, i)?;
+                let frame = probe_gpu_frame(device, pool, i)?;
                 bytes += encoder
                     .encode_sync(&frame)?
                     .iter()
@@ -1526,6 +1550,9 @@ fn install_vp9_qsv_idr(_verdict: Option<(bool, bool)>) {}
     any(feature = "mf-encoder", feature = "wgc-capture")
 ))]
 fn install_gpu_input(proven: Vec<String>) {
+    // FR-118 P3 — the capture side reads the same list to put its device on
+    // those cells' adapter.
+    crate::capture::gpu_frame::install_gpu_input_cells(proven.clone());
     crate::encode::ffmpeg::gpu_input::install_proven(proven);
 }
 
@@ -3913,15 +3940,61 @@ mod tests {
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(
             child::candidates_gpu(&caps),
-            vec!["hevc_qsv", "av1_qsv", "h264_qsv"],
-            "vp9_qsv and NVENC take no GPU frames yet"
+            vec!["hevc_qsv", "av1_qsv", "h264_qsv", "hevc_nvenc"],
+            "vp9_qsv takes no GPU frames yet; NVENC does since P3"
         );
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu") };
-        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv", "h264_qsv"]);
+        assert_eq!(
+            child::candidates_gpu(&caps),
+            vec!["hevc_qsv", "h264_qsv", "hevc_nvenc"]
+        );
         // SAFETY: as above.
         unsafe { set("ENCODER_CELLS_DENY", "h264_qsv:yuv420") };
+        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv", "hevc_nvenc"]);
+        // A list REPLACES the one before it, so both entries go in one list.
+        // SAFETY: as above.
+        unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu,hevc_nvenc:gpu") };
         assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv"]);
+    }
+
+    /// FR-118 P3 — the GPU phase proves NVENC's GPU-input forms on an NVIDIA
+    /// device: each opens on the D3D11 pool (not CPU frames) and two GPU frames
+    /// come out as packets. Runs where an NVIDIA adapter is (neo16's RTX 5090);
+    /// a runner without one has nothing to prove and says so. The test stands
+    /// in for the probe child (`ROOMLERD_CAPS_CHILD`), whose job is the proof.
+    #[cfg(all(
+        target_os = "windows",
+        feature = "system-context",
+        feature = "mf-encoder",
+        feature = "scrap-capture",
+        feature = "ffmpeg-encoder"
+    ))]
+    #[test]
+    fn the_gpu_phase_proves_nvenc_on_an_nvidia_device() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let _child = Saved::cleared("CAPS_CHILD");
+        if crate::capture::gpu_frame::device_on_vendor(0x10de).is_none() {
+            eprintln!("no NVIDIA adapter here — nothing to prove");
+            return;
+        }
+        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+        unsafe {
+            set("ZERO_COPY", "1");
+            set("CAPS_CHILD", "1");
+        }
+        let names: Vec<String> = ["hevc_nvenc", "h264_nvenc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let proven = probe_gpu(&names);
+        eprintln!("proven on the NVIDIA device: {proven:?}");
+        assert_eq!(proven, names, "both NVENC forms take GPU frames");
     }
 
     /// FR-77 P3c — the merge adds `yuv444` to exactly the named cells, and

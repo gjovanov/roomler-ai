@@ -204,9 +204,9 @@ flowchart TD
     T -- "died / hung" --> H2["the 4:2:0 matrix, and the log names<br/>the last open — the entry for encoder_cells_deny"]
     G --> P
     H2 --> P
-    P{candidates_gpu:<br/>zero_copy on? the QSV 4:2:0 cells<br/>the GPU input covers, minus both denylists}
-    P -- "none: the switch is off, or no QSV cell" --> W
-    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on the capture<br/>adapter, two GPU frames encoded"]
+    P{candidates_gpu:<br/>zero_copy on? the QSV and NVENC 4:2:0 cells<br/>the GPU input covers, minus both denylists}
+    P -- "none: the switch is off, or no such cell" --> W
+    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded"]
     U -- ROOMLER_CAPS_GPU --> V[gpu_input: the forms<br/>a session may open]
     U -- "died / hung" --> V2["no GPU-input form, and the log names<br/>the last open — the entry for zero_copy_deny"]
     V --> W{any hardware cell?}
@@ -237,12 +237,14 @@ service host its stderr reaches no log.
 Why a third (FR-118 P2-3): a QSV encoder that takes GPU frames
 (`zero_copy`, [FR-118](fr/FR-118-gpu-resident-frames.md) §5.4) opens on a frame
 pool of the capture's own D3D11 device, an open no other cell makes. The `gpu`
-child makes it first, on a device of the adapter the SystemContext DXGI arm
-captures on, and encodes two GPU frames through it. A session opens that form
-only for an encoder the child proved (`input_reason=unproven` otherwise), so a
-driver that faults on it takes down a child, never the daemon. With
-`zero_copy` off there are no candidates and no third child. The proven names
-(`gpu_input`) ride the cache with the caps; they are not a wire capability.
+child makes it first and encodes two GPU frames through it. QSV's forms open
+on a device of the adapter the SystemContext DXGI arm captures on, and NVENC's
+(FR-118 P3) on a device of the NVIDIA adapter, where WGC's device goes. A
+session opens that form only for an encoder the child proved
+(`input_reason=unproven` otherwise), so a driver that faults on it takes down a
+child, never the daemon. With `zero_copy` off there are no candidates and no
+third child. The proven names (`gpu_input`) ride the cache with the caps; they
+are not a wire capability.
 
 Why a cache (P3a): the matrix probe costs 4–6 s on a Windows host with two GPUs,
 paid on every daemon start for an answer that changes only when the GPU, its
@@ -531,9 +533,12 @@ the denylist, and the raw dump of a healthy build decodes as-is.
 The input path is a third dimension of a cell, beside codec × backend and
 chroma: an encoder takes its frames from CPU memory, as every cell did until
 FR-118, or as textures on the capture's own GPU. The GPU form is **off by
-default** (`zero_copy`), and one family takes it so far: QSV (`hevc_qsv`,
-`av1_qsv`, `h264_qsv`, 4:2:0) on the SystemContext DXGI arm, which is the arm
-every QSV host in the fleet captures through.
+default** (`zero_copy`), and two families take it so far, both at 4:2:0:
+
+- **QSV** (`hevc_qsv`, `av1_qsv`, `h264_qsv`) on the SystemContext DXGI arm, which is the arm every QSV host in
+  the fleet captures through.
+- **NVENC** (`hevc_nvenc`, `av1_nvenc`, `h264_nvenc`) on the WGC arm (FR-118 P3). On a hybrid laptop WGC's device
+  moves to the NVIDIA adapter.
 
 ```mermaid
 flowchart LR
@@ -548,6 +553,12 @@ flowchart LR
     C2 -->|CopySubresourceRegion| D2[QSV pool slice]
     D2 -->|AV_PIX_FMT_QSV| E2[QSV]
   end
+  subgraph wgc["GPU input (zero_copy, a proven NVENC cell)"]
+    A3["WGC frame, its device on the NVIDIA adapter<br/>(the OS copies across from the panel's)"] -->|CopySubresourceRegion| B3[pool texture, same device]
+    B3 -->|"VideoProcessorBlt, BT.601 limited"| C3[NV12 texture]
+    C3 -->|CopySubresourceRegion| D3[D3D11 pool slice]
+    D3 -->|AV_PIX_FMT_D3D11| E3[NVENC]
+  end
 ```
 
 | Piece | What it is | Where |
@@ -555,7 +566,8 @@ flowchart LR
 | the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it | `capture::gpu_frame::zero_copy_enabled` |
 | the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open | `encode::ffmpeg::gpu_hint::denied` |
 | the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. A consumer that needs bytes reads it back, once | `agents/roomlerd/src/capture/gpu_frame.rs` |
-| the GPU input | a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
+| the capture's adapter | the DXGI arm: the primary output's. WGC: the adapter of the first proven GPU-input cell's vendor, in the order every cascade opens backends (NVENC, QSV, AMF); with none proven, the default adapter | `capture::gpu_frame::capture_adapter` |
+| the GPU input | QSV: a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool. NVENC: the same D3D11VA context and an `AV_PIX_FMT_D3D11` NV12 pool, decoder-bound (the RTX 5090 refuses its NV12 array otherwise) | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
 | the proof | the probe's `gpu` child opens each GPU form and encodes two frames through it; a session opens only a form the child proved | [The probe lifecycle](#the-probe-lifecycle) |
 
 The session reports which form it opened and why, on the heartbeat as
@@ -568,7 +580,7 @@ The session reports which form it opened and why, on the heartbeat as
 | `no_gpu_cell` | this encoder or chroma takes no GPU frames yet |
 | `denied` | `zero_copy_deny` names it |
 | `unproven` | the probe's `gpu` child did not prove this form on this host |
-| `adapter_mismatch` | the capture's adapter has no QSV |
+| `adapter_mismatch` | the capture's device is on an adapter this backend cannot encode from: no QSV behind it, or not NVIDIA's for NVENC |
 | `open_failed` | the GPU form failed to open, and the CPU form took over |
 
 > [!WARNING]
@@ -588,13 +600,21 @@ The session reports which form it opened and why, on the heartbeat as
   readback leaves the capture stage. `send_frame` grows by 1.9 ms, because it
   now waits for the GPU's conversion before QSV reads the surface. The pattern
   decodes identically on both paths.
-- **Not yet:** NVENC, AMF and the WGC arm (FR-118 P3). On a hybrid laptop
-  whose panel is driven by the iGPU, WGC's device and the dGPU's encoder sit on
-  different adapters. Measured on such a laptop
+- **WGC across adapters.** On a hybrid laptop whose panel is driven by the
+  iGPU, WGC's device and the dGPU's encoder sit on different adapters. Measured
+  on such a laptop
   ([FR-118 §9.4](fr/FR-118-gpu-resident-frames.md#94-wgc-across-adapters-for-p3-2026-10-28)):
   giving WGC's device the encoder's adapter lets the OS copy each frame across
-  for 0.3–0.6 ms at the median, with no frame lost and no CPU spent, so that is
-  the adapter P3 uses.
+  for 0.3–0.6 ms at the median, with no frame lost and no CPU spent. So that is
+  the adapter P3 uses, and NVENC takes the frame on its own GPU
+  ([FR-118 §5.6](fr/FR-118-gpu-resident-frames.md#56-p3--the-wgc-arm-hands-nvenc-its-frames-as-built-2026-10-28)).
+- **One vendor per capture.** WGC's adapter is chosen once, from the proven
+  forms, because a capture opens before the session's encoder exists. On a host
+  with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
+  and reads `adapter_mismatch`: CPU frames, the picture unchanged.
+- **Not yet:** the NVENC cell's field run (P3 is unreleased), and AMF. The
+  measurement above made the AMF route unnecessary on the hybrid host, so an
+  AMD-only host's AMF cells stay on CPU frames until one needs them.
 
 ## Configuration
 
@@ -603,7 +623,7 @@ The session reports which form it opened and why, on the heartbeat as
 | `encoder_preference` | `ROOMLERD_ENCODER` (CLI `--encoder` wins) | `auto` | `auto` · `hardware` · `software` |
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm keeps frames on the GPU, and a proven QSV cell takes them ([above](#gpu-resident-frames-the-input-path-fr-118)) |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them ([above](#gpu-resident-frames-the-input-path-fr-118)) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
