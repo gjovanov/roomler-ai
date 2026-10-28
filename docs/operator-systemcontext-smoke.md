@@ -128,13 +128,53 @@ icacls "C:\ProgramData\roomler"
 
 If `Users` appears, the wizard's `harden_machine_global_dir` step never
 ran (typical for an auto-update path rather than a fresh wizard
-install). Apply it manually — one command:
+install). Apply it manually, from an elevated shell, the owner FIRST:
 
 ```powershell
+icacls "C:\ProgramData\roomler" /setowner "*S-1-5-32-544"
 icacls "C:\ProgramData\roomler" /inheritance:r `
        /grant:r "*S-1-5-18:(OI)(CI)F" `
        /grant:r "*S-1-5-32-544:(OI)(CI)F"
 ```
+
+> ⚠️ **Never `/inheritance:r` a directory you do not own** (#3073). Once
+> inheritance is gone, only the owner keeps the right to rewrite the DACL.
+> When the directory belongs to someone else, for example the signed-in
+> user because the desktop companion created it, the grant that follows
+> fails `Access is denied`. The directory is left with an empty protected
+> DACL that SYSTEM itself cannot open. Both the daemon's hardening
+> (`crates/agent-core/src/config.rs:3480`, steps at `:3523`) and the
+> wizard's (`agents/roomler-setup/src/orchestrator_agent.rs:1125`) now take
+> ownership for Administrators first, and stop if they cannot.
+
+### If SYSTEM is locked out of `C:\ProgramData\roomler\roomler` (#3073)
+
+Before the fix, a SystemContext host's first healthy run could seal this
+directory. Nothing fails at that moment: the daemon keeps writing through
+the handles it already has. From the next restart on (usually an update),
+it can open nothing in the directory.
+
+| What you see | Why |
+|---|---|
+| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:254`) |
+| `icacls C:\ProgramData\roomler\roomler` lists **no** entries | the DACL is protected and empty (`icacls … /save` shows `D:PAI`) |
+| a leftover `config.toml.tmp.<pid>` in that directory | the config save whose hardening sealed it could not rename its file into place |
+
+Repair it as SYSTEM (`roomler exec <device> -- "…"`) or from an elevated
+shell. Own the top, give it back its DACL, then let each pass reach one
+level deeper:
+
+```powershell
+$d = 'C:\ProgramData\roomler\roomler'
+takeown /F $d /A
+icacls $d /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+foreach ($i in 1..3) { takeown /F $d /A /R /D Y; icacls "$d\*" /reset /T /C /Q }
+```
+
+`takeown /R` stops at every directory it cannot list yet, which is why
+the passes repeat. Its `/D` answer is localized: `/D J` on German Windows.
+Then `roomler restart`: a running daemon only reopens its log when it
+starts.
 
 Verify a non-admin user truly cannot read it:
 

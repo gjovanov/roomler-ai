@@ -1115,6 +1115,24 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
         })?;
     std::fs::create_dir_all(roomler_dir)
         .map_err(|e| format!("create {}: {e}", roomler_dir.display()))?;
+    // #3073 — the owner first. Only the owner keeps WRITE_DAC once
+    // `/inheritance:r` has removed every ACE, so a directory someone else
+    // owns (the daemon hardening it later runs as SYSTEM) must belong to
+    // Administrators before inheritance goes. Abort rather than strip it
+    // from a directory we could not take.
+    let owner = std::process::Command::new("icacls")
+        .arg(roomler_dir)
+        .arg("/setowner")
+        .arg("*S-1-5-32-544")
+        .output()
+        .map_err(|e| format!("spawn icacls: {e}"))?;
+    if !owner.status.success() {
+        return Err(format!(
+            "icacls /setowner exited {}: {}",
+            owner.status,
+            String::from_utf8_lossy(&owner.stderr).trim()
+        ));
+    }
     let output = std::process::Command::new("icacls")
         .arg(roomler_dir)
         .arg("/inheritance:r")
