@@ -92,7 +92,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter,
-    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource,
 };
 use windows::core::Interface;
 
@@ -211,6 +212,40 @@ pub struct DxgiDirectBackend {
 /// persistently broken driver costs one attempt a minute, short enough
 /// that a transient (device reset mid-session) recovers.
 const VP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// FR-118 P2-2 — what `reset` keeps across a rebuild while GPU frames are on:
+/// the device, its immediate context, and the texture pool GPU frames are
+/// copied into.
+struct Kept {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    gpu_pool: Option<TexturePool>,
+}
+
+impl Kept {
+    /// The device is still the one to keep: alive (no driver reset removed
+    /// it), and on the adapter that owns the primary output now. Anything the
+    /// check cannot read is a no.
+    fn fits(&self, adapter: &IDXGIAdapter1) -> bool {
+        // SAFETY: plain COM queries on live objects.
+        unsafe {
+            if self.device.GetDeviceRemovedReason().is_err() {
+                return false;
+            }
+            let Ok(dxgi) = self.device.cast::<IDXGIDevice>() else {
+                return false;
+            };
+            let (Ok(ours), Ok(theirs)) = (
+                dxgi.GetAdapter().and_then(|a| a.GetDesc()),
+                adapter.GetDesc1(),
+            ) else {
+                return false;
+            };
+            ours.AdapterLuid.LowPart == theirs.AdapterLuid.LowPart
+                && ours.AdapterLuid.HighPart == theirs.AdapterLuid.HighPart
+        }
+    }
+}
 
 /// Phase B — cached D3D11 VideoProcessor objects for one
 /// (input dims → output dims) pair. See the plan's D3D11 recipe; every
@@ -376,6 +411,13 @@ impl DxgiDirectBackend {
     /// FP16 surfaces as BGRA8 (field WINHOST-F: purple 2×-zoomed
     /// flicker on every recomposited frame).
     pub fn primary() -> Result<Self, BackendBail> {
+        Self::open(None)
+    }
+
+    /// [`Self::primary`], reusing `keep`'s device (and its texture pool) when
+    /// the primary output is still on that device's adapter and the device is
+    /// alive (FR-118 P2-2, see `reset`). Anything else makes a new device.
+    fn open(keep: Option<Kept>) -> Result<Self, BackendBail> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(map_dxgi_err)?;
 
@@ -391,7 +433,19 @@ impl DxgiDirectBackend {
             // E_INVALIDARG cross-adapter / E_ACCESSDENIED on the secure desktop),
             // and try_build_dxgi logs the whole error before falling back to
             // scrap — so the message is self-disambiguating without per-step logs.
-            let (device, context) = create_device_on(&adapter).map_err(map_dxgi_err)?;
+            let (device, context, gpu_pool) = match keep.filter(|k| k.fits(&adapter)) {
+                Some(k) => {
+                    tracing::info!(
+                        adapter = %adapter_name,
+                        "DXGI-direct: FR-118 kept the device across the rebuild (GPU frames stay on it)"
+                    );
+                    (k.device, k.context, k.gpu_pool)
+                }
+                None => {
+                    let (device, context) = create_device_on(&adapter).map_err(map_dxgi_err)?;
+                    (device, context, None)
+                }
+            };
 
             // Desktop Duplication lives on IDXGIOutput1.
             let output1: IDXGIOutput1 = output.cast().map_err(map_dxgi_err)?;
@@ -470,7 +524,7 @@ impl DxgiDirectBackend {
                 vp_input_needs_copy: false,
                 vp_mid_tex: None,
                 zero_copy: gpu_frame::zero_copy_enabled(),
-                gpu_pool: None,
+                gpu_pool,
                 gpu_failed_at: None,
             })
         }
@@ -1173,7 +1227,18 @@ impl DxgiCapture for DxgiDirectBackend {
         // display config may have changed across the AccessLost (resolution
         // swap during a lock screen), so re-deriving from scratch is the
         // safe move — same as the scrap backend's reset().
-        *self = Self::primary()?;
+        //
+        // FR-118 P2-2 — except the device, while GPU frames are on and the
+        // primary output is still on its adapter: the encoder takes GPU
+        // frames from this device, and a new one would cost it a reopen (a
+        // QSV open is 0.6–0.9 s) and a keyframe after every lock, unlock and
+        // cap lift. The duplication is still rebuilt from scratch.
+        let keep = self.zero_copy.then(|| Kept {
+            device: self.device.clone(),
+            context: self.context.clone(),
+            gpu_pool: self.gpu_pool.take(),
+        });
+        *self = Self::open(keep)?;
         Ok(())
     }
 

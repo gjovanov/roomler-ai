@@ -35,6 +35,16 @@
 
 #[cfg(feature = "ffmpeg-encoder")]
 pub mod encoder;
+/// FR-118 P2-2 — which capture device an encoder open may take GPU frames from.
+#[cfg(feature = "ffmpeg-encoder")]
+pub(crate) mod gpu_hint;
+/// FR-118 P2-2 — the encoder takes a GPU frame (QSV on the capture's device).
+#[cfg(all(
+    target_os = "windows",
+    feature = "ffmpeg-encoder",
+    any(feature = "mf-encoder", feature = "wgc-capture")
+))]
+pub(crate) mod gpu_input;
 /// FR-77 P4 — the VAAPI device + frame pools (`*_vaapi` encoders only).
 pub(crate) mod hwframes;
 
