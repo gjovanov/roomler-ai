@@ -8638,17 +8638,22 @@ async fn media_pump_ffmpeg_dc(
             // ⚠️ Timed around the AWAIT, not the call, so `open_ms` stays the
             // honest wall-clock cost of getting an encoder.
             let __open_t = std::time::Instant::now();
+            // FR-118 P2-2 — a GPU frame names its capture device, and a QSV
+            // encoder opened in its scope takes GPU frames from it.
+            let gpu_device = crate::encode::ffmpeg::gpu_hint::device_of(&frame);
             let __opened = match tokio::task::spawn_blocking(move || {
-                codec.open(
-                    w,
-                    h,
-                    target_fps,
-                    open_rate as usize,
-                    cq_bias,
-                    cell_444,
-                    constrained,
-                    last_encoder_name,
-                )
+                crate::encode::ffmpeg::gpu_hint::opening_on(gpu_device, || {
+                    codec.open(
+                        w,
+                        h,
+                        target_fps,
+                        open_rate as usize,
+                        cq_bias,
+                        cell_444,
+                        constrained,
+                        last_encoder_name,
+                    )
+                })
             })
             .await
             {
@@ -9652,7 +9657,7 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 avg_convert_ms, avg_upload_ms, avg_submit_ms, avg_drain_ms,
-                avg_readback_ms,
+                avg_readback_ms, input_path = rate_stats.input.path(), input_reason = rate_stats.input.reason,
                 send_wait_avg_ms, send_wait_max_ms,
                 learned_ceiling_bps = governor.learned_ceiling_bps(),
                 send_stalls,
