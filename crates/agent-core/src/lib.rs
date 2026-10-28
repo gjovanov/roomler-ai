@@ -40,6 +40,9 @@ pub mod logging;
 pub mod logs_upload;
 pub mod machine;
 pub mod notify;
+/// FR-129 — the device-pairing client (`/api/pair/start`, `/api/pair/poll`):
+/// the wizard's half in A3, the daemon's `enroll --pair` in A4.
+pub mod pairing;
 /// FR-90 P4-5-1b — `knowhow_probe_reach`, where this device's knowhow
 /// probes may go: its syntax, shared by the config surface and the prober.
 pub mod probe_reach;

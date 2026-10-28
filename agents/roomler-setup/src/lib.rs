@@ -25,6 +25,9 @@ pub mod commands;
 pub mod diagnostics;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
+/// FR-129 A3 — the pairing session: the device code and the delivered
+/// token live here, in this process, and never reach the webview.
+pub mod pairing;
 pub mod proxy;
 pub mod role;
 

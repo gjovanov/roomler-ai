@@ -65,6 +65,34 @@ const state = {
                        // run: unticked is the default, every launch.
   pageEnteredAt: 0,    // performance.now() when the current page was shown;
                        // a page boundary's elapsed_ms is measured from it.
+  installMode: "pasted", // FR-129: which token cmd_install enrolls with —
+                       // "pasted" (state.token) or "paired" (the one Rust
+                       // holds from the pairing; the SPA never sees it).
+  pair: {              // FR-129 A3: the pairing as this page sees it. The
+                       // device code and the delivered token never come
+                       // here — see src/pairing.rs.
+    phase: "idle",     // idle | starting | waiting | approved | ended
+    unavailableFor: null, // the server whose start answered 404: paste only
+    userCode: null,    // "BCDF-GHJK"
+    uri: null,         // the page to open; carries no code
+    expiresAt: 0,      // Date.now() ms when the code runs out
+    intervalMs: 5000,  // the server's poll interval; grows on slow_down
+    nextPollAt: 0,     // Date.now() ms of the next poll
+    ticker: null,      // the ONE setInterval driving countdown + polls
+    gen: 0,            // bumped by every start/stop: a stale async result
+                       // (an old loop's poll, a superseded start) is dropped
+    inFlight: false,   // a poll is awaiting its answer (never two at once)
+    opened: false,     // the page was opened at least once (button label)
+    orgName: null,     // from the approval, shown before the install: the
+                       // org's display name (not unique) …
+    orgSlug: null,     // … and its slug (unique); null from an older server
+    approverName: null,     // the approver's display name (free text) …
+    approverUsername: null, // … and their username (unique); null if older
+    error: null,       // a start that failed (network, refusal)
+    hint: null,        // a poll that failed, shown under the countdown
+                       // until the next poll answers
+    endedText: null,   // why the pairing ended (denied / expired)
+  },
 };
 
 // Checklist rows keyed by event type — replay + live events render
@@ -196,6 +224,10 @@ function renderStepIndicator() {
 }
 
 async function gotoStep(name) {
+  // FR-129: no poll loop outlives the Join step. The session itself is the
+  // caller's decision — Back cancels it, a paired Install keeps it for
+  // cmd_install — but the timer stops on every step change, whoever made it.
+  if (name !== "token" && state.pair.ticker) stopPairingLoop();
   state.step = name;
   state.pageEnteredAt = performance.now();
   await persistState();
@@ -292,8 +324,10 @@ function wireWelcome() {
       state.roleAck = false;
       document.getElementById("cross-flavour-ack").checked = false;
       // Role change invalidates any previous token introspection (the
-      // audience gate depends on the role).
+      // audience gate depends on the role) — and any pairing, whose token
+      // kind follows the role it was started for (FR-129).
       state.tokenView = null;
+      if (state.pair.phase !== "idle") cancelPairing();
       persistState();
       renderWelcome();
     });
@@ -463,12 +497,19 @@ function wireToken() {
     state.token = "";
     state.tokenView = null;
     document.getElementById("token-input").value = "";
+    // FR-129: Back forgets the pairing — its code and any delivered token —
+    // so a changed server or role never meets a token minted for another.
+    await cancelPairing();
     await gotoStep("server");
   });
   document.getElementById("token-continue").addEventListener("click", async () => {
     // FR-102 P3b: the token page is passed once, here; a Retry from the
     // Install page re-runs the pipeline, not this boundary.
     await pageBoundary("token", "ok");
+    // FR-129: the pasted token wins; a pairing left running or approved
+    // beside it is dropped, so the two paths never cross.
+    await cancelPairing();
+    state.installMode = "pasted";
     await runInstall();
   });
   let debounce;
@@ -477,6 +518,7 @@ function wireToken() {
     clearTimeout(debounce);
     debounce = setTimeout(validateToken, 350);
   });
+  wirePairing();
 }
 
 async function validateToken() {
@@ -500,8 +542,11 @@ async function validateToken() {
 }
 
 function renderToken() {
-  const lead = document.getElementById("token-lead");
-  lead.textContent = state.role === "tunnel-client"
+  renderPairing();
+
+  // The paste path's role-specific hint (the whole page's lead before
+  // FR-129; now the line under "I already have a token").
+  document.getElementById("paste-lead").textContent = state.role === "tunnel-client"
     ? "Paste a tunnel-enrollment token from Admin → Tunnels."
     : "Paste a fresh enrollment token from Admin → Agents.";
 
@@ -559,6 +604,346 @@ function formatExpiry(unix) {
   if (minutes < 0) return `${stamp} (${-minutes} min ago)`;
   if (minutes < 60) return `${stamp} (in ${minutes} min)`;
   return stamp;
+}
+
+// ─── Step 3, FR-129 A3: pairing from the browser ───────────────────────────
+//
+// The flow: "Set up in the browser" → cmd_pair_start (Rust keeps the device
+// code; this page gets the user code, the page and the clock) → the person
+// types the code at /pair and approves → the poll loop sees `approved` →
+// "Approved by X to join Y. Install into this org?" → Install runs the
+// ordinary install with the token Rust holds (cmd_install, usePaired).
+//
+// The poll loop is ONE setInterval tick per second that updates the
+// countdown and fires a poll when its interval is due. It stops on
+// approval, denial, expiry, Cancel, Back, a new start and any step change
+// (gotoStep); `gen` is bumped by every stop, and an async answer whose
+// generation is stale is dropped, so two loops never run and no late
+// answer lands on a later pairing. A failed poll (the network blinked) is
+// retried at the interval until the clock, with one grace interval past
+// expiry for the server's own answer, ends it.
+
+function wirePairing() {
+  document.getElementById("pair-start").addEventListener("click", startPairing);
+  document.getElementById("pair-restart").addEventListener("click", startPairing);
+  document.getElementById("pair-copy").addEventListener("click", copyPairCode);
+  document.getElementById("pair-open").addEventListener("click", openPairPage);
+  document.getElementById("pair-cancel").addEventListener("click", async () => {
+    await cancelPairing();
+    renderToken();
+  });
+  document.getElementById("pair-approved-cancel").addEventListener("click", async () => {
+    // AC5: Cancel leaves the device unenrolled; the delivered token is
+    // dropped here and expires unused on its own clock.
+    await cancelPairing();
+    renderToken();
+  });
+  document.getElementById("pair-approved-install").addEventListener("click", async () => {
+    if (state.pair.phase !== "approved") return;
+    await pageBoundary("token", "ok");
+    state.installMode = "paired";
+    await runInstall();
+  });
+}
+
+async function startPairing() {
+  stopPairingLoop();
+  const p = state.pair;
+  p.phase = "starting";
+  p.error = null;
+  p.hint = null;
+  p.endedText = null;
+  p.orgName = null;
+  p.orgSlug = null;
+  p.approverName = null;
+  p.approverUsername = null;
+  p.opened = false;
+  renderToken();
+
+  const gen = p.gen;
+  let view;
+  try {
+    view = await invoke("cmd_pair_start", {
+      server: state.server,
+      role: state.role,
+      deviceName: state.device,
+    });
+  } catch (err) {
+    if (gen !== p.gen) return;
+    console.warn("[pairing] start failed:", err);
+    p.phase = "idle";
+    p.error = `Could not start pairing: ${err}`;
+    renderToken();
+    return;
+  }
+  if (gen !== p.gen) {
+    // Back or Cancel raced this start, and Rust now holds a session nobody
+    // wants; drop it — unless a newer start is under way, which replaced
+    // it already.
+    if (p.phase === "idle") invoke("cmd_pair_cancel").catch(() => {});
+    return;
+  }
+  if (view.kind === "unavailable") {
+    // The server has no pairing (switched off, or older): paste only,
+    // silently — the card hides and the paste box opens.
+    p.unavailableFor = state.server;
+    p.phase = "idle";
+    document.getElementById("paste-wrap").open = true;
+    renderToken();
+    return;
+  }
+  p.phase = "waiting";
+  p.userCode = view.userCode;
+  p.uri = view.verificationUri;
+  p.expiresAt = Date.now() + Math.max(0, view.expiresIn) * 1000;
+  p.intervalMs = Math.max(1, view.interval ?? 5) * 1000;
+  p.nextPollAt = Date.now() + p.intervalMs;
+  p.ticker = setInterval(pairTick, 1000);
+  renderToken();
+}
+
+// Stop the loop (timer + generation); the session in Rust is untouched.
+function stopPairingLoop() {
+  const p = state.pair;
+  if (p.ticker) {
+    clearInterval(p.ticker);
+    p.ticker = null;
+  }
+  p.gen += 1;
+  p.inFlight = false;
+}
+
+// Forget the pairing on both sides: the loop here, the device code and
+// any delivered token in Rust.
+async function cancelPairing() {
+  stopPairingLoop();
+  const p = state.pair;
+  p.phase = "idle";
+  p.userCode = null;
+  p.uri = null;
+  p.orgName = null;
+  p.orgSlug = null;
+  p.approverName = null;
+  p.approverUsername = null;
+  p.endedText = null;
+  p.error = null;
+  p.hint = null;
+  p.opened = false;
+  try {
+    await invoke("cmd_pair_cancel");
+  } catch (err) {
+    console.warn("[pairing] cancel failed:", err);
+  }
+}
+
+async function pairTick() {
+  const p = state.pair;
+  if (p.phase !== "waiting") return;
+  renderPairStatus();
+  const now = Date.now();
+  if (p.inFlight) return;
+  if (now < p.nextPollAt) {
+    // Past the clock with one grace interval given to the server's own
+    // answer: end it here.
+    if (now >= p.expiresAt + p.intervalMs) endPairing("The code expired.");
+    return;
+  }
+
+  p.inFlight = true;
+  const gen = p.gen;
+  let view;
+  try {
+    // Rust computes the next interval from this one on slow_down / 429.
+    view = await invoke("cmd_pair_poll", { intervalSecs: Math.round(p.intervalMs / 1000) });
+  } catch (err) {
+    if (gen !== p.gen) return;
+    p.inFlight = false;
+    console.warn("[pairing] poll failed:", err);
+    p.nextPollAt = Date.now() + p.intervalMs;
+    if (Date.now() >= p.expiresAt + p.intervalMs) {
+      endPairing("The code expired.");
+    } else {
+      p.hint = `Could not reach the server (${err}) — trying again.`;
+      renderPairStatus();
+    }
+    return;
+  }
+  if (gen !== p.gen) return;
+  p.inFlight = false;
+  p.hint = null;
+  p.nextPollAt = Date.now() + p.intervalMs;
+
+  switch (view.status) {
+    case "authorization_pending":
+      break;
+    case "slow_down":
+      // RFC 8628 §3.5: the next interval as Rust computed it from ours —
+      // the server's, never shorter than what we polled with.
+      p.intervalMs = Math.max(p.intervalMs, Math.max(1, view.interval ?? 5) * 1000);
+      p.nextPollAt = Date.now() + p.intervalMs;
+      break;
+    case "rate_limited":
+      // HTTP 429 from the per-IP governor (several installers behind one
+      // NAT): backed off like a slow_down — ours + 5 s, or Retry-After when
+      // longer, as Rust computed it — and said so, since nothing is wrong
+      // with the pairing itself.
+      p.intervalMs = Math.max(p.intervalMs, Math.max(1, view.interval ?? 5) * 1000);
+      p.nextPollAt = Date.now() + p.intervalMs;
+      p.hint = "The server asked for a slower pace — trying again.";
+      renderPairStatus();
+      break;
+    case "approved":
+      stopPairingLoop();
+      p.phase = "approved";
+      p.orgName = view.orgName ?? null;
+      p.orgSlug = view.orgSlug ?? null;
+      p.approverName = view.approverName ?? null;
+      p.approverUsername = view.approverUsername ?? null;
+      renderToken();
+      break;
+    case "access_denied":
+      endPairing("This was denied in the browser.");
+      break;
+    case "expired_token":
+      endPairing("The code expired.");
+      break;
+    default:
+      // A status this wizard does not know (a newer server): keep polling;
+      // the clock still ends the loop.
+      console.warn("[pairing] unknown poll status:", view.status, view.detail ?? "");
+      break;
+  }
+}
+
+function endPairing(text) {
+  stopPairingLoop();
+  const p = state.pair;
+  p.phase = "ended";
+  p.endedText = text;
+  // Rust already dropped the session on the server's own denial/expiry;
+  // on the clock's, drop it here — nothing is left to deliver.
+  invoke("cmd_pair_cancel").catch(() => {});
+  renderToken();
+}
+
+async function copyPairCode() {
+  const code = state.pair.userCode;
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code);
+    showSnackbar("Code copied.");
+  } catch (err) {
+    // A webview may refuse the async clipboard; the selection path works on
+    // a click.
+    const ok = copyBySelection(code);
+    showSnackbar(ok ? "Code copied." : "Could not copy — type the code shown.");
+  }
+}
+
+function copyBySelection(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  return ok;
+}
+
+async function openPairPage() {
+  // Rust opens the page it holds for this pairing; nothing is passed from
+  // here, and the URL carries no code (operator decision 1).
+  try {
+    await invoke("cmd_pair_open");
+    state.pair.opened = true;
+    renderPairing();
+  } catch (err) {
+    showSnackbar(`Could not open the browser: ${err}`);
+  }
+}
+
+function pairDisplayUri(uri) {
+  return (uri ?? "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+}
+
+// «Goran Jovanov» (@gjovanov) — or «Goran Jovanov» from an older server.
+function pairApproverLabel(p) {
+  const name = `«${p.approverName || "an administrator"}»`;
+  return p.approverUsername ? `${name} (@${p.approverUsername})` : name;
+}
+
+// «Roomler» (roomler) — or «Roomler» from an older server.
+function pairOrgLabel(p) {
+  const name = `«${p.orgName || "an organization"}»`;
+  return p.orgSlug ? `${name} (${p.orgSlug})` : name;
+}
+
+function renderPairing() {
+  const p = state.pair;
+  const available = p.unavailableFor !== state.server;
+  document.getElementById("pair-card").hidden = !available;
+
+  document.getElementById("token-lead").textContent = available
+    ? "Approve this device from your browser — nothing to copy. Or paste a token you already have."
+    : "This server does not offer pairing from the browser. Paste a fresh enrollment token.";
+  const paste = document.getElementById("paste-wrap");
+  document.getElementById("paste-summary").textContent = available
+    ? "I already have a token"
+    : "Enrollment token";
+  if (!available) paste.open = true;
+
+  const idle = p.phase === "idle" || p.phase === "starting";
+  document.getElementById("pair-idle").hidden = !idle;
+  const startBtn = document.getElementById("pair-start");
+  startBtn.disabled = p.phase === "starting";
+  startBtn.textContent = p.phase === "starting" ? "Starting…" : "Set up in the browser";
+  const errEl = document.getElementById("pair-error");
+  errEl.hidden = !p.error;
+  errEl.textContent = p.error ?? "";
+
+  document.getElementById("pair-active").hidden = p.phase !== "waiting";
+  if (p.phase === "waiting") {
+    document.getElementById("pair-code").textContent = p.userCode ?? "";
+    const shown = pairDisplayUri(p.uri);
+    document.getElementById("pair-uri").textContent = shown;
+    document.getElementById("pair-open").textContent = p.opened
+      ? "Open the page again"
+      : `Open ${shown}`;
+    renderPairStatus();
+  }
+
+  document.getElementById("pair-approved").hidden = p.phase !== "approved";
+  if (p.phase === "approved") {
+    // The hijack guard reads: «display name» (unique identifier). A display
+    // name is free text anyone can copy; the username and the slug are
+    // unique, so the person can tell their admin and their org from ones
+    // merely named like them. An older server sends no identifiers, and the
+    // wording then falls back to the names alone.
+    document.getElementById("pair-approved-text").textContent =
+      `Approved by ${pairApproverLabel(p)} to join ${pairOrgLabel(p)}.`;
+  }
+
+  document.getElementById("pair-ended").hidden = p.phase !== "ended";
+  document.getElementById("pair-ended-text").textContent = p.endedText ?? "";
+}
+
+function renderPairStatus() {
+  const p = state.pair;
+  const left = Math.max(0, Math.ceil((p.expiresAt - Date.now()) / 1000));
+  const mm = String(Math.floor(left / 60)).padStart(2, "0");
+  const ss = String(left % 60).padStart(2, "0");
+  const base = left > 0
+    ? `Waiting for approval in the browser… the code expires in ${mm}:${ss}.`
+    : "The code has run out — checking once more.";
+  document.getElementById("pair-status").textContent = p.hint ? `${base} ${p.hint}` : base;
 }
 
 // ─── Step 4: Install ───────────────────────────────────────────────────────
@@ -622,6 +1007,10 @@ function wireInstall() {
     state.installError = null;
     state.installErrorStep = null;
     installRows = new Map();
+    // FR-129: a failed paired install's token is dropped with the pairing —
+    // the next pass through the Join step starts clean.
+    if (state.installMode === "paired") await cancelPairing();
+    state.installMode = "pasted";
     await gotoStep("welcome");
   });
 }
@@ -641,8 +1030,11 @@ async function runInstall() {
   const what = state.role === "tunnel-client"
     ? "tunnel client"
     : `daemon (${flavourLabel(roleFlavour(state.role))})`;
+  // FR-129: a paired install names the org it was approved into.
+  const paired = state.installMode === "paired";
+  const into = paired && state.pair.orgName ? ` into ${pairOrgLabel(state.pair)}` : "";
   document.getElementById("install-summary").textContent =
-    `Installing the ${what} from ${state.server} as “${state.device}”.`;
+    `Installing the ${what} from ${state.server} as “${state.device}”${into}.`;
   renderInstall();
 
   // 1. Attach the Channel listener FIRST so no live event is dropped.
@@ -661,14 +1053,17 @@ async function runInstall() {
     console.warn("[runInstall] progress replay failed:", err);
   }
 
-  // 3. Kick the install.
+  // 3. Kick the install. A paired install sends no token: Rust enrolls
+  //    with the one the pairing delivered (usePaired) and forgets it on
+  //    success; a failure keeps it for Retry.
   try {
     const report = await invoke("cmd_install", {
       role: state.role,
       server: state.server,
-      token: state.token,
+      token: paired ? "" : state.token,
       deviceName: state.device,
       advanced: gatherAdvanced(),
+      usePaired: paired,
       onEvent: channel,
     });
     console.log("[runInstall] cmd_install returned:", report);
@@ -677,6 +1072,17 @@ async function runInstall() {
     // Token cleared from memory now that enrollment succeeded.
     state.token = "";
     document.getElementById("token-input").value = "";
+    if (paired) {
+      // The session in Rust is already gone (cmd_install's success path);
+      // this page's view of it goes too, keeping only the org and the
+      // approver, which the Done page's lead shows (renderDone).
+      const { orgName, orgSlug, approverName, approverUsername } = state.pair;
+      stopPairingLoop();
+      state.pair.phase = "idle";
+      state.pair.userCode = null;
+      state.pair.uri = null;
+      Object.assign(state.pair, { orgName, orgSlug, approverName, approverUsername });
+    }
     // Two-step transition: paint Done step FIRST (so the operator
     // sees the Finish button immediately), THEN persist state in the
     // background. If persistState ever hangs or rejects, the user is
@@ -867,6 +1273,12 @@ function renderDone() {
     if (cliIncluded) lead += " The roomler CLI came with it (managed by the daemon's updater).";
     if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
     if (done.anchored === true) lead += " It is anchored: commands can run as SYSTEM here.";
+  }
+  // FR-129: a paired install names the org it joined and who approved it,
+  // each with its unique identifier (runInstall keeps them after the
+  // pairing's own view is cleared).
+  if (state.pair.orgName) {
+    lead += ` It joined ${pairOrgLabel(state.pair)}, approved by ${pairApproverLabel(state.pair)}.`;
   }
   document.getElementById("done-lead").textContent = lead;
 

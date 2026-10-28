@@ -15,7 +15,7 @@
       <ol>
         <li data-step="welcome">Welcome</li>
         <li data-step="server">Server</li>
-        <li data-step="token">Token</li>
+        <li data-step="token">Join</li>
         <li data-step="install">Install</li>
         <li data-step="done">Done</li>
       </ol>
@@ -173,12 +173,68 @@
       </footer>
     </section>
 
-    <!-- Step 3: Enrollment token -->
+    <!-- Step 3: Join the organization — pair from the browser (FR-129 A3),
+         or paste a token. The pairing's device code and the token it
+         delivers never reach this page: Rust holds them (src/pairing.rs);
+         the SPA sees the user code, the page to open and the clock. -->
     <section id="step-token" class="step" hidden>
-      <h1>Enrollment token</h1>
-      <p class="lead" id="token-lead">Paste a fresh token from the Roomler admin UI.</p>
+      <h1>Join your organization</h1>
+      <p class="lead" id="token-lead">Approve this device from your browser — nothing to
+      copy. Or paste a token you already have.</p>
 
-      <div class="card">
+      <div id="pair-card" class="card">
+        <!-- Idle: the primary action. -->
+        <div id="pair-idle">
+          <p>Sign in or create your account in the browser, type the code this wizard
+          shows, and approve the device there. The wizard installs only after you confirm
+          the organization it was approved into.</p>
+          <p id="pair-error" class="error" hidden></p>
+          <footer class="actions actions-start">
+            <button id="pair-start">Set up in the browser</button>
+          </footer>
+        </div>
+
+        <!-- Waiting: the code, large; the page; the clock. -->
+        <div id="pair-active" hidden>
+          <p class="muted">Type this code at <code id="pair-uri"></code>:</p>
+          <div class="pair-code" id="pair-code" aria-live="polite">····-····</div>
+          <footer class="actions actions-start">
+            <button id="pair-copy" class="secondary">Copy code</button>
+            <button id="pair-open">Open the page</button>
+          </footer>
+          <p class="muted" id="pair-status">Waiting for approval in the browser…</p>
+          <p class="muted">Approve it in the browser only if this is the device in front
+          of you.</p>
+          <footer class="actions actions-start">
+            <button id="pair-cancel" class="secondary">Cancel pairing</button>
+          </footer>
+        </div>
+
+        <!-- Approved: the hijack guard. The device installs only on this
+             click, after the person has read which org, approved by whom. -->
+        <div id="pair-approved" hidden>
+          <p class="info"><strong id="pair-approved-text"></strong> Install into this org?</p>
+          <footer class="actions">
+            <button id="pair-approved-cancel" class="secondary">Cancel</button>
+            <button id="pair-approved-install">Install →</button>
+          </footer>
+        </div>
+
+        <!-- Denied in the browser, or the code expired. -->
+        <div id="pair-ended" hidden>
+          <p class="warning" id="pair-ended-text"></p>
+          <footer class="actions actions-start">
+            <button id="pair-restart">Start again</button>
+          </footer>
+        </div>
+      </div>
+
+      <!-- The paste: the secondary path (scripted installs, MSP flows, offline
+           mints, FR-104 anchoring tokens), and the only one when the server
+           has no pairing. Live validation unchanged. -->
+      <details id="paste-wrap" class="card">
+        <summary id="paste-summary">I already have a token</summary>
+        <p class="muted" id="paste-lead">Paste a fresh enrollment token from Admin → Agents.</p>
         <label class="field">
           <span>Token</span>
           <textarea id="token-input" rows="4" autocomplete="off" spellcheck="false"
@@ -210,7 +266,7 @@
           Could not parse this as a JWT. Make sure you copied the whole token
           (three dot-separated parts).
         </div>
-      </div>
+      </details>
 
       <footer class="actions">
         <button id="token-back" class="secondary">← Back</button>
