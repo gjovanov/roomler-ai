@@ -5,7 +5,7 @@
 //!
 //! An FFmpeg encoder decides its input form when it opens: a QSV encoder that
 //! takes GPU frames is opened on a frame pool of the capture's own D3D11 device
-//! (`gpu_input::QsvGpuInput`). The device comes from the frame the pump is about
+//! (`gpu_input::GpuInput`). The device comes from the frame the pump is about
 //! to encode ([`device_of`]), and reaches the open through [`opening_on`], a
 //! scope around the open, rather than through the twenty-odd constructors
 //! between the pump's one call and the place that opens the codec.

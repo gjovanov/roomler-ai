@@ -1103,7 +1103,7 @@ sequenceDiagram
   applied rate exceeds the new ceiling, opens lower: at the rung the controller's
   first tick would apply anyway. `rebuild_spec_at_dims` (`rebuild_spec_at` since
   FR-119 P2b-2, which also takes the frame rate) coarsens the rate the same way
-  `set_bitrate` does (`encoder.rs:2290`, `:2442`), so that tick finds
+  `set_bitrate` does (`encoder.rs:2443`, `:2811`), so that tick finds
   the encoder already on its rung and does nothing.
 - **No kill switch, on purpose.** The change moves one transient to the rate the
   next tick applies anyway; it removes an open and adds no state. Its alarm is
