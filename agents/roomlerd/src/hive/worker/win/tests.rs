@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::{AsRawSocket, IntoRawHandle};
 use std::sync::Arc;
 
 use bson::oid::ObjectId;
@@ -11,6 +11,59 @@ use super::super::{
     GiveUp, Msg, Running, Spawn, Theirs, Timing, VERSION, Worker, recv, send, serve,
 };
 use super::*;
+
+/// FR-90 P8-2b-3 — a listener's protocol info round-trips: duplicated
+/// targeting this process's own pid (always valid, and the shape a real
+/// worker's hand-over takes — a different pid, same call), turned back into
+/// a real listener, which accepts a real connection at the same address. The
+/// source listener is untouched: duplicating it again (as `rehand` would for
+/// a second worker) still works, and the source itself is still usable after.
+#[tokio::test]
+async fn a_listeners_protocol_info_round_trips_to_a_real_listener() {
+    let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = source.local_addr().unwrap();
+    let pid = std::process::id();
+
+    let bytes = duplicate_for(pid, source.as_raw_socket() as _).expect("duplicate_for");
+    assert_eq!(bytes.len(), PROTOCOL_INFO_LEN);
+    let reconstructed = socket_from_info(&bytes).expect("socket_from_info");
+    assert_eq!(reconstructed.local_addr().unwrap(), addr);
+    reconstructed.set_nonblocking(true).unwrap();
+    let first = tokio::net::TcpListener::from_std(reconstructed).unwrap();
+    let dial = tokio::spawn(tokio::net::TcpStream::connect(addr));
+    let (_, peer) = tokio::time::timeout(Duration::from_secs(5), first.accept())
+        .await
+        .expect("accepted on the reconstructed listener")
+        .unwrap();
+    assert!(peer.ip().is_loopback());
+    dial.await.unwrap().unwrap();
+
+    // rehand: the source survives, and duplicates again cleanly.
+    let bytes2 = duplicate_for(pid, source.as_raw_socket() as _).expect("duplicate_for again");
+    let reconstructed2 = socket_from_info(&bytes2).unwrap();
+    reconstructed2.set_nonblocking(true).unwrap();
+    let second = tokio::net::TcpListener::from_std(reconstructed2).unwrap();
+    let dial2 = tokio::spawn(tokio::net::TcpStream::connect(addr));
+    let (_, peer2) = tokio::time::timeout(Duration::from_secs(5), second.accept())
+        .await
+        .expect("accepted on the SECOND reconstructed listener")
+        .unwrap();
+    assert!(peer2.ip().is_loopback());
+    dial2.await.unwrap().unwrap();
+
+    // The source itself is still usable, exactly as rehand needs.
+    source.set_nonblocking(true).unwrap();
+}
+
+/// Protocol info of the wrong length is refused outright, never read as one.
+#[test]
+fn protocol_info_of_the_wrong_length_is_refused() {
+    let err = socket_from_info(&[0u8; 4]).unwrap_err();
+    assert!(
+        err.to_string().contains("4 bytes"),
+        "names the length it got: {err}"
+    );
+}
 
 /// FR-90 P8-2b-2 — the guard arms `SEM_NOGPFAULTERRORBOX`, so a crash writes
 /// no dump, event or upload of the worker's memory; and it keeps the other
@@ -245,5 +298,99 @@ async fn the_real_worker_answers_over_its_pipe() {
     .await
     .unwrap();
     assert_eq!(waited, WAIT_OBJECT_0, "it ended at bye");
+    worker.kill().await;
+}
+
+/// FR-90 P8-2b-3 — the real worker serves a real credential endpoint handed
+/// to it: a listener this test binds crosses as `Call::Serve`'s `info`
+/// (`duplicate_for`, targeting the worker's reported pid), the worker
+/// answers `Done`, and a connection from this process (the account `at`
+/// names) is accepted on the SAME address. That only holds if the worker's
+/// own reconstructed listener, not this test's, is the one serving it: this
+/// test's copy is dropped the moment its protocol info is taken, so nothing
+/// is left listening here if the worker's `socket_from_info` had failed.
+#[tokio::test]
+#[ignore = "needs a built roomlerd.exe with hive,vault, named in ROOMLERD_WORKER_EXE"]
+async fn the_real_worker_serves_a_credential_endpoint_handed_to_it() {
+    use crate::hive::vault_connect::handed::{Answer, At, Call, Spec};
+
+    let exe = std::env::var_os("ROOMLERD_WORKER_EXE").expect("ROOMLERD_WORKER_EXE");
+    let (server, pipe) = channel().unwrap();
+    let args = [super::super::WORKER_SUBCOMMAND.to_string()];
+    let mut worker = spawn(Path::new(&exe), None, &args, pipe).unwrap();
+    let connected = server.connect().await;
+    let (mut rd, mut wr) = tokio::io::split(server);
+    let hello = Msg::Hello {
+        session: ObjectId::new().to_hex(),
+        fence: 11,
+    };
+    let ready = match connected {
+        Ok(()) if send(&mut wr, &hello).await.is_ok() => tokio::time::timeout(WAIT, recv(&mut rd))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten(),
+        _ => None,
+    };
+    let Some(Msg::Ready { pid, .. }) = ready else {
+        panic!("the worker was not ready: {ready:?}");
+    };
+
+    // A real loopback listener, standing in for a vault endpoint's: admit
+    // this process's own account, as a real session would admit its own.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let my_sid = crate::hive_win::process_sid(std::process::id()).expect("this process's own SID");
+    let info = duplicate_for(pid, listener.as_raw_socket() as _).expect("duplicate_for");
+    drop(listener);
+
+    let spec = Spec {
+        engine: "http".into(),
+        host: "localhost".into(),
+        port: 0,
+        auth_source: None,
+        auth: None,
+        front: String::new(),
+        secret: "t/s".into(),
+        user: None,
+        ca: None,
+        at: At::Loopback { peer: my_sid },
+        through: None,
+    };
+    send(
+        &mut wr,
+        &Msg::Call {
+            id: 1,
+            call: Call::Serve {
+                endpoint: 1,
+                spec: Box::new(spec),
+                info: info.to_vec(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let answer = loop {
+        match tokio::time::timeout(WAIT, recv(&mut rd))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Some(Msg::Log { .. }) => continue,
+            Some(Msg::Answer { id: 1, answer }) => break answer,
+            other => panic!("unexpected while waiting for the Serve answer: {other:?}"),
+        }
+    };
+    assert_eq!(answer, Answer::Done, "the worker served the endpoint");
+
+    // The listener is alive in the worker, not here: this process's own
+    // connection is accepted on the handed-over address.
+    let connect = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(addr)).await;
+    assert!(
+        connect.is_ok() && connect.unwrap().is_ok(),
+        "accepted on the listener the worker reconstructed"
+    );
+
+    send(&mut wr, &Msg::Bye).await.unwrap();
     worker.kill().await;
 }
