@@ -124,7 +124,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
 | 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
-| 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources | #3024, #3030 |
+| 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources. Field-verified on 0.4.181: no companion recompiled on the tag run or the reseed after it, and the diagnostic came out again (PR_NUMBER) | #3024, #3030, PR_NUMBER |
 
 ## Acceptance criteria
 
@@ -1005,3 +1005,26 @@ itself on the affected run's page. Baseline when the program started: releases t
     - no `Compiling roomler-desktop` in any companion job (strip colours first);
     - no `fingerprint dirty` line in their logs.
     Then the `CARGO_LOG` lines come out of the four steps.
+- 2026-10-28, morning: **wave 31 field-verified on agent-v0.4.181**, cut by stardesk-teardown-roomler.
+  The rehearsal (run 40627954705) and the tag run (40630476314) built the same tree, `c6406facc817`.
+  - The rehearsal is the positive control, and it passed. Each of the four companion jobs compiled
+    `roomler-desktop` once, and `CARGO_LOG` printed 12 fingerprint lines there. On the first build of
+    a new version these read `fingerprint error … failed to read …/bin-roomler-desktop`, not
+    `fingerprint dirty`, because there is no previous fingerprint to compare.
+  - **The tag run is clean.** In all four companion jobs there is no `Compiling roomler-desktop` and
+    no fingerprint line, the only `CARGO_LOG` trace being the env line. Against 0.4.180:
+    - the macOS companion job took 52 s, against 184 s;
+    - the Windows companion took 111 s, against 223 s;
+    - the `.pkg` took 130 s, against 247 s, because it no longer waits for the companion.
+    The four daemon jobs reused as before and reported `roomlerd 0.4.181`.
+  - **The reseed after it is clean too.** Run 40631116972 on master, the same tree: all four
+    companion jobs reused, with no compile and no fingerprint line. On 0.4.180 this run had recompiled
+    the macOS companion (142 s).
+    - Two of its daemon jobs compiled cold anyway. Their seeds had passed the 3,000 MB cap (Linux
+      x86_64 at 3,306 MB: 580 crates, 12 min 47 s) and were dropped whole, as designed. A reseed
+      absorbs that cost, so no release pays it.
+  - **Tag to publish took 6 min 28 s** (04:06:56 → 04:13:24Z). The critical path is now the MSI: its
+    job waited 70 s for a Windows runner, then took 274 s. The companion fix shortens the `.pkg`'s
+    path, not this one.
+  - The diagnostic came out of the four steps again (PR_NUMBER). To read a future recompile, put
+    `CARGO_LOG=cargo::core::compiler::fingerprint=info` back on the step, or run `cargo build -v`.

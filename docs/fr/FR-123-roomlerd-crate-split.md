@@ -598,6 +598,9 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
   *Read 1 of 3, 0.4.180's rehearsal (§8.1): MSI build step 542 s (−22.9 % against 0.4.173's 703 s),
   `.pkg` 987 s (+19.5 % against 826 s). Neither reaches 30 %: P2 alone projected about −14 % / −27 %
   of these steps, and the `.pkg` ran on a slow runner.*
+  *Read 2 of 3, 0.4.181's rehearsal (§8): MSI 814 s (+15.8 %), `.pkg` 884 s (+7.0 %). The MSI moved
+  272 s between two consecutive releases with no phase in between, so a single reading cannot
+  carry this criterion. Decision 8 asks how AC1 should be read.*
 - [ ] **AC2 — the binary is no larger.** `roomlerd.exe`, the macOS `roomlerd`, the `.deb`'s
   `roomlerd` and both MSIs are within +1 % of the release before each phase, and smaller is fine (the
   MSI size step's `::notice::` lines; the `.deb`/`.pkg` asset sizes on the release). *Reworded
@@ -670,6 +673,17 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
    of both crates and move or de-generify what both instantiate); or an LTO re-measurement on
    today's tree (FR-6 P3e's +5 % thin-LTO finding is from the rc.363 tree, seven months and ×3.6
    lines ago).
+8. **How AC1 is read** (the operator, posed 2026-10-28). AC1 compares single release build steps
+   against 0.4.173's rehearsal, but one reading swings with the runner far more than a phase moves
+   it. The same work took 466–1,117 s on macOS across 33 builds (§8.1). Two consecutive rehearsals
+   put the MSI build step at 542 s (0.4.180) and 814 s (0.4.181): −22.9 % and then +15.8 % against
+   the baseline. The tree also grows from release to release. Options:
+   - (a) keep AC1 as written and read the median of the three;
+   - (b) judge each phase by its same-runner A/B (the probe, §2.4), keeping the release reading as a
+     sanity check with a normalised metric: codegen + bin per second of the run's own front end
+     (§8.1);
+   - (c) both.
+   Recommended: (b). It is the only reading that can tell a phase's share from runner noise.
 
 ## 7. Out of scope
 
@@ -697,6 +711,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-27 20:03Z | **0.4.180's rehearsal (run 40574588069, `9aab8f703`), the first release with P2**, against 0.4.179's (40527141713); each daemon lane's compile split at the markers cargo prints (§8.1) | the bin's 132–303 s are gone on all four lanes (0–5 s left). On the Linux lanes, whose runners were equally fast both days, the lib absorbed 40–62 % of that time and the daemon's compile fell **−19 % (aarch64) and −12 % (x86_64)**. Windows (−44 %) and macOS (+10 %) are one noisy sample each; per second of its own front end, the macOS compile fell −13 %. Build steps: MSI 947 → 542 s, `.pkg` 892 → 987, `.deb` 454 → 403 and 569 → 464. Every artifact smaller (AC2) |
 | 2026-10-27 20:25Z | 0.4.180's tag run (40577974956), the same SHA | all 8 build jobs reused the rehearsal's compile, and the four daemon builds answered `roomlerd 0.4.180` to `--version`; published 20:31:19Z, 5 min 28 s after the run was created (FR-6's log) |
 | 2026-10-28 01:35Z | 0.4.180's post-roll check (AC3, P2's half): the server's agent listing, exec, one remote-desktop session, an overlay ping, a tunnel request | 20 of 20 online agents in four orgs on 0.4.180; exec reads 0.4.180 on two Linux servers and two Windows corporate laptops; the session ran H.265 4:2:0 hardware (VAAPI), direct, 15 fps, ~17 ms, and was closed; overlay 3/3 at 31 ms; two SOCKS5 listeners returned 200 in 0.31–0.33 s |
+| 2026-10-28 04:06Z | AC1 read 2: 0.4.181's rehearsal (run 40627954705, `3d96ea216`), the second release with P2 | build steps: MSI 814 s, `.pkg` 884, `.deb` x86_64 490 and aarch64 500. Lib · bin · total: aarch64 463 · 4 · 467 s (front end 52 s), x86_64 447 · 1 · 448 (61), `.pkg` 797 · 4 · 801 (113), MSI 701 · 3 · 704. Against 0.4.180's rehearsal the Linux front ends ran 10–33 % slower and the macOS one 13 % slower; per second of front end the `.pkg` went 8.18 → 6.08. Runner noise swamps a single reading on every lane: decision 8 |
 
 ### 8.1 Reading the release side (0.4.180)
 
