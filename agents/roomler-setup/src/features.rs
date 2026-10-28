@@ -7,9 +7,12 @@
 //! {"pairing": true, "wizard_unix_daemon": false}
 //! ```
 //!
-//! ⚠️ Anything but a JSON `true` reads as **false**: an older server's 404, a
-//! 503 with the fleet module unmounted, a proxy's HTML error page, a timeout,
-//! a string `"true"`. Absent means "what the wizard could do before this
+//! ⚠️ Anything but a JSON `true` reads as **false**: an older server's 400 or
+//! 404, a 503 with the fleet module unmounted, a proxy's HTML error page, a
+//! timeout, a string `"true"`. (The 400 is measured: a server older than B1-s
+//! routes `/api/setup/features` to its `/api/setup/{platform}` download and
+//! answers `{"error": "bad_request", "message": "unknown platform …"}`.)
+//! Absent means "what the wizard could do before this
 //! route existed" — the daemon on Windows only — and that is the safe
 //! direction: a daemon card the server does not vouch for is the failure the
 //! switch exists to prevent. The answer is never cached across runs, and it is
@@ -65,9 +68,16 @@ pub fn parse(status: u16, body: &[u8]) -> SetupFeatures {
     }
 }
 
+/// An answer that only says the server predates the route, which is no
+/// failure: a 404, or the 400 an older server's `/api/setup/{platform}`
+/// answers for the unknown platform "features".
+pub fn older_server(status: u16) -> bool {
+    matches!(status, 400 | 404)
+}
+
 /// Ask `server`. Never fails: a server that cannot be reached, answers
-/// something else, or takes too long reads as both switches off. A 404 is
-/// quiet (every older server answers it); any other failure is a warning
+/// something else, or takes too long reads as both switches off. An older
+/// server's answer is quiet ([`older_server`]); any other failure is a warning
 /// line, so "why is there no daemon card" has an answer in the log.
 pub async fn fetch(server: &str) -> SetupFeatures {
     let url = features_url(server);
@@ -87,8 +97,8 @@ pub async fn fetch(server: &str) -> SetupFeatures {
             let status = resp.status().as_u16();
             let body = resp.bytes().await.unwrap_or_default();
             let features = parse(status, &body);
-            if status == 404 {
-                tracing::debug!(%url, "setup features: 404 — an older server; every switch off");
+            if older_server(status) {
+                tracing::debug!(%url, status, "setup features: an older server; every switch off");
             } else if !(200..300).contains(&status) {
                 tracing::warn!(%url, status, "setup features: not answered; every switch read as off");
             } else {
@@ -176,6 +186,24 @@ mod tests {
             parse(302, br#"{"pairing": true, "wizard_unix_daemon": true}"#),
             SetupFeatures::default()
         );
+    }
+
+    /// Production before B1-s, measured 2026-10-28: its `/api/setup/{platform}`
+    /// takes "features" for a platform and answers 400 with an error object.
+    /// That is an older server, read as both switches off and said nowhere
+    /// but the debug log; a 5xx stays a warning.
+    #[test]
+    fn an_older_servers_400_is_off_and_quiet() {
+        let body = br#"{"error":"bad_request","message":"unknown platform \"features\"; expected one of linux-x86_64 / linux-aarch64 / macos / windows-x86_64"}"#;
+        assert_eq!(parse(400, body), SetupFeatures::default());
+        assert!(older_server(400), "the pre-B1-s server's answer");
+        assert!(older_server(404), "a server without the route at all");
+        for status in [200, 302, 500, 502, 503] {
+            assert!(
+                !older_server(status),
+                "{status} is not an older server's answer"
+            );
+        }
     }
 
     /// The route is read under the server's origin as the enroll would reach
