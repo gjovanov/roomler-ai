@@ -76,6 +76,20 @@ impl Role {
         }
     }
 
+    /// FR-129 — which pairing this role asks the browser for, and so which
+    /// token kind the approval mints: the tunnel client pairs for a
+    /// `TunnelEnrollment` token, every other role for an agent `Enrollment`
+    /// token. A role is either the tunnel client or a daemon flavour — the
+    /// vocabulary at the top of this file — so the Linux and macOS daemon
+    /// roles B1 adds land in the second arm with no change here.
+    pub fn pair_role(&self) -> roomlerd::pairing::PairRole {
+        use roomlerd::pairing::PairRole;
+        match self {
+            Role::TunnelClient => PairRole::Tunnel,
+            _ => PairRole::Daemon,
+        }
+    }
+
     /// Parse the kebab-case string persisted in `WizardState.role`
     /// back into a typed `Role`. Unknown / stale values return `None`
     /// so the SPA re-prompts the picker on resume instead of failing.
@@ -151,6 +165,17 @@ mod tests {
             Role::DaemonMachine.install_scope().map(|s| s.wire()),
             Some("attended")
         );
+    }
+
+    /// FR-129 — the tunnel client pairs as `tunnel`; every daemon flavour as
+    /// `daemon`. Listed per variant so a new role is seen here when it lands.
+    #[test]
+    fn pair_role_mapping() {
+        use roomlerd::pairing::PairRole;
+        assert_eq!(Role::TunnelClient.pair_role(), PairRole::Tunnel);
+        assert_eq!(Role::DaemonSystem.pair_role(), PairRole::Daemon);
+        assert_eq!(Role::DaemonUser.pair_role(), PairRole::Daemon);
+        assert_eq!(Role::DaemonMachine.pair_role(), PairRole::Daemon);
     }
 
     #[test]

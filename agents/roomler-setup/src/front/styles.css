@@ -349,7 +349,8 @@ button.secondary:hover:not(:disabled) {
   to { opacity: 1; transform: translate(-50%, 0); }
 }
 
-/* S2: advanced-options collapsible on the Server step */
+/* S2: advanced-options collapsible on the Server step (and FR-129's
+   "I already have a token" on the Join step) */
 details.card > summary {
   cursor: pointer;
   font-weight: 600;
@@ -357,6 +358,27 @@ details.card > summary {
   user-select: none;
 }
 details.card[open] > summary { margin-bottom: 12px; }
+
+/* FR-129 A3: the pairing code — large enough to read across a desk and to
+   type into the browser from. The buttons under it sit left, beside the
+   code they act on, unlike the step's own Back/Install footer. */
+.pair-code {
+  font-family: "Cascadia Mono", "Consolas", "SF Mono", Menlo, monospace;
+  font-size: 2.4rem;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-align: center;
+  padding: 14px 12px;
+  margin: 8px 0 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg-strong);
+  user-select: all;
+}
+.actions.actions-start { justify-content: flex-start; }
+#pair-card .info,
+#pair-card .warning { margin-top: 0; }
 .field.checkline {
   display: flex;
   flex-direction: row;
