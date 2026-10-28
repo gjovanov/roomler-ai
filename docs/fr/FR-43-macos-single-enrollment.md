@@ -392,8 +392,16 @@ The proposal on the issue was different, and both changes were deliberate:
   Matching the exact command line also finds those workers, and it carries no
   stale-pid risk.
 
-Operator-facing detail, the mixed-version matrix and the remedy for a stuck
-Mac: `docs/installation.md`, "The GUI worker never outlives its daemon".
+**Field-verified on 0.4.181 (2026-10-28, the operator's MacBook).** After a
+`kill -9` of the daemon, the worker left 5.7 ms later through a clean stop, and the
+next daemon's worker attached 472 ms after the kill. A stand-in for an older worker
+had its argv set to exactly `<exe> run --supervised`, and the next daemon's reap
+stopped it 107 ms before spawning. A `SIGSTOP`ped worker cannot stand in for an old
+one: the kernel's SIGHUP to an orphaned, stopped process group ends it first.
+
+Operator-facing detail, the mixed-version matrix, the field runs and the remedy
+for a stuck Mac: `docs/installation.md`, "The GUI worker never outlives its
+daemon".
 
 ### Components
 

@@ -631,6 +631,24 @@ roomlerd holds this person's single-instance lock`. The holder is then not a
 supervised worker: `pgrep -lU <uid> roomlerd` names it. Stop it, then run
 `sudo launchctl kickstart -k system/com.roomler.daemon`.
 
+**Field-verified on 0.4.181** (the operator's MacBook, 2026-10-28, both halves on
+0.4.181). Before the fix, the same Mac lost its worker on 2026-10-26, as
+described above.
+
+| Test | Result |
+|---|---|
+| `kill -9` of the root daemon | The worker logged `delegation: our daemon is gone` 5.7 ms after the kill and recorded a clean stop 9 ms later. launchd started a new daemon at once, and its worker attached **472 ms** after the kill. Nothing was left with ppid 1, and the reap found nothing to stop |
+| A worker the lifeline cannot reach. The stand-in was a process run as the person, with its argv set to exactly `<exe> run --supervised`, followed by `launchctl kickstart -k system/com.roomler.daemon` | The new daemon logged `stopping a GUI worker a previous daemon left behind … pid=<stand-in>`, and spawned its own worker 107 ms later |
+
+⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
+daemon dies, the worker's process group becomes orphaned with a stopped member,
+so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3153`), so
+the worker is gone before the next daemon's reap looks. That exit is abrupt, and
+the next worker counts it as a crash (`crash_count=1`). This is harmless while
+`last_known_good_version` is the running release: `should_rollback` never rolls
+back to the version that is running (`crates/agent-core/src/config.rs:2659`).
+
 ### Paths, logs, limits
 
 | | Path |
