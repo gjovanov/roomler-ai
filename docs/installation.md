@@ -28,7 +28,10 @@ flowchart TB
 
 Everything needs an **enrollment token** — minted in the admin UI
 (**Admin → Agents → Enroll** for daemons, **Tunnel clients → Enroll** for CLIs),
-valid 10 minutes, single-use.
+valid 10 minutes, single-use — or, for a daemon, a **pairing** (FR-129): the
+wizard's "Set up in the browser", and `--pair` on the terminal installers
+([below](#pairing-from-a-terminal)), mint that same token into the installing
+process after you approve a code at `/pair`, so nothing is copied or pasted.
 
 ## Enrollment — what every path does
 
@@ -54,12 +57,12 @@ wizard's and `install.ps1`'s) and the tunnel CLI's installers do
 which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
-- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:325`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:381`);
 - every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
-(`scripts/install.ps1:147`).
+(`scripts/install.ps1:164`).
 
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
@@ -88,6 +91,62 @@ the **environment**, never the flag: a script installs whatever release is
 current, and a daemon from before the flag existed would refuse an argument it
 does not know. A `re-enroll` sends nothing and leaves the row's recorded install
 alone.
+
+### Pairing from a terminal
+
+`roomlerd enroll --pair` (FR-129 A4; `install.sh --pair` and `install.ps1 -Pair`
+run it for you once the package is placed) is the token step without the token:
+
+```text
+To pair this device, open   https://roomler.ai/pair
+and type the code           BCDF-GHJK
+
+(The code expires in 15 minutes. Waiting for the approval…)
+
+Approved in the browser.
+  Organization: Acme Corp  (slug: acme)
+  Approved by:  Dana Smith  (username: dana)
+Join «Acme Corp» (acme) as approved by «Dana Smith» (@dana)? [y/N] y
+Enrollment successful. Agent id: …
+```
+
+- The page's address never carries the code: you type it there, signed in (or
+  after creating an account and an org on that page). The daemon polls, and on
+  the approval enrolls **in the same process** through exactly the `--token`
+  path — the delivered token never touches a command line, a log line, or any
+  file but the enrolled config.
+- **Check the two unique handles before you answer.** Anybody can give an org or
+  an account any display name; the org's slug and the approver's username are
+  unique — but only byte for byte. An approval into an org you don't recognise
+  ends at this question: `n` (or nothing)
+  enrolls nothing, the pairing stays delivered on the server, and its token
+  expires unused in 10 minutes. Everything the server sent is shown with its
+  control and invisible characters escaped (`\u{1b}`), and a slug the admin UI
+  could not have made (`ACME`, `acme `, a Cyrillic `а`) or a username with
+  spaces or non-ASCII letters carries a `WARNING:` line — that is what an
+  org dressed up as yours looks like.
+- The question is asked on the **terminal** (`/dev/tty`; the console on
+  Windows), never on stdin — under `curl … | sh` stdin is the script itself.
+  With no terminal at all (a scheduler, `ssh host 'curl … | sh -s -- --pair'`
+  without `-t`) the only way to enroll is **`--pair-org <slug>`**: the device
+  enrolls only if the approval names exactly that org — **byte for byte**, so
+  `ACME` is not `acme`. On a terminal the flag replaces the question; a
+  mismatch refuses either way. On Windows the question goes to the console
+  `roomlerd.exe` is attached to, so where nobody can see that console (a
+  scheduled task, a tool that hosts programs on a hidden console) pass
+  `--pair-org` too.
+- A poll that fails (a network blip, a server restarting) is retried at a
+  longer interval until the code expires; nothing needs restarting.
+- `--pair` and `--token` refuse each other; `--pair` refuses `--ephemeral` (a
+  pairing mints a standard token, never an ephemeral key). An older server, or
+  one with `[pairing] enabled = false`, answers "this server does not support
+  pairing; use --token", and the command exits 1.
+- The served scripts: `install.sh --role daemon --pair [--pair-org SLUG]`
+  (per-user, `--system`, and on macOS the per-user half) and
+  `install.ps1 -Role … -Pair [-PairOrg SLUG]`. The tunnel role still takes
+  `--token` (the `roomler` CLI has no `--pair` yet). The macOS root half is a
+  second enrollment, paired afterwards as root — the install prints the two
+  commands (the macOS section below); one approval for both halves is FR-129 B2.
 
 ### "The host must be re-enrolled" — when to believe it
 
@@ -181,7 +240,12 @@ Details worth knowing:
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
 - Terminal alternative: `irm https://roomler.ai/api/setup/install.ps1 | iex`
-  (prompts for role/token; flags mirror the sh script).
+  runs the script with its defaults (`-Role daemon-system` from an elevated
+  shell, nothing enrolled — it asks for nothing). To pass parameters, which
+  mirror the sh script's, download it first or use
+  `& ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-system -Pair`:
+  `-Pair [-PairOrg <slug>]` pairs in the browser instead of taking `-Token`
+  ([above](#pairing-from-a-terminal)).
 - Binaries are Authenticode-signed; the MSI's payload EXEs are signed before
   packaging.
 - On a perMachine install the SCM host writes the Defender rule
@@ -198,6 +262,10 @@ Details worth knowing:
 ```bash
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <enrollment-jwt> [--server https://roomler.ai] [--name lab-1]
+
+# or pair in the browser instead of pasting a token (FR-129 A4):
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --pair [--pair-org <org-slug>] [--server https://roomler.ai] [--name lab-1]
 ```
 
 - Installs the `.deb` (x86_64 **and** arm64) or tarball, verifies SHA-256,
@@ -457,6 +525,14 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --daemon-token <second-token> \
   --server https://roomler.ai --name "$(hostname)"
+
+# Or pair in the browser instead of pasting a token (FR-129 A4): the per-user half …
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --pair --server https://roomler.ai --name "$(hostname)"
+# … then, for the overlay, pair the root half as root (its own approval):
+sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml \
+  enroll --pair --server https://roomler.ai --name "$(hostname)-daemon" --overlay
+sudo roomlerd service install --as-service
 ```
 
 `--daemon-token` also turns the overlay on (`enroll --overlay`) — installing a
@@ -803,8 +879,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:902` (the section) — `uninstall_linux` at `:1328`,
-`uninstall_macos` at `:1377`.
+`scripts/install.sh:1019` (the section) — `uninstall_linux` at `:1445`,
+`uninstall_macos` at `:1494`.
 
 ```mermaid
 flowchart TD
@@ -828,7 +904,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2019`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2048`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

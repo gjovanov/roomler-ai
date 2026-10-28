@@ -413,9 +413,10 @@ pub fn host_arch() -> String {
     std::env::consts::ARCH.to_string()
 }
 
+/// The loopback HTTP server this crate's pairing tests speak to — shared
+/// with `pairing_terminal`'s (FR-129 A4).
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_http {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
@@ -423,16 +424,16 @@ mod tests {
 
     /// One request the loopback server saw: its path and its body.
     #[derive(Clone, Debug)]
-    struct Seen {
-        path: String,
-        body: String,
+    pub(crate) struct Seen {
+        pub(crate) path: String,
+        pub(crate) body: String,
     }
 
     /// A loopback HTTP server that reads each whole request, records its
     /// path and body, and answers the next scripted `(status line, body)` —
     /// the last one again once the script is used up. Returns its base URL
     /// and the record.
-    async fn scripted_server(
+    pub(crate) async fn scripted_server(
         script: Vec<(&'static str, &'static str)>,
     ) -> (String, Arc<Mutex<Vec<Seen>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -509,6 +510,12 @@ mod tests {
         });
         (base, seen)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_http::scripted_server;
+    use super::*;
 
     fn request() -> StartRequest {
         StartRequest {

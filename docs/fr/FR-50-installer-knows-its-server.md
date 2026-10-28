@@ -19,13 +19,13 @@ script substitutes the default before the bytes leave the process.
 
 ## Root cause, with anchors
 
-`scripts/install.sh:46`
+`scripts/install.sh:63`
 
 ```sh
 SERVER="https://roomler.ai"
 ```
 
-`scripts/install.ps1:64`
+`scripts/install.ps1:78`
 
 ```powershell
 [string]$Server = 'https://roomler.ai',
