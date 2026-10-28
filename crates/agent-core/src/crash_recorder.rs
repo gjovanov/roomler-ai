@@ -115,6 +115,39 @@ pub fn record(reason: CrashReason, summary: &str, ctx: WriterContext) {
     record_with_log_tail(reason, summary, ctx, None);
 }
 
+/// #3018 — [`record`], with `appendix` written after the rolling log's tail.
+///
+/// [`fit_to_envelope`] trims the tail from its OLDEST line, so whatever comes
+/// last survives longest: a stall's thread stacks stay whole while the log
+/// lines from before the stall make room. The appendix goes through the same
+/// credential scrub as the tail. An empty appendix is plain [`record`].
+pub fn record_with_appendix(
+    reason: CrashReason,
+    summary: &str,
+    ctx: WriterContext,
+    appendix: &str,
+) {
+    if appendix.is_empty() {
+        return record(reason, summary, ctx);
+    }
+    let tail = read_log_tail(LOG_TAIL_LINES);
+    record_with_log_tail(
+        reason,
+        summary,
+        ctx,
+        Some(tail_then_appendix(&tail, appendix)),
+    );
+}
+
+/// #3018 — the tail, then the appendix, on lines of their own.
+fn tail_then_appendix(tail: &str, appendix: &str) -> String {
+    match (tail.is_empty(), appendix.is_empty()) {
+        (_, true) => tail.to_string(),
+        (true, false) => appendix.to_string(),
+        (false, false) => format!("{tail}\n{appendix}"),
+    }
+}
+
 /// Same as [`record`] but accepts a caller-supplied `log_tail`
 /// (typically the child worker's captured stderr) that OVERRIDES
 /// the local rolling-log read. Used by the SCM supervisor on
@@ -1226,6 +1259,46 @@ mod tests {
         // None and a record call to log spam would race other tests).
         let _ = record_with_log_tail as fn(CrashReason, &str, WriterContext, Option<String>);
         let _ = record as fn(CrashReason, &str, WriterContext);
+        let _ = record_with_appendix as fn(CrashReason, &str, WriterContext, &str);
+    }
+
+    // ─── #3018: an appendix after the tail ──────────────────────────────────
+
+    /// #3018 — the appendix comes after the tail, and an empty side adds no
+    /// blank line.
+    #[test]
+    fn the_appendix_follows_the_tail() {
+        assert_eq!(tail_then_appendix("a\nb", "S"), "a\nb\nS");
+        assert_eq!(tail_then_appendix("", "S"), "S");
+        assert_eq!(tail_then_appendix("a", ""), "a");
+    }
+
+    /// #3018 — when the envelope cannot hold both, the oldest log lines go
+    /// first, and the appendix (a stall's thread stacks) survives whole.
+    #[test]
+    fn the_envelope_trims_the_tail_before_the_appendix() {
+        let tail: String = (0..4000).map(|i| format!("old log line {i}\n")).collect();
+        let appendix = "--- threads ---\n[4] tokio-rt-worker\n  __psynch_mutexwait";
+        let mut p = sample_payload();
+        p.log_tail = tail_then_appendix(tail.trim_end(), appendix);
+        assert!(
+            estimate_json_size(&p) > MAX_PAYLOAD_BYTES,
+            "the test needs a trim"
+        );
+        fit_to_envelope(&mut p, MAX_PAYLOAD_BYTES);
+        assert!(estimate_json_size(&p) <= MAX_PAYLOAD_BYTES);
+        assert!(
+            p.log_tail.trim_end().ends_with(appendix),
+            "the appendix survives whole"
+        );
+        assert!(
+            !p.log_tail.contains("old log line 0\n"),
+            "the oldest lines went first"
+        );
+        assert!(
+            p.log_tail.contains("old log line 3999\n"),
+            "the newest log lines stay"
+        );
     }
 
     // ─── #2955: torn sidecars ────────────────────────────────────────────────
