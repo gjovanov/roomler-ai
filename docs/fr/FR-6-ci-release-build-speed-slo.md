@@ -1028,3 +1028,26 @@ itself on the affected run's page. Baseline when the program started: releases t
     path, not this one.
   - The diagnostic came out of the four steps again (#3037). To read a future recompile, put
     `CARGO_LOG=cargo::core::compiler::fingerprint=info` back on the step, or run `cargo build -v`.
+- 2026-10-28, afternoon: **agent-v0.4.182, cut by stardesk-teardown-roomler.** Wave 31 held on its
+  second release. Rehearsal 40723384188, tag run 40730055980 and the bump's squash `8e55985c0`
+  all had tree `8048f68fca0c`.
+  - The rehearsal compiled `roomler-desktop` once in each companion job: the positive control.
+  - **The tag run is clean.** All 8 jobs carry the reuse notice. The four daemon jobs compiled
+    nothing and reported `roomlerd 0.4.182`. The four companion jobs compiled nothing either.
+  - **Tag to publish took 13 min 09 s**, all of it runner queueing, none of it builds. The run was
+    created at 16:51:21Z and validated by 16:51:52Z. The Linux jobs started at 16:51:54–16:52:53Z,
+    the Windows companion at 16:53:37Z, the MSI at 16:53:58Z, the macOS companion at 16:58:44Z, and
+    the `.pkg` only at 17:00:01Z, 8 min after validation. The release published at 17:04:30Z.
+    Each build job itself took 99–339 s.
+  - The reseed after it (40732757710, the same tree): every companion job reused with no compile,
+    and the three daemon jobs that reused (the `.pkg` and both `.deb`) reported `roomlerd 0.4.182`.
+    Its MSI compiled cold: the seed held 3,024 MB, over the 3,000 MB cap, and was dropped whole
+    (586 crates, 20 min 47 s).
+  - That is the third post-release reseed in a row to drop the Windows seed, after 0.4.180 (3,042 MB)
+    and 0.4.181 (3,022 MB). Each cycle (reseed, rehearsal, tag, reseed) grows it past the cap again, so the cap
+    now costs one cold Windows build per release. It lands on the reseed, never on the tag run. The
+    next lever: prune units older than the last few generations instead of dropping the whole target.
+    Not started.
+  - Two seeds are at the cap's edge: the `.pkg` at 2,995 MB and the `.deb` aarch64 at 2,902 MB, so
+    the next rehearsal or reseed will likely drop them and compile those jobs cold once. A tag run
+    skips that check ("tag run — skipping accretion GC"), so no release pays it.
