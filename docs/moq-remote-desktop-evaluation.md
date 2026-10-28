@@ -11,7 +11,7 @@ This doc is the answer ("research + evaluate MoQ + weigh pros/cons + decide if i
 ### How remote desktop works today (verified)
 - **P2P WebRTC** (webrtc-rs): the controlled-host **agent is the answerer**, the **browser controller is the offerer**; media flows agent↔browser directly, **TURN-relayed only when NAT requires** — and TURN relays *opaque DTLS*, so **the server never sees pixels**. (`agents/roomlerd/src/peer.rs`; `crates/remote_control/src/turn_creds.rs`.)
 - Three video sub-paths: WebRTC **video track** (RTP/SRTP, H.264/HEVC/AV1, `peer.rs:852-1689`); **HEVC-over-DataChannel** and **VP9-444-over-DataChannel** (`peer.rs:895-994`) — both send raw frames over the `"video-bytes"` SCTP DataChannel with a **13-byte length header** (`frame_video_bytes`, `peer.rs:1713`), 16 KiB chunks, AIMD on `dc.buffered_amount`, keyframe-on-open gating.
-- The two DC paths **decode in the browser via WebCodecs onto a canvas** (`ui/src/workers/rc-vp9-444-worker.ts`, `rc-hevc-worker.ts`) — already bypassing `<video>`'s jitter buffer (present-ASAP). Input is JSON over an `"input"` DataChannel (`peer.rs:2921-3007`, enigo). Transport is chosen via `AgentCaps.transports` + `ClientMsg::SessionRequest{preferred_transport}` (`encode/caps.rs:142-274`, `signaling.rs:250`).
+- The two DC paths **decode in the browser via WebCodecs onto a canvas** (`ui/src/workers/rc-vp9-444-worker.ts`, `rc-hevc-worker.ts`) — already bypassing `<video>`'s jitter buffer (present-ASAP). Input is JSON over an `"input"` DataChannel (`peer.rs:2921-3007`, enigo). Transport is chosen via `AgentCaps.transports` + `ClientMsg::SessionRequest{preferred_transport}` (`encode/caps.rs:142-296`, `signaling.rs:250`).
 
 ## Evaluation — pros / cons (the "is there a benefit?" answer)
 
@@ -26,7 +26,7 @@ This doc is the answer ("research + evaluate MoQ + weigh pros/cons + decide if i
 | **Maturity** | moq-transport **draft-17** (not RFC); secure-objects draft; proponents say "years to WebRTC parity." Our WebRTC+DC path was just hardened (rc.94–106). | ❌ Moving target vs proven |
 | **quinn reuse (from tunnel)** | The browser side is **WebTransport, not quinn**; the tunnel's 8 MiB-window *throughput* tune is the opposite of what interactive media wants. | ⚪ Red herring for the browser path |
 | **Connection setup** | MoQ/QUIC ~532 ms vs WebRTC ~1421 ms. One-time; dominated by our own WS/signaling anyway; can't justify paying 2× steady-state latency. | ⚪ Marginal |
-| **Multi-viewer fan-out** | `max_simultaneous_sessions: 1` today (`encode/caps.rs:323`); N WebRTC viewers = N encodes + N congestion loops on the controlled host, or build an SFU. MoQ pub/sub = **encode once, relay fans out to K**. | ✅ The *one* real fit (latency-tolerant spectators) |
+| **Multi-viewer fan-out** | `max_simultaneous_sessions: 1` today (`encode/caps.rs:345`); N WebRTC viewers = N encodes + N congestion loops on the controlled host, or build an SFU. MoQ pub/sub = **encode once, relay fans out to K**. | ✅ The *one* real fit (latency-tolerant spectators) |
 
 **Adversarial check:** a dedicated devil's-advocate pass tried six ways to break the verdict (agent-as-WebTransport-server; video-MoQ/input-WebRTC hybrid; browser RoQ; multi-viewer; faster setup; quinn reuse) — **none broke it**; several reinforced it (UDP-only reach; RoQ-not-browser-reachable). The verdict is sound.
 

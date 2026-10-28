@@ -1601,6 +1601,20 @@ pub struct AgentConfig {
     /// `encoder_cells_deny`: it only ever REMOVES rates.
     #[serde(default)]
     pub fps_deny: Option<String>,
+    /// FR-118 — keep a captured frame on the GPU until the encoder takes it
+    /// (`ROOMLERD_ZERO_COPY`): the SystemContext DXGI arm delivers GPU frames,
+    /// and a QSV encoder whose GPU-input form the capability probe proved takes
+    /// them without a CPU copy. Built-in: off. Read when a capture or an
+    /// encoder opens and by the probe, so a change needs a restart.
+    #[serde(default)]
+    pub zero_copy: Option<bool>,
+    /// FR-118 — GPU-input cells this device must not open, comma-separated
+    /// `name:gpu` (`hevc_qsv:gpu`). Unset or `none` = deny nothing. Env
+    /// `ROOMLERD_ZERO_COPY_DENY`, read by the probe and at every encoder open.
+    /// Local only for now: the fleet's kill switch is `zero_copy` itself,
+    /// which is off unless a device owner turns it on.
+    #[serde(default)]
+    pub zero_copy_deny: Option<String>,
     /// FR-119 P2b-10 — how NVENC splits a frame across its engines above
     /// 60 fps: `auto` (unset; the driver picks the number of strips), `off`
     /// (never ask, as before P2b-10), or a strip count `2`–`4` (applied only
@@ -3004,6 +3018,8 @@ pub fn test_fixture() -> AgentConfig {
         fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
+        zero_copy: None,
+        zero_copy_deny: None,
         nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,
@@ -3126,7 +3142,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 90] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 91] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3230,6 +3246,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 90]
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
         ("CAPS_CACHE", cfg.caps_cache),
         ("FPS_HIGH", cfg.fps_high),
+        ("ZERO_COPY", cfg.zero_copy),
     ]
 }
 
@@ -3361,6 +3378,11 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // FR-119 P2b — the frame-rate denylist, read by the pump once per session.
     if let Some(v) = &cfg.fps_deny {
         fallbacks.insert("FPS_DENY".to_string(), v.clone());
+    }
+    // FR-118 — the GPU-input denylist, read by the probe child and at every
+    // encoder open (the bool switch rides `env_bridge_bools`).
+    if let Some(v) = &cfg.zero_copy_deny {
+        fallbacks.insert("ZERO_COPY_DENY".to_string(), v.clone());
     }
     // FR-119 P2b-10 — NVENC's split-frame encoding above 60 fps, read at
     // every encoder open.
@@ -3709,10 +3731,14 @@ mod tests {
         cfg.overlay_pathmon = Some("shadow".into());
         cfg.encoder_cells_deny = Some("h264/nvenc".into());
         cfg.fps_deny = Some("hevc_qsv:120".into());
+        cfg.zero_copy = Some(true);
+        cfg.zero_copy_deny = Some("hevc_qsv:gpu".into());
         cfg.nvenc_split = Some("off".into());
         let m = env_fallbacks(&cfg);
         let get = |k: &str| m.get(k).map(String::as_str);
         assert_eq!(get("FPS_DENY"), Some("hevc_qsv:120"));
+        assert_eq!(get("ZERO_COPY"), Some("1"));
+        assert_eq!(get("ZERO_COPY_DENY"), Some("hevc_qsv:gpu"));
         assert_eq!(get("NVENC_SPLIT"), Some("off"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
