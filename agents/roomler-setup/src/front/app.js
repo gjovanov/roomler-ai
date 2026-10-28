@@ -83,8 +83,11 @@ const state = {
                        // (an old loop's poll, a superseded start) is dropped
     inFlight: false,   // a poll is awaiting its answer (never two at once)
     opened: false,     // the page was opened at least once (button label)
-    orgName: null,     // from the approval, shown before the install
-    approverName: null,
+    orgName: null,     // from the approval, shown before the install: the
+                       // org's display name (not unique) …
+    orgSlug: null,     // … and its slug (unique); null from an older server
+    approverName: null,     // the approver's display name (free text) …
+    approverUsername: null, // … and their username (unique); null if older
     error: null,       // a start that failed (network, refusal)
     hint: null,        // a poll that failed, shown under the countdown
                        // until the next poll answers
@@ -651,7 +654,9 @@ async function startPairing() {
   p.hint = null;
   p.endedText = null;
   p.orgName = null;
+  p.orgSlug = null;
   p.approverName = null;
+  p.approverUsername = null;
   p.opened = false;
   renderToken();
 
@@ -717,7 +722,9 @@ async function cancelPairing() {
   p.userCode = null;
   p.uri = null;
   p.orgName = null;
+  p.orgSlug = null;
   p.approverName = null;
+  p.approverUsername = null;
   p.endedText = null;
   p.error = null;
   p.hint = null;
@@ -746,7 +753,8 @@ async function pairTick() {
   const gen = p.gen;
   let view;
   try {
-    view = await invoke("cmd_pair_poll");
+    // Rust computes the next interval from this one on slow_down / 429.
+    view = await invoke("cmd_pair_poll", { intervalSecs: Math.round(p.intervalMs / 1000) });
   } catch (err) {
     if (gen !== p.gen) return;
     p.inFlight = false;
@@ -769,15 +777,28 @@ async function pairTick() {
     case "authorization_pending":
       break;
     case "slow_down":
-      // RFC 8628 §3.5: the server's new interval, never shorter than ours.
+      // RFC 8628 §3.5: the next interval as Rust computed it from ours —
+      // the server's, never shorter than what we polled with.
       p.intervalMs = Math.max(p.intervalMs, Math.max(1, view.interval ?? 5) * 1000);
       p.nextPollAt = Date.now() + p.intervalMs;
+      break;
+    case "rate_limited":
+      // HTTP 429 from the per-IP governor (several installers behind one
+      // NAT): backed off like a slow_down — ours + 5 s, or Retry-After when
+      // longer, as Rust computed it — and said so, since nothing is wrong
+      // with the pairing itself.
+      p.intervalMs = Math.max(p.intervalMs, Math.max(1, view.interval ?? 5) * 1000);
+      p.nextPollAt = Date.now() + p.intervalMs;
+      p.hint = "The server asked for a slower pace — trying again.";
+      renderPairStatus();
       break;
     case "approved":
       stopPairingLoop();
       p.phase = "approved";
       p.orgName = view.orgName ?? null;
+      p.orgSlug = view.orgSlug ?? null;
       p.approverName = view.approverName ?? null;
+      p.approverUsername = view.approverUsername ?? null;
       renderToken();
       break;
     case "access_denied":
@@ -853,6 +874,18 @@ function pairDisplayUri(uri) {
   return (uri ?? "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
 }
 
+// «Goran Jovanov» (@gjovanov) — or «Goran Jovanov» from an older server.
+function pairApproverLabel(p) {
+  const name = `«${p.approverName || "an administrator"}»`;
+  return p.approverUsername ? `${name} (@${p.approverUsername})` : name;
+}
+
+// «Roomler» (roomler) — or «Roomler» from an older server.
+function pairOrgLabel(p) {
+  const name = `«${p.orgName || "an organization"}»`;
+  return p.orgSlug ? `${name} (${p.orgSlug})` : name;
+}
+
 function renderPairing() {
   const p = state.pair;
   const available = p.unavailableFor !== state.server;
@@ -889,8 +922,13 @@ function renderPairing() {
 
   document.getElementById("pair-approved").hidden = p.phase !== "approved";
   if (p.phase === "approved") {
+    // The hijack guard reads: «display name» (unique identifier). A display
+    // name is free text anyone can copy; the username and the slug are
+    // unique, so the person can tell their admin and their org from ones
+    // merely named like them. An older server sends no identifiers, and the
+    // wording then falls back to the names alone.
     document.getElementById("pair-approved-text").textContent =
-      `Approved by ${p.approverName || "an administrator"} to join ${p.orgName || "an organization"}.`;
+      `Approved by ${pairApproverLabel(p)} to join ${pairOrgLabel(p)}.`;
   }
 
   document.getElementById("pair-ended").hidden = p.phase !== "ended";
@@ -994,7 +1032,7 @@ async function runInstall() {
     : `daemon (${flavourLabel(roleFlavour(state.role))})`;
   // FR-129: a paired install names the org it was approved into.
   const paired = state.installMode === "paired";
-  const into = paired && state.pair.orgName ? ` into ${state.pair.orgName}` : "";
+  const into = paired && state.pair.orgName ? ` into ${pairOrgLabel(state.pair)}` : "";
   document.getElementById("install-summary").textContent =
     `Installing the ${what} from ${state.server} as “${state.device}”${into}.`;
   renderInstall();
@@ -1036,14 +1074,14 @@ async function runInstall() {
     document.getElementById("token-input").value = "";
     if (paired) {
       // The session in Rust is already gone (cmd_install's success path);
-      // this page's view of it goes too, keeping only the org name, which
-      // the Done page's lead shows (renderDone).
-      const orgName = state.pair.orgName;
+      // this page's view of it goes too, keeping only the org and the
+      // approver, which the Done page's lead shows (renderDone).
+      const { orgName, orgSlug, approverName, approverUsername } = state.pair;
       stopPairingLoop();
       state.pair.phase = "idle";
       state.pair.userCode = null;
       state.pair.uri = null;
-      state.pair.orgName = orgName;
+      Object.assign(state.pair, { orgName, orgSlug, approverName, approverUsername });
     }
     // Two-step transition: paint Done step FIRST (so the operator
     // sees the Finish button immediately), THEN persist state in the
@@ -1236,9 +1274,12 @@ function renderDone() {
     if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
     if (done.anchored === true) lead += " It is anchored: commands can run as SYSTEM here.";
   }
-  // FR-129: a paired install names the org it joined (runInstall keeps the
-  // name after the pairing's own view is cleared).
-  if (state.pair.orgName) lead += ` It joined ${state.pair.orgName}.`;
+  // FR-129: a paired install names the org it joined and who approved it,
+  // each with its unique identifier (runInstall keeps them after the
+  // pairing's own view is cleared).
+  if (state.pair.orgName) {
+    lead += ` It joined ${pairOrgLabel(state.pair)}, approved by ${pairApproverLabel(state.pair)}.`;
+  }
   document.getElementById("done-lead").textContent = lead;
 
   // FR-104 — the anchor step ran and did not anchor: the manual command,

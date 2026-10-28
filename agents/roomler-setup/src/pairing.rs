@@ -42,16 +42,23 @@ use serde::Serialize;
 use crate::role::Role;
 
 /// What the SPA learns from a poll. `status` is the server's vocabulary
-/// plus `unknown` for a spelling this build has not heard of (`detail`
-/// then carries the server's own); `interval` rides `slow_down`; the org
-/// and the approver ride `approved`.
+/// plus `rate_limited` (an HTTP 429 from the per-IP governor, handled like
+/// `slow_down`) and `unknown` for a spelling this build has not heard of
+/// (`detail` then carries the server's own). `interval` rides `slow_down`
+/// and `rate_limited` as the NEXT interval in seconds, computed here from
+/// the one the SPA polled with — never shorter than it. The org and the
+/// approver ride `approved`: each a display name (free text, not unique)
+/// beside its unique identifier (the org's slug, the approver's username),
+/// which an older server omits.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairPollView {
     pub status: PairPollStatus,
     pub interval: Option<u64>,
     pub org_name: Option<String>,
+    pub org_slug: Option<String>,
     pub approver_name: Option<String>,
+    pub approver_username: Option<String>,
     pub detail: Option<String>,
 }
 
@@ -61,6 +68,7 @@ pub struct PairPollView {
 pub enum PairPollStatus {
     AuthorizationPending,
     SlowDown,
+    RateLimited,
     Approved,
     AccessDenied,
     ExpiredToken,
@@ -165,8 +173,18 @@ impl PairStore {
     ///   the org and the approver and waits for the person's click.
     /// * `access_denied` / `expired_token` end the session: the device code
     ///   is dead on the server, so nothing is left to hold.
+    /// * `slow_down` and a 429 (`rate_limited`) leave it and name the next
+    ///   interval, from `polled_interval` (seconds, what the SPA polled
+    ///   with): the server's on `slow_down`, `+5 s` or `Retry-After` on a
+    ///   429 — never shorter than what was polled with.
     /// * the rest leave the session as it is.
-    pub fn apply_poll(&self, generation: u64, outcome: PollOutcome) -> PairPollView {
+    pub fn apply_poll(
+        &self,
+        generation: u64,
+        outcome: PollOutcome,
+        polled_interval: u64,
+    ) -> PairPollView {
+        use roomlerd::pairing::{interval_after_rate_limit, interval_after_slow_down};
         let mut g = self.lock();
         let current = matches!(&g.session, Some((held, _)) if *held == generation);
         if !current {
@@ -179,8 +197,12 @@ impl PairStore {
         match outcome {
             PollOutcome::AuthorizationPending => view(PairPollStatus::AuthorizationPending),
             PollOutcome::SlowDown { interval } => PairPollView {
-                interval: Some(interval),
+                interval: Some(interval_after_slow_down(polled_interval, interval)),
                 ..view(PairPollStatus::SlowDown)
+            },
+            PollOutcome::RateLimited { retry_after } => PairPollView {
+                interval: Some(interval_after_rate_limit(polled_interval, retry_after)),
+                ..view(PairPollStatus::RateLimited)
             },
             PollOutcome::AccessDenied => {
                 g.session = None;
@@ -193,7 +215,9 @@ impl PairStore {
             PollOutcome::Approved(approved) => {
                 let v = PairPollView {
                     org_name: Some(approved.org_name.clone()),
+                    org_slug: approved.org_slug.clone(),
                     approver_name: Some(approved.approver_name.clone()),
+                    approver_username: approved.approver_username.clone(),
                     ..view(PairPollStatus::Approved)
                 };
                 if let Some((_, s)) = g.session.as_mut() {
@@ -269,7 +293,9 @@ fn view(status: PairPollStatus) -> PairPollView {
         status,
         interval: None,
         org_name: None,
+        org_slug: None,
         approver_name: None,
+        approver_username: None,
         detail: None,
     }
 }
@@ -292,11 +318,16 @@ mod tests {
         PollOutcome::Approved(Approved {
             tokens: vec![token.into()],
             org_name: "Acme".into(),
+            org_slug: Some("acme".into()),
             approver_name: "Dana".into(),
+            approver_username: Some("dana".into()),
         })
     }
 
     const SERVER: &str = "https://example.invalid";
+
+    /// The interval every test polls with, where it does not matter.
+    const POLLED: u64 = 5;
 
     #[test]
     fn a_start_holds_the_session_and_a_snapshot_copies_what_a_poll_needs() {
@@ -329,11 +360,34 @@ mod tests {
             "the pairing has not been approved yet"
         );
 
-        let v = store.apply_poll(generation, approved("eyJ.tok.sig"));
+        let v = store.apply_poll(generation, approved("eyJ.tok.sig"), POLLED);
         assert_eq!(v.status, PairPollStatus::Approved);
         assert_eq!(v.org_name.as_deref(), Some("Acme"));
+        assert_eq!(v.org_slug.as_deref(), Some("acme"));
         assert_eq!(v.approver_name.as_deref(), Some("Dana"));
+        assert_eq!(v.approver_username.as_deref(), Some("dana"));
         assert_eq!(store.state(), (true, true));
+
+        // An older server's approval, without the unique identifiers, still
+        // reaches the SPA — with them absent, not invented.
+        let generation = store.begin(SERVER.into(), Role::DaemonSystem, started("dc-2"));
+        let v = store.apply_poll(
+            generation,
+            PollOutcome::Approved(Approved {
+                tokens: vec!["eyJ.tok2.sig".into()],
+                org_name: "Acme".into(),
+                org_slug: None,
+                approver_name: "Dana".into(),
+                approver_username: None,
+            }),
+            POLLED,
+        );
+        assert_eq!(v.status, PairPollStatus::Approved);
+        assert_eq!(v.org_name.as_deref(), Some("Acme"));
+        assert_eq!(v.org_slug, None);
+        assert_eq!(v.approver_username, None);
+        let generation = store.begin(SERVER.into(), Role::DaemonSystem, started("dc-1"));
+        store.apply_poll(generation, approved("eyJ.tok.sig"), POLLED);
 
         // Cloned, not consumed: a Retry after a pre-enroll failure reads it
         // again.
@@ -362,7 +416,7 @@ mod tests {
     fn the_token_is_refused_for_another_role_or_server() {
         let store = PairStore::new();
         let generation = store.begin(SERVER.into(), Role::TunnelClient, started("dc-1"));
-        store.apply_poll(generation, approved("tok"));
+        store.apply_poll(generation, approved("tok"), POLLED);
 
         let e = store.token_for(Role::DaemonUser, SERVER).unwrap_err();
         assert!(e.contains("different role"), "{e}");
@@ -380,7 +434,7 @@ mod tests {
     fn a_new_start_replaces_the_session_and_stale_polls_are_ignored() {
         let store = PairStore::new();
         let first = store.begin(SERVER.into(), Role::TunnelClient, started("dc-1"));
-        store.apply_poll(first, approved("old-token"));
+        store.apply_poll(first, approved("old-token"), POLLED);
         assert_eq!(store.state(), (true, true));
 
         let second = store.begin(SERVER.into(), Role::TunnelClient, started("dc-2"));
@@ -390,17 +444,17 @@ mod tests {
 
         // The old loop's late answers: an approval must not deliver into the
         // new session, and a denial must not end it.
-        let v = store.apply_poll(first, approved("stale-token"));
+        let v = store.apply_poll(first, approved("stale-token"), POLLED);
         assert_eq!(v.status, PairPollStatus::ExpiredToken);
         assert_eq!(store.state(), (true, false));
-        let v = store.apply_poll(first, PollOutcome::AccessDenied);
+        let v = store.apply_poll(first, PollOutcome::AccessDenied, POLLED);
         assert_eq!(v.status, PairPollStatus::ExpiredToken);
         assert_eq!(store.state(), (true, false));
 
         // The new loop's own answers apply.
-        let v = store.apply_poll(second, PollOutcome::AuthorizationPending);
+        let v = store.apply_poll(second, PollOutcome::AuthorizationPending, POLLED);
         assert_eq!(v.status, PairPollStatus::AuthorizationPending);
-        let v = store.apply_poll(second, approved("new-token"));
+        let v = store.apply_poll(second, approved("new-token"), POLLED);
         assert_eq!(v.status, PairPollStatus::Approved);
         assert_eq!(
             store.token_for(Role::TunnelClient, SERVER).unwrap(),
@@ -416,31 +470,75 @@ mod tests {
         let store = PairStore::new();
         let generation = store.begin(SERVER.into(), Role::DaemonMachine, started("dc-1"));
 
-        let v = store.apply_poll(generation, PollOutcome::SlowDown { interval: 10 });
+        let v = store.apply_poll(generation, PollOutcome::SlowDown { interval: 10 }, 5);
         assert_eq!(v.status, PairPollStatus::SlowDown);
         assert_eq!(v.interval, Some(10));
         assert_eq!(store.state(), (true, false));
+        // Never shorter than what was polled with.
+        let v = store.apply_poll(generation, PollOutcome::SlowDown { interval: 10 }, 15);
+        assert_eq!(v.interval, Some(15));
 
-        let v = store.apply_poll(generation, PollOutcome::Unknown("later".into()));
+        let v = store.apply_poll(generation, PollOutcome::Unknown("later".into()), POLLED);
         assert_eq!(v.status, PairPollStatus::Unknown);
         assert_eq!(v.detail.as_deref(), Some("later"));
         assert_eq!(store.state(), (true, false));
 
-        let v = store.apply_poll(generation, PollOutcome::AccessDenied);
+        let v = store.apply_poll(generation, PollOutcome::AccessDenied, POLLED);
         assert_eq!(v.status, PairPollStatus::AccessDenied);
         assert_eq!(store.state(), (false, false));
 
         let generation = store.begin(SERVER.into(), Role::DaemonMachine, started("dc-2"));
-        let v = store.apply_poll(generation, PollOutcome::ExpiredToken);
+        let v = store.apply_poll(generation, PollOutcome::ExpiredToken, POLLED);
         assert_eq!(v.status, PairPollStatus::ExpiredToken);
         assert_eq!(store.state(), (false, false));
+    }
+
+    /// A 429 from the per-IP governor is handled like a `slow_down`: the
+    /// session stays, and the next interval is the polled one plus 5 s, or
+    /// `Retry-After` when that is longer — never shorter.
+    #[test]
+    fn a_rate_limit_backs_off_like_a_slow_down_and_keeps_the_session() {
+        let store = PairStore::new();
+        let generation = store.begin(SERVER.into(), Role::TunnelClient, started("dc-1"));
+
+        let v = store.apply_poll(
+            generation,
+            PollOutcome::RateLimited { retry_after: None },
+            5,
+        );
+        assert_eq!(v.status, PairPollStatus::RateLimited);
+        assert_eq!(v.interval, Some(10));
+        assert_eq!(store.state(), (true, false));
+
+        let v = store.apply_poll(
+            generation,
+            PollOutcome::RateLimited {
+                retry_after: Some(30),
+            },
+            10,
+        );
+        assert_eq!(v.interval, Some(30), "Retry-After is honoured");
+
+        let v = store.apply_poll(
+            generation,
+            PollOutcome::RateLimited {
+                retry_after: Some(3),
+            },
+            30,
+        );
+        assert_eq!(v.interval, Some(35), "a short Retry-After never shrinks it");
+
+        // The pairing itself is untouched: an approval still lands.
+        let v = store.apply_poll(generation, approved("tok"), 35);
+        assert_eq!(v.status, PairPollStatus::Approved);
+        assert_eq!(store.token_for(Role::TunnelClient, SERVER).unwrap(), "tok");
     }
 
     #[test]
     fn cancel_forgets_everything() {
         let store = PairStore::new();
         let generation = store.begin(SERVER.into(), Role::TunnelClient, started("dc-1"));
-        store.apply_poll(generation, approved("tok"));
+        store.apply_poll(generation, approved("tok"), POLLED);
         store.cancel();
         assert_eq!(store.state(), (false, false));
         assert!(store.snapshot().is_none());
@@ -456,7 +554,7 @@ mod tests {
     fn debug_output_carries_no_secret() {
         let store = PairStore::new();
         let generation = store.begin(SERVER.into(), Role::TunnelClient, started("dc-SECRET"));
-        store.apply_poll(generation, approved("eyJ.TOKEN.sig"));
+        store.apply_poll(generation, approved("eyJ.TOKEN.sig"), POLLED);
         let text = format!("{store:?}");
         assert!(!text.contains("SECRET"), "{text}");
         assert!(!text.contains("TOKEN"), "{text}");
@@ -472,20 +570,26 @@ mod tests {
             status: PairPollStatus::SlowDown,
             interval: Some(10),
             org_name: Some("Acme".into()),
+            org_slug: Some("acme".into()),
             approver_name: Some("Dana".into()),
+            approver_username: Some("dana".into()),
             detail: None,
         };
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains(r#""status":"slow_down""#), "{json}");
         assert!(json.contains(r#""interval":10"#), "{json}");
         assert!(json.contains(r#""orgName":"Acme""#), "{json}");
+        assert!(json.contains(r#""orgSlug":"acme""#), "{json}");
         assert!(json.contains(r#""approverName":"Dana""#), "{json}");
+        assert!(json.contains(r#""approverUsername":"dana""#), "{json}");
         assert!(!json.contains("org_name"), "{json}");
+        assert!(!json.contains("approver_username"), "{json}");
         for (status, wire) in [
             (
                 PairPollStatus::AuthorizationPending,
                 "authorization_pending",
             ),
+            (PairPollStatus::RateLimited, "rate_limited"),
             (PairPollStatus::Approved, "approved"),
             (PairPollStatus::AccessDenied, "access_denied"),
             (PairPollStatus::ExpiredToken, "expired_token"),

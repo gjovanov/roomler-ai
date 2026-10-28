@@ -146,10 +146,17 @@ pub enum StartOutcome {
 pub struct Approved {
     /// One per half (`halves` in the start request).
     pub tokens: Vec<String>,
-    /// The org the approver chose — shown before the install (AC5).
+    /// The org the approver chose — shown before the install (AC5). A
+    /// display name: NOT unique, and chosen by whoever made the org.
     pub org_name: String,
-    /// Who approved — shown beside it.
+    /// The org's slug — unique, so the person can tell their org from one
+    /// merely named like it. `None` from a server before A1's review fix.
+    pub org_slug: Option<String>,
+    /// Who approved — shown beside it. A display name: free text.
     pub approver_name: String,
+    /// The approver's username — unique, so a display name copied from the
+    /// real admin does not pass as them. `None` from an older server.
+    pub approver_username: Option<String>,
 }
 
 impl fmt::Debug for Approved {
@@ -157,7 +164,9 @@ impl fmt::Debug for Approved {
         f.debug_struct("Approved")
             .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
             .field("org_name", &self.org_name)
+            .field("org_slug", &self.org_slug)
             .field("approver_name", &self.approver_name)
+            .field("approver_username", &self.approver_username)
             .finish()
     }
 }
@@ -169,6 +178,11 @@ pub enum PollOutcome {
     AuthorizationPending,
     /// Polled too fast: poll again after this (longer) interval.
     SlowDown { interval: u64 },
+    /// HTTP 429 — not the pairing's own `slow_down` but the global per-IP
+    /// governor, which several installers behind one corporate NAT trip
+    /// together. Treated like `slow_down` by the caller: the interval grows
+    /// by 5 s, never shrinks, and a `Retry-After` (seconds) is honoured.
+    RateLimited { retry_after: Option<u64> },
     /// The person denied it in the browser. Final.
     AccessDenied,
     /// The pairing ran out, or its token was already delivered. Final.
@@ -186,12 +200,31 @@ impl PollOutcome {
         match self {
             PollOutcome::AuthorizationPending => "authorization_pending",
             PollOutcome::SlowDown { .. } => "slow_down",
+            PollOutcome::RateLimited { .. } => "rate_limited",
             PollOutcome::AccessDenied => "access_denied",
             PollOutcome::ExpiredToken => "expired_token",
             PollOutcome::Approved(_) => "approved",
             PollOutcome::Unknown(s) => s,
         }
     }
+}
+
+/// RFC 8628 §3.5 — what a poll interval grows by on `slow_down`, and what
+/// this client adds on its own for a 429 (which carries no interval).
+pub const SLOW_DOWN_STEP_SECS: u64 = 5;
+
+/// The next poll interval after a 429: the current one plus the slow-down
+/// step, or the server's `Retry-After` when that is longer — never shorter
+/// than what was polled with.
+pub fn interval_after_rate_limit(current: u64, retry_after: Option<u64>) -> u64 {
+    let grown = current.saturating_add(SLOW_DOWN_STEP_SECS);
+    grown.max(retry_after.unwrap_or(0))
+}
+
+/// The next poll interval after a `slow_down`: the server's, unless the
+/// current one is already longer.
+pub fn interval_after_slow_down(current: u64, server: u64) -> u64 {
+    current.max(server)
 }
 
 // ─── The wire shapes, private: the public types above are what callers hold ──
@@ -228,7 +261,11 @@ struct PollAnswerWire {
     #[serde(default)]
     org_name: Option<String>,
     #[serde(default)]
+    org_slug: Option<String>,
+    #[serde(default)]
     approver_name: Option<String>,
+    #[serde(default)]
+    approver_username: Option<String>,
 }
 
 impl PollAnswerWire {
@@ -248,12 +285,27 @@ impl PollAnswerWire {
                 PollOutcome::Approved(Approved {
                     tokens,
                     org_name: self.org_name.unwrap_or_default(),
+                    org_slug: self.org_slug.filter(|s| !s.trim().is_empty()),
                     approver_name: self.approver_name.unwrap_or_default(),
+                    approver_username: self.approver_username.filter(|s| !s.trim().is_empty()),
                 })
             }
             _ => PollOutcome::Unknown(self.status),
         })
     }
+}
+
+/// A `Retry-After` header's delay in seconds. Only the delta-seconds form
+/// is read; the HTTP-date form (rare from a governor) reads as absent, and
+/// the caller's own step still applies.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 // ─── The two calls ──────────────────────────────────────────────────────────
@@ -328,6 +380,13 @@ pub async fn poll(server: &str, device_code: &DeviceCode) -> Result<PollOutcome>
         .context("POST /api/pair/poll")?;
 
     let status = resp.status();
+    if status.as_u16() == 429 {
+        // The global per-IP governor, not the pairing: typed, so the caller
+        // backs off like a `slow_down` instead of retrying at the same pace.
+        let retry_after = retry_after_secs(resp.headers());
+        tracing::info!(?retry_after, "pairing poll rate-limited (429)");
+        return Ok(PollOutcome::RateLimited { retry_after });
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         bail!("pairing poll rejected (status {status}): {body}");
@@ -544,6 +603,11 @@ mod tests {
             ("200 OK", r#"{"status":"expired_token"}"#),
             (
                 "200 OK",
+                r#"{"status":"approved","tokens":["eyJ.a.b"],"org_name":"Acme","org_slug":"acme","approver_name":"Dana","approver_username":"dana"}"#,
+            ),
+            // An older server: the two unique identifiers absent.
+            (
+                "200 OK",
                 r#"{"status":"approved","tokens":["eyJ.a.b"],"org_name":"Acme","approver_name":"Dana"}"#,
             ),
             ("200 OK", r#"{"status":"needs_a_second_factor"}"#),
@@ -566,8 +630,21 @@ mod tests {
             PollOutcome::Approved(Approved {
                 tokens: vec!["eyJ.a.b".into()],
                 org_name: "Acme".into(),
+                org_slug: Some("acme".into()),
                 approver_name: "Dana".into(),
+                approver_username: Some("dana".into()),
             })
+        );
+        assert_eq!(
+            poll(&base, &code).await.unwrap(),
+            PollOutcome::Approved(Approved {
+                tokens: vec!["eyJ.a.b".into()],
+                org_name: "Acme".into(),
+                org_slug: None,
+                approver_name: "Dana".into(),
+                approver_username: None,
+            }),
+            "a server without the unique identifiers still approves"
         );
         // A spelling from a newer server is carried verbatim, never a
         // parse failure.
@@ -577,7 +654,7 @@ mod tests {
         );
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.len(), 7);
         for s in seen.iter() {
             assert_eq!(s.path, POLL_ROUTE);
             let body: serde_json::Value = serde_json::from_str(&s.body).unwrap();
@@ -611,6 +688,66 @@ mod tests {
         assert!(e.contains("400"), "{e}");
     }
 
+    /// A 429 is the global per-IP governor (several installers behind one
+    /// NAT), not the pairing: a typed outcome the caller backs off on, with
+    /// `Retry-After`'s seconds when the header carries them. The HTTP-date
+    /// form reads as absent; the caller's own step still applies. (The
+    /// scripted status line carries the header after its own `\r\n`.)
+    #[tokio::test]
+    async fn a_429_on_poll_is_rate_limited_with_retry_after() {
+        let (base, _) = scripted_server(vec![
+            ("429 Too Many Requests\r\nRetry-After: 12", ""),
+            ("429 Too Many Requests", r#"{"error":"too many requests"}"#),
+            (
+                "429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT",
+                "",
+            ),
+            ("429 Too Many Requests\r\nRetry-After:  3 ", ""),
+        ])
+        .await;
+        let code = DeviceCode::new("dc");
+        assert_eq!(
+            poll(&base, &code).await.unwrap(),
+            PollOutcome::RateLimited {
+                retry_after: Some(12)
+            }
+        );
+        assert_eq!(
+            poll(&base, &code).await.unwrap(),
+            PollOutcome::RateLimited { retry_after: None }
+        );
+        assert_eq!(
+            poll(&base, &code).await.unwrap(),
+            PollOutcome::RateLimited { retry_after: None }
+        );
+        assert_eq!(
+            poll(&base, &code).await.unwrap(),
+            PollOutcome::RateLimited {
+                retry_after: Some(3)
+            }
+        );
+        assert_eq!(
+            PollOutcome::RateLimited { retry_after: None }.status(),
+            "rate_limited"
+        );
+    }
+
+    /// The back-off arithmetic: a 429 grows the interval by the slow-down
+    /// step, or to `Retry-After` when that is longer, and never shrinks it;
+    /// a `slow_down` takes the server's interval unless the current one is
+    /// already longer.
+    #[test]
+    fn the_interval_only_grows() {
+        assert_eq!(interval_after_rate_limit(5, None), 10);
+        assert_eq!(interval_after_rate_limit(5, Some(3)), 10);
+        assert_eq!(interval_after_rate_limit(5, Some(30)), 30);
+        assert_eq!(interval_after_rate_limit(30, Some(12)), 35);
+        assert_eq!(interval_after_rate_limit(u64::MAX, Some(1)), u64::MAX);
+        assert_eq!(interval_after_slow_down(5, 10), 10);
+        assert_eq!(interval_after_slow_down(15, 10), 15);
+        assert_eq!(interval_after_slow_down(5, 5), 5);
+    }
+
     /// AC3 — the device code appears in no `Debug` output: not its own, not
     /// the pairing's, and the delivered tokens are counted, not printed.
     #[test]
@@ -634,12 +771,15 @@ mod tests {
         let approved = Approved {
             tokens: vec!["eyJ.TOKEN.sig".into(), "eyJ.TOKEN2.sig".into()],
             org_name: "Acme".into(),
+            org_slug: Some("acme".into()),
             approver_name: "Dana".into(),
+            approver_username: Some("dana".into()),
         };
         let text = format!("{approved:?}");
         assert!(!text.contains("TOKEN"), "{text}");
         assert!(text.contains("<2 redacted>"), "{text}");
         assert!(text.contains("Acme") && text.contains("Dana"), "{text}");
+        assert!(text.contains("acme") && text.contains("dana"), "{text}");
         let text = format!("{:?}", PollOutcome::Approved(approved));
         assert!(!text.contains("TOKEN"), "{text}");
     }
@@ -677,6 +817,10 @@ mod tests {
             "authorization_pending"
         );
         assert_eq!(PollOutcome::SlowDown { interval: 1 }.status(), "slow_down");
+        assert_eq!(
+            PollOutcome::RateLimited { retry_after: None }.status(),
+            "rate_limited"
+        );
         assert_eq!(PollOutcome::AccessDenied.status(), "access_denied");
         assert_eq!(PollOutcome::ExpiredToken.status(), "expired_token");
         assert_eq!(PollOutcome::Unknown("x".into()).status(), "x");
