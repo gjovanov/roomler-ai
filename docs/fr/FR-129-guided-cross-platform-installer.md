@@ -365,6 +365,156 @@ flowchart TB
    or `--no-desktop` explicitly. The wizard's order on Linux and macOS is therefore: *(system
    scope: enroll in-process first)* → privileged half → *(per-user: enroll in-process)* →
    `--user-steps`.
+
+   **Decided by B1** (the wizard on top of that seam; the PR is the "B1" row below):
+
+   - **#2338, every platform.** The wizard's enroll step now reads the config at the
+     role's path and folds the fresh enrollment into it through
+     `enrollment::apply_enrollment` — reusing its `machine_id`, keeping every
+     operator-owned key — exactly as `roomlerd enroll` does
+     (`agents/roomler-setup/src/enroll_step.rs`). A fresh install's defaults (FR-99's
+     `lock_on_end = auto` for a Windows service install, the role's overlay default) apply
+     to a **fresh** config only, so a value the device already has is never overridden by a
+     default (the FR-99 P3c note). The Advanced boxes the person **touched** land on a fresh
+     and on a refreshed config alike (the SPA names them, `touched`); the untouched ones
+     only on a fresh config. An enrollment that resolves to another org is appended as a
+     secondary, as the CLI does, and the person is told.
+     **A config that is there and does not load is never read as absent (F4).** The probe
+     every fold used, `config::read_if_present`, turns absent, unreadable and unparseable
+     alike into "no config" — right for a caller asking whether an optional file exists, wrong
+     for one about to write the path — and `config::save` does not even keep such a file: its
+     `.prev` rotation runs only for a file that still parses, so that a broken file never
+     overwrites the last good copy. A fold now reads through `config::read_merge_base`
+     (`crates/agent-core/src/config.rs`; `read_if_present` itself is unchanged, the CLI shares
+     it): a file that does not load is folded into from its last good copy (`.prev`) when that
+     one loads — what the daemon's own `load` would run on at its next start — and kept aside as
+     `config.toml.unreadable` (never over `.prev`) either way, and the person is told which
+     happened, naming the path, the reason and both files.
+   - **The system-scope merge: option (b), a daemon verb run by the privileged half.** The
+     person cannot read the root daemon's `/etc/roomler/config.toml` (root:root 0600), so
+     the fold cannot happen in the wizard. `roomlerd --config TARGET adopt-enrollment --from
+     FILE [--take KEY]…` (no token; the enroll already happened) runs the same
+     `apply_enrollment` as root, inside `place_system_config`, when a config is already at the
+     target; `--config-take` carries the touched keys. Why not (a), a non-argv token channel
+     into `roomlerd enroll`: it would move the enroll — and the token — into the elevated half,
+     against B0's "a half never takes a token", it overlaps A4's `enroll` changes, and it would
+     spend the token *after* the package step, so a failed placement would still cost a Retry
+     its token. With (b) the B0 property holds as it was: the enroll happens first, the file
+     is placed by root, and a half that fails leaves an enrolled file the next attempt reuses
+     (the wizard keeps it, `unix_daemon::KeptEnrollment`, shredded at the latest at exit). A
+     daemon too old for the verb (a self-hosted server pinning an older release) gets B0's
+     placement with the old config kept as `.prev`, and says that the settings did not carry
+     over. The same function serves B2's macOS root half: `place_system_config` is called
+     with the bundle's daemon binary there too. The verb reads its target as the wizard's folds
+     do (F4) and retires a previous row's key (F3, next), and says both on stderr, which the
+     wizard streams to the person.
+   - **A device the server no longer recognises (F3).** The server reuses a device row by
+     `(tenant, machine_id)` (`crates/modules/fleet/src/agent.rs`, `enroll_agent`), and a
+     system-scope enroll in the wizard has to derive the machine id — SHA-256 of the host name,
+     OS, arch and config path (`crates/agent-core/src/machine.rs`) — because the person cannot
+     read the one root's config holds. On a host renamed since its first enrollment, or a VM
+     cloned together with its config, that is a NEW id: the server makes a new row, and the
+     fold kept the existing WireGuard key, which the previous row (offline, never removed)
+     still claims. The overlay join then refuses the new row for good — `wg_key_taken_by_other`
+     fails closed, and silently: the device is not told — and the device has a duplicate row.
+     `roomlerd enroll` on a terminal never does this, since it reads the existing id.
+     **Decided:** a refresh of the same org that lands on another row retires the kept key —
+     `overlay_wg_secret_key` dropped and `overlay_wg_key_epoch` back to 0, so the daemon mints a
+     key at its next start, as on a first install — and names the previous row for the
+     operator, with what to do for each cause (`enrollment::retire_key_of_previous_row`,
+     `describe_previous_row`). `adopt-enrollment` applies it as root, from the files; the
+     wizard's own folds apply it too, where it cannot fire today (they read the id back).
+     Before the enroll the wizard also asks the running root daemon which device it is, over
+     the person socket a Linux root daemon serves the console user (`Status` is in
+     `Scope::Person`; `agents/roomler-setup/src/root_identity.rs`), and says a new row on its
+     own page. **What the LocalAPI does not say, and why it is not added:** it answers the
+     agent id (`node_id`), the org and the name — never the machine id — so the wizard cannot
+     enroll with it and have the server reuse the row. Adding it would not be the fix: on a
+     cloned VM the previous row is the ORIGINAL machine's, still in use, and reusing it would
+     make two machines one device (the terminal `enroll` does exactly that on a clone today). A
+     new row with a retired key is right for a clone and costs a renamed host one stale row to
+     remove; the warning says which is which. **B2 inherits this as it is** — the macOS root
+     half's config is root:wheel 0600 too, and `place_system_config` runs the same verb there
+     — **and meets it more often:** on a Mac with no `HostName` set, `gethostname()` can follow
+     the network (a DHCP- or Bonjour-derived name), so a wizard reinstall on another network
+     derives another id. B2 should take the root half's machine id from something that does
+     not move (the `IOPlatformUUID`, which the person can read through `ioreg`), or have the
+     root half hand back its own.
+   - **A reinstall's running daemon.** `systemctl enable --now` leaves an *active* unit as
+     it is, so on a reinstall the root daemon would keep its previous config in memory
+     (nothing in the daemon watches the file; its runtime writers reload before they save,
+     so the file was never overwritten — but the new name and options never took). The
+     privileged half now **restarts** `roomlerd.service` when it placed a config and the unit
+     is active. The per-user unit was already covered: `--user-steps` restarts a daemon
+     running beside an enabled helper (B0's finding), and the macOS user half's
+     `kickstart -k` restarts by definition. The terminal path (`enable --now` after its own
+     enroll) is unchanged, so B0's regress cells stay valid; the same reinstall there keeps the
+     old identity in memory until the next restart, which a later PR may take up.
+   - **When the half has started, and what an exit means (F1, F2).** The privileged half
+     writes to files in the scratch directory, never to pipes the wizard holds: a root
+     `dpkg -i` must not die of SIGPIPE halfway through because the window closed, and
+     `osascript`'s `do shell script` returns its output only when the command has finished, so
+     for the macOS half a file is also the only way its lines stream at all (the constant
+     AppleScript sends the shell's stdout and stderr to two files and its exit status to a
+     third: `unix_daemon::ADMIN_APPLESCRIPT`). The wizard tails them into the progress channel.
+     **Started** means something runs, or ran, as root: for `pkexec`, the half's first stdout
+     line (the script prints its banner before any step; `pkexec` itself writes only stderr) or
+     a kill refused with EPERM (`pkexec` has switched every uid to 0); for `osascript`, the
+     output file the root shell creates as its first act. **Before the start** the exit is the
+     prompt tool's: `pkexec` **126** = the person dismissed the dialog ("cancelled", nothing
+     installed, never a package failure); **127** = no authentication possible (no polkit
+     agent in the session, `pkexec` absent — a spawn error — or the password refused), which
+     turns into the terminal fallback: the identical half shown as `sudo /bin/sh
+     <scratch>/install.sh --privileged-steps …` (no secret on it), a wait for "I've run it",
+     then a check that the daemon (and, for a system scope, the config) is there; `osascript`
+     `(-128)` = cancelled. **After the start every exit is the script's own (F2):** `pkexec`
+     passes the script's status through, so a `set -e` step whose `dpkg` or `systemctl` is
+     missing exits 127 too — a failed step, never "no polkit agent", never the terminal
+     fallback. Measured values are in the log rows below.
+   - **Cancel (F1).** Before the start a cancel kills the prompt client (`pkexec`,
+     `osascript`, still the person's processes) and the dialog goes away: *cancelled* means
+     nothing ran. After it nothing the person's process sends can stop a root process — and
+     killing `osascript` would only stop the wizard seeing the end of one that runs on:
+     `installer -pkg` would carry on while the wizard said "nothing was installed", and a Retry
+     could start a second, concurrent install. So the cancel is reported, the half waited out
+     to its own exit, and the install stops after it, saying what the half left
+     (`orchestrator_unix::cancelled_after_privileged`). One race is closed on purpose: a cancel
+     that kills `osascript` in the instant the password is accepted can leave the root shell
+     running, so for 5 s after such a kill the wizard watches for its output file and, if it
+     appears, waits for the status file instead of reporting a cancel. The window does not
+     close while the half (or the terminal step standing in for it) runs: the wizard's exit
+     would remove the scratch directory — the config a root half has yet to place — from under
+     it; a native message says why.
+   - **Retry (F5).** What an attempt leaves is kept for the next one with the same server,
+     name and scope (`unix_daemon::KeptEnrollment`): the enrollment the server holds, a
+     system-scope config the half has not placed yet, and whether the privileged half ran to
+     its end. A Retry after a cancel or a failure that came after that half — between the
+     halves — does not run it again (no second password) and, for a system scope, does not
+     enroll again. Before this it kept the placed enrollment with no scratch file, fell
+     through to "enroll", and posted a token the first attempt had already spent. The half's
+     work is checked first (the daemon binary, the placed config); if it has gone since, the
+     install runs from the start and says that a spent token will be refused — get a new one,
+     or pair again — and the server's refusal of a used token says the same.
+   - **The per-user overlay on Linux** goes through the userspace netstack: the wizard
+     writes `netstack_socks_port` (the first free port of 10800–10899, picked as the
+     secondaries' are) beside `overlay_enabled`, because a per-user unit has no
+     `CAP_NET_ADMIN` and a daemon without the port joins nothing (#2493's lesson, applied to
+     the primary). macOS leaves the overlay off: the mesh is the root half's (B2).
+   - **The per-user unit's folders (found on the Fedora cell).** The packaged
+     `roomler.service` lists the daemon's config and data folders in `ReadWritePaths=`
+     without `-`, on the stated assumption that `roomlerd enroll` makes both (the data folder
+     as a side effect of its logging). The wizard enrolls in its own process, so the data
+     folder was never made, and wherever a user manager applies the sandbox the unit failed
+     226/NAMESPACE every 5 s, forever, under an install the wizard had reported done. Fedora
+     44's user manager applies it; Ubuntu 24.04's skips the mounts (AppArmor's
+     unprivileged-userns restriction), which is why the Ubuntu cells never showed it. The
+     wizard now makes both folders before the user half starts the unit, a Retry included
+     (`unix_daemon::unit_folders`, `make_unit_folders`), from the same `appdirs` resolution
+     as the config path — never a fixed `~/.local/share/roomler`: on a pre-rename host a
+     new-segment folder made beside the legacy tree would turn the daemon's new-then-old
+     resolution away from its enrolled config. A test reads the packaged unit and fails when
+     a required `%h/` folder is not one the wizard makes, or is made after the user half.
+
 2. **Elevation through the desktop's own prompt:** `pkexec` (polkit) on Linux, which is present
    in any GNOME or KDE session, and `osascript … with administrator privileges` on macOS — one
    native password dialog per install. With no polkit agent (rare on a desktop), the wizard
@@ -493,7 +643,7 @@ subject plain text: the machine name is the installer's own text.
 | A3 | wizard: "Set up in the browser" as the token step's primary action — start, open `/pair`, show the code, poll with back-off, confirm org + approver, then install; paste kept as "I already have a token" | A1's switch; an older server (404 on start) → paste only | **merged** — [#3027](https://github.com/gjovanov/roomler-ai/pull/3027) (`48f9e1762`, 2026-10-28); not on production yet; end-to-end on the dev stack against A1 (#3040 at `9fab730c0`, 2026-10-28): a paired tunnel install, the guard with the unique identifiers, Cancel leaving the pairing `delivered` and nothing enrolled (AC5), the 429 back-off |
 | A4 | terminal parity: `roomlerd enroll --pair [--pair-org SLUG]`, `install.sh --pair [--pair-org SLUG]`, `install.ps1 -Pair [-PairOrg SLUG]` — the code and the page on the terminal, A3's back-off, the hijack guard as `Join «org» (slug) as approved by «name» (@username)? [y/N]` on `/dev/tty` / the Windows console, `--pair-org` (byte for byte) for a terminal that has none, server text escaped, the in-process enroll through the `--token` path (invariant 10 above; the judgement calls below) | omit the flag (nothing changes without it); an older server or `[pairing] enabled = false` → "use --token", exit 1 | **merged** — [#3045](https://github.com/gjovanov/roomler-ai/pull/3045) (`f37b2c74a`, 2026-10-28), in agent 0.4.183; the scripts' `--pair` ships in the server image. End-to-end on the dev stack against A1 (the log below): the `curl … \| sh -s -- --pair` shape running the real `enroll_daemon` on a Linux pty (`y`, `n`), no terminal without and with `--pair-org`, a lookalike org refused, an org name full of escapes shown inert, an older server; the Windows build with `--pair-org`, with no console at all, and asked in a real console (code page 437); no secret in any transcript or log (AC3). The first draft, run the same way, enrolled into the lookalike and printed the escapes raw. AC13 at this head: the FR-61 no-flag cells pass on Ubuntu (per-user, `--system`); Win11 matches master check for check (its `#desktop` fails on master too) — the log below |
 | B0 | spike: the privileged/user split of `install.sh` under `pkexec` (Ubuntu GNOME, Fedora KDE vmtest cells) and `osascript` admin (macOS cell); the seam recorded in this spec | — | **merged** — [#3039](https://github.com/gjovanov/roomler-ai/pull/3039) (`ef6e3ed01`, 2026-10-28): `--privileged-steps` / `--user-steps` / `--config-from`, proven under `pkexec` on Ubuntu 24.04 GNOME-Wayland (per-user, `--system`) and Fedora 44 KDE Plasma 6 Wayland (per-user, tarball + `.rpm`); the terminal path re-run on all three and on macOS (per-user, and the root half through `--daemon-token`); **owed: the macOS native-prompt half** (no display driver in the harness's macOS lane) |
-| B1 | wizard: daemon roles on Linux (per-user, system) and macOS (per-user) through the embedded `install.sh` steps; the companion placed as the terminal places it; #2338 folded in | `wizard_unix_daemon` absent/false on the setup endpoint → Windows-only cards | — |
+| B1 | wizard: daemon roles on Linux (per-user, system) and macOS (per-user) through the embedded `install.sh` steps; the companion placed as the terminal places it; #2338 folded in | `wizard_unix_daemon` absent/false on the setup endpoint → Windows-only cards | draft PR on `fr-129-b1-unix-daemon`. Field (log rows below): Ubuntu GNOME per-user and system, each with a remote-desktop session through the production viewer; Fedora KDE per-user (red, a fix, green); #2338 kept on Linux (per-user, system) and on Windows (red on `setup-v0.4.182`, green on B1); F1, F2 and F5 on the per-user cell, with `pkexec`'s 126/127 measured; F3 (a renamed host) and F4 (a zeroed root config) on the system cell. **Owed:** the macOS GUI half (the recipe is in its row) |
 | B1-s | server: `GET /api/setup/features` → `{"pairing", "wizard_unix_daemon", "wizard_pairing"}`, public. `pairing` is the server's fact (A1's switch, for the wizard); the two `[setup]` switches are the operator's assertions about the **released** wizard, each default **off** until its field run — `wizard_unix_daemon` (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`; AC11) and `wizard_pairing` (`ROOMLER__SETUP__WIZARD_PAIRING`; A3 against this server). The enrollment dialog, the landing page and the static `/` (`home.js`) show the Linux and macOS wizard only on `wizard_unix_daemon`, and the install lead says "sign in from your browser" only on `pairing && wizard_pairing` — never on the server's fact alone, or a server promoted before the first `setup-v*` carrying A3 would promise a flow the download cannot do | the settings; absent/false, a 404 (an older server) and a 503 (fleet unmounted) all read as false | PR [#3044](https://github.com/gjovanov/roomler-ai/pull/3044) |
 | B2 | macOS root half from the GUI (two tokens from one approval), or FR-43's single enrollment if it lands first | B1's switch | — |
 | D | docs, vmtest cells (wizard × OS × daemon; pairing end to end), field log | — | `docs/device-pairing.md` merged ([#3051](https://github.com/gjovanov/roomler-ai/pull/3051)); its §13, terminal pairing, follows A4. Owed: the vmtest matrix and the acceptance criteria |
@@ -608,3 +758,11 @@ All seven open decisions were resolved as the spec recommended
 | 2026-10-28 | A4, sudo 1.9.15p5 (WSL Ubuntu 24.04 with `Defaults use_pty`; a throwaway `ubuntu:24.04` container for the logging policies) | **Does `sudo` swallow a piped script?** A 209 KB script — past the shell's read buffer — fed to `sh` through a pipe, `sudo -n sleep 1` at its top and an `echo` as its last line: the last line ran under the default policy, `log_input`, `log_stdin` and both, with and without a pty. Nothing on the paired enroll's path reads the piped script today; `install.sh`'s `</dev/null` on that enroll is a belt (A4-10). A first, 3-line version of this test proved nothing — the shell had read all of it before `sudo` ran. |
 | 2026-10-28 | A4, the scripts at `c3821085c`: `install.sh` (sha256 `abc54226…`) fetched by commit from the public repo into a private copy of B0's lab harness, `install.ps1` (`b39cd099…`) fetched by commit by the Win11 lane's guest; agent 0.4.181 from the release feed; the lab host's vmtest lanes on a private home and env, issue filing off | **AC13 — the FR-61 no-flag regression, at this head.** Ubuntu 24.04 GNOME-Wayland, per-user: `install.sh --role daemon --no-enroll --desktop` exit 0 (the guest's own hash of the script it ran: `abc54226…`), the lane's ephemeral enroll and one start, the device online. `--system`: the same, as root. Win11 `script/system` (`install.ps1 -Role daemon-system -NoEnroll`): install, enroll, overlay (self `100.65.x`, the anchor in `peers`, a ping) and rd PASS, `#desktop` FAIL ("WebView2 CDP endpoint never answered on 127.0.0.1:9333") — and the same cell with **master's** `install.ps1` (`886ad79b1`), run straight after as the control, failed `#desktop` the same way with every other check passing: a fault of the lane's companion check, which neither script touches, not of A4. Every cell torn down by name, the org back at its baseline. The first draft's own runs of the same three cells (`191676df8`) read the same, and so did a pair of Ubuntu cells on a copy that differed from this one by a comment only. |
 | 2026-10-28 | **`setup-v0.4.182`**, the first release carrying A3 (tag `agent-v0.4.182` → `8e55985c0`, which contains `48f9e1762`): `roomler-setup-0.4.182-x86_64-pc-windows-msvc.zip`, sha256 `225b71b3…` = its published `.sha256`; run on a Windows 11 desktop against **production** (`hosted-20261026-21d7c18`, no FR-129 server commit) | **The released wizard falls back to the paste box where the server has no pairing.** Production first, measured on its own: `POST /api/pair/start` → **404, empty body**. The wizard resumed at its token step from a saved state, whose server was a dev stack's loopback URL, so the Server page was set back to `https://roomler.ai` first. Then **Set up in the browser**: the pairing card was gone with no error shown, no browser opened, the paste box was open and retitled **Enrollment token**, and the lead read "This server does not offer pairing from the browser. Paste a fresh enrollment token." Nothing was installed; the wizard was closed. Driven through the window's UI Automation tree, which exposes the page's element ids (`pair-start`, `paste-summary`, `token-input`). WebView2's debugging port could not be opened without a machine policy, because the wizard sets its own browser arguments, and no policy was set. A side finding: production's server answers `GET /api/setup/features` with **400**, not 404 — its `/api/setup/{platform}` route takes "features" as an unknown platform — so a client must read any non-2xx answer as off, not just a 404. |
+| 2026-10-28 | B1, branch `fr-129-b1-unix-daemon` at `63ce0acd2`, the wizard's Linux x86_64 build (sha256 `91b06426…`) against the released `setup-v0.4.181` (`9dd6178d…`); Ubuntu 24.04.4 GNOME-Wayland vmtest cells (`vmtest-ub-b1-usr-161205`, `vmtest-ub-b1-sys-164635`) and a Fedora clone (row below). The wizard is driven through WebDriver (tauri-driver 2.1.0 → WebKitWebDriver; the wizard started with `TAURI_WEBVIEW_AUTOMATION=true` in the person's user manager), and the administrator password is typed from the hypervisor's keyboard. `GET /api/setup/features` is answered by a loopback shim in the cell (`wizard_unix_daemon: true`); every other request goes through to production over TLS, so the enrollment, the hub, the mesh and the viewer are production's own. Production itself predates B1-s and is under a promote hold | **Fail-first, the Welcome page, and the switch.** The released wizard on Linux: its three daemon cards carry `hidden`, but `label.radio`'s `display: flex` outranks the user agent's `[hidden]` rule, so all three **Windows** daemon cards were on screen under "the daemon roles are Windows-only" (measured by computed style, not by the DOM). That is a card the person can pick on a platform where it cannot install. B1 against production: production answers `/api/setup/features` with **400**, because its `/api/setup/{platform}` route takes "features" for a platform. B1 reads that as off: no daemon card on screen, the tunnel card alone. B1 against the shim: `daemon-system` and `daemon-user`. Fixed in B1: a global `[hidden] { display: none !important; }` (`front/styles.css`, with a test), without which the switch's off state (AC14) would hide nothing either. An older server's 400, like its 404, is now quiet in the log (`features::older_server`). Evidence: the lab host's `~/b1/runs/usr/probe-*` and `~/b1/runs/fed/probe-*`. |
+| 2026-10-28 | B1, the same harness; the cell's first install on the build before `63ce0acd2`, the rest on `63ce0acd2` | **Ubuntu per-user through the wizard, one prompt.** The first attempt found a bug the unit tests could not: the user half ran `/bin/sh /bin/sh <script> --user-steps …` ("Syntax error: ")" unexpected", exit 2), because `run_half` put the shell in front of an argv that already began with it. Fixed in `63ce0acd2` (`run_half` takes the whole argv; a test runs a real child). Then: Welcome → "this user only" → Server (the shim) → Join (a pasted single-use token) → Install. GNOME Shell's polkit dialog came up once (`polkitd: … ONE-SHOT authorization …` for the wizard's `pkexec`). The half ran as root: resolve, sha256, `dpkg -i`, the FR-96 helper, the companion `.deb`. The in-process enroll was folded into `~/.config/roomler/config.toml` (vmtest:vmtest 0600, `overlay_enabled` with `netstack_socks_port = 10800`), and `--user-steps` started `roomler.service` as vmtest. Done. Read: roomlerd 0.4.181, the companion running its Welcome tour, the helper timer + path enabled, **online**, overlay `100.65.x` over the netstack with the anchor in `peers`. The lane's remote-desktop check through the **production viewer** passed on the cell's GNOME desktop (1 passed, 6.8 s). Evidence: `~/b1/runs/usr/install*`, `inspect`, `rd`. |
+| 2026-10-28 | B1 at `63ce0acd2`, cell `vmtest-ub-b1-usr-161205` | **#2338, per-user, Ubuntu: kept.** A fresh install (standard token), then the operator's edits (`lock_on_end = "always"`, a soft-disabled `[[tunnel_routes]]` entry; `overlay_enabled` was already on), then a wizard reinstall with another token and one Advanced box touched (`auto_grant_session` off). After: the **same** row (`6ae22561…`, one row for the name), `lock_on_end = "always"`, the route, the overlay and `netstack_socks_port` kept, the WireGuard key kept, `auto_grant_session = false` (the touched box), the daemon restarted onto it (a new MainPID), online, the anchor in `peers`. There is no red run on Linux: the released wizard cannot install a daemon there at all (first row). The red run is on Windows (below). Evidence: `~/b1/runs/usr/2338/`. |
+| 2026-10-28 | B1 at `63ce0acd2`, the same cell | **Cancel, exits and Retry (F1, F2, F5).** (a) The person dismisses the polkit dialog (Escape): "cancelled at the administrator prompt — nothing was installed", and no `pkexec` is left. (b) The wizard's Cancel while the dialog is up: the dialog closes ("closing the administrator prompt"), with the same message. (c) The wizard's Cancel after the half had started (its `# ` lines on screen): the half ran to its end, and the wizard said so: "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed, but this device is not enrolled yet. Retry finishes the install without asking for the password again." Then Retry: Done and online, with **one** polkit authentication for the whole of (c), counted in the journal. (d) `pkexec` measured on its own in the same session: dismissed → **126**; no agent (an SSH session) → **127**, with "Error creating textual authentication agent …". These are the two values the wizard reads, and only before the half's first line. Evidence: `~/b1/runs/usr/f1/`, `~/b1/runs/usr/seq-f1.log`. |
+| 2026-10-28 | B1 at `63ce0acd2`, cell `vmtest-ub-b1-sys-164635`. For the reinstalls, the B1 daemon (an `overlay-l3,overlay-netstack` build of this branch) was put at `/usr/bin/roomlerd` with `dpkg-divert`, because the released 0.4.181 daemon has no `adopt-enrollment`. A release carries the wizard and its daemon in lockstep | **The system scope through the wizard.** Fresh install: one prompt, with the enroll done in-process before it into a 0600 scratch file. The half placed it (`/etc/roomler/config.toml` root:root 600) and disabled the helper; `roomlerd.service` ran as root, the companion ran, and the device was online over the TUN with the anchor in `peers`. The production viewer's remote-desktop check passed. **#2338, system:** the operator edited the root config (`lock_on_end = "always"`, `auto_update = false`, a route), then a wizard reinstall ran. The half ran `roomlerd adopt-enrollment` as root (`enrollment adopted … outcome=RefreshedPrimary` in root's log) and restarted the active unit onto the placed file (a new MainPID). The device kept its row (one row), its keys, its route and its WireGuard key, and stayed online with the anchor in `peers`. **F3:** the host was renamed (`hostnamectl`), then a wizard reinstall ran. Before anything ran, the wizard asked the running root daemon over the person socket and said: "The root daemon here runs as "<name>": this machine was enrolled in this organization as device 6ae228b0…, and the server has now enrolled it as a NEW device, 6ae22b11…: the machine's fingerprint changed …". The half's `adopt-enrollment` logged "a new device row; the previous row's overlay key retired previous=6ae228b0… new=6ae22b11…". The new row came up online with a fresh key and a new overlay address, the anchor in `peers`. The old row stayed, offline, for the operator to remove. **F4, root side:** the daemon was stopped and the root config zeroed (2362 bytes of NUL, an unclean shutdown's signature), with its last good copy as `.prev`. A wizard reinstall followed. `adopt-enrollment` said "… could not be read (… 2362 bytes of NUL …). Its last good copy, /etc/roomler/config.toml.prev, is used instead, so this device's settings carry over. The unreadable file is kept as /etc/roomler/config.toml.unreadable." The device kept the same row, `lock_on_end` and the route, and stayed online with the anchor in `peers`; the damaged file was kept root:root 600. Evidence: `~/b1/runs/sys/`. |
+| 2026-10-28 | B1 at `63ce0acd2`, then `ac4c1db87` (the wizard's Linux build sha256 `554f1271…`); Fedora 44 KDE Plasma 6 Wayland, a throwaway clone of the lab's KDE guest (`wlab-b1kde-170415`, user `wlab`); agent 0.4.182, released during the run | **Fedora per-user, the tarball path: red, then green.** The wizard itself needs WebKitGTK 4.1, which this KDE image did not have (the harness installed `webkit2gtk4.1`, and `webkitgtk6.0` for its WebKitWebDriver; worth a line on the download page). The released wizard here showed the same three Windows cards on screen. B1 at `63ce0acd2`: one `polkit-kde` prompt; the half took the tarball path and the companion `.rpm`; Done. The daemon **never started**: `roomler.service` restarted every 5 s with `226/NAMESPACE` ("Failed to set up mount namespacing: /home/wlab/.local/share/roomler: No such file or directory"). The packaged unit requires that folder in `ReadWritePaths=`, and `roomlerd enroll` makes it, but the wizard's in-process enroll did not. Fedora's user manager applies the sandbox; Ubuntu's skips it. `mkdir ~/.local/share/roomler` on the cell started the unit within one restart, online. Fixed in `ac4c1db87` (the wizard makes the unit's folders; see the decision above). Green: the same cell, reset to a fresh person's state (unit off, config and data folders removed, the row deleted), with the fixed wizard. Done; `roomler.service` active as wlab with **0 restarts and no NAMESPACE line since the install began**; roomlerd 0.4.182; `roomler-desktop-0.4.182` running; the helper enabled; the WireGuard key minted; **online**, overlay `100.65.x` with the anchor in `peers`. Evidence: `~/b1/runs/fed/`. |
+| 2026-10-28 | B1 at `63ce0acd2`, the wizard's Windows build (debug, with the static CRT the release uses; sha256 `62ddcf4e…`) against the released `setup-v0.4.182` (`f4fa903f…`, fetched from `/api/setup/windows`); a kept win11 vmtest cell from the lane's golden (`vmtest-w-b1-2338-173909`); the wizard walked over WebView2's debugging port as the lane's `wizard` method does (the token in a 0600 file mounted into the walker); the per-user daemon role, production as the server | **#2338 on Windows, red first, then green (issue #2338's own recipe).** A fresh per-user install with the released wizard (Done, the agent-v0.4.182 MSI, enrolled). Then the operator's edits, made while the daemon ran: `overlay_enabled = true`, `lock_on_end = "always"`, a soft-disabled `[[tunnel_routes]]` entry. **Red:** a reinstall with the released wizard and a fresh token reached Done and wrote a fresh config. `lock_on_end` went back to `"never"`, `overlay_enabled` back to `false`, and the route was gone. The same edits again, then **green:** a reinstall with the B1 wizard and a fresh token reached Done, and the config read the same as before it, key for key (secret-shaped values compared as present or absent). The three edits were kept, on the same row (one row for the name throughout). A harness fault on the way was repaired before the red run: the second launch's unzip met the still-open first wizard, and the edit step then ran twice, so its duplicate route was removed. **Harness finding:** the lane's win11 golden has an expired account password (`PasswordLastSet` 2026-09-02, Windows' 42-day maximum, so expired 2026-10-14). Its autologon stops at "Your password has expired and must be changed". Every console-session cell (`attended`, the `wizard` method) then has no desktop, and a GUI launch fails without saying why. This cell was set `PasswordNeverExpires` over SSH and rebooted; the golden needs the same at bake time. Also, as B0 found for macOS, every win11 clone enrolls under one hostname-derived machine id, so a standard enroll lands on one shared row (`6a97e322…`, created at the golden's bake). It was deleted by id afterwards, as the lane's own wizard cell does. Evidence: `~/b1/runs/win/`. |
+| 2026-10-28 | B1 | **macOS: owed.** The `cfg(target_os = "macos")` arms are compile-checked on every PR now: `cargo check -p roomler-setup --lib --bins` in CI's `macos-overlay-check` job (this branch adds the step). The GUI half was not run. The lane's tart cells are headless (B0's row), and this harness drives no display on macOS. The recipe stands as B0 wrote it, with the wizard in place of the hand-run halves: a tart cell started with `--vnc`; the wizard launched in the console user's session (`launchctl asuser <uid> open …`); the SecurityAgent password typed over VNC; then the per-user LaunchAgent, the companion and the device online. Then a Cancel after the password, which must wait the root shell out (the 5-second late-start watch). Never on the operator's own Mac. |

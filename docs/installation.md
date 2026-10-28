@@ -18,8 +18,14 @@ flowchart TB
     OS1 -->|Windows| WGUI{"GUI or terminal?"}
     WGUI -->|GUI| WIZ["roomler-setup wizard<br/>role picker → MSI"]
     WGUI -->|terminal| PS1["irm roomler.ai/api/setup/install.ps1 | iex"]
-    OS1 -->|Linux| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
-    OS1 -->|macOS| PKG["install.sh --role daemon (.pkg, arm64)<br/>(the wizard's daemon roles are Windows-only)"]
+    OS1 -->|Linux| LGUI{"GUI or terminal?"}
+    LGUI -->|"GUI (FR-129 B1)"| LWIZ["roomler-setup wizard<br/>per-user or system daemon →<br/>the embedded install.sh halves,<br/>one pkexec prompt"]
+    LGUI -->|terminal| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
+    OS1 -->|macOS| MGUI{"GUI or terminal?"}
+    MGUI -->|"GUI (FR-129 B1)"| MWIZ["roomler-setup wizard<br/>per-user daemon → install.sh halves,<br/>one osascript admin prompt<br/>(the root half: B2)"]
+    MGUI -->|terminal| PKG["install.sh --role daemon (.pkg, arm64)"]
+    LWIZ -.->|"only when the server says<br/>wizard_unix_daemon: true"| LGUI
+    MWIZ -.->|"same switch"| MGUI
 
     TC --> OS2{"OS?"}
     OS2 -->|Windows| TCW["wizard (tunnel-client role)<br/>or the zip"]
@@ -368,6 +374,99 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
 
+### The wizard on Linux (FR-129 B1)
+
+The same `roomler-setup` wizard that installs the daemon on Windows installs it
+on a Linux desktop, with two daemon cards — **this user only** (the systemd user
+unit, the overlay through the userspace netstack; the default for a desktop)
+and **system service** (the root `roomlerd.service`, the TUN overlay, config at
+`/etc/roomler/config.toml` — the terminal path's `--system`). It is a GUI front
+end to the **embedded `install.sh`**, never a second implementation of its steps
+(`agents/roomler-setup/src/unix_daemon.rs`, `orchestrator_unix.rs`):
+
+```mermaid
+sequenceDiagram
+    participant W as wizard (the person)
+    participant P as polkit prompt
+    participant R as install.sh --privileged-steps (root)
+    participant U as install.sh --user-steps (the person)
+    Note over W: system scope only: ask the root daemon which device it is, then enroll in-process → a 0600 file in a 0700 scratch dir
+    W->>P: pkexec /bin/sh <script> --privileged-steps --role daemon --server … --name … --desktop [--system --config-from <file>]
+    P-->>W: ONE password dialog (GNOME Shell / KDE)
+    P->>R: as root, its stdout and stderr to files in the scratch dir
+    R->>R: resolve · sha256 (REQUIRED) · dpkg -i / tarball · FR-96 helper · companion .deb/.rpm
+    R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#2338), then enable or RESTART roomlerd.service
+    R-->>W: lines tailed as written · exit 0 (file shredded) · before its first line: 126 = cancelled, 127 = no prompt → the terminal command · after it: the script's own exit
+    Note over W: per-user scope: enroll in-process now, folded into ~/.config/roomler/config.toml, then make the unit's folders
+    W->>U: /bin/sh <script> --user-steps --role daemon [--system]
+    U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
+```
+
+- **The cards appear only when the chosen server says so**: the wizard reads
+  `GET /api/setup/features` and shows the Linux cards on a JSON
+  `wizard_unix_daemon: true` and on nothing else — a 404 (an older server), a
+  503, a timeout, a string `"true"` all mean the tunnel-client card alone
+  (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`, default off; B1-s). The server is picked
+  after the role, so the Server page asks again when the URL changes and the
+  pipeline once more before it installs.
+- **One prompt, through the desktop's own agent.** `pkexec` is launched from
+  the wizard's process, which GNOME and Plasma put in the user manager; polkit
+  resolves it to the seat session and GNOME Shell or `polkit-kde-agent` shows
+  the dialog. `pkexec` strips `DISPLAY`, so the half cannot see a desktop:
+  the wizard passes `--desktop`, because the companion is the device's consent
+  prompt surface. Until the half prints its first line, exit **126** is the
+  person's No ("cancelled", nothing installed) and **127** is "no prompt
+  possible" (no agent in this session, `pkexec` absent, the password refused):
+  the wizard then shows the identical half as `sudo /bin/sh …` for a terminal
+  — no secret on it — waits for the person to say it ran, and checks the daemon
+  is there. After that line every exit is the script's own: a step whose
+  command is missing exits 127 too, and that is a failed step, never a reason
+  to show the terminal command.
+- **Cancel** while the dialog is up closes it, and nothing was installed. Once
+  the password is accepted the half runs as root, and nothing the wizard does
+  can stop it: a cancel then is reported, the half runs to its end, and the
+  install stops there and says what the half left. The window does not close
+  while the half runs, since the wizard's exit would remove the files the half
+  is still using. **Retry** picks up where it stopped: a half that ran to its
+  end is not run again (no second password), and a system scope is not enrolled
+  twice with a token already spent.
+- **A missing digest is an error here**, where the terminal path only warns:
+  a GUI that elevated to root places nothing it cannot verify (AC12).
+- **The token never leaves the wizard's process** — not in argv, a URL or a
+  line. A system scope enrolls *before* the prompt into a private file the half
+  places root-owned 0600; the file is shredded once placed, kept for a Retry
+  when the half failed (the single-use token is already spent, so the Retry
+  reuses the enrollment), and shredded at the wizard's exit at the latest.
+- **A reinstall keeps the device's settings (#2338).** The wizard folds the new
+  enrollment into the config already at its path, as `roomlerd enroll` does;
+  for the root config, which the person cannot read, the privileged half runs
+  `roomlerd adopt-enrollment` as root. Only the Advanced boxes the person
+  *touched* are written over an existing config. And because `systemctl enable
+  --now` leaves an active unit as it is, the half **restarts** a running
+  `roomlerd.service` onto the placed config.
+  - A config there that **does not load** is not treated as absent: the wizard
+    (or, for the root config, `adopt-enrollment`) says so, folds the enrollment
+    into its last good copy (`config.toml.prev`) when that one loads, and keeps
+    the damaged file as `config.toml.unreadable`.
+  - A system scope's machine id is **derived from the host name** (the person
+    cannot read the one in root's config). On a renamed host, or a VM cloned
+    together with its config, the server therefore enrolls a **new device**: the
+    old private-network key, which the old row still claims, is dropped so the
+    mesh comes up on a fresh one, and the old device is named — remove it if it
+    was this machine, keep it if it is the machine this one was cloned from.
+- **The overlay on a per-user install** goes through the userspace netstack:
+  the wizard writes `netstack_socks_port` (the first free port in 10800–10899)
+  with `overlay_enabled`, since a per-user unit has no `CAP_NET_ADMIN` and
+  joins nothing without it.
+- **The per-user unit's folders exist before it starts.** The packaged unit
+  lists `~/.config/roomler` and `~/.local/share/roomler` in `ReadWritePaths=`
+  without `-`, and wherever the user manager applies that sandbox (Fedora's
+  does; Ubuntu 24.04's skips its mounts) a missing one stops the unit with
+  226/NAMESPACE, every 5 s. On the terminal path `roomlerd enroll` makes both;
+  the wizard enrolls in its own process, so it makes them itself, from the same
+  resolution as the config path (a pre-rename host keeps its legacy tree).
+- Install trace: `install.method = wizard`, `scope = per-user` or `system`.
+
 ### Where a root daemon's config lives (rc.435)
 
 A **root** daemon on Linux resolves `/etc/roomler/config.toml` — the path the
@@ -483,6 +582,25 @@ cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why
 > one value, `MACOS_FLOOR` in `release-agent.yml`. A future runner move that
 > raises a dylib's minimum fails the release instead of shipping a daemon that
 > cannot start.
+
+**The wizard on macOS (FR-129 B1)** installs the per-user half — the
+LaunchAgent, screen sharing — through the same embedded `install.sh` halves as
+on Linux, under one `osascript … with administrator privileges` dialog. The
+AppleScript is a constant that takes the half's argv as *its* arguments and
+quotes each with `quoted form of`, so nothing from the device name or the
+server URL is ever interpolated into script source; a dismissed dialog
+(`User canceled. (-128)`) reads as "cancelled", a failed shell command as its
+own exit code. `do shell script` hands back nothing until the command has
+finished, so the root shell writes its output to files the wizard tails as
+they grow, and its exit status to a third. A cancel closes the dialog while it
+is up; once the password is accepted, killing `osascript` would no longer stop
+the root shell — `installer -pkg` would run on — so the wizard waits it out
+and says so instead. The card appears only when the server's `wizard_unix_daemon`
+switch is on, like the Linux cards. The root half (the overlay) is **B2**: the
+seam is in place — the pairing's `halves: 2`, two tokens, `--config-from` on
+macOS requests the root half and folds into an existing `/etc/roomler/config.toml`
+through `roomlerd adopt-enrollment` — but the wizard does not run it yet. The
+two privacy grants below remain the person's; the Done page says so.
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
