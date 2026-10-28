@@ -43,6 +43,10 @@ pub mod notify;
 /// FR-129 — the device-pairing client (`/api/pair/start`, `/api/pair/poll`):
 /// the wizard's half in A3, the daemon's `enroll --pair` in A4.
 pub mod pairing;
+/// FR-129 A4 — pairing from a terminal: the code on screen, the poll loop,
+/// the `Join …? [y/N]` guard on `/dev/tty` or the Windows console, and
+/// `--pair-org` for a terminal that has none.
+pub mod pairing_terminal;
 /// FR-90 P4-5-1b — `knowhow_probe_reach`, where this device's knowhow
 /// probes may go: its syntax, shared by the config surface and the prober.
 pub mod probe_reach;
