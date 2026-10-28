@@ -206,10 +206,10 @@ flowchart LR
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b rides the next agent release; the fleet read is AC1 |
+| P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b in 0.4.181. The fleet read is AC1, done 2026-10-28 (§9.5) |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
-| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6); field run owed. AMF not built: the measurement found no need for it |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day; field run owed. AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
@@ -506,11 +506,15 @@ flowchart LR
 
 ## 6. Acceptance criteria
 
-- [ ] **AC1 — the split, measured.** P0 has shipped, and a fleet week is read per encoder × geometry into the
+- [x] **AC1 — the split, measured.** P0 has shipped, and a fleet week is read per encoder × geometry into the
   §9 log: the share of the encode stage that is conversion, copy and upload, against submission and drain, and
   the capture thread's readback. On the QSV hosts that readback is the DXGI arm's, so its half is read once P0b
   has shipped. This is the red record for AC3 and AC4. *(P0b's first reading, agent 0.4.181 on one host:
-  3.97–4.05 ms for the DXGI readback of a 1920×1200 frame, §9.2. The fleet week is still owed.)*
+  3.97–4.05 ms for the DXGI readback of a 1920×1200 frame, §9.2.)* **Met 2026-10-28** (§9.5): the week
+  2026-10-21 20:14Z → 2026-10-28 20:14Z on the CPU path, 27 encoder × geometry groups. Conversion and copy are
+  15–35 % of the encode stage on QSV, 10–23 % on NVENC and 70–87 % on VideoToolbox, with `send_frame` and the
+  drain the rest. WGC's readback is 5.7–6.1 ms at 2560×1600. The DXGI arm's, in the 16 hours since P0b shipped,
+  is 3.4–4.1 ms at 1080p and 1200p and 7.3 ms on §2.2's 2880×1800 laptop.
 - [x] **AC2 — C0 is invisible.** `Frame::cpu()` on a GPU frame returns the bytes today's readback returns:
   tested on a Windows CI device (WARP is enough), and on the synthetic source. L0's cells read the same within
   their spread, with only `Cpu` produced. **Met 2026-10-28.** The GPU half ran in CI on the Windows runner's
@@ -606,6 +610,7 @@ flowchart LR
 | 2026-10-28 | agent 0.4.181, CORPLAP-3 on the soak (`zero_copy` on), a person's own session, 09:24:49–09:29:41Z | **The GPU input across a lock-screen transition.** All 145 heartbeats read `input_path=gpu`: 2 380 frames captured, 6 283 encoded, 40 IDRs, capture 1.49 ms and encode 11.54 ms (heartbeat means). The session crossed a desktop transition. The DXGI arm reported `AccessLost` three times and kept its device across the rebuilds ("kept the device across the rebuild", 7 times; §5.4). It then went through the GDI fallback for the lock screen, whose frames in memory the encoder uploaded into its QSV pool (`avg_upload_ms` 2.3 in that window). It climbed back to DXGI on a new device, and the encoder moved to it ("the capture's device changed under the encoder — reopened", still `gpu`). The viewer's uploaded logs carry no decode-error or keyframe line |
 | 2026-10-28 | agent 0.4.181, CORPLAP-3: `av1_qsv` 1920×1200 on the SystemContext DXGI arm, direct, AC3's test pattern full screen at 60 fps; the viewer on neo16 | **AC3's 20-minute pairs** (§9.3), on, off, on, back to back. Capture + encode 14.70 → 12.30 and 12.33 ms; the worker's CPU 15.9 → 10.6 and 10.9 ms per encoded frame at the same bytes. Every patch of the pattern decoded identically on both paths; no decode error; resyncs at one rate on both paths, and one swap episode per leg. **AC3 met.** Two pre-existing defects surfaced and were filed: saturated colours decode as BT.709 on both paths (#3049), and a recovered direct session stays at the ladder's 25 M top (#3050) |
 | 2026-10-28 | neo16: panel on the Radeon 610M, RTX 5090 with no outputs; harness `wgcx` (FR-118 tools), 2560×1600, a 60 Hz source, 30-second cells, twice | **Open decision 1, measured for P3** (§9.4). WGC with its device on the RTX 5090 keeps the frame rate (55–56 fps on both adapters) and arrives 0.3–0.6 ms later at the median, with no CPU cost in the process or in DWM. A copy into a GPU pool there takes 0.27 ms, against today's 3.7 ms readback on the Radeon device. **Resolved: WGC's device goes on the encoder's adapter.** The AMF route is not needed on this host |
+| 2026-10-28 | fleet, agents 0.4.150–0.4.182, 2026-10-21 20:14Z → 2026-10-28 20:14Z | every FFmpeg DC heartbeat on the CPU path: 27 encoder × geometry groups of ≥ 10 windows, and the readback over the windows that measured one | **AC1, the red record** (§9.5). Conversion and copy are 15–35 % of the encode stage on QSV, with `send_frame` and the drain 60–83 %. On NVENC they are 10–23 % against 75–89 %. On VideoToolbox the conversion is 70–87 %. WGC's readback is 5.7–6.1 ms at 2560×1600 over the week. The DXGI arm's (P0b, 0.4.181–0.4.182, 16 hours) is 3.4–4.1 ms at 1080p and 1200p and 7.3 ms on §2.2's 2880×1800 laptop. **AC1 met** |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -766,6 +771,80 @@ idled in P8, 180–345 MHz).
   on the encoder's adapter, and then there is nothing to cross.
 
 **Decision 1 resolved:** P3 gives WGC's device the encoder's adapter. The AMF route is not needed on this host.
+
+### 9.5 AC1, the fleet week (2026-10-28)
+
+The week from 2026-10-21 20:14Z to 2026-10-28 20:14Z, read from `agent_logs` on mars. It covers every FFmpeg DC
+heartbeat from agents 0.4.150 and later that encoded a frame on the CPU path. `input_path=gpu` is left out, which
+drops CORPLAP-3's sessions with the switch on. Stage times are medians of each heartbeat's per-frame average, in
+milliseconds. Each share is the median of every window's own share, so a row's two shares need not add up to
+100 %. The table keeps the groups with at least 250 windows. The queries and their output are `ac1-read.js`,
+`ac1-read2.js` and `ac1-read2-20261028.txt` (FR-118 tools).
+
+| Encoder | Geometry | Windows (hosts) | Encode p50 (p90) | Convert | Upload | Submit | Drain | Convert + upload, share | Submit + drain, share |
+|---|---|---|---|---|---|---|---|---|---|
+| `hevc_qsv` | 1366×768 | 121 640 (2) | 7.6 (8.0) | 2.7 | 0 | 4.8 | 0.1 | 35 % | 62 % |
+| `hevc_qsv` | 1920×1080 | 104 584 (3) | 7.3 (11.3) | 1.3 | 0 | 5.2 | 0.1 | 18 % | 81 % |
+| `hevc_qsv` | 1280×1024 | 4 356 (1) | 7.5 (7.8) | 1.8 | 0 | 5.6 | 0.1 | 24 % | 75 % |
+| `hevc_qsv` | 1920×1200 | 1 310 (1) | 10.5 (11.7) | 3.7 | 0 | 6.3 | 0.1 | 35 % | 60 % |
+| `av1_qsv` | 1920×1200 | 3 529 (1) | 13.0 (13.8) | 2.6 | 0 | 10.1 | 0.1 | 20 % | 78 % |
+| `av1_qsv` | 2880×1800 | 1 419 (1) | 19.1 (20.3) | 3.0 | 0 | 16.4 | 0.1 | 15 % | 83 % |
+| `vp9_qsv` | 1920×1080 | 8 218 (1) | 23.7 (29.6) | 4.7 | 0 | 17.9 | 0.1 | 21 % | 78 % |
+| `av1_nvenc` | 1920×1080 | 2 578 (1) | 6.9 (7.5) | 0.7 | 0 | 6.2 | 0 | 10 % | 89 % |
+| `av1_nvenc` | 1920×1200 | 349 (2) | 7.9 (8.5) | 0.8 | 0 | 7.1 | 0 | 10 % | 89 % |
+| `av1_nvenc` | 2560×1600 | 842 (1) | 5.1 (9.2) | 1.1 | 0 | 3.8 | 0 | 23 % | 75 % |
+| `hevc_nvenc` | 1920×1200 | 1 699 (2) | 20.7 (21.3) | 4.4 | 0 | 15.6 | 0 | 21 % | 75 % |
+| `hevc_nvenc` | 2560×1600 | 824 (1) | 10.4 (27.2) | 1.3 | 0 | 8.8 | 0 | 14 % | 85 % |
+| `hevc_videotoolbox` | 3024×1964 | 33 729 (1) | 6.0 (6.3) | 4.7 | 0 | 1.3 | 0 | 78 % | 22 % |
+| `hevc_videotoolbox` | 1920×1200 | 5 267 (1) | 2.9 (3.0) | 2.0 | 0 | 0.8 | 0 | 70 % | 29 % |
+| `hevc_videotoolbox` | three window sizes near 1660×1080 | 1 637 (1) | 3.2–5.8 | 2.8–5.1 | 0 | 0.4–0.7 | 0 | 85–87 % | 13–14 % |
+| `hevc_vaapi` | 1600×900 | 274 (1) | 4.1 (4.2) | 0.7 | 0.5 | 2.9 | 0 | 30 % | 70 % |
+
+The second table is the capture thread's readback, over the windows that measured one (`avg_readback_ms` > 0).
+Up to 0.4.180 only WGC reports a readback; from 0.4.181 (P0b) the DXGI arm does too. It keeps the groups with at
+least 40 windows. The geometry is the encode geometry, while the readback copies the capture surface at its native
+size: a session scaled to 1704×1066 on a 2560×1600 panel reads back the whole panel. On WGC the readback runs off
+the pump's clock, so its capture column is the pump's wait for a frame. On the DXGI arm the readback is inside
+`avg_capture_ms`, but that average counts every capture call, including the polls that found no new frame, so it
+can sit below the readback.
+
+| Releases | Arm | Encoder | Geometry | Windows | Readback p50 (p90) | Capture p50 | Encode p50 |
+|---|---|---|---|---|---|---|---|
+| 0.4.162–0.4.180 | WGC | `hevc_nvenc` | 2560×1600 | 797 | 5.7 (7.2) | 6.3 | 10.4 |
+| | WGC | `av1_nvenc` | 2560×1600 | 762 | 6.1 (8.5) | 9.4 | 5.3 |
+| | WGC | `av1_nvenc` | 1024×768 | 80 | 1.6 (2.1) | 19.9 | 3.0 |
+| | WGC | `av1_nvenc` | 1704×1066 | 68 | 8.8 (9.3) | 0.2 | 3.5 |
+| 0.4.181–0.4.182 | DXGI | `av1_qsv` | 1920×1200 | 889 | 4.1 (4.2) | 4.4 | 10.2 |
+| | DXGI | `av1_qsv` | 2880×1800 | 119 | 7.3 (9.4) | 5.5 | 17.5 |
+| | DXGI | `hevc_qsv` | 1920×1080 | 116 | 3.4 (4.1) | 1.9 | 6.8 |
+| | DXGI | `av1_nvenc` | 1920×1080 | 59 | 6.8 (8.0) | 6.0 | 6.6 |
+| | WGC | `av1_nvenc` | 2560×1600 | 55 | 7.8 (9.0) | 4.5 | 4.5 |
+| | DXGI | `av1_qsv` | 1920×1080 | 46 | 4.0 (5.3) | 4.1 | 8.6 |
+
+The arm of a 0.4.181+ row is inferred, not logged: the heartbeat does not name its backend. Every QSV host
+captures through the DXGI arm (§9.1). The `av1_nvenc` 1920×1080 host reported no readback in its 2 514 windows
+before 0.4.181, so it is not on WGC either. The 2560×1600 host is neo16 (§9.4).
+
+- **On QSV and NVENC the conversion is the smaller part of the encode stage.** The CPU's BGRA → NV12 conversion
+  and the plane copy take 15–35 % of the stage on QSV and 10–23 % on NVENC; `send_frame` and the drain take
+  the rest. `send_frame` holds the encoder's own upload of the system-memory frame and, with one frame in
+  flight, the wait for the hardware encode, and the heartbeat cannot separate the two. AC3 could: on
+  CORPLAP-3 the GPU input took capture + encode from 14.70 to 12.30 ms (§9.3).
+- **On VideoToolbox the conversion is the larger part**, 70–87 % of the stage, as §9.1 found. Per frame, P5
+  has the most to remove.
+- **The readback is as long as an encode stage.** WGC's is 5.7–6.1 ms at 2560×1600, against an AV1 stage of
+  5.1–5.3 ms on the same host. The DXGI arm's is 3.4–4.1 ms at 1080p and 1200p, against QSV stages of
+  6.8–10.2 ms. That copy is what P2 and P3 take off the capture thread.
+- **The red record for AC3 and AC4.** AC3's host, `av1_qsv` at 1920×1200, reads back 4.1 ms and encodes in
+  10.2 ms on 0.4.181, as §9.2's and §9.3's legs with the switch off measured. AC4's host, §2.2's 2880×1800
+  laptop, has an encode stage of 19.1 ms over the week, 16.4 ms of it in `send_frame` and 3.0 ms in the
+  conversion, and a 7.3 ms readback on 0.4.182. The GPU input removes the readback, the conversion and QSV's
+  upload. How much of `send_frame` is that upload, and so whether the host can reach 50 fps, is for AC4 to
+  measure.
+- **The DXGI half covers 16 hours, not a week.** P0b shipped in 0.4.181 at 04:13Z on the window's last day,
+  so its rows are the sessions since then. AC1 asks for that half once P0b has shipped.
+
+**AC1 met.**
 
 ## 10. Related
 

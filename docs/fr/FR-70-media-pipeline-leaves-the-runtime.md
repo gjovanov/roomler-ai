@@ -1201,6 +1201,19 @@ shadow WOULD count, and one is the stale phenomenon M3a.1 already counts apart.
 Nothing could tell them apart mechanically. A week's read was therefore a hand
 attribution, and a gate that needs one cannot read zero.
 
+**The final read** covered exactly the week, 2026-10-21 16:55:30Z to 2026-10-28
+16:55:30Z, bounded at both ends, with server-side counts only (#1330). It had
+737 sessions started, 730 with agent logs, and **426 FFmpeg DC sessions with
+heartbeats on 13 hosts** (294 718 heartbeats). 364 read zero on every field,
+and **62 carried a divergence**: 36 in `dims` only, 20 in `bitrate` only, 6 in
+both. They wrote **71 first-divergence lines: 45 `dims`, 26 `bitrate`**.
+`budget`, `hard_budget`, `lag_bound`, `gate` and `fps` read zero in every
+session. By encoder: `hevc_qsv` 25, `av1_nvenc` 17, `hevc_videotoolbox` 10,
+`hevc_nvenc` 6, `av1_qsv` 2, `vp9_qsv` 2. The 12 hours after the interim read
+added 18 sessions and 5 divergences (4 `dims` lines, 1 `bitrate`), in the same
+two fields as the six classes. They were not attributed by hand. **AC10 does
+not hold for this week.**
+
 **Decided by the operator, 2026-10-28:** count the documented lags and B2 apart,
 and fix B1. B3 surfaced while this section's cases were re-read for it (the
 interim attribution had filed #24 under D3 by its `dims` line alone). It is
@@ -1276,9 +1289,9 @@ flowchart TD
 
 The gate reads every `plan_divergences` field at zero. `plan_lags`,
 `plan_stale_swaps` and `plan_stale_ticks` are reported beside it and do not
-fail it. The week restarts on the release carrying M3a.3. Its read keeps the
-`remote_sessions` denominator, and a divergence there is a bug by construction:
-its inputs held.
+fail it. The week restarts on the release carrying M3a.3, agent 0.4.182
+(published 2026-10-28 17:04Z). Its read keeps the `remote_sessions`
+denominator, and a divergence there is a bug by construction: its inputs held.
 
 ## Acceptance criteria
 
@@ -1341,11 +1354,13 @@ its inputs held.
       the next tick. Owed: that fix, a week after it, the full read with the
       `remote_sessions` denominator, and the missing driven moves — §"M3a.1".
       The fix is §"M3a.2", in 0.4.150 at the earliest; the week starts there.
-      2026-10-28: that week's read found 57 of 408 FFmpeg DC sessions with a
-      divergence, in six classes. Three are the documented lags, one is M3a.1's
-      stale adoption a tick later, and two are genuine bugs, both fixed in
-      §"M3a.3", which also counts the lags and the first-tick re-rates apart.
-      The week restarts on the release carrying M3a.3.)*
+      2026-10-28: that week's interim read found 57 of 408 FFmpeg DC sessions
+      with a divergence, in six classes. Three are the documented lags, one is
+      M3a.1's stale adoption a tick later, and two are genuine bugs, both fixed
+      in §"M3a.3", which also counts the lags and the first-tick re-rates apart.
+      The final read of the week found 62 of 426, every one in `dims` or
+      `bitrate`, so the week fails (§"What the week found"). The week restarts
+      on the release carrying M3a.3, 0.4.182.)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 
