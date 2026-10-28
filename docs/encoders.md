@@ -581,14 +581,20 @@ The session reports which form it opened and why, on the heartbeat as
   limited range, the matrix of the CPU path's conversion, so flipping the
   switch does not change the picture. In the field, on an Intel adapter,
   flat regions decode identically on both paths.
-- **Measured** ([FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28),
-  `av1_qsv` at 1920×1200, the same encoded rate): capture + encode fell from
-  14.5 to 12.2 ms per frame, and the worker's CPU from 52 % to 34 % of a core.
-  The readback leaves the capture stage. `send_frame` grows by 1.8 ms, because
-  it now waits for the GPU's conversion before QSV reads the surface.
+- **Measured** ([FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28),
+  `av1_qsv` at 1920×1200 and 60 fps on a moving test pattern, 20-minute legs
+  on, off, on): capture + encode fell from 14.70 to 12.30 ms per frame, and the
+  worker's CPU from 15.9 to 10.6 ms per encoded frame, at the same bytes. The
+  readback leaves the capture stage. `send_frame` grows by 1.9 ms, because it
+  now waits for the GPU's conversion before QSV reads the surface. The pattern
+  decodes identically on both paths.
 - **Not yet:** NVENC, AMF and the WGC arm (FR-118 P3). On a hybrid laptop
   whose panel is driven by the iGPU, WGC's device and the dGPU's encoder sit on
-  different adapters.
+  different adapters. Measured on such a laptop
+  ([FR-118 §9.4](fr/FR-118-gpu-resident-frames.md#94-wgc-across-adapters-for-p3-2026-10-28)):
+  giving WGC's device the encoder's adapter lets the OS copy each frame across
+  for 0.3–0.6 ms at the median, with no frame lost and no CPU spent, so that is
+  the adapter P3 uses.
 
 ## Configuration
 
