@@ -3506,7 +3506,12 @@ fn prev_path(path: &std::path::Path) -> PathBuf {
 
 pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     let err = match try_load(path) {
-        Ok(cfg) => return Ok(cfg),
+        Ok(cfg) => {
+            // Here, not in `try_load`: that also serves the optional probe and
+            // `save`'s rotation check, which have nothing to tell an owner.
+            note_unknown_keys(path);
+            return Ok(cfg);
+        }
         Err(e) => e,
     };
 
@@ -3739,12 +3744,241 @@ fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     Ok(cfg)
 }
 
+/// One step to a key in the config document, as `serde_ignored` reports where
+/// a key it skipped sits: a table key, or an entry of an array of tables
+/// (`[[orgs]]`, `[[tunnel_routes]]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyStep {
+    Key(String),
+    Index(usize),
+}
+
+/// #2078 — the keys in `raw` that this build's [`AgentConfig`] does not model,
+/// each as the steps to it: a key a newer build added, set ahead of the update
+/// that knows it or left behind by a rollback. Paths only, never values: the
+/// file holds the agent token and the overlay keys.
+///
+/// `Err` when `raw` does not parse as a config at all.
+fn unknown_keys(raw: &str) -> Result<Vec<Vec<KeyStep>>> {
+    let mut found = Vec::new();
+    let de = toml::de::Deserializer::parse(raw)?;
+    let _: AgentConfig = serde_ignored::deserialize(de, |path| found.push(key_steps(&path)))?;
+    Ok(found)
+}
+
+fn key_steps(path: &serde_ignored::Path<'_>) -> Vec<KeyStep> {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => Vec::new(),
+        Path::Seq { parent, index } => {
+            let mut steps = key_steps(parent);
+            steps.push(KeyStep::Index(*index));
+            steps
+        }
+        Path::Map { parent, key } => {
+            let mut steps = key_steps(parent);
+            steps.push(KeyStep::Key(key.clone()));
+            steps
+        }
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => key_steps(parent),
+    }
+}
+
+/// `orgs.0.future_key`, for the log.
+fn dotted(steps: &[KeyStep]) -> String {
+    steps
+        .iter()
+        .map(|s| match s {
+            KeyStep::Key(k) => k.clone(),
+            KeyStep::Index(i) => i.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The keys that name an entry of an array of tables: a route's `id`, an org's
+/// `tenant_id`, else a `label`. The first one the entry on disk has decides.
+const ENTRY_IDENTITY: [&str; 3] = ["id", "tenant_id", "label"];
+
+/// Where `entry`, from the file being replaced, sits in `out` now: found by its
+/// identity, never by its position. A save that adds or removes an org moves
+/// the entries, and promoting one puts the demoted primary at the promoted
+/// org's index (`promote_org_to_primary`), so the same index can hold another
+/// org with the array's length unchanged. A key copied onto another org would
+/// be worse than a key lost. `None` when the entry has no identity, or not
+/// exactly one entry in `out` carries it.
+fn same_entry(entry: &toml::Table, out: &[toml::Value]) -> Option<usize> {
+    let key = ENTRY_IDENTITY
+        .iter()
+        .find(|k| entry.get(**k).is_some_and(toml::Value::is_str))?;
+    let want = entry.get(*key)?;
+    let mut hits = out
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.get(*key) == Some(want));
+    let (i, _) = hits.next()?;
+    hits.next().is_none().then_some(i)
+}
+
+/// Copies the key at `steps` from `disk` into `out`, which must already hold
+/// every table on the way; an entry of an array of tables is found by
+/// [`same_entry`]. `false` = not kept.
+fn copy_key(disk: &toml::Table, out: &mut toml::Table, steps: &[KeyStep]) -> bool {
+    match steps {
+        [KeyStep::Key(k)] => match disk.get(k) {
+            Some(value) => {
+                if !out.contains_key(k) {
+                    out.insert(k.clone(), value.clone());
+                }
+                true
+            }
+            None => false,
+        },
+        [KeyStep::Key(k), KeyStep::Index(n), rest @ ..] => {
+            let (Some(toml::Value::Array(d)), Some(toml::Value::Array(o))) =
+                (disk.get(k), out.get_mut(k))
+            else {
+                return false;
+            };
+            let Some(toml::Value::Table(entry)) = d.get(*n) else {
+                return false;
+            };
+            let Some(i) = same_entry(entry, o) else {
+                return false;
+            };
+            match o.get_mut(i) {
+                Some(toml::Value::Table(o)) => copy_key(entry, o, rest),
+                _ => false,
+            }
+        }
+        [KeyStep::Key(k), rest @ ..] => match (disk.get(k), out.get_mut(k)) {
+            (Some(toml::Value::Table(d)), Some(toml::Value::Table(o))) => copy_key(d, o, rest),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// #2078 — `plain` (the struct's own serialisation) plus every key of `raw`
+/// (the file being replaced) at `unknown`, each where it was. Read back, the
+/// result must serialise to exactly `plain`: the merge may only ADD what this
+/// build ignores and never change a key it knows, so a key it cleared stays
+/// cleared. Returns the text and the keys it could not keep.
+///
+/// The errors are fixed strings on purpose: a TOML error quotes the line it
+/// stopped at, and these lines hold the agent token and the overlay keys.
+fn merge_unknown_keys(
+    raw: &str,
+    plain: &str,
+    unknown: &[Vec<KeyStep>],
+) -> std::result::Result<(String, Vec<String>), &'static str> {
+    let disk: toml::Table =
+        toml::from_str(raw).map_err(|_| "the file being replaced did not parse as a table")?;
+    let mut out: toml::Table =
+        toml::from_str(plain).map_err(|_| "the config being saved did not parse as a table")?;
+    let mut lost = Vec::new();
+    for steps in unknown {
+        if !copy_key(&disk, &mut out, steps) {
+            lost.push(dotted(steps));
+        }
+    }
+    let merged = toml::to_string_pretty(&out).map_err(|_| "the merged table did not serialise")?;
+    let back: AgentConfig =
+        toml::from_str(&merged).map_err(|_| "the merged text did not read back as a config")?;
+    let again = toml::to_string_pretty(&back).map_err(|_| "the merged config did not serialise")?;
+    if again != plain {
+        return Err("the merged text changed a key this build knows");
+    }
+    Ok((merged, lost))
+}
+
+/// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key the file
+/// being replaced holds that this build does not model. Before this, every
+/// save erased them: a key set ahead of the update that knows it was gone by
+/// the old daemon's stop, and a rollback erased every newer key for good.
+///
+/// A file with no such key is written exactly as before, byte for byte, and
+/// any failure to keep them saves `cfg` alone and says so: the worst case is
+/// the old behaviour. Comments are still lost; that needs an in-place editor.
+fn serialise_for(path: &PathBuf, cfg: &AgentConfig) -> Result<String> {
+    let plain = toml::to_string_pretty(cfg).context("serialising config")?;
+    // No file yet, unreadable, or not a config: nothing to keep.
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(plain);
+    };
+    let Ok(unknown) = unknown_keys(&raw) else {
+        return Ok(plain);
+    };
+    if unknown.is_empty() {
+        return Ok(plain);
+    }
+    match merge_unknown_keys(&raw, &plain, &unknown) {
+        Ok((merged, lost)) => {
+            if !lost.is_empty() {
+                tracing::warn!(
+                    path = %path.display(),
+                    keys = %lost.join(", "),
+                    "config keys this build does not know were NOT kept through this save: \
+                     the org, route or table that held them is not in it"
+                );
+            }
+            Ok(merged)
+        }
+        Err(why) => {
+            let keys: Vec<String> = unknown.iter().map(|s| dotted(s)).collect();
+            tracing::warn!(
+                path = %path.display(),
+                keys = %keys.join(", "),
+                why,
+                "config keys this build does not know were NOT kept through this save"
+            );
+            Ok(plain)
+        }
+    }
+}
+
+/// #2078 — names the keys this build ignores in the config it runs on, once per
+/// process and file: after a rollback, or a key set ahead of the update that
+/// knows it, "my setting did nothing" has its answer in the log. Key paths
+/// only; the file holds secrets.
+fn note_unknown_keys(path: &PathBuf) {
+    static NOTED: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(unknown) = unknown_keys(&raw) else {
+        return;
+    };
+    if unknown.is_empty() {
+        return;
+    }
+    let keys = unknown
+        .iter()
+        .map(|s| dotted(s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    {
+        let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if noted.iter().any(|(p, k)| p == path && *k == keys) {
+            return;
+        }
+        noted.push((path.clone(), keys.clone()));
+    }
+    tracing::warn!(
+        path = %path.display(),
+        keys = %keys,
+        "config keys this build does not know: ignored here, and kept in the file through every save"
+    );
+}
+
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
-    let serialised = toml::to_string_pretty(cfg).context("serialising config")?;
+    let serialised = serialise_for(path, cfg)?;
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -4026,6 +4260,219 @@ machine_name = "devbox"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unknown_names(path: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = unknown_keys(&std::fs::read_to_string(path).unwrap())
+            .unwrap()
+            .iter()
+            .map(|s| dotted(s))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn saved_table(path: &std::path::Path) -> toml::Table {
+        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// #2078 / #2972 — what the running build does not model survives its
+    /// saves: a top-level key (the field cases were `mutter_input` under 0.4.131
+    /// and `hive_worker` under 0.4.177), a whole table, and a key inside a table
+    /// this build does know. The change the save was for is made, and a second
+    /// save keeps them too: the field defect showed at the NEXT start.
+    #[test]
+    fn keys_this_build_does_not_know_survive_its_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "a_key_from_a_newer_build = true\n{}\n[forward_acl]\nenabled = true\n\
+             rule_from_a_newer_build = \"strict\"\n\n[a_table_from_a_newer_build]\nlimit = 7\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let want = [
+            "a_key_from_a_newer_build",
+            "a_table_from_a_newer_build",
+            "forward_acl.rule_from_a_newer_build",
+        ];
+        assert_eq!(unknown_names(&path), want);
+
+        let mut cfg = load(&path).expect("a file with keys this build does not know still loads");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        let table = saved_table(&path);
+        assert_eq!(table["a_key_from_a_newer_build"].as_bool(), Some(true));
+        assert_eq!(
+            table["forward_acl"]["rule_from_a_newer_build"].as_str(),
+            Some("strict")
+        );
+        assert_eq!(
+            table["a_table_from_a_newer_build"]["limit"].as_integer(),
+            Some(7)
+        );
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        assert_eq!(back.agent_token, "tok");
+
+        save(&path, &back).unwrap();
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+        assert_eq!(try_load(&path).unwrap().machine_name, "renamed");
+    }
+
+    /// #2078 — only keys this build IGNORES are carried over. One it knows and
+    /// the save cleared stays cleared, though the file being replaced had it.
+    #[test]
+    fn a_known_key_the_save_cleared_stays_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "zero_copy = true\na_key_from_a_newer_build = 1\n{}",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let mut cfg = load(&path).unwrap();
+        assert_eq!(cfg.zero_copy, Some(true));
+        cfg.zero_copy = None;
+        save(&path, &cfg).unwrap();
+        let table = saved_table(&path);
+        assert!(
+            !table.contains_key("zero_copy"),
+            "a cleared key came back: {table:?}"
+        );
+        assert_eq!(table["a_key_from_a_newer_build"].as_integer(), Some(1));
+    }
+
+    /// #2078 — a file with nothing unknown in it is written exactly as before
+    /// the fix, byte for byte: the merge runs only when there is something to
+    /// keep.
+    #[test]
+    fn a_file_with_nothing_unknown_is_written_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        save(&path, &cfg).unwrap();
+        save(&path, &cfg).unwrap(); // reads the first save: nothing unknown in it
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            toml::to_string_pretty(&cfg).unwrap()
+        );
+    }
+
+    /// #2078 — a key a newer build wrote into an org's entry follows THAT org,
+    /// found by its `tenant_id`, through a save that moves it, and is dropped
+    /// (with a WARN) once the org is gone. Never by position and never by label:
+    /// promoting an org puts the demoted primary at the promoted org's index,
+    /// under the promoted org's label, with the array's length unchanged.
+    #[test]
+    fn an_org_entrys_unknown_key_follows_its_org() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture(); // primary tenant: "tid"
+        cfg.orgs = vec![
+            org_fixture("zeta", "tid-z"),
+            org_fixture("acme", "tid-acme"),
+            org_fixture("beta", "tid-beta"),
+        ];
+        save(&path, &cfg).unwrap();
+        // A newer build wrote a key into acme's entry and into beta's.
+        let mut table = saved_table(&path);
+        for i in [1usize, 2] {
+            table
+                .get_mut("orgs")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|orgs| orgs.get_mut(i))
+                .and_then(|org| org.as_table_mut())
+                .unwrap()
+                .insert(
+                    "org_key_from_a_newer_build".into(),
+                    toml::Value::Integer(i as i64),
+                );
+        }
+        std::fs::write(&path, toml::to_string_pretty(&table).unwrap()).unwrap();
+        assert_eq!(
+            unknown_names(&path),
+            [
+                "orgs.1.org_key_from_a_newer_build",
+                "orgs.2.org_key_from_a_newer_build"
+            ]
+        );
+
+        // Removing zeta moves acme and beta down one: each key goes with its org.
+        let mut moved = load(&path).unwrap();
+        moved.orgs.remove(0);
+        save(&path, &moved).unwrap();
+        let orgs = saved_table(&path)["orgs"].as_array().unwrap().clone();
+        assert_eq!(orgs[0]["tenant_id"].as_str(), Some("tid-acme"));
+        assert_eq!(orgs[0]["org_key_from_a_newer_build"].as_integer(), Some(1));
+        assert_eq!(orgs[1]["tenant_id"].as_str(), Some("tid-beta"));
+        assert_eq!(orgs[1]["org_key_from_a_newer_build"].as_integer(), Some(2));
+
+        // Promoting acme puts the demoted primary at acme's index, under acme's
+        // label. acme's key does not pass to it, and beta's stays on beta.
+        let mut promoted = load(&path).unwrap();
+        promote_org_to_primary(&mut promoted, "acme", None).unwrap();
+        save(&path, &promoted).unwrap();
+        let orgs = saved_table(&path)["orgs"].as_array().unwrap().clone();
+        assert_eq!(orgs.len(), 2);
+        assert_eq!(
+            orgs[0]["tenant_id"].as_str(),
+            Some("tid"),
+            "the demoted primary"
+        );
+        assert_eq!(
+            orgs[0]["label"].as_str(),
+            Some("acme"),
+            "under acme's label"
+        );
+        assert!(
+            orgs[0].get("org_key_from_a_newer_build").is_none(),
+            "acme's key went to another org: {orgs:?}"
+        );
+        assert_eq!(orgs[1]["org_key_from_a_newer_build"].as_integer(), Some(2));
+    }
+
+    /// #2078 — a file that carries one unknown key is not re-sorted around it:
+    /// the merged text keeps the struct's own order (`preserve_order`).
+    #[test]
+    fn a_merged_file_keeps_the_structs_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        save(&path, &cfg).unwrap();
+        let plain = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("a_key_from_a_newer_build = true\n{plain}")).unwrap();
+        save(&path, &cfg).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|l| l.split(" = ").next().unwrap_or("").trim().to_string())
+                .filter(|k| !k.is_empty() && k != "a_key_from_a_newer_build")
+                .collect()
+        };
+        assert_eq!(lines(&merged), lines(&plain), "{merged}");
+        assert!(
+            merged.contains("a_key_from_a_newer_build = true"),
+            "{merged}"
+        );
+    }
+
+    /// The merge's own guard. Were the unknown-key scan ever to name a key this
+    /// build knows, the read-back check refuses the merge, and `save` writes the
+    /// plain struct, rather than bring a cleared value back.
+    #[test]
+    fn the_merge_refuses_to_change_a_key_this_build_knows() {
+        let mut cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        cfg.zero_copy = None;
+        let plain = toml::to_string_pretty(&cfg).unwrap();
+        let raw = format!("zero_copy = true\n{}", minimal_toml());
+        let wrong = [vec![KeyStep::Key("zero_copy".into())]];
+        assert_eq!(
+            merge_unknown_keys(&raw, &plain, &wrong).unwrap_err(),
+            "the merged text changed a key this build knows"
+        );
     }
 
     #[test]
