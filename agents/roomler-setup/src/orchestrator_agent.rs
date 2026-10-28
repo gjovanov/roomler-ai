@@ -605,11 +605,20 @@ async fn run_install_inner(
     // operator-owned key. FR-99 decision 3's `lock_on_end = auto` and the
     // flavour's overlay default (FR-84 S2) apply to a FRESH config only; the
     // boxes the person touched land either way, the untouched ones only on
-    // a fresh config.
-    let existing = roomlerd::config::read_if_present(&config_path);
-    let crate::enroll_step::Enrolled { mut cfg, outcome } = crate::enroll_step::enroll_folded(
+    // a fresh config. F4: a config there that does not load is said,
+    // recovered from its last good copy when it can be, and kept aside —
+    // never read as absent and silently written over.
+    let existing = crate::enroll_step::read_existing(&config_path);
+    if let Some(message) = existing.warning {
+        emit(on_event, ProgressEvent::PreflightWarning { message });
+    }
+    let crate::enroll_step::Enrolled {
+        mut cfg,
+        outcome,
+        previous_row,
+    } = crate::enroll_step::enroll_folded(
         &config_path,
-        existing,
+        existing.cfg,
         &server,
         &token,
         &device_name,
@@ -617,6 +626,16 @@ async fn run_install_inner(
     )
     .await
     .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    // F3: the machine id was read back from the config, so the server reuses
+    // the row — unless it no longer can; then the old key is retired and said.
+    if let Some(row) = &previous_row {
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: roomlerd::enrollment::describe_previous_row(row, &cfg.agent_id),
+            },
+        );
+    }
     let note = crate::enroll_step::finish(
         &mut cfg,
         &outcome,

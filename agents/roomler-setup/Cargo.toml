@@ -106,6 +106,12 @@ tempfile = { workspace = true }
 # Win32 mechanic this app needs: MSI wait/terminate, registry PATH
 # edit, WM_SETTINGCHANGE broadcast.)
 
+# FR-129 B1 (F3) — the root daemon's own identity, read over the person
+# socket a Linux root daemon serves the console user (`root_identity.rs`).
+# The protocol leaf crate only: the companion links the same one.
+[target.'cfg(target_os = "linux")'.dependencies]
+roomler-localapi = { path = "../../crates/localapi" }
+
 [dev-dependencies]
 # `config::test_fixture()` for the orchestrator's config-shaping tests — the
 # same escape roomlerd uses: the fixture is feature-gated so a downstream

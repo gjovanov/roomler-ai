@@ -34,11 +34,21 @@
 //! it here (it is root's, 0600); its merge runs inside the privileged
 //! `install.sh` half through `roomlerd adopt-enrollment`, which applies the
 //! same rules with the same function — [`crate::orchestrator_unix`].
+//!
+//! Two more rules, shared with `adopt-enrollment` through the agent's core:
+//!
+//! 4. A config that is there and does not load is never read as "absent"
+//!    ([`read_existing`]): its last good copy (`.prev`) is folded into when
+//!    that one loads, the damaged file is kept aside as `.unreadable`, and the
+//!    person is told which happened (F4).
+//! 5. A refresh of the same org that the server answered with ANOTHER device
+//!    row does not keep the WireGuard key the previous row still claims
+//!    ([`Enrolled::previous_row`], F3).
 
 use std::path::Path;
 
-use roomlerd::config::AgentConfig;
-use roomlerd::enrollment::{EnrollInputs, EnrollOutcome, InstallInfo};
+use roomlerd::config::{AgentConfig, MergeBase};
+use roomlerd::enrollment::{EnrollInputs, EnrollOutcome, InstallInfo, PreviousRow};
 
 use crate::orchestrator_agent::AdvancedOptions;
 
@@ -46,6 +56,45 @@ use crate::orchestrator_agent::AdvancedOptions;
 pub struct Enrolled {
     pub cfg: AgentConfig,
     pub outcome: EnrollOutcome,
+    /// The server answered with another device row than the config held
+    /// (its WireGuard key was retired from `cfg`); the caller tells the
+    /// person ([`roomlerd::enrollment::describe_previous_row`]).
+    pub previous_row: Option<PreviousRow>,
+}
+
+/// What a fold found at the config path.
+pub struct Existing {
+    /// The config to fold into: the one at the path, or its last good copy.
+    pub cfg: Option<AgentConfig>,
+    /// For the person, when the file at the path did not load.
+    pub warning: Option<String>,
+}
+
+/// F4 — read the config at `path` for a fold: a file there that does not
+/// load is recovered from its last good copy when that one loads, kept aside
+/// either way, and said — never silently "absent", which would write a fresh
+/// config over the device's settings ([`roomlerd::config::read_merge_base`]).
+pub fn read_existing(path: &Path) -> Existing {
+    match roomlerd::config::read_merge_base(&path.to_path_buf()) {
+        MergeBase::Absent => Existing {
+            cfg: None,
+            warning: None,
+        },
+        MergeBase::Loaded(cfg) => Existing {
+            cfg: Some(cfg),
+            warning: None,
+        },
+        MergeBase::Unreadable { reason, recovered } => {
+            let kept = roomlerd::config::keep_unreadable(path).map_err(|e| e.to_string());
+            let warning =
+                roomlerd::config::describe_unreadable(path, &reason, recovered.is_some(), &kept);
+            tracing::warn!(path = %path.display(), %reason, recovered = recovered.is_some(), "the existing config does not load");
+            Existing {
+                cfg: recovered,
+                warning: Some(warning),
+            }
+        }
+    }
 }
 
 /// Enroll `device_name` against `server` with `token`, for the config at
@@ -75,8 +124,21 @@ pub async fn enroll_folded(
         install: Some(install),
     })
     .await?;
-    let (cfg, outcome) = roomlerd::enrollment::apply_enrollment(existing, fresh, None, false)?;
-    Ok(Enrolled { cfg, outcome })
+    fold(existing, fresh)
+}
+
+/// The fold itself, without the network: `apply_enrollment`, then the
+/// previous row's key retired when the server made another row (F3).
+fn fold(existing: Option<AgentConfig>, fresh: AgentConfig) -> anyhow::Result<Enrolled> {
+    let previous = existing.clone();
+    let (mut cfg, outcome) = roomlerd::enrollment::apply_enrollment(existing, fresh, None, false)?;
+    let previous_row =
+        roomlerd::enrollment::retire_key_of_previous_row(previous.as_ref(), &mut cfg, &outcome);
+    Ok(Enrolled {
+        cfg,
+        outcome,
+        previous_row,
+    })
 }
 
 /// Finish a folded config before it is saved: a fresh install's defaults on
@@ -234,5 +296,70 @@ mod tests {
         assert!(!cfg.auto_grant_session);
         assert_eq!(cfg.lock_on_end, LockOnEnd::Always);
         assert!(note.unwrap().contains("\"other\""));
+    }
+
+    /// F4 — the wizard's fold (Windows, Linux and macOS per-user) never reads
+    /// a config that is there and does not load as "absent". Before the fix it
+    /// took the probe's `None` and wrote a fresh config over the device's
+    /// settings, unsaid; `save` does not even keep a file that does not parse.
+    #[test]
+    fn a_config_that_does_not_load_is_said_recovered_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Nothing there, and a config that loads: no word.
+        let none = read_existing(&path);
+        assert!(none.cfg.is_none() && none.warning.is_none());
+        roomlerd::config::save(&path, &existing()).unwrap();
+        let fine = read_existing(&path);
+        assert!(fine.cfg.is_some() && fine.warning.is_none());
+
+        // A second save keeps the first as `.prev`; then a hand edit breaks it.
+        roomlerd::config::save(&path, &existing()).unwrap();
+        std::fs::write(&path, "overlay_enabled = ture\n").unwrap();
+        let broken = read_existing(&path);
+        let warning = broken.warning.expect("said");
+        assert!(warning.contains("could not be read"), "{warning}");
+        assert!(warning.contains("config.toml.prev"), "{warning}");
+        assert!(warning.contains("config.toml.unreadable"), "{warning}");
+        let cfg = broken.cfg.expect("its last good copy");
+        assert!(cfg.overlay_enabled, "the device's settings carry over");
+        assert_eq!(cfg.lock_on_end, LockOnEnd::Always);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.unreadable")).unwrap(),
+            "overlay_enabled = ture\n",
+            "the damaged file is kept"
+        );
+
+        // No last good copy: said, kept, and nothing to fold into.
+        std::fs::remove_file(dir.path().join("config.toml.prev")).unwrap();
+        let lost = read_existing(&path);
+        assert!(lost.cfg.is_none());
+        assert!(
+            lost.warning.expect("said").contains("do not carry over"),
+            "the person is told the settings are gone"
+        );
+    }
+
+    /// F3 — the in-process fold retires the WireGuard key when the server
+    /// answered with another device row of the same org, and keeps it on the
+    /// same row (the ordinary reinstall).
+    #[test]
+    fn a_new_row_retires_the_key_in_the_wizards_fold() {
+        let mut held = existing();
+        held.overlay_wg_secret_key = Some("OLD".into());
+        let mut same = roomlerd::config::test_fixture();
+        same.agent_token = "NEW".into();
+        let kept = fold(Some(held.clone()), same).unwrap();
+        assert!(kept.previous_row.is_none());
+        assert_eq!(kept.cfg.overlay_wg_secret_key.as_deref(), Some("OLD"));
+
+        let mut other = roomlerd::config::test_fixture();
+        other.agent_id = "aid-2".into();
+        other.machine_id = "mid-2".into();
+        let moved = fold(Some(held), other).unwrap();
+        assert_eq!(moved.cfg.overlay_wg_secret_key, None);
+        assert_eq!(moved.previous_row.expect("a new row").agent_id, "aid");
+        assert!(moved.cfg.overlay_enabled, "everything else stays");
     }
 }
