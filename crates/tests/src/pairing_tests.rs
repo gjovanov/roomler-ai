@@ -311,6 +311,10 @@ async fn a_daemon_pairing_delivers_an_enrollment_token_once_and_it_enrolls() {
     assert_eq!(tokens.len(), 1);
     assert_eq!(polled["org_name"], "pair1 Corp");
     assert_eq!(polled["approver_name"], "pair1 Admin");
+    // F2 — the hijack guard shows the UNIQUE handles beside the display
+    // names, which anyone can set to anything.
+    assert_eq!(polled["org_slug"], "pair1");
+    assert_eq!(polled["approver_username"], "pair1_admin");
     let token = tokens[0].as_str().unwrap();
 
     // FR-102: the issuance is on the ledger exactly as the admin route's is.
@@ -507,8 +511,10 @@ async fn a_user_code_or_a_forged_device_code_retrieves_nothing() {
         assert_eq!(polled["status"], "expired_token", "{forged:?}: {polled}");
         assert!(polled.get("tokens").is_none());
     }
-    // Every forged poll is on the trail.
-    assert_eq!(audit(&app, "refuse", "refused:unknown_code").await.len(), 6);
+    // F4 — the forged polls are on the trail ONCE: an anonymous refusal is
+    // recorded once per source per hour, or a flood would write a durable
+    // row per request.
+    assert_eq!(audit(&app, "refuse", "refused:unknown_code").await.len(), 1);
 
     // The real code still delivers: the forgeries cost the pairing nothing.
     let (_, polled) = poll(&app, &device_code).await;
@@ -614,7 +620,134 @@ async fn polling_faster_than_the_interval_answers_slow_down_with_a_longer_interv
     let (_, third) = poll(&app, &device_code).await;
     assert_eq!(third["status"], "slow_down", "{third}");
     assert_eq!(third["interval"], 15);
-    assert_eq!(audit(&app, "refuse", "refused:slow_down").await.len(), 2);
+    // F4 — one durable row per source per hour for this class.
+    assert_eq!(audit(&app, "refuse", "refused:slow_down").await.len(), 1);
+}
+
+/// F3 — the interval only ever grows within a pairing's life: polls in
+/// flight together each read the old interval, and the row keeps the
+/// highest value any of them answered (`$max`), never a stale lower one.
+#[tokio::test]
+async fn concurrent_polls_never_shorten_the_interval() {
+    let app = TestApp::spawn().await; // the default interval: 5 s
+    let (device_code, user_code) = start_daemon(&app).await;
+    let (_, first) = poll(&app, &device_code).await;
+    assert_eq!(first["status"], "authorization_pending", "{first}");
+
+    let burst = futures::future::join_all((0..8).map(|_| poll(&app, &device_code))).await;
+    let mut answered = Vec::new();
+    for (status, body) in burst {
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "slow_down", "{body}");
+        answered.push(body["interval"].as_u64().unwrap());
+    }
+    let highest = *answered.iter().max().unwrap();
+    assert!(highest >= 10, "{answered:?}");
+    let row = pairing_row(&app, &user_code).await;
+    let stored = row
+        .get_i64("poll_interval_secs")
+        .map(|v| v as u64)
+        .unwrap_or_else(|_| row.get_i32("poll_interval_secs").map(|v| v as u64).unwrap());
+    assert!(
+        stored >= highest,
+        "the row holds {stored}, below an answered {highest}: a stale write lowered it"
+    );
+    // The next poll steps up from the stored value, never below it.
+    let (_, next) = poll(&app, &device_code).await;
+    assert_eq!(next["status"], "slow_down", "{next}");
+    assert_eq!(next["interval"].as_u64().unwrap(), (stored + 5).min(60));
+}
+
+/// F7 — a body that does not declare JSON is refused with 415 before it is
+/// read, on the public routes and on the cookie-authenticated ones: a
+/// cross-site `text/plain` form post cannot reach `approve` or `deny`.
+#[tokio::test]
+async fn a_request_that_does_not_declare_json_is_refused_with_415() {
+    let app = app_fast().await;
+    let org = app.seed_tenant("pair16").await;
+    let (device_code, user_code) = start_daemon(&app).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/pair/start"))
+        .header("content-type", "text/plain")
+        .body(start_body("daemon", "linux").to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 415);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "unsupported_media_type");
+
+    // `app.client` carries the member's session cookie from `seed_tenant`:
+    // exactly the credential a cross-site form would ride on.
+    for path in ["/api/pair/approve", "/api/pair/deny"] {
+        let resp = app
+            .client
+            .post(app.url(path))
+            .header("content-type", "text/plain")
+            .body(json!({ "user_code": &user_code, "tenant_id": &org.tenant_id }).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 415, "{path}");
+    }
+    // A JSON-with-parameters content type is JSON.
+    let resp = app
+        .auth_post("/api/pair/lookup", &org.admin.access_token)
+        .header("content-type", "Application/JSON; charset=utf-8")
+        .body(json!({ "user_code": &user_code }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Nothing was decided by the refused posts.
+    let (_, polled) = poll(&app, &device_code).await;
+    assert_eq!(polled["status"], "authorization_pending", "{polled}");
+    assert_eq!(audit(&app, "start", "refused:not_json").await.len(), 1);
+}
+
+/// F6 — an archived org accepts no devices: an approval into one is
+/// refused before the decision is recorded, so no admin is told a device
+/// was paired into a closed org. A plain `forbidden`, never the code the
+/// SPA leaves the org on.
+#[tokio::test]
+async fn approving_into_an_archived_org_is_refused_before_any_notice() {
+    let app = app_fast().await;
+    let org = app.seed_tenant("pair17").await;
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/archive", org.tenant_id),
+            &org.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "archive");
+
+    let (device_code, user_code) = start_daemon(&app).await;
+    let (status, refused) =
+        approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(refused["error"], "forbidden");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("archived"),
+        "{refused}"
+    );
+    let row = pairing_row(&app, &user_code).await;
+    assert_eq!(
+        row.get_str("status").unwrap(),
+        "pending",
+        "nothing was decided"
+    );
+    let (_, polled) = poll(&app, &device_code).await;
+    assert_eq!(polled["status"], "authorization_pending");
+    assert_eq!(audit(&app, "approve", "refused:archived").await.len(), 1);
+    assert!(audit(&app, "approve", "ok").await.is_empty());
 }
 
 /// A pairing past its life answers `expired_token`, names nothing to the
@@ -763,6 +896,8 @@ async fn approving_a_daemon_pairing_needs_manage_agents_in_that_org() {
     assert_eq!(status, 200, "{approved}");
     let (_, polled) = poll(&app, &device_code).await;
     assert_eq!(polled["org_name"], "pair10b Corp", "{polled}");
+    assert_eq!(polled["org_slug"], "pair10b");
+    assert_eq!(polled["approver_username"], "pair10b_admin");
 }
 
 // ── downstream, unchanged ───────────────────────────────────────────────────
@@ -850,6 +985,10 @@ async fn a_start_flood_from_one_address_is_refused_past_the_ceiling() {
     assert_eq!(status, 429, "{refused}");
     assert_eq!(refused["error"], "rate_limited");
     assert!(refused.get("device_code").is_none());
+    let (status, _) = start(&app, &start_body("daemon", "linux")).await;
+    assert_eq!(status, 429, "still refused");
+    // F4 — the flood is on the trail once per source per hour, with the
+    // address; the repeats are counted, not stored.
     let hits = audit(&app, "start", "refused:ip_ceiling").await;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].get_str("client_ip").unwrap(), "127.0.0.1");
@@ -1013,16 +1152,18 @@ async fn malformed_requests_are_refused_with_400() {
     let mut body = start_body("daemon", "linux");
     body["role"] = json!("agent");
     assert_eq!(start(&app, &body).await.0, 400);
+    // F4 — three refusals of one class from one source within the hour
+    // are ONE durable row; the repeats are counted, not stored.
     assert_eq!(
         audit(&app, "start", "refused:invalid_request").await.len(),
-        3
+        1
     );
 
     // Odd content in the free-text fields is clamped, never refused.
     let mut body = start_body("daemon", "linux");
     body["machine_name"] = json!(format!("  {}  ", "n".repeat(300)));
     body["client"] = json!("a-client-from-the-future");
-    body["client_version"] = json!("<script>alert(1)</script>");
+    body["client_version"] = json!("1.0\u{0}-dev");
     let (status, started) = start(&app, &body).await;
     assert_eq!(status, 200, "{started}");
     let (status, seen) = lookup(
@@ -1034,7 +1175,46 @@ async fn malformed_requests_are_refused_with_400() {
     assert_eq!(status, 200, "{seen}");
     assert_eq!(seen["machine_name"].as_str().unwrap().len(), 64);
     assert_eq!(seen["client"], "other");
-    assert_eq!(seen["client_version"], "<script>alert(1)</script>");
+    assert_eq!(
+        seen["client_version"], "1.0-dev",
+        "control characters are dropped"
+    );
+
+    // F1 — markup in a machine name is kept as TEXT on the row (an
+    // installer is never refused for it), control characters are dropped,
+    // and the admins' notice renders it escaped: a pairing named like a
+    // password-reset link mails its own characters, not a link.
+    let evil = "<a href=\"//evil.test\">Reset your password</a>";
+    let mut body = start_body("tunnel", "linux");
+    // 45 + 13 characters: inside the 64-character cap, so the clamp drops
+    // only the control characters.
+    body["machine_name"] = json!(format!("{evil}\r\nBcc: v@e.test"));
+    let (status, started) = start(&app, &body).await;
+    assert_eq!(status, 200, "{started}");
+    let (status, seen) = lookup(
+        &app,
+        &org.admin.access_token,
+        started["user_code"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "{seen}");
+    let stored = seen["machine_name"].as_str().unwrap().to_string();
+    assert_eq!(stored, format!("{evil}Bcc: v@e.test"));
+    use roomler_ai_services::email::{DevicePairedNotice, render_device_paired_notice};
+    let (subject, html) = render_device_paired_notice(&DevicePairedNotice {
+        approver_name: "pair15 Member".into(),
+        machine_name: stored.clone(),
+        os_label: "Linux".into(),
+        role_label: "a tunnel client (the roomler CLI)".into(),
+        org_name: "pair15 Corp".into(),
+        location: "an unknown location".into(),
+        devices_url: format!("http://localhost:5173/tenant/{}/devices", org.tenant_id),
+    });
+    assert!(!html.contains(evil), "the markup must not survive: {html}");
+    assert!(html.contains("&lt;a href=&quot;//evil.test&quot;&gt;Reset your password&lt;/a&gt;"));
+    assert_eq!(html.matches("<a href=").count(), 1, "the one link is ours");
+    assert!(html.contains("a tunnel client (the roomler CLI)"));
+    assert!(!subject.chars().any(char::is_control));
 
     let (status, _) = post_json_as(
         &app,

@@ -12,9 +12,10 @@
 
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
+use roomler_ai_services::email::DevicePairedNotice;
 use tracing::{debug, info, warn};
 
-use crate::FleetState;
+use crate::{FleetState, pairing::PairingRole};
 
 /// The human label for an `OsKind` wire spelling, for the notice's text.
 fn os_label(os: &str) -> &str {
@@ -26,18 +27,38 @@ fn os_label(os: &str) -> &str {
     }
 }
 
+/// What the pairing enrolls, so an admin reading the notice can tell a
+/// tunnel client — paired by any member — from the full daemon.
+pub fn role_label(role: PairingRole) -> &'static str {
+    match role {
+        PairingRole::Daemon => {
+            "remote desktop and the private network (roomlerd — runs as SYSTEM/root when installed system-wide)"
+        }
+        PairingRole::Tunnel => "a tunnel client (the roomler CLI)",
+    }
+}
+
 /// Spawn the notice for one approval. Returns at once.
 pub fn spawn_paired_notice(
     state: FleetState,
     tenant_id: ObjectId,
     approver_id: ObjectId,
+    role: PairingRole,
     machine_name: String,
     os: String,
     country: Option<String>,
 ) {
     tokio::spawn(async move {
-        if let Err(e) =
-            send_paired_notice(&state, tenant_id, approver_id, &machine_name, &os, country).await
+        if let Err(e) = send_paired_notice(
+            &state,
+            tenant_id,
+            approver_id,
+            role,
+            &machine_name,
+            &os,
+            country,
+        )
+        .await
         {
             warn!(tenant = %tenant_id, error = %e, "pairing: the device-paired notice failed");
         }
@@ -51,6 +72,7 @@ pub async fn send_paired_notice(
     state: &FleetState,
     tenant_id: ObjectId,
     approver_id: ObjectId,
+    role: PairingRole,
     machine_name: &str,
     os: &str,
     country: Option<String>,
@@ -74,9 +96,16 @@ pub async fn send_paired_notice(
         .unwrap_or_else(|| "an unknown location".to_string());
     let os_label = os_label(os);
     let title = "A device was paired into your organization";
+    // The push body is plain text (the browser renders a notification's
+    // text as text), with the kind named so a tunnel client reads as one.
     let body = format!(
-        "{} paired {} ({}) into {} from {}",
-        approver.display_name, machine_name, os_label, tenant.name, location
+        "{} paired {} ({}) into {} from {} — {}",
+        approver.display_name,
+        machine_name,
+        os_label,
+        tenant.name,
+        location,
+        role_label(role)
     );
     let devices_path = format!("/tenant/{}/devices", tenant_id.to_hex());
     let devices_url = format!(
@@ -84,24 +113,22 @@ pub async fn send_paired_notice(
         state.settings.app.frontend_url.trim_end_matches('/'),
         devices_path
     );
+    let notice = DevicePairedNotice {
+        approver_name: approver.display_name.clone(),
+        machine_name: machine_name.to_string(),
+        os_label: os_label.to_string(),
+        role_label: role_label(role).to_string(),
+        org_name: tenant.name.clone(),
+        location: location.clone(),
+        devices_url: devices_url.clone(),
+    };
     let mut emails = 0usize;
     let mut pushes = 0usize;
     for admin_id in recipients {
         if let Some(email) = &state.email {
             match state.users.base.find_by_id(admin_id).await {
                 Ok(admin) => {
-                    if let Err(e) = email
-                        .send_device_paired_notice(
-                            &admin.email,
-                            &approver.display_name,
-                            machine_name,
-                            os_label,
-                            &tenant.name,
-                            &location,
-                            &devices_url,
-                        )
-                        .await
-                    {
+                    if let Err(e) = email.send_device_paired_notice(&admin.email, &notice).await {
                         debug!(user = %admin_id, error = %e, "pairing: notice email failed");
                     } else {
                         emails += 1;

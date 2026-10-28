@@ -33,7 +33,10 @@
 //! 8. `[pairing] enabled = false` makes every route the empty 404 an older
 //!    server answers, so a client falls back to the paste step.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use axum::{
     Json,
@@ -85,6 +88,11 @@ const CODE_RETRIES: usize = 5;
 
 /// The module the tunnel role's token is redeemed on.
 const NETWORK_MODULE: &str = "network";
+/// How many `(action, reason, address)` keys the anonymous-refusal audit
+/// de-duplication remembers per pod before it stops writing rows for new
+/// sources (F4): one durable row per source per hour, and a flood from
+/// more sources than this leaves a debug line, not a row.
+const AUDIT_DEDUPE_MAX_KEYS: usize = 50_000;
 
 // ── the wire ────────────────────────────────────────────────────────────────
 
@@ -168,7 +176,7 @@ fn one() -> u8 {
     1
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct StartResponse {
     /// The installer's secret. This is the only response that carries it.
     pub device_code: String,
@@ -179,9 +187,32 @@ pub struct StartResponse {
     pub interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
+/// F9 — the device code never reaches a log line through a `{:?}`: the
+/// one secret-bearing response redacts it structurally.
+impl fmt::Debug for StartResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartResponse")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 pub struct PollRequest {
     pub device_code: String,
+}
+
+/// F9 — as [`StartResponse`]: the credential is never printed.
+impl fmt::Debug for PollRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PollRequest")
+            .field("device_code", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,9 +300,16 @@ pub fn hash_device_code(device_code: &str) -> String {
     hex::encode(Sha256::digest(device_code.as_bytes()))
 }
 
-/// Trim and cap at [`FIELD_MAX_CHARS`] characters; never refuse.
+/// Trim, drop every control character (a newline or an escape sequence
+/// must reach neither a log line nor a mail header), and cap at
+/// [`FIELD_MAX_CHARS`] characters; never refuse. Markup is kept as text —
+/// every renderer escapes it (`render_device_paired_notice`, the SPA).
 pub fn clamp_field(s: &str) -> String {
-    s.trim().chars().take(FIELD_MAX_CHARS).collect()
+    s.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(FIELD_MAX_CHARS)
+        .collect()
 }
 
 /// A client name in [`CLIENTS`], or `other` — the server's clamp, as
@@ -334,7 +372,9 @@ pub fn decide_poll(
         && now_ms - last < i64::from(poll_interval_secs) * 1000
     {
         return PollDecision::SlowDown {
-            interval: (poll_interval_secs + SLOW_DOWN_STEP_SECS).min(MAX_POLL_INTERVAL_SECS),
+            interval: poll_interval_secs
+                .saturating_add(SLOW_DOWN_STEP_SECS)
+                .min(MAX_POLL_INTERVAL_SECS),
         };
     }
     match status {
@@ -349,32 +389,53 @@ pub fn decide_poll(
 /// best-effort: a failed insert is logged and the request proceeds.
 struct Audit {
     action: &'static str,
-    outcome: String,
+    /// `None` = `ok`; `Some(reason)` = `refused:<reason>`.
+    reason: Option<&'static str>,
     pairing: Option<ObjectId>,
     user_id: Option<ObjectId>,
     tenant_id: Option<ObjectId>,
     client_ip: Option<IpAddr>,
     machine_name: Option<String>,
     role: Option<String>,
+    /// F4 — a refusal an anonymous caller can repeat at will (an address
+    /// past its ceiling, a body that is not a request, a code that names
+    /// nothing, a poll too soon): recorded once per `(action, reason,
+    /// address)` per hour per pod, the repeats counted in a debug line.
+    /// Everything a signed-in account does, every decision about a real
+    /// pairing, every start and every delivery stays a durable row.
+    anonymous: bool,
 }
 
 impl Audit {
     fn new(action: &'static str) -> Self {
         Self {
             action,
-            outcome: "ok".to_string(),
+            reason: None,
             pairing: None,
             user_id: None,
             tenant_id: None,
             client_ip: None,
             machine_name: None,
             role: None,
+            anonymous: false,
         }
     }
 
-    fn refused(mut self, reason: &str) -> Self {
-        self.outcome = format!("refused:{reason}");
+    fn refused(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
         self
+    }
+
+    fn anonymous(mut self) -> Self {
+        self.anonymous = true;
+        self
+    }
+
+    fn outcome(&self) -> String {
+        match self.reason {
+            None => "ok".to_string(),
+            Some(reason) => format!("refused:{reason}"),
+        }
     }
 
     fn pairing(mut self, row: &DevicePairing) -> Self {
@@ -403,10 +464,26 @@ impl Audit {
     }
 
     async fn record(self, state: &FleetState) {
+        let outcome = self.outcome();
+        if self.anonymous {
+            let key = (
+                self.action,
+                self.reason.unwrap_or("ok"),
+                self.client_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            );
+            if !state.pairing_audit_dedupe.once(key, AUDIT_DEDUPE_MAX_KEYS) {
+                debug!(
+                    action = self.action,
+                    outcome,
+                    "pairing audit: a repeat of this refusal from this source within the hour — counted, not recorded again"
+                );
+                return;
+            }
+        }
         let event = PairingAuditEvent {
             id: None,
             action: self.action.to_string(),
-            outcome: self.outcome,
+            outcome,
             pairing_id: self.pairing,
             user_id: self.user_id,
             tenant_id: self.tenant_id,
@@ -439,16 +516,54 @@ fn client_ip(state: &FleetState, headers: &HeaderMap, peer: PeerAddr) -> Option<
     client_ip_or_peer(headers, peer.0, state.settings.app.rate_limit_trusted_hops)
 }
 
-/// The body as `T`, or the 400 to answer. The refusals below are boxed
-/// because a `Response` is a large `Err` (clippy's `result_large_err`), and
-/// every caller returns it at once.
-fn parse_body<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, Box<Response>> {
-    serde_json::from_slice(body).map_err(|e| {
-        Box::new(refuse(
+/// A request refused before it was read: the answer, and the audit reason.
+/// Boxed because a `Response` is a large `Err` (clippy's
+/// `result_large_err`), and every caller returns it at once.
+struct Refusal {
+    reason: &'static str,
+    response: Box<Response>,
+}
+
+/// Whether the request declares a JSON body (`application/json` or a
+/// `+json` suffix, the essence compared case-insensitively).
+fn declares_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|essence| {
+            let essence = essence.trim().to_ascii_lowercase();
+            essence == "application/json" || essence.ends_with("+json")
+        })
+        .unwrap_or(false)
+}
+
+/// The body as `T`, or the refusal to answer. F7 — the content type must
+/// say JSON (415 otherwise), as `axum::Json` would insist: a cross-site
+/// `text/plain` form post then cannot reach the cookie-authenticated
+/// `approve` or `deny` without a CORS preflight, which the server's CORS
+/// policy refuses for a foreign origin.
+fn parse_body<T: for<'de> Deserialize<'de>>(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<T, Refusal> {
+    if !declares_json(headers) {
+        return Err(Refusal {
+            reason: "not_json",
+            response: Box::new(refuse(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "Send the request as application/json",
+            )),
+        });
+    }
+    serde_json::from_slice(body).map_err(|e| Refusal {
+        reason: "invalid_request",
+        response: Box::new(refuse(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             &format!("Invalid request body: {e}"),
-        ))
+        )),
     })
 }
 
@@ -511,6 +626,14 @@ fn account_locked(state: &FleetState, user_id: ObjectId) -> bool {
     state
         .pairing_miss_limiter
         .at_limit(&user_id, state.settings.pairing.misses_per_account_per_hour)
+}
+
+/// One miss against the account (a code that named nothing, an approval
+/// the gate refused).
+fn record_miss(state: &FleetState, user_id: ObjectId) {
+    state
+        .pairing_miss_limiter
+        .record(user_id, state.settings.pairing.misses_per_account_per_hour);
 }
 
 fn locked_response() -> Response {
@@ -595,6 +718,7 @@ pub async fn start(
     {
         Audit::new("start")
             .refused("ip_ceiling")
+            .anonymous()
             .ip(ip)
             .record(&state)
             .await;
@@ -604,20 +728,24 @@ pub async fn start(
             "Too many pairings started from this address; try again later",
         );
     }
-    let req: StartRequest = match parse_body(&body) {
+    let req: StartRequest = match parse_body(&headers, &body) {
         Ok(r) => r,
         Err(r) => {
             Audit::new("start")
-                .refused("invalid_request")
+                .refused(r.reason)
+                .anonymous()
                 .ip(ip)
                 .record(&state)
                 .await;
-            return *r;
+            return *r.response;
         }
     };
     let machine_name = clamp_field(&req.machine_name);
     if let Err(reason) = validate_start(&req) {
-        let mut a = Audit::new("start").refused("invalid_request").ip(ip);
+        let mut a = Audit::new("start")
+            .refused("invalid_request")
+            .anonymous()
+            .ip(ip);
         a.machine_name = Some(machine_name);
         a.role = Some(req.role.wire().to_string());
         a.record(&state).await;
@@ -626,7 +754,10 @@ pub async fn start(
     // A tunnel token is redeemed on the network module's enroll route; with
     // that module unmounted the token would have nowhere to go.
     if req.role == PairingRole::Tunnel && !state.mounted.contains(NETWORK_MODULE) {
-        let mut a = Audit::new("start").refused("network_unmounted").ip(ip);
+        let mut a = Audit::new("start")
+            .refused("network_unmounted")
+            .anonymous()
+            .ip(ip);
         a.machine_name = Some(machine_name);
         a.role = Some(req.role.wire().to_string());
         a.record(&state).await;
@@ -723,9 +854,9 @@ pub async fn poll(
         return r;
     }
     let ip = client_ip(&state, &headers, peer);
-    let req: PollRequest = match parse_body(&body) {
+    let req: PollRequest = match parse_body(&headers, &body) {
         Ok(r) => r,
-        Err(r) => return *r,
+        Err(r) => return *r.response,
     };
     let row = match state
         .device_pairings
@@ -736,6 +867,7 @@ pub async fn poll(
         Ok(None) => {
             Audit::new("refuse")
                 .refused("unknown_code")
+                .anonymous()
                 .ip(ip)
                 .record(&state)
                 .await;
@@ -761,11 +893,14 @@ pub async fn poll(
             status_json("expired_token")
         }
         PollDecision::SlowDown { interval } => {
-            if let Err(e) = state.device_pairings.note_poll(id, now, interval).await {
-                debug!(pairing = %id, error = %e, "pairing: could not note the poll");
+            // `$max`: a concurrent poll that read the old interval cannot
+            // lower what this one answered (F3).
+            if let Err(e) = state.device_pairings.slow_down(id, now, interval).await {
+                debug!(pairing = %id, error = %e, "pairing: could not note the slow-down");
             }
             Audit::new("refuse")
                 .refused("slow_down")
+                .anonymous()
                 .pairing(&row)
                 .ip(ip)
                 .record(&state)
@@ -773,21 +908,13 @@ pub async fn poll(
             Json(json!({ "status": "slow_down", "interval": interval })).into_response()
         }
         PollDecision::Pending => {
-            if let Err(e) = state
-                .device_pairings
-                .note_poll(id, now, row.poll_interval_secs)
-                .await
-            {
+            if let Err(e) = state.device_pairings.note_poll(id, now).await {
                 debug!(pairing = %id, error = %e, "pairing: could not note the poll");
             }
             status_json("authorization_pending")
         }
         PollDecision::Deliver => {
-            if let Err(e) = state
-                .device_pairings
-                .note_poll(id, now, row.poll_interval_secs)
-                .await
-            {
+            if let Err(e) = state.device_pairings.note_poll(id, now).await {
                 debug!(pairing = %id, error = %e, "pairing: could not note the poll");
             }
             deliver(&state, row, id, now, ip).await
@@ -846,6 +973,7 @@ async fn deliver(
         Ok(false) => {
             Audit::new("refuse")
                 .refused("already_delivered")
+                .anonymous()
                 .pairing(&row)
                 .ip(ip)
                 .record(state)
@@ -898,19 +1026,22 @@ async fn deliver(
             }
         }
     }
-    let org_name = state
+    // F2 — the hijack guard the installer shows before it installs: the
+    // org and the approver by their UNIQUE handles (`slug`, `username`)
+    // beside the display names, which anyone can set to anything.
+    let (org_name, org_slug) = state
         .tenants
         .base
         .find_by_id(tenant_id)
         .await
-        .map(|t| t.name)
+        .map(|t| (t.name, t.slug))
         .unwrap_or_default();
-    let approver_name = state
+    let (approver_name, approver_username) = state
         .users
         .base
         .find_by_id(approver)
         .await
-        .map(|u| u.display_name)
+        .map(|u| (u.display_name, u.username))
         .unwrap_or_default();
     info!(pairing = %id, tenant = %tenant_id, approver = %approver, tokens = tokens.len(), "pairing: delivered");
     Audit::new("deliver")
@@ -924,7 +1055,9 @@ async fn deliver(
         "status": "approved",
         "tokens": tokens,
         "org_name": org_name,
+        "org_slug": org_slug,
         "approver_name": approver_name,
+        "approver_username": approver_username,
     }))
     .into_response()
 }
@@ -947,9 +1080,9 @@ pub async fn lookup(
         Err(r) => return *r,
     };
     let ip = client_ip(&state, &headers, peer);
-    let req: CodeRequest = match parse_body(&body) {
+    let req: CodeRequest = match parse_body(&headers, &body) {
         Ok(r) => r,
-        Err(r) => return *r,
+        Err(r) => return *r.response,
     };
     if account_locked(&state, auth.user_id) {
         Audit::new("lookup")
@@ -966,7 +1099,7 @@ pub async fn lookup(
         Err(r) => return *r,
     };
     let Some(row) = row else {
-        state.pairing_miss_limiter.record(auth.user_id);
+        record_miss(&state, auth.user_id);
         Audit::new("lookup")
             .refused("not_pending")
             .user(auth.user_id)
@@ -1014,9 +1147,9 @@ pub async fn approve(
         Err(r) => return *r,
     };
     let ip = client_ip(&state, &headers, peer);
-    let req: ApproveRequest = match parse_body(&body) {
+    let req: ApproveRequest = match parse_body(&headers, &body) {
         Ok(r) => r,
-        Err(r) => return *r,
+        Err(r) => return *r.response,
     };
     let Ok(tenant_id) = ObjectId::parse_str(&req.tenant_id) else {
         return ApiError::BadRequest("Invalid tenant_id".to_string()).into_response();
@@ -1037,7 +1170,7 @@ pub async fn approve(
         Err(r) => return *r,
     };
     let Some(row) = row else {
-        state.pairing_miss_limiter.record(auth.user_id);
+        record_miss(&state, auth.user_id);
         Audit::new("approve")
             .refused("not_pending")
             .user(auth.user_id)
@@ -1074,7 +1207,7 @@ pub async fn approve(
             // A refused approval counts against the account like a miss:
             // an org you cannot add devices to is as much a probe as a
             // code that names nothing.
-            state.pairing_miss_limiter.record(auth.user_id);
+            record_miss(&state, auth.user_id);
             Audit::new("approve")
                 .refused(reason)
                 .pairing(&row)
@@ -1086,6 +1219,29 @@ pub async fn approve(
             return err.into_response();
         }
         Err(e) => return e.into_response(),
+    }
+    // F6 — an archived org accepts no devices (`routes::tenant::archive`),
+    // and the enroll route would refuse the daemon token later anyway; refused
+    // HERE, before the decision is recorded, so no admin is told a device
+    // was paired into an org that is closed. Plain `forbidden` (never the
+    // navigating code), not counted as a miss: the code was real.
+    match state.tenants.base.find_by_id(tenant_id).await {
+        Ok(t) if t.is_archived => {
+            Audit::new("approve")
+                .refused("archived")
+                .pairing(&row)
+                .user(auth.user_id)
+                .tenant(tenant_id)
+                .ip(ip)
+                .record(&state)
+                .await;
+            return ApiError::Forbidden(
+                "This organization is archived and accepts no device enrollments".to_string(),
+            )
+            .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return ApiError::from(e).into_response(),
     }
     match state
         .device_pairings
@@ -1123,6 +1279,7 @@ pub async fn approve(
         state.clone(),
         tenant_id,
         auth.user_id,
+        role,
         row.machine_name.clone(),
         row.os.clone(),
         row.country.clone(),
@@ -1148,9 +1305,9 @@ pub async fn deny(
         Err(r) => return *r,
     };
     let ip = client_ip(&state, &headers, peer);
-    let req: CodeRequest = match parse_body(&body) {
+    let req: CodeRequest = match parse_body(&headers, &body) {
         Ok(r) => r,
-        Err(r) => return *r,
+        Err(r) => return *r.response,
     };
     if account_locked(&state, auth.user_id) {
         Audit::new("deny")
@@ -1167,7 +1324,7 @@ pub async fn deny(
         Err(r) => return *r,
     };
     let Some(row) = row else {
-        state.pairing_miss_limiter.record(auth.user_id);
+        record_miss(&state, auth.user_id);
         Audit::new("deny")
             .refused("not_pending")
             .user(auth.user_id)
@@ -1279,6 +1436,13 @@ mod tests {
         // Multi-byte text is cut at a character, never inside one.
         let wide = "é".repeat(100);
         assert_eq!(clamp_field(&wide).chars().count(), FIELD_MAX_CHARS);
+        // F1 — control characters never reach a log line or a mail header;
+        // markup stays as text for the renderers to escape.
+        assert_eq!(
+            clamp_field("lap\r\nBcc: x@example.test\u{7}top\t\u{1b}[31m"),
+            "lapBcc: x@example.testtop[31m"
+        );
+        assert_eq!(clamp_field("<b>name</b>"), "<b>name</b>");
         assert_eq!(clamp_client("wizard"), "wizard");
         assert_eq!(clamp_client(" Wizard "), "wizard");
         assert_eq!(clamp_client("script-sh"), "script-sh");
@@ -1306,6 +1470,43 @@ mod tests {
         assert!(validate_start(&start(OsKind::Windows, PairingRole::Daemon, 2)).is_err());
         assert!(validate_start(&start(OsKind::Linux, PairingRole::Daemon, 0)).is_err());
         assert!(validate_start(&start(OsKind::Linux, PairingRole::Daemon, 3)).is_err());
+    }
+
+    /// F9 — the two structs that carry the device code redact it from
+    /// `{:?}`, so no log line can print it by accident.
+    #[test]
+    fn the_device_code_is_redacted_from_debug_output() {
+        let secret = generate_device_code();
+        let req = PollRequest {
+            device_code: secret.clone(),
+        };
+        let shown = format!("{req:?}");
+        assert!(!shown.contains(&secret), "{shown}");
+        assert!(shown.contains("<redacted>"));
+        let resp = StartResponse {
+            device_code: secret.clone(),
+            user_code: "BCDF-GHJK".into(),
+            verification_uri: "https://example.test/pair".into(),
+            expires_in: 900,
+            interval: 5,
+        };
+        let shown = format!("{resp:?}");
+        assert!(!shown.contains(&secret), "{shown}");
+        assert!(shown.contains("BCDF-GHJK"), "the user code is not a secret");
+        // The wire still carries it: redaction is for Debug only.
+        let wire = serde_json::to_string(&resp).unwrap();
+        assert!(wire.contains(&secret));
+    }
+
+    /// F3 — the step never overflows.
+    #[test]
+    fn the_slow_down_step_saturates() {
+        assert_eq!(
+            decide_poll(PairingStatus::Pending, T0 + 60_000, Some(T0), u32::MAX, T0),
+            PollDecision::SlowDown {
+                interval: MAX_POLL_INTERVAL_SECS
+            }
+        );
     }
 
     #[test]

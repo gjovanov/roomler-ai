@@ -25,6 +25,7 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use std::{
     hash::Hash,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -98,16 +99,31 @@ impl RateLimiter {
 /// ~2.6 × 10¹⁰ and a 15-minute pairing life, not the security boundary —
 /// the device code is — so a per-pod count is the right trade against a
 /// Redis round trip on every poll.
+///
+/// Memory is bounded per key: a key keeps at most `limit` timestamps (the
+/// newest — exactly the ones a "within `limit` in the window" decision can
+/// turn on, so the decision is unchanged), and the map is swept of dead
+/// keys on a time cadence ([`WINDOW_SWEEP_EVERY`]) rather than on every
+/// call. A flood from one attacker-chosen key therefore costs `limit`
+/// `Instant`s, not one per attempt.
 pub struct WindowLimiter<K: Hash + Eq> {
     window: Duration,
     hits: DashMap<K, Vec<Instant>>,
+    /// When the map was last swept; `Mutex` for the one-line compare-and-set,
+    /// never held across anything.
+    last_sweep: Mutex<Instant>,
 }
+
+/// How often at most a [`WindowLimiter`] walks its whole map to drop keys
+/// whose every timestamp has left the window.
+pub const WINDOW_SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 impl<K: Hash + Eq + Clone> WindowLimiter<K> {
     pub fn new(window: Duration) -> Self {
         Self {
             window,
             hits: DashMap::new(),
+            last_sweep: Mutex::new(Instant::now()),
         }
     }
 
@@ -130,17 +146,24 @@ impl<K: Hash + Eq + Clone> WindowLimiter<K> {
         entry.retain(|t| now.duration_since(*t) < window);
         let allowed = entry.len() < limit as usize;
         entry.push(now);
+        keep_newest(&mut entry, limit as usize);
         allowed
     }
 
-    /// Record one event against `key` without deciding anything.
-    pub fn record(&self, key: K) {
+    /// Record one event against `key` without deciding anything, keeping
+    /// the newest `limit` (the most [`Self::at_limit`] can ever need).
+    /// `0` records nothing, as `0` never locks.
+    pub fn record(&self, key: K, limit: u32) {
+        if limit == 0 {
+            return;
+        }
         let now = Instant::now();
         self.maybe_sweep(now);
         let window = self.window;
         let mut entry = self.hits.entry(key).or_default();
         entry.retain(|t| now.duration_since(*t) < window);
         entry.push(now);
+        keep_newest(&mut entry, limit as usize);
     }
 
     /// Whether `key` has `limit` or more events in the window. `0` never
@@ -163,13 +186,64 @@ impl<K: Hash + Eq + Clone> WindowLimiter<K> {
             >= limit as usize
     }
 
-    fn maybe_sweep(&self, now: Instant) {
-        if self.hits.len() < SWEEP_THRESHOLD {
-            return;
+    /// "The first time in this window": `true` once per `key` per window,
+    /// `false` for every repeat until the window from that first time has
+    /// passed — a repeat does NOT extend it, unlike [`Self::check`]'s
+    /// refusals, so a source that never stops still earns one `true` per
+    /// window. The de-duplication behind an audit row that an anonymous
+    /// flood could otherwise write once per request.
+    ///
+    /// `max_keys` bounds the map: a key not yet known while the map holds
+    /// that many is answered `false` (after a sweep), because the safe
+    /// direction for "we cannot remember whether we saw this source" is to
+    /// write nothing more, not to write without limit.
+    pub fn once(&self, key: K, max_keys: usize) -> bool {
+        let now = Instant::now();
+        self.maybe_sweep(now);
+        let window = self.window;
+        if let Some(seen) = self.hits.get(&key) {
+            // A guard, dropped at the end of this block; nothing awaits.
+            let fresh = seen.iter().any(|t| now.duration_since(*t) < window);
+            if fresh {
+                return false;
+            }
+        } else if self.hits.len() >= max_keys {
+            self.sweep(now);
+            if self.hits.len() >= max_keys {
+                return false;
+            }
         }
+        let mut entry = self.hits.entry(key).or_default();
+        entry.clear();
+        entry.push(now);
+        true
+    }
+
+    /// Sweep at most every [`WINDOW_SWEEP_EVERY`].
+    fn maybe_sweep(&self, now: Instant) {
+        {
+            let mut last = self.last_sweep.lock().unwrap_or_else(|e| e.into_inner());
+            if now.duration_since(*last) < WINDOW_SWEEP_EVERY {
+                return;
+            }
+            *last = now;
+        }
+        self.sweep(now);
+    }
+
+    /// Drop every key whose timestamps have all left the window.
+    fn sweep(&self, now: Instant) {
         let window = self.window;
         self.hits
             .retain(|_, v| v.iter().any(|t| now.duration_since(*t) < window));
+    }
+}
+
+/// Keep the newest `n` of a time-ordered vector.
+fn keep_newest(v: &mut Vec<Instant>, n: usize) {
+    if v.len() > n {
+        let excess = v.len() - n;
+        v.drain(..excess);
     }
 }
 
@@ -247,24 +321,90 @@ mod tests {
         let wl: WindowLimiter<ObjectId> = WindowLimiter::hourly();
         let user = ObjectId::new();
         assert!(!wl.at_limit(&user, 2), "no misses yet");
-        wl.record(user);
+        wl.record(user, 2);
         assert!(!wl.at_limit(&user, 2), "one miss is under a ceiling of two");
-        wl.record(user);
+        wl.record(user, 2);
         assert!(wl.at_limit(&user, 2), "two misses reach it");
         // Asking does not count: a locked key is not pushed further.
         assert!(wl.at_limit(&user, 2));
         assert!(!wl.at_limit(&ObjectId::new(), 2), "another account is free");
         assert!(!wl.at_limit(&user, 0), "0 never locks");
+        wl.record(user, 0);
+        assert_eq!(
+            wl.hits.get(&user).map(|v| v.len()),
+            Some(2),
+            "0 records nothing"
+        );
     }
 
     #[test]
     fn window_limiter_forgets_events_older_than_its_window() {
         let wl: WindowLimiter<u8> = WindowLimiter::new(Duration::from_millis(30));
-        wl.record(7);
-        wl.record(7);
+        wl.record(7, 2);
+        wl.record(7, 2);
         assert!(wl.at_limit(&7, 2));
         std::thread::sleep(Duration::from_millis(60));
         assert!(!wl.at_limit(&7, 2), "the misses aged out of the window");
         assert!(wl.check(7, 1), "and a check starts a fresh count");
+    }
+
+    /// F5 — a flood from one key costs `limit` timestamps, never one per
+    /// attempt, and the decision is the same as if every attempt were kept.
+    #[test]
+    fn window_limiter_keeps_at_most_limit_timestamps_per_key() {
+        let wl: WindowLimiter<u8> = WindowLimiter::hourly();
+        for _ in 0..5_000 {
+            wl.check(1, 3);
+        }
+        assert_eq!(wl.hits.get(&1).map(|v| v.len()), Some(3));
+        assert!(!wl.check(1, 3), "still refused");
+        for _ in 0..5_000 {
+            wl.record(2, 10);
+        }
+        assert_eq!(wl.hits.get(&2).map(|v| v.len()), Some(10));
+        assert!(wl.at_limit(&2, 10));
+    }
+
+    /// F5 — the map is walked on a cadence, not on every call: a map past
+    /// the old threshold is not swept twice within a minute.
+    #[test]
+    fn window_limiter_sweeps_on_a_cadence_not_per_call() {
+        let wl: WindowLimiter<u32> = WindowLimiter::new(Duration::from_millis(20));
+        for k in 0..2_000u32 {
+            wl.record(k, 1);
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        // Every key is dead, but the last sweep was at construction, less
+        // than a minute ago: nothing is walked.
+        wl.record(9_999, 1);
+        assert_eq!(wl.hits.len(), 2_001, "no sweep inside the cadence");
+        // Forcing the cadence over: the dead keys go.
+        *wl.last_sweep.lock().unwrap() = Instant::now() - WINDOW_SWEEP_EVERY;
+        wl.record(9_998, 1);
+        assert_eq!(wl.hits.len(), 2, "only the two live keys remain");
+    }
+
+    /// F4 — `once` answers true one time per key per window, a repeat does
+    /// not extend the window, and a full map answers false for a new key.
+    #[test]
+    fn window_limiter_once_is_first_per_window_and_bounded() {
+        let wl: WindowLimiter<u8> = WindowLimiter::new(Duration::from_millis(40));
+        assert!(wl.once(1, 10));
+        for _ in 0..50 {
+            assert!(!wl.once(1, 10), "a repeat inside the window");
+        }
+        assert_eq!(
+            wl.hits.get(&1).map(|v| v.len()),
+            Some(1),
+            "one timestamp kept"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(wl.once(1, 10), "the window passed despite the repeats");
+        // The cap: three keys known, a fourth is refused while they are live.
+        assert!(wl.once(2, 3));
+        assert!(wl.once(3, 3));
+        assert!(!wl.once(4, 3), "the map is full of live keys");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(wl.once(4, 3), "a sweep frees the dead keys first");
     }
 }

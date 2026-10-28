@@ -143,8 +143,21 @@ impl DevicePairingDao {
             .await
     }
 
-    /// Record a poll's arrival and the interval the installer now holds.
-    pub async fn note_poll(
+    /// Record a poll's arrival. The interval is not touched: only a
+    /// `slow_down` moves it, and only upward ([`Self::slow_down`]).
+    pub async fn note_poll(&self, id: ObjectId, now: DateTime) -> DaoResult<bool> {
+        self.base
+            .update_one(doc! { "_id": id }, doc! { "$set": { "last_poll_at": now } })
+            .await
+    }
+
+    /// Record a poll that came too soon and the longer interval the
+    /// installer was told. `$max`, never `$set`: two polls in flight both
+    /// read the old interval and each computes old + 5, and a `$set` from
+    /// the slower writer would race the interval back DOWN past a value
+    /// another poll had already answered — the interval only ever grows
+    /// within a pairing's life.
+    pub async fn slow_down(
         &self,
         id: ObjectId,
         now: DateTime,
@@ -153,11 +166,44 @@ impl DevicePairingDao {
         self.base
             .update_one(
                 doc! { "_id": id },
-                doc! { "$set": {
-                    "last_poll_at": now,
-                    "poll_interval_secs": poll_interval_secs,
-                } },
+                slow_down_update(now, poll_interval_secs),
             )
             .await
+    }
+}
+
+/// The update a [`DevicePairingDao::slow_down`] applies — pure, so the
+/// `$max` is a unit test rather than a race.
+pub fn slow_down_update(now: DateTime, poll_interval_secs: u32) -> bson::Document {
+    doc! {
+        "$set": { "last_poll_at": now },
+        "$max": { "poll_interval_secs": poll_interval_secs },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F3 — the interval is raised with `$max`, so a concurrent writer that
+    /// read an older value cannot lower what another poll already answered.
+    #[test]
+    fn a_slow_down_only_ever_raises_the_interval() {
+        let now = DateTime::now();
+        let u = slow_down_update(now, 15);
+        let max = u.get_document("$max").expect("$max");
+        // `doc!` stores a `u32` as the narrowest integer that holds it.
+        let raised = max
+            .get_i32("poll_interval_secs")
+            .map(i64::from)
+            .or_else(|_| max.get_i64("poll_interval_secs"))
+            .ok();
+        assert_eq!(raised, Some(15));
+        let set = u.get_document("$set").expect("$set");
+        assert!(set.contains_key("last_poll_at"));
+        assert!(
+            !set.contains_key("poll_interval_secs"),
+            "the interval is never $set"
+        );
     }
 }

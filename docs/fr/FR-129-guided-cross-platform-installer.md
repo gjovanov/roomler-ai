@@ -147,8 +147,11 @@ The invariants, each closing a specific failure:
    and the tunnel role takes `issue_tunnel_enrollment_token` behind `is_member`. Both write
    the FR-102 ledger exactly as the admin route does today. Consequence: **no token ever rests
    in the database**, and everything downstream holds unchanged — the enroll route, the
-   archived-org refusal, the plan device cap, the single-use claim, the 10-minute life. A lost
-   delivery response is recovered by starting again: delivery is once.
+   archived-org refusal (which the daemon enroll route holds; the tunnel enroll route never
+   checked it, a pre-existing gap filed separately — and `approve` itself refuses an archived
+   org for both kinds, before any notice fires), the plan device cap, the single-use claim,
+   the 10-minute life. A lost delivery response is recovered by starting again: delivery is
+   once.
 
 3. **Both directions are confirmed on the other side.** The device-code flow has a known
    phishing hole, and here it runs both ways.
@@ -282,15 +285,19 @@ governor. **The `device_code` travels only in POST bodies**, and appears in no r
 | route | auth | request | response |
 |---|---|---|---|
 | `POST /api/pair/start` | none (per-IP ceiling) | `{machine_name, os: "linux"\|"macos"\|"windows", arch: "x86_64"\|"aarch64", role: "daemon"\|"tunnel", halves: 1\|2 (default 1), client, client_version}` | `{device_code, user_code: "BCDF-GHJK", verification_uri, expires_in, interval}` · 400 `invalid_request` · 400 `network_unmounted` (a tunnel role on a server without the network module) · 429 `rate_limited` |
-| `POST /api/pair/poll` | none — the `device_code` is the credential | `{device_code}` | `{status: "authorization_pending"}` · `{status: "slow_down", interval}` · `{status: "access_denied"}` · `{status: "expired_token"}` · `{status: "approved", tokens: [jwt, …], org_name, approver_name}` |
+| `POST /api/pair/poll` | none — the `device_code` is the credential | `{device_code}` | `{status: "authorization_pending"}` · `{status: "slow_down", interval}` · `{status: "access_denied"}` · `{status: "expired_token"}` · `{status: "approved", tokens: [jwt, …], org_name, org_slug, approver_name, approver_username}` — the two **unique** handles (`slug`, `username`) are what the installer shows beside the display names, which anyone can set to anything |
 | `POST /api/pair/lookup` | `AuthUser`, per-account miss ceiling | `{user_code}` | `{machine_name, os, arch, role, halves, client, client_version, country, started_at, expires_at}` · 404 when no live pending pairing has that code · 429 once the account is locked |
-| `POST /api/pair/approve` | `AuthUser` + `MANAGE_AGENTS` (daemon) / member (tunnel) in `tenant_id` | `{user_code, tenant_id}` | `{approved: true}` · 404 not pending · 403 `forbidden` (the gate — **never the `not_a_member` code**, which moves the SPA out of the org) · 400 `network_unmounted` · 429 locked |
+| `POST /api/pair/approve` | `AuthUser` + `MANAGE_AGENTS` (daemon) / member (tunnel) in `tenant_id` | `{user_code, tenant_id}` | `{approved: true}` · 404 not pending · 403 `forbidden` (the gate, or an **archived** org — **never the `not_a_member` code**, which moves the SPA out of the org) · 400 `network_unmounted` · 429 locked |
 | `POST /api/pair/deny` | `AuthUser`, per-account miss ceiling | `{user_code}` | `{denied: true}` · 404 · 429 locked |
 
-- `os` is `OsKind`'s wire spelling. `machine_name`, `client` and `client_version` are trimmed
-  and capped at 64 characters, never refused for odd content; a `client` outside
-  `wizard · roomlerd · roomler · script-sh · script-ps1` is clamped to `other`, as
-  `InstallInfo::clamped` does for the install trace.
+- Every route takes JSON and says so: a body whose content type is not `application/json`
+  (or `+json`) is refused **415** before it is read, so a cross-site `text/plain` form post
+  cannot reach the cookie-authenticated `approve` or `deny` without a CORS preflight.
+- `os` is `OsKind`'s wire spelling. `machine_name`, `client` and `client_version` are trimmed,
+  stripped of control characters and capped at 64 characters, never refused for odd content —
+  markup is kept as **text**, and every renderer escapes it (the admins' notice, the SPA); a
+  `client` outside `wizard · roomlerd · roomler · script-sh · script-ps1` is clamped to
+  `other`, as `InstallInfo::clamped` does for the install trace.
 - `user_code`: 8 characters from `BCDFGHJKLMNPQRSTVWXZ`, displayed `XXXX-XXXX`; input is
   normalised (case-insensitive, hyphens and spaces optional) and stored without the hyphen.
   Anything that is not eight letters of the alphabet names no pairing and counts as a miss.
@@ -311,9 +318,13 @@ governor. **The `device_code` travels only in POST bodies**, and appears in no r
 - 404 and 403 from `lookup`, `approve` and `deny` count as misses against the account; past
   `[pairing] misses_per_account_per_hour` (10) that account's three routes answer 429 for the
   rest of the hour. `start` has its own per-address ceiling
-  (`[pairing] start_per_ip_per_hour`, 20) on top of the governor. Both ceilings are per pod,
-  in memory, like the exec and SSH limiters: abuse ceilings over a code space of ~2.6 × 10¹⁰
-  and a 15-minute life, not the security boundary — the device code is.
+  (`[pairing] start_per_ip_per_hour`, 60 — a corporate NAT rolling out a floor of machines
+  must not be refused at install #21) on top of the governor. Both ceilings are per pod, in
+  memory, like the exec and SSH limiters: abuse ceilings over a code space of ~2.6 × 10¹⁰ and
+  a 15-minute life, not the security boundary — the device code is. A key keeps at most
+  `limit` timestamps, so a flood costs `limit` entries, not one per attempt.
+- An approval into an **archived** org is refused (403 `forbidden`, audited `refused:archived`)
+  before the decision is recorded, so no admin is told a device was paired into a closed org.
 
 **The row** (`device_pairings`): `device_code_hash` (unique), `user_code` (unique among
 `pending` rows — a partial index, so a decided pairing frees its code and `start` regenerates
@@ -337,17 +348,25 @@ approve and poll may each land on a different pod.
 **The trail** (`pairing_audit`, 90-day TTL): one row per decision — `action` (`start` ·
 `lookup` · `approve` · `deny` · `deliver` · `expire` · `refuse`), `outcome` (`ok` or
 `refused:<reason>` — `ip_ceiling`, `account_locked`, `not_pending`, `no_permission`,
-`not_a_member`, `network_unmounted`, `gate_lost`, `slow_down`, `unknown_code`,
-`already_delivered`, `invalid_request`), the pairing id, user id, tenant id, client IP, machine
-name, role, `at`. Best-effort: a failed insert is logged and the request proceeds. Never the
-device code, never a token.
+`not_a_member`, `archived`, `network_unmounted`, `gate_lost`, `slow_down`, `unknown_code`,
+`already_delivered`, `invalid_request`, `not_json`), the pairing id, user id, tenant id,
+client IP, machine name, role, `at`. Best-effort: a failed insert is logged and the request
+proceeds. Never the device code, never a token. **Every decision about a real pairing or by a
+signed-in account is a durable row** (lookups, approvals, denials, deliveries, expiries, the
+gate gone at delivery); a refusal an anonymous caller can repeat at will (an address past its
+ceiling, a body that is not a request, a code that names nothing, a poll too soon, a poll after
+delivery) is recorded **once per `(action, reason, address)` per hour** per pod, the repeats
+counted in a debug line — or a flood could write a 90-day row per request.
 
 **The notice** (`pairing_notice.rs`): on approve, the org's other `MANAGE_AGENTS` holders get
-"<approver> paired <machine_name> (<os>) into <org> from <country or 'an unknown location'>"
-by web push and by email — spawned, best-effort, never gating the answer.
+"<approver> paired <machine_name> (<os>) into <org> from <country or 'an unknown location'>",
+naming what the pairing enrolls (a tunnel client, which any member may pair, or the full
+daemon), by web push and by email — spawned, best-effort, never gating the answer. The mail
+is rendered by `render_device_paired_notice`, which HTML-escapes every field and keeps the
+subject plain text: the machine name is the installer's own text.
 
 **Settings** — `[pairing]`, env `ROOMLER__PAIRING__*`: `enabled` (default **on**),
-`ttl_secs` (900), `poll_interval_secs` (5), `start_per_ip_per_hour` (20),
+`ttl_secs` (900), `poll_interval_secs` (5), `start_per_ip_per_hour` (60),
 `misses_per_account_per_hour` (10).
 
 ## Phases
@@ -385,7 +404,9 @@ Each criterion's fail-first run is today's build, recorded in the log before its
       state), in an integration test with two servers on one database.
 - [ ] **AC7** — A start flood from one IP is refused past its ceiling; a poll faster than
       `interval` answers `slow_down`; misses past the per-account ceiling lock that account's
-      approvals for the hour. Every refusal lands in `pairing_audit`.
+      approvals for the hour. `pairing_audit` holds every decision about a real pairing or by a
+      signed-in account, and the first refusal per source per hour for the refusals an
+      anonymous caller can repeat at will.
 - [ ] **AC8** — Every lookup, approve, deny, delivery and expiry lands in `pairing_audit`, and
       the org's other admins receive the "device paired" notice.
 - [ ] **AC9** — A paired token is the ordinary single-use enrollment token: the plan device cap

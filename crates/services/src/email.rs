@@ -497,44 +497,18 @@ consent prompt.</p>
 
     /// FR-129 A1 — tell an org's other `MANAGE_AGENTS` holders that a
     /// device was paired into the org through `/pair`: who approved, which
-    /// machine, from which country (or "an unknown location" — never a
-    /// guess). Informational; the device list is the link. Admin-to-admin,
-    /// so the approver themselves never receives it.
-    #[allow(clippy::too_many_arguments)]
+    /// machine, of which kind, from which country (or "an unknown
+    /// location" — never a guess). Informational; the device list is the
+    /// link. Admin-to-admin, so the approver themselves never receives it.
+    /// Rendered by [`render_device_paired_notice`], which escapes every
+    /// field: the machine name is the installer's own text, and a tunnel
+    /// client is paired by any member.
     pub async fn send_device_paired_notice(
         &self,
         to_email: &str,
-        approver_name: &str,
-        machine_name: &str,
-        os_label: &str,
-        org_name: &str,
-        location: &str,
-        devices_url: &str,
+        notice: &DevicePairedNotice,
     ) -> anyhow::Result<()> {
-        let subject = format!("{approver_name} paired {machine_name} into {org_name}");
-        let html = format!(
-            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-<h2>A device was paired into {org}</h2>
-<p><strong>{approver}</strong> paired <strong>{machine}</strong> ({os}) into
-<strong>{org}</strong> from {location}.</p>
-<p style="margin: 24px 0;">
-  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
-    Open the device list
-  </a>
-</p>
-<p style="color: #b45309; font-size: 12px;">
-  If nobody in your organization was setting this device up, remove it from the
-  device list and review who holds the permission to add devices.
-</p>
-<p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
-</div>"#,
-            approver = approver_name,
-            machine = machine_name,
-            os = os_label,
-            org = org_name,
-            location = location,
-            url = devices_url,
-        );
+        let (subject, html) = render_device_paired_notice(notice);
         self.send(to_email, &subject, &html).await
     }
 
@@ -641,6 +615,124 @@ consent prompt.</p>
             url = app_url,
         );
         self.send(to_email, &subject, &html).await
+    }
+}
+
+/// FR-129 A1 — what the "device paired" notice says. Every string field is
+/// treated as untrusted text: `machine_name` is whatever the installer
+/// sent (clamped, never refused), `approver_name` and `org_name` are
+/// free-text profile fields, and a tunnel client is paired by any member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePairedNotice {
+    pub approver_name: String,
+    pub machine_name: String,
+    /// `Linux` · `macOS` · `Windows`.
+    pub os_label: String,
+    /// What the pairing enrolls — "a tunnel client" or the full daemon —
+    /// so an admin can tell a `roomler` CLI from a SYSTEM/root `roomlerd`.
+    pub role_label: String,
+    pub org_name: String,
+    /// A country, or "an unknown location".
+    pub location: String,
+    pub devices_url: String,
+}
+
+/// Printable text for a header line: every control character (a newline
+/// would end the subject and start a header) is dropped.
+fn header_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The notice's `(subject, html)`. Pure, so the escaping is a unit test:
+/// every interpolated value goes through [`crate::newsletter::escape_html`]
+/// (the body) or [`header_text`] (the subject, plain text).
+pub fn render_device_paired_notice(n: &DevicePairedNotice) -> (String, String) {
+    use crate::newsletter::escape_html;
+    let subject = format!(
+        "{} paired {} into {}",
+        header_text(&n.approver_name),
+        header_text(&n.machine_name),
+        header_text(&n.org_name)
+    );
+    let html = format!(
+        r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>A device was paired into {org}</h2>
+<p><strong>{approver}</strong> paired <strong>{machine}</strong> ({os}) into
+<strong>{org}</strong> from {location}.</p>
+<p>What it enrolls: <strong>{role}</strong>.</p>
+<p style="margin: 24px 0;">
+  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
+    Open the device list
+  </a>
+</p>
+<p style="color: #b45309; font-size: 12px;">
+  If nobody in your organization was setting this device up, remove it from the
+  device list and review who holds the permission to add devices.
+</p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
+</div>"#,
+        approver = escape_html(&n.approver_name),
+        machine = escape_html(&n.machine_name),
+        os = escape_html(&n.os_label),
+        role = escape_html(&n.role_label),
+        org = escape_html(&n.org_name),
+        location = escape_html(&n.location),
+        url = escape_html(&n.devices_url),
+    );
+    (subject, html)
+}
+
+#[cfg(test)]
+mod device_paired_notice_tests {
+    use super::*;
+
+    fn notice(machine_name: &str) -> DevicePairedNotice {
+        DevicePairedNotice {
+            approver_name: "Ada <b>Admin</b>".into(),
+            machine_name: machine_name.into(),
+            os_label: "Linux".into(),
+            role_label: "a tunnel client (the roomler CLI)".into(),
+            org_name: "Acme & Co".into(),
+            location: "an unknown location".into(),
+            devices_url: "https://example.test/tenant/0123456789abcdef01234567/devices".into(),
+        }
+    }
+
+    /// F1 — an installer's machine name is text, never markup: a pairing
+    /// named like a password-reset link renders as its own characters.
+    #[test]
+    fn every_field_is_escaped_in_the_body() {
+        let evil = r#"<a href="//evil.test">Reset your password</a>"#;
+        let (_, html) = render_device_paired_notice(&notice(evil));
+        assert!(!html.contains(evil), "the markup must not survive");
+        assert!(!html.contains("<a href=\"//evil"));
+        assert!(
+            html.contains("&lt;a href=&quot;//evil.test&quot;&gt;Reset your password&lt;/a&gt;")
+        );
+        assert!(html.contains("Ada &lt;b&gt;Admin&lt;/b&gt;"));
+        assert!(html.contains("Acme &amp; Co"));
+        assert!(html.contains("a tunnel client (the roomler CLI)"));
+        // The one link in the mail is ours.
+        assert_eq!(html.matches("<a href=").count(), 1);
+        assert!(
+            html.contains(
+                r#"<a href="https://example.test/tenant/0123456789abcdef01234567/devices""#
+            )
+        );
+    }
+
+    /// F1 — the subject is a header line: plain text, no control
+    /// characters (a newline there would start a header of the attacker's
+    /// choosing), and markup stays visibly markup.
+    #[test]
+    fn the_subject_is_plain_text_without_control_characters() {
+        let (subject, _) =
+            render_device_paired_notice(&notice("lap\r\nBcc: victim@example.test\u{7}top"));
+        assert_eq!(
+            subject,
+            "Ada <b>Admin</b> paired lapBcc: victim@example.testtop into Acme & Co"
+        );
+        assert!(!subject.chars().any(char::is_control));
     }
 }
 
