@@ -29,8 +29,19 @@
 //! task) that wakes every 30 s and force-exits if the async
 //! watchdog's own heartbeat counter hasn't moved in 60 s. This is
 //! the absolute last resort against a fully-deadlocked tokio
-//! runtime — the only place in the codebase where we deliberately
-//! step outside the async world.
+//! runtime.
+//!
+//! ## What a stall leaves behind (#3018)
+//!
+//! Both exits write a crash sidecar before they go: the summary, the log
+//! lines before the stall, and every thread's stack where the OS lets us
+//! read them ([`crate::thread_dump`]). Until #3018 the watchdog-of-watchdog
+//! wrote one stderr line and nothing else, so a Mac whose whole runtime froze
+//! for a minute (2026-10-26) left no record of where. The evidence runs on a
+//! thread of its own and gets [`STALL_EVIDENCE_BUDGET`]. Whatever the stuck
+//! threads hold (the pump lock, the log writer, a filesystem) can delay the
+//! exit by that much, never stop it. On the runtime-stall path the exit-node
+//! routes are dropped first, because they are the host's safety, not ours.
 //!
 //! ## Global singleton
 //!
@@ -189,6 +200,24 @@ pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
 /// per `supervision::RESTART_MIN_INTERVAL`, across process lifetimes.
 pub const RESTART_REQUESTED_EXIT_CODE: i32 = 9;
 
+/// How often the watchdog-of-watchdog looks at the async watchdog's
+/// heartbeat.
+pub const THREAD_WATCHDOG_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// How long the async watchdog's heartbeat may stand still before the
+/// watchdog-of-watchdog declares the runtime stuck. With
+/// [`THREAD_WATCHDOG_CHECK_EVERY`], it fires 60–90 s into a stall.
+pub const THREAD_WATCHDOG_STUCK_AFTER: Duration = Duration::from_secs(60);
+
+/// #3018 — how long a stall's exit waits for its evidence: a crash sidecar
+/// with every thread's stack. `sample` takes ~1.6 s on a Mac. The rest is
+/// margin for the sidecar's write, which can meet the same stuck
+/// filesystem the stall did.
+pub const STALL_EVIDENCE_BUDGET: Duration = Duration::from_secs(10);
+
+/// #3018 — the stack reader's share of [`STALL_EVIDENCE_BUDGET`].
+const THREAD_DUMP_DEADLINE: Duration = Duration::from_secs(6);
+
 /// Process-wide singleton. Set by `install`; read by the free
 /// functions and the `run` task.
 static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
@@ -328,6 +357,36 @@ impl Watchdog {
 
     pub fn own_heartbeat(&self) -> u64 {
         self.own_heartbeat.load(Ordering::Acquire)
+    }
+
+    /// #3018 — every active pump's age and stage, `name=Ns@stage`, without
+    /// waiting for the pump lock: on the runtime-stall path the thread that
+    /// holds it may be one of the stuck ones. `None` while it is held.
+    pub fn pump_ages_now(&self, now: Instant) -> Option<String> {
+        let m = match self.pumps.try_lock() {
+            Ok(m) => m,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let mut ages: Vec<(&'static str, Duration, String)> = m
+            .iter()
+            .filter(|(_, p)| p.active)
+            .map(|(n, p)| {
+                (
+                    *n,
+                    now.saturating_duration_since(p.last_tick),
+                    p.stage.to_string(),
+                )
+            })
+            .collect();
+        drop(m);
+        ages.sort_by_key(|(n, ..)| *n);
+        Some(
+            ages.iter()
+                .map(|(n, d, s)| format!("{n}={}s@{s}", d.as_secs()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 }
 
@@ -495,13 +554,31 @@ pub(crate) async fn run_with_intervals(
 /// counter has not moved in >60 s — catches the case where the
 /// tokio runtime itself is deadlocked.
 pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
-    let _ = std::thread::Builder::new()
+    let _ = spawn_thread_watchdog_with(
+        wd,
+        THREAD_WATCHDOG_CHECK_EVERY,
+        THREAD_WATCHDOG_STUCK_AFTER,
+        force_exit_on_runtime_stall,
+    );
+}
+
+/// [`spawn_thread_watchdog`] with its cadence and its action injected, so a
+/// test can stop a runtime and watch it fire without the process exiting.
+/// `on_stuck` gets how long the heartbeat stood still. The thread ends after
+/// it, in the one case where it returns at all.
+pub(crate) fn spawn_thread_watchdog_with(
+    wd: Arc<Watchdog>,
+    check_every: Duration,
+    stuck_after: Duration,
+    on_stuck: impl FnOnce(&Watchdog, Duration) + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
         .name("roomlerd-watchdog-of-watchdog".into())
         .spawn(move || {
             let mut prev_count = wd.own_heartbeat();
             let mut prev_at = Instant::now();
             loop {
-                std::thread::sleep(Duration::from_secs(30));
+                std::thread::sleep(check_every);
                 let now_count = wd.own_heartbeat();
                 let now_at = Instant::now();
                 if now_count != prev_count {
@@ -510,23 +587,78 @@ pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
                     continue;
                 }
                 let stuck_for = now_at.saturating_duration_since(prev_at);
-                if stuck_for > Duration::from_secs(60) {
-                    // FR-97 P6e (#1538) — never `eprintln!` here: on a failing
-                    // stderr it panics, this thread dies, and the exit below,
-                    // the last line of defense, never happens.
-                    crate::logging::say_on_stderr(format_args!(
-                        "watchdog-of-watchdog: async watchdog has not heartbeat in {:?}; \
-                         forcing exit({STALL_EXIT_CODE})",
-                        stuck_for
-                    ));
-                    // P5/A2 — this exit bypasses RAII; drop any exit-node
-                    // split-default first so a stalled host doesn't stay
-                    // blackholed until the supervisor's restart reconciles it.
-                    crate::purge_exit_routes();
-                    std::process::exit(STALL_EXIT_CODE);
+                if stuck_for > stuck_after {
+                    on_stuck(&wd, stuck_for);
+                    return;
                 }
             }
+        })
+}
+
+/// The watchdog-of-watchdog's action: the whole runtime has stood still for
+/// `stuck_for`.
+fn force_exit_on_runtime_stall(wd: &Watchdog, stuck_for: Duration) {
+    // FR-97 P6e (#1538) — never `eprintln!` here: on a failing stderr it
+    // panics, this thread dies, and the exit below, the last line of
+    // defense, never happens.
+    crate::logging::say_on_stderr(format_args!(
+        "watchdog-of-watchdog: async watchdog has not heartbeat in {stuck_for:?}; \
+         forcing exit({STALL_EXIT_CODE})"
+    ));
+    // P5/A2 — this exit bypasses RAII; drop any exit-node split-default
+    // first so a stalled host doesn't stay blackholed until the supervisor's
+    // restart reconciles it. First of all (#3018): the evidence below may
+    // take its whole budget.
+    crate::purge_exit_routes();
+    let pumps = wd
+        .pump_ages_now(Instant::now())
+        .unwrap_or_else(|| "unknown, their lock is held".to_string());
+    let summary = format!(
+        "runtime stalled: the async watchdog has not ticked in {}s (watchdog-of-watchdog); pumps: {pumps}",
+        stuck_for.as_secs()
+    );
+    if !leave_stall_evidence(summary, STALL_EVIDENCE_BUDGET) {
+        crate::logging::say_on_stderr(format_args!(
+            "watchdog-of-watchdog: the stall's evidence did not finish within {STALL_EVIDENCE_BUDGET:?}; \
+             exiting without it"
+        ));
+    }
+    std::process::exit(STALL_EXIT_CODE);
+}
+
+/// #3018 — the record a stall leaves: a crash sidecar with `summary`, and
+/// every thread's stack where the OS lets us read them, after the log tail
+/// ([`crate::thread_dump`], `crash_recorder::record_with_appendix`). The
+/// whole stack report stays in the log dir.
+///
+/// It runs on a thread of its own, and this returns after `budget` whether
+/// or not it finished, because the stuck code may hold anything it needs: the
+/// log writer, a filesystem. Returns whether it finished in time.
+pub(crate) fn leave_stall_evidence(summary: String, budget: Duration) -> bool {
+    within(budget, move || {
+        let dump = crate::logging::log_dir()
+            .and_then(|dir| crate::thread_dump::capture(&dir, THREAD_DUMP_DEADLINE));
+        crate::crash_recorder::record_with_appendix(
+            crate::crash_recorder::Reason::WatchdogStall,
+            &summary,
+            crate::crash_recorder::WriterContext::Worker,
+            dump.as_ref().map_or("", |d| d.condensed.as_str()),
+        );
+    })
+}
+
+/// Run `f` on a thread of its own and wait for it at most `budget`. Whether
+/// it finished in time. A thread that did not is left running, to end with
+/// the process.
+pub(crate) fn within(budget: Duration, f: impl FnOnce() + Send + 'static) -> bool {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-stall-evidence".into())
+        .spawn(move || {
+            f();
+            let _ = done_tx.send(());
         });
+    spawned.is_ok() && done_rx.recv_timeout(budget).is_ok()
 }
 
 /// Default stall handler — log + `std::process::exit(STALL_EXIT_CODE)`.
@@ -545,20 +677,18 @@ pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
     ));
     tracing::error!(stalled = %summary, "watchdog: forcing process exit");
 
+    // P5/A2 — bypasses RAII; drop any exit-node split-default so the stall
+    // doesn't leave the host blackholed until the supervisor restarts it.
+    // Before the evidence (#3018), which may take its whole budget.
+    crate::purge_exit_routes();
+
     // Phase 1B (Task 9): emit a crash sidecar BEFORE process-exit
     // so the next agent startup can upload it to roomler.ai. Worker
     // context: the watchdog runs inside the worker process; the SCM
     // supervisor's own crash detection (Phase 1B site 3) excludes
-    // STALL_EXIT_CODE explicitly to avoid double-recording.
-    crate::crash_recorder::record(
-        crate::crash_recorder::Reason::WatchdogStall,
-        &format!("pumps stalled ({summary})"),
-        crate::crash_recorder::WriterContext::Worker,
-    );
-
-    // P5/A2 — bypasses RAII; drop any exit-node split-default so the stall
-    // doesn't leave the host blackholed until the supervisor restarts it.
-    crate::purge_exit_routes();
+    // STALL_EXIT_CODE explicitly to avoid double-recording. #3018: with
+    // every thread's stack, and bounded.
+    leave_stall_evidence(format!("pumps stalled ({summary})"), STALL_EVIDENCE_BUDGET);
 
     std::process::exit(STALL_EXIT_CODE);
 }
@@ -1250,5 +1380,117 @@ mod tests {
         let summary = stall_summary(&stalled, |n| wd.stage_of(n));
         assert!(summary.starts_with("signaling="), "{summary}");
         assert!(summary.ends_with("s@device_end"), "{summary}");
+    }
+
+    // ─── #3018: the watchdog-of-watchdog, and what a stall leaves ───────────
+
+    /// A runtime with ONE worker: holding it stops every task on it, as
+    /// blocked workers stopped the Mac's whole runtime on 2026-10-26.
+    fn one_worker_runtime_with_a_ticking_watchdog() -> (tokio::runtime::Runtime, Arc<Watchdog>) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let wd = Watchdog::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let looped = Arc::clone(&wd);
+        rt.spawn(async move {
+            // A dropped sender would make `changed()` ready at once, and the
+            // loop would spin instead of sleeping between scans.
+            let _keep = shutdown_tx;
+            run_with_intervals(
+                looped,
+                shutdown_rx,
+                |_| true,
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        let started = Instant::now();
+        while wd.own_heartbeat() < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the async watchdog never ticked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (rt, wd)
+    }
+
+    /// #3018 — holding the runtime's only worker stops the async watchdog, and
+    /// the watchdog-of-watchdog fires with how long its heartbeat stood still.
+    #[test]
+    fn the_thread_watchdog_fires_when_the_runtime_stops() {
+        let (rt, wd) = one_worker_runtime_with_a_ticking_watchdog();
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        spawn_thread_watchdog_with(
+            Arc::clone(&wd),
+            Duration::from_millis(25),
+            Duration::from_millis(200),
+            move |_, stuck_for| {
+                let _ = fired_tx.send(stuck_for);
+            },
+        )
+        .unwrap();
+        rt.spawn(async { std::thread::sleep(Duration::from_secs(2)) });
+        let stuck_for = fired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watchdog-of-watchdog fired");
+        assert!(stuck_for > Duration::from_millis(200), "{stuck_for:?}");
+        rt.shutdown_background();
+    }
+
+    /// #3018 — the converse: while the heartbeat moves, it stays quiet.
+    #[test]
+    fn the_thread_watchdog_stays_quiet_while_the_runtime_ticks() {
+        let (rt, wd) = one_worker_runtime_with_a_ticking_watchdog();
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        spawn_thread_watchdog_with(
+            wd,
+            Duration::from_millis(25),
+            Duration::from_millis(200),
+            move |_, stuck_for| {
+                let _ = fired_tx.send(stuck_for);
+            },
+        )
+        .unwrap();
+        assert!(fired_rx.recv_timeout(Duration::from_millis(800)).is_err());
+        rt.shutdown_background();
+    }
+
+    /// #3018 — the evidence gives way to the exit: evidence that hangs costs
+    /// its budget, and no more.
+    #[test]
+    fn stall_evidence_that_hangs_costs_only_its_budget() {
+        let started = Instant::now();
+        assert!(!within(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(30))
+        }));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(100) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert!(within(Duration::from_secs(5), || ()));
+    }
+
+    /// #3018 — the runtime-stall path reads the pumps without waiting: a held
+    /// pump lock gives `None`, never a hang.
+    #[test]
+    fn pump_ages_never_wait_for_the_pump_lock() {
+        let wd = Watchdog::new();
+        wd.register("signaling", Duration::from_secs(90), true);
+        wd.register("encoder", Duration::from_secs(30), false);
+        wd.set_stage("signaling", "ws.text:rc:ssh.response");
+        let now = Instant::now() + Duration::from_secs(61);
+        assert_eq!(
+            wd.pump_ages_now(now).as_deref(),
+            Some("signaling=61s@ws.text:rc:ssh.response")
+        );
+        let held = wd.pumps.lock().unwrap();
+        assert_eq!(wd.pump_ages_now(now), None);
+        drop(held);
     }
 }
