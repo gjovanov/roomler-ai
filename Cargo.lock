@@ -9498,6 +9498,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roomler-ai-remote-control",
  "roomler-cli",
+ "roomler-localapi",
  "roomler-node-core",
  "roomler-setup-core",
  "roomlerd",

@@ -72,9 +72,38 @@ pub struct AdvancedOptions {
     pub overlay_advertised_routes: Option<String>,
     /// Comma-separated CIDRs → `advertise_routes` (tunnel/SOCKS mesh).
     pub advertise_routes: Option<String>,
+    /// #2338 — the config keys the person touched on the Server page
+    /// (`overlay_enabled`, `auto_grant_session`, …). On a config that already
+    /// exists only these land; the untouched boxes keep the device's own
+    /// values. An absent list (an older SPA) means nothing was touched.
+    pub touched: Vec<String>,
 }
 
 impl AdvancedOptions {
+    /// The config keys the person touched, deduplicated, in the registry's
+    /// spelling — for the fold here and for a merge that runs elsewhere
+    /// (the privileged half's `--config-take`).
+    pub(crate) fn touched_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .touched
+            .iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| {
+                matches!(
+                    k.as_str(),
+                    "overlay_enabled"
+                        | "advertise_local_subnets"
+                        | "auto_grant_session"
+                        | "overlay_advertised_routes"
+                        | "advertise_routes"
+                )
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// The two free-text route lists, with empties normalised away —
     /// shared by pre-MSI validation and the post-enroll apply.
     fn route_fields(&self) -> [(&'static str, Option<&str>); 2] {
@@ -92,7 +121,7 @@ impl AdvancedOptions {
 
     /// Fail fast on bad route CIDRs (called pre-MSI). Bool options
     /// can't be invalid.
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         for (key, val) in self.route_fields() {
             if let Some(v) = val {
                 roomlerd::config_surface::validate_cidr_list(v)
@@ -102,34 +131,48 @@ impl AdvancedOptions {
         Ok(())
     }
 
-    /// FR-84 S2 — resolve the options the SPA left unset from the install
-    /// flavour, before [`Self::apply_to`]. Today that is one key: the
-    /// overlay follows the flavour (see [`overlay_enabled_default`]). The
-    /// SPA sends the box as the operator saw it, so this is a belt for a
-    /// caller that never sent the field — and a second place the default
-    /// is written down, next to the one that consumes it.
-    fn with_flavour_defaults(mut self, flavour: WindowsInstallFlavour) -> Self {
-        self.overlay_enabled = overlay_enabled_default(self.overlay_enabled, flavour);
+    /// FR-84 S2 — the overlay box resolved from a role's default when the
+    /// SPA sent nothing for it, before [`Self::apply_to`] on a fresh config.
+    /// The SPA sends the box as the operator saw it, so this is a belt for
+    /// a caller that never sent the field — and a second place the default
+    /// is written down, next to the one that consumes it: the one default
+    /// the roles disagree on (`overlay_enabled_default` on Windows; the
+    /// Linux and macOS roles' in [`crate::orchestrator_unix`]).
+    pub(crate) fn with_overlay_default(mut self, default: Option<bool>) -> Self {
+        self.overlay_enabled = self.overlay_enabled.or(default);
         self
     }
 
-    /// Write the selected options into the freshly-enrolled config via
-    /// the same per-key registry the desktop editor uses.
-    fn apply_to(&self, cfg: &mut roomlerd::config::AgentConfig) -> Result<(), String> {
+    /// Write the selected options into the enrolled config via the same
+    /// per-key registry the desktop editor uses. With `only_touched` (a
+    /// config that already existed, #2338) a key lands only if the person
+    /// touched its box; an untouched box must not overwrite what the device
+    /// already had.
+    pub(crate) fn apply_to(
+        &self,
+        cfg: &mut roomlerd::config::AgentConfig,
+        only_touched: bool,
+    ) -> Result<(), String> {
         use roomlerd::config_surface::apply;
+        let touched = self.touched_keys();
+        let lands = |key: &str| !only_touched || touched.iter().any(|t| t == key);
         let bools = [
             ("overlay_enabled", self.overlay_enabled),
             ("advertise_local_subnets", self.advertise_local_subnets),
             ("auto_grant_session", self.auto_grant_session),
         ];
         for (key, val) in bools {
-            if let Some(v) = val {
+            if let Some(v) = val
+                && lands(key)
+            {
                 apply(cfg, key, Some(if v { "true" } else { "false" }))
                     .map_err(|e| format!("advanced option {key}: {e}"))?;
             }
         }
         for (key, val) in self.route_fields() {
-            if let Some(v) = val {
+            if let Some(v) = val
+                && lands(key)
+            {
                 apply(cfg, key, Some(v)).map_err(|e| format!("advanced option {key}: {e}"))?;
             }
         }
@@ -193,7 +236,7 @@ pub async fn run_install(
 /// FR-102 P3b — the origin the diagnostics are posted to: the server as the
 /// enroll will reach it (a remote `http://` is upgraded to `https://`, a
 /// loopback one left alone), without a trailing slash.
-fn diagnostics_server(server: &str) -> String {
+pub(crate) fn diagnostics_server(server: &str) -> String {
     roomler_ai_remote_control::server_url::secure(server, false)
         .url
         .trim_end_matches('/')
@@ -544,7 +587,6 @@ async fn run_install_inner(
             },
         );
     }
-    let machine_id = roomlerd::machine::derive_machine_id(&config_path);
     // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
     // scope its role installs (`Role::install_scope`). A daemon role always
     // has one; the `None` arm is the tunnel role, which never reaches here.
@@ -557,31 +599,58 @@ async fn run_install_inner(
             .unwrap_or(roomlerd::enrollment::InstallScope::Unknown),
     );
     install.run = diag.run_id();
-    let inputs = roomlerd::enrollment::EnrollInputs {
-        server_url: &server,
-        enrollment_token: &token,
-        machine_id: &machine_id,
-        machine_name: &device_name,
-        install: Some(install),
-    };
-    let mut cfg = roomlerd::enrollment::enroll(inputs)
-        .await
-        .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
-    // FR-99 decision 3 — the SystemContext flavour is a Windows service
-    // install, and the wizard always writes a fresh config: it starts at
-    // `lock_on_end = auto` (`enrollment::apply_service_install_defaults`).
-    if is_system_context {
-        roomlerd::enrollment::apply_service_install_defaults(&mut cfg);
+    // #2338 — a config already at the path is the base: the fresh identity
+    // is folded into it (`crate::enroll_step`), as `roomlerd enroll` does,
+    // so a reinstall keeps the mesh, the routes and every other
+    // operator-owned key. FR-99 decision 3's `lock_on_end = auto` and the
+    // flavour's overlay default (FR-84 S2) apply to a FRESH config only; the
+    // boxes the person touched land either way, the untouched ones only on
+    // a fresh config. F4: a config there that does not load is said,
+    // recovered from its last good copy when it can be, and kept aside —
+    // never read as absent and silently written over.
+    let existing = crate::enroll_step::read_existing(&config_path);
+    if let Some(message) = existing.warning {
+        emit(on_event, ProgressEvent::PreflightWarning { message });
     }
-    // S2 — fold the wizard's advanced options into the enrolled config
-    // before it's written (route lists already validated pre-MSI). An
-    // overlay choice the SPA did not send follows the flavour (FR-84 S2).
-    advanced
-        .with_flavour_defaults(wfx)
-        .apply_to(&mut cfg)
-        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
-    let agent_id = cfg.agent_id.clone();
-    let tenant_id = cfg.tenant_id.clone();
+    let crate::enroll_step::Enrolled {
+        mut cfg,
+        outcome,
+        previous_row,
+    } = crate::enroll_step::enroll_folded(
+        &config_path,
+        existing.cfg,
+        &server,
+        &token,
+        &device_name,
+        install,
+    )
+    .await
+    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    // F3: the machine id was read back from the config, so the server reuses
+    // the row — unless it no longer can; then the old key is retired and said.
+    if let Some(row) = &previous_row {
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: roomlerd::enrollment::describe_previous_row(row, &cfg.agent_id),
+            },
+        );
+    }
+    let note = crate::enroll_step::finish(
+        &mut cfg,
+        &outcome,
+        is_system_context,
+        &advanced,
+        overlay_enabled_default(None, wfx),
+    )
+    .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
+    if let Some(message) = note {
+        emit(on_event, ProgressEvent::PreflightWarning { message });
+    }
+    // The device this install enrolled: on an org added beside the primary,
+    // that org's row, never the primary's (the config's top-level ids).
+    let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
+    let added_org = roomlerd::enrollment::is_added_org(&outcome);
     roomlerd::config::save(&config_path, &cfg)
         .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
     emit(
@@ -612,7 +681,17 @@ async fn run_install_inner(
     // companion step: a declined prompt or a failure leaves an enrolled
     // install, and the Done page carries the manual command.
     diag.begin(Step::Anchor);
-    let anchored = anchor_device(role, wfx, &server, &token, &agent_id, on_event).await;
+    let anchored = if added_org {
+        // Not the step at all, so the Done page offers no manual command for
+        // it: that command would move the machine's anchor to this org.
+        if let Some(reason) = added_org_anchor_note(role, &token) {
+            tracing::warn!(%reason, "FR-104: the device was not anchored");
+            emit(on_event, ProgressEvent::AnchorSkipped { reason });
+        }
+        None
+    } else {
+        anchor_device(role, wfx, &server, &token, &agent_id, on_event).await
+    };
     best_effort_outcome(diag, anchored, ErrorCode::Anchor);
 
     // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
@@ -670,6 +749,23 @@ fn best_effort_outcome(diag: &Diagnostics, report: Option<bool>, code: ErrorCode
 /// for? The two machine-wide Windows roles; a per-user install has none.
 pub fn role_anchors(role: Role) -> bool {
     cfg!(target_os = "windows") && matches!(role, Role::DaemonSystem | Role::DaemonMachine)
+}
+
+/// FR-104 on an install whose enrollment was ADDED beside the machine's
+/// primary one (another org): the step does not run. The anchor is one per
+/// machine (`exec_service.rs`: one `anchor.json`, and only the anchored
+/// device's connection advertises `exec-system`), so anchoring this org's row
+/// would take SYSTEM exec away from the primary organization on another
+/// organization's token, the rule peer relays keep too (primary-org only).
+/// `Some(reason)` when the token asked for an anchor, so the person is told;
+/// `None` when the step would not have applied anyway.
+pub(crate) fn added_org_anchor_note(role: Role, token: &str) -> Option<String> {
+    (role_anchors(role) && wizard_shared::token_peek::parse_anchor_claim(token)).then(|| {
+        "this install added another organization beside the machine's primary enrollment, \
+         and the machine's one SYSTEM anchor belongs to the primary organization, so this \
+         device was not anchored"
+            .to_string()
+    })
 }
 
 /// How long the elevated anchor step may take, the administrator prompt
@@ -1375,19 +1471,24 @@ mod tests {
     fn overlay_flavour_default_lands_in_the_enrolled_config() {
         // Through the real apply path on a real config: the belt is only
         // worth having if the key actually reaches config.toml.
+        let for_flavour = |sent: AdvancedOptions, flavour| {
+            let default = overlay_enabled_default(None, flavour);
+            sent.with_overlay_default(default)
+        };
         let mut cfg = roomlerd::config::test_fixture();
         cfg.overlay_enabled = false;
-        AdvancedOptions::default()
-            .with_flavour_defaults(WindowsInstallFlavour::PerMachine)
-            .apply_to(&mut cfg)
-            .expect("apply");
+        for_flavour(
+            AdvancedOptions::default(),
+            WindowsInstallFlavour::PerMachine,
+        )
+        .apply_to(&mut cfg, false)
+        .expect("apply");
         assert!(cfg.overlay_enabled, "perMachine + no choice → overlay on");
 
         let mut cfg = roomlerd::config::test_fixture();
         cfg.overlay_enabled = false;
-        AdvancedOptions::default()
-            .with_flavour_defaults(WindowsInstallFlavour::PerUser)
-            .apply_to(&mut cfg)
+        for_flavour(AdvancedOptions::default(), WindowsInstallFlavour::PerUser)
+            .apply_to(&mut cfg, false)
             .expect("apply");
         assert!(
             !cfg.overlay_enabled,
@@ -1396,16 +1497,84 @@ mod tests {
 
         let mut cfg = roomlerd::config::test_fixture();
         cfg.overlay_enabled = false;
-        AdvancedOptions {
-            overlay_enabled: Some(false),
-            ..Default::default()
-        }
-        .with_flavour_defaults(WindowsInstallFlavour::PerMachine)
-        .apply_to(&mut cfg)
+        for_flavour(
+            AdvancedOptions {
+                overlay_enabled: Some(false),
+                ..Default::default()
+            },
+            WindowsInstallFlavour::PerMachine,
+        )
+        .apply_to(&mut cfg, false)
         .expect("apply");
         assert!(
             !cfg.overlay_enabled,
             "an explicit off on perMachine is respected"
         );
+    }
+
+    /// #2338 — with `only_touched`, a box the person never touched does not
+    /// overwrite the device's value, and a touched one does. The SPA names
+    /// the touched keys; an unknown name is ignored.
+    #[test]
+    fn only_touched_keys_land_on_an_existing_config() {
+        let mut cfg = roomlerd::config::test_fixture();
+        cfg.overlay_enabled = true;
+        cfg.auto_grant_session = false;
+        let sent = AdvancedOptions {
+            overlay_enabled: Some(false),
+            auto_grant_session: Some(true),
+            touched: vec!["auto_grant_session".into(), "no_such_key".into()],
+            ..Default::default()
+        };
+        assert_eq!(sent.touched_keys(), vec!["auto_grant_session".to_string()]);
+        sent.apply_to(&mut cfg, true).expect("apply");
+        assert!(cfg.overlay_enabled, "untouched: kept");
+        assert!(cfg.auto_grant_session, "touched: landed");
+        // Without the flag every sent value lands (a fresh config).
+        sent.apply_to(&mut cfg, false).expect("apply");
+        assert!(!cfg.overlay_enabled);
+    }
+
+    /// An older SPA sends no `touched` list: it deserialises as empty.
+    #[test]
+    fn advanced_options_without_touched_deserialise() {
+        let v: AdvancedOptions =
+            serde_json::from_str(r#"{"overlayEnabled": true}"#).expect("parse");
+        assert_eq!(v.overlay_enabled, Some(true));
+        assert!(v.touched.is_empty());
+        let v: AdvancedOptions = serde_json::from_str(
+            r#"{"overlayEnabled": true, "touched": ["overlay_enabled", "overlay_enabled"]}"#,
+        )
+        .expect("parse");
+        assert_eq!(v.touched_keys(), vec!["overlay_enabled".to_string()]);
+    }
+
+    /// An install whose enrollment was added beside the machine's primary
+    /// one is never anchored: the machine's one SYSTEM anchor stays the
+    /// primary organization's. The person is told when the token asked for an
+    /// anchor (a machine-wide role, on Windows); otherwise there is nothing to
+    /// say. Before this the step ran with the primary's device id and the new
+    /// org's token, and the server refused it as "no such device".
+    #[test]
+    fn an_added_org_is_never_anchored() {
+        // Unsigned test JWTs: only the payload is read.
+        let anchoring = "h.eyJ0b2tlbl90eXBlIjoiZW5yb2xsbWVudCIsImFuY2hvciI6dHJ1ZX0.s";
+        let plain = "h.eyJ0b2tlbl90eXBlIjoiZW5yb2xsbWVudCJ9.s";
+        assert!(wizard_shared::token_peek::parse_anchor_claim(anchoring));
+        assert_eq!(
+            added_org_anchor_note(Role::DaemonUser, anchoring),
+            None,
+            "a per-user role has no SYSTEM service"
+        );
+        assert_eq!(
+            added_org_anchor_note(Role::DaemonSystem, plain),
+            None,
+            "a plain token asked for no anchor"
+        );
+        let note = added_org_anchor_note(Role::DaemonSystem, anchoring);
+        assert_eq!(note.is_some(), cfg!(target_os = "windows"));
+        if let Some(note) = note {
+            assert!(note.contains("primary organization"), "{note}");
+        }
     }
 }
