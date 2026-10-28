@@ -14,13 +14,15 @@
 //! 2. **system scope only:** enroll in-process, into a private 0600 file in
 //!    the scratch directory. The person cannot read the root daemon's own
 //!    config, so the fold into an existing one (#2338) happens in the next
-//!    step, as root, through `roomlerd adopt-enrollment`;
+//!    step, as root, through `roomlerd adopt-enrollment`. The running root
+//!    daemon is asked first which device it is ([`crate::root_identity`]),
+//!    so a new device row (a renamed host, a cloned VM) is said here too;
 //! 3. the **privileged half** — `--privileged-steps --role daemon --server …
 //!    --name … --desktop`, plus `--system --config-from <file>` for the
 //!    system scope — under ONE native prompt: `pkexec` on Linux, `osascript`
-//!    with administrator privileges on macOS. The half's stdout and stderr
-//!    stream into the progress channel. A dismissed prompt ends the install
-//!    as *cancelled*; a prompt that cannot be shown turns into the terminal
+//!    with administrator privileges on macOS. The half's output streams into
+//!    the progress channel. A dismissed prompt ends the install as
+//!    *cancelled*; a prompt that cannot be shown turns into the terminal
 //!    command (no secret on it) and a wait for the person to say it ran;
 //! 4. **per-user scope:** enroll in-process now, as the person, folded into
 //!    the config already at the path (#2338) — how Windows does it;
@@ -34,11 +36,13 @@
 //! happened and the single-use token is spent — the B0 property), and
 //! shredded at the wizard's exit at the latest.
 //!
-//! **Cancel.** Before the prompt is answered the prompt client is killed
-//! and the dialog goes away. After it, the half runs as root and cannot be
-//! stopped from here: the cancel is reported, the half is waited out, and
-//! the pipeline then stops — a system-scope install may already be enrolled
-//! and running at that point, and a Retry folds into it.
+//! **Cancel** (F1). Before the prompt is answered the prompt client is
+//! killed, the dialog goes away, and *cancelled* means nothing ran. After it
+//! the half runs as root and cannot be stopped from here: the cancel is
+//! reported, the half waited out, and the install stops after it, saying
+//! what the half did. A Retry then picks up where it stopped (F5): a half
+//! that ran to its end is not run again — no second password, no second
+//! enrollment with a token already spent.
 
 use std::ffi::OsString;
 use std::sync::atomic::Ordering;
@@ -105,6 +109,68 @@ pub fn overlay_default(os: HostOs, scope: Scope) -> Option<bool> {
     }
 }
 
+/// F5 — what an earlier attempt with the same server, name and scope left,
+/// and what this attempt can therefore skip.
+#[derive(Debug)]
+struct Resume {
+    /// The device the server holds for this machine, `(agent, tenant)`.
+    ids: Option<(String, String)>,
+    /// System scope: the enrolled config the privileged half never placed.
+    scratch: Option<Scratch>,
+    /// The privileged half ran to its end and its work is still in place:
+    /// it is not run again.
+    privileged_done: bool,
+}
+
+/// Is a finished privileged half's work still in place? The daemon binary,
+/// and for a system scope the placed config.
+fn privileged_work_in_place(os: HostOs, scope: Scope) -> bool {
+    ud::daemon_binary(os).is_file()
+        && (scope == Scope::PerUser || ud::system_config_path().is_file())
+}
+
+/// F5 — read what was kept, against what is on disk now (`in_place`:
+/// [`privileged_work_in_place`]).
+fn resume_from(
+    kept: Option<KeptEnrollment>,
+    scope: Scope,
+    in_place: bool,
+) -> (Resume, Option<String>) {
+    let Some(k) = kept else {
+        return (
+            Resume {
+                ids: None,
+                scratch: None,
+                privileged_done: false,
+            },
+            None,
+        );
+    };
+    if k.privileged_done && !in_place {
+        // Removed in between: run it all again. A token the earlier attempt
+        // spent cannot enroll again — say so before the server does.
+        let note = (scope == Scope::System && k.ids.is_some()).then(|| {
+            "The previous attempt's install is no longer in place, so it runs again from the start. Its enrollment token was already used: if the enroll is refused, get a new token or pair again.".to_string()
+        });
+        return (
+            Resume {
+                ids: None,
+                scratch: None,
+                privileged_done: false,
+            },
+            note,
+        );
+    }
+    (
+        Resume {
+            ids: k.ids,
+            scratch: k.scratch,
+            privileged_done: k.privileged_done,
+        },
+        None,
+    )
+}
+
 async fn run_install_inner(
     role: Role,
     server: String,
@@ -144,7 +210,7 @@ async fn run_install_inner(
         },
     );
     if let Some(message) = other_scope_warning(&detected, scope) {
-        emit(on_event, ProgressEvent::PreflightWarning { message });
+        warn(on_event, message);
     }
     // The server's word, for the server the person chose (after the role).
     let features = crate::features::fetch(&server).await;
@@ -180,48 +246,71 @@ async fn run_install_inner(
         install.run = diag.run_id();
         install
     };
-    let mut kept = ud::take_kept(scope, &server, &device_name);
+    // F5 — an earlier attempt's work, for the same server, name and scope.
+    let (resume, resume_note) = resume_from(
+        ud::take_kept(scope, &server, &device_name),
+        scope,
+        privileged_work_in_place(os, scope),
+    );
+    if let Some(message) = resume_note {
+        warn(on_event, message);
+    }
+    let skip_privileged = resume.privileged_done;
+    if skip_privileged {
+        warn(
+            on_event,
+            match scope {
+                Scope::System => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed and this device enrolled, its service running), so neither the password nor the token is asked for again.",
+                Scope::PerUser => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed), so the password is not asked for again.",
+            }
+            .to_string(),
+        );
+    }
+    let mut ids = resume.ids.clone();
+    let kept_ids = resume.ids;
+    let kept_scratch = resume.scratch;
 
     // --- Step 2 (system): enroll in-process, into the scratch file -------
     let mut scratch: Option<Scratch> = None;
-    let mut ids: Option<(String, String)> = None;
     let mut take: Vec<String> = Vec::new();
-    if scope == Scope::System {
+    if scope == Scope::System && !skip_privileged {
         diag.begin(Step::Enroll);
         check_cancel()?;
         emit(on_event, ProgressEvent::EnrollStarted);
-        match kept.take() {
-            Some(k)
-                if k.scratch
-                    .as_ref()
-                    .is_some_and(|s| s.config_from().is_file()) =>
-            {
-                emit(
+        match (kept_scratch, kept_ids.clone()) {
+            (Some(s), Some((agent_id, tenant_id))) if s.config_from().is_file() => {
+                warn(
                     on_event,
-                    ProgressEvent::PreflightWarning {
-                        message: "reusing the enrollment from the previous attempt (its token was already spent)".to_string(),
-                    },
+                    "reusing the enrollment from the previous attempt (its token was already spent)".to_string(),
                 );
-                emit_enrolled(on_event, &k.agent_id, &k.tenant_id);
-                ids = Some((k.agent_id.clone(), k.tenant_id.clone()));
+                emit_enrolled(on_event, &agent_id, &tenant_id);
+                ids = Some((agent_id, tenant_id));
                 take = advanced.touched_keys();
-                scratch = k.scratch;
+                scratch = Some(s);
             }
             _ => {
                 let s = Scratch::create().map_err(|e| failed(ErrorCode::ConfigWrite, e))?;
+                // F3 — which device the root daemon here is, before the
+                // enroll makes one (it may make ANOTHER: see below).
+                let root = if ud::system_config_path().is_file() {
+                    crate::root_identity::query().await
+                } else {
+                    None
+                };
                 // `existing: None` on purpose — root's config is unreadable
                 // here; the privileged half folds into it (#2338).
-                let crate::enroll_step::Enrolled { mut cfg, outcome } =
-                    crate::enroll_step::enroll_folded(
-                        &config_path,
-                        None,
-                        &server,
-                        &token,
-                        &device_name,
-                        install_info(),
-                    )
-                    .await
-                    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+                let crate::enroll_step::Enrolled {
+                    mut cfg, outcome, ..
+                } = crate::enroll_step::enroll_folded(
+                    &config_path,
+                    None,
+                    &server,
+                    &token,
+                    &device_name,
+                    install_info(),
+                )
+                .await
+                .map_err(|e| failed(enroll_error_code(&e), enroll_refusal(&e)))?;
                 crate::enroll_step::finish(
                     &mut cfg,
                     &outcome,
@@ -236,6 +325,14 @@ async fn run_install_inner(
                         format!("write the enrolled config: {e}"),
                     )
                 })?;
+                if let Some(message) = root
+                    .as_ref()
+                    .and_then(|r| r.new_row_warning(&cfg.agent_id, &cfg.tenant_id))
+                {
+                    // The privileged half retires the key the previous row
+                    // still claims (`adopt-enrollment`); this says so first.
+                    warn(on_event, message);
+                }
                 emit_enrolled(on_event, &cfg.agent_id, &cfg.tenant_id);
                 ids = Some((cfg.agent_id.clone(), cfg.tenant_id.clone()));
                 take = advanced.touched_keys();
@@ -248,76 +345,123 @@ async fn run_install_inner(
         Some(s) => s,
         None => Scratch::create().map_err(|e| failed(ErrorCode::ConfigWrite, e))?,
     };
-    let keep_system = |scratch: Scratch, ids: &Option<(String, String)>| {
-        if let Some((agent_id, tenant_id)) = ids {
+    // What a Retry finds when this attempt stops before the end.
+    let keep_unplaced = |scratch: Scratch, ids: &Option<(String, String)>| {
+        if ids.is_some() {
             ud::keep(KeptEnrollment {
                 scope,
                 server: server.clone(),
                 device_name: device_name.clone(),
-                agent_id: agent_id.clone(),
-                tenant_id: tenant_id.clone(),
+                ids: ids.clone(),
                 config_path: config_path.clone(),
                 scratch: Some(scratch),
+                privileged_done: false,
             });
         }
     };
+    let keep_after_privileged = |ids: &Option<(String, String)>| {
+        ud::keep(KeptEnrollment {
+            scope,
+            server: server.clone(),
+            device_name: device_name.clone(),
+            ids: ids.clone(),
+            config_path: config_path.clone(),
+            scratch: None,
+            privileged_done: true,
+        });
+    };
 
     // --- Step 3: the privileged half, under ONE native prompt ------------
-    diag.begin(Step::Msi);
-    if let Err(e) = check_cancel() {
-        keep_system(scratch, &ids);
-        return Err(e);
+    if !skip_privileged {
+        diag.begin(Step::Msi);
+        if let Err(e) = check_cancel() {
+            keep_unplaced(scratch, &ids);
+            return Err(e);
+        }
+        let config_from = (scope == Scope::System).then(|| scratch.config_from());
+        let args = ud::privileged_args(&ud::PrivilegedSpec {
+            script: &scratch.script,
+            server: &server,
+            device_name: &device_name,
+            scope,
+            config_from: config_from.as_deref(),
+            take: &take,
+        });
+        let done = {
+            // The window refuses to close while this runs: the wizard's exit
+            // would remove the scratch directory from under it.
+            let _running = ud::PrivilegedRunning::begin();
+            run_privileged(tool, &args, &scratch, os, scope, on_event).await
+        };
+        let done = match done {
+            Ok(done) => done,
+            Err(e) => {
+                keep_unplaced(scratch, &ids);
+                return Err(e);
+            }
+        };
+        diag.ok();
+        // Placed: the file has done its job.
+        scratch.shred_config();
+        // F1 — a cancel that came while the half ran (or the moment after):
+        // it ran to its end, and the install stops here, saying so.
+        if done.cancelled_late || cancel_requested() {
+            keep_after_privileged(&ids);
+            Diagnostics::global().cancelled();
+            return Err(cancelled_after_privileged(scope));
+        }
     }
-    let config_from = (scope == Scope::System).then(|| scratch.config_from());
-    let args = ud::privileged_args(&ud::PrivilegedSpec {
-        script: &scratch.script,
-        server: &server,
-        device_name: &device_name,
-        scope,
-        config_from: config_from.as_deref(),
-        take: &take,
-    });
-    if let Err(e) = run_privileged(tool, &args, os, scope, on_event).await {
-        keep_system(scratch, &ids);
-        return Err(e);
-    }
-    diag.ok();
-    // Placed: the file has done its job.
-    scratch.shred_config();
 
     // --- Step 4 (per-user): enroll in-process, as the person -------------
     if scope == Scope::PerUser {
         diag.begin(Step::Enroll);
-        check_cancel()?;
+        if let Err(e) = check_cancel() {
+            keep_after_privileged(&ids);
+            return Err(e);
+        }
         emit(on_event, ProgressEvent::EnrollStarted);
-        let reusable = kept.take().filter(|k| {
-            roomlerd::config::read_if_present(&config_path)
-                .is_some_and(|cfg| cfg.agent_id == k.agent_id)
+        // F4 — a config there that does not load is said, recovered from its
+        // last good copy when it can be, and kept aside.
+        let existing = crate::enroll_step::read_existing(&config_path);
+        if let Some(message) = existing.warning.clone() {
+            warn(on_event, message);
+        }
+        let reusable = kept_ids.filter(|(agent_id, _)| {
+            existing
+                .cfg
+                .as_ref()
+                .is_some_and(|cfg| &cfg.agent_id == agent_id)
         });
         match reusable {
-            Some(k) => {
-                emit(
+            Some((agent_id, tenant_id)) => {
+                warn(
                     on_event,
-                    ProgressEvent::PreflightWarning {
-                        message: "reusing the enrollment from the previous attempt (its token was already spent)".to_string(),
-                    },
+                    "reusing the enrollment from the previous attempt (its token was already spent)".to_string(),
                 );
-                emit_enrolled(on_event, &k.agent_id, &k.tenant_id);
-                ids = Some((k.agent_id, k.tenant_id));
+                emit_enrolled(on_event, &agent_id, &tenant_id);
+                ids = Some((agent_id, tenant_id));
             }
             None => {
-                let existing = roomlerd::config::read_if_present(&config_path);
-                let crate::enroll_step::Enrolled { mut cfg, outcome } =
-                    crate::enroll_step::enroll_folded(
-                        &config_path,
-                        existing,
-                        &server,
-                        &token,
-                        &device_name,
-                        install_info(),
-                    )
-                    .await
-                    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+                let enrolled = crate::enroll_step::enroll_folded(
+                    &config_path,
+                    existing.cfg,
+                    &server,
+                    &token,
+                    &device_name,
+                    install_info(),
+                )
+                .await;
+                let crate::enroll_step::Enrolled {
+                    mut cfg,
+                    outcome,
+                    previous_row,
+                } = match enrolled {
+                    Ok(e) => e,
+                    Err(e) => {
+                        keep_after_privileged(&ids);
+                        return Err(failed(enroll_error_code(&e), enroll_refusal(&e)));
+                    }
+                };
                 let note = crate::enroll_step::finish(
                     &mut cfg,
                     &outcome,
@@ -327,10 +471,16 @@ async fn run_install_inner(
                 )
                 .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
                 if let Some(message) = note {
-                    emit(on_event, ProgressEvent::PreflightWarning { message });
+                    warn(on_event, message);
+                }
+                if let Some(row) = &previous_row {
+                    warn(
+                        on_event,
+                        roomlerd::enrollment::describe_previous_row(row, &cfg.agent_id),
+                    );
                 }
                 if let Some(message) = give_netstack_port(os, &mut cfg) {
-                    emit(on_event, ProgressEvent::PreflightWarning { message });
+                    warn(on_event, message);
                 }
                 roomlerd::config::save(&config_path, &cfg).map_err(|e| {
                     failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}"))
@@ -341,28 +491,17 @@ async fn run_install_inner(
         }
         diag.ok();
     }
-    let (agent_id, tenant_id) = ids.ok_or_else(|| {
+    let (agent_id, tenant_id) = ids.clone().ok_or_else(|| {
         failed(
             ErrorCode::Other,
             "no enrollment was made (a bug: the pipeline reached the user half without one)"
                 .to_string(),
         )
     })?;
-    let keep_placed = || {
-        ud::keep(KeptEnrollment {
-            scope,
-            server: server.clone(),
-            device_name: device_name.clone(),
-            agent_id: agent_id.clone(),
-            tenant_id: tenant_id.clone(),
-            config_path: config_path.clone(),
-            scratch: None,
-        })
-    };
 
     // --- Step 5: the user half, as the person ----------------------------
     if let Err(e) = check_cancel() {
-        keep_placed();
+        keep_after_privileged(&ids);
         return Err(e);
     }
     emit(
@@ -379,12 +518,13 @@ async fn run_install_inner(
         Half::User,
         on_event,
         ud::USER_BUDGET,
+        &crate::CANCEL_REQUESTED,
     )
     .await
     {
         Ok(run) => run,
         Err(e) => {
-            keep_placed();
+            keep_after_privileged(&ids);
             return Err(failed(
                 ErrorCode::Other,
                 format!(
@@ -399,7 +539,7 @@ async fn run_install_inner(
             ));
         }
     };
-    match ud::classify(Tool::Sh, run.status, &run.stderr_tail, run.killed) {
+    match ud::classify(Tool::Sh, &run) {
         HalfOutcome::Exited(0) => emit(
             on_event,
             ProgressEvent::ScriptHalfDone {
@@ -415,7 +555,7 @@ async fn run_install_inner(
                     code,
                 },
             );
-            keep_placed();
+            keep_after_privileged(&ids);
             check_cancel()?;
             return Err(failed(
                 ErrorCode::Other,
@@ -426,7 +566,7 @@ async fn run_install_inner(
             ));
         }
         HalfOutcome::Cancelled | HalfOutcome::Unavailable(_) => {
-            keep_placed();
+            keep_after_privileged(&ids);
             return Err(check_cancel().err().unwrap_or_else(|| {
                 failed(ErrorCode::Other, "the user steps did not run".to_string())
             }));
@@ -465,18 +605,46 @@ async fn run_install_inner(
     })
 }
 
+/// F1 — the install stopped by a cancel that came after the administrator
+/// steps had started: they ran to the end, and this says what that left.
+pub fn cancelled_after_privileged(scope: Scope) -> String {
+    match scope {
+        Scope::System => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this device is enrolled, its service running. Nothing else was done. Retry finishes the install without asking for the password or a token again.".to_string(),
+        Scope::PerUser => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed, but this device is not enrolled yet. Retry finishes the install without asking for the password again.".to_string(),
+    }
+}
+
+/// The enroll's refusal, for the person: a token the server already took
+/// (a Retry of an attempt that spent it, a token used twice) needs a new one.
+fn enroll_refusal(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    if text.contains("already been used") {
+        format!(
+            "enrollment: {text}. An enrollment token works once: get a new one (or pair again) and Retry."
+        )
+    } else {
+        format!("enrollment: {text}")
+    }
+}
+
+/// What the privileged half did, when it did not fail.
+#[derive(Debug)]
+struct PrivilegedDone {
+    /// A cancel came after the half had started: it ran to its end anyway.
+    cancelled_late: bool,
+}
+
 /// The privileged half under the prompt tool, with the terminal fallback.
 async fn run_privileged(
     tool: Tool,
     args: &[OsString],
+    scratch: &Scratch,
     os: HostOs,
     scope: Scope,
     on_event: &Channel<ProgressEvent>,
-) -> Result<(), String> {
-    let argv: Vec<OsString> = match tool {
-        Tool::Osascript => ud::osascript_args(args),
-        _ => args.to_vec(),
-    };
+) -> Result<PrivilegedDone, String> {
+    let files = scratch.half_files();
+    let cmd = ud::prompt_command(tool, &files, args);
     emit(
         on_event,
         ProgressEvent::ScriptHalfStarted {
@@ -484,17 +652,17 @@ async fn run_privileged(
             tool: tool.wire().to_string(),
         },
     );
-    let outcome = match ud::run_half(
-        tool.program(),
-        &argv,
-        Half::Privileged,
+    let (outcome, cancelled_late) = match ud::run_privileged_half(
+        &cmd,
+        &files,
         on_event,
         ud::PRIVILEGED_BUDGET,
+        &crate::CANCEL_REQUESTED,
     )
     .await
     {
-        Ok(run) => ud::classify(tool, run.status, &run.stderr_tail, run.killed),
-        Err(e) => HalfOutcome::Unavailable(ud::spawn_failure(tool, &e)),
+        Ok(run) => (ud::classify(tool, &run), run.cancelled_late),
+        Err(e) => (HalfOutcome::Unavailable(ud::spawn_failure(tool, &e)), false),
     };
     match outcome {
         HalfOutcome::Exited(0) => {
@@ -505,7 +673,7 @@ async fn run_privileged(
                     code: 0,
                 },
             );
-            Ok(())
+            Ok(PrivilegedDone { cancelled_late })
         }
         HalfOutcome::Exited(code) => {
             emit(
@@ -515,16 +683,23 @@ async fn run_privileged(
                     code,
                 },
             );
-            // A cancel that landed after the password: the half ran on to
-            // its end, and the person's intent is what to report.
-            check_cancel()?;
-            Err(failed(
-                ErrorCode::MsiFatal,
+            // `failed` records a cancel when the flag is set; the message
+            // says both, since the half ran on and failed regardless.
+            let message = if cancelled_late || cancel_requested() {
                 format!(
-                    "the privileged install steps failed (exit {code}) — see the lines above. Nothing \
-                     was enrolled on this side that a Retry cannot reuse."
-                ),
-            ))
+                    "Cancelled while the administrator steps were running — a step running as root cannot be stopped from here — and they failed (exit {code}): see the lines above. Retry runs them again{}.",
+                    if scope == Scope::System {
+                        " with the same enrollment"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!(
+                    "the privileged install steps failed (exit {code}) — see the lines above. Nothing was enrolled on this side that a Retry cannot reuse."
+                )
+            };
+            Err(failed(ErrorCode::MsiFatal, message))
         }
         HalfOutcome::Cancelled => {
             emit(
@@ -540,9 +715,11 @@ async fn run_privileged(
                     .to_string(),
             )
         }
-        HalfOutcome::Unavailable(reason) => {
-            terminal_fallback(args, reason, os, scope, on_event).await
-        }
+        HalfOutcome::Unavailable(reason) => terminal_fallback(args, reason, os, scope, on_event)
+            .await
+            .map(|()| PrivilegedDone {
+                cancelled_late: false,
+            }),
     }
 }
 
@@ -693,6 +870,10 @@ fn emit_enrolled(on_event: &Channel<ProgressEvent>, agent_id: &str, tenant_id: &
     );
 }
 
+fn warn(on_event: &Channel<ProgressEvent>, message: String) {
+    emit(on_event, ProgressEvent::PreflightWarning { message });
+}
+
 fn last_line(text: &str) -> &str {
     text.lines()
         .rev()
@@ -804,5 +985,93 @@ mod tests {
             cfg.netstack_socks_port, None,
             "macOS: the mesh is the root half's"
         );
+    }
+
+    fn kept(scope: Scope, privileged_done: bool, scratch: Option<Scratch>) -> KeptEnrollment {
+        KeptEnrollment {
+            scope,
+            server: "https://example.invalid".into(),
+            device_name: "lab".into(),
+            ids: Some(("aid".into(), "tid".into())),
+            config_path: std::path::PathBuf::from(ud::SYSTEM_CONFIG),
+            scratch,
+            privileged_done,
+        }
+    }
+
+    /// F5 — a system-scope attempt cancelled after its privileged half ran
+    /// to the end kept the placed enrollment with no scratch file. Before
+    /// the fix the Retry fell through to "enroll again" and posted a token
+    /// already spent; now it reads as a half that need not run again — as
+    /// long as its work is still in place — and anything else is said.
+    #[test]
+    fn a_retry_picks_up_after_a_finished_privileged_half() {
+        // The work still in place: the half is not run again, and its
+        // enrollment carries the run.
+        let (resume, note) =
+            resume_from(Some(kept(Scope::System, true, None)), Scope::System, true);
+        assert!(resume.privileged_done, "not run again");
+        assert_eq!(resume.ids, Some(("aid".into(), "tid".into())));
+        assert!(note.is_none());
+
+        // The work gone since (removed in between): it all runs again, and the
+        // person is told the spent token may be refused.
+        let (resume, note) =
+            resume_from(Some(kept(Scope::System, true, None)), Scope::System, false);
+        assert!(!resume.privileged_done);
+        assert!(resume.ids.is_none());
+        let note = note.expect("said");
+        assert!(
+            note.contains("already used") && note.contains("new token"),
+            "{note}"
+        );
+
+        // An attempt whose half never finished keeps its unplaced config for
+        // the half to place.
+        let scratch = Scratch::create().unwrap();
+        std::fs::write(scratch.config_from(), "agent_id = \"aid\"").unwrap();
+        let (resume, note) = resume_from(
+            Some(kept(Scope::System, false, Some(scratch))),
+            Scope::System,
+            false,
+        );
+        assert!(!resume.privileged_done);
+        assert!(note.is_none());
+        assert!(resume.scratch.expect("kept").config_from().is_file());
+        assert_eq!(resume.ids, Some(("aid".into(), "tid".into())));
+
+        // Nothing kept: nothing to skip.
+        let (resume, note) = resume_from(None, Scope::System, true);
+        assert!(!resume.privileged_done && resume.ids.is_none() && note.is_none());
+    }
+
+    /// F1 — what a cancel after the start reports: never "nothing was
+    /// installed"; the state the half left, per scope, and that a Retry does
+    /// not ask again.
+    #[test]
+    fn a_late_cancel_says_what_the_half_left() {
+        let system = cancelled_after_privileged(Scope::System);
+        assert!(system.contains("ran to the end"), "{system}");
+        assert!(system.contains("enrolled"), "{system}");
+        assert!(!system.contains("nothing was installed"), "{system}");
+        assert!(system.contains("password or a token"), "{system}");
+        let per_user = cancelled_after_privileged(Scope::PerUser);
+        assert!(per_user.contains("not enrolled yet"), "{per_user}");
+        assert!(!per_user.contains("nothing was installed"), "{per_user}");
+    }
+
+    /// F5 — a spent token's refusal names the remedy.
+    #[test]
+    fn a_spent_token_names_the_remedy() {
+        let e = anyhow::anyhow!(
+            "enrollment rejected (status 401 Unauthorized): This enrollment token has already been used"
+        );
+        let said = enroll_refusal(&e);
+        assert!(
+            said.contains("works once") && said.contains("pair again"),
+            "{said}"
+        );
+        let other = enroll_refusal(&anyhow::anyhow!("connection refused"));
+        assert_eq!(other, "enrollment: connection refused");
     }
 }
