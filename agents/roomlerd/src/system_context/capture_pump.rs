@@ -981,7 +981,7 @@ fn dxgi_to_frame(f: DxgiFrame, start: Instant) -> Frame {
         height: f.height,
         stride: f.stride,
         pixel_format: PixelFormat::Bgra,
-        data: f.bytes.into(),
+        data: f.data,
         monotonic_us: start.elapsed().as_micros() as u64,
         monitor: 0,
         // P8a — the DXGI-direct backend reads the duplication metadata

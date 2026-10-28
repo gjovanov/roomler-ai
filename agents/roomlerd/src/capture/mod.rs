@@ -76,6 +76,13 @@ pub mod cursor;
 /// it into the frame, and where it is when the recorder has to draw it.
 pub mod pointer;
 
+/// FR-118 P2 — a frame that stays on the GPU: a texture on the capture's device.
+#[cfg(all(
+    target_os = "windows",
+    any(feature = "mf-encoder", feature = "wgc-capture")
+))]
+pub mod gpu_frame;
+
 /// A captured frame, in an encoder-agnostic representation.
 ///
 /// We don't commit to a specific colour space in the trait — backends can
@@ -122,32 +129,58 @@ impl Frame {
 
     /// FR-118 P1 — the frame's bytes in CPU memory, laid out as
     /// `pixel_format` with `stride` bytes per row. Every consumer that does
-    /// not take a GPU surface reads the pixels here. On a GPU frame this
-    /// will read them back once, with today's readback, and keep them.
+    /// not take a GPU surface reads the pixels here. A GPU frame reads them
+    /// back on the first call and keeps them.
     pub fn cpu(&self) -> &[u8] {
-        let FrameData::Cpu(bytes) = &self.data;
-        bytes
+        match &self.data {
+            FrameData::Cpu(bytes) => bytes,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            FrameData::Gpu(gpu) => gpu.cpu(),
+        }
     }
 
     /// FR-118 P1 — the bytes, to change in place: the recorder draws the
-    /// pointer into a frame, and tests paint one.
+    /// pointer into a frame, and tests paint one. A GPU frame becomes a CPU
+    /// frame first: a consumer that changes pixels needs them in memory.
     pub fn cpu_mut(&mut self) -> &mut Vec<u8> {
-        let FrameData::Cpu(bytes) = &mut self.data;
-        bytes
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        if let FrameData::Gpu(gpu) = &self.data {
+            self.data = FrameData::Cpu(gpu.cpu().to_vec());
+        }
+        match &mut self.data {
+            FrameData::Cpu(bytes) => bytes,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            FrameData::Gpu(_) => unreachable!("a GPU frame was replaced by its bytes just above"),
+        }
     }
 }
 
 /// FR-118 P1 (C0) — where a frame's pixels live.
 ///
-/// Only [`FrameData::Cpu`] is produced today. The GPU forms (a D3D11
-/// texture, an IOSurface, a dma-buf) arrive with their cells (FR-118 §4.1),
-/// and a consumer that has not moved keeps reading through [`Frame::cpu`].
-/// ⚠️ Each accessor destructures this enum without a wildcard, so a new
-/// variant fails to compile until every one of them handles it.
+/// The GPU forms arrive with their cells (FR-118 §4.1): the D3D11 texture
+/// first (P2), an IOSurface and a dma-buf later. A consumer that has not
+/// moved keeps reading through [`Frame::cpu`].
+/// ⚠️ Each accessor matches this enum without a wildcard, so a new variant
+/// fails to compile until every one of them handles it.
 #[derive(Clone)]
 pub enum FrameData {
     /// In system memory.
     Cpu(Vec<u8>),
+    /// FR-118 P2 — a BGRA texture on the capture's D3D11 device.
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    Gpu(gpu_frame::GpuFrame),
 }
 
 impl From<Vec<u8>> for FrameData {

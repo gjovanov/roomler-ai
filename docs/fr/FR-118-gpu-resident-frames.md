@@ -208,7 +208,7 @@ flowchart LR
 |---|---|---|---|
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b rides the next agent release; the fleet read is AC1 |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
-| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3) | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | — |
+| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3) |
 | P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
@@ -284,6 +284,41 @@ through `Frame::cpu()`. Only `FrameData::Cpu` exists, so nothing changes at run 
   recorder's pointer tests, which draw through these accessors.
 - **AC2's GPU half** (a GPU frame's `cpu()` equals today's readback, on a Windows CI device) waits for the
   first GPU variant (P2). Its L0 half reads the `l4_latency` cells on this change's CI run against master's.
+
+### 5.3 P2-1 — the GPU frame, as built (2026-10-28)
+
+The DXGI arm can now deliver a frame that stays on the GPU. Nothing takes it as a texture yet (that is P2-2),
+so every consumer reads it back through `Frame::cpu()`: with the switch on, the readback moves from the
+capture thread to whichever consumer asks first, and nothing else changes.
+
+| Piece | What it is | Where |
+|---|---|---|
+| `FrameData::Gpu(GpuFrame)` | a BGRA8 texture on the capture's D3D11 device. Cheap to clone: the clones share the texture and its one readback | `agents/roomlerd/src/capture/gpu_frame.rs` |
+| `GpuFrame::cpu()` | the bytes, read back on the first call (a staging copy, `Map` and a row copy, as every Windows backend reads back today) and kept. A readback that fails yields a black frame of the right size, never a short buffer, because every consumer trusts the frame's dims | the same |
+| `Frame::cpu_mut()` on a GPU frame | turns it into a CPU frame first: a consumer that changes pixels (the recorder's pointer) needs them in memory | `agents/roomlerd/src/capture/mod.rs` |
+| `TexturePool` | the textures a backend copies its frames into, on its device. A texture goes back when the last clone of its frame is dropped; a pool keeps at most 6. Making one turns the device's multithread protection on (the switch FFmpeg's D3D11VA device turns on too), because frames are read back on other threads while the capture thread keeps using the immediate context; a device that refuses it keeps CPU frames | `agents/roomlerd/src/capture/gpu_frame.rs` |
+| the DXGI arm's GPU frame | `try_gpu_frame` → `gpu_frame`: one `CopyResource` from the duplication surface into a pool texture (native), or the Phase B VideoProcessor scale and a copy of its output (a smaller box). It runs before the CPU paths. An FP16 desktop and a rotated output keep their CPU paths (the LUT, the raw copy), and a failure is contained like a VP failure: CPU frames until `VP_RETRY_AFTER`, never a `BackendBail`. The backend's label reads `dxgi-direct-gpu` while it delivers GPU frames | `agents/roomlerd/src/system_context/dxgi_direct.rs` |
+| the switch | `ROOMLERD_ZERO_COPY` (config `zero_copy`): `1`/`true`/`yes`/`on` turn it on, anything else leaves it off. Read once when the backend opens, so a capture rebuilt after a desktop switch reads it again | `gpu_frame::zero_copy_enabled` |
+
+- **What the heartbeat shows with the switch on:** `avg_readback_ms` falls to about 0, because the capture
+  thread reads nothing back, and the readback reappears in the stage of whichever consumer reads the frame
+  first: the encoder's `avg_convert_ms`, whose conversion reads the bytes. That shift is P2-1's field signal
+  that frames are travelling on the GPU.
+- **The duplication surface is released right after the copy is queued**, without waiting for the copy, as
+  Microsoft's Desktop Duplication sample does; the copy is ordered before the next frame's by the device. The
+  CPU paths still wait (their `Map` does). A torn or stale picture with the switch on would point here first.
+- **Tests:** five, in the Windows recorder lane (`capture::gpu_frame`), four of them on a WARP device so CI
+  needs no GPU. A GPU frame's `cpu()` is the bytes its texture holds (an odd width, so the staging rows are
+  padded), and its clones share the one readback; `cpu_mut()` turns it into a CPU frame; a texture returns to
+  its pool, and one of the old dims is not kept after the pool moves on; a frame reads back on another
+  thread, with the device's multithread protection on; and the switch's parsing. The lib suite is 2380 with
+  the Windows hardware features.
+- **Negative controls**, run together, each failing its own tests: a readback that copies row 0 for every row
+  fails the two readback tests (the bytes repeat after the first row); a frame that never returns its texture
+  fails the pool test (`left: 0, right: 1`); a pool that skips multithread protection fails the threads test.
+- **AC2's GPU half is met in CI** by the first test: a GPU frame's `cpu()` returns exactly the bytes its
+  texture holds, which is what today's readback returns. Its L0 half (the `l4_latency` cells of C0's CI run
+  against master's, §5.2) is still to be read, so the box stays open until it is.
 
 ## 6. Acceptance criteria
 
