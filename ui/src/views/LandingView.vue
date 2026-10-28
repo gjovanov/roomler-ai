@@ -107,7 +107,7 @@
     <section id="download" class="download-section py-8 py-md-16">
       <v-container>
         <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">{{ DOWNLOAD.title }}</h2>
-        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">{{ DOWNLOAD.lead }}</p>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">{{ installLead }}</p>
         <v-row justify="center">
           <v-col v-for="os in downloads" :key="os.os" cols="12" md="4">
             <v-card variant="outlined" class="pa-4 pa-md-6 h-100 d-flex flex-column" rounded="lg">
@@ -254,15 +254,16 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
 import { BRAND_LOGO_LIGHT } from '@/composables/useBrand'
+import { useSetupFeaturesStore } from '@/stores/setupFeatures'
 import { installCards } from '@/utils/enrollCommands'
-import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, VIDEO_TOUR, annualLine, type Plan } from '@/utils/landing'
+import { CAPABILITIES, CTA, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, PRICING, VIDEO_TOUR, annualLine, downloadLead, type Plan } from '@/utils/landing'
 import { FEATURED_VIDEO_ID } from '@/utils/videos'
 import VideoFacade from '@/components/common/VideoFacade.vue'
 import videoTourPoster from '@/assets/tutorial/video-C1YdfmhbAKM.jpg'
@@ -279,16 +280,26 @@ const pillars = PILLARS
 
 // One-line installs — same vitest-locked template source the in-app
 // enrollment dialog uses (token placeholder until they have one), and the
-// wizard only where it installs the agent (FR-97 D5).
+// wizard only where it installs the agent: Windows (FR-97 D5), and Linux
+// and macOS once the server advertises `wizard_unix_daemon` (FR-129 B1-s).
+// The server also says whether the download signs the person in from the
+// browser — `pairing` (this server answers `/api/pair/*`) AND
+// `wizard_pairing` (the released wizard uses it), both, for the lead. Every
+// switch reads false until it has said true (`stores/setupFeatures.ts`), so
+// the first paint is the Windows-only page with the token lead.
 const osIcon: Record<string, string> = {
   windows: 'mdi-microsoft-windows',
   linux: 'mdi-linux',
   macos: 'mdi-apple',
 }
-const downloads = installCards(window.location.origin).map((card) => ({
-  ...card,
-  icon: osIcon[card.os]!,
-}))
+const setupFeatures = useSetupFeaturesStore()
+const downloads = computed(() =>
+  installCards(window.location.origin, { wizardUnixDaemon: setupFeatures.wizardUnixDaemon }).map((card) => ({
+    ...card,
+    icon: osIcon[card.os]!,
+  })),
+)
+const installLead = computed(() => downloadLead(setupFeatures.wizardPairs))
 
 // The fallback until /api/stripe/plans (the single source of truth) answers.
 const plans = ref<Plan[]>(FALLBACK_PLANS.map((p) => ({ ...p, features: [...p.features] })))
@@ -299,6 +310,9 @@ const plans = ref<Plan[]>(FALLBACK_PLANS.map((p) => ({ ...p, features: [...p.fea
 // `/newsletter/confirmed` + `/newsletter/unsubscribed` pages.
 
 onMounted(async () => {
+  // Not awaited: the cards and the lead follow the store's refs when (if)
+  // the answer lands, and the plans below need not wait for it.
+  void setupFeatures.load()
   try {
     const resp = await fetch('/api/stripe/plans')
     if (resp.ok) {
