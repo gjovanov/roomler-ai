@@ -412,17 +412,17 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:1287`](../agents/roomlerd/src/encode/caps.rs#L1287)), applied in
-`detect()` ([`caps.rs:989`](../agents/roomlerd/src/encode/caps.rs#L989))
+([`caps.rs:1312`](../agents/roomlerd/src/encode/caps.rs#L1312)), applied in
+`detect()` ([`caps.rs:1014`](../agents/roomlerd/src/encode/caps.rs#L1014))
 after the config lists, over plain `HostFacts`
-([`caps.rs:1001`](../agents/roomlerd/src/encode/caps.rs#L1001)), so it runs and
+([`caps.rs:1026`](../agents/roomlerd/src/encode/caps.rs#L1026)), so it runs and
 is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3428`](../agents/roomlerd/src/signaling.rs#L3428)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:1268`](../agents/roomlerd/src/encode/caps.rs#L1268)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:1293`](../agents/roomlerd/src/encode/caps.rs#L1293)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -465,7 +465,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:1150`](../agents/roomlerd/src/encode/caps.rs#L1150)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:1175`](../agents/roomlerd/src/encode/caps.rs#L1175)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | since FR-97 P2a: ScreenCaptureKit's mix of every app, this process's own excluded ([`audio/sck.rs`](../agents/roomlerd/src/audio/sck.rs)), in a process with a window-server session. On a supervised Mac that is the GUI worker, and the root's row carries the worker's offer (`DelegateHost::effective_audio`); the root decides a delegated session's audio by it. 48 kHz stereo float, 20 ms buffers: Opus's own frame, nothing resampled. It hears the apps with the output muted | the root half itself: `no-session`; the kill switch `ROOMLERD_SCK_AUDIO=0` (forwarded to the worker): `switched-off` on the hello, `switched_off` from a capture; ScreenCaptureKit's own refusal (the Screen Recording grant): `backend_error` with its words |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -707,9 +707,13 @@ Every Windows arm reads each captured frame back into memory. The
 SystemContext DXGI arm copies the duplication surface into a staging texture
 and maps it, inside the capture stage: about 4 ms at 1920×1200. WGC does the
 same in its `FrameArrived` handler, off the pump's clock: about 6 ms at
-2560×1600. With `zero_copy` on (default off), the DXGI arm keeps the frame as
-a texture on its own device, and a QSV encoder whose GPU form the probe proved
-takes it there:
+2560×1600. With `zero_copy` on (default off), both arms keep the frame as a
+texture on their own device:
+
+- **The DXGI arm** hands it to a QSV encoder whose GPU form the probe proved.
+- **WGC** (FR-118 P3) hands it to a proven NVENC encoder. WGC first moves its
+  device to the NVIDIA adapter, so on a hybrid laptop the OS copies each frame
+  across from the panel's iGPU (0.3–0.6 ms at the median, measured).
 
 ```mermaid
 flowchart TB
@@ -718,8 +722,11 @@ flowchart TB
   D -->|"switch on: CopyResource"| T[pool texture]
   T -->|"VideoProcessorBlt, BT.601"| N[NV12 texture]
   N -->|"copy into the pool slice"| E2["QSV<br/>GPU frame"]
-  W["WGC<br/>(attended arm)"] -->|"readback in FrameArrived<br/>(every encoder, today)"| CPU2[BGRA in memory]
+  W["WGC<br/>(attended arm)"] -->|"switch off: readback in FrameArrived"| CPU2[BGRA in memory]
   CPU2 -->|dcv| E3["NVENC · QSV · AMF<br/>system-memory frame"]
+  W -->|"switch on: its device on the NVIDIA adapter,<br/>region copy in FrameArrived"| T2[pool texture]
+  T2 -->|"VideoProcessorBlt, BT.601"| N2[NV12 texture]
+  N2 -->|"copy into the D3D11 pool slice"| E4["NVENC<br/>GPU frame"]
 ```
 
 | Measured: `av1_qsv` 1920×1200 at 60 fps, a moving test pattern, 20-minute legs (FR-118 AC3) | Switch off | Switch on |
@@ -741,6 +748,10 @@ flowchart TB
   keeps its D3D11 device when the device is alive and still on the primary
   output's adapter, so the encoder does not reopen and send a keyframe each
   time. A capture that does come back on a new device moves the encoder to it.
+- **WGC's GPU path has no field numbers yet.** It is built and tested on a
+  hybrid laptop (the probe proves NVENC's GPU form on the RTX 5090, and the
+  pool refuses the Radeon), but no release carries it yet
+  ([FR-118 §5.6](fr/FR-118-gpu-resident-frames.md#56-p3--the-wgc-arm-hands-nvenc-its-frames-as-built-2026-10-28)).
 - The cells, the reasons a session took CPU frames, and the configuration:
   [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
   field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28)
@@ -777,7 +788,7 @@ without the switch behaves exactly as before. Spec and field log:
 
 **The switch and the wire.** `fps_high` in the config (or `ROOMLERD_FPS_HIGH`),
 default off. With it on, the hello's `AgentCaps.video` carries `fps-high` and
-`fps-retry` ([`caps.rs:1635`](../agents/roomlerd/src/encode/caps.rs#L1635)).
+`fps-retry` ([`caps.rs:1663`](../agents/roomlerd/src/encode/caps.rs#L1663)).
 Without them the viewer never offers above 60 and never sends `rc:fps`.
 
 | Message | Direction | Fields |
@@ -3056,7 +3067,7 @@ to-activate, so the browser never sees a bait-and-switch.
   because an X server buffers what a client does not read. Our own writes
   change the owner too, and the content hashes swallow them as before.
   `AgentCaps.unavailable["clipboard-image-events"]` goes away where the
-  gate opens (`agents/roomlerd/src/encode/caps.rs:1113`). ⚠️ Not under
+  gate opens (`agents/roomlerd/src/encode/caps.rs:1138`). ⚠️ Not under
   Wayland: the clipboard is the compositor's there, and Xwayland's copy
   of it is unmeasured. A broken gate connection drops back to text
   polling with images unwatched. Kill switch
@@ -3072,7 +3083,7 @@ to-activate, so the browser never sees a bait-and-switch.
   the gate skips cannot ask. The count is read inside an autorelease pool of
   its own (`clipboard.rs:797`), because the clipboard worker is not the main
   thread. `unavailable["clipboard-image-events"]` goes away wherever the
-  switch is on (`agents/roomlerd/src/encode/caps.rs:1120`), without asking this
+  switch is on (`agents/roomlerd/src/encode/caps.rs:1145`), without asking this
   process's own pasteboard (`clipboard.rs:807`): on a supervised Mac the root
   daemon says the hello, while a delegated session's clipboard runs in the GUI
   worker. A root daemon outside the console session cannot reach the
@@ -3293,7 +3304,7 @@ the compositor's, and no protocol the desktops share reads or sets it.
 Xwayland's XKB group is a copy of what the compositor sends, and locking it
 does not reach the compositor. A system install reaches the screen through DRM
 and has no X connection (FR-113). Both leave `layout` out of the hello
-(`agents/roomlerd/src/encode/caps.rs:1328`), with no reason in `unavailable`:
+(`agents/roomlerd/src/encode/caps.rs:1353`), with no reason in `unavailable`:
 there is no control to grey, so the chip does not appear, as before P3e.
 
 ### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)

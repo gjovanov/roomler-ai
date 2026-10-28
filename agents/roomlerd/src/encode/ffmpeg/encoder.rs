@@ -696,7 +696,7 @@ pub struct FfmpegEncoder {
         target_os = "windows",
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
-    gpu: Option<super::gpu_input::QsvGpuInput>,
+    gpu: Option<super::gpu_input::GpuInput>,
     /// FR-118 P2-2 — a capture device this encoder could not take GPU frames
     /// from (a reopen on it was refused), so it is not tried on every frame.
     #[cfg(all(
@@ -781,7 +781,7 @@ struct Opened {
         target_os = "windows",
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
-    gpu: Option<super::gpu_input::QsvGpuInput>,
+    gpu: Option<super::gpu_input::GpuInput>,
     input: super::gpu_hint::InputForm,
 }
 
@@ -1772,11 +1772,15 @@ impl FfmpegEncoder {
         // `VK_KHR_video_encode_queue`, the RTX did). So the whole
         // configure-and-open below runs once per candidate device until one
         // succeeds, and the winner is remembered for the next open.
-        // FR-118 P2-2 — `gpu_frames`: a QSV GPU input's frame pool, which the
-        // encoder then takes frames from (`AV_PIX_FMT_QSV`).
+        // FR-118 P2-2 — `gpu_frames`: a GPU input's frame pool and the pixel
+        // format of its frames, which the encoder then takes frames from
+        // (`AV_PIX_FMT_QSV` for QSV; P3, `AV_PIX_FMT_D3D11` for NVENC).
         type Inputs = (
             Option<hwframes::Frames>,
-            Option<*mut ffmpeg_next::ffi::AVBufferRef>,
+            Option<(
+                *mut ffmpeg_next::ffi::AVBufferRef,
+                ffmpeg_next::ffi::AVPixelFormat,
+            )>,
         );
         let open_with = |(hw_frames, gpu_frames): Inputs| -> Result<(
             codec::encoder::Video,
@@ -1810,14 +1814,13 @@ impl FfmpegEncoder {
                         (*enc.as_mut_ptr()).pix_fmt = kind.pixel();
                         (*enc.as_mut_ptr()).hw_frames_ctx = frames.new_ref();
                     }
-                } else if let Some(pool) = gpu_frames {
-                    // FR-118 P2-2 — QSV takes the GPU input's pool frames. A fresh
-                    // reference per open attempt, as above.
+                } else if let Some((pool, pix_fmt)) = gpu_frames {
+                    // FR-118 P2-2 / P3 — the encoder takes the GPU input's pool
+                    // frames. A fresh reference per open attempt, as above.
                     // SAFETY: an unopened, exclusively owned context; `pool` is a
                     // live frames context the GPU input owns for the whole open.
                     unsafe {
-                        (*enc.as_mut_ptr()).pix_fmt =
-                            ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_QSV;
+                        (*enc.as_mut_ptr()).pix_fmt = pix_fmt;
                         (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg_next::ffi::av_buffer_ref(pool);
                     }
                 } else {
@@ -1993,7 +1996,7 @@ impl FfmpegEncoder {
             any(feature = "mf-encoder", feature = "wgc-capture")
         ))]
         let input = match super::gpu_input::plan(name, chroma444, width, height) {
-            Ok(pool) => match open_with((None, Some(pool.frames_raw()))) {
+            Ok(pool) => match open_with((None, Some((pool.frames_raw(), pool.pix_fmt())))) {
                 Ok((encoder, hw)) => {
                     tracing::info!(
                         encoder = name,
@@ -2346,7 +2349,7 @@ pub struct RebuiltEncoder {
         target_os = "windows",
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
-    gpu: Option<super::gpu_input::QsvGpuInput>,
+    gpu: Option<super::gpu_input::GpuInput>,
     input: super::gpu_hint::InputForm,
 }
 

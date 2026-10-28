@@ -36,6 +36,9 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Multithread, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
+};
 use windows::core::Interface;
 
 /// How many free textures a pool keeps. More than the frames a session holds
@@ -58,6 +61,107 @@ fn zero_copy_from(value: Option<&str>) -> bool {
             .iter()
             .any(|on| v.eq_ignore_ascii_case(on))
     })
+}
+
+/// FR-118 P3 — the encoders whose GPU-input form the capability probe proved,
+/// as the capture side sees them: the same list `encode::ffmpeg::gpu_input`
+/// gates its opens on, installed once by `caps::detect` before any session.
+static GPU_INPUT_CELLS: OnceLock<Vec<String>> = OnceLock::new();
+
+pub fn install_gpu_input_cells(names: Vec<String>) {
+    let _ = GPU_INPUT_CELLS.set(names);
+}
+
+/// FR-118 P3 — the PCI vendor whose adapter a capture device belongs on: the
+/// vendor of the first proven GPU-input cell in the backend order every codec's
+/// cascade opens in (NVENC, then QSV, then AMF; `encode::ffmpeg::encoder`'s
+/// `*_ENCODER_NAMES`). `None` when no GPU-input cell is proven: the capture
+/// keeps the default adapter, as before.
+///
+/// Open decision 1, measured on a hybrid laptop (FR-118 §9.4): WGC with its
+/// device on the encoder's adapter lets the OS copy each frame across from the
+/// panel's adapter for 0.3–0.6 ms, and the frame is then where the encoder
+/// takes it. One vendor for every codec is a simplification: a host whose
+/// NVENC lacks a codec that its QSV has opens that codec on QSV, on the other
+/// adapter, and those sessions read `adapter_mismatch` and stay on CPU frames.
+pub fn preferred_vendor(names: &[String]) -> Option<u32> {
+    const ORDER: [(&str, u32); 3] = [("_nvenc", 0x10de), ("_qsv", 0x8086), ("_amf", 0x1002)];
+    ORDER
+        .iter()
+        .find(|(suffix, _)| names.iter().any(|n| n.ends_with(suffix)))
+        .map(|&(_, vendor)| vendor)
+}
+
+/// FR-118 P3 — the adapter of [`preferred_vendor`], with its name: the first
+/// hardware adapter of that vendor `EnumAdapters1` lists. `None` before the
+/// probe installed its cells, when no cell is proven, or when no adapter of
+/// that vendor is present.
+pub fn capture_adapter() -> Option<(IDXGIAdapter1, String)> {
+    adapter_of_vendor(preferred_vendor(GPU_INPUT_CELLS.get()?)?)
+}
+
+/// FR-118 P3 — a D3D11 device (BGRA support) on the first hardware adapter of
+/// `vendor`, for the capability probe's GPU-input opens: NVENC's forms are
+/// proven on an NVIDIA device, the device a capture would hand them frames on.
+pub fn device_on_vendor(vendor: u32) -> Option<ID3D11Device> {
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    };
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice,
+    };
+    use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+    let (adapter, _) = adapter_of_vendor(vendor)?;
+    let base: IDXGIAdapter = adapter.cast().ok()?;
+    let mut device: Option<ID3D11Device> = None;
+    // SAFETY: an explicit adapter with driver type UNKNOWN, as the API requires;
+    // valid out-params.
+    unsafe {
+        D3D11CreateDevice(
+            &base,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            // The levels WGC's own device asks for, so the probe proves the
+            // form on the device a session would hand it frames on.
+            Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+        .ok()?;
+    }
+    device
+}
+
+/// The first hardware adapter of `vendor` that `EnumAdapters1` lists, with its
+/// name.
+fn adapter_of_vendor(vendor: u32) -> Option<(IDXGIAdapter1, String)> {
+    // SAFETY: plain DXGI factory and adapter enumeration; every out-value is
+    // owned by the returned interfaces.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            index += 1;
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if desc.VendorId != vendor || software {
+                continue;
+            }
+            let len = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            return Some((adapter, String::from_utf16_lossy(&desc.Description[..len])));
+        }
+    }
+    None
 }
 
 /// A BGRA frame on a D3D11 device. Cheap to clone: the clones share the
@@ -350,6 +454,33 @@ mod tests {
             assert!(!zero_copy_from(Some(off)), "{off:?} leaves it off");
         }
         assert!(!zero_copy_from(None));
+    }
+
+    /// P3 — the capture's device goes where the first proven GPU-input cell
+    /// lives, in the order every codec's cascade opens backends: NVENC, QSV,
+    /// AMF. Nothing proven keeps the default adapter.
+    #[test]
+    fn the_capture_follows_the_first_gpu_cell_in_the_cascade_s_backend_order() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(preferred_vendor(&names(&[])), None);
+        assert_eq!(
+            preferred_vendor(&names(&["av1_qsv", "h264_qsv"])),
+            Some(0x8086)
+        );
+        assert_eq!(preferred_vendor(&names(&["hevc_amf"])), Some(0x1002));
+        assert_eq!(
+            preferred_vendor(&names(&["av1_qsv", "hevc_amf", "hevc_nvenc"])),
+            Some(0x10de),
+            "NVENC first, whatever order the probe listed them in"
+        );
+        assert_eq!(
+            preferred_vendor(&names(&["h264_qsv", "hevc_amf"])),
+            Some(0x8086)
+        );
+        assert_eq!(
+            preferred_vendor(&names(&["libvpx-vp9-444-sw", "openh264-sw"])),
+            None
+        );
     }
 
     /// WARP: the software rasterizer every Windows has, so the test needs no GPU.

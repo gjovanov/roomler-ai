@@ -209,7 +209,7 @@ flowchart LR
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b rides the next agent release; the fleet read is AC1 |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
-| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter; not built yet |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6); field run owed. AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
@@ -438,6 +438,72 @@ flowchart LR
 - **Not yet:** a run on a QSV host (AC3, which needs a release carrying P2-1 to P2-3), `input_path` on
   `rc:video-info`, and pushing `zero_copy_deny` through remote config.
 
+### 5.6 P3 — the WGC arm hands NVENC its frames, as built (2026-10-28)
+
+Open decision 1 was measured first (§9.4): on a hybrid laptop, WGC with its device on the encoder's adapter
+costs the OS's copy across, 0.3–0.6 ms at the median. So P3 puts WGC's device on the GPU-input encoder's
+adapter, keeps each frame on it, and gives NVENC a D3D11 frame pool there. It reuses P2's pieces: the
+`GpuFrame` and its texture pool, the VideoProcessor conversion (BT.601 limited, the CPU path's matrix), the
+probe's `gpu` child, and the `unproven` gate. All of it sits behind the same `zero_copy` switch and
+`zero_copy_deny` list.
+
+```mermaid
+flowchart LR
+  subgraph probe["caps::detect (switch on)"]
+    C[candidates_gpu<br/>QSV + NVENC 4:2:0 cells] --> G["child gpu<br/>QSV forms on the primary output's adapter<br/>NVENC forms on the NVIDIA adapter"]
+    G -->|proven| P[gpu_input + gpu_frame<br/>the proven list]
+  end
+  P --> A[capture_adapter<br/>vendor of the first proven cell:<br/>NVENC, then QSV, then AMF]
+  A --> W["WGC<br/>its D3D11 device on that adapter<br/>(the OS copies across from the panel's)"]
+  W -->|"CopySubresourceRegion<br/>into a pool texture"| F[GpuFrame]
+  F --> N["NvencGpuInput<br/>VideoProcessorBlt → NV12<br/>copy into the D3D11 pool's slice"]
+  N -->|AV_PIX_FMT_D3D11| E[hevc_nvenc · h264_nvenc · av1_nvenc]
+  F -.->|"cpu(): only when a consumer asks"| R[read back once]
+```
+
+| Piece | What it is | Where |
+|---|---|---|
+| the capture's adapter | `preferred_vendor`: the vendor of the first proven GPU-input cell in the order every codec's cascade opens backends in (NVENC, QSV, AMF). `capture_adapter`: the first hardware adapter of that vendor. `caps::detect` installs the proven list for the capture side too (`install_gpu_input_cells`) | `capture/gpu_frame.rs:87`, `:99`, `:71`; `encode/caps.rs:1553` |
+| WGC's device | created on that adapter when the switch is on (`D3D11CreateDevice` with an explicit adapter, driver type `UNKNOWN`); a device that will not open there falls back to the default adapter, as before | `capture/wgc_backend.rs:539`, `:886` |
+| WGC's frames | with a texture pool on the device, the handler copies the frame's content (a region copy: WGC's surface keeps the frame pool's size while the content can be smaller) into a pool texture and hands on a `GpuFrame`. Without one, today's readback, timed as before | `capture/wgc_backend.rs:685`, `:932` |
+| `NvencGpuInput` | the capture's device wrapped in a D3D11VA context (`av_hwdevice_ctx_alloc`, never a second device), an `AV_PIX_FMT_D3D11` / NV12 frame pool of 12, the converter, and one whole-subresource copy into the frame's array slice. FFmpeg 9.0.1's `nvenc.c` opens its session on that pool's device and registers each frame by texture and slice (checked in the source) | `encode/ffmpeg/gpu_input.rs:250` |
+| the pool is decoder-bound | FFmpeg makes the pool ONE NV12 array texture. The RTX 5090 refuses that array with no bind flags or as a render target (`CreateTexture2D` → `E_INVALIDARG`, measured in the tests below) and takes it decoder-bound, the binding every d3d11va-decode → NVENC transcode has. A decoder-bound slice still takes the copy, as QSV's pool does | `encode/ffmpeg/gpu_input.rs:346` |
+| the adapter rule | NVENC opens a DirectX session only on an NVIDIA device, so the pool refuses any other with `adapter_mismatch` before it makes anything: the D3D11 pool itself would open anywhere, and only NVENC's session open would fail, later. NV12 needs even dims; odd ones refuse (`open_failed`) | `encode/ffmpeg/gpu_input.rs:219`; `NvencGpuInput::open` |
+| `GpuInput` | QSV's pool or NVENC's, with the pixel format the encoder is configured with (`AV_PIX_FMT_QSV`, `AV_PIX_FMT_D3D11`). The encoder's open takes the pool with its format | `encode/ffmpeg/gpu_input.rs:163`; `encode/ffmpeg/encoder.rs:1817` |
+| the cells | `hevc_nvenc`, `h264_nvenc` and `av1_nvenc` at 4:2:0 join QSV's; NVENC's 4:4:4 forms stay on CPU frames until measured | `encode/ffmpeg/gpu_input.rs:112` |
+| the probe | `candidates_gpu` takes NVENC's cells too, and `probe_gpu` opens each form on a device of its frames' adapter: QSV's on the primary output's (as before), NVENC's on the NVIDIA adapter (`device_on_vendor`, feature levels 11_1 then 11_0, as WGC's device) | `encode/caps.rs:633`, `:838`; `capture/gpu_frame.rs:106` |
+
+- **One vendor for every codec.** The capture's adapter is chosen once, from the proven list, because a
+  capture opens before the session's encoder exists. Every cascade opens NVENC first, so on a host with both
+  NVENC and QSV a codec NVENC lacks opens on QSV, on the other adapter, and reads `adapter_mismatch` (CPU
+  frames). Correct, and slower only for that codec.
+- **What does not change:** with the switch off, WGC's device and frames are today's, byte for byte. With it on
+  but nothing proven (a host without NVENC, QSV or AMF GPU forms), the device stays on the default adapter.
+  The DXGI arm (SystemContext) keeps P2's device rule: the primary output's adapter.
+- **Tests** (Windows, run locally on neo16: the Radeon 610M and the RTX 5090; no Windows CI lane builds
+  FFmpeg):
+  - `the_gpu_phase_proves_nvenc_on_an_nvidia_device`: the probe opened `hevc_nvenc` and `h264_nvenc` in the
+    GPU form on the RTX 5090 and turned two GPU frames into packets. A machine without an NVIDIA adapter has
+    nothing to prove and says so.
+  - `the_nvenc_pool_opens_on_nvidia_and_refuses_elsewhere`: the Radeon refuses with `adapter_mismatch`; the
+    RTX 5090 opens the pool, takes a GPU frame and a CPU frame, and its slice holds exactly the converter's
+    NV12.
+  - `the_capture_follows_the_first_gpu_cell_in_the_cascade_s_backend_order`; and the P2 tests updated:
+    `plan_reads_every_gate_at_the_open` (NVENC's cells stop at `unproven`; its 4:4:4 form is no GPU cell) and
+    `the_gpu_phase_tries_only_what_a_session_may_open` (NVENC's cells are candidates; `hevc_nvenc:gpu` removes
+    one).
+  - The lib suite with the Windows hardware features: 2084 passed. Clippy clean on that feature set and on
+    CI's Linux FFmpeg lane.
+- **Negative controls**, each failing only its own tests: the vendor order with QSV first fails the vendor
+  test; the pool without the vendor check fails the pool test (`a pool opened on a device that is not
+  NVIDIA's`); the candidates without NVENC fail the phase test; the GPU cells without NVENC fail the phase test,
+  the gate test and the probe test. The first run of the second control did NOT fail, because the pool test
+  asserted the reason of a refusal but not that a non-NVIDIA device refuses; the test was tightened and the
+  control re-run.
+- **Not yet:** the field run on neo16 (AC7's NVENC cell and the WGC arm, against the same session with the
+  switch off), AC5's `adapter_mismatch` in the field, AMF, and a QSV host that captures through WGC (the
+  fleet's QSV hosts all capture through the DXGI arm, §9).
+
 ## 6. Acceptance criteria
 
 - [ ] **AC1 — the split, measured.** P0 has shipped, and a fleet week is read per encoder × geometry into the
@@ -474,7 +540,10 @@ flowchart LR
   answer this; §2.2's host is not available for test sessions.)*
 - [ ] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
-  *(The first field host captures on its Intel adapter, so it has no mismatch to show.)*
+  *(The first field host captures on its Intel adapter, so it has no mismatch to show. P3 adds NVENC's half of the
+  rule, unit-tested on neo16's Radeon (§5.6). On a hybrid host P3 moves WGC's device to the NVIDIA adapter, so
+  the field half needs a capture that stays on the other adapter. One is the DXGI arm (SystemContext), whose
+  device stays on the primary output's adapter.)*
 - [x] **AC6 — the gate holds at every entry point.** With the switch off, or the cell denied, neither the probe
   nor a session opens the GPU-input form. Tested at both entry points. **Met 2026-10-28.** Both halves are
   unit-tested at both entry points (P2-3, §5.5), and both were seen in the field on agent 0.4.181 (§9.2). With the
@@ -482,7 +551,10 @@ flowchart LR
   `input_reason=switch_off`. With `zero_copy_deny = av1_qsv:gpu`, the probe's `gpu` child tried only `h264_qsv`
   (04:48:49Z) and an AV1 session read `input_reason=denied`.
 - [ ] **AC7 — every further cell, or its reason.** NVENC, AMF, the WGC arm, VideoToolbox and VAAPI are each
-  field-verified like AC3, or deferred with the measurement that deferred them.
+  field-verified like AC3, or deferred with the measurement that deferred them. *(P3 built the WGC arm and NVENC,
+  2026-10-28 (§5.6). Their field run on neo16 needs a release carrying P3. AMF is not built: on the hybrid host
+  that might have needed it, §9.4 measured the route through NVENC as cheap. An AMD-only host's AMF cells stay on
+  CPU frames until a host needs them.)*
 - [ ] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
   Linked from `docs/README.md`. *(P2's half written 2026-10-28: `encoders.md` § GPU-resident frames, with the

@@ -189,7 +189,7 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1037`,
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1062`,
 `:624` via `with_config_lists` `:655`) — in the daemon, never in the
 caps-probe child (§4.3).
 
@@ -314,12 +314,12 @@ restart changes it. That is why P6 added a fourth value:
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
   `caps_cache.rs:289`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:2229`; a test locks
+  and the child's struct carries none (`apps_caps`, `caps.rs:2257`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:1305`; `files_caps` `:2218`), which a
+  seam (`with_config_lists`, `caps.rs:1330`; `files_caps` `:2246`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.

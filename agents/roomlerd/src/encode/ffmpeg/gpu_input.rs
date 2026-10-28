@@ -43,7 +43,8 @@ use ffmpeg_next::frame;
 use ffmpeg_next::sys as ff;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BOX, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET, D3D11_BOX, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
@@ -57,6 +58,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::core::Interface;
 
 use crate::capture::gpu_frame::GpuFrame;
@@ -104,23 +106,34 @@ impl Refused {
     }
 }
 
-/// The cells that take GPU frames: QSV's 4:2:0 encoders. (`vp9_qsv` has its
-/// own open-time probes and stays on CPU frames until it is measured.)
+/// The cells that take GPU frames: QSV's and (FR-118 P3) NVENC's 4:2:0
+/// encoders. (`vp9_qsv` has its own open-time probes and stays on CPU frames
+/// until it is measured; NVENC's 4:4:4 forms wait for their own measurement.)
 pub(crate) fn gpu_cell(name: &str, chroma444: bool) -> bool {
-    !chroma444 && matches!(name, "hevc_qsv" | "av1_qsv" | "h264_qsv")
+    !chroma444
+        && matches!(
+            name,
+            "hevc_qsv" | "av1_qsv" | "h264_qsv" | "hevc_nvenc" | "av1_nvenc" | "h264_nvenc"
+        )
+}
+
+/// FR-118 P3 — an NVENC cell, whose GPU input is a D3D11 frame pool on an
+/// NVIDIA device rather than a QSV one.
+fn is_nvenc(name: &str) -> bool {
+    name.ends_with("_nvenc")
 }
 
 /// FR-118 P2-2 — the pool a `name` encoder opens on, or why it opens on CPU
 /// frames. Every gate is read here, at the open: the switch, the device the
 /// pump named (a GPU frame's), the cell, the denylist, the probe's proof
-/// (P2-3); then the pool itself, which fails on an adapter without QSV
-/// (`adapter_mismatch`).
+/// (P2-3); then the pool itself, which fails on an adapter that is not the
+/// cell's (`adapter_mismatch`).
 pub(crate) fn plan(
     name: &str,
     chroma444: bool,
     width: u32,
     height: u32,
-) -> Result<QsvGpuInput, Refused> {
+) -> Result<GpuInput, Refused> {
     if !crate::capture::gpu_frame::zero_copy_enabled() {
         return Err(Refused::because("switch_off"));
     }
@@ -136,7 +149,289 @@ pub(crate) fn plan(
     if !proven(name) {
         return Err(Refused::because("unproven"));
     }
-    QsvGpuInput::open(&device, width, height)
+    if is_nvenc(name) {
+        NvencGpuInput::open(&device, width, height).map(GpuInput::Nvenc)
+    } else {
+        QsvGpuInput::open(&device, width, height).map(GpuInput::Qsv)
+    }
+}
+
+/// FR-118 — an encoder's GPU input: QSV's derived pool (P2-2), or NVENC's
+/// D3D11 pool (P3). Both fill their pool from a [`GpuFrame`] through the same
+/// [`Converter`] (BT.601 limited, the CPU path's matrix), so which backend
+/// takes the frame never changes its colour.
+pub(crate) enum GpuInput {
+    Qsv(QsvGpuInput),
+    Nvenc(NvencGpuInput),
+}
+
+impl GpuInput {
+    /// The pixel format the encoder is configured with: the pool's frames.
+    pub(crate) fn pix_fmt(&self) -> ff::AVPixelFormat {
+        match self {
+            GpuInput::Qsv(_) => ff::AVPixelFormat::AV_PIX_FMT_QSV,
+            GpuInput::Nvenc(_) => ff::AVPixelFormat::AV_PIX_FMT_D3D11,
+        }
+    }
+
+    /// The frame pool, for the encoder's configure step to take a NEW
+    /// reference to per open attempt (`QsvGpuInput::frames_raw`).
+    pub(crate) fn frames_raw(&self) -> *mut ff::AVBufferRef {
+        match self {
+            GpuInput::Qsv(q) => q.frames_raw(),
+            GpuInput::Nvenc(n) => n.frames,
+        }
+    }
+
+    /// The capture device the pool lives on.
+    pub(crate) fn device(&self) -> &ID3D11Device {
+        match self {
+            GpuInput::Qsv(q) => q.device(),
+            GpuInput::Nvenc(n) => &n.device,
+        }
+    }
+
+    /// Whether `device` is the pool's (a capture backend rebuilds its device
+    /// after a desktop switch).
+    pub(crate) fn same_device(&self, device: &ID3D11Device) -> bool {
+        self.device().as_raw() == device.as_raw()
+    }
+
+    /// A GPU frame as a frame of the pool's format, for `send_frame`.
+    pub(crate) fn convert_gpu_frame(&mut self, gpu: &GpuFrame) -> Result<frame::Video> {
+        match self {
+            GpuInput::Qsv(q) => q.convert_gpu_frame(gpu),
+            GpuInput::Nvenc(n) => n.convert_gpu_frame(gpu),
+        }
+    }
+
+    /// A CPU frame (NV12, the pool's size, props stamped) uploaded into the
+    /// pool: the frames that still arrive in memory.
+    pub(crate) fn upload(&self, sw: &frame::Video) -> Result<frame::Video> {
+        match self {
+            GpuInput::Qsv(q) => q.upload(sw),
+            GpuInput::Nvenc(n) => upload_into(n.frames, sw),
+        }
+    }
+}
+
+/// The PCI vendor of the adapter `device` was created on.
+fn adapter_vendor(device: &ID3D11Device) -> Result<u32> {
+    // SAFETY: QueryInterface and two getters on a live device; the adapter is
+    // a new reference released at the end of the scope.
+    unsafe {
+        let dxgi: IDXGIDevice = device
+            .cast()
+            .map_err(|e| anyhow!("ID3D11Device -> IDXGIDevice: {e}"))?;
+        let adapter = dxgi
+            .GetAdapter()
+            .map_err(|e| anyhow!("IDXGIDevice::GetAdapter: {e}"))?;
+        let desc = adapter
+            .GetDesc()
+            .map_err(|e| anyhow!("IDXGIAdapter::GetDesc: {e}"))?;
+        Ok(desc.VendorId)
+    }
+}
+
+/// NVIDIA's PCI vendor id: the only adapter NVENC opens a DirectX session on.
+const NVIDIA: u32 = 0x10de;
+
+/// FR-118 P3 — an NVENC encoder's input on the capture's D3D11 device: an
+/// `AV_PIX_FMT_D3D11` frame pool (NV12) the encoder is opened with, and the
+/// conversion that fills it from a [`GpuFrame`].
+///
+/// FFmpeg 9.0.1's `nvenc.c` (checked in the source): an `hw_frames_ctx` of
+/// format `AV_PIX_FMT_D3D11` makes the encoder open its session on that pool's
+/// D3D11 device (`nvenc_setup_device`), and each frame is registered by its
+/// texture and array slice (`data[0]`, `data[1]`; `nvenc_register_frame`), with
+/// NV12 a supported buffer format. FFmpeg builds the pool as ONE array texture
+/// (`d3d11va_frames_init`), so the converter writes its own NV12 texture of the
+/// pool's size, and one whole-subresource copy puts it into the frame's slice.
+pub(crate) struct NvencGpuInput {
+    device: ID3D11Device,
+    /// `AV_HWDEVICE_TYPE_D3D11VA`, wrapping `device`.
+    d3d11: *mut ff::AVBufferRef,
+    /// The `AV_PIX_FMT_D3D11` frames context the encoder's `hw_frames_ctx`
+    /// refers to.
+    frames: *mut ff::AVBufferRef,
+    converter: Converter,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: as for `QsvGpuInput`: reference-counted FFmpeg contexts used by one
+// encoder from one thread at a time; a free-threaded device whose immediate
+// context is multithread-protected.
+unsafe impl Send for NvencGpuInput {}
+
+impl NvencGpuInput {
+    /// The pool on `device` for a `width × height` encoder. Refuses a device
+    /// that is not NVIDIA's (`adapter_mismatch`: NVENC opens a DirectX session
+    /// on no other), odd dims (an NV12 texture has even ones), and leaves
+    /// nothing behind when a step fails.
+    pub(crate) fn open(device: &ID3D11Device, width: u32, height: u32) -> Result<Self, Refused> {
+        let failed = |e: anyhow::Error| Refused {
+            reason: "open_failed",
+            detail: Some(e.to_string()),
+        };
+        match adapter_vendor(device) {
+            Ok(NVIDIA) => {}
+            Ok(vendor) => {
+                return Err(Refused {
+                    reason: "adapter_mismatch",
+                    detail: Some(format!(
+                        "the capture device is on vendor 0x{vendor:04x}, not NVIDIA's"
+                    )),
+                });
+            }
+            Err(e) => return Err(failed(e)),
+        }
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(Refused {
+                reason: "open_failed",
+                detail: Some(format!("odd dims {width}x{height} for an NV12 pool")),
+            });
+        }
+        let converter = Converter::new(device, width, height, (width, height)).map_err(failed)?;
+        Self::open_with(device, converter, width, height).map_err(failed)
+    }
+
+    fn open_with(
+        device: &ID3D11Device,
+        converter: Converter,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let mut this = Self {
+            device: device.clone(),
+            d3d11: std::ptr::null_mut(),
+            frames: std::ptr::null_mut(),
+            converter,
+            width,
+            height,
+        };
+        // SAFETY: each FFmpeg call gets the buffers it documents; a failure
+        // returns with the ones made so far owned by `this`, whose Drop unrefs
+        // them.
+        unsafe {
+            this.d3d11 = ff::av_hwdevice_ctx_alloc(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+            if this.d3d11.is_null() {
+                return Err(anyhow!("av_hwdevice_ctx_alloc(d3d11va) failed"));
+            }
+            let hw = (*this.d3d11).data as *mut ff::AVHWDeviceContext;
+            let d3d = (*hw).hwctx as *mut ff::AVD3D11VADeviceContext;
+            // FFmpeg releases the device when the context goes, so it gets a
+            // reference of its own.
+            (*d3d).device = device.clone().into_raw() as *mut ff::ID3D11Device;
+            let rc = ff::av_hwdevice_ctx_init(this.d3d11);
+            if rc < 0 {
+                return Err(anyhow!("av_hwdevice_ctx_init(d3d11va): {}", ff_err(rc)));
+            }
+            this.frames = ff::av_hwframe_ctx_alloc(this.d3d11);
+            if this.frames.is_null() {
+                return Err(anyhow!("av_hwframe_ctx_alloc(d3d11va) failed"));
+            }
+            let ctx = (*this.frames).data as *mut ff::AVHWFramesContext;
+            (*ctx).format = ff::AVPixelFormat::AV_PIX_FMT_D3D11;
+            (*ctx).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*ctx).width = width as i32;
+            (*ctx).height = height as i32;
+            (*ctx).initial_pool_size = POOL_SIZE;
+            // Decoder-bound, as the frames of every d3d11va-decode → NVENC
+            // transcode are: the pool is one NV12 array texture, and the RTX
+            // 5090 refuses that array (E_INVALIDARG from `CreateTexture2D`)
+            // with no bind flags or as a render target, measured. A
+            // decoder-bound slice still takes a copy, as QSV's pool does.
+            let d3d_frames = (*ctx).hwctx as *mut ff::AVD3D11VAFramesContext;
+            (*d3d_frames).BindFlags = D3D11_BIND_DECODER.0 as u32;
+            let rc = ff::av_hwframe_ctx_init(this.frames);
+            if rc < 0 {
+                return Err(anyhow!("av_hwframe_ctx_init(d3d11va): {}", ff_err(rc)));
+            }
+        }
+        Ok(this)
+    }
+
+    /// A GPU frame as a D3D11 pool frame for `send_frame`: converted to NV12 by
+    /// the VideoProcessor, then copied into the pool frame's array slice.
+    fn convert_gpu_frame(&mut self, gpu: &GpuFrame) -> Result<frame::Video> {
+        if gpu.device().as_raw() != self.device.as_raw() {
+            return Err(anyhow!("the frame is on another D3D11 device"));
+        }
+        if gpu.dims() != (self.width, self.height) {
+            return Err(anyhow!(
+                "a {:?} frame for a {}x{} pool",
+                gpu.dims(),
+                self.width,
+                self.height
+            ));
+        }
+        self.converter.convert(gpu.texture())?;
+        let mut out = frame::Video::empty();
+        // SAFETY: `out` is an empty frame the pool fills with its array texture
+        // (data[0]) and slice index (data[1]), live while `out` is. The copy is
+        // two NV12 textures of one size on this device: the converter's output
+        // and one slice of the pool's array.
+        unsafe {
+            let rc = ff::av_hwframe_get_buffer(self.frames, out.as_mut_ptr(), 0);
+            if rc < 0 {
+                return Err(anyhow!("av_hwframe_get_buffer(d3d11va): {}", ff_err(rc)));
+            }
+            let raw = (*out.as_ptr()).data[0] as *mut c_void;
+            let slice = (*out.as_ptr()).data[1] as usize as u32;
+            let texture = ID3D11Texture2D::from_raw_borrowed(&raw)
+                .ok_or_else(|| anyhow!("the pool frame has no texture"))?;
+            let context = self
+                .device
+                .GetImmediateContext()
+                .map_err(|e| anyhow!("GetImmediateContext: {e}"))?;
+            // An array slice of a one-mip texture is subresource `slice`.
+            context.CopySubresourceRegion(
+                texture,
+                slice,
+                0,
+                0,
+                0,
+                self.converter.output(),
+                0,
+                None,
+            );
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for NvencGpuInput {
+    fn drop(&mut self) {
+        // SAFETY: each buffer is ours, once; unref of a null one is a no-op.
+        // The frame pool goes first: it holds a reference to the device.
+        unsafe {
+            ff::av_buffer_unref(&mut self.frames);
+            ff::av_buffer_unref(&mut self.d3d11);
+        }
+    }
+}
+
+/// A CPU frame (NV12, the pool's size, pts and picture type stamped) as a
+/// frame of the pool `frames`: FFmpeg's upload into a pool frame.
+fn upload_into(frames: *mut ff::AVBufferRef, sw: &frame::Video) -> Result<frame::Video> {
+    let mut hw = frame::Video::empty();
+    // SAFETY: an empty frame the pool fills, a populated software frame.
+    unsafe {
+        let rc = ff::av_hwframe_get_buffer(frames, hw.as_mut_ptr(), 0);
+        if rc < 0 {
+            return Err(anyhow!("av_hwframe_get_buffer: {}", ff_err(rc)));
+        }
+        let rc = ff::av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0);
+        if rc < 0 {
+            return Err(anyhow!("av_hwframe_transfer_data(upload): {}", ff_err(rc)));
+        }
+        let rc = ff::av_frame_copy_props(hw.as_mut_ptr(), sw.as_ptr());
+        if rc < 0 {
+            return Err(anyhow!("av_frame_copy_props: {}", ff_err(rc)));
+        }
+    }
+    Ok(hw)
 }
 
 /// FR-118 P2-3 — the encoders whose GPU-input form the capability probe proved
@@ -982,9 +1277,10 @@ mod tests {
         // SAFETY: serialised by LOCK; the guards restore both on drop.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(reason(None, "hevc_qsv", false), "cpu_frames");
-        assert_eq!(reason(Some(&warp), "hevc_nvenc", false), "no_gpu_cell");
+        assert_eq!(reason(Some(&warp), "hevc_amf", false), "no_gpu_cell");
         assert_eq!(reason(Some(&warp), "vp9_qsv", false), "no_gpu_cell");
         assert_eq!(reason(Some(&warp), "hevc_qsv", true), "no_gpu_cell");
+        assert_eq!(reason(Some(&warp), "hevc_nvenc", true), "no_gpu_cell");
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "hevc_qsv:gpu") };
         assert_eq!(reason(Some(&warp), "hevc_qsv", false), "denied");
@@ -993,7 +1289,116 @@ mod tests {
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "none") };
         assert_eq!(reason(Some(&warp), "hevc_qsv", false), "unproven");
-        // The pool itself, the gate after the proof, has its own test below.
+        // FR-118 P3 — NVENC's 4:2:0 cells are GPU cells, behind the same gates.
+        assert_eq!(reason(Some(&warp), "hevc_nvenc", false), "unproven");
+        // SAFETY: as above.
+        unsafe { set("ZERO_COPY_DENY", "av1_nvenc:gpu") };
+        assert_eq!(reason(Some(&warp), "av1_nvenc", false), "denied");
+        // The pools themselves, the gate after the proof, have their own tests.
+    }
+
+    /// FR-118 P3 — the NVENC pool opens only on an NVIDIA device; elsewhere it
+    /// refuses with `adapter_mismatch` before making anything. Where it opens,
+    /// a GPU frame and a CPU frame both become D3D11 frames of the pool, and
+    /// the GPU frame's NV12 is the converter's: the pool slice holds the
+    /// picture the conversion made.
+    #[test]
+    fn the_nvenc_pool_opens_on_nvidia_and_refuses_elsewhere() {
+        use crate::capture::gpu_frame::TexturePool;
+        let (width, height) = (64u32, 32u32);
+        let mut opened = 0;
+        for (name, device) in devices() {
+            let mut input = match NvencGpuInput::open(&device, width, height) {
+                Ok(input) => input,
+                Err(e) => {
+                    eprintln!("{name}: no NVENC pool ({}: {:?})", e.reason, e.detail);
+                    let nvidia = adapter_vendor(&device).ok() == Some(NVIDIA);
+                    if nvidia {
+                        panic!("{name}: an NVIDIA device refused the pool: {e:?}");
+                    }
+                    assert_eq!(e.reason, "adapter_mismatch", "{name}: {e:?}");
+                    continue;
+                }
+            };
+            // The D3D11 pool itself would open on any adapter; the refusal off
+            // NVIDIA is the adapter rule's, and nothing else catches it before
+            // NVENC's session fails in the encoder's open.
+            assert_eq!(
+                adapter_vendor(&device).ok(),
+                Some(NVIDIA),
+                "{name}: a pool opened on a device that is not NVIDIA's"
+            );
+            let pool = TexturePool::new(&device).unwrap();
+            let bgra = bars(width, height);
+            let texture = pool.take(width, height).unwrap();
+            // SAFETY: `bgra` holds `height` rows of `width × 4` bytes.
+            unsafe {
+                device.GetImmediateContext().unwrap().UpdateSubresource(
+                    &texture,
+                    0,
+                    None,
+                    bgra.as_ptr().cast(),
+                    width * 4,
+                    0,
+                );
+            }
+            let gpu = pool.frame(texture, width, height);
+            let from_gpu = input.convert_gpu_frame(&gpu).unwrap();
+            let mut sw = frame::Video::new(ffmpeg_next::format::Pixel::NV12, width, height);
+            for plane in 0..2 {
+                sw.data_mut(plane).fill(0x80);
+            }
+            let uploaded = upload_into(input.frames, &sw).unwrap();
+            for f in [&from_gpu, &uploaded] {
+                // SAFETY: reading a field of a valid frame.
+                let format = unsafe { (*f.as_ptr()).format };
+                assert_eq!(format, ff::AVPixelFormat::AV_PIX_FMT_D3D11 as i32);
+            }
+            // The pool slice holds the converter's picture: read the slice back
+            // and compare it with the converter's own output.
+            // SAFETY: the frame's data[0] is the pool's array texture, data[1]
+            // its slice; both live while `from_gpu` is.
+            let (slice_y, slice_uv) = unsafe {
+                let raw = (*from_gpu.as_ptr()).data[0] as *mut c_void;
+                let slice = (*from_gpu.as_ptr()).data[1] as usize as u32;
+                let array = ID3D11Texture2D::from_raw_borrowed(&raw).unwrap();
+                let single = texture_nv12(&device, width, height);
+                let context = device.GetImmediateContext().unwrap();
+                context.CopySubresourceRegion(&single, 0, 0, 0, 0, array, slice, None);
+                read_nv12(&device, &single, (width, height), width, height)
+            };
+            let (out_y, out_uv) = read_nv12(&device, input.converter.output(), (width, height), width, height);
+            assert_eq!(slice_y, out_y, "{name}: the slice's luma is the converter's");
+            assert_eq!(slice_uv, out_uv, "{name}: the slice's chroma is the converter's");
+            eprintln!("{name}: NVENC pool opened; a GPU frame and a CPU frame both entered it");
+            opened += 1;
+        }
+        if opened == 0 {
+            eprintln!("no NVIDIA device here — the refusals above are the test");
+        }
+    }
+
+    /// An NV12 `DEFAULT` texture, a copy target for reading one pool slice.
+    fn texture_nv12(device: &ID3D11Device, width: u32, height: u32) -> ID3D11Texture2D {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        // SAFETY: a valid desc and out-param.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)).unwrap() };
+        tex.unwrap()
     }
 
     /// The QSV pool opens only where QSV runs (an Intel adapter); elsewhere
