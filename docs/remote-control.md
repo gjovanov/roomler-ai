@@ -3704,6 +3704,54 @@ sequenceDiagram
   world-writable directory lets any local account plant a symlink
   there and have root overwrite the file it points to.
 
+**What the second named stall found** (#2551). A second Windows device
+stalled on 2026-10-27, under 0.4.177, and read
+`signaling=95s@heartbeat.sys`. That stage copies the host sampler's
+cache and borrows the overlay view's `watch`, nothing else. Its log tail
+had no `host sampler:` line and no QUIC collapse, so the host read is
+ruled out by the rule above. The lock behind that borrow is what held it.
+- The view's lock is a `parking_lot` `RwLock`, because tokio's `full`
+  feature includes `parking_lot`. It is task-fair: once a writer waits,
+  a new `read()` parks, even on a thread that already holds a read guard.
+- `DaemonState::status()`
+  (`agents/roomlerd/src/localapi_state.rs:654`) built `NodeStatus` as
+  one struct literal, and ten of its fields each called
+  `self.overlay.borrow()`. A temporary lives until the literal is
+  finished, so every field's guard was still held when the next field
+  borrowed: ten nested read locks on one lock.
+- The view's one writer is the overlay runtime's `publish_view`
+  (`send_replace`, `crates/tunnel-core/src/overlay/runtime.rs:1973`), on
+  every 5 s sweep and on carrier events. A publish that landed between
+  two of `status()`'s borrows left nothing able to move:
+
+```mermaid
+sequenceDiagram
+    participant S as LocalAPI status()
+    participant L as overlay view RwLock
+    participant R as overlay runtime (publish_view)
+    participant H as signaling heartbeat
+    S->>L: read(): guard 1, held to the end of the literal
+    R->>L: write(): waits for guard 1
+    S->>L: read(): parks behind the waiting writer
+    H->>L: read() at heartbeat.sys: parks behind the writer
+    Note over S,H: nobody releases, so the watchdog kills the worker 90 s later
+```
+
+- The companion's device view asks for `status()` every 2 s while its
+  window is open (`pollDeviceView`), and `roomler status` asks for it too.
+  The window was microseconds wide, so the deadlock was rare, not
+  impossible.
+- `status()` now takes the view once, clones the ten fields out, and
+  drops the guard before the literal. The test
+  `status_survives_a_view_publish_mid_read` drives it against a writer
+  in a tight loop.
+- ⚠️ **Never borrow one `watch` twice in one statement.** A struct
+  literal, an argument list, a tuple and a tail expression all keep each
+  temporary's guard to their end. Bind one borrow, copy what you need,
+  and drop it. The same goes for any `RwLock` read guard: `std`
+  documents that a recursive read may deadlock, and `parking_lot`'s fair
+  policy makes it certain once a writer waits in between.
+
 **Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
 (`auth_backoff_for`): 30s → 60s → 5min → 1h capped. Server-side
