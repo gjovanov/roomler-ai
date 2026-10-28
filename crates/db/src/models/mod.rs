@@ -45,6 +45,12 @@ pub use agent_log::*;
 pub mod consent_request;
 pub use consent_request::*;
 
+pub mod device_pairing;
+pub use device_pairing::*;
+
+pub mod pairing_audit;
+pub use pairing_audit::*;
+
 pub mod subscriber;
 pub use subscriber::*;
 

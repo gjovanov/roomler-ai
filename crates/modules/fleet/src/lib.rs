@@ -48,11 +48,15 @@ use roomler_ai_remote_control::{audit::AuditSink, models::AgentStatus};
 use roomler_ai_services::dao::{
     agent::AgentDao, agent_crash::AgentCrashDao, agent_log::AgentLogDao,
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
-    enroll_token_issued::EnrollTokenIssuedDao, enrollment_key::EnrollmentKeyDao,
-    exec_audit::ExecAuditDao, exec_pending::ExecPendingDao, external_rc_audit::ExternalRcAuditDao,
-    keep_busy_event::KeepBusyEventDao, setup_diagnostics::SetupDiagnosticsDao,
+    device_pairing::DevicePairingDao, enroll_token_issued::EnrollTokenIssuedDao,
+    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, exec_pending::ExecPendingDao,
+    external_rc_audit::ExternalRcAuditDao, keep_busy_event::KeepBusyEventDao,
+    pairing_audit::PairingAuditDao, setup_diagnostics::SetupDiagnosticsDao,
 };
-use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
+use roomler_core::{
+    Capabilities, Core, Module, TenantCtx,
+    rate_limit::{RateLimiter, WindowLimiter},
+};
 use tokio::sync::mpsc;
 
 pub mod agent;
@@ -72,6 +76,8 @@ pub mod hub;
 pub mod install_trace;
 pub mod keep_busy;
 pub mod nudge;
+pub mod pairing;
+pub mod pairing_notice;
 pub mod presence;
 pub mod releases;
 pub mod remote_config;
@@ -103,6 +109,20 @@ pub struct FleetState {
     pub agent_logs: Arc<AgentLogDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
+    /// FR-129 A1 — device pairings (`/api/pair/*`): the row is the whole
+    /// state of a pairing, so start, approve and poll may land on
+    /// different pods. Holds a device-code HASH and never a token.
+    pub device_pairings: Arc<DevicePairingDao>,
+    /// FR-129 A1 — every pairing decision, granted or refused.
+    pub pairing_audit: Arc<PairingAuditDao>,
+    /// FR-129 A1 — `start` per client address per hour, on top of the
+    /// governor. Per pod, in memory: an abuse ceiling, not the boundary.
+    pub pairing_start_limiter: Arc<WindowLimiter<std::net::IpAddr>>,
+    /// FR-129 A1 — misses (a lookup, deny or approval that named no live
+    /// pairing, or an approval the gate refused) per account per hour; at
+    /// the ceiling that account's lookups, approvals and denials answer
+    /// 429 for the rest of the hour. Per pod, in memory.
+    pub pairing_miss_limiter: Arc<WindowLimiter<ObjectId>>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
     /// FR-94 — commands waiting for a Windows device's SYSTEM service to
@@ -286,6 +306,10 @@ impl Module for FleetState {
             agent_crashes: Arc::new(AgentCrashDao::new(db)),
             agent_logs: Arc::new(AgentLogDao::new(db)),
             consent_requests,
+            device_pairings: Arc::new(DevicePairingDao::new(db)),
+            pairing_audit: Arc::new(PairingAuditDao::new(db)),
+            pairing_start_limiter: Arc::new(WindowLimiter::hourly()),
+            pairing_miss_limiter: Arc::new(WindowLimiter::hourly()),
             exec_audit: Arc::new(ExecAuditDao::new(db)),
             exec_pending: Arc::new(ExecPendingDao::new(db)),
             external_rc_audit: Arc::new(ExternalRcAuditDao::new(db)),
@@ -548,6 +572,18 @@ impl Module for FleetState {
         // the release workflows on every published tag.
         let releases = Router::new().route("/refresh", post(releases::refresh));
 
+        // FR-129 A1 — device pairing. `start` and `poll` are public (the
+        // device code is the credential); `lookup`, `approve` and `deny`
+        // take the signed-in person (`AuthUser`, read after the kill switch
+        // so a disabled server answers 404 to everyone). Every route is the
+        // empty 404 while `[pairing] enabled = false`.
+        let pair = Router::new()
+            .route("/start", post(pairing::start))
+            .route("/poll", post(pairing::poll))
+            .route("/lookup", post(pairing::lookup))
+            .route("/approve", post(pairing::approve))
+            .route("/deny", post(pairing::deny));
+
         Router::new()
             .nest("/tenant/{tenant_id}/agent", agent)
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
@@ -566,15 +602,50 @@ impl Module for FleetState {
             .nest("/tunnel", public_tunnel_release)
             .nest("/setup", public_setup)
             .nest("/releases", releases)
+            .nest("/pair", pair)
             .with_state(self.clone())
     }
 
-    /// The twelve collections this module owns. The first eight specs are the
-    /// ones the db crate's plan held before P5a, unchanged; `keep_busy_events`
-    /// (FR-92 P7), `exec_pending` (FR-94), `enroll_token_issued` (FR-102 P3)
-    /// and `setup_diagnostics` (FR-102 P3b) were born here.
+    /// The fourteen collections this module owns. The first eight specs are
+    /// the ones the db crate's plan held before P5a, unchanged;
+    /// `keep_busy_events` (FR-92 P7), `exec_pending` (FR-94),
+    /// `enroll_token_issued` (FR-102 P3), `setup_diagnostics` (FR-102 P3b),
+    /// `device_pairings` and `pairing_audit` (FR-129 A1) were born here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
+            // FR-129 A1 — device pairings. The hash is the poll's lookup and
+            // unique; the user code is unique only among PENDING rows (the
+            // partial index), so a code is free again once its pairing is
+            // decided, and `start` regenerates on a collision. The TTL on
+            // `expires_at` only tidies: every read compares the clock itself,
+            // because the monitor runs about a minute late.
+            IndexSet {
+                collection: roomler_ai_db::models::DevicePairing::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "device_code_hash": 1 }),
+                    index_unique_partial(
+                        bson::doc! { "user_code": 1 },
+                        bson::doc! { "status": "pending" },
+                    ),
+                    index_ttl(bson::doc! { "expires_at": 1 }, 0),
+                ],
+            },
+            // FR-129 A1 — every pairing decision, granted or refused. 90 days
+            // like the other decision logs; never a device code or a token.
+            IndexSet {
+                collection: roomler_ai_db::models::PairingAuditEvent::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "pairing_id": 1, "at": -1 }),
+                    index(bson::doc! { "tenant_id": 1, "at": -1 }),
+                    index(bson::doc! { "user_id": 1, "at": -1 }),
+                    index_ttl(
+                        bson::doc! { "at": 1 },
+                        roomler_ai_db::models::PairingAuditEvent::TTL_SECS,
+                    ),
+                ],
+            },
             IndexSet {
                 collection: "consent_requests",
                 pre_ops: Vec::new(),
