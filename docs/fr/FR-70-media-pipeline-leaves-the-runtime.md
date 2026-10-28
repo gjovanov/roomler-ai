@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; M3b not built)
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; **M3a.3 — the week's documented lags and first-tick re-rates counted apart, and two more genuine findings fixed (the flip's open at the old profile's rate, a superseded held target flushed after the controller moved on), 2026-10-28**, §"M3a.3"; M3b not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -1173,6 +1173,113 @@ week that AC10 needs starts when that release reaches the fleet, and the `zeus`
 move is its first driven check. Still owed: the full read with the
 `remote_sessions` denominator, and the three driven moves §"M3a.1" lists.
 
+## M3a.3 — lags counted apart, the first tick after an adoption, and the flip's open (2026-10-28)
+
+Anchors verified against branch `fr70-m3a3` (master `886ad79b1` + this change).
+The sections above keep their own anchors.
+
+### What the week found
+
+AC10's week ran from 0.4.150's arrival (2026-10-21 16:55:30Z). The interim read
+at 2026-10-28 05:03Z had **713 sessions started, 706 with agent logs, 408 FFmpeg
+DC sessions with heartbeats on 13 hosts**. 351 read zero on every field; 57
+carried at least one divergence, in **66 first-divergence lines: 41 `dims`, 25
+`bitrate`**. The log windows around 21 of those lines were read by hand
+(`windows*.js`, FR-70 tools). Each fell into one of six classes:
+
+| Class | What happened | Cases | Against M3a's own list |
+|---|---|---|---|
+| **D1** | FR-108's display match switched the host's mode under the live session, so the capture reopened at a new native. The plan's native dims are the LAST frame's, read from `capture_native_dims` at the top of the pass | #1, #6, #14, #15, #16, #19, #26 | "a native-dims change under a live session": a documented lag |
+| **D2** | an `rc:resolution` landed between the plan's snapshot and the inline read (#9: the update at `.341`, the divergence at `.346`) | #9, #25 | "a target_resolution write landing between the snapshot and the inline read": a documented lag |
+| **D3** | a follower joined a shared pipeline, so the merged target moved between the two reads | #7, #24 (its `dims` line) | the same lag class, through the merge |
+| **B1** | a persisted transport flip dropped the encoder. The inline open ran at `ceiling.min(applied_bps)`, and `applied_bps` was still the OLD profile's target. The same pass's tick, under the new ceiling, re-rated it: a second open on QSV | #10, #23 | **a genuine defect**: it breaks the open-rate comment's own claim (`peer.rs:8626`) |
+| **B2** | a rate replacement adopted while the plan held, then a congestion decrease on the controller's very next tick (#18: 16 M adopted, 2 M one tick later) | #2, #4, #5, #18, #22 | M3a.1's stale adoption, one tick later |
+| **B3** | a session that started relayed held its first target (1.5 M) under the relay's IDR thrift. Relay-escape lifted the clamp, and the next target (2 M) went out through the direct background swap, which left the old hold in place. Two seconds of quiet later the hold was flushed: a third encoder at 1.5 M, re-rated to 2 M on its first tick | #24 (its `bitrate` line, 17:49:08–17:49:16) | **a genuine defect**: a superseded target applied after the controller moved on |
+
+So of the six classes, two are bugs. Three are the lags M3a's design said the
+shadow WOULD count, and one is the stale phenomenon M3a.1 already counts apart.
+Nothing could tell them apart mechanically. A week's read was therefore a hand
+attribution, and a gate that needs one cannot read zero.
+
+**Decided by the operator, 2026-10-28:** count the documented lags and B2 apart,
+and fix B1. B3 surfaced while this section's cases were re-read for it (the
+interim attribution had filed #24 under D3 by its `dims` line alone). It is
+fixed here too, on the same reasoning as M3a.2: a genuine bug the gate found is
+fixed before the week restarts, or the week reads it again.
+
+### The change
+
+```mermaid
+flowchart TD
+  A["check_dims: plan dims ≠ inline dims"] --> B{"did a geometry input move<br/>between the plan's snapshot<br/>and the inline read?"}
+  B -->|"yes: native, target, priority_cap,<br/>slow_link_cap, refine, soft_cap"| L["a LAG<br/>plan_lags += 1, logged once with the input"]
+  B -->|no| D["a dims DIVERGENCE"]
+  T["after_tick: a built encoder<br/>≠ the controller's first target"] --> S{"a replacement, re-rated on THIS tick,<br/>its rate within the ceiling<br/>the loop planned the frame at?"}
+  S -->|yes| ST["a STALE TICK<br/>plan_stale_ticks += 1, logged once"]
+  S -->|"no: an inline open, an unmoved tick,<br/>or built above the ceiling"| BD["a bitrate DIVERGENCE"]
+```
+
+| Where | What |
+|---|---|
+| `DimsInputs` gains `PartialEq` (`policy.rs:42`) | the shadow compares the inputs it was produced from with the ones the inline arithmetic read |
+| `Shadow::check_dims` takes the inline inputs (`plan.rs:604`), the pump passes them (`peer.rs:8224`) | a geometry difference whose inputs moved is a lag (`moved_input`, `plan.rs:375`, names the first that moved). One whose inputs held is still a `dims` divergence. The pump binds the inline `DimsInputs` once (`peer.rs:8191`), so the plan dims and the check read the same struct |
+| `Shadow::note_built` (`plan.rs:660`) | an inline open records whether it was built from moved inputs, so its dims at the tick are a lag too, not a divergence |
+| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:683`, `peer.rs:9284`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:722`) |
+| the heartbeat (`peer.rs:9824`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:9920`; `log_plan_lag`, `peer.rs:9944`) |
+| the flip's open (`flip_rebuild_pending`, `peer.rs:6341`, set at `:7474`; the open at `:8614`; the pass's tick at `:9107`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
+| the tick's direct background-swap arm (`peer.rs:9152`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:7873`; the send overflow, `:9571`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
+
+- **Why only a replacement can be a stale tick.** The inline open runs in the
+  same pass as the tick, so the loop can consult the controller before it
+  opens. The flip's open now does. An inline open re-rated on its first tick
+  stays a divergence: that is how B1 was found, and how a regression of it would
+  show.
+- **Why the ceiling.** M3a.1's genuine finding, `hevc_vaapi`, was also a
+  replacement re-rated on its first tick. Its 25 M rung sat ABOVE the 9.87 M
+  ceiling of the frame it was opened for, so the loop could have known. That
+  case stays a divergence (`a_dims_replacement_opened_at_the_old_frame_s_rate_is_a_divergence`
+  now passes that ceiling and still fails the bitrate field). B2's were
+  congestion decreases within the ceiling, which nothing at the adoption could
+  have predicted.
+- **What a lag is not.** The rule cannot tell a lag from a bug that happens to
+  fire on the frame an input moved. It also cannot see a bug that fires only
+  while an input moves. Both are possible. The negative control below shows the
+  rule does not hide a divergence whose inputs held, which is every divergence
+  the week's read could not attribute.
+- **No kill switch.** The classification changes counters and log lines, not
+  behaviour. B1's fix changes one open's rate to the rate the next tick would
+  apply anyway, removes an open, and adds no state beyond a flag. B3's removes
+  an open at a rate nobody asked for any more. The alarm for both is the
+  shadow's own `bitrate` field: under the new rule each still reads as a
+  divergence (B1 is an inline open; B3's tick does not move the target), so a
+  regression of either is counted, not classified away.
+
+### Verification
+
+- **`encode::plan`, +5 tests, with the field's cases.** D1 (a native change: a
+  lag at the check and at the open's tick, clean the pass after), D2/D3 (a
+  target or a Priority write, named by the input that moved), B2 (a 6 M
+  replacement, then 1.5 M on its first tick within the ceiling: a stale tick),
+  and two negative controls: an open built from held inputs at other dims is
+  still a `dims` divergence, and an inline open re-rated on its first tick (B1's
+  shape) is still a `bitrate` divergence. The existing `hevc_vaapi` test now
+  passes its own ceiling and still diverges.
+- ⚠️ **No unit test reaches the pump's call sites**, B1's and B3's fixes
+  included: they sit inside `media_pump_ffmpeg_dc`. The field verifies them.
+  **Red** is the week read above (#10 and #23 for B1, #24 for B3, on
+  0.4.151–0.4.179). **Green owed** on the release that carries this change: a
+  persisted relay→direct flip whose open lands at the post-flip target, and a
+  relayed start that escapes to direct with no later swap at the start's held
+  rate. Neither may show a `bitrate` divergence or a re-rate in the tick after.
+
+### For the gate (AC10)
+
+The gate reads every `plan_divergences` field at zero. `plan_lags`,
+`plan_stale_swaps` and `plan_stale_ticks` are reported beside it and do not
+fail it. The week restarts on the release carrying M3a.3. Its read keeps the
+`remote_sessions` denominator, and a divergence there is a bug by construction:
+its inputs held.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -1233,7 +1340,12 @@ move is its first driven check. Still owed: the full read with the
       replacement going down opens at the old frame's rate and is re-rated on
       the next tick. Owed: that fix, a week after it, the full read with the
       `remote_sessions` denominator, and the missing driven moves — §"M3a.1".
-      The fix is §"M3a.2", in 0.4.150 at the earliest; the week starts there.)*
+      The fix is §"M3a.2", in 0.4.150 at the earliest; the week starts there.
+      2026-10-28: that week's read found 57 of 408 FFmpeg DC sessions with a
+      divergence, in six classes. Three are the documented lags, one is M3a.1's
+      stale adoption a tick later, and two are genuine bugs, both fixed in
+      §"M3a.3", which also counts the lags and the first-tick re-rates apart.
+      The week restarts on the release carrying M3a.3.)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 

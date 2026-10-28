@@ -577,11 +577,13 @@ flowchart TD
     PACE -. "check_fps" .-> CNT
     PACE --> CAP["capture"]
     CAP --> DIMS["inline plan_dims → plan_target"]
-    DIMS -. "check_dims" .-> CNT
+    DIMS -. "check_dims(dims, inputs)" .-> CNT
+    DIMS -. "inputs moved since the snapshot" .-> APART["counted apart<br/>plan_lags · plan_stale_swaps · plan_stale_ticks"]
     DIMS --> BUILD["inline open / adopted replacement<br/>note_built(rate, dims)"]
     BUILD --> TICK["governor.pre_encode_tick"]
-    TICK -. "after_tick: republish bitrate, judge the build" .-> CNT
-    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch"]
+    TICK -. "after_tick(target, ceiling): republish bitrate, judge the build" .-> CNT
+    TICK -. "a replacement re-rated within the ceiling on its first tick" .-> APART
+    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch · plan_lags · plan_stale_*"]
 ```
 
 | plan field | what it is | the inline value it is compared with |
@@ -608,13 +610,24 @@ WARN FR-70 M3a: the shadow plan diverged from the pump's inline value (first tim
      field="dims" plan="(1920, 1200)" inline="(944, 590)"
 ```
 
-Read the line, not the count: it names the field and the two numbers. The
-counts the shadow is EXPECTED to show, each a one-frame lag M3b has to design
-for rather than a bug: a native-dims change under a live session, a refine
-flip during the pass's capture (inert on the fleet default — the dial's
-dims-caps are off), a resolution or Priority write landing between the
-snapshot and the inline read, a `pipe_bps` TTL expiry between the two reads.
-Anything else is a plan bug and blocks M3b.
+Read the line, not the count: it names the field and the two numbers.
+
+Three things are counted **apart** from the divergences, because none is a bug
+in the plan, and each logs its first occurrence once:
+
+| heartbeat field | counts | since |
+|---|---|---|
+| `plan_lags` | a geometry difference whose INPUTS moved between the plan's snapshot and the inline read: a native-dims change under a live session (a display-mode switch), a resolution or Priority write landing in between, a viewer joining a shared pipeline, a refine flip or a soft-cap move. The log line names the input that moved (`moved="native"`, `"target"`, `"priority_cap"`, …) | FR-70 M3a.3 |
+| `plan_stale_swaps` | a replacement adopted after the plan moved while it opened | FR-70 M3a.1 |
+| `plan_stale_ticks` | a replacement adopted while the plan held, whose rate the controller moved on its very next tick within the frame's ceiling (a congestion decrease, often set off by the replacement's own IDR) | FR-70 M3a.3 |
+
+The gate reads `plan_divergences` alone. A geometry divergence there had its
+inputs hold, and a bitrate divergence is an encoder built at a rate the plan
+did not stand behind: an inline open re-rated on its first tick, a replacement
+built above its frame's ceiling, or one re-rated on a tick that did not move.
+Each of those is a plan bug and blocks M3b. ⚠️ A `pipe_bps` TTL expiry between
+the two reads would still read as a budget divergence: no counter classifies
+the budget fields yet, and none has been seen.
 
 ⚠️ **No kill switch, on purpose.** The shadow changes no decision, takes no
 await, adds no env read to the frame path (every knob is resolved once per pump
