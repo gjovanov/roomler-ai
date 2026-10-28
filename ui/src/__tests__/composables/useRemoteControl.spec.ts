@@ -143,6 +143,8 @@ import {
   localRelayRequestFields,
   loopbackProbeIsSilent,
   thisDevicesFromPick,
+  mayLookAgain,
+  relayChoiceAfterProbe,
   type LocalRelayDescriptor,
   LOCAL_RELAYS_MAX,
   LOCAL_RELAY_PROBE_PORT,
@@ -4740,12 +4742,14 @@ describe('FR-121 — the relays of the devices this browser runs on', () => {
     ).toBeNull()
   })
 
-  it('P3b — a device stored before P3b widens to every own device found, and keeps itself', () => {
+  it('P3b — a device stored before P3b widens to every own device found, in probe order', () => {
     const owns = (id: string) => id === mine || id === wsl
-    const repair = (probed: LocalRelayDescriptor[]) =>
-      devicesToPairFromProbe({ thisDevices: [wsl], legacy: true, probed, ownsDevice: owns })
+    const repair = (probed: LocalRelayDescriptor[], stored = [wsl]) =>
+      devicesToPairFromProbe({ thisDevices: stored, legacy: true, probed, ownsDevice: owns })
     // the field case: paired with the WSL agent; the Windows one answers first
     expect(repair([relay(47989, mine), relay(47990, wsl)])).toEqual([mine, wsl])
+    // probe order whatever was stored: the stored device was a race too
+    expect(repair([relay(47989, wsl), relay(47990, mine)], [mine])).toEqual([wsl, mine])
     // its own agent restarting right now: still paired with it
     expect(repair([relay(47989, mine)])).toEqual([mine, wsl])
     // nothing of the person's own answered: left as it is
@@ -4765,18 +4769,100 @@ describe('FR-121 — the relays of the devices this browser runs on', () => {
       devices: [mine, wsl],
       legacy: false,
     })
-    expect(parseStoredThisDevices('none', mine)).toEqual({ devices: 'none', legacy: false })
+    expect(parseStoredThisDevices('none', 'none')).toEqual({ devices: 'none', legacy: false })
     // each id once, nothing that is not one, at most LOCAL_RELAYS_MAX
-    expect(parseStoredThisDevices(`${mine},${mine},evil,${wsl}`, null).devices).toEqual([
+    expect(parseStoredThisDevices(`${mine},${mine},evil,${wsl}`, mine).devices).toEqual([
       mine,
       wsl,
     ])
     const many = Array.from({ length: 6 }, (_, i) => `507f1f77bcf86cd79943901${i}`)
-    expect(parseStoredThisDevices(many.join(','), null).devices).toEqual(
+    expect(parseStoredThisDevices(many.join(','), many[0]).devices).toEqual(
       many.slice(0, LOCAL_RELAYS_MAX),
     )
     // a list that holds nothing usable falls back to the single key
     expect(parseStoredThisDevices('garbage', mine)).toEqual({ devices: [mine], legacy: true })
+  })
+
+  it('P3b — a choice a tab on an older bundle made since wins over the list', () => {
+    // that tab writes the single key alone, so it no longer echoes the list
+    expect(parseStoredThisDevices(`${mine},${wsl}`, 'none')).toEqual({
+      devices: 'none',
+      legacy: false,
+    })
+    expect(parseStoredThisDevices(`${mine},${wsl}`, null)).toEqual({
+      devices: null,
+      legacy: false,
+    })
+    expect(parseStoredThisDevices(`${mine},${wsl}`, wsl)).toEqual({
+      devices: [wsl],
+      legacy: true,
+    })
+    expect(parseStoredThisDevices('none', mine)).toEqual({ devices: [mine], legacy: true })
+  })
+
+  it('P3b — looks again only at a legacy pairing the device list in view vouches for', () => {
+    const owns = (id: string) => id === mine || id === wsl
+    const may = (
+      over: Partial<Parameters<typeof mayLookAgain>[0]> = {},
+    ): boolean =>
+      mayLookAgain({
+        planKind: 'from',
+        legacy: true,
+        thisDevices: [wsl],
+        ownsDevice: owns,
+        ...over,
+      })
+    expect(may()).toBe(true)
+    expect(may({ legacy: false })).toBe(false)
+    expect(may({ planKind: 'probe' })).toBe(false)
+    expect(may({ planKind: 'none' })).toBe(false)
+    // another organization in view, or a list that failed to load: wait
+    expect(may({ ownsDevice: () => false })).toBe(false)
+    expect(may({ ownsDevice: undefined })).toBe(false)
+    expect(may({ thisDevices: 'none' })).toBe(false)
+  })
+
+  it('P3b — what a connect does with its probe: send what it found, or name the devices', () => {
+    const owns = (id: string) => id === mine || id === wsl
+    const W = relay(47989, mine)
+    const L = relay(47990, wsl)
+    const T = relay(47991, theirs)
+    const choose = (over: Partial<Parameters<typeof relayChoiceAfterProbe>[0]>) =>
+      relayChoiceAfterProbe({
+        lookAgain: false,
+        thisDevices: null,
+        legacy: false,
+        found: [],
+        ownsDevice: owns,
+        target,
+        ...over,
+      })
+    // an unanswered browser: pairs with its own, sends everything it found
+    expect(choose({ found: [W, L, T] })).toEqual({
+      store: [mine, wsl],
+      probed: [W, L, T],
+      named: [],
+    })
+    expect(choose({ found: [T] })).toEqual({ store: undefined, probed: [T], named: [] })
+    // the one look at a legacy pairing names the devices, in probe order
+    const look = { lookAgain: true, thisDevices: [wsl], legacy: true }
+    expect(choose({ ...look, found: [W, L] })).toEqual({
+      store: [mine, wsl],
+      probed: [],
+      named: [mine, wsl],
+    })
+    // ...leaving out the device being viewed
+    expect(choose({ ...look, found: [W, L], target: mine })).toEqual({
+      store: [mine, wsl],
+      probed: [],
+      named: [wsl],
+    })
+    // found none of its own: it keeps its device, stored the new way (once)
+    expect(choose({ ...look, found: [T] })).toEqual({
+      store: [wsl],
+      probed: [],
+      named: [wsl],
+    })
   })
 
   it('stores the list, and the first device where an older bundle reads it', () => {
@@ -4850,13 +4936,17 @@ describe('FR-121 P3b (#2774) — every relay on this computer, not the first to 
       const port = Number(new URL(url).port)
       return new Promise((resolve, reject) => {
         // Nothing answers until every port has been asked: a probe that
-        // waited for one port before the next would never finish here.
+        // waited for one port before the next would never finish here. Then
+        // the answers land last port first, so a probe that kept them in
+        // arrival order would come back reversed.
         pending.push(() =>
           answers[port]
             ? resolve({ ok: true, json: async () => answers[port] })
             : reject(new TypeError('connection refused')),
         )
-        if (pending.length === LOCAL_RELAY_PROBE_PORTS.length) pending.forEach((go) => go())
+        if (pending.length === LOCAL_RELAY_PROBE_PORTS.length) {
+          pending.slice().reverse().forEach((go) => go())
+        }
       })
     }) as unknown as typeof fetch
     const found = await probeLocalRelays(fakeFetch)

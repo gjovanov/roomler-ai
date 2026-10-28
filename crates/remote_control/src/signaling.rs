@@ -2030,7 +2030,7 @@ pub enum ClientMsg {
         /// agents (Windows and WSL, a container), each with its own relay and
         /// its own overlay path to the target, so the first to answer is no
         /// better than the rest: the Hub hands the target every one, and ICE
-        /// keeps the path that works. Read only beside a `local_relay`, at most
+        /// checks a pair through each. Read only beside a `local_relay`, at most
         /// [`LOCAL_RELAYS_MAX`] in all. Absent from older viewers; an older
         /// server ignores it and hands over the first alone.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

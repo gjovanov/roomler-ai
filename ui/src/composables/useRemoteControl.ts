@@ -3798,9 +3798,10 @@ export const LOCAL_RELAY_PROBE_PORTS = [
  *  run several enrolled agents (Windows and WSL, a container), each with its
  *  own relay and its own overlay path to the target: a WSL agent can sit on
  *  DERP while the Windows one is direct, and the first to answer is no better
- *  than the rest. Every one goes in, and ICE keeps the path that works. MUST
- *  match `LOCAL_RELAYS_MAX` in `crates/remote_control/src/signaling.rs`, where
- *  the server stops. */
+ *  than the rest. Every one goes in, and ICE checks a pair through each
+ *  (Chrome ranks them in the order given: FR-121 open decision 4). MUST match
+ *  `LOCAL_RELAYS_MAX` in `crates/remote_control/src/signaling.rs`, where the
+ *  server stops. */
 export const LOCAL_RELAYS_MAX = 4
 
 /** FR-121 P3b (#2774) — the probe's answers, in port order: the failures
@@ -3901,14 +3902,18 @@ function normalizeThisDevices(v: ThisDevices): ThisDevices {
 /** FR-121 P3b (#2774) — where this browser was told it runs, from the two
  *  stored values. `legacy`: one device stored before P3b that no probe has
  *  looked past; on a computer with several agents it is whichever happened to
- *  answer first. Pure + exported for tests. */
+ *  answer first. The list holds only while the single key still echoes it
+ *  (its first device, or `none`): a tab on an older bundle that changed the
+ *  choice since wrote the single key alone, and the newer write wins. Pure +
+ *  exported for tests. */
 export function parseStoredThisDevices(
   list: string | null,
   single: string | null,
 ): { devices: ThisDevices; legacy: boolean } {
-  if (list === 'none') return { devices: 'none', legacy: false }
-  const listed = normalizeThisDevices((list ?? '').split(','))
-  if (listed !== null) return { devices: listed, legacy: false }
+  const listed = list === 'none' ? 'none' : normalizeThisDevices((list ?? '').split(','))
+  if (listed !== null && single === (listed === 'none' ? 'none' : listed[0])) {
+    return { devices: listed, legacy: false }
+  }
   if (single === 'none') return { devices: 'none', legacy: false }
   if (single !== null && AGENT_ID.test(single)) return { devices: [single], legacy: true }
   return { devices: null, legacy: false }
@@ -3972,8 +3977,9 @@ export function localRelayPlan(opts: {
  *  working probe for a refusal on every later connect. P3b (#2774) — every
  *  one of the person's own among the relays found, in probe order, not just
  *  the first to answer; and a device stored before P3b (`legacy`) widens to
- *  them, keeping itself even when it did not answer (its agent may only be
- *  restarting). Pure + exported for tests. */
+ *  them, kept even when it did not answer (its agent may only be restarting).
+ *  It has no claim to the top rank: it too was whichever answered first.
+ *  Pure + exported for tests. */
 export function devicesToPairFromProbe(opts: {
   thisDevices: ThisDevices
   legacy: boolean
@@ -3988,6 +3994,60 @@ export function devicesToPairFromProbe(opts: {
   const kept = opts.legacy && Array.isArray(opts.thisDevices) ? opts.thisDevices : []
   const paired = normalizeThisDevices([...own, ...kept])
   return Array.isArray(paired) ? paired : null
+}
+
+/** FR-121 P3b (#2774) — whether this connect may take the one look at a pre-P3b
+ *  pairing: it names devices, the pairing is legacy, and the person's device
+ *  list in view vouches for a stored device as theirs. Without that the look
+ *  could not tell the person's own devices from anyone else's (another
+ *  organization in view, a list that failed to load), and would be spent for
+ *  nothing; it waits for a connect that can. The permission check comes after
+ *  (`loopbackProbeIsSilent`). Pure + exported for tests. */
+export function mayLookAgain(opts: {
+  planKind: 'from' | 'probe' | 'none'
+  legacy: boolean
+  thisDevices: ThisDevices
+  ownsDevice: ((agentId: string) => boolean) | undefined
+}): boolean {
+  return (
+    opts.planKind === 'from' &&
+    opts.legacy &&
+    Array.isArray(opts.thisDevices) &&
+    opts.thisDevices.some((d) => opts.ownsDevice?.(d) === true)
+  )
+}
+
+/** FR-121 P3b (#2774) — what a connect does with the probe it ran: the pairing
+ *  to store (`store`; `undefined` leaves it as it is), and the relays it sends
+ *  (`probed`) or the devices it names (`named`). An unanswered browser's probe
+ *  sends what it found, as before P3b. The one look at a pre-P3b pairing
+ *  (`lookAgain`) names the devices instead, so the Hub checks each (owner,
+ *  organization, the device being viewed) in the order every later connect
+ *  uses; found or not, the pairing is stored the new way, so the look happens
+ *  once. Pure + exported for tests. */
+export function relayChoiceAfterProbe(opts: {
+  lookAgain: boolean
+  thisDevices: ThisDevices
+  legacy: boolean
+  found: readonly LocalRelayDescriptor[]
+  ownsDevice: ((agentId: string) => boolean) | undefined
+  target: string
+}): { store: ThisDevices | undefined; probed: LocalRelayDescriptor[]; named: string[] } {
+  const pair = devicesToPairFromProbe({
+    thisDevices: opts.thisDevices,
+    legacy: opts.legacy,
+    probed: opts.found,
+    ownsDevice: opts.ownsDevice,
+  })
+  if (!opts.lookAgain) return { store: pair ?? undefined, probed: [...opts.found], named: [] }
+  const store = pair ?? opts.thisDevices
+  const plan = localRelayPlan({
+    enabled: true,
+    external: false,
+    thisDevices: store,
+    target: opts.target,
+  })
+  return { store, probed: [], named: plan.kind === 'from' ? plan.devices : [] }
 }
 
 /** FR-121 P3b (#2774) — whether this page can fetch 127.0.0.1 without a prompt:
@@ -9493,28 +9553,30 @@ export function useRemoteControl(
     localRelayRefused.value = null
     // FR-121 P3b (#2774) — a browser paired before P3b names one device: on a
     // computer with several agents, whichever happened to answer first. It
-    // looks once for the others, and only where looking cannot prompt.
+    // looks once for the others, only where the device list in view vouches
+    // for its device and looking cannot prompt.
     const lookAgain =
-      relayPlan.kind === 'from' &&
-      thisDevicesLegacy &&
-      (await loopbackProbeIsSilent(queryPermission))
+      mayLookAgain({
+        planKind: relayPlan.kind,
+        legacy: thisDevicesLegacy,
+        thisDevices: thisDevices.value,
+        ownsDevice: opts?.ownsDevice,
+      }) && (await loopbackProbeIsSilent(queryPermission))
     if (relayPlan.kind === 'probe' || lookAgain) {
       const found = await probeLocalRelays()
       // FR-121 — a probe that found the person's own devices answers the
       // question for good: the next connect names them and does not probe.
-      const pair = devicesToPairFromProbe({
+      const choice = relayChoiceAfterProbe({
+        lookAgain,
         thisDevices: thisDevices.value,
         legacy: thisDevicesLegacy,
-        probed: found,
+        found,
         ownsDevice: opts?.ownsDevice,
+        target: agentId,
       })
-      if (pair || lookAgain) setThisDevices(pair ?? thisDevices.value)
-      // A look at a pre-P3b pairing happens once, found or not. This connect relays
-      // through what the probe found, unless that look found none of its own.
-      if (relayPlan.kind === 'probe' || pair) {
-        localRelays = found
-        localRelayFrom = []
-      }
+      if (choice.store !== undefined) setThisDevices(choice.store)
+      localRelays = choice.probed
+      localRelayFrom = choice.named
       if (localRelays.length > 0) {
         iceServers = [...localRelays.map(localRelayIceServer), ...iceServers]
         console.info(

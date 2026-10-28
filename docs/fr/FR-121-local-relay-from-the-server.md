@@ -182,29 +182,32 @@ sequenceDiagram
     participant B as browser on that computer
     participant S as server (fleet Hub)
     participant R as remote agent
+    Note over B: the first connect, nothing paired yet
     B->>W: probe (every port at once)
     B->>L: probe
     W-->>B: descriptor {agent_id: W}
     L-->>B: descriptor {agent_id: L}
     Note over B: pairs with [W, L]: every own device that answered, in port order
+    B->>S: rc:session.request {local_relay: W's, local_relay_also: [L's]}
+    Note over B,S: every later connect: no probe, the devices named
     B->>S: rc:session.request {local_relay_from: W, local_relay_from_also: [L]}
-    Note over S: each device resolved on its own: owner, organization, rc_overlay, a report
+    Note over S: the target's rc_overlay first, then each device on its own: owner, organization, a report
     S->>B: rc:session.created {local_relay: W's, local_relay_also: [L's]}
     Note over B: setConfiguration: turn:127.0.0.1 for each, in order
     B->>S: rc:sdp.offer
     S->>R: rc:sdp.offer + turn:overlay of W, turn:overlay of L
-    Note over B,R: ICE checks every pair, and the session rides the one that works
+    Note over B,R: ICE checks a pair through each relay, ranked in that order
 ```
 
 | piece | where |
 |---|---|
-| The probe asks every port of the band at once, so a connect waits one timeout, not one per port, and keeps every answer in port order, one per relay, at most `LOCAL_RELAYS_MAX` (4) | `ui/src/composables/useRemoteControl.ts:3804`, `:3809`, `:3832` |
-| "This browser runs on" holds a list: a new key, `roomler-rc-this-devices`, beside the old one, which still gets the first device for a tab on an older bundle. A probe pairs an unanswered browser with every own device it found (`devicesToPairFromProbe`) | `ui/src/composables/useRemoteControl.ts:3882`, `:3905`, `:3930`, `:3977` |
-| A device stored before P3b is **legacy**: on its next connect the browser looks once more, only when Chrome says the loopback permission is already granted (`loopback-network`, before the split `local-network-access`), and widens the pairing to every own device found, keeping the old one | `ui/src/composables/useRemoteControl.ts:4000`, `:9497` |
-| The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3956`, `:4023`, `:4039`, `:4052`, `:8611`, `:10972` |
-| The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1951`, `:3743`; `useRemoteControl.ts:4075` |
+| The probe asks every port of the band at once, so a connect waits one timeout, not one per port, and keeps every answer in port order, one per relay, at most `LOCAL_RELAYS_MAX` (4) | `ui/src/composables/useRemoteControl.ts:3805`, `:3810`, `:3833` |
+| "This browser runs on" holds a list: a new key, `roomler-rc-this-devices`, beside the old one, which still gets the first device for a tab on an older bundle. The list holds only while the old key echoes it, so a choice made since in such a tab wins. A probe pairs an unanswered browser with every own device it found (`devicesToPairFromProbe`) | `ui/src/composables/useRemoteControl.ts:3883`, `:3909`, `:3935`, `:3983` |
+| A device stored before P3b is **legacy**. On a later connect the browser looks once more, only when the device list in view vouches for the stored device as the person's own (`mayLookAgain`; another organization in view, or a list that failed to load, waits for a later connect) and Chrome says the loopback permission is already granted (`loopback-network`, before the split `local-network-access`). It widens the pairing to every own device found, in probe order (the stored device was a race too), and that connect names them, so the Hub checks each. Found or not, the look happens once (`relayChoiceAfterProbe`) | `ui/src/composables/useRemoteControl.ts:4006`, `:4028`, `:4060`, `:9558` |
+| The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3961`, `:4083`, `:4099`, `:4112`, `:8671`, `:11034` |
+| The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1951`, `:3743`; `useRemoteControl.ts:4135` |
 | The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2037`, `:2044`, `:3349`, `:5544` |
-| The Hub resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:84`, `:104`, `:125`, `:1624`, `:1852`, `:2275`, `:3986`; `crates/remote_control/src/session.rs:63` |
+| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:84`, `:104`, `:125`, `:1624`, `:1852`, `:2275`, `:3986`, `:3995`; `crates/remote_control/src/session.rs:63` |
 
 ⚠️ **ICE keeps the path that works, not the fastest one that works.** Chrome ranks its relay candidates by the order of
 its TURN servers, the first highest, and nominates the best-ranked pair that succeeds. The browser puts the relays in
@@ -212,8 +215,9 @@ port order. If the slow agent's relay ranks first and its pair succeeds at all, 
 agent's relay produced no working pair, but that is a field question, open as decision 4 and measured by AC9.
 
 ⚠️ The re-look of a legacy pairing is the one exception to AC4 ("no probe once chosen"). It runs once, only where the
-permission is already granted. Where that cannot be known (another browser, a Chrome that knows neither name), there is
-no re-look: such a browser keeps its one device until the person picks again.
+permission is already granted and the device list in view vouches for the stored device. Where the permission cannot
+be known (another browser, a Chrome that knows neither name), there is no re-look: such a browser keeps its one device
+until the person picks again.
 
 ## 4. Phases
 
