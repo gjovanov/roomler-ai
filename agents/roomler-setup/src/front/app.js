@@ -71,10 +71,12 @@ const ROLE_COPY = {
     },
   },
   macos: {
+    // FR-129 B2: the per-user half, and — with "Join the overlay network"
+    // ticked, the default — the root half beside it, a second device.
     "daemon-user": {
-      title: "Be accessed — this user only",
-      desc: "A LaunchAgent in your session: screen sharing and remote control. Asks for your password once, to install the package. The private network needs the root half, which this wizard does not install yet.",
-      label: "This user only",
+      title: "Be accessed — this Mac",
+      desc: "Screen sharing and remote control in your session, and the private network in a root service beside it, so this Mac joins as two devices. Asks for your password once. Untick “Join the overlay network” under Advanced options for screen sharing only.",
+      label: "This Mac",
     },
   },
 };
@@ -99,6 +101,10 @@ const state = {
                        // sent through cmd_save_state.
   tokenView: null,     // TokenValidation (or {error}) from cmd_validate_token
   tokenValidating: false,
+  rootToken: "",       // FR-129 B2: the pasted second token, the macOS root
+                       // half's — JS memory only, like `token`
+  rootTokenView: null, // its TokenValidation (or {error})
+  rootTokenValidating: false,
   installError: null,
   installErrorStep: null, // step scope from the last Error event
   installDone: null,   // DoneReport
@@ -140,6 +146,7 @@ const state = {
     orgSlug: null,     // … and its slug (unique); null from an older server
     approverName: null,     // the approver's display name (free text) …
     approverUsername: null, // … and their username (unique); null if older
+    rootHalf: false,   // FR-129 B2: started for a Mac's two halves
     error: null,       // a start that failed (network, refusal)
     hint: null,        // a poll that failed, shown under the countdown
                        // until the next poll answers
@@ -371,12 +378,27 @@ function daemonModeLabel(role) {
 // FR-84 S2 / FR-129 B1 — the overlay box's default for a role on this OS:
 // Windows, on for the service roles (they can create the TUN adapter), off
 // for a per-user install; Linux, on for both (root takes the TUN, a per-user
-// daemon the userspace stack); macOS, off (the mesh needs the root half,
-// B2). Mirrors `overlay_enabled_default` / `orchestrator_unix::overlay_default`.
+// daemon the userspace stack); macOS (B2), on — there the box installs the
+// root half, whose mesh it is. Mirrors `overlay_enabled_default` /
+// `orchestrator_unix::overlay_default`.
 function overlayDefault(os, role) {
   if (os === "linux") return true;
-  if (os === "macos") return false;
+  if (os === "macos") return role === "daemon-user";
   return isPerMachine(role);
+}
+
+// FR-129 B2 — does this install add the macOS root half (the root service
+// that owns the private network's interface, a device of its own)? The macOS
+// daemon role with the box ticked. Mirrors `role::wants_root_half`, which
+// cmd_pair_start and cmd_install apply to the same box.
+function wantsRootHalf() {
+  return state.os === "macos" && state.role === "daemon-user"
+    && overlayChecked(state.role, state.overlayChoice) === true;
+}
+
+// FR-129 B2 — the root half's device name, as `role::root_half_name` makes it.
+function rootHalfName(device) {
+  return `${device}-daemon`;
 }
 
 // FR-84 S2 — what the overlay box shows: the operator's explicit choice if
@@ -395,7 +417,7 @@ function overlayHint(os, role) {
     return "A per-user daemon joins the private network through a userspace stack (a SOCKS5 front on 127.0.0.1); the system service uses a TUN interface instead.";
   }
   if (os === "macos") {
-    return "On macOS the private network needs the root half, which this wizard does not install yet — screen sharing works without it. Leave this off unless you add the root half from a terminal.";
+    return "On a Mac the private network runs in a second, root service beside yours (it owns the mesh's interface), so with this ticked the Mac joins as two devices — one for the screen, one for the private network — and counts as two on the plan. Untick it to install screen sharing only.";
   }
   return null;
 }
@@ -673,7 +695,12 @@ function renderServer() {
 function gatherAdvanced() {
   if (state.role === "tunnel-client") return null;
   return {
-    overlayEnabled: document.getElementById("adv-overlay").checked,
+    // From the state the box mirrors (renderServer writes it, its change
+    // handler reads it), not the element: a wizard resumed at the Join step
+    // never rendered the Server page, and the element there still has its
+    // HTML default. FR-129 B2: on macOS this box is also what adds the root
+    // half (wantsRootHalf), so the two must read the same thing.
+    overlayEnabled: overlayChecked(state.role, state.overlayChoice),
     advertiseLocalSubnets: document.getElementById("adv-local-subnets").checked,
     autoGrantSession: document.getElementById("adv-auto-grant").checked,
     overlayAdvertisedRoutes: document.getElementById("adv-overlay-routes").value.trim(),
@@ -689,6 +716,7 @@ function wireToken() {
     state.token = "";
     state.tokenView = null;
     document.getElementById("token-input").value = "";
+    clearRootToken();
     // FR-129: Back forgets the pairing — its code and any delivered token —
     // so a changed server or role never meets a token minted for another.
     await cancelPairing();
@@ -710,7 +738,21 @@ function wireToken() {
     clearTimeout(debounce);
     debounce = setTimeout(validateToken, 350);
   });
+  // FR-129 B2: the macOS root half's own token, peeked the same way.
+  let rootDebounce;
+  document.getElementById("root-token-input").addEventListener("input", (e) => {
+    state.rootToken = e.target.value;
+    clearTimeout(rootDebounce);
+    rootDebounce = setTimeout(validateRootToken, 350);
+  });
   wirePairing();
+}
+
+// FR-129 B2 — forget the pasted second token (memory and field).
+function clearRootToken() {
+  state.rootToken = "";
+  state.rootTokenView = null;
+  document.getElementById("root-token-input").value = "";
 }
 
 async function validateToken() {
@@ -733,14 +775,65 @@ async function validateToken() {
   }
 }
 
+// FR-129 B2 — the same unverified peek for the second token. A stale answer
+// (the field changed meanwhile) is dropped.
+async function validateRootToken() {
+  const t = state.rootToken.trim();
+  if (!t) {
+    state.rootTokenView = null;
+    state.rootTokenValidating = false;
+    renderToken();
+    return;
+  }
+  state.rootTokenValidating = true;
+  renderToken();
+  let view;
+  try {
+    view = await invoke("cmd_validate_token", { token: t, role: state.role });
+    view.error = null;
+  } catch (err) {
+    view = { error: String(err) };
+  }
+  if (state.rootToken.trim() !== t) return;
+  state.rootTokenView = view;
+  state.rootTokenValidating = false;
+  renderToken();
+}
+
+// FR-129 B2 — what is wrong with the second token, or null when it can go:
+// present, a JWT, not expired, and not the first token again (each enrolls
+// one device and works once).
+function rootTokenProblem() {
+  const t = state.rootToken.trim();
+  if (!t) return "The private network is a second device: paste a second token for it.";
+  if (state.rootTokenValidating || !state.rootTokenView) return "Checking the second token…";
+  if (state.rootTokenView.error) return "Could not parse the second token as a JWT — copy the whole token.";
+  if (state.rootTokenView.appearsExpired) return "The second token has already expired. Mint a new one.";
+  if (t === state.token.trim()) return "That is the first token again: each token enrolls one device, so the private network needs a different one.";
+  return null;
+}
+
 function renderToken() {
   renderPairing();
 
   // The paste path's role-specific hint (the whole page's lead before
   // FR-129; now the line under "I already have a token").
+  const rootHalf = wantsRootHalf();
   document.getElementById("paste-lead").textContent = state.role === "tunnel-client"
     ? "Paste a tunnel-enrollment token from Admin → Tunnels."
-    : "Paste a fresh enrollment token from Admin → Agents.";
+    : rootHalf
+      ? "Paste two fresh enrollment tokens from Admin → Agents: one for this Mac's screen, one for its private network."
+      : "Paste a fresh enrollment token from Admin → Agents.";
+  // FR-129 B2: the second field is the macOS root half's, shown only when
+  // this install adds it.
+  document.getElementById("root-token-wrap").hidden = !rootHalf;
+  const rootStatus = document.getElementById("root-token-status");
+  const rootProblem = rootHalf ? rootTokenProblem() : null;
+  rootStatus.hidden = !rootHalf || (!rootProblem && !state.rootTokenView);
+  rootStatus.className = rootProblem && state.rootToken.trim() ? "warning" : "muted";
+  rootStatus.textContent = rootProblem
+    ?? `Second token: ${state.rootTokenView?.tokenType ?? "enrollment"}, expires ${
+      state.rootTokenView?.expiresAtUnix ? formatExpiry(state.rootTokenView.expiresAtUnix) : "(no exp)"}.`;
 
   const info = document.getElementById("token-info");
   const warnAudience = document.getElementById("token-warn-audience");
@@ -785,7 +878,8 @@ function renderToken() {
     warnExpired.hidden = false;
     return;
   }
-  continueBtn.disabled = false;
+  // FR-129 B2: with the root half, its own token must be fit to go too.
+  continueBtn.disabled = rootHalf && rootProblem !== null;
 }
 
 function formatExpiry(unix) {
@@ -853,12 +947,16 @@ async function startPairing() {
   renderToken();
 
   const gen = p.gen;
+  // FR-129 B2: a Mac adding the root half asks for both halves at once —
+  // one approval, two tokens.
+  p.rootHalf = wantsRootHalf();
   let view;
   try {
     view = await invoke("cmd_pair_start", {
       server: state.server,
       role: state.role,
       deviceName: state.device,
+      rootHalf: p.rootHalf,
     });
   } catch (err) {
     if (gen !== p.gen) return;
@@ -921,6 +1019,7 @@ async function cancelPairing() {
   p.error = null;
   p.hint = null;
   p.opened = false;
+  p.rootHalf = false;
   try {
     await invoke("cmd_pair_cancel");
   } catch (err) {
@@ -1119,8 +1218,12 @@ function renderPairing() {
     // unique, so the person can tell their admin and their org from ones
     // merely named like them. An older server sends no identifiers, and the
     // wording then falls back to the names alone.
+    // FR-129 B2: and what joins — a Mac's two devices.
     document.getElementById("pair-approved-text").textContent =
-      `Approved by ${pairApproverLabel(p)} to join ${pairOrgLabel(p)}.`;
+      `Approved by ${pairApproverLabel(p)} to join ${pairOrgLabel(p)}.` +
+      (p.rootHalf
+        ? ` This Mac joins as two devices: “${state.device}” for the screen and “${rootHalfName(state.device)}” for the private network.`
+        : "");
   }
 
   document.getElementById("pair-ended").hidden = p.phase !== "ended";
@@ -1183,6 +1286,9 @@ const SCRIPT_TOOL_WORDS = {
   sh: "as you",
 };
 const SCRIPT_LINES_SHOWN = 14;
+// FR-129 B2 — the `EnrollOk` kind of a Mac's root half
+// (`orchestrator_unix::ROOT_HALF_PRINCIPAL_KIND`).
+const ROOT_HALF_KIND = "agent_root_half";
 
 function wireInstall() {
   document.getElementById("install-cancel").addEventListener("click", async () => {
@@ -1266,8 +1372,11 @@ async function runInstall() {
   // FR-129: a paired install names the org it was approved into.
   const paired = state.installMode === "paired";
   const into = paired && state.pair.orgName ? ` into ${pairOrgLabel(state.pair)}` : "";
+  // FR-129 B2: and a Mac's private network, as its own device.
+  const rootHalf = wantsRootHalf();
+  const beside = rootHalf ? `, and its private network as “${rootHalfName(state.device)}”` : "";
   document.getElementById("install-summary").textContent =
-    `Installing the ${what} from ${state.server} as “${state.device}”${into}.`;
+    `Installing the ${what} from ${state.server} as “${state.device}”${beside}${into}.`;
   renderInstall();
 
   // 1. Attach the Channel listener FIRST so no live event is dropped.
@@ -1288,12 +1397,14 @@ async function runInstall() {
 
   // 3. Kick the install. A paired install sends no token: Rust enrolls
   //    with the one the pairing delivered (usePaired) and forgets it on
-  //    success; a failure keeps it for Retry.
+  //    success; a failure keeps it for Retry. FR-129 B2: a pasted install
+  //    that adds the macOS root half sends that half's own token too.
   try {
     const report = await invoke("cmd_install", {
       role: state.role,
       server: state.server,
       token: paired ? "" : state.token,
+      rootToken: !paired && rootHalf ? state.rootToken : null,
       deviceName: state.device,
       advanced: gatherAdvanced(),
       usePaired: paired,
@@ -1302,9 +1413,10 @@ async function runInstall() {
     console.log("[runInstall] cmd_install returned:", report);
     state.installDone = report;
     state.installInFlight = false;
-    // Token cleared from memory now that enrollment succeeded.
+    // Tokens cleared from memory now that enrollment succeeded.
     state.token = "";
     document.getElementById("token-input").value = "";
+    clearRootToken();
     if (paired) {
       // The session in Rust is already gone (cmd_install's success path);
       // this page's view of it goes too, keeping only the org and the
@@ -1411,8 +1523,10 @@ function handleProgress(event, live) {
     state.installErrorStep = data.step ?? null;
   }
 
-  // Idempotent checklist row keyed by event type.
-  installRows.set(type, { type, data });
+  // Idempotent checklist row keyed by event type — FR-129 B2: a Mac's root
+  // half enrolls as a device of its own and keeps its own row.
+  const key = type === "EnrollOk" && data.principalKind === ROOT_HALF_KIND ? "EnrollOk:root" : type;
+  installRows.set(key, { type, data });
   renderInstall();
 }
 
@@ -1514,6 +1628,9 @@ function checklistLabel(event) {
   if (t === "ExtractDone") return `Extracted. Binary at ${d.tunnelBinary}`;
   if (t === "IntegrationDone")
     return `Integration: PATH ${d.pathUpdated ? "updated" : "unchanged"}; shortcut ${d.shortcutCreated ? "created" : "skipped"}`;
+  if (t === "EnrollOk" && d.principalKind === ROOT_HALF_KIND) {
+    return `Enrolled the private network's root half (agent ${d.principalId})`;
+  }
   if (t === "EnrollOk") return `Enrolled (${d.principalKind} ${d.principalId})`;
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "Error") return `Error at ${d.step}: ${d.message}`;
@@ -1557,6 +1674,10 @@ function renderDone() {
     lead = "The tunnel client is installed, enrolled, and on PATH.";
   } else {
     lead = "The Roomler daemon is installed and enrolled.";
+    // FR-129 B2: a Mac's private network, as the second device it is.
+    if (done.rootHalf) {
+      lead += ` Its private network runs in the root half beside it, enrolled as its own device, “${done.rootHalf.name}”.`;
+    }
     if (cliIncluded) lead += " The roomler CLI came with it (managed by the daemon's updater).";
     if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
     if (done.anchored === true) lead += " It is anchored: commands can run as SYSTEM here.";
@@ -1587,6 +1708,13 @@ function renderDone() {
   document.getElementById("done-principal-id").textContent =
     done.principalId ?? "(unknown — install report missing)";
   document.getElementById("done-tenant-id").textContent = done.tenantId ?? "(unknown)";
+  // FR-129 B2: the root half's own device id.
+  const rootHalf = isTunnel ? null : (done.rootHalf ?? null);
+  document.getElementById("done-root-half-label").hidden = !rootHalf;
+  document.getElementById("done-root-half-id").hidden = !rootHalf;
+  if (rootHalf) {
+    document.getElementById("done-root-half-id").textContent = rootHalf.principalId;
+  }
   document.getElementById("done-role").textContent = roleLabel(done.role ?? state.role);
   document.getElementById("done-tag").textContent = done.tag ?? "(unknown)";
 

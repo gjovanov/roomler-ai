@@ -301,10 +301,14 @@ pub struct PrivilegedSpec<'a> {
 }
 
 /// `/bin/sh <script> --privileged-steps --role daemon --server … --name …
-/// --desktop [--system --config-from … [--config-take …]]`, one element per
+/// --desktop [--system] [--config-from … [--config-take …]]`, one element per
 /// argument. `--desktop` always: `pkexec` strips `DISPLAY`, so the half
 /// cannot see the session this wizard is running in, and the companion is
-/// the device's consent prompt surface.
+/// the device's consent prompt surface. `--config-from` names the root-owned
+/// config the wizard enrolled: the Linux system scope's (with `--system`), or
+/// — FR-129 B2 — the macOS root half's, where it also requests the root half
+/// (the marker before the `.pkg`, as `--daemon-token` does on a terminal) and
+/// there is no `--system` (the script refuses it on macOS).
 pub fn privileged_args(spec: &PrivilegedSpec<'_>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         OsString::from("/bin/sh"),
@@ -696,20 +700,31 @@ fn shred(path: &Path) {
 /// that is already spent (the B0 property, "a package placement that fails
 /// leaves an enrolled config to retry with") and never asks for the
 /// administrator password again for a half that already ran.
+///
+/// FR-129 B2: an attempt that adds the macOS root half makes TWO enrollments
+/// with two tokens — the root half's before the privileged half (as a Linux
+/// system scope's), the person's after it — and keeps each on its own, so a
+/// Retry reuses whichever was already made, never re-posting either token.
 #[derive(Debug)]
 pub struct KeptEnrollment {
     pub scope: Scope,
     pub server: String,
     pub device_name: String,
+    /// FR-129 B2: the attempt adds the macOS root half.
+    pub root_half: bool,
     /// The device the server now holds for this machine, `(agent, tenant)`,
-    /// when the attempt enrolled.
+    /// when the attempt enrolled: the system scope's, or the person's.
     pub ids: Option<(String, String)>,
+    /// FR-129 B2: the macOS root half's device, once it was enrolled.
+    pub root_half_ids: Option<(String, String)>,
     pub config_path: PathBuf,
-    /// System scope, the privileged half NOT run to its end: the enrolled
-    /// config, still in the scratch directory, for the half to place.
+    /// The privileged half NOT run to its end: the enrolled root-owned config
+    /// — the Linux system scope's or the macOS root half's — still in the
+    /// scratch directory, for the half to place.
     pub scratch: Option<Scratch>,
     /// The privileged half ran to its end: the package is installed, and for
-    /// a system scope the enrolled config is placed and its unit running.
+    /// a system scope or a root half the enrolled config is placed and its
+    /// service running.
     pub privileged_done: bool,
 }
 
@@ -721,16 +736,29 @@ pub fn keep(kept: KeptEnrollment) {
     *g = Some(kept);
 }
 
-/// Take the kept enrollment, if it is for this scope, server and name —
-/// anything else is dropped (and its config shredded), because a different
-/// server or name needs a new enrollment.
-pub fn take_kept(scope: Scope, server: &str, device_name: &str) -> Option<KeptEnrollment> {
+/// Take the kept enrollment, if it is for this scope, server and name, with
+/// or without the root half as this attempt is — anything else is dropped
+/// (and its config shredded), because a different server or name needs a new
+/// enrollment, and an attempt that no longer adds the root half has no use
+/// for one.
+pub fn take_kept(
+    scope: Scope,
+    server: &str,
+    device_name: &str,
+    root_half: bool,
+) -> Option<KeptEnrollment> {
     let mut g = KEPT.lock().unwrap_or_else(|p| p.into_inner());
     let kept = g.take()?;
-    if kept.scope == scope && kept.server == server && kept.device_name == device_name {
+    if kept.scope == scope
+        && kept.server == server
+        && kept.device_name == device_name
+        && kept.root_half == root_half
+    {
         Some(kept)
     } else {
-        tracing::info!("a kept enrollment is for another server, name or scope; dropping it");
+        tracing::info!(
+            "a kept enrollment is for another server, name, scope or set of halves; dropping it"
+        );
         None
     }
 }
@@ -1368,6 +1396,47 @@ mod tests {
         );
         let user = user_args(script, Scope::PerUser);
         assert!(!user.iter().any(|a| a == "--system"));
+
+        // FR-129 B2 — the macOS root half: the person's scope, the root
+        // half's config from the scratch directory, and no `--system`, which
+        // `install.sh` refuses on macOS.
+        let take = vec!["overlay_advertised_routes".to_string()];
+        let args = privileged_args(&spec(script, Scope::PerUser, Some(from), &take));
+        let as_str: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            &as_str[10..],
+            &[
+                "--config-from",
+                "/tmp/roomler-setup-x/config.toml",
+                "--config-take",
+                "overlay_advertised_routes",
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--system"));
+    }
+
+    /// FR-129 B2 — the script the wizard embeds takes `--config-from` on
+    /// macOS without `--system` (only Linux insists on it), requests the root
+    /// half with it, and places it with the same function that folds a
+    /// reinstall in: `place_system_config` into the root half's config.
+    #[test]
+    fn the_embedded_script_requests_and_places_the_macos_root_half() {
+        assert!(
+            INSTALL_SH.contains(
+                "if [ \"$OS\" = Linux ] && [ \"$SYSTEM\" != 1 ]; then\n        half_err \"on Linux --config-from"
+            ),
+            "only Linux requires --system beside --config-from"
+        );
+        assert!(
+            INSTALL_SH.contains("if [ -n \"$DAEMON_TOKEN\" ] || [ -n \"$CONFIG_FROM\" ]; then\n        say \"requesting the privileged half"),
+            "--config-from requests the root half before the .pkg"
+        );
+        assert!(
+            INSTALL_SH.contains("place_system_config \"$MACOS_DAEMON_CONFIG\" \"$daemon_bin\""),
+            "the root half's config is placed (and a reinstall folded) by place_system_config"
+        );
+        assert!(INSTALL_SH.contains("MACOS_DAEMON_CONFIG=\"/etc/roomler/config.toml\""));
+        assert_eq!(SYSTEM_CONFIG, "/etc/roomler/config.toml");
     }
 
     /// The macOS prompt: a constant AppleScript, then `--`, the three output
@@ -1628,31 +1697,48 @@ mod tests {
         assert!(!dir.exists());
     }
 
-    /// A kept enrollment is handed back only to the attempt it was made for.
+    /// A kept enrollment is handed back only to the attempt it was made for —
+    /// the same scope, server and name, and (FR-129 B2) with the root half
+    /// or without it, as it was.
     #[test]
     fn a_kept_enrollment_matches_scope_server_and_name() {
         clear_kept();
-        let kept = || KeptEnrollment {
+        let kept = |root_half: bool| KeptEnrollment {
             scope: Scope::System,
             server: "https://example.invalid".into(),
             device_name: "lab".into(),
+            root_half,
             ids: Some(("aid".into(), "tid".into())),
+            root_half_ids: root_half.then(|| ("aid-root".into(), "tid".into())),
             config_path: PathBuf::from("/etc/roomler/config.toml"),
             scratch: None,
             privileged_done: true,
         };
-        keep(kept());
-        assert!(take_kept(Scope::PerUser, "https://example.invalid", "lab").is_none());
-        keep(kept());
-        assert!(take_kept(Scope::System, "https://other.invalid", "lab").is_none());
-        keep(kept());
-        assert!(take_kept(Scope::System, "https://example.invalid", "lab-2").is_none());
-        keep(kept());
-        let got = take_kept(Scope::System, "https://example.invalid", "lab").unwrap();
+        keep(kept(false));
+        assert!(take_kept(Scope::PerUser, "https://example.invalid", "lab", false).is_none());
+        keep(kept(false));
+        assert!(take_kept(Scope::System, "https://other.invalid", "lab", false).is_none());
+        keep(kept(false));
+        assert!(take_kept(Scope::System, "https://example.invalid", "lab-2", false).is_none());
+        keep(kept(false));
+        assert!(
+            take_kept(Scope::System, "https://example.invalid", "lab", true).is_none(),
+            "an attempt that adds the root half reuses no attempt that did not"
+        );
+        keep(kept(true));
+        assert!(
+            take_kept(Scope::System, "https://example.invalid", "lab", false).is_none(),
+            "nor the other way round"
+        );
+        keep(kept(false));
+        let got = take_kept(Scope::System, "https://example.invalid", "lab", false).unwrap();
         assert_eq!(got.ids, Some(("aid".into(), "tid".into())));
         assert!(got.privileged_done);
         // Taken once.
-        assert!(take_kept(Scope::System, "https://example.invalid", "lab").is_none());
+        assert!(take_kept(Scope::System, "https://example.invalid", "lab", false).is_none());
+        keep(kept(true));
+        let got = take_kept(Scope::System, "https://example.invalid", "lab", true).unwrap();
+        assert_eq!(got.root_half_ids, Some(("aid-root".into(), "tid".into())));
     }
 
     /// The terminal confirm wakes exactly one waiter, and refuses when none
