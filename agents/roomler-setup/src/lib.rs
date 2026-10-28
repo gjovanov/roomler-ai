@@ -84,3 +84,25 @@ pub static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// (Legacy home: module-local in the agent wizard's orchestrator; the
 /// tunnel pipeline never touches it — no msiexec to hammer.)
 pub static ACTIVE_MSI_PID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+mod front_tests {
+    /// FR-129 B1 — `hidden` hides, whatever an element's own `display` says.
+    /// A role card is a `label.radio` (`display: flex`), so without the
+    /// global rule a hidden card stayed on screen: on Linux and macOS the
+    /// Windows daemon cards showed (the released wizard measured in a field
+    /// cell), and the server's `wizard_unix_daemon` switch hid nothing — AC14.
+    #[test]
+    fn hidden_wins_over_every_display_rule() {
+        let css = include_str!("front/styles.css").replace("\r\n", "\n");
+        assert!(
+            css.contains("[hidden] {\n  display: none !important;\n}"),
+            "the global [hidden] rule is gone"
+        );
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("class=\"radio role-daemon\""),
+            "the role cards are still label.radio; re-check the rule if they change"
+        );
+    }
+}
