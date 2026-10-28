@@ -74,6 +74,14 @@
 #                        caller enrolled in its own process: the Linux
 #                        --system unit's, or the macOS root half's — which it
 #                        also requests, as --daemon-token does on a terminal.
+#                        A config already at the target is NOT replaced: the
+#                        installed daemon folds the new enrollment into it
+#                        (`roomlerd adopt-enrollment`), keeping the operator's
+#                        settings — FR-129 B1, #2338 — and a running root
+#                        unit is restarted onto the result.
+#   --config-take KEYS   (with --config-from) comma-separated config keys to
+#                        copy from FILE on top of a kept config: the options
+#                        the person set by hand in the wizard.
 #
 # Neither half takes a token. The caller enrolls in-process between them, as
 # the Windows wizard does, because a token on a command line is readable by
@@ -138,6 +146,9 @@ KEEP_CONFIG=0
 PRIV_STEPS=0
 USER_STEPS=0
 CONFIG_FROM=""
+# FR-129 B1 — the keys `adopt-enrollment` takes from --config-from on top of
+# a kept config (comma-separated; see place_system_config).
+CONFIG_TAKE=""
 # An elevated run places nothing it cannot verify: with this set, a release
 # without a digest is an error where the terminal path only warns.
 DIGEST_REQUIRED=0
@@ -148,7 +159,7 @@ usage() {
     echo "                  [--name NAME] [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
     echo "       install.sh --privileged-steps --role daemon [--system] [--config-from FILE]"
-    echo "                  [--server URL] [--name NAME] [--desktop|--no-desktop]"
+    echo "                  [--config-take KEYS] [--server URL] [--name NAME] [--desktop|--no-desktop]"
     echo "       install.sh --user-steps --role daemon [--system]"
     echo "       install.sh --uninstall [--keep-config]"
     echo
@@ -164,7 +175,9 @@ usage() {
     echo "                  through the desktop's own prompt and runs the rest as the person."
     echo "                  Neither takes a token: enroll in your own process between them."
     echo "                  --config-from FILE hands the privileged half a system-scope config"
-    echo "                  (Linux --system; on macOS it also requests the root half)."
+    echo "                  (Linux --system; on macOS it also requests the root half). A config"
+    echo "                  already there keeps its operator settings (the daemon folds the new"
+    echo "                  enrollment in); --config-take KEYS copies those keys from FILE anyway."
     echo
     echo "  --uninstall     Remove every Roomler part on this machine — the daemon, the"
     echo "                  companion, the tunnel CLI — however it was installed (this"
@@ -209,6 +222,7 @@ while [ $# -gt 0 ]; do
         --privileged-steps) PRIV_STEPS=1; shift ;;
         --user-steps) USER_STEPS=1; shift ;;
         --config-from) CONFIG_FROM="$2"; shift 2 ;;
+        --config-take) CONFIG_TAKE="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown flag: $1" >&2; usage ;;
     esac
@@ -220,7 +234,7 @@ if [ "$UNINSTALL" = 1 ]; then
     # of the install options.
     if [ -n "$ROLE" ] || [ -n "$TOKEN" ] || [ -n "$DAEMON_TOKEN" ] || [ "$SYSTEM" = 1 ] ||
         [ "$DOWNLOAD_ONLY" = 1 ] || [ "$NO_ENROLL" = 1 ] || [ -n "$DESKTOP" ] ||
-        [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ] || [ -n "$CONFIG_FROM" ] ||
+        [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ] || [ -n "$CONFIG_FROM" ] || [ -n "$CONFIG_TAKE" ] ||
         [ "$PAIR" = 1 ] || [ -n "$PAIR_ORG" ]; then
         echo "error: --uninstall removes every Roomler part on this machine and takes no install options (only --keep-config)" >&2
         exit 1
@@ -337,6 +351,13 @@ if [ -n "$CONFIG_FROM" ]; then
         half_err "on Linux --config-from is the SYSTEM unit's config and needs --system (a per-user daemon's config is written by the enroll in the caller's own process, as the person)"
     fi
     [ -s "$CONFIG_FROM" ] || half_err "--config-from: $CONFIG_FROM is not a readable, non-empty file"
+fi
+if [ -n "$CONFIG_TAKE" ]; then
+    [ -n "$CONFIG_FROM" ] || half_err "--config-take applies with --config-from only"
+    # Key names only: they become arguments of the daemon's own verb.
+    case "$CONFIG_TAKE" in
+        *[!a-z0-9_,]*) half_err "--config-take: keys are lowercase config key names, comma-separated (got '$CONFIG_TAKE')" ;;
+    esac
 fi
 
 # ─── who is the desktop user? ───────────────────────────────────────────────
@@ -668,11 +689,21 @@ install_daemon_linux() {
     [ "$PRIV_STEPS" = 1 ] || enroll_daemon /usr/bin/roomlerd
 
     if [ "$SYSTEM" = 1 ]; then
-        [ -z "$CONFIG_FROM" ] || place_system_config "$SYSTEM_CONFIG"
+        [ -z "$CONFIG_FROM" ] || place_system_config "$SYSTEM_CONFIG" /usr/bin/roomlerd
         disable_update_helper
         say "enabling the systemd SYSTEM unit (root: self-update, the overlay TUN, and the desktop of the person on screen)"
         as_root systemctl daemon-reload || true
-        as_root systemctl enable --now roomlerd.service
+        if [ -n "$CONFIG_FROM" ] && as_root systemctl is-active --quiet roomlerd.service; then
+            # FR-129 B1 — `enable --now` leaves an ACTIVE unit exactly as it
+            # is, so on a reinstall the running root daemon would keep its
+            # previous config in memory while the placed one waits for the
+            # next boot. The placed config is the one to run: restart onto it.
+            say "the root daemon is running — restarting it onto the placed config (a remote or SSH session to this device drops for a few seconds)"
+            as_root systemctl enable roomlerd.service
+            as_root systemctl restart roomlerd.service
+        else
+            as_root systemctl enable --now roomlerd.service
+        fi
         say "daemon status: $(as_root systemctl is-active roomlerd.service || true)"
         say "logs: sudo journalctl -u roomlerd.service -f"
     else
@@ -728,14 +759,37 @@ user_steps_linux() {
 # half's). The halves keep the token in the caller's process, so the caller
 # enrolls into a private file of its own and the privileged half places that
 # file where the root daemon reads it: root-owned, 0600, as `roomlerd enroll`
-# writes it. A config already there is kept beside it as `.prev` (the daemon's
-# own rollback convention): the caller's enroll has already happened, so the
-# new identity is the one to run. The source file is the caller's to shred.
+# writes it. The source file is the caller's to shred.
+#
+# FR-129 B1 (#2338) — a config already at the target is the device's operator
+# state (the mesh, its routes, its lock policy, secondary orgs …), and the
+# person running the wizard cannot read it to merge it: it is root's. So the
+# merge runs HERE, as root, through the daemon this half just installed:
+# `roomlerd adopt-enrollment` folds the new identity into the existing config
+# exactly as `roomlerd enroll` does for a config it can read, and
+# `--config-take` copies the keys the person set by hand in the wizard. A
+# daemon too old for the verb (a self-hosted server pinning an older release)
+# gets the B0 placement — the old config kept beside as `.prev` — and says so.
+#   place_system_config <target> <daemon-binary>
 place_system_config() {
-    target="$1"
+    target="$1"; daemon_bin="$2"
     grp=root; [ "$OS" = Darwin ] && grp=wheel
+    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help >/dev/null 2>&1; then
+        say "a config already exists at $target — folding the new enrollment into it (operator settings kept)"
+        take_args=""
+        if [ -n "$CONFIG_TAKE" ]; then
+            for k in $(printf '%s' "$CONFIG_TAKE" | tr ',' ' '); do take_args="$take_args --take $k"; done
+        fi
+        # shellcheck disable=SC2086
+        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args; then
+            return 0
+        fi
+        warn "the daemon could not fold the enrollment in — placing the new config instead, the old one kept as $target.prev"
+    elif [ -f "$target" ]; then
+        warn "this daemon cannot fold an enrollment into an existing config (no adopt-enrollment verb) — the old config is kept as $target.prev and its settings do NOT carry over"
+    fi
     if [ -f "$target" ]; then
-        say "a config already exists at $target — keeping it as $target.prev"
+        say "keeping the existing config as $target.prev"
         mv -f "$target" "$target.prev"
     fi
     say "placing the enrolled config at $target (root-owned, 0600)"
@@ -855,8 +909,9 @@ install_macos_privileged_half() {
     fi
 
     if [ -n "$CONFIG_FROM" ]; then
-        # FR-129 B0 — the caller enrolled this half in its own process.
-        place_system_config "$MACOS_DAEMON_CONFIG"
+        # FR-129 B0 — the caller enrolled this half in its own process (B1:
+        # folded into a config already here, through the daemon).
+        place_system_config "$MACOS_DAEMON_CONFIG" "$daemon_bin"
     elif as_root test -f "$MACOS_DAEMON_CONFIG"; then
         say "privileged half already enrolled at $MACOS_DAEMON_CONFIG — leaving it alone"
     else

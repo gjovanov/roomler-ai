@@ -2,9 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Tauri invoke handlers for the unified setup wizard.
 //!
-//! 17 handlers — the union of the two legacy wizards' surfaces, the
-//! diagnostics pair (FR-102) and the pairing four (FR-129) behind ONE
-//! command vocabulary. Each handler returns `Result<T, String>` (or a
+//! 19 handlers — the union of the two legacy wizards' surfaces, the
+//! diagnostics pair (FR-102), the pairing four (FR-129 A3) and the two
+//! of the Linux/macOS daemon install (FR-129 B1) behind ONE command
+//! vocabulary. Each handler returns `Result<T, String>` (or a
 //! plain value) so Tauri marshals errors as rejected promises the SPA
 //! renders verbatim. The raw enrollment token NEVER flows back from any
 //! command — only parsed metadata (H5, inherited from both legacy
@@ -32,17 +33,21 @@ pub struct DetectResult {
     pub tunnel: TunnelDetect,
 }
 
-/// Daemon (MSI) probe half. Mirrors the legacy agent wizard's
-/// `DetectResult` fields — flat string discriminator for JS
-/// consumption — plus the `supported` flag the unified SPA uses to
-/// hide the daemon role cards on non-Windows hosts.
+/// Daemon probe half. Mirrors the legacy agent wizard's `DetectResult`
+/// fields — flat string discriminator for JS consumption — plus the
+/// `supported` flag the unified SPA uses to hide the daemon role cards, and
+/// (FR-129 B1) what this OS implements and what the server allows.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDetect {
-    /// `false` on non-Windows: the daemon roles are MSI-only, so the
-    /// SPA shows only the tunnel-client card.
+    /// Whether a daemon card may be shown at all. Windows: always. Linux
+    /// and macOS (FR-129 B1): this OS implements a daemon role AND the
+    /// server named to `cmd_detect_install` answered `wizard_unix_daemon:
+    /// true` on `GET /api/setup/features` — anything else is `false`.
     pub supported: bool,
-    /// `"clean" | "peruser" | "permachine" | "ambiguous"`.
+    /// `"clean" | "peruser" | "permachine" | "ambiguous"`. On Linux and
+    /// macOS `permachine` is the system (root) daemon's enrollment, and
+    /// `peruser` the person's own.
     pub kind: String,
     /// perUser version when present, else None.
     pub peruser_version: Option<String>,
@@ -52,6 +57,16 @@ pub struct AgentDetect {
     /// happen post-rc.18 but is surfaced explicitly so the wizard
     /// can refuse to proceed until the operator cleans up.
     pub ambiguous: bool,
+    /// `windows` · `linux` · `macos` · `other`: which card copy to show.
+    pub os: String,
+    /// The daemon roles this OS implements, in card order
+    /// ([`crate::role::daemon_roles`]); the SPA hides every other daemon card.
+    pub daemon_roles: Vec<Role>,
+    /// The server whose `wizard_unix_daemon` switch `supported` reflects, on
+    /// Linux and macOS; `None` on Windows, where no server is asked.
+    pub features_server: Option<String>,
+    /// That server's answer (`false` for anything but a JSON `true`).
+    pub wizard_unix_daemon: bool,
 }
 
 /// Tunnel-CLI probe half. Mirrors the legacy tunnel wizard's
@@ -67,51 +82,117 @@ pub struct TunnelDetect {
     pub config_path: Option<String>,
 }
 
-/// Probe the registry (daemon MSI flavours) + the tunnel CLI config
-/// path. `detect_existing_install` is itself cfg-gated in the agent
-/// crate (always `Clean` on non-Windows), so the call is
-/// unconditional here — only the `supported` flag needs the
-/// compile-time platform check.
-#[tauri::command]
-pub fn cmd_detect_install() -> Result<DetectResult, String> {
+/// Probe the host: the registry (the daemon MSI flavours) on Windows, the
+/// daemon binary and the two config paths on Linux and macOS, plus the
+/// tunnel CLI's config path everywhere. `server` is the Server page's URL as
+/// the SPA has it when the Welcome page loads (its persisted or default
+/// value): on Linux and macOS the daemon cards appear only when THAT server
+/// says `wizard_unix_daemon: true` (FR-129 B1, key design B.6), and the
+/// SPA asks again ([`cmd_setup_features`]) when the URL changes. The
+/// orchestrator asks once more, for the chosen server, before installing.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, String> {
+    let os = crate::role::HostOs::current();
+    let agent = match os {
+        crate::role::HostOs::Windows => detect_windows(os),
+        _ => {
+            let server = server
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(cmd_default_server_url);
+            let features = crate::features::fetch(&server).await;
+            detect_unix(os, &server, features)
+        }
+    };
+    let tunnel = probe_tunnel_install();
+    Ok(DetectResult { agent, tunnel })
+}
+
+/// Windows: the MSI registry probe (`detect_existing_install`), unchanged.
+fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
     use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
-    let agent = match detect_existing_install() {
-        ExistingInstall::Clean => AgentDetect {
-            supported: cfg!(target_os = "windows"),
-            kind: "clean".to_string(),
-            peruser_version: None,
-            permachine_version: None,
-            ambiguous: false,
-        },
+    let base = AgentDetect {
+        supported: true,
+        kind: "clean".to_string(),
+        peruser_version: None,
+        permachine_version: None,
+        ambiguous: false,
+        os: os.wire().to_string(),
+        daemon_roles: crate::role::daemon_roles(os).to_vec(),
+        features_server: None,
+        wizard_unix_daemon: false,
+    };
+    match detect_existing_install() {
+        ExistingInstall::Clean => base,
         ExistingInstall::PerUser(info) => AgentDetect {
-            supported: cfg!(target_os = "windows"),
             kind: "peruser".to_string(),
             peruser_version: info.version,
-            permachine_version: None,
-            ambiguous: false,
+            ..base
         },
         ExistingInstall::PerMachine(info) => AgentDetect {
-            supported: cfg!(target_os = "windows"),
             kind: "permachine".to_string(),
-            peruser_version: None,
             permachine_version: info.version,
-            ambiguous: false,
+            ..base
         },
         ExistingInstall::Ambiguous {
             peruser,
             permachine,
         } => AgentDetect {
-            supported: cfg!(target_os = "windows"),
             kind: "ambiguous".to_string(),
             peruser_version: peruser.version,
             permachine_version: permachine.version,
             ambiguous: true,
+            ..base
         },
+    }
+}
+
+/// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
+/// and the server's switch — a card is shown only on its `true`.
+fn detect_unix(
+    os: crate::role::HostOs,
+    server: &str,
+    features: crate::features::SetupFeatures,
+) -> AgentDetect {
+    let d = crate::unix_daemon::detect(os);
+    let roles = crate::role::daemon_roles(os);
+    let kind = match (d.per_user_config, d.system_config) {
+        (true, true) => "ambiguous",
+        (true, false) => "peruser",
+        (false, true) => "permachine",
+        (false, false) => "clean",
     };
+    AgentDetect {
+        supported: !roles.is_empty() && features.wizard_unix_daemon,
+        kind: kind.to_string(),
+        peruser_version: d
+            .per_user_config
+            .then(|| d.daemon_version.clone())
+            .flatten(),
+        permachine_version: d.system_config.then(|| d.daemon_version.clone()).flatten(),
+        // Two enrollments on a Linux box are two daemons, not an MSI
+        // mix-up: said on the Welcome page, never a refusal.
+        ambiguous: false,
+        os: os.wire().to_string(),
+        daemon_roles: roles.to_vec(),
+        features_server: Some(server.to_string()),
+        wizard_unix_daemon: features.wizard_unix_daemon,
+    }
+}
 
-    let tunnel = probe_tunnel_install();
+/// FR-129 B1 — the server's switches, for the Server page: when the URL
+/// changes, the SPA asks here whether the daemon role it holds is still
+/// offered there. Never cached; anything but a JSON `true` is `false`.
+#[tauri::command]
+pub async fn cmd_setup_features(server: String) -> crate::features::SetupFeatures {
+    crate::features::fetch(&server).await
+}
 
-    Ok(DetectResult { agent, tunnel })
+/// FR-129 B1 — the terminal fallback's "I've run it": the privileged half
+/// could not be prompted for, the SPA showed the command, and the person
+/// says it ran. Wakes the waiting pipeline, which then checks.
+#[tauri::command]
+pub fn cmd_privileged_half_done() -> Result<(), String> {
+    crate::unix_daemon::confirm_fire()
 }
 
 /// The legacy tunnel wizard's config.toml probe, verbatim: resolve
@@ -336,16 +417,31 @@ pub async fn cmd_install(
             crate::orchestrator_tunnel::run_install(role, server, token, device_name, on_event)
                 .await
         }
+        // FR-129 B1 — the MSI pipeline on Windows; the embedded `install.sh`
+        // halves on Linux and macOS (which refuse a role their OS does not
+        // implement, and a server that does not allow it).
         Role::DaemonSystem | Role::DaemonUser | Role::DaemonMachine => {
-            crate::orchestrator_agent::run_install(
-                role,
-                server,
-                token,
-                device_name,
-                advanced.unwrap_or_default(),
-                on_event,
-            )
-            .await
+            if crate::role::HostOs::current() == crate::role::HostOs::Windows {
+                crate::orchestrator_agent::run_install(
+                    role,
+                    server,
+                    token,
+                    device_name,
+                    advanced.unwrap_or_default(),
+                    on_event,
+                )
+                .await
+            } else {
+                crate::orchestrator_unix::run_install(
+                    role,
+                    server,
+                    token,
+                    device_name,
+                    advanced.unwrap_or_default(),
+                    on_event,
+                )
+                .await
+            }
         }
     };
     if paired && report.is_ok() {
@@ -436,6 +532,9 @@ pub fn cmd_diagnostics_page(step: String, outcome: String, elapsed_ms: u64) {
 /// shuts the runtime down deterministically.
 #[tauri::command]
 pub fn cmd_exit_wizard(app: tauri::AppHandle) {
+    // FR-129 B1 — an enrolled system-scope config kept for a Retry never
+    // outlives the wizard: shredded before the process goes.
+    crate::unix_daemon::clear_kept();
     app.exit(0);
 }
 
@@ -607,6 +706,10 @@ mod tests {
                 peruser_version: Some("0.3.0-rc.190".to_string()),
                 permachine_version: None,
                 ambiguous: false,
+                os: "linux".to_string(),
+                daemon_roles: vec![Role::DaemonSystem, Role::DaemonUser],
+                features_server: Some("https://example.invalid".to_string()),
+                wizard_unix_daemon: true,
             },
             tunnel: TunnelDetect {
                 installed: true,
@@ -624,6 +727,50 @@ mod tests {
         assert!(json.contains(r#""supported":true"#), "{json}");
         assert!(!json.contains("peruser_version"), "{json}");
         assert!(!json.contains("machine_name"), "{json}");
+        // FR-129 B1 — the per-OS fields, camelCase, the roles in kebab-case.
+        assert!(json.contains(r#""os":"linux""#), "{json}");
+        assert!(
+            json.contains(r#""daemonRoles":["daemon-system","daemon-user"]"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""featuresServer":"https://example.invalid""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""wizardUnixDaemon":true"#), "{json}");
+    }
+
+    /// FR-129 B1 — on Linux and macOS a daemon card needs the server's
+    /// `true`; the kind reads the two enrollments; Windows never asks.
+    #[test]
+    fn unix_detection_follows_the_server_switch() {
+        use crate::features::SetupFeatures;
+        use crate::role::HostOs;
+        let off = SetupFeatures::default();
+        let on = SetupFeatures {
+            pairing: true,
+            wizard_unix_daemon: true,
+        };
+        let d = detect_unix(HostOs::Linux, "https://a.invalid", off);
+        assert!(!d.supported, "the switch is off");
+        assert_eq!(d.os, "linux");
+        assert_eq!(d.daemon_roles, vec![Role::DaemonSystem, Role::DaemonUser]);
+        assert_eq!(d.features_server.as_deref(), Some("https://a.invalid"));
+        assert!(!d.wizard_unix_daemon);
+        let d = detect_unix(HostOs::Linux, "https://a.invalid", on);
+        assert!(d.supported);
+        assert!(d.wizard_unix_daemon);
+        let d = detect_unix(HostOs::Macos, "https://a.invalid", on);
+        assert!(d.supported);
+        assert_eq!(d.daemon_roles, vec![Role::DaemonUser]);
+        let d = detect_unix(HostOs::Other, "https://a.invalid", on);
+        assert!(!d.supported, "no daemon role on this OS");
+        assert!(d.daemon_roles.is_empty());
+        // The kind is one of the SPA's four, whatever this box has.
+        assert!(matches!(
+            d.kind.as_str(),
+            "clean" | "peruser" | "permachine" | "ambiguous"
+        ));
     }
 
     #[test]
@@ -874,13 +1021,17 @@ mod tests {
         assert_eq!(cmd_default_server_url(), "https://roomler.ai");
     }
 
-    #[test]
-    fn detect_install_returns_consistent_shape() {
+    #[tokio::test]
+    async fn detect_install_returns_consistent_shape() {
         // Real probe on whatever host runs the tests: contract is a
         // valid discriminator + `supported` matching the compile
         // target — NOT a specific install state (dev boxes may have
-        // real installs).
-        let r = cmd_detect_install().unwrap();
+        // real installs). The server named is a closed loopback port, so
+        // off Windows the features fetch fails at once and the switch reads
+        // off, as it must (FR-129 B1): no test reaches the network.
+        let r = cmd_detect_install(Some("http://127.0.0.1:9".to_string()))
+            .await
+            .unwrap();
         assert!(
             matches!(
                 r.agent.kind.as_str(),
@@ -890,6 +1041,7 @@ mod tests {
             r.agent.kind
         );
         assert_eq!(r.agent.supported, cfg!(target_os = "windows"));
+        assert_eq!(r.agent.os, crate::role::HostOs::current().wire());
         if !r.tunnel.installed {
             assert!(r.tunnel.config_path.is_none());
         }

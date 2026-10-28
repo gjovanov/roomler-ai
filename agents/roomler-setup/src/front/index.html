@@ -40,30 +40,33 @@
 
       <div class="card">
         <h2>What should this machine be?</h2>
-        <p id="platform-note" class="muted" hidden>This platform supports the tunnel
-        client only — the daemon roles are Windows-only.</p>
+        <!-- FR-129 B1: the daemon cards follow the OS (which roles it
+             implements) and, on Linux and macOS, the chosen server's
+             wizard_unix_daemon switch; app.js fills the copy per OS and
+             shows this note when no daemon card may appear. -->
+        <p id="platform-note" class="muted" hidden></p>
         <fieldset id="role-fieldset">
-          <label class="radio role-daemon">
+          <label class="radio role-daemon" data-role="daemon-system">
             <input type="radio" name="role" value="daemon-system">
             <div>
-              <strong>Be accessed — background service (pre-logon, recommended)</strong>
-              <p class="muted">perMachine install + SystemContext: remote control works on
+              <strong id="role-title-daemon-system">Be accessed — background service (pre-logon, recommended)</strong>
+              <p class="muted" id="role-desc-daemon-system">perMachine install + SystemContext: remote control works on
               the lock screen, UAC dialogs, and admin apps. Requires admin (UAC prompt).</p>
             </div>
           </label>
-          <label class="radio role-daemon">
+          <label class="radio role-daemon" data-role="daemon-machine">
             <input type="radio" name="role" value="daemon-machine">
             <div>
-              <strong>Be accessed — attended service</strong>
-              <p class="muted">perMachine install for all users on this PC, without the
+              <strong id="role-title-daemon-machine">Be accessed — attended service</strong>
+              <p class="muted" id="role-desc-daemon-machine">perMachine install for all users on this PC, without the
               SystemContext swap. Requires admin (UAC prompt) during install.</p>
             </div>
           </label>
-          <label class="radio role-daemon">
+          <label class="radio role-daemon" data-role="daemon-user">
             <input type="radio" name="role" value="daemon-user">
             <div>
-              <strong>Be accessed — this user only</strong>
-              <p class="muted">perUser install under my account. No admin password needed.</p>
+              <strong id="role-title-daemon-user">Be accessed — this user only</strong>
+              <p class="muted" id="role-desc-daemon-user">perUser install under my account. No admin password needed.</p>
             </div>
           </label>
           <label class="radio">
@@ -118,6 +121,10 @@
           <input id="server-url" type="url" required>
           <small class="muted">Production: <code>https://roomler.ai</code></small>
         </label>
+        <!-- FR-129 B1: on Linux and macOS a daemon role needs the chosen
+             server's say-so (GET /api/setup/features); the server is picked
+             after the role, so it is asked again here when the URL changes. -->
+        <p id="server-features-note" class="warning" hidden></p>
 
         <label class="field">
           <span>Device name</span>
@@ -140,10 +147,12 @@
           <input id="adv-overlay" type="checkbox">
           <span>Join the overlay network (private mesh between your devices)</span>
         </label>
-        <p id="adv-overlay-hint" class="muted" hidden>The private network's TUN
-        adapter needs a service install: a per-user daemon runs with limited
-        rights and cannot create it, so the mesh will not come up on this install.
-        Pick a service role above if this machine should join it.</p>
+        <!-- The hint under the box follows the OS and the role (app.js
+             renderServer): Windows per-user, Linux per-user, macOS. -->
+        <p id="adv-overlay-hint" class="muted" hidden></p>
+        <p id="adv-existing-note" class="muted" hidden>This machine already has an
+        enrollment: the daemon keeps its current settings, and only the options you
+        change here are written over them.</p>
         <label class="field checkline">
           <input id="adv-local-subnets" type="checkbox" checked>
           <span>Advertise directly-connected subnets (admin approval required before use)</span>
@@ -290,6 +299,28 @@
         <p class="muted" id="progress-label"></p>
       </div>
 
+      <!-- FR-129 B1 (Linux/macOS): the install.sh halves print what they do;
+           the last lines are shown here as they arrive. -->
+      <div id="script-output-wrap" hidden>
+        <p class="muted" id="script-output-label"></p>
+        <pre id="script-output" class="script-output" aria-live="polite"></pre>
+      </div>
+
+      <!-- FR-129 B1: no administrator prompt could be shown (no polkit
+           agent, pkexec absent, the password refused). The same step as a
+           terminal command — it carries no secret — and a button for when
+           it has run. -->
+      <div id="elevation-fallback" class="warning" hidden>
+        <p><strong>The administrator prompt could not be shown.</strong>
+          <span id="elevation-reason"></span></p>
+        <p>Run this in a terminal (it asks for your password there), then come back:</p>
+        <pre class="code" id="elevation-command"></pre>
+        <footer class="actions">
+          <button id="elevation-copy" class="secondary">Copy command</button>
+          <button id="elevation-done">I've run it — continue →</button>
+        </footer>
+      </div>
+
       <div id="install-systemcontext-error" class="error" hidden>
         <h3 id="systemcontext-error-stage"></h3>
         <p id="systemcontext-error-message"></p>
@@ -357,6 +388,13 @@
         <p>The install itself is complete. To anchor this device later, run this from an
         elevated shell, with a fresh enrollment token from the dashboard:</p>
         <pre class="code" id="done-anchor-command"></pre>
+      </div>
+
+      <!-- FR-129 B1: what the daemon on Linux / macOS still needs from the
+           person — the macOS privacy grants the OS never asks for, and where
+           the daemon's logs are. Filled by app.js renderDone. -->
+      <div id="done-unix-note" class="info" hidden>
+        <p id="done-unix-text"></p>
       </div>
 
       <div id="done-systemcontext-note" class="info" hidden>
