@@ -1020,7 +1020,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1074` (the section) — `uninstall_linux` at `:1500`,
+`scripts/install.sh:1257` (the section) — `uninstall_linux` at `:1683`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid
