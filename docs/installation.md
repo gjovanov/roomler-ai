@@ -183,7 +183,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3507`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3543`) |
+| `config::load` (`crates/agent-core/src/config.rs:3507`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3548`) |
 | `config::read_if_present` (`:3490`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -214,6 +214,76 @@ process runs on, it is exactly as serious as it was. And never use
 "running on an older config must never look like a normal boot" failure the
 ERROR exists to prevent. FR-66's P2 audited all 37 `load` call sites on this
 question; two moved to `read_if_present`.
+
+### What a save keeps: the keys this build does not know (#2078)
+
+`roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
+start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
+`crates/agent-core/src/config.rs:2609`, `:2631`), at the clean-run promotion
+(`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:3976`). Each save
+serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
+does not model:
+
+- **A key set ahead of the update that knows it** was gone by the old daemon's stop, so the
+  new daemon started on the default and nothing said so. Measured twice: `mutter_input`,
+  written while 0.4.131 ran on the FR-93 lab, and `hive_worker` under 0.4.177 on a vmtest
+  cell (#2972).
+- **A rollback** erased every key newer than the version it rolled back to, and the next
+  upgrade did not bring them back.
+
+Now `save` writes the struct **plus** every key of the file it replaces that this build
+ignores (`serialise_for`, `:3905`):
+
+| In the file being replaced | After the save |
+|---|---|
+| a key this build does not know, top level or a whole table | kept where it was |
+| a key it does not know inside a table it knows (`[forward_acl]`) | kept inside that table |
+| a key it does not know inside an `[[orgs]]` or `[[tunnel_routes]]` entry | kept on that entry wherever the save moved it, found by the org's `tenant_id` or the route's `id`; **dropped, with a WARN naming it,** once that entry is gone |
+| a key this build knows and the save cleared | stays cleared: only ignored keys are copied |
+| nothing it does not know | written exactly as before, byte for byte |
+| comments | lost, as before; keeping them needs an in-place editor |
+
+```mermaid
+flowchart TD
+    S["save(cfg)"] --> P["plain = cfg serialised"]
+    P --> R{"the file on disk parses<br/>as a config?"}
+    R -->|"no file, or no"| W["write plain"]
+    R -->|"yes"| U{"keys this build<br/>ignores in it?"}
+    U -->|"none"| W
+    U -->|"some"| M["copy each into plain's table,<br/>where it was"]
+    M --> C{"reads back, and serialises<br/>to exactly plain?"}
+    C -->|"yes"| WM["write the merged text"]
+    C -->|"no"| WW["write plain<br/>WARN, the keys named"]
+```
+
+"Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
+keys (`unknown_keys`, `:3762`).
+
+⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
+`:3812`): a route's `id`, an org's `tenant_id`, else a `label` (`ENTRY_IDENTITY`, `:3803`).
+Positions move: removing an org shifts the ones after it, and promoting an org puts the
+demoted primary at the promoted org's index, under the promoted org's label, with the
+array's length unchanged (`promote_org_to_primary`). Matched by position, or by label, a
+key would land on another org, which is worse than losing it.
+
+Two guards keep the worst case at the old behaviour. The merged text must read back and
+serialise to exactly what the struct alone would have written (`:3891`), so the merge can only
+add what this build ignores and never change a key it knows. And any failure writes the struct
+alone, with a WARN that names the keys it could not keep.
+
+`load` names them once per process and file (`note_unknown_keys`, `:3946`), with WARN *"config
+keys this build does not know: ignored here, and kept in the file through every save"* and the
+key paths. After a rollback, "my setting did nothing" has its answer in the log.
+
+⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
+TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
+passes a parser message on.
+
+⚠️ **A key a build retires now stays in the file** and is logged as unknown at every start,
+where the next save used to scrub it. Every key retired so far was a knob or a kill switch. A
+retired key that held a secret would need an explicit scrub; no code relies on a save to
+remove one today.
 
 ## Windows
 

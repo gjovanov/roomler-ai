@@ -80,7 +80,7 @@ own doc comment) *hosts nothing yet*.
 The defect is that `config::load` (`crates/agent-core/src/config.rs:3507`) is
 not a neutral reader. On the both-copies-missing arm it logs
 `tracing::error!(… "the host must be re-enrolled")`
-(`crates/agent-core/src/config.rs:3538-3544`) before returning `Err`.
+(`crates/agent-core/src/config.rs:3543-3549`) before returning `Err`.
 
 That severity is right for its *original* caller — the 2026-08-12 self-heal for
 an all-NUL config, where the worker really was exit-1'ing every 60 s and
