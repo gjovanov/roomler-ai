@@ -1646,11 +1646,14 @@ jobs:
       # `scrap-capture` bring them in. The units: a recording's WGC session
       # draws the pointer and the live one does not (unless
       # ROOMLERD_WGC_CURSOR=1), and the pointer's placement.
+      # FR-118 P2-1 — and the GPU frame (`capture::gpu_frame`): a texture on a
+      # WARP device reads back the bytes it holds, once, on any thread, and
+      # goes back to its pool. The same features compile it.
       - name: The recorder's pointer — Windows capture compiles, lints, and its units pass
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
-          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::gpu_frame
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

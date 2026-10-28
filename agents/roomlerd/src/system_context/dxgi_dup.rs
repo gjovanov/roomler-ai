@@ -153,8 +153,9 @@ impl BackendBail {
 /// to recompute.
 #[cfg(feature = "scrap-capture")]
 pub struct DxgiFrame {
-    /// BGRA8 pixel data, length `width * height * 4`.
-    pub bytes: Vec<u8>,
+    /// BGRA8 pixels, `width * height * 4` bytes in memory, or (FR-118 P2) a
+    /// texture on the capture device.
+    pub data: crate::capture::FrameData,
     pub width: u32,
     pub height: u32,
     /// Bytes per row. Always `width * 4` on the DXGI path; carried
@@ -274,7 +275,7 @@ impl DxgiDupBackend {
                 }
                 let bytes = buf[..expected].to_vec();
                 Ok(DxgiFrame {
-                    bytes,
+                    data: bytes.into(),
                     width: self.width,
                     height: self.height,
                     stride,
