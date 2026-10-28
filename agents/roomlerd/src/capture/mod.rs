@@ -474,9 +474,9 @@ pub trait ScreenCapture: Send {
     }
 
     /// FR-118 P0 — the backend's own copy of a GPU surface into CPU memory,
-    /// cumulative `(frames, microseconds)`, for a backend that does it OFF the
-    /// pump's clock: WGC reads back on its capture thread, inside
-    /// `FrameArrived`, so the pump's `avg_capture_ms` never contained it.
+    /// cumulative `(frames, microseconds)`. WGC reads back inside `FrameArrived`,
+    /// off the pump's clock, so `avg_capture_ms` never contains it; the DXGI arm
+    /// reads back on its capture thread while the pump waits, so it does.
     /// `None` from every backend that does not measure it.
     fn readback_totals(&self) -> Option<(u64, u64)> {
         None
