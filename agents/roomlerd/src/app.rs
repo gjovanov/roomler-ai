@@ -2887,9 +2887,21 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 /// enroll already happened in the caller's process.
 ///
 /// A `FILE` that does not parse is a refusal before anything is written, and
-/// so is a `--take` key outside the config surface; a `TARGET` that exists
-/// but does not parse is treated as absent, loudly, rather than blocking the
-/// install behind a file nothing can read anyway.
+/// so is a `--take` key outside the config surface. A `TARGET` that exists but
+/// does not load is not a refusal either — nothing can read it anyway — but it
+/// is never silently "absent": its last good copy (`.prev`) is folded into
+/// when that one loads, as the daemon itself would recover at its next start,
+/// the damaged file is kept as `.unreadable`, and both are said on stderr,
+/// which the setup wizard streams to the person
+/// ([`config::read_merge_base`]).
+///
+/// The person's process enrolled with a machine id derived from the host
+/// name, since it could not read this file. When the server answered that
+/// with ANOTHER device row of the same org (a renamed host, a VM cloned with
+/// its config), the kept WireGuard key — which the previous row still claims,
+/// and the overlay join refuses to share — is retired, so the daemon mints a
+/// fresh one, and the previous row is named for the operator
+/// ([`enrollment::retire_key_of_previous_row`]).
 fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<()> {
     let from_path = from.to_path_buf();
     let Some(fresh) = config::read_if_present(&from_path) else {
@@ -2914,19 +2926,26 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         taken.push((key.to_string(), entry.value));
     }
     let target = config_path.to_path_buf();
-    let existing = if target.exists() {
-        let read = config::read_if_present(&target);
-        if read.is_none() {
-            tracing::warn!(
-                path = %target.display(),
-                "adopt-enrollment: the existing config does not parse; writing the new one as if none were there"
-            );
+    let existing = match config::read_merge_base(&target) {
+        config::MergeBase::Absent => None,
+        config::MergeBase::Loaded(cfg) => Some(cfg),
+        config::MergeBase::Unreadable { reason, recovered } => {
+            let kept = config::keep_unreadable(&target).map_err(|e| e.to_string());
+            let said = config::describe_unreadable(&target, &reason, recovered.is_some(), &kept);
+            tracing::warn!(path = %target.display(), %reason, recovered = recovered.is_some(), "adopt-enrollment: {said}");
+            eprintln!("WARNING: {said}");
+            recovered
         }
-        read
-    } else {
-        None
     };
+    let previous = existing.clone();
+    let new_agent_id = fresh.agent_id.clone();
     let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, None, false)?;
+    let retired = enrollment::retire_key_of_previous_row(previous.as_ref(), &mut cfg, &outcome);
+    if let Some(row) = &retired {
+        let said = enrollment::describe_previous_row(row, &new_agent_id);
+        tracing::warn!(previous = %row.agent_id, new = %new_agent_id, org = %row.org_label, "adopt-enrollment: a new device row; the previous row's overlay key retired");
+        eprintln!("WARNING: {said}");
+    }
     for (key, value) in &taken {
         roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
             .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
@@ -7493,5 +7512,94 @@ mod tests {
         assert!(adopt_enrollment_cmd(&target, &from, &[]).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
         assert!(adopt_enrollment_cmd(&target, &dir.path().join("missing.toml"), &[]).is_err());
+    }
+
+    /// FR-129 B1 (F3) — the wizard enrolled the system scope with a machine id
+    /// derived from the host name (root's config is unreadable to it), and the
+    /// host was renamed since, so the server made ANOTHER row of the same org.
+    /// The fold keeps the operator state but must not keep the WireGuard key,
+    /// which the previous row still claims: the new row's overlay join would be
+    /// refused for good (`wg_key_taken_by_other`, fail-closed).
+    #[test]
+    fn adopt_enrollment_retires_the_key_a_previous_row_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        let mut existing = operator_config(); // agent "aid", machine "mid", key existing-wg-key
+        existing.overlay_wg_key_epoch = 2;
+        config::save(&target, &existing).unwrap();
+        let mut fresh = fresh_same_org();
+        fresh.machine_id = "mid-from-the-new-host-name".into();
+        fresh.agent_id = "aid-new-row".into();
+        config::save(&from, &fresh).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_id, "aid-new-row", "the new row's identity");
+        assert_eq!(merged.machine_id, "mid-from-the-new-host-name");
+        assert_eq!(
+            merged.overlay_wg_secret_key, None,
+            "the previous row's key is retired; the daemon mints one at start"
+        );
+        assert_eq!(merged.overlay_wg_key_epoch, 0);
+        assert!(merged.overlay_enabled, "the operator state stays");
+        assert_eq!(merged.tunnel_routes.len(), 1);
+        assert_eq!(
+            merged.lock_on_end,
+            roomler_ai_remote_control::models::LockOnEnd::Always
+        );
+
+        // The ordinary reinstall (the server reused the row): the key stays.
+        let mut again = fresh_same_org();
+        again.agent_id = "aid-new-row".into();
+        again.machine_id = "mid-from-the-new-host-name".into();
+        config::save(&from, &again).unwrap();
+        let mut keyed = config::load(&target).unwrap();
+        keyed.overlay_wg_secret_key = Some("minted-for-the-new-row".into());
+        config::save(&target, &keyed).unwrap();
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+        assert_eq!(
+            config::load(&target)
+                .unwrap()
+                .overlay_wg_secret_key
+                .as_deref(),
+            Some("minted-for-the-new-row")
+        );
+    }
+
+    /// FR-129 B1 (F4) — a root config that is there and does not load (an
+    /// unclean shutdown zeroed it) is neither refused nor silently replaced:
+    /// its last good copy carries the operator state over, as the daemon's own
+    /// load would, and the damaged file is kept aside, never over `.prev`.
+    #[test]
+    fn adopt_enrollment_recovers_a_damaged_target_from_its_last_good_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        config::save(&target, &operator_config()).unwrap(); // rotates the first to .prev
+        let len = std::fs::metadata(&target).unwrap().len() as usize;
+        std::fs::write(&target, vec![0u8; len]).unwrap();
+        config::save(&from, &fresh_same_org()).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_token, "tok-2", "the new credential");
+        assert!(merged.overlay_enabled, "recovered from .prev");
+        assert_eq!(merged.tunnel_routes.len(), 1, "recovered from .prev");
+        let kept = config::unreadable_copy_path(&target);
+        assert_eq!(std::fs::read(&kept).unwrap(), vec![0u8; len]);
+        // A damaged target with no last good copy: written fresh, still kept.
+        std::fs::write(&target, b"overlay_enabled = ture\n").unwrap();
+        std::fs::remove_file(target.with_extension("toml.prev")).unwrap();
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+        let fresh = config::load(&target).unwrap();
+        assert!(!fresh.overlay_enabled, "nothing to recover");
+        assert_eq!(
+            std::fs::read_to_string(&kept).unwrap(),
+            "overlay_enabled = ture\n"
+        );
     }
 }
