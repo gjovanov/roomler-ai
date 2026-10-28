@@ -124,7 +124,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
 | 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
-| 31 | 10-28 | **The companion builds log why cargo rebuilds** (diagnostic). The macOS companion recompiled `roomler-desktop` on every reused same-tree run read so far (0.4.179's and 0.4.180's tag runs, 0.4.180's reseed), and five read-only probes could not reproduce it (field log, 2026-10-27 evening). The four companion build steps now set `CARGO_LOG=cargo::core::compiler::fingerprint=info`: a fresh unit prints nothing, a dirty one prints `fingerprint dirty for …` and the stale file or env var with both mtimes. Log-only, and removed once a reused run has named the reason | #3024 |
+| 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources | #3024, #3030 |
 
 ## Acceptance criteria
 
@@ -978,3 +978,30 @@ itself on the affected run's page. Baseline when the program started: releases t
     Its companion logs are the positive control: each dirty unit must print its reason.
   - The first reused same-tree run after it names the macOS companion's reason: the next tag
     run, or the reseed after a release. Its read goes here.
+- 2026-10-28, night: **the reason, read off cargo, and the fix (#3030).**
+  - R1, reseed 40602653917 (a new tree), was the positive control. Its macOS companion printed
+    22 fingerprint lines, each a source with both mtimes.
+  - R2, 40605173133, ran the same tree on a branch pinned to R1's commit. It was **fresh**
+    (5.50 s). A reseed's seed reuses cleanly; something only a release's rehearsal does
+    leaves the trap. The rehearsal is the one that builds a new version, so every one of
+    our units gets a new hash and compiles for the first time.
+  - Probe v6, 40605635409, bumped `roomler-desktop` alone to 0.4.999, so its build is a
+    first build. The rebuild on the same runner was dirty:
+    `stale: changed …/out/tauri-codegen-assets/8068…ba4.js (vs) …/dep-bin-roomler-desktop`,
+    `1793145568.351986499 < 1793145569.649334416`.
+    - The asset was written 1.3 s after the compile started, by tauri's `generate_context!`.
+      It writes the file during the compile, only when missing, and lists it as an input.
+    - Restored from the tar on another runner, the rebuild was dirty the same way (`568 <
+      569`, the tar keeping whole seconds). It recompiled in 2 min 22 s, the field's figure.
+    - That explains every reading: the macOS companion every release; the Windows one on
+      0.4.179 and not on 0.4.180, depending on whether the write crossed a second; and the
+      once-only recompile, because the file then exists and is never rewritten.
+  - The fix: on a same-tree reuse, `seed-tree-reuse` marks every file under
+    `target/*/build/*/out/` and `target/*/*/build/*/out/` old, as it does the sources. A
+    build script that does rerun rewrites its OUT_DIR, which is new again.
+  - Probe v7, 40607295709, applied the fix verbatim after a first build. All three were
+    fresh: macOS on the same runner 1.98 s, macOS on another runner 4.87 s, Windows 0.68 s.
+  - Field proof owed, on the next release's tag run:
+    - no `Compiling roomler-desktop` in any companion job (strip colours first);
+    - no `fingerprint dirty` line in their logs.
+    Then the `CARGO_LOG` lines come out of the four steps.
