@@ -375,7 +375,7 @@ subject plain text: the machine name is the installer's own text.
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this commit |
 | A1 | server: `device_pairings` + `pairing_audit`; `/api/pair/start`, `/poll` (public), `/lookup`, `/approve`, `/deny` (`AuthUser`); mint on delivery; FR-102 ledger; limits; integration tests incl. start on one pod, approve + poll on another | `[pairing] enabled = false` → every `/api/pair/*` route answers the empty 404 and the wizard shows the paste step only | in review — [#3040](https://github.com/gjovanov/roomler-ai/pull/3040) |
-| A2 | web: `/pair` — type the code, see the device, pick or create the org, approve or deny; the pending pairing through login, OAuth and email activation; the admins' notice | unmounted with A1's switch | — |
+| A2 | web: `/pair` — type the code, see the device, pick or create the org, approve or deny; the pending pairing through login, OAuth and email activation; the admins' notice | unmounted with A1's switch | PR [#3026](https://github.com/gjovanov/roomler-ai/pull/3026) |
 | A3 | wizard: "Set up in the browser" as the token step's primary action — start, open `/pair`, show the code, poll with back-off, confirm org + approver, then install; paste kept as "I already have a token" | A1's switch; an older server (404 on start) → paste only | — |
 | A4 | terminal parity: `roomlerd enroll --pair`, `install.sh --pair`, `install.ps1 -Pair` | omit the flag | — |
 | B0 | spike: the privileged/user split of `install.sh` under `pkexec` (Ubuntu GNOME, Fedora KDE vmtest cells) and `osascript` admin (macOS cell); the seam recorded in this spec | — | — |
