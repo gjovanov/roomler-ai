@@ -22,11 +22,12 @@ async fn get_anon(app: &TestApp) -> reqwest::Response {
         .expect("request")
 }
 
-/// The shipped defaults: pairing ON (A1), the Linux/macOS daemon wizard OFF
-/// (the wizard that can do it has not shipped). Exactly these two keys, both
+/// The shipped defaults: pairing ON (A1, the server's fact), both claims
+/// about the released wizard OFF (the wizard that installs the daemon off
+/// Windows, or pairs, has not shipped). Exactly these three keys, all
 /// booleans — a consumer never has to default a missing one.
 #[tokio::test]
-async fn the_default_shape_is_pairing_on_and_the_unix_daemon_wizard_off() {
+async fn the_default_shape_is_pairing_on_and_the_wizard_claims_off() {
     let app = TestApp::spawn().await;
     let resp = get_anon(&app).await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -43,24 +44,26 @@ async fn the_default_shape_is_pairing_on_and_the_unix_daemon_wizard_off() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
         body,
-        json!({ "pairing": true, "wizard_unix_daemon": false })
+        json!({ "pairing": true, "wizard_unix_daemon": false, "wizard_pairing": false })
     );
 }
 
-/// Each flag follows its own setting, and what `pairing` says matches what
-/// the pairing routes do: with `[pairing] enabled = false` the flag is
-/// false AND `/api/pair/start` is the empty 404 of an absent path.
+/// Each flag follows its own setting and none implies another, and what
+/// `pairing` says matches what the pairing routes do: with
+/// `[pairing] enabled = false` the flag is false AND `/api/pair/start` is
+/// the empty 404 of an absent path.
 #[tokio::test]
 async fn each_flag_follows_its_setting() {
     let app = TestApp::spawn_with_settings(|s| {
         s.pairing.enabled = false;
         s.setup.wizard_unix_daemon = true;
+        s.setup.wizard_pairing = true;
     })
     .await;
     let body: Value = get_anon(&app).await.json().await.unwrap();
     assert_eq!(
         body,
-        json!({ "pairing": false, "wizard_unix_daemon": true })
+        json!({ "pairing": false, "wizard_unix_daemon": true, "wizard_pairing": true })
     );
 
     let start = reqwest::Client::new()
@@ -82,10 +85,19 @@ async fn each_flag_follows_its_setting() {
         "pairing: false ⇒ the pairing routes are gone too"
     );
 
-    // The other way round: the wizard switch alone, pairing untouched.
+    // Each wizard claim alone, pairing untouched and the other claim off.
     let app = TestApp::spawn_with_settings(|s| s.setup.wizard_unix_daemon = true).await;
     let body: Value = get_anon(&app).await.json().await.unwrap();
-    assert_eq!(body, json!({ "pairing": true, "wizard_unix_daemon": true }));
+    assert_eq!(
+        body,
+        json!({ "pairing": true, "wizard_unix_daemon": true, "wizard_pairing": false })
+    );
+    let app = TestApp::spawn_with_settings(|s| s.setup.wizard_pairing = true).await;
+    let body: Value = get_anon(&app).await.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "pairing": true, "wizard_unix_daemon": false, "wizard_pairing": true })
+    );
 }
 
 /// A signed-in person gets the same answer as nobody: the switches are
@@ -105,4 +117,5 @@ async fn a_member_reads_the_same_switches_as_a_guest() {
     let guest: Value = get_anon(&app).await.json().await.unwrap();
     assert_eq!(signed_in, guest);
     assert_eq!(guest["wizard_unix_daemon"], true);
+    assert_eq!(guest["wizard_pairing"], false);
 }

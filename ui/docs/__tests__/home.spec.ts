@@ -449,7 +449,7 @@ describe('home.js — live prices', () => {
 // but a JSON `true`.
 describe('home.js — the install switches (FR-129 B1-s)', () => {
   const base = { '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404 }
-  const FEATURES_ON = { ok: true, body: { pairing: true, wizard_unix_daemon: true } }
+  const FEATURES_ON = { ok: true, body: { pairing: true, wizard_unix_daemon: true, wizard_pairing: true } }
   const button = (doc: Document, os: string) => doc.querySelector(`[data-os="${os}"] [data-wizard-unix]`) as HTMLElement
   const label = (doc: Document, os: string) => doc.querySelector(`[data-os="${os}"] .home-muted`)!.textContent
   const lead = (doc: Document) => doc.querySelector('[data-download-lead]')!.textContent
@@ -475,26 +475,36 @@ describe('home.js — the install switches (FR-129 B1-s)', () => {
     expect(lead(doc)).toBe(DOWNLOAD.leadPairing)
   })
 
-  it('reads each switch on its own', async () => {
-    const a = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: false } } })
+  it('reads each switch on its own, and the lead needs both pairing switches', async () => {
+    // The buttons off, the lead on.
+    const a = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: false, wizard_pairing: true } } })
     await settle()
     expect(button(a.doc, 'linux').hidden).toBe(true)
     expect(label(a.doc, 'linux')).toBe('From a terminal:')
     expect(lead(a.doc)).toBe(DOWNLOAD.leadPairing)
 
-    const b = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: false, wizard_unix_daemon: true } } })
+    // The buttons on; the released wizard pairs but this server does not.
+    const b = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: false, wizard_unix_daemon: true, wizard_pairing: true } } })
     await settle()
     expect(button(b.doc, 'macos').hidden).toBe(false)
     expect(label(b.doc, 'macos')).toBe('Or from a terminal:')
     expect(lead(b.doc)).toBe(DOWNLOAD.lead)
+
+    // The buttons on; this server pairs but the released wizard does not —
+    // the shipped default of `pairing`, and the lead must keep the token.
+    const c = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: true, wizard_pairing: false } } })
+    await settle()
+    expect(button(c.doc, 'linux').hidden).toBe(false)
+    expect(lead(c.doc)).toBe(DOWNLOAD.lead)
   })
 
   it.each([
     ['an older server (404)', { ok: false, status: 404 }],
     ['a server without the fleet module (503)', { ok: false, status: 503 }],
     ['unreachable', new Error('offline')],
-    ['saying both are off', { ok: true, body: { pairing: false, wizard_unix_daemon: false } }],
-    ['sending strings, not booleans', { ok: true, body: { pairing: 'true', wizard_unix_daemon: 'true' } }],
+    ['saying every switch is off', { ok: true, body: { pairing: false, wizard_unix_daemon: false, wizard_pairing: false } }],
+    ['saying the server pairs but the released wizard does neither (the shipped default)', { ok: true, body: { pairing: true, wizard_unix_daemon: false, wizard_pairing: false } }],
+    ['sending strings, not booleans', { ok: true, body: { pairing: 'true', wizard_unix_daemon: 'true', wizard_pairing: 'true' } }],
     ['sending no object', { ok: true, body: null }],
     ['sending an array', { ok: true, body: [true, true] }],
   ] as Array<[string, Answer]>)('fails CLOSED — the page exactly as built — with the endpoint %s', async (_, answer) => {

@@ -98,6 +98,17 @@ pub struct SetupSettings {
     /// it has not shipped. Env: `ROOMLER__SETUP__WIZARD_UNIX_DAEMON`.
     #[serde(default)]
     pub wizard_unix_daemon: bool,
+    /// "The released Roomler Setup pairs — signs the person in from their
+    /// browser instead of asking for a token (FR-129 A3) — and that is
+    /// field-proven against this server." `pairing` on `/api/setup/features`
+    /// is a fact about the SERVER (`/api/pair/*` answers; on by default); this
+    /// is the claim about the DOWNLOAD, and both homepages word the install
+    /// lead as "sign in from your browser" only when both are true. Without
+    /// it, a server image promoted before the first `setup-v*` that carries
+    /// A3 would promise a flow the wizard cannot do. Default **off**.
+    /// Env: `ROOMLER__SETUP__WIZARD_PAIRING`.
+    #[serde(default)]
+    pub wizard_pairing: bool,
 }
 
 /// FR-129 A1 — `[pairing]`, env `ROOMLER__PAIRING__*`: the RFC 8628-shaped
@@ -2087,19 +2098,28 @@ mod pairing_settings_tests {
 mod setup_settings_tests {
     use super::SetupSettings;
 
-    /// FR-129 B1-s — the Unix daemon wizard switch ships OFF, both where the
-    /// settings are built whole and where a file leaves the key out; only a
-    /// file (or `ROOMLER__SETUP__WIZARD_UNIX_DAEMON=true`) turns it on. The
-    /// default is the claim: the wizard that installs the daemon off Windows
-    /// has not shipped, and a card the released wizard cannot honour is the
-    /// failure the switch exists to prevent.
+    /// FR-129 B1-s — both claims about the released wizard ship OFF, where
+    /// the settings are built whole and where a file leaves the keys out;
+    /// only a file (or `ROOMLER__SETUP__WIZARD_UNIX_DAEMON=true`,
+    /// `ROOMLER__SETUP__WIZARD_PAIRING=true`) turns one on, and neither
+    /// implies the other. The default is the claim: the wizard that installs
+    /// the daemon off Windows, or pairs, has not shipped, and a card or a
+    /// lead the released wizard cannot honour is the failure the switches
+    /// exist to prevent.
     #[test]
-    fn the_unix_daemon_wizard_is_off_until_turned_on() {
-        assert!(!SetupSettings::default().wizard_unix_daemon);
+    fn the_wizard_claims_are_off_until_turned_on() {
+        let d = SetupSettings::default();
+        assert!(!d.wizard_unix_daemon);
+        assert!(!d.wizard_pairing);
         let absent: SetupSettings = toml::from_str("").expect("every key defaults");
         assert!(!absent.wizard_unix_daemon, "a file without the key");
-        let on: SetupSettings = toml::from_str("wizard_unix_daemon = true").unwrap();
-        assert!(on.wizard_unix_daemon);
+        assert!(!absent.wizard_pairing, "a file without the key");
+        let daemon: SetupSettings = toml::from_str("wizard_unix_daemon = true").unwrap();
+        assert!(daemon.wizard_unix_daemon);
+        assert!(!daemon.wizard_pairing, "each key on its own");
+        let pairing: SetupSettings = toml::from_str("wizard_pairing = true").unwrap();
+        assert!(pairing.wizard_pairing);
+        assert!(!pairing.wizard_unix_daemon, "each key on its own");
     }
 }
 
