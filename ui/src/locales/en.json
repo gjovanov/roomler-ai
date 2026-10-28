@@ -611,5 +611,17 @@
         "server": "The server's own record of an admin's change."
       }
     }
+  },
+  "activation": {
+    "working": "Activating your account…",
+    "doneTitle": "Your account is active",
+    "doneText": "Sign in to get started.",
+    "signIn": "Sign in",
+    "invalidTitle": "This activation link is invalid or has expired",
+    "invalidText": "If you have already activated your account, just sign in. Otherwise, register again to get a new link.",
+    "register": "Register again",
+    "errorTitle": "Could not reach the server",
+    "errorText": "Nothing was changed. Check your connection and try again.",
+    "retry": "Try again"
   }
 }

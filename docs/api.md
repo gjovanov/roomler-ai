@@ -79,7 +79,7 @@ capability URLs, webhook signatures).
 | POST | `/api/auth/login` | Password login (`email` or `username`) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
-| POST | `/api/auth/activate` | Redeem an email activation code |
+| POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |
 | GET/PUT | `/api/auth/me` | Current user (read / update) |
 | GET | `/api/oauth/{provider}` | OAuth redirect (google, facebook, github, linkedin, microsoft) |
 | GET | `/api/oauth/callback/{provider}` | OAuth callback |
