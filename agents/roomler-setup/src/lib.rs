@@ -8,14 +8,15 @@
 //! without spawning the Tauri webview EXE (which would require
 //! elevation on Windows when run from a non-admin shell).
 //!
-//! One app, four roles (see [`role::Role`]): the three daemon roles
-//! drive the MSI pipeline ([`orchestrator_agent`]); the tunnel-client
-//! role drives the archive pipeline ([`orchestrator_tunnel`]) — both
-//! relocated (P4a) from the legacy wizard crates retired in P4c-2.
-//! Mechanics (asset resolver, MSI runner,
-//! extract, integration, enroll HTTP, unified ProgressEvent) come
-//! from `wizard_shared` (`crates/roomler-setup-core`); the agent- and
-//! tunnel-coupled calls stay here.
+//! One app, four roles (see [`role::Role`]): on Windows the three daemon
+//! roles drive the MSI pipeline ([`orchestrator_agent`]); on Linux and macOS
+//! the two daemon roles drive the embedded `install.sh` halves
+//! ([`orchestrator_unix`], FR-129 B1); the tunnel-client role drives the
+//! archive pipeline ([`orchestrator_tunnel`]) — the last two relocated (P4a)
+//! from the legacy wizard crates retired in P4c-2. Mechanics (asset
+//! resolver, MSI runner, extract, integration, enroll HTTP, unified
+//! ProgressEvent) come from `wizard_shared` (`crates/roomler-setup-core`);
+//! the agent- and tunnel-coupled calls stay here.
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
@@ -23,13 +24,25 @@ pub mod commands;
 /// FR-102 P3b — the opt-in setup diagnostics: the recorder, its gate, the
 /// buffer until the server is known, and the fire-and-forget sender.
 pub mod diagnostics;
+/// #2338 — the enroll step every daemon pipeline shares: the fresh
+/// enrollment folded into the config already at its path.
+pub mod enroll_step;
+/// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
+pub mod features;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
+/// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded
+/// `install.sh` halves under the desktop's own administrator prompt.
+pub mod orchestrator_unix;
 /// FR-129 A3 — the pairing session: the device code and the delivered
 /// token live here, in this process, and never reach the webview.
 pub mod pairing;
 pub mod proxy;
 pub mod role;
+/// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
+/// script, the halves' argv, the prompt tools, the exit codes, the private
+/// scratch directory.
+pub mod unix_daemon;
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
