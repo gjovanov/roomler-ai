@@ -823,13 +823,19 @@ Binary Images:
     #[test]
     fn this_process_dumps_its_own_threads() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let parked = std::thread::Builder::new()
             // Linux keeps 15 bytes of a thread's name.
             .name("tdump-parked".into())
             .spawn(move || {
+                let _ = ready_tx.send(());
                 let _ = rx.recv();
             })
             .unwrap();
+        // The new thread sets its own name before it runs this closure, and
+        // until then the OS shows its creator's. CI's first run read procfs in
+        // that window, under a full parallel test run.
+        ready_rx.recv().expect("the parked thread started");
         let dir =
             std::env::temp_dir().join(format!("roomlerd-thread-dump-self-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
