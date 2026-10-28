@@ -176,6 +176,24 @@ enum Command {
         #[arg(long)]
         org: Option<String>,
     },
+    /// FR-129 B1 (#2338) — fold an enrollment another process wrote into the
+    /// config at `--config`, keeping that config's operator state: what
+    /// `enroll` does for a config it can read. The setup wizard enrolls a
+    /// SYSTEM-scope install in its own process, as the person, into a private
+    /// file, and the person cannot read the root daemon's own config to merge
+    /// it; the privileged install half runs this as root instead. With no
+    /// config at `--config` the file is placed as it is. Takes no token.
+    AdoptEnrollment {
+        /// The freshly enrolled config whose identity is taken.
+        #[arg(long)]
+        from: PathBuf,
+        /// A config key to copy from `--from` as well — the wizard's Advanced
+        /// options the person set explicitly (`overlay_enabled`, …). Each must
+        /// be a config-surface key; an unknown one refuses the whole adopt,
+        /// before anything is written. Repeatable.
+        #[arg(long = "take", value_name = "KEY")]
+        take: Vec<String>,
+    },
     /// FR-94 (Windows) — anchor this machine's device, so Fleet RPC runs as
     /// SYSTEM through the Roomler service instead of as the signed-in user.
     /// Every action needs an elevated prompt (Run as administrator).
@@ -1657,6 +1675,7 @@ async fn daemon_main() -> Result<()> {
         Command::ReEnroll { token, org } => {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
+        Command::AdoptEnrollment { from, take } => adopt_enrollment_cmd(&config_path, &from, &take),
         Command::Anchor { action } => {
             use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
             let action = match action {
@@ -2854,6 +2873,96 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         eprintln!();
         eprint!("{}", warning_message_for_user_context_enroll());
     }
+    Ok(())
+}
+
+/// FR-129 B1 (#2338) — `roomlerd --config TARGET adopt-enrollment --from FILE
+/// [--take KEY]…`: the identity from `FILE` folded into the config at
+/// `TARGET` through the same dispatch `enroll` uses
+/// ([`enrollment::apply_enrollment`]): a refresh of the same org keeps every
+/// operator-owned key, another org is appended, no config at all is written
+/// fresh. `--take` copies named keys from `FILE` on top — the wizard's
+/// Advanced options the person set by hand — so an untouched box never
+/// overwrites a value the device already had. Nothing here reads a token: the
+/// enroll already happened in the caller's process.
+///
+/// A `FILE` that does not parse is a refusal before anything is written, and
+/// so is a `--take` key outside the config surface; a `TARGET` that exists
+/// but does not parse is treated as absent, loudly, rather than blocking the
+/// install behind a file nothing can read anyway.
+fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<()> {
+    let from_path = from.to_path_buf();
+    let Some(fresh) = config::read_if_present(&from_path) else {
+        bail!(
+            "--from {} is not a readable, enrolled config",
+            from_path.display()
+        );
+    };
+    if fresh.agent_token.trim().is_empty() || fresh.agent_id.trim().is_empty() {
+        bail!(
+            "--from {} carries no enrollment (agent_id / agent_token are empty)",
+            from_path.display()
+        );
+    }
+    // Every `--take` key is checked first: a typo must not cost the adopt.
+    let mut taken: Vec<(String, Option<String>)> = Vec::with_capacity(take.len());
+    for key in take {
+        let key = key.trim();
+        let Some(entry) = roomlerd::config_surface::entry_for(&fresh, key) else {
+            bail!("--take {key:?} is not a config key");
+        };
+        taken.push((key.to_string(), entry.value));
+    }
+    let target = config_path.to_path_buf();
+    let existing = if target.exists() {
+        let read = config::read_if_present(&target);
+        if read.is_none() {
+            tracing::warn!(
+                path = %target.display(),
+                "adopt-enrollment: the existing config does not parse; writing the new one as if none were there"
+            );
+        }
+        read
+    } else {
+        None
+    };
+    let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, None, false)?;
+    for (key, value) in &taken {
+        roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
+            .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
+    }
+    config::save(&target, &cfg).context("saving the adopted config")?;
+    use enrollment::EnrollOutcome;
+    let what = match &outcome {
+        EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
+        EnrollOutcome::RefreshedPrimary => {
+            "folded into the existing config (same server + org; operator settings kept)"
+                .to_string()
+        }
+        EnrollOutcome::ReplacedPrimary => "replaced the primary enrollment".to_string(),
+        EnrollOutcome::RefreshedOrg { label } => format!("refreshed org {label:?}"),
+        EnrollOutcome::AppendedOrg { label } => {
+            format!("appended as an ADDITIONAL org {label:?} (the primary enrollment stays)")
+        }
+    };
+    tracing::info!(path = %target.display(), ?outcome, taken = taken.len(), "enrollment adopted");
+    println!(
+        "Enrollment adopted: {what}{}. Config written to: {}",
+        if taken.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} key(s) taken from the new config ({})",
+                taken.len(),
+                taken
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+        target.display()
+    );
     Ok(())
 }
 
@@ -7242,4 +7351,147 @@ mod tests {
         assert!(!should_self_heal_config(true, peruser, mg, true));
     }
     // RETIRED-NAME-ANCHOR-END
+
+    // ─── FR-129 B1 (#2338): adopt-enrollment ───────────────────────────────
+
+    /// The operator state #2338 names, on a config that stands in for the
+    /// root daemon's: the mesh on, a declared route, a lock policy.
+    fn operator_config() -> config::AgentConfig {
+        let mut existing = config::test_fixture();
+        existing.overlay_enabled = true;
+        existing.overlay_wg_secret_key = Some("existing-wg-key".into());
+        existing.lock_on_end = roomler_ai_remote_control::models::LockOnEnd::Always;
+        existing
+            .tunnel_routes
+            .push(tunnel_core::localapi::RouteDescriptor {
+                id: "db".into(),
+                kind: tunnel_core::localapi::FlowKind::Forward,
+                node: "abc123".into(),
+                local: 15432,
+                remote: Some("db.internal:5432".into()),
+                transport: String::new(),
+                enabled: true,
+                org: None,
+            });
+        existing
+    }
+
+    /// A fresh enrollment of the same machine into the same org: a new
+    /// token, the same agent id (the server reuses the row), a new name.
+    fn fresh_same_org() -> config::AgentConfig {
+        let mut fresh = config::test_fixture();
+        fresh.agent_token = "tok-2".into();
+        fresh.machine_name = "renamed".into();
+        fresh
+    }
+
+    /// #2338 — a reinstall's enrollment is folded into the existing config:
+    /// the identity is the new one, every operator-owned key survives, and
+    /// `lock_on_end` is not reset to a fresh install's default.
+    #[test]
+    fn adopt_enrollment_keeps_operator_state_on_a_reinstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("etc").join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        config::save(&from, &fresh_same_org()).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_token, "tok-2", "the new credential");
+        assert_eq!(merged.machine_name, "renamed", "the new name");
+        assert!(merged.overlay_enabled, "overlay_enabled survived");
+        assert_eq!(
+            merged.overlay_wg_secret_key.as_deref(),
+            Some("existing-wg-key"),
+            "the WG key did not rotate"
+        );
+        assert_eq!(merged.tunnel_routes.len(), 1, "the declared route survived");
+        assert_eq!(merged.tunnel_routes[0].id, "db");
+        assert_eq!(
+            merged.lock_on_end,
+            roomler_ai_remote_control::models::LockOnEnd::Always,
+            "lock_on_end kept the device's own value"
+        );
+        // The source file is the caller's to shred; it is untouched here.
+        assert!(from.exists());
+    }
+
+    /// With no config at the target the fresh one is placed as it is — the
+    /// first install — and the file is the daemon's own 0600.
+    #[test]
+    fn adopt_enrollment_places_a_fresh_config_where_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("etc").join("roomler").join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&from, &fresh_same_org()).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let placed = config::load(&target).unwrap();
+        assert_eq!(placed.agent_token, "tok-2");
+        assert!(
+            !placed.overlay_enabled,
+            "a fresh config carries its own defaults"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the config holds a bearer token");
+        }
+    }
+
+    /// `--take` copies a named key from the new config on top of the kept
+    /// state — the box the person ticked wins, the one they never touched
+    /// does not exist on the command line and changes nothing — and an
+    /// unknown key refuses before anything is written.
+    #[test]
+    fn adopt_enrollment_takes_only_the_keys_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        let mut fresh = fresh_same_org();
+        fresh.overlay_enabled = false;
+        fresh.auto_grant_session = false;
+        config::save(&from, &fresh).unwrap();
+
+        // Untouched: the existing `true` stays although the fresh file says false.
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+        let merged = config::load(&target).unwrap();
+        assert!(merged.overlay_enabled);
+        assert!(merged.auto_grant_session);
+
+        // Named: the fresh file's value lands, and only for that key.
+        adopt_enrollment_cmd(&target, &from, &["overlay_enabled".to_string()]).unwrap();
+        let merged = config::load(&target).unwrap();
+        assert!(!merged.overlay_enabled, "the taken key");
+        assert!(merged.auto_grant_session, "the key not named");
+        assert_eq!(merged.tunnel_routes.len(), 1, "everything else still kept");
+
+        // A key outside the surface: refused, and the target untouched.
+        let before = std::fs::read_to_string(&target).unwrap();
+        let e = adopt_enrollment_cmd(&target, &from, &["no_such_key".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("not a config key"), "{e}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+    }
+
+    /// A `--from` that is not an enrolled config is a refusal, and the target
+    /// is left alone.
+    #[test]
+    fn adopt_enrollment_refuses_an_unenrolled_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        let mut empty = config::test_fixture();
+        empty.agent_token = String::new();
+        config::save(&from, &empty).unwrap();
+        let before = std::fs::read_to_string(&target).unwrap();
+        assert!(adopt_enrollment_cmd(&target, &from, &[]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+        assert!(adopt_enrollment_cmd(&target, &dir.path().join("missing.toml"), &[]).is_err());
+    }
 }

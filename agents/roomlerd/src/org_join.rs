@@ -527,6 +527,24 @@ fn assign_netstack_port(org: &mut OrgEntry, claimed: &[u16]) -> Option<u16> {
     org.netstack_socks_port
 }
 
+/// FR-129 B1 — a loopback port for the PRIMARY enrollment's netstack front
+/// (`netstack_socks_port`), picked as the secondary orgs' are: the first port
+/// of the band that no org claims and nothing on this host listens on. The
+/// wizard writes it for a per-user Linux daemon that joins the overlay, which
+/// has no CAP_NET_ADMIN under its unit and reaches the mesh only through the
+/// userspace stack. `None` when the band is exhausted; the caller says so.
+pub fn pick_primary_netstack_port(cfg: &AgentConfig) -> Option<u16> {
+    if let Some(port) = cfg.netstack_socks_port {
+        return Some(port);
+    }
+    let claimed: Vec<u16> = cfg
+        .orgs
+        .iter()
+        .filter_map(|o| o.netstack_socks_port)
+        .collect();
+    pick_netstack_port(&claimed)
+}
+
 /// The line a CLI verb prints about a netstack org's front.
 fn say_netstack_front(label: &str, port: Option<u16>) {
     match port {
