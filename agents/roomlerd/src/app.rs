@@ -2780,13 +2780,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     })?;
     use enrollment::EnrollOutcome;
-    let enrolled_agent_id = match &outcome {
-        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => cfg
-            .find_org(label)
-            .map(|o| o.agent_id.clone())
-            .unwrap_or_else(|| cfg.agent_id.clone()),
-        _ => cfg.agent_id.clone(),
-    };
+    let (enrolled_agent_id, _) = enrollment::enrolled_identity(&cfg, &outcome);
     tracing::info!(
         path = %target_path.display(),
         agent_id = %enrolled_agent_id,
@@ -2946,12 +2940,34 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         tracing::warn!(previous = %row.agent_id, new = %new_agent_id, org = %row.org_label, "adopt-enrollment: a new device row; the previous row's overlay key retired");
         eprintln!("WARNING: {said}");
     }
+    use enrollment::EnrollOutcome;
+    // The `--take` keys are the person's boxes for the enrollment they just
+    // made. When that enrollment is ANOTHER org — appended beside the
+    // primary, or a secondary refreshed — every one of them is the PRIMARY's
+    // (the device's consent policy, the primary's mesh and routes), so none
+    // is taken: the wizard's own fold refuses them the same way
+    // (`enroll_step::finish`).
+    let added_org = matches!(
+        outcome,
+        EnrollOutcome::RefreshedOrg { .. } | EnrollOutcome::AppendedOrg { .. }
+    );
+    if added_org && !taken.is_empty() {
+        eprintln!(
+            "NOTE: this enrollment is another organization, added beside the primary one; the \
+             options set for it ({}) are the primary enrollment's settings and were not changed.",
+            taken
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        taken.clear();
+    }
     for (key, value) in &taken {
         roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
             .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
     }
     config::save(&target, &cfg).context("saving the adopted config")?;
-    use enrollment::EnrollOutcome;
     let what = match &outcome {
         EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
         EnrollOutcome::RefreshedPrimary => {
@@ -3769,6 +3785,16 @@ async fn run_cmd(
             Ok(()) => tracing::info!("overlay: generated + persisted node WireGuard key"),
             Err(e) => tracing::warn!(error = %e, "overlay: failed to persist WG key"),
         }
+    }
+
+    // FR-129 B1 — the same for every secondary org on the mesh: one appended
+    // by a build without an overlay surface (the setup wizard, the tray), or
+    // whose key a new device row retired, has none and would join nothing.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    if roomlerd::org_join::heal_org_keys(&mut cfg)
+        && let Err(e) = config::save(config_path, &cfg)
+    {
+        tracing::warn!(error = %e, "overlay: failed to persist the orgs' WG keys");
     }
 
     // #2493 — a secondary in `netstack` mode joins only with a loopback port
@@ -7495,6 +7521,50 @@ mod tests {
         let e = adopt_enrollment_cmd(&target, &from, &["no_such_key".to_string()]).unwrap_err();
         assert!(e.to_string().contains("not a config key"), "{e}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+    }
+
+    /// The person's boxes describe the enrollment they made. When that is
+    /// ANOTHER org, appended beside the primary, every `--take` key is the
+    /// primary's — `auto_grant_session` is the device's consent policy — so
+    /// none is taken, as the wizard's own fold refuses them. Before this an
+    /// install into org B with "auto-grant" ticked auto-granted org A's
+    /// remote-control sessions.
+    #[test]
+    fn adopt_enrollment_takes_no_key_onto_another_orgs_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        let mut existing = operator_config(); // the primary: example.invalid / tid / aid
+        existing.auto_grant_session = false;
+        config::save(&target, &existing).unwrap();
+        let mut other = config::test_fixture();
+        other.server_url = "https://other.invalid".into();
+        other.tenant_id = "tid-other".into();
+        other.agent_id = "aid-other".into();
+        other.agent_token = "tok-other".into();
+        other.auto_grant_session = true;
+        other.overlay_enabled = false;
+        config::save(&from, &other).unwrap();
+
+        adopt_enrollment_cmd(
+            &target,
+            &from,
+            &[
+                "auto_grant_session".to_string(),
+                "overlay_enabled".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_id, "aid", "the primary stays the primary");
+        assert!(
+            !merged.auto_grant_session,
+            "the primary's consent policy is not the added org's box"
+        );
+        assert!(merged.overlay_enabled, "nor is the primary's mesh");
+        assert_eq!(merged.orgs.len(), 1, "the org is appended all the same");
+        assert_eq!(merged.orgs[0].agent_id, "aid-other");
     }
 
     /// A `--from` that is not an enrolled config is a refusal, and the target

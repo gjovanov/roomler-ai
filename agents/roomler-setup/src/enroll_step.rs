@@ -169,11 +169,12 @@ pub fn finish(
             advanced.apply_to(cfg, true)?;
             Ok(None)
         }
-        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => {
-            Ok(Some(format!(
-                "this machine is already enrolled in another organization; the new one was added as org \"{label}\" (manage with `roomlerd org ls`). The Advanced options apply to the primary enrollment and were not changed."
-            )))
-        }
+        EnrollOutcome::AppendedOrg { label } => Ok(Some(format!(
+            "this machine is already enrolled in another organization, so this one was added beside it as org \"{label}\" (`roomlerd org ls` lists them). The daemon serves it from its next start. Its private network is off until you join it (`roomlerd org overlay {label} netstack`). The Advanced options are the primary enrollment's and were not changed."
+        ))),
+        EnrollOutcome::RefreshedOrg { label } => Ok(Some(format!(
+            "this machine already has this organization as org \"{label}\", beside its primary enrollment; that entry was refreshed (`roomlerd org ls` lists them). The daemon serves it from its next start. The Advanced options are the primary enrollment's and were not changed."
+        ))),
     }
 }
 

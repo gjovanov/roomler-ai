@@ -647,8 +647,10 @@ async fn run_install_inner(
     if let Some(message) = note {
         emit(on_event, ProgressEvent::PreflightWarning { message });
     }
-    let agent_id = cfg.agent_id.clone();
-    let tenant_id = cfg.tenant_id.clone();
+    // The device this install enrolled: on an org added beside the primary,
+    // that org's row, never the primary's (the config's top-level ids).
+    let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
+    let added_org = roomlerd::enrollment::is_added_org(&outcome);
     roomlerd::config::save(&config_path, &cfg)
         .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
     emit(
@@ -679,7 +681,17 @@ async fn run_install_inner(
     // companion step: a declined prompt or a failure leaves an enrolled
     // install, and the Done page carries the manual command.
     diag.begin(Step::Anchor);
-    let anchored = anchor_device(role, wfx, &server, &token, &agent_id, on_event).await;
+    let anchored = if added_org {
+        // Not the step at all, so the Done page offers no manual command for
+        // it: that command would move the machine's anchor to this org.
+        if let Some(reason) = added_org_anchor_note(role, &token) {
+            tracing::warn!(%reason, "FR-104: the device was not anchored");
+            emit(on_event, ProgressEvent::AnchorSkipped { reason });
+        }
+        None
+    } else {
+        anchor_device(role, wfx, &server, &token, &agent_id, on_event).await
+    };
     best_effort_outcome(diag, anchored, ErrorCode::Anchor);
 
     // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
@@ -737,6 +749,23 @@ fn best_effort_outcome(diag: &Diagnostics, report: Option<bool>, code: ErrorCode
 /// for? The two machine-wide Windows roles; a per-user install has none.
 pub fn role_anchors(role: Role) -> bool {
     cfg!(target_os = "windows") && matches!(role, Role::DaemonSystem | Role::DaemonMachine)
+}
+
+/// FR-104 on an install whose enrollment was ADDED beside the machine's
+/// primary one (another org): the step does not run. The anchor is one per
+/// machine (`exec_service.rs`: one `anchor.json`, and only the anchored
+/// device's connection advertises `exec-system`), so anchoring this org's row
+/// would take SYSTEM exec away from the primary organization on another
+/// organization's token, the rule peer relays keep too (primary-org only).
+/// `Some(reason)` when the token asked for an anchor, so the person is told;
+/// `None` when the step would not have applied anyway.
+pub(crate) fn added_org_anchor_note(role: Role, token: &str) -> Option<String> {
+    (role_anchors(role) && wizard_shared::token_peek::parse_anchor_claim(token)).then(|| {
+        "this install added another organization beside the machine's primary enrollment, \
+         and the machine's one SYSTEM anchor belongs to the primary organization, so this \
+         device was not anchored"
+            .to_string()
+    })
 }
 
 /// How long the elevated anchor step may take, the administrator prompt
@@ -1518,5 +1547,34 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(v.touched_keys(), vec!["overlay_enabled".to_string()]);
+    }
+
+    /// An install whose enrollment was added beside the machine's primary
+    /// one is never anchored: the machine's one SYSTEM anchor stays the
+    /// primary organization's. The person is told when the token asked for an
+    /// anchor (a machine-wide role, on Windows); otherwise there is nothing to
+    /// say. Before this the step ran with the primary's device id and the new
+    /// org's token, and the server refused it as "no such device".
+    #[test]
+    fn an_added_org_is_never_anchored() {
+        // Unsigned test JWTs: only the payload is read.
+        let anchoring = "h.eyJ0b2tlbl90eXBlIjoiZW5yb2xsbWVudCIsImFuY2hvciI6dHJ1ZX0.s";
+        let plain = "h.eyJ0b2tlbl90eXBlIjoiZW5yb2xsbWVudCJ9.s";
+        assert!(wizard_shared::token_peek::parse_anchor_claim(anchoring));
+        assert_eq!(
+            added_org_anchor_note(Role::DaemonUser, anchoring),
+            None,
+            "a per-user role has no SYSTEM service"
+        );
+        assert_eq!(
+            added_org_anchor_note(Role::DaemonSystem, plain),
+            None,
+            "a plain token asked for no anchor"
+        );
+        let note = added_org_anchor_note(Role::DaemonSystem, anchoring);
+        assert_eq!(note.is_some(), cfg!(target_os = "windows"));
+        if let Some(note) = note {
+            assert!(note.contains("primary organization"), "{note}");
+        }
     }
 }

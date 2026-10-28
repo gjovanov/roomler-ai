@@ -171,6 +171,15 @@ fn resume_from(
     )
 }
 
+/// F5 — is the device a kept enrollment names still in this config? It is the
+/// primary's or, for an org the attempt added beside the primary, that org
+/// entry's ([`roomlerd::enrollment::enrolled_identity`]).
+fn enrollment_in(cfg: Option<&roomlerd::config::AgentConfig>, agent_id: &str) -> bool {
+    cfg.is_some_and(|cfg| {
+        cfg.agent_id == agent_id || cfg.orgs.iter().any(|o| o.agent_id == agent_id)
+    })
+}
+
 async fn run_install_inner(
     role: Role,
     server: String,
@@ -426,12 +435,8 @@ async fn run_install_inner(
         if let Some(message) = existing.warning.clone() {
             warn(on_event, message);
         }
-        let reusable = kept_ids.filter(|(agent_id, _)| {
-            existing
-                .cfg
-                .as_ref()
-                .is_some_and(|cfg| &cfg.agent_id == agent_id)
-        });
+        let reusable =
+            kept_ids.filter(|(agent_id, _)| enrollment_in(existing.cfg.as_ref(), agent_id));
         match reusable {
             Some((agent_id, tenant_id)) => {
                 warn(
@@ -485,8 +490,11 @@ async fn run_install_inner(
                 roomlerd::config::save(&config_path, &cfg).map_err(|e| {
                     failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}"))
                 })?;
-                emit_enrolled(on_event, &cfg.agent_id, &cfg.tenant_id);
-                ids = Some((cfg.agent_id.clone(), cfg.tenant_id.clone()));
+                // The device this install enrolled: on an org added beside the
+                // primary, that org's row, never the primary's.
+                let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
+                emit_enrolled(on_event, &agent_id, &tenant_id);
+                ids = Some((agent_id, tenant_id));
             }
         }
         diag.ok();
@@ -1071,6 +1079,36 @@ mod tests {
         let per_user = cancelled_after_privileged(Scope::PerUser);
         assert!(per_user.contains("not enrolled yet"), "{per_user}");
         assert!(!per_user.contains("nothing was installed"), "{per_user}");
+    }
+
+    /// F5 — a kept enrollment is reused when its device is still in the
+    /// config: the primary's, or the entry of an org the attempt added beside
+    /// it. Without the second, a Retry after an install into another org
+    /// enrolled again with the token the attempt had spent.
+    #[test]
+    fn a_kept_enrollment_is_found_in_an_added_org_too() {
+        let mut cfg = roomlerd::config::test_fixture(); // primary "aid"
+        assert!(enrollment_in(Some(&cfg), "aid"), "the primary");
+        assert!(!enrollment_in(Some(&cfg), "aid-other"));
+        let (merged, outcome) = roomlerd::enrollment::apply_enrollment(
+            Some(cfg.clone()),
+            {
+                let mut other = roomlerd::config::test_fixture();
+                other.server_url = "https://other.invalid".into();
+                other.tenant_id = "tid-other".into();
+                other.agent_id = "aid-other".into();
+                other
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(roomlerd::enrollment::is_added_org(&outcome));
+        cfg = merged;
+        let (kept, _) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
+        assert_eq!(kept, "aid-other", "the added org's own row");
+        assert!(enrollment_in(Some(&cfg), &kept), "found in the added org");
+        assert!(!enrollment_in(None, "aid"), "no config: nothing kept");
     }
 
     /// F5 — a spent token's refusal names the remedy.

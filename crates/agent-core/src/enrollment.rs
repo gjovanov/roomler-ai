@@ -732,12 +732,15 @@ pub struct PreviousRow {
 /// nothing), and its mesh never comes up.
 ///
 /// This retires that key from the folded config — the daemon mints a fresh one
-/// at its next overlay start, as on a first install (`overlay_wg_key_epoch`
-/// back to 0, the first key of the new row) — and returns the previous row
-/// for the caller to name. It does nothing when the row is the same one (an
-/// ordinary reinstall keeps its key: no rotation) and for a fresh config or
-/// another org. A refreshed secondary org gets the same treatment for its own
-/// key.
+/// at its next start, as on a first install (`overlay_wg_key_epoch` back to 0,
+/// the first key of the new row) — and returns the previous row for the caller
+/// to name. It does nothing when the row is the same one (an ordinary
+/// reinstall keeps its key: no rotation) and for a fresh config or another
+/// org. A refreshed secondary org gets the same treatment for its own key.
+/// Both mints are the daemon's own: the primary's at its first overlay-enabled
+/// start, a secondary's when its overlay is on (`roomlerd`'s
+/// `org_join::heal_org_keys`). Before that heal a secondary was minted only
+/// when it was appended, so a key retired here left that org off its mesh.
 ///
 /// It never folds into the previous row instead. That would need the previous
 /// machine id, and on a cloned VM the previous row is the ORIGINAL machine's,
@@ -801,6 +804,34 @@ pub fn describe_previous_row(previous: &PreviousRow, new_agent_id: &str) -> Stri
          is the machine this one was cloned from, leave it.",
         old = previous.agent_id,
         new = new_agent_id,
+    )
+}
+
+/// The device an enrollment landed on, `(agent_id, tenant_id)`: the primary's
+/// for a fresh, refreshed or replaced primary, the org entry's for an org
+/// refreshed or appended beside it. A caller that reports or acts on "the
+/// device just enrolled" reads this, never the folded config's top-level ids:
+/// those are the PRIMARY's, and an install into another org would otherwise
+/// name — and anchor — a device of the wrong org.
+pub fn enrolled_identity(cfg: &AgentConfig, outcome: &EnrollOutcome) -> (String, String) {
+    match outcome {
+        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => cfg
+            .find_org(label)
+            .map(|o| (o.agent_id.clone(), o.tenant_id.clone()))
+            .unwrap_or_else(|| (cfg.agent_id.clone(), cfg.tenant_id.clone())),
+        EnrollOutcome::FreshPrimary
+        | EnrollOutcome::RefreshedPrimary
+        | EnrollOutcome::ReplacedPrimary => (cfg.agent_id.clone(), cfg.tenant_id.clone()),
+    }
+}
+
+/// Did the enrollment land on an org BESIDE the primary (refreshed or
+/// appended)? Then everything host-global stays the primary's: its options,
+/// its exec anchor.
+pub fn is_added_org(outcome: &EnrollOutcome) -> bool {
+    matches!(
+        outcome,
+        EnrollOutcome::RefreshedOrg { .. } | EnrollOutcome::AppendedOrg { .. }
     )
 }
 
@@ -1303,6 +1334,64 @@ mod tests {
             None
         );
         assert_eq!(cfg.overlay_wg_secret_key.as_deref(), Some("OLD-WG-KEY"));
+    }
+
+    /// FR-129 B1 — the device an enrollment landed on. For the primary
+    /// outcomes it is the primary's; for an org appended or refreshed beside
+    /// it, the org entry's — never the folded config's top-level ids, which
+    /// stay the primary's. Before this the setup wizard reported an install
+    /// into org B with org A's device and org, and passed org A's device to
+    /// the FR-104 anchor step with org B's token.
+    #[test]
+    fn the_enrolled_identity_is_the_orgs_when_it_lands_beside_the_primary() {
+        let existing = crate::config::test_fixture(); // example.invalid / tid / aid
+
+        let (cfg, outcome) = apply_enrollment(
+            Some(existing.clone()),
+            fresh_for("https://b.invalid", "t2", "T2"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, EnrollOutcome::AppendedOrg { .. }));
+        assert!(is_added_org(&outcome));
+        assert_eq!(cfg.agent_id, "aid", "the primary stays the primary");
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid-t2".to_string(), "t2".to_string())
+        );
+
+        // That org refreshed: still its own row, not the primary's.
+        let (cfg, outcome) = apply_enrollment(
+            Some(cfg),
+            fresh_for("https://b.invalid", "t2", "T2-again"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, EnrollOutcome::RefreshedOrg { .. }));
+        assert!(is_added_org(&outcome));
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid-t2".to_string(), "t2".to_string())
+        );
+
+        // The primary refreshed, and a fresh config: the top-level ids.
+        let mut same = crate::config::test_fixture();
+        same.agent_token = "NEW".into();
+        let (cfg, outcome) = apply_enrollment(Some(existing), same, None, false).unwrap();
+        assert!(!is_added_org(&outcome));
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid".to_string(), "tid".to_string())
+        );
+        let (cfg, outcome) =
+            apply_enrollment(None, fresh_for("https://a.invalid", "t1", "x"), None, false).unwrap();
+        assert!(!is_added_org(&outcome));
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid-t1".to_string(), "t1".to_string())
+        );
     }
 
     /// FR-129 B1 — the same for a refreshed secondary org: its own key goes,
