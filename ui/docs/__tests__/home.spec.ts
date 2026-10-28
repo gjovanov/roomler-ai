@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearSignedIn, markSignedIn } from '../../src/api/session.ts'
 import { enrollCommands } from '../../src/utils/enrollCommands.ts'
-import { CAPABILITIES, FALLBACK_PLANS, HERO, PILLARS, annualLine } from '../../src/utils/landing.ts'
+import { CAPABILITIES, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, annualLine } from '../../src/utils/landing.ts'
 import { MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS, SITE_ORIGIN } from '../site.ts'
 import { HOME_DESCRIPTION, HOME_TITLE, priceLabel, renderHome } from '../theme/home-layout.ts'
 import type { ShellNav, SiteAssets } from '../theme/shell.ts'
@@ -121,6 +121,26 @@ describe('the static homepage', () => {
       const escaped = cmd.command.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
       expect(html).toContain(`<pre class="home-cmd"><code>${escaped}</code></pre>`)
     }
+  })
+
+  // FR-129 B1-s — the page is written at build time, when the server's
+  // `wizard_unix_daemon` cannot be known, so it ships the FR-97 D5 layout and
+  // carries the Linux and macOS buttons hidden for home.js (below).
+  it('ships the Linux and macOS wizard buttons hidden, in the Windows card’s markup, for home.js to show', () => {
+    const html = render()
+    // Windows: the button as always, nothing gated, nothing to swap.
+    expect(html).toContain(`<div class="home-card home-card--os" data-os="windows"><h3 class="home-card__title home-os">`)
+    expect(html).toContain(`<p><a class="btn btn--tonal" href="${SITE_ORIGIN}/api/setup/windows">`)
+    expect(html).toContain('</a></p><p class="home-muted">Or from a terminal:</p>')
+    // Linux and macOS: the same button, hidden, with the URL the switch
+    // unlocks; the label carries its wording-with-a-wizard for home.js.
+    for (const os of ['linux', 'macos']) {
+      expect(html).toContain(`<p data-wizard-unix hidden><a class="btn btn--tonal" href="${SITE_ORIGIN}/api/setup/${os}">`)
+    }
+    expect(html.match(/data-wizard-unix/g)).toHaveLength(2)
+    expect(html.match(/<p class="home-muted" data-terminal-label data-with-wizard="Or from a terminal:">From a terminal:<\/p>/g)).toHaveLength(2)
+    // The lead ships the token wording and carries the pairing one.
+    expect(html).toContain(`<p class="home-sub" data-download-lead data-pairing-lead="${DOWNLOAD.leadPairing}">${DOWNLOAD.lead}</p>`)
   })
 
   it('ships the fallback price table, marked up for the live refresh', () => {
@@ -421,5 +441,68 @@ describe('home.js — live prices', () => {
       await settle()
       expect(doc.querySelector('[data-plans]')!.innerHTML).toBe(before)
     }
+  })
+})
+
+// FR-129 B1-s — `/api/setup/features`: the Linux and macOS "Roomler Setup"
+// buttons and the pairing lead, failing CLOSED (the page as built) on anything
+// but a JSON `true`.
+describe('home.js — the install switches (FR-129 B1-s)', () => {
+  const base = { '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404 }
+  const FEATURES_ON = { ok: true, body: { pairing: true, wizard_unix_daemon: true } }
+  const button = (doc: Document, os: string) => doc.querySelector(`[data-os="${os}"] [data-wizard-unix]`) as HTMLElement
+  const label = (doc: Document, os: string) => doc.querySelector(`[data-os="${os}"] .home-muted`)!.textContent
+  const lead = (doc: Document) => doc.querySelector('[data-download-lead]')!.textContent
+
+  it('asks the server with no credentials', async () => {
+    const run = runHomeJs({ ...base, '/api/setup/features': FEATURES_ON })
+    await settle()
+    expect(run.fetch).toHaveBeenCalledWith('/api/setup/features', { credentials: 'omit' })
+  })
+
+  it('shows the Linux and macOS buttons, in the Windows card’s layout, and the pairing lead once the server says so', async () => {
+    const { doc } = runHomeJs({ ...base, '/api/setup/features': FEATURES_ON })
+    await settle()
+    for (const os of ['linux', 'macos']) {
+      expect(button(doc, os).hidden, os).toBe(false)
+      expect(button(doc, os).querySelector('a')!.getAttribute('href')).toBe(`${SITE_ORIGIN}/api/setup/${os}`)
+      expect(button(doc, os).querySelector('a')!.textContent).toBe('Roomler Setup')
+      // The button sits above the terminal form, as on the Windows card.
+      expect(button(doc, os).nextElementSibling).toBe(doc.querySelector(`[data-os="${os}"] .home-muted`))
+      expect(label(doc, os)).toBe('Or from a terminal:')
+    }
+    expect(label(doc, 'windows')).toBe('Or from a terminal:')
+    expect(lead(doc)).toBe(DOWNLOAD.leadPairing)
+  })
+
+  it('reads each switch on its own', async () => {
+    const a = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: false } } })
+    await settle()
+    expect(button(a.doc, 'linux').hidden).toBe(true)
+    expect(label(a.doc, 'linux')).toBe('From a terminal:')
+    expect(lead(a.doc)).toBe(DOWNLOAD.leadPairing)
+
+    const b = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: false, wizard_unix_daemon: true } } })
+    await settle()
+    expect(button(b.doc, 'macos').hidden).toBe(false)
+    expect(label(b.doc, 'macos')).toBe('Or from a terminal:')
+    expect(lead(b.doc)).toBe(DOWNLOAD.lead)
+  })
+
+  it.each([
+    ['an older server (404)', { ok: false, status: 404 }],
+    ['a server without the fleet module (503)', { ok: false, status: 503 }],
+    ['unreachable', new Error('offline')],
+    ['saying both are off', { ok: true, body: { pairing: false, wizard_unix_daemon: false } }],
+    ['sending strings, not booleans', { ok: true, body: { pairing: 'true', wizard_unix_daemon: 'true' } }],
+    ['sending no object', { ok: true, body: null }],
+    ['sending an array', { ok: true, body: [true, true] }],
+  ] as Array<[string, Answer]>)('fails CLOSED — the page exactly as built — with the endpoint %s', async (_, answer) => {
+    const before = new DOMParser().parseFromString(render(), 'text/html').querySelector('#download')!.innerHTML
+    const { doc } = runHomeJs({ ...base, '/api/setup/features': answer })
+    await settle()
+    expect(doc.querySelector('#download')!.innerHTML).toBe(before)
+    expect(button(doc, 'linux').hidden).toBe(true)
+    expect(lead(doc)).toBe(DOWNLOAD.lead)
   })
 })

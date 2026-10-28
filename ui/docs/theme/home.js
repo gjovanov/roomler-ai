@@ -22,6 +22,16 @@
  * 4. FR-88 (#1790): the `subscribe` goal after the newsletter's 202, and the
  *    campaign as the form's `source` when `attribution.js` found one on the
  *    URL (it sets `data-source`; without it the source stays `home`).
+ * 5. FR-129 B1-s: the install switches from `/api/setup/features`. The page
+ *    is written at build time with Roomler Setup on the Windows card only
+ *    (FR-97 D5) and the Linux and macOS buttons HIDDEN; the server says
+ *    whether the released wizard installs the daemon there
+ *    (`wizard_unix_daemon`) and whether it signs the person in from the
+ *    browser (`pairing`, which swaps the section's lead). Fail CLOSED, the
+ *    opposite of the newsletter: anything but a JSON `true` — an older
+ *    server's 404, a server without the fleet module, a proxy's error page —
+ *    leaves the page as built. A button the wizard cannot honour is the
+ *    mistake.
  *
  * With JavaScript off the page is complete; only the form is replaced by a
  * pointer to sign-up.
@@ -170,8 +180,41 @@
       })
   }
 
+  // FR-129 B1-s — see 5. above. The markup carries everything: the hidden
+  // button with its URL (`[data-wizard-unix]`), the label's wording with a
+  // wizard (`[data-terminal-label]`'s `data-with-wizard`), and the pairing
+  // lead (`[data-download-lead]`'s `data-pairing-lead`), all from
+  // `enrollCommands.ts` and `landing.ts` at build time, so this reads only
+  // two booleans and never composes copy or a URL.
+  function initSetupFeatures() {
+    var buttons = document.querySelectorAll('[data-wizard-unix]')
+    var lead = document.querySelector('[data-download-lead]')
+    if (!buttons.length && !lead) return
+    fetch('/api/setup/features', { credentials: 'omit' })
+      .then(function (r) {
+        return r.ok ? r.json() : null
+      })
+      .then(function (f) {
+        if (!f || typeof f !== 'object') return
+        if (f.wizard_unix_daemon === true) {
+          Array.prototype.forEach.call(buttons, function (p) {
+            p.hidden = false
+            var label = p.parentNode && p.parentNode.querySelector('[data-terminal-label]')
+            var wording = label && label.getAttribute('data-with-wizard')
+            if (wording) label.textContent = wording
+          })
+        }
+        var pairingLead = lead && lead.getAttribute('data-pairing-lead')
+        if (f.pairing === true && pairingLead) lead.textContent = pairingLead
+      })
+      .catch(function () {
+        /* as built: the wizard on Windows only, the token lead */
+      })
+  }
+
   ready(function () {
     initNewsletter()
     initPrices()
+    initSetupFeatures()
   })
 })()

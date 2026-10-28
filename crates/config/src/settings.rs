@@ -75,6 +75,29 @@ pub struct Settings {
     /// defaults.
     #[serde(default)]
     pub pairing: PairingSettings,
+    /// FR-129 B1-s — what `GET /api/setup/features` advertises to the
+    /// installers and the download cards. Absent ⇒ every switch off.
+    #[serde(default)]
+    pub setup: SetupSettings,
+}
+
+/// FR-129 B1-s — `[setup]`, env `ROOMLER__SETUP__*`: the switches
+/// `GET /api/setup/features` advertises (`crates/modules/fleet/src/setup_release.rs`,
+/// `setup_features`). Each is the operator's assertion about a RELEASED
+/// client, not a fact about this server, so each defaults **off** and is
+/// flipped in the deploy env — later a default change — once the field run
+/// that proves the client is on record.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SetupSettings {
+    /// "The released Roomler Setup installs the full daemon on Linux and
+    /// macOS, and it is field-proven" (FR-129 B1; AC11). While `false`, the
+    /// SPA's enrollment dialog and both homepages offer the wizard for a
+    /// daemon on Windows only, as before FR-129, and a B1 wizard shows no
+    /// daemon card off Windows (AC14, key design B.6) — so the cards can be
+    /// turned off without a release. Default **off**: the wizard that can do
+    /// it has not shipped. Env: `ROOMLER__SETUP__WIZARD_UNIX_DAEMON`.
+    #[serde(default)]
+    pub wizard_unix_daemon: bool,
 }
 
 /// FR-129 A1 — `[pairing]`, env `ROOMLER__PAIRING__*`: the RFC 8628-shaped
@@ -2057,6 +2080,26 @@ mod pairing_settings_tests {
             off.poll_interval_secs, 5,
             "the other keys keep their defaults"
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_settings_tests {
+    use super::SetupSettings;
+
+    /// FR-129 B1-s — the Unix daemon wizard switch ships OFF, both where the
+    /// settings are built whole and where a file leaves the key out; only a
+    /// file (or `ROOMLER__SETUP__WIZARD_UNIX_DAEMON=true`) turns it on. The
+    /// default is the claim: the wizard that installs the daemon off Windows
+    /// has not shipped, and a card the released wizard cannot honour is the
+    /// failure the switch exists to prevent.
+    #[test]
+    fn the_unix_daemon_wizard_is_off_until_turned_on() {
+        assert!(!SetupSettings::default().wizard_unix_daemon);
+        let absent: SetupSettings = toml::from_str("").expect("every key defaults");
+        assert!(!absent.wizard_unix_daemon, "a file without the key");
+        let on: SetupSettings = toml::from_str("wizard_unix_daemon = true").unwrap();
+        assert!(on.wizard_unix_daemon);
     }
 }
 

@@ -381,6 +381,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/setup/features",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/setup/install.ps1",
       "methods": "GET,HEAD"
     },
