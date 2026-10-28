@@ -1275,12 +1275,14 @@ jobs:
       # FR-97 P2f-2: and `macos_spawn::`, a child started as its own
       # responsible process: the private call is there, and a real
       # posix_spawn's pipes carry both ways, with the extra environment.
+      # #3018: and `thread_dump::`, a stall's thread stacks: `/usr/bin/sample`
+      # reads this test process, and its real report must parse.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn::
+          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the

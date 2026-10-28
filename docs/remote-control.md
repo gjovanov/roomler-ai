@@ -3568,7 +3568,7 @@ supervisor to relaunch a healthy copy. Suspend handling: if a loop
 iteration takes more than `SCAN_INTERVAL + 60s`, treat as wall-clock
 jump (laptop close-lid → resume) and reset all pump heartbeats
 instead of declaring a stall. **Watchdog-of-watchdog** runs on a
-dedicated `std::thread` (the only `std::thread` in the codebase),
+dedicated `std::thread`, outside the runtime it watches,
 wakes every 30s, force-exits if the async watchdog hasn't bumped
 its `AtomicU64` heartbeat in 60s — catches a fully-deadlocked
 tokio runtime.
@@ -3578,7 +3578,7 @@ where it is. The signaling loop awaits inside its `select!` arms,
 so a stall is one arm whose await never returned, and the INFO log
 is silent while it waits.
 - Every arm therefore enters a named stage first
-  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:375`):
+  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:434`):
   `shutdown`, `keepalive`, `netchange`, `heartbeat`, `outbound`,
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
@@ -3592,12 +3592,12 @@ is silent while it waits.
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
   `agents/roomlerd/src/signaling.rs:6782`). The dispatch awaits per
   message, so that is where a stall inside it shows.
-- The `StageGuard` (`watchdog.rs:389`) puts the pump back to
+- The `StageGuard` (`watchdog.rs:448`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
   leaves early cannot leave its name behind for a later stall to be
   blamed on.
 - The stall report then reads `signaling=93s@ws.text:rc:ssh.response`
-  (`stall_summary`, `watchdog.rs:405`). The `name=Ns` prefix is
+  (`stall_summary`, `watchdog.rs:464`). The `name=Ns` prefix is
   unchanged, so a parser of the old line still finds the pump.
 - ⚠️ Read it from the crash record, not only the log. The summary
   also goes into the crash sidecar that the next worker uploads
@@ -3605,11 +3605,11 @@ is silent while it waits.
   own log line about 1 stall in 6, measured on a Windows dev box on
   2026-10-19.
 - The sidecar is fsync'd before its rename
-  (`crates/agent-core/src/crash_recorder.rs:253`, #2955). Without that,
+  (`crates/agent-core/src/crash_recorder.rs:286`, #2955). Without that,
   a power loss could persist a NUL-filled file that no parser reads; one
   was seen, skipped at every start for two weeks. A sidecar that does
   not parse is now moved once into `crashes/malformed/`
-  (`crash_recorder.rs:390`), so it is kept but not re-warned.
+  (`crash_recorder.rs:423`), so it is kept but not re-warned.
 
 **What the first named stall found** (#2551). The first stall to name
 its stage came on 2026-10-22, under 0.4.151, and read
@@ -3650,6 +3650,59 @@ table), on a host whose adapters and routes churn.
   - It is now warmed at the top of `run`, before any connect, while the
     pump is gated off and on a blocking thread
     (`agents/roomlerd/src/signaling.rs:852`).
+
+**What a stall leaves behind** (#3018). Until #3018 the
+watchdog-of-watchdog wrote one stderr line and exited. On 2026-10-26
+a Mac's whole runtime froze for a minute inside an overlay carrier
+flap, and that line was all there was. No crash record reached the
+server, and nothing said where any worker was stuck. Both exits now
+leave the same evidence before they go:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as watchdog-of-watchdog (std thread)
+    participant E as evidence thread
+    participant S as sample (macOS) / procfs (Linux)
+    W->>W: the async watchdog's heartbeat stood still past 60 s
+    W->>W: stderr line, then the exit-node routes dropped
+    W->>E: collect, within STALL_EVIDENCE_BUDGET (10 s)
+    E->>S: every thread's stack (6 s deadline)
+    S-->>E: the whole report, kept in the log dir
+    E->>E: crash sidecar (WatchdogStall): summary, log tail, condensed stacks
+    E-->>W: done, or the budget ran out
+    W->>W: exit(2), either way
+```
+
+| what | where |
+|---|---|
+| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:600` |
+| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:689` |
+| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:637`, `within` `:674` |
+| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:365` |
+| Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
+| Condensed per thread to the leaf end of its heaviest path, 16 frames, with identical stacks folded and a 24 KiB cap | `condense_sample` `:191`, `condense_procfs` `:412` |
+| Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:124` |
+| The whole report stays beside the log as `stall-<unix>-<pid>.threads.txt`, the newest 3 | `FULL_REPORTS_KEPT`, `thread_dump.rs:46` |
+
+- The summary reads `runtime stalled: the async watchdog has not
+  ticked in 63s (watchdog-of-watchdog); pumps: signaling=88s@select`,
+  and the sidecar's log tail ends with a block headed
+  `--- thread stacks (#3018): N threads, M stacks (sample, 1 s) ---`.
+- As root, `sample` reads the hardened-runtime daemon: measured on a
+  MacBook on 0.4.181, 43 threads with symbolized Rust frames in 1.6 s.
+  On macOS the stacks are read **only as root**
+  (`may_read_own_stacks`, `watchdog.rs:656`). The FR-43 GUI worker runs
+  as the signed-in person, where a request to read the hardened binary
+  would be refused, and a refused debugger-style request has no business
+  on someone's desktop. Its record names the stall without the stacks.
+- On Linux, procfs gives each thread's name, state and kernel wait
+  channel. Its kernel stack needs root. That says "waiting on a futex"
+  or "in a socket send", not which Rust frame.
+- ⚠️ The report is written into the agent's own log dir, never `/tmp`.
+  `sample -file` writes as root, and a predictable name in a
+  world-writable directory lets any local account plant a symlink
+  there and have root overwrite the file it points to.
 
 **Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
