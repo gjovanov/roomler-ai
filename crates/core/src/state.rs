@@ -23,7 +23,10 @@
 //! ([`crate::ws`], [`crate::cluster`], [`crate::storage`],
 //! [`crate::user_analytics`], [`crate::rate_limit`], [`crate::relay_load`]).
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+};
 
 use bson::oid::ObjectId;
 use mongodb::Database;
@@ -129,4 +132,43 @@ pub struct Core {
     /// unlimited, and an org there is `free` only because nobody sold it
     /// anything. Set once, by the host.
     pub plans_sold: bool,
+    /// FR-129 A1 — the module ids this pod actually mounts, as
+    /// `GET /api/capabilities` reports them: the host copies its composed
+    /// set in here once, at the end of composition, so a module can ask
+    /// whether a sibling it must not call is present (fleet refuses a
+    /// tunnel-role pairing while `network` is unmounted, because the token
+    /// it would mint has no route to be redeemed on). Shared, so the copy
+    /// made after this `Core` was cloned is visible to the clone. Empty
+    /// until composition has finished, which no request can observe.
+    pub mounted: MountedModules,
+}
+
+/// FR-129 A1 — the mounted module set, written once by the host after it
+/// composed the modules and read by any module thereafter. A plain
+/// `RwLock`: nothing holds it across an await (the read is a `contains` on
+/// a handful of static strings).
+#[derive(Clone, Default)]
+pub struct MountedModules {
+    ids: Arc<RwLock<Vec<&'static str>>>,
+}
+
+impl MountedModules {
+    /// The host's one write — the ids `compose::Modules::mounted()` answers,
+    /// so this and `/api/capabilities` can never disagree.
+    pub fn set(&self, ids: Vec<&'static str>) {
+        *self.ids.write().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
+
+    /// Whether the module `id` is mounted on this pod.
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id)
+    }
+
+    /// Every mounted id, in composition order.
+    pub fn ids(&self) -> Vec<&'static str> {
+        self.ids.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }

@@ -495,6 +495,49 @@ consent prompt.</p>
         self.send(to_email, &subject, &html).await
     }
 
+    /// FR-129 A1 — tell an org's other `MANAGE_AGENTS` holders that a
+    /// device was paired into the org through `/pair`: who approved, which
+    /// machine, from which country (or "an unknown location" — never a
+    /// guess). Informational; the device list is the link. Admin-to-admin,
+    /// so the approver themselves never receives it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_device_paired_notice(
+        &self,
+        to_email: &str,
+        approver_name: &str,
+        machine_name: &str,
+        os_label: &str,
+        org_name: &str,
+        location: &str,
+        devices_url: &str,
+    ) -> anyhow::Result<()> {
+        let subject = format!("{approver_name} paired {machine_name} into {org_name}");
+        let html = format!(
+            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>A device was paired into {org}</h2>
+<p><strong>{approver}</strong> paired <strong>{machine}</strong> ({os}) into
+<strong>{org}</strong> from {location}.</p>
+<p style="margin: 24px 0;">
+  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
+    Open the device list
+  </a>
+</p>
+<p style="color: #b45309; font-size: 12px;">
+  If nobody in your organization was setting this device up, remove it from the
+  device list and review who holds the permission to add devices.
+</p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
+</div>"#,
+            approver = approver_name,
+            machine = machine_name,
+            os = os_label,
+            org = org_name,
+            location = location,
+            url = devices_url,
+        );
+        self.send(to_email, &subject, &html).await
+    }
+
     /// Send a mention notification email.
     pub async fn send_mention_notification(
         &self,
