@@ -444,9 +444,12 @@ flowchart LR
   §9 log: the share of the encode stage that is conversion, copy and upload, against submission and drain, and
   the capture thread's readback. On the QSV hosts that readback is the DXGI arm's, so its half is read once P0b
   has shipped. This is the red record for AC3 and AC4.
-- [ ] **AC2 — C0 is invisible.** `Frame::cpu()` on a GPU frame returns the bytes today's readback returns:
+- [x] **AC2 — C0 is invisible.** `Frame::cpu()` on a GPU frame returns the bytes today's readback returns:
   tested on a Windows CI device (WARP is enough), and on the synthetic source. L0's cells read the same within
-  their spread, with only `Cpu` produced.
+  their spread, with only `Cpu` produced. **Met 2026-10-28.** The GPU half ran in CI on the Windows runner's
+  WARP device (§5.3, run 40617907270). The synthetic source reads through `Frame::cpu()` in every L0 cell, and
+  `a_cpu_frame_reads_back_the_bytes_it_was_built_with` covers the CPU frame (§5.2). The L0 half: 14 CI runs, the
+  same within each runner class (§9, the 2026-10-28 CI row).
 - [ ] **AC3 — the first cell, in the field.** On a QSV host whose panel is on the Intel adapter, 20-minute
   sessions with the switch on and off, back to back, on the same content. Pass if all of these hold: the encode
   stage per frame falls by at least the conversion + copy + upload share P0 measured on that host, minus the GPU
@@ -495,6 +498,7 @@ flowchart LR
 | 2026-10-21 | fleet, agents 0.4.135–0.4.148 | every FFmpeg DC session for 7 days: 142 538 heartbeats, 11 hosts | **The red record, before P0.** §2.2's table. The 2880×1800 `hevc_qsv` laptop peaked at 29.4 fps against 60. At 1080p, QSV's encode stage takes 10.6 ms. `hevc_nvenc` takes 22 ms where `av1_nvenc` takes 10–11 ms on the same host, so that host's cap is not a copy |
 | 2026-10-27 | fleet, agents 0.4.150–0.4.180, 10-21 16:55Z → 10-27 23:35Z | every FFmpeg DC heartbeat with P0's fields: 26 encoder × geometry groups of ≥ 10 windows | **An interim split, not AC1** (AC1 reads a full week). §9.1's table. On QSV, conversion is 16–35 % of the encode stage and `send_frame` 60–83 %. **Every QSV host captures through the SystemContext DXGI arm**: all 8 logged `capture: backend=system-context` (197 selections) and none `backend=wgc`, so their readback reads `0` because P0 never timed that arm. Two changes follow: P0b times it, and P2 moves from WGC to the DXGI arm |
 | 2026-10-28 | FFmpeg 9.0.1 CLI, `hevc_nvenc` with the agent's options (`-preset p4 -tune ll -rc vbr -cq 22 -bf 0 -rc-lookahead 0 -delay 0 -split_encode_mode forced`), an idle RTX 5090 Laptop GPU | **NVENC's own upload, measured for P3**: the same 8 frames looped 1200 times, once from system memory (NVENC uploads each, the production path) and once from CUDA memory (uploaded once by `hwupload_cuda`). Four runs; the CUDA path is steady and the system-memory path varies, so the upload is given as min–median. **2560×1600 NV12: 1.8–2.6 ms a frame** (system memory 4.04–5.04 ms, CUDA 2.25–2.43), 4:4:4 1.7–3.4 ms; **1920×1080 NV12: 0.7–1.1 ms**, 4:4:4 0.7–1.5 ms. These are throughput numbers. The agent's `submit` is latency-bound (8.8 ms at 2560×1600 HEVC in §9.1), so there the upload is about a fifth of it. With the 1.3 ms conversion and WGC's 6 ms readback, P3 would take about 3 ms off the encode stage, plus the readback off the capture thread. Script: `nvenc-split.sh` (FR-118 tools) |
+| 2026-10-28 | CI, the `Recorder tests (FR-85)` job's L0 cells: 6 master runs before C0 (`9aab8f703` to `c2ccd5e17`) and 8 runs with it (C0's PR run, then master `384443de3` to `e9f99cecf`) | **AC2's L0 half: C0 is invisible.** On both sides the runs fall into three runner speed classes: clean p50 ≈ 6, ≈ 9 and ≈ 12 ms, with `delay100` sitting 100.5–101.5 ms above clean in every run. So a pooled median moves with the class the runs happened to draw, and 6 of the 8 runs with C0 drew the slowest. Within a class, C0 moves clean's p50 by at most 0.5 ms: 5.9 and 6.0 → 6.5; 9.0 and 9.2 → 9.4; 11.8 and 12.2 → 11.7–12.7. Every cell keeps its frame rate (clean 60.2, `gate_slot` 25.2, `gate_lgcy` 24.5 fps). `lossy` and `gate50` vary with their loss and hold, as before. Tools: `l0-collect.sh` and `l0-summary.awk` (FR-118 tools) |
 
 ### 9.1 The interim split (2026-10-27)
 
