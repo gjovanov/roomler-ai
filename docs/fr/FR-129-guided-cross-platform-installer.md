@@ -325,7 +325,7 @@ flowchart TB
 
 1. **The seam is decided by a spike (B0), then recorded here before B1.** The candidates:
    - **(i)** Run the whole script elevated. This breaks the per-user Linux path, which runs
-     `systemctl --user` as the invoking user (`install.sh:702`); under `pkexec` that is root's
+     `systemctl --user` as the invoking user (`install.sh:733`); under `pkexec` that is root's
      user manager.
    - **(ii)** Give `install.sh` a privileged-steps entry point and a user-steps entry point.
      The terminal path calls both in order and does not change; the wizard elevates only the
@@ -521,7 +521,7 @@ flowchart TB
    shows the terminal command. That command carries no secret; the wizard enrolls in-process
    once it detects the installed daemon.
 3. **Fail closed on a missing digest** when elevated, unlike the terminal's soft-skip
-   (`install.sh:388-409`). A root install of an unverified package is the thing to refuse.
+   (`install.sh:409-430`). A root install of an unverified package is the thing to refuse.
 4. **Roles.**
    - **Linux per-user** (the default for a desktop): screen sharing, plus the overlay through
      the userspace netstack.
@@ -722,7 +722,7 @@ All seven open decisions were resolved as the spec recommended
 | A4-5 | **the tunnel role does not pair from the scripts** (`--role tunnel --pair` and `-Role tunnel-client -Pair` are refused, naming `--token` and the wizard) | the `roomler` CLI's enroll is its own code (`agents/roomler-cli`) and has no `--pair` yet; a script cannot pair on its behalf without holding the token itself, which is the thing `--pair` exists to avoid. A CLI `--pair` is a follow-up. |
 | A4-6 | **`--pair-org` matches the approved slug byte for byte** — no case folding, no trimming of the server's value, no Unicode normalisation; only the person's own value is trimmed | the server takes a slug as sent (`crates/api/src/routes/tenant.rs:60-68` passes it straight to the DAO; only `ui/src/composables/useValidation.ts:10` constrains it) under the binary-collated unique index of `crates/db/src/indexes.rs:132`, so `ACME`, `acme ` and a Cyrillic `аcme` are three orgs anyone can create beside `acme`. The first A4 draft trimmed and case-folded the server's slug, which let `ACME` through with no question asked: the flag that was the guard would have been the bypass. |
 | A4-7 | **server-sent text is escaped on the terminal, and a lookalike handle is flagged** | the org's name and slug and the approver's name and username are typed by whoever made the org and the account. Printed raw, an ANSI sequence (cursor up, clear line) in an org's name can repaint the `Join …?` line with another org's; a bidi override can reorder it. Escaping controls and invisible characters keeps every byte visible, and the warnings catch what escaping cannot (a slug in capitals, a Cyrillic letter). On Windows the question goes out through `WriteConsoleW`, so the `«»` and a non-ASCII name are not garbled by the console's code page. |
-| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:758-770`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
+| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:950-962`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
 | A4-9 | **the existing config is read after the pairing, not before it** | the first draft read it before the wait and merged into that copy after: a running daemon's own writes in between (token renewal, remote configuration, the companion's settings) would be saved over. Reading after makes the paired enroll's read-to-save window the `--token` one, and every line of it the `--token` code. |
 | A4-10 | **`install.sh` gives the paired enroll `/dev/null` as stdin** | under `curl … \| sh` the shell's stdin is the rest of the script. Nothing reads it today — the daemon asks on `/dev/tty`, and sudo 1.9.15 passed a piped script through untouched by default and with `log_input` or `log_stdin` set (the log below) — so this is a belt, kept because the cost of being wrong is an install that silently stops halfway. |
 

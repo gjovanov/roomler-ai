@@ -837,7 +837,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3153`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3281`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -997,7 +997,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1019` (the section) — `uninstall_linux` at `:1445`,
+`scripts/install.sh:1074` (the section) — `uninstall_linux` at `:1500`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid
@@ -1022,7 +1022,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2048`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2067`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
