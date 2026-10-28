@@ -3584,6 +3584,131 @@ pub fn read_if_present(path: &PathBuf) -> Option<AgentConfig> {
     }
 }
 
+/// FR-129 B1 — what is at a config path that an enrollment is about to be
+/// folded into, or written over ([`read_merge_base`]).
+#[derive(Debug)]
+pub enum MergeBase {
+    /// Nothing at the path: a first install.
+    Absent,
+    /// The config loads: the enrollment folds into it.
+    Loaded(AgentConfig),
+    /// Something is at the path and does not load. `recovered` is its last
+    /// good copy (`.prev`) when that one loads — what [`load`] itself would
+    /// run on at the daemon's next start — else `None`, and the merge writes
+    /// a fresh config.
+    Unreadable {
+        /// Why, on one line, for the person.
+        reason: String,
+        recovered: Option<AgentConfig>,
+    },
+}
+
+impl MergeBase {
+    /// The config to fold the enrollment into, if there is one.
+    pub fn into_config(self) -> Option<AgentConfig> {
+        match self {
+            MergeBase::Absent => None,
+            MergeBase::Loaded(cfg) => Some(cfg),
+            MergeBase::Unreadable { recovered, .. } => recovered,
+        }
+    }
+}
+
+/// FR-129 B1 (#2338) — read a config that an enrollment is about to be folded
+/// into, or written over.
+///
+/// [`read_if_present`] is a probe: absent, unreadable and unparseable all
+/// collapse to `None`, which is right for a caller asking whether an optional
+/// file happens to exist and wrong for one about to WRITE the path. A merge
+/// that read a damaged config as absent would write a fresh one over it — the
+/// device's private network, routes and lock policy gone and nobody told,
+/// #2338 by another road — and [`save`] would not even keep the damaged file:
+/// its `.prev` rotation runs only for a file that still parses, so that a
+/// broken file never overwrites the last good copy. This tells the three apart
+/// and, for a file that does not load, recovers from `.prev` exactly as
+/// [`load`] does, without [`load`]'s side effects (it rewrites the live file
+/// and logs "must be re-enrolled" at ERROR): the caller is about to write the
+/// path itself, and says what it found ([`describe_unreadable`]).
+pub fn read_merge_base(path: &PathBuf) -> MergeBase {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MergeBase::Absent,
+        _ => {}
+    }
+    match try_load(path) {
+        Ok(cfg) => MergeBase::Loaded(cfg),
+        Err(e) => MergeBase::Unreadable {
+            reason: one_line(&format!("{e:#}")),
+            recovered: try_load(&prev_path(path)).ok(),
+        },
+    }
+}
+
+/// Where [`keep_unreadable`] keeps a config that did not load:
+/// `config.toml.unreadable` beside it. Never `.prev`, which holds the last
+/// copy that DID load and is what a recovery reads.
+pub fn unreadable_copy_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension("toml.unreadable")
+}
+
+/// Copy a config that does not load aside ([`unreadable_copy_path`]) before it
+/// is written over, so whatever the person can still read out of it by hand
+/// is not lost. 0600 on Unix: a damaged config can still hold a bearer token.
+pub fn keep_unreadable(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dest = unreadable_copy_path(path);
+    std::fs::copy(path, &dest)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(dest)
+}
+
+/// What to tell the person about a config that did not load, once it has been
+/// (or could not be) kept aside: the path, the reason, whether its last good
+/// copy carries the device's settings over, and where the damaged file went.
+/// One wording for every caller (the setup wizard, `roomlerd
+/// adopt-enrollment`).
+pub fn describe_unreadable(
+    path: &std::path::Path,
+    reason: &str,
+    recovered: bool,
+    kept: &Result<PathBuf, String>,
+) -> String {
+    let what = if recovered {
+        format!(
+            "{} could not be read ({reason}). Its last good copy, {}, is used instead, so this \
+             device's settings carry over.",
+            path.display(),
+            prev_path(path).display()
+        )
+    } else {
+        format!(
+            "{} could not be read ({reason}) and has no usable previous copy: a fresh config is \
+             written, and this device's earlier settings (its private network, routes, lock \
+             policy …) do not carry over.",
+            path.display()
+        )
+    };
+    match kept {
+        Ok(copy) => format!("{what} The unreadable file is kept as {}.", copy.display()),
+        Err(e) => format!("{what} The unreadable file could not be kept ({e})."),
+    }
+}
+
+/// An error chain on one line, bounded: a TOML parse error carries a source
+/// snippet over several lines, which a progress row or a terminal line cannot
+/// show.
+fn one_line(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() > 300 {
+        let cut: String = joined.chars().take(300).collect();
+        format!("{cut}…")
+    } else {
+        joined
+    }
+}
+
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
@@ -4837,6 +4962,99 @@ tenant_id = "tid2"
         assert!(
             load_log.contains("ERROR"),
             "load must still report at ERROR; got: {load_log}"
+        );
+    }
+
+    /// FR-129 B1 — a merge reads the three cases apart, where the probe
+    /// ([`read_if_present`]) sees `None` for every one of them: nothing there,
+    /// a config that loads, and a file that is there and does not load.
+    #[test]
+    fn a_merge_tells_absent_loaded_and_unreadable_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert!(matches!(read_merge_base(&path), MergeBase::Absent));
+
+        let mut cfg = test_fixture();
+        cfg.overlay_enabled = true;
+        save(&path, &cfg).expect("save");
+        match read_merge_base(&path) {
+            MergeBase::Loaded(c) => assert!(c.overlay_enabled),
+            other => panic!("{other:?}"),
+        }
+
+        // A hand edit with a typo: the probe calls it absent.
+        std::fs::write(&path, "overlay_enabled = ture\n").expect("write");
+        assert!(read_if_present(&path).is_none(), "the probe's view");
+        match read_merge_base(&path) {
+            MergeBase::Unreadable { reason, recovered } => {
+                assert!(reason.contains("parsing config"), "{reason}");
+                assert!(!reason.contains('\n'), "one line: {reason}");
+                assert!(recovered.is_none(), "no .prev was ever written");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// FR-129 B1 — a damaged config whose last good copy loads is recovered
+    /// from it, as `load` would at the daemon's next start, and nothing is
+    /// written by the read; the damaged file is kept aside, never over `.prev`.
+    #[test]
+    fn a_damaged_config_recovers_from_prev_and_is_kept_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut first = test_fixture();
+        first.overlay_enabled = true;
+        save(&path, &first).expect("first save");
+        let mut second = first.clone();
+        second.machine_name = "second".into();
+        save(&path, &second).expect("second save: rotates the first to .prev");
+        // An unclean shutdown: the live file is the right length and all NUL.
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).expect("zero it");
+        let damaged = std::fs::read(&path).unwrap();
+
+        let base = read_merge_base(&path);
+        let (reason, recovered) = match base {
+            MergeBase::Unreadable { reason, recovered } => (reason, recovered),
+            other => panic!("{other:?}"),
+        };
+        assert!(reason.contains("NUL"), "{reason}");
+        let recovered = recovered.expect("the .prev copy loads");
+        assert!(recovered.overlay_enabled, "the operator state is there");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "a read writes nothing"
+        );
+
+        let kept = keep_unreadable(&path).map_err(|e| e.to_string());
+        let copy = kept.clone().expect("kept");
+        assert_eq!(copy, unreadable_copy_path(&path));
+        assert_eq!(std::fs::read(&copy).unwrap(), damaged);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "it can still hold a bearer token");
+        }
+        assert!(
+            try_load(&prev_path(&path)).is_ok(),
+            ".prev is still the last good copy"
+        );
+
+        let said = describe_unreadable(&path, &reason, true, &kept);
+        assert!(said.contains("config.toml.prev"), "{said}");
+        assert!(said.contains("config.toml.unreadable"), "{said}");
+        assert!(said.contains("carry over"), "{said}");
+        let said = describe_unreadable(&path, &reason, false, &Err("denied".into()));
+        assert!(said.contains("do not carry over"), "{said}");
+        assert!(said.contains("could not be kept (denied)"), "{said}");
+
+        // The fold's view: the recovered config.
+        assert!(
+            read_merge_base(&path)
+                .into_config()
+                .is_some_and(|c| c.overlay_enabled)
         );
     }
 }
