@@ -391,14 +391,14 @@ sequenceDiagram
     participant R as install.sh --privileged-steps (root)
     participant U as install.sh --user-steps (the person)
     Note over W: system scope only: ask the root daemon which device it is, then enroll in-process → a 0600 file in a 0700 scratch dir
-    W->>P: pkexec /bin/sh <script> --privileged-steps --role daemon --server … --name … --desktop [--system --config-from <file>]
+    W->>P: pkexec /bin/sh #lt;script#gt; --privileged-steps --role daemon --server … --name … --desktop [--system --config-from #lt;file#gt;]
     P-->>W: ONE password dialog (GNOME Shell / KDE)
     P->>R: as root, its stdout and stderr to files in the scratch dir
     R->>R: resolve · sha256 (REQUIRED) · dpkg -i / tarball · FR-96 helper · companion .deb/.rpm
-    R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#2338), then enable or RESTART roomlerd.service
+    R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#35;2338), then enable or RESTART roomlerd.service
     R-->>W: lines tailed as written · exit 0 (file shredded) · before its first line: 126 = cancelled, 127 = no prompt → the terminal command · after it: the script's own exit
     Note over W: per-user scope: enroll in-process now, folded into ~/.config/roomler/config.toml, then make the unit's folders
-    W->>U: /bin/sh <script> --user-steps --role daemon [--system]
+    W->>U: /bin/sh #lt;script#gt; --user-steps --role daemon [--system]
     U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
 ```
 
