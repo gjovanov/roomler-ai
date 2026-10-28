@@ -601,6 +601,13 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
   *Read 2 of 3, 0.4.181's rehearsal (§8): MSI 814 s (+15.8 %), `.pkg` 884 s (+7.0 %). The MSI moved
   272 s between two consecutive releases with no phase in between, so a single reading cannot
   carry this criterion. Decision 8 asks how AC1 should be read.*
+  *Read 3 of 3, 0.4.182's rehearsal (§8): MSI 814 s (+15.8 %), `.pkg` 822 s (−0.5 %). Over the
+  three releases with P2, the medians are MSI 814 s and `.pkg` 884 s: AC1's 30 % is not met, and
+  P2 alone was never projected to meet it. Against the medians of the 39 release runs before P2
+  (2026-10-24 to 10-27), the steady Linux lanes keep P2's gain: aarch64 569 → 464 s (−18 %),
+  x86_64 548 → 484 s (−12 %). The MSI (831 → 814 s) and the `.pkg` (879 → 884 s) sit at their
+  old medians. There, runner noise and a tree that grows every release hide P2's share, which is
+  decision 8's case for same-runner A/B.*
 - [ ] **AC2 — the binary is no larger.** `roomlerd.exe`, the macOS `roomlerd`, the `.deb`'s
   `roomlerd` and both MSIs are within +1 % of the release before each phase, and smaller is fine (the
   MSI size step's `::notice::` lines; the `.deb`/`.pkg` asset sizes on the release). *Reworded
@@ -712,6 +719,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-27 20:25Z | 0.4.180's tag run (40577974956), the same SHA | all 8 build jobs reused the rehearsal's compile, and the four daemon builds answered `roomlerd 0.4.180` to `--version`; published 20:31:19Z, 5 min 28 s after the run was created (FR-6's log) |
 | 2026-10-28 01:35Z | 0.4.180's post-roll check (AC3, P2's half): the server's agent listing, exec, one remote-desktop session, an overlay ping, a tunnel request | 20 of 20 online agents in four orgs on 0.4.180; exec reads 0.4.180 on two Linux servers and two Windows corporate laptops; the session ran H.265 4:2:0 hardware (VAAPI), direct, 15 fps, ~17 ms, and was closed; overlay 3/3 at 31 ms; two SOCKS5 listeners returned 200 in 0.31–0.33 s |
 | 2026-10-28 04:06Z | AC1 read 2: 0.4.181's rehearsal (run 40627954705, `3d96ea216`), the second release with P2 | build steps: MSI 814 s, `.pkg` 884, `.deb` x86_64 490 and aarch64 500. Lib · bin · total: aarch64 463 · 4 · 467 s (front end 52 s), x86_64 447 · 1 · 448 (61), `.pkg` 797 · 4 · 801 (113), MSI 701 · 3 · 704. Against 0.4.180's rehearsal the Linux front ends ran 10–33 % slower and the macOS one 13 % slower; per second of front end the `.pkg` went 8.18 → 6.08. Runner noise swamps a single reading on every lane: decision 8 |
+| 2026-10-28 16:49Z | AC1 read 3: 0.4.182's rehearsal (run 40723384188, `ca5e34764`), the third release with P2 | build steps: MSI 814 s, `.pkg` 822, `.deb` x86_64 484 and aarch64 457. Lib · bin · total: aarch64 423 · 3 · 426 s (front end 46 s), x86_64 443 · 1 · 444 (63), `.pkg` 764 · 5 · 769 (92), MSI 715 · 3 · 718. The three reads' medians: MSI 814 s (+15.8 % against 0.4.173), `.pkg` 884 s (+7.0 %), so AC1 is not met. Against the 39 runs before P2, Linux keeps −18 % / −12 % while the MSI and `.pkg` sit at their old medians (decision 8) |
 
 ### 8.1 Reading the release side (0.4.180)
 
