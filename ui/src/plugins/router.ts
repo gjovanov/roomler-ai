@@ -74,6 +74,27 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/legal/ImprintView.vue'),
   },
   {
+    // #3029 — where the activation email's link lands
+    // (`crates/api/src/routes/auth.rs`, `activation_url`). The page redeems
+    // the token with `POST /api/auth/activate`; until it existed the link
+    // rendered Not Found, and no email signup could ever sign in. No
+    // `meta.auth` (there is no session yet) and no `meta.guest` (a signed-in
+    // browser may be activating another account's link, and the guest guard
+    // would bounce it to the dashboard before the token was redeemed).
+    // Every path the server builds into an email is locked by
+    // `__tests__/plugins/routerEmailLinks.spec.ts`.
+    path: '/auth/activate',
+    name: 'activate',
+    component: () => import('@/views/auth/ActivateView.vue'),
+  },
+  {
+    // #3029 — the activation-success email linked here, and the sign-in page
+    // is `/login`. Kept as an alias so the emails already sent keep working;
+    // the query and hash ride along.
+    path: '/auth/login',
+    redirect: '/login',
+  },
+  {
     path: '/oauth/callback',
     name: 'oauth-callback',
     component: () => import('@/views/auth/OAuthCallbackView.vue'),
