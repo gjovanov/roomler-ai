@@ -637,6 +637,7 @@ fn force_exit_on_runtime_stall(wd: &Watchdog, stuck_for: Duration) {
 pub(crate) fn leave_stall_evidence(summary: String, budget: Duration) -> bool {
     within(budget, move || {
         let dump = crate::logging::log_dir()
+            .filter(|_| may_read_own_stacks())
             .and_then(|dir| crate::thread_dump::capture(&dir, THREAD_DUMP_DEADLINE));
         crate::crash_recorder::record_with_appendix(
             crate::crash_recorder::Reason::WatchdogStall,
@@ -645,6 +646,26 @@ pub(crate) fn leave_stall_evidence(summary: String, budget: Duration) -> bool {
             dump.as_ref().map_or("", |d| d.condensed.as_str()),
         );
     })
+}
+
+/// #3018 — whether a stall reads this process's thread stacks. On macOS only
+/// as root. `sample` reads the hardened-runtime daemon as root (measured).
+/// The FR-43 GUI worker runs as the person, where a request to read the
+/// hardened binary would be refused, and a refused debugger-style request has
+/// no business on someone's desktop.
+fn may_read_own_stacks() -> bool {
+    !cfg!(target_os = "macos") || effective_root()
+}
+
+#[cfg(unix)]
+fn effective_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn effective_root() -> bool {
+    false
 }
 
 /// Run `f` on a thread of its own and wait for it at most `budget`. Whether
