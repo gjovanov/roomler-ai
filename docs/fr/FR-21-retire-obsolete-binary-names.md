@@ -276,7 +276,7 @@ order and it is wrong, because in a rename the docs are only wrong *after* the c
 **What P1 actually found and fixed** — the most valuable single line in the FR so far:
 
 ```rust
--#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/app.rs:39
+-#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/app.rs:40
 +#[command(name = "roomlerd",      version, about, long_about = None)]
 -#[command(name = "roomler-cli", ...)]                                // agents/roomler-cli/src/cli.rs:60
 +#[command(name = "roomler",        ...)]

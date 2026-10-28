@@ -29,7 +29,8 @@ use roomlerd::win_timer;
 use roomlerd::win32_monitors;
 use roomlerd::{
     config, crash_uploader, encode, enrollment, instance_lock, localapi_state, logging, machine,
-    notify, post_install, preflight, service, signaling, updater, watchdog,
+    notify, pairing, pairing_terminal, post_install, preflight, service, signaling, updater,
+    watchdog,
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -56,9 +57,31 @@ enum Command {
         /// Base URL of the Roomler API (e.g. https://roomler.live).
         #[arg(long)]
         server: String,
-        /// Enrollment token, as printed by the admin UI.
-        #[arg(long)]
-        token: String,
+        /// Enrollment token, as printed by the admin UI. Either this or
+        /// `--pair`.
+        #[arg(long, required_unless_present = "pair", conflicts_with = "pair")]
+        token: Option<String>,
+        /// FR-129 A4 — pair in the browser instead of pasting a token: prints
+        /// a code and the page to type it on, waits for the approval, shows
+        /// the org and the approver (with their unique slug and username) and
+        /// asks before enrolling. The question is asked on the terminal
+        /// (`/dev/tty`, the Windows console), never on stdin; with no
+        /// terminal at all only `--pair-org` can let it enroll. The token the
+        /// approval delivers stays inside this process. An ephemeral
+        /// enrollment needs an ephemeral KEY, which a pairing never mints, so
+        /// the two flags refuse each other.
+        #[arg(long, conflicts_with = "ephemeral")]
+        pair: bool,
+        /// FR-129 A4 — with `--pair`: the slug of the org the approval must
+        /// name, as the admin UI shows it. Stated in advance it replaces the
+        /// terminal's question: the device enrolls only if the approval names
+        /// exactly this org, and never otherwise — on a headless install, or
+        /// `ssh host 'curl … | sh -s -- --pair'`, the only way to enroll.
+        /// Refused without `--pair` (`enroll_token_source`: clap's `requires`
+        /// is satisfied by a `SetTrue` flag's own default, so the check is
+        /// explicit).
+        #[arg(long, value_name = "SLUG")]
+        pair_org: Option<String>,
         /// Friendly name shown in the admin agents list.
         #[arg(long)]
         name: String,
@@ -1597,6 +1620,8 @@ async fn daemon_main() -> Result<()> {
         Command::Enroll {
             server,
             token,
+            pair,
+            pair_org,
             name,
             machine_global,
             label,
@@ -1607,11 +1632,15 @@ async fn daemon_main() -> Result<()> {
             install_method,
             install_scope,
         } => {
+            // FR-129 A4 — before anything else: a flag combination that
+            // names nothing must be seen at the prompt, not after a browser
+            // approval.
+            let token = enroll_token_source(token.as_deref(), pair, pair_org.as_deref())?;
             enroll_cmd(
                 &config_path,
                 EnrollOptions {
                     server: &server,
-                    enrollment_token: &token,
+                    token,
                     machine_name: &name,
                     machine_global,
                     label: label.as_deref(),
@@ -2437,6 +2466,47 @@ fn resolve_encoder_preference(
     }
 }
 
+/// FR-129 A4 — where `enroll` gets its enrollment token.
+enum TokenSource<'a> {
+    /// `--token`: pasted by the person, minted in the admin UI.
+    Given(&'a str),
+    /// `--pair`: a browser approval, waited for on this terminal
+    /// ([`pairing_terminal`]). The token it delivers never leaves the
+    /// process: it goes from the poll's answer into `enrollment::enroll` and
+    /// into nothing else. `expect_org` is `--pair-org`.
+    Pair { expect_org: Option<&'a str> },
+}
+
+/// FR-129 A4 — which of `--token` / `--pair [--pair-org SLUG]` the command
+/// line asked for. clap already refuses `--token` beside `--pair` and
+/// requires one of them; this adds the one rule clap cannot express for a
+/// `SetTrue` flag (its `requires` is satisfied by the flag's own default):
+/// `--pair-org` belongs to `--pair`. A blank `--pair-org` is refused too,
+/// rather than read as absent: a scripted `--pair-org "$SLUG"` whose
+/// variable came out empty names no org, and should say so.
+fn enroll_token_source<'a>(
+    token: Option<&'a str>,
+    pair: bool,
+    pair_org: Option<&'a str>,
+) -> Result<TokenSource<'a>> {
+    match (token, pair) {
+        (Some(_), true) => bail!("--token and --pair are two ways to one enrollment: pass one"),
+        (Some(t), false) => {
+            if pair_org.is_some() {
+                bail!("--pair-org applies to --pair only");
+            }
+            Ok(TokenSource::Given(t))
+        }
+        (None, true) => match pair_org.map(str::trim) {
+            Some("") => bail!(
+                "--pair-org needs the org's slug, exactly as the admin UI shows it; an empty one names no org"
+            ),
+            expect_org => Ok(TokenSource::Pair { expect_org }),
+        },
+        (None, false) => bail!("one of --token or --pair is required"),
+    }
+}
+
 /// What `enroll` was asked to do.
 ///
 /// A struct rather than eight positionals because three of them are bools:
@@ -2446,7 +2516,7 @@ fn resolve_encoder_preference(
 /// meaning rather than silently ignored.
 struct EnrollOptions<'a> {
     server: &'a str,
-    enrollment_token: &'a str,
+    token: TokenSource<'a>,
     machine_name: &'a str,
     machine_global: bool,
     label: Option<&'a str>,
@@ -2466,7 +2536,7 @@ struct EnrollOptions<'a> {
 async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     let EnrollOptions {
         server,
-        enrollment_token,
+        token,
         machine_name,
         machine_global,
         label,
@@ -2502,6 +2572,51 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     } else {
         config_path.to_path_buf()
+    };
+
+    // FR-129 A4 — `--pair` waits, minutes if need be, for a person in a
+    // browser, so the pairing runs HERE: after the refusals above (the
+    // install trace, the target path) and the archive replica's, which reads
+    // the config — so a refusal costs nobody an approval — and BEFORE
+    // everything below, which then runs exactly as it runs for a pasted
+    // token: the same read of the existing config, the same machine id, the
+    // same `apply_enrollment` merge, the same save. The read belongs AFTER
+    // the wait: a daemon running on this machine saves its own config in
+    // the meantime (token renewal, remote configuration, the companion's
+    // settings), and a copy read before the wait would be merged and saved
+    // over them. The delivered token lives in `paired` and nowhere else.
+    let paired: String;
+    let enrollment_token: &str = match token {
+        TokenSource::Given(t) => t,
+        TokenSource::Pair { expect_org } => {
+            // `--ephemeral` cannot reach here: clap refuses it beside `--pair`.
+            if archive_replica {
+                roomlerd::archive_replica::preflight(
+                    config::read_if_present(&target_path).is_some(),
+                    ephemeral,
+                )?;
+            }
+            let approved = pairing_terminal::pair_from_terminal(
+                pairing_terminal::PairParams {
+                    server,
+                    machine_name,
+                    role: pairing::PairRole::Daemon,
+                    halves: 1,
+                    client: pairing_terminal::client_for(&install.method),
+                    client_version: env!("CARGO_PKG_VERSION"),
+                    expect_org,
+                },
+                &mut std::io::stdout(),
+                &mut pairing_terminal::TtyConsole,
+            )
+            .await?;
+            paired = approved
+                .tokens
+                .into_iter()
+                .next()
+                .context("the pairing delivered no token")?;
+            &paired
+        }
     };
 
     // Multi-org P1: when a config already exists at the target path, reuse
@@ -6903,6 +7018,144 @@ mod tests {
         // Line 2: restart-service
         let cli = Cli::try_parse_from(["roomlerd", "restart-service"]);
         assert!(cli.is_ok(), "rc.30 snippet line 2 must parse: {cli:?}");
+    }
+
+    // ─── FR-129 A4: `enroll --pair` ─────────────────────────────────────────
+
+    const SERVER: &str = "https://example.invalid";
+
+    /// `--pair` stands in for `--token`: the two are exclusive and one is
+    /// required — the served scripts spell both, so each must keep parsing.
+    #[test]
+    fn enroll_takes_a_token_or_a_pairing_but_not_both() {
+        let cli = Cli::try_parse_from([
+            "roomlerd", "enroll", "--server", SERVER, "--name", "lab-1", "--pair",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Enroll {
+                token,
+                pair,
+                pair_org,
+                ..
+            }) => {
+                assert!(token.is_none());
+                assert!(pair);
+                assert!(pair_org.is_none());
+            }
+            other => panic!("expected Enroll --pair, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "roomlerd",
+            "enroll",
+            "--server",
+            SERVER,
+            "--name",
+            "lab-1",
+            "--token",
+            "tok-for-the-parse-test",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Enroll { token, pair, .. }) => {
+                assert_eq!(token.as_deref(), Some("tok-for-the-parse-test"));
+                assert!(!pair);
+            }
+            other => panic!("expected Enroll --token, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "roomlerd",
+                "enroll",
+                "--server",
+                SERVER,
+                "--name",
+                "lab-1",
+                "--token",
+                "tok-for-the-parse-test",
+                "--pair",
+            ])
+            .is_err(),
+            "--token and --pair are two ways to one token: refused together"
+        );
+        assert!(
+            Cli::try_parse_from(["roomlerd", "enroll", "--server", SERVER, "--name", "lab-1"])
+                .is_err(),
+            "one of the two is required"
+        );
+    }
+
+    /// `--pair-org` belongs to `--pair`, and a pairing can never be an
+    /// ephemeral enrollment (that needs an ephemeral KEY, never minted by an
+    /// approval).
+    #[test]
+    fn pair_org_needs_pair_and_pair_refuses_ephemeral() {
+        let cli = Cli::try_parse_from([
+            "roomlerd",
+            "enroll",
+            "--server",
+            SERVER,
+            "--name",
+            "lab-1",
+            "--pair",
+            "--pair-org",
+            "acme",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Enroll { pair, pair_org, .. }) => {
+                assert!(pair);
+                assert_eq!(pair_org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected Enroll --pair --pair-org, got {other:?}"),
+        }
+        // clap parses `--token … --pair-org …` (a SetTrue flag's `requires`
+        // is satisfied by its own default), so the refusal is the run-time
+        // one, before any token is spent or any pairing started.
+        let e = enroll_token_source(Some("tok-for-the-parse-test"), false, Some("acme"))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("--pair-org applies to --pair only"),
+            "--pair-org without --pair names nothing: {e}"
+        );
+        assert!(matches!(
+            enroll_token_source(None, true, Some(" acme ")),
+            Ok(TokenSource::Pair {
+                expect_org: Some("acme")
+            })
+        ));
+        // A blank `--pair-org` names no org: refused, not read as absent.
+        let e = enroll_token_source(None, true, Some("  "))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("names no org"), "{e}");
+        assert!(matches!(
+            enroll_token_source(None, true, None),
+            Ok(TokenSource::Pair { expect_org: None })
+        ));
+        assert!(matches!(
+            enroll_token_source(Some("tok-for-the-parse-test"), false, None),
+            Ok(TokenSource::Given("tok-for-the-parse-test"))
+        ));
+        assert!(enroll_token_source(Some("t"), true, None).is_err());
+        assert!(enroll_token_source(None, false, None).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "roomlerd",
+                "enroll",
+                "--server",
+                SERVER,
+                "--name",
+                "lab-1",
+                "--pair",
+                "--ephemeral",
+            ])
+            .is_err(),
+            "a paired token is a standard token: --ephemeral would enroll a permanent device under a random id"
+        );
     }
 
     // ─── rc.52: config-path resolution ladder ──────────────────────────────
