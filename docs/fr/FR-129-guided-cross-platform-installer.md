@@ -1,6 +1,6 @@
 # FR-129: The installer pairs instead of asking for a token, and installs the full daemon on Linux and macOS
 
-**Issue:** [#3022](https://github.com/gjovanov/roomler-ai/issues/3022) · **Status:** **decisions resolved 2026-10-28 · A1 (the server half) in review** ·
+**Issue:** [#3022](https://github.com/gjovanov/roomler-ai/issues/3022) · **Status:** **decisions resolved 2026-10-28 · A1 (the server) and A2 (`/pair`) merged · A3 (the wizard) in review** ·
 **Related:** [#2338](https://github.com/gjovanov/roomler-ai/issues/2338) (a wizard reinstall overwrites `config.toml`) ·
 FR-43 ([#971](https://github.com/gjovanov/roomler-ai/issues/971), the macOS halves) ·
 FR-84 ([#1633](https://github.com/gjovanov/roomler-ai/issues/1633), the wizard in lockstep) ·
@@ -374,8 +374,8 @@ subject plain text: the machine name is the installer's own text.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this commit |
-| A1 | server: `device_pairings` + `pairing_audit`; `/api/pair/start`, `/poll` (public), `/lookup`, `/approve`, `/deny` (`AuthUser`); mint on delivery; FR-102 ledger; limits; integration tests incl. start on one pod, approve + poll on another | `[pairing] enabled = false` → every `/api/pair/*` route answers the empty 404 and the wizard shows the paste step only | in review — [#3040](https://github.com/gjovanov/roomler-ai/pull/3040) |
-| A2 | web: `/pair` — type the code, see the device, pick or create the org, approve or deny; the pending pairing through login, OAuth and email activation; the admins' notice | unmounted with A1's switch | PR [#3026](https://github.com/gjovanov/roomler-ai/pull/3026) |
+| A1 | server: `device_pairings` + `pairing_audit`; `/api/pair/start`, `/poll` (public), `/lookup`, `/approve`, `/deny` (`AuthUser`); mint on delivery; FR-102 ledger; limits; integration tests incl. start on one pod, approve + poll on another | `[pairing] enabled = false` → every `/api/pair/*` route answers the empty 404 and the wizard shows the paste step only | **merged** — [#3040](https://github.com/gjovanov/roomler-ai/pull/3040) (`571615b7a`, 2026-10-28); not on production yet (a promote hold) |
+| A2 | web: `/pair` — type the code, see the device, pick or create the org, approve or deny; the pending pairing through login, OAuth and email activation; the admins' notice | unmounted with A1's switch | **merged** — [#3026](https://github.com/gjovanov/roomler-ai/pull/3026) (`3b723161c`, 2026-10-28); not on production yet |
 | A3 | wizard: "Set up in the browser" as the token step's primary action — start, open `/pair`, show the code, poll with back-off, confirm org + approver, then install; paste kept as "I already have a token" | A1's switch; an older server (404 on start) → paste only | PR [#3027](https://github.com/gjovanov/roomler-ai/pull/3027) — in review; end-to-end on the dev stack against A1 (#3040 at `9fab730c0`, 2026-10-28): a paired tunnel install, the guard with the unique identifiers, Cancel leaving the pairing `delivered` and nothing enrolled (AC5), the 429 back-off |
 | A4 | terminal parity: `roomlerd enroll --pair`, `install.sh --pair`, `install.ps1 -Pair` | omit the flag | — |
 | B0 | spike: the privileged/user split of `install.sh` under `pkexec` (Ubuntu GNOME, Fedora KDE vmtest cells) and `osascript` admin (macOS cell); the seam recorded in this spec | — | — |
