@@ -292,7 +292,8 @@ from both branches (FR-87 §9).
   over the fallback table the page ships; and, from `GET /api/setup/features` (FR-129
   B1-s), the Linux and macOS "Roomler Setup" buttons — shipped hidden in the Windows card's
   markup, shown when the server advertises `wizard_unix_daemon` — and the pairing lead when
-  it advertises `pairing`. That one fails **closed**: anything but a JSON `true` (an older
+  it advertises both `pairing` (this server answers `/api/pair/*`) and `wizard_pairing` (the
+  released wizard uses it). That one fails **closed**: anything but a JSON `true` (an older
   server's 404, a server without the fleet module, a proxy's error page) leaves the page as
   built, because a button the released wizard cannot honour is the mistake. With JavaScript
   off, the page is complete and the form's place links to sign-up.

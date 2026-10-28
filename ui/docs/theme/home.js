@@ -26,8 +26,10 @@
  *    is written at build time with Roomler Setup on the Windows card only
  *    (FR-97 D5) and the Linux and macOS buttons HIDDEN; the server says
  *    whether the released wizard installs the daemon there
- *    (`wizard_unix_daemon`) and whether it signs the person in from the
- *    browser (`pairing`, which swaps the section's lead). Fail CLOSED, the
+ *    (`wizard_unix_daemon`) and whether the download signs the person in
+ *    from the browser — `pairing` (the server answers `/api/pair/*`) AND
+ *    `wizard_pairing` (the released wizard uses it), both, or the section's
+ *    lead keeps naming the token. Fail CLOSED, the
  *    opposite of the newsletter: anything but a JSON `true` — an older
  *    server's 404, a server without the fleet module, a proxy's error page —
  *    leaves the page as built. A button the wizard cannot honour is the
@@ -205,7 +207,7 @@
           })
         }
         var pairingLead = lead && lead.getAttribute('data-pairing-lead')
-        if (f.pairing === true && pairingLead) lead.textContent = pairingLead
+        if (f.pairing === true && f.wizard_pairing === true && pairingLead) lead.textContent = pairingLead
       })
       .catch(function () {
         /* as built: the wizard on Windows only, the token lead */

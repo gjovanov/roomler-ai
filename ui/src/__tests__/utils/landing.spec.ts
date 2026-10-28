@@ -4,13 +4,14 @@ import { describe, expect, it } from 'vitest'
 import { DOWNLOAD, downloadLead } from '@/utils/landing'
 
 /**
- * FR-129 B1-s — the install section's lead follows the server's `pairing`
- * (`GET /api/setup/features`): the token wording until the server has said
- * `true`, the browser sign-in once it has. Both homepages (`LandingView.vue`,
- * the static `/`) render this one rule.
+ * FR-129 B1-s — the install section's lead follows `wizardPairs`, the
+ * server's `pairing` AND `wizard_pairing` (`GET /api/setup/features`, read
+ * together by `useSetupFeaturesStore`): the token wording until the server
+ * has said both, the browser sign-in once it has. Both homepages
+ * (`LandingView.vue`, the static `/`) render this one rule.
  */
 describe('downloadLead (FR-129 B1-s)', () => {
-  it('names the browser sign-in only once the server has said pairing is on', () => {
+  it('names the browser sign-in only once the server pairs AND the released wizard does', () => {
     expect(downloadLead(false)).toBe(DOWNLOAD.lead)
     expect(downloadLead(true)).toBe(DOWNLOAD.leadPairing)
     expect(DOWNLOAD.leadPairing).not.toBe(DOWNLOAD.lead)

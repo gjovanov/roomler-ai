@@ -282,9 +282,11 @@ const pillars = PILLARS
 // enrollment dialog uses (token placeholder until they have one), and the
 // wizard only where it installs the agent: Windows (FR-97 D5), and Linux
 // and macOS once the server advertises `wizard_unix_daemon` (FR-129 B1-s).
-// The server also says whether the wizard signs the person in from the
-// browser (`pairing`, the lead). Both read false until it has said true
-// (`stores/setupFeatures.ts`), so the first paint is the Windows-only page.
+// The server also says whether the download signs the person in from the
+// browser — `pairing` (this server answers `/api/pair/*`) AND
+// `wizard_pairing` (the released wizard uses it), both, for the lead. Every
+// switch reads false until it has said true (`stores/setupFeatures.ts`), so
+// the first paint is the Windows-only page with the token lead.
 const osIcon: Record<string, string> = {
   windows: 'mdi-microsoft-windows',
   linux: 'mdi-linux',
@@ -297,7 +299,7 @@ const downloads = computed(() =>
     icon: osIcon[card.os]!,
   })),
 )
-const installLead = computed(() => downloadLead(setupFeatures.pairing))
+const installLead = computed(() => downloadLead(setupFeatures.wizardPairs))
 
 // The fallback until /api/stripe/plans (the single source of truth) answers.
 const plans = ref<Plan[]>(FALLBACK_PLANS.map((p) => ({ ...p, features: [...p.features] })))

@@ -43,9 +43,9 @@ const buttons = (label: string) =>
 
 beforeEach(() => {
   setActivePinia(createPinia())
-  // The shipped default: pairing on, the Linux/macOS daemon wizard off.
+  // The shipped default: pairing on, both claims about the released wizard off.
   mockApi.get.mockReset()
-  mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: false })
+  mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: false, wizard_pairing: false })
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -224,7 +224,7 @@ describe('EnrollmentDialog — the Linux and macOS wizard (FR-129 B1-s)', () => 
   })
 
   it('offers Roomler Setup on the Linux tab once the server advertises wizard_unix_daemon', async () => {
-    mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: true })
+    mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: true, wizard_pairing: false })
     const w = await mountOnLinux()
     const link = wizardLink('linux')
     expect(link).not.toBeNull()

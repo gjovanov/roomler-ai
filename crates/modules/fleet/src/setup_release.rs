@@ -92,6 +92,10 @@ pub struct SetupFeatures {
     /// `[setup] wizard_unix_daemon` (FR-129 B1-s): the released Roomler Setup
     /// installs the full daemon on Linux and macOS.
     pub wizard_unix_daemon: bool,
+    /// `[setup] wizard_pairing` (FR-129 B1-s): the released Roomler Setup
+    /// pairs (A3), so a homepage may say "sign in from your browser" — with
+    /// `pairing`, never on its own.
+    pub wizard_pairing: bool,
 }
 
 /// `GET /api/setup/features` — the server-wide switches a client reads before
@@ -99,26 +103,33 @@ pub struct SetupFeatures {
 /// unauthenticated, a plain JSON object:
 ///
 /// ```json
-/// {"pairing": true, "wizard_unix_daemon": false}
+/// {"pairing": true, "wizard_unix_daemon": false, "wizard_pairing": false}
 /// ```
 ///
-/// * `pairing` mirrors `[pairing] enabled`: whether `/api/pair/*` answers, so
-///   a wizard or the homepage can say "sign in from your browser" up front
-///   rather than discover the empty 404 on `start`.
-/// * `wizard_unix_daemon` is `[setup] wizard_unix_daemon`, default off: the
-///   operator's assertion that the released Roomler Setup installs the full
-///   daemon on Linux and macOS (B1) and that AC11's field run is on record.
-///   The SPA's enrollment dialog, both homepages and a B1 wizard show the
-///   Linux and macOS daemon cards only on `true`, so the cards can be turned
-///   off without a release (key design B.6).
+/// * `pairing` mirrors `[pairing] enabled` — a fact about THIS SERVER:
+///   whether `/api/pair/*` answers. It is what a wizard reads to offer "Set
+///   up in the browser" up front rather than discover the empty 404 on
+///   `start`.
+/// * The two `[setup]` switches are the operator's assertions about the
+///   RELEASED wizard, each default off and flipped after its field run:
+///   - `wizard_unix_daemon`: it installs the full daemon on Linux and macOS
+///     (B1; AC11). The SPA's enrollment dialog, both homepages and a B1
+///     wizard show the Linux and macOS daemon cards only on `true`, so the
+///     cards can be turned off without a release (key design B.6).
+///   - `wizard_pairing`: it pairs (A3), against this server. Both homepages
+///     word the install lead as "sign in from your browser" only on
+///     `pairing && wizard_pairing`: `pairing` alone is the server's fact, on
+///     by default, and a server image promoted before the first `setup-v*`
+///     that carries A3 would otherwise promise a flow the download cannot
+///     do.
 ///
 /// ⚠️ Every consumer reads anything but a JSON `true` as **false**: an older
 /// server (404), a server with the fleet module unmounted (503), a proxy's
 /// HTML error page, a timeout, a string `"true"`. Absent means "offer what
 /// the client could do before this route existed" — the daemon wizard on
-/// Windows only, the token lead — which is the safe direction: a card the
-/// released wizard cannot honour is the failure this switch exists to
-/// prevent, and an older server never advertises one.
+/// Windows only, the token lead — which is the safe direction: a card or a
+/// lead the released wizard cannot honour is the failure these switches
+/// exist to prevent, and an older server never advertises one.
 ///
 /// Deliberately NOT a field on `/api/setup/latest-release`: that route
 /// answers a bare JSON array every shipped wizard parses as
@@ -129,6 +140,7 @@ pub async fn setup_features(State(state): State<FleetState>) -> Json<SetupFeatur
     Json(SetupFeatures {
         pairing: state.settings.pairing.enabled,
         wizard_unix_daemon: state.settings.setup.wizard_unix_daemon,
+        wizard_pairing: state.settings.setup.wizard_pairing,
     })
 }
 
