@@ -701,6 +701,47 @@ sequenceDiagram
   (2026-10-18, read-only over `roomler exec`), the three corporate laptops in
   the fleet all set it to `1`.
 
+### 5.1f The frame stays on the GPU (FR-118)
+
+Every Windows arm reads each captured frame back into memory. The
+SystemContext DXGI arm copies the duplication surface into a staging texture
+and maps it, inside the capture stage: about 4 ms at 1920×1200. WGC does the
+same in its `FrameArrived` handler, off the pump's clock: about 6 ms at
+2560×1600. With `zero_copy` on (default off), the DXGI arm keeps the frame as
+a texture on its own device, and a QSV encoder whose GPU form the probe proved
+takes it there:
+
+```mermaid
+flowchart TB
+  D["Desktop Duplication<br/>(DXGI arm, SystemContext)"] -->|"switch off: staging copy + Map"| CPU1[BGRA in memory]
+  CPU1 -->|dcv BGRA→NV12| E1["QSV<br/>system-memory frame"]
+  D -->|"switch on: CopyResource"| T[pool texture]
+  T -->|"VideoProcessorBlt, BT.601"| N[NV12 texture]
+  N -->|"copy into the pool slice"| E2["QSV<br/>GPU frame"]
+  W["WGC<br/>(attended arm)"] -->|"readback in FrameArrived<br/>(every encoder, today)"| CPU2[BGRA in memory]
+  CPU2 -->|dcv| E3["NVENC · QSV · AMF<br/>system-memory frame"]
+```
+
+| Measured: `av1_qsv` 1920×1200, the same encoded rate | Switch off | Switch on |
+|---|---|---|
+| capture | 4.48 ms | 0.76 ms |
+| readback (inside capture on this arm) | 4.04 ms | 0 |
+| encode | 10.00 ms | 11.42 ms |
+| **capture + encode** | **14.5 ms** | **12.2 ms** |
+| worker CPU | 52 % of a core | 34 % of a core |
+
+- **The encode stage grows**, because `send_frame` waits for the GPU's
+  conversion and copy before QSV reads the surface. The whole frame is still
+  2.3 ms shorter, and the CPU no longer copies 9 MB a frame.
+- **The device survives a desktop transition.** A lock, an unlock or a UAC
+  prompt makes the DXGI arm rebuild its duplication. With the switch on, it
+  keeps its D3D11 device when the device is alive and still on the primary
+  output's adapter, so the encoder does not reopen and send a keyframe each
+  time. A capture that does come back on a new device moves the encoder to it.
+- The cells, the reasons a session took CPU frames, and the configuration:
+  [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
+  field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28).
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:

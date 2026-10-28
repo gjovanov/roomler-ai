@@ -526,6 +526,70 @@ roomler code in the loop, so the cell sits on the built-in denylist
 stays: a cell whose session looks wrong is attributed offline before anyone touches
 the denylist, and the raw dump of a healthy build decodes as-is.
 
+## GPU-resident frames: the input path (FR-118)
+
+The input path is a third dimension of a cell, beside codec × backend and
+chroma: an encoder takes its frames from CPU memory, as every cell did until
+FR-118, or as textures on the capture's own GPU. The GPU form is **off by
+default** (`zero_copy`), and one family takes it so far: QSV (`hevc_qsv`,
+`av1_qsv`, `h264_qsv`, 4:2:0) on the SystemContext DXGI arm, which is the arm
+every QSV host in the fleet captures through.
+
+```mermaid
+flowchart LR
+  subgraph cpu["CPU input (every cell)"]
+    A1[duplication surface] -->|"staging copy + Map<br/>(the readback, ~4 ms at 1920×1200)"| B1[BGRA in memory]
+    B1 -->|dcv BGRA→NV12| C1[NV12 in memory]
+    C1 -->|"send_frame: QSV copies and uploads it"| E1[QSV]
+  end
+  subgraph gpu["GPU input (zero_copy, a proven QSV cell)"]
+    A2[duplication surface] -->|CopyResource| B2[pool texture, same device]
+    B2 -->|"VideoProcessorBlt, BT.601 limited"| C2[NV12 texture]
+    C2 -->|CopySubresourceRegion| D2[QSV pool slice]
+    D2 -->|AV_PIX_FMT_QSV| E2[QSV]
+  end
+```
+
+| Piece | What it is | Where |
+|---|---|---|
+| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it | `capture::gpu_frame::zero_copy_enabled` |
+| the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open | `encode::ffmpeg::gpu_hint::denied` |
+| the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. A consumer that needs bytes reads it back, once | `agents/roomlerd/src/capture/gpu_frame.rs` |
+| the GPU input | a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
+| the proof | the probe's `gpu` child opens each GPU form and encodes two frames through it; a session opens only a form the child proved | [The probe lifecycle](#the-probe-lifecycle) |
+
+The session reports which form it opened and why, on the heartbeat as
+`input_path` (`gpu` or `cpu`) and `input_reason`:
+
+| `input_reason` | Meaning |
+|---|---|
+| `switch_off` | `zero_copy` is off |
+| `cpu_frames` | the capture delivered frames in memory: another arm, an FP16 desktop, a rotated output, a fallback |
+| `no_gpu_cell` | this encoder or chroma takes no GPU frames yet |
+| `denied` | `zero_copy_deny` names it |
+| `unproven` | the probe's `gpu` child did not prove this form on this host |
+| `adapter_mismatch` | the capture's adapter has no QSV |
+| `open_failed` | the GPU form failed to open, and the CPU form took over |
+
+> [!WARNING]
+> **A refusal never costs the picture.** The GPU form opens only on the
+> capture's own device. Any refusal or failed open falls back to the CPU form,
+> today's path, and a GPU frame from another device moves the encoder to that
+> device.
+
+- **The colour is the CPU path's.** The VideoProcessor converts with BT.601
+  limited range, the matrix of the CPU path's conversion, so flipping the
+  switch does not change the picture. In the field, on an Intel adapter,
+  flat regions decode identically on both paths.
+- **Measured** ([FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28),
+  `av1_qsv` at 1920×1200, the same encoded rate): capture + encode fell from
+  14.5 to 12.2 ms per frame, and the worker's CPU from 52 % to 34 % of a core.
+  The readback leaves the capture stage. `send_frame` grows by 1.8 ms, because
+  it now waits for the GPU's conversion before QSV reads the surface.
+- **Not yet:** NVENC, AMF and the WGC arm (FR-118 P3). On a hybrid laptop
+  whose panel is driven by the iGPU, WGC's device and the dGPU's encoder sit on
+  different adapters.
+
 ## Configuration
 
 | Key (config.toml / `roomler config set`) | Env | Default | What |
@@ -533,6 +597,8 @@ the denylist, and the raw dump of a healthy build decodes as-is.
 | `encoder_preference` | `ROOMLERD_ENCODER` (CLI `--encoder` wins) | `auto` | `auto` · `hardware` · `software` |
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm keeps frames on the GPU, and a proven QSV cell takes them ([above](#gpu-resident-frames-the-input-path-fr-118)) |
+| `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
