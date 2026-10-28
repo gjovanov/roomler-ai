@@ -74,6 +74,25 @@ also fetches the Visual C++ runtime from `aka.ms` when it is missing
 re-running an installer on a known machine reuses its identity instead of
 duplicating it.
 
+**A reinstall keeps the device's settings** (#2338, FR-129 B1). `roomlerd
+enroll` and the setup wizard, on every OS, fold the new enrollment into the
+config already at its path instead of replacing it
+(`agents/roomler-setup/src/enroll_step.rs`). A refresh of the same organization
+keeps the mesh and its key, the routes, the lock and consent policy and every
+other operator-owned key; of the wizard's Advanced boxes, only the ones the
+person *touched* are written over them. An enrollment into **another
+organization** is added beside the primary one (`roomlerd org ls`):
+
+- none of the Advanced boxes is written then, touched or not, because they are
+  the primary enrollment's settings (`auto_grant_session` is the device's
+  consent policy for every organization);
+- the added organization's private network starts off (`roomlerd org overlay
+  <label> netstack` joins it), and the daemon mints that organization's own
+  key at its first start on the mesh (`org_join::heal_org_keys`);
+- the Done page names the added organization's device, not the primary's;
+- on Windows, a token minted to anchor the device does not anchor it: the
+  machine's one SYSTEM anchor stays with the primary organization.
+
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
 `install {method, scope}`, shown on the device (`GET …/agent/{id}`) and counted
@@ -444,6 +463,10 @@ sequenceDiagram
   *touched* are written over an existing config. And because `systemctl enable
   --now` leaves an active unit as it is, the half **restarts** a running
   `roomlerd.service` onto the placed config.
+  - An enrollment into **another organization** is added beside the primary
+    one, and none of the Advanced boxes is written then
+    ([every path's rule](#enrollment--what-every-path-does)); for the root
+    config, `adopt-enrollment` applies that rule as root and says so.
   - A config there that **does not load** is not treated as absent: the wizard
     (or, for the root config, `adopt-enrollment`) says so, folds the enrollment
     into its last good copy (`config.toml.prev`) when that one loads, and keeps
@@ -837,7 +860,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3281`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3297`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
