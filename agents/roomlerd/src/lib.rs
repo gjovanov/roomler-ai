@@ -27,7 +27,7 @@ pub mod app;
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
     appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, pairing, token_slot,
+    machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
