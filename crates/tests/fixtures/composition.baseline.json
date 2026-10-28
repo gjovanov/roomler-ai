@@ -333,6 +333,26 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/pair/approve",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/deny",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/lookup",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/poll",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/start",
+      "methods": "POST"
+    },
+    {
       "path": "/api/push/config",
       "methods": "GET,HEAD"
     },
@@ -1475,6 +1495,32 @@
         ]
       },
       {
+        "collection": "device_pairings",
+        "indexes": [
+          {
+            "key": {
+              "device_code_hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_code": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "enroll_token_issued",
         "indexes": [
           {
@@ -2339,6 +2385,35 @@
           {
             "key": {
               "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "pairing_audit",
+        "indexes": [
+          {
+            "key": {
+              "pairing_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
             },
             "expireAfterSeconds": 7776000
           }
@@ -3855,6 +3930,32 @@
         ]
       },
       {
+        "collection": "device_pairings",
+        "indexes": [
+          {
+            "key": {
+              "device_code_hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_code": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "enroll_token_issued",
         "indexes": [
           {
@@ -4717,6 +4818,35 @@
           {
             "key": {
               "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "pairing_audit",
+        "indexes": [
+          {
+            "key": {
+              "pairing_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
             },
             "expireAfterSeconds": 7776000
           }

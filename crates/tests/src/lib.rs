@@ -262,6 +262,14 @@ mod overlay_route_offer_tests;
 mod overlay_tests;
 #[cfg(test)]
 mod pagination_tests;
+/// FR-129 A1 — device pairing, the server half: the daemon and tunnel
+/// flows end to end, two halves, two pods, the codes (a user code or a
+/// forged device code retrieves nothing; the device code in no response
+/// but start's), slow-down, expiry, denial, the gate re-checked at delivery,
+/// the device cap and an archived org refusing a paired token like a pasted
+/// one, the address and account ceilings, the kill switch, the audit trail.
+#[cfg(test)]
+mod pairing_tests;
 #[cfg(test)]
 mod pdf_export_tests;
 /// FR-100 P1a — a device's identity key as the fleet stores and shows it, and
