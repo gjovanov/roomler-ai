@@ -208,7 +208,7 @@ monitor.
 | P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | `display_match = always` (no hand-back) | **built** (3e "as built"): `away_since_lock` in the tracker, the waiting request and `on_unlock` from the session's lock watcher, the 250 ms `on_tick` watcher with `hand_back`. Unit tests on Windows and Linux with two negative controls: an `away_since_lock` that never reads a lock as away failed the two lock tests, and a `hand_back` that keeps the mode under `never` failed the hand-back test. **Shipped in agent 0.4.140 and field-verified there:** AC2's locked half (§8 row 6), AC3 (§8 row 7) |
 | P2 | Linux virtual desktops: switch the virtual desktop's mode to the one asked (Xorg + dummy, open decision 4), reopen the capture after a switch, restore at the end | `display_match = never` | **probe done 2026-10-16** (§8 row 5): Xvfb cannot switch at all; Xorg + dummy switches to any size. **Built** (decision 4 settled 2026-10-17: Xorg + dummy where installed, Xvfb otherwise): the server pick and its kill switch `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb`, the config (an exact start mode, `ReducedBlanking`, no input devices, an empty config dir), the request as the mode exactly, `xrandr` switch and restore, the capture reopened on a mode generation. Tests: the config, the argv, the server pick, the kill switch, the modeline, the mode fitting, `xrandr --current` parsing |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
-| P4a | Choose the display (3g): one display table, `display-select`, `rc:display`, the capture reopened on the shown display, and the input, the pointer, shared pipelines and display match following it. First a probe: a vmtest guest with two heads, so there is a second display to test on | `display-select` left out of the hello: no picker, and `mon` stays 0 | **designed 2026-10-21** (3g) |
+| P4a | Choose the display (3g): one display table, `display-select`, `rc:display`, the capture reopened on the shown display, and the input, the pointer, shared pipelines and display match following it. First a probe: a vmtest guest with two heads, so there is a second display to test on | `display-select` left out of the hello: no picker, and `mon` stays 0 | **designed 2026-10-21** (3g); **waits for the first multi-display host** (open decision 5, decided 2026-10-28) |
 | P4b | Several displays at once (3g): a pipeline and a channel per display, a window per display, one pipe | the same; direct paths only | **designed 2026-10-21** (3g) |
 | P5 | Docs: [`docs/display-match.md`](../display-match.md) (mermaid, the answers, the owner's key), linked from `docs/remote-control.md` §18.6.1 and indexed in `docs/README.md` | — | the page exists from P1 and grows with each phase |
 
@@ -291,7 +291,8 @@ monitor.
    Recommended: the first. **Decided by the operator, 2026-10-17: the first, as recommended** (P2).
 5. **P4's priority.** No live device reports a second display (§2, P4's evidence). Recommended: build P4a
    when the first multi-display host enrolls, or sooner if StarDesk's parity row matters on its own. P4b
-   comes after P4a.
+   comes after P4a. **Decided by the operator, 2026-10-28: wait.** P4a is built when the first
+   multi-display host enrolls, not sooner for the parity row alone.
 6. **How P4b splits the pipe.** By the pixels each display streams (recommended), or most of it to the
    window the controller used last.
 

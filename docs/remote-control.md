@@ -722,17 +722,20 @@ flowchart TB
   CPU2 -->|dcv| E3["NVENC · QSV · AMF<br/>system-memory frame"]
 ```
 
-| Measured: `av1_qsv` 1920×1200, the same encoded rate | Switch off | Switch on |
+| Measured: `av1_qsv` 1920×1200 at 60 fps, a moving test pattern, 20-minute legs (FR-118 AC3) | Switch off | Switch on |
 |---|---|---|
-| capture | 4.48 ms | 0.76 ms |
-| readback (inside capture on this arm) | 4.04 ms | 0 |
-| encode | 10.00 ms | 11.42 ms |
-| **capture + encode** | **14.5 ms** | **12.2 ms** |
-| worker CPU | 52 % of a core | 34 % of a core |
+| capture | 4.45 ms | 0.43–0.44 ms |
+| readback (inside capture on this arm) | 4.06 ms | 0 |
+| encode | 10.24 ms | 11.87–11.91 ms |
+| **capture + encode** | **14.70 ms** | **12.30–12.33 ms** |
+| worker CPU per encoded frame | 15.9 ms (95 % of a core) | 10.6–10.9 ms (63–65 %) |
 
 - **The encode stage grows**, because `send_frame` waits for the GPU's
   conversion and copy before QSV reads the surface. The whole frame is still
-  2.3 ms shorter, and the CPU no longer copies 9 MB a frame.
+  2.4 ms shorter, and the CPU no longer copies 9 MB a frame.
+- **The picture does not change.** Every patch of the test pattern decodes to
+  the same RGB with the switch on and off, and the viewer sees no decode error
+  and no extra keyframe requests on either path.
 - **The device survives a desktop transition.** A lock, an unlock or a UAC
   prompt makes the DXGI arm rebuild its duplication. With the switch on, it
   keeps its D3D11 device when the device is alive and still on the primary
@@ -740,7 +743,8 @@ flowchart TB
   time. A capture that does come back on a new device moves the encoder to it.
 - The cells, the reasons a session took CPU frames, and the configuration:
   [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
-  field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28).
+  field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28)
+  and [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28).
 
 ### 5.2 Encoder selection
 
