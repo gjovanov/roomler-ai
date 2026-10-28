@@ -1054,13 +1054,18 @@ pub async fn run_privileged_half(
     Ok(run)
 }
 
-/// Spawn the user half (`program args…`, as the person), stream every stdout
+/// Spawn the user half — `argv[0]` is the program, as [`user_args`] builds it
+/// (`/bin/sh <script> --user-steps …`), as the person — stream every stdout
 /// and stderr line into the progress channel as `ScriptLine`, watch `cancel`,
 /// and wait for the exit within `budget`. It is the person's own process, so
 /// a cancel stops it outright.
+///
+/// The whole argv, never a program beside it: a separate `/bin/sh` in front
+/// of [`user_args`] ran `/bin/sh /bin/sh <script>`, and dash read the shell's
+/// own binary as a script (`Syntax error: ")" unexpected` — the first B1
+/// field cell).
 pub async fn run_half(
-    program: &str,
-    args: &[OsString],
+    argv: &[OsString],
     half: Half,
     on_event: &Channel<ProgressEvent>,
     budget: Duration,
@@ -1068,6 +1073,12 @@ pub async fn run_half(
 ) -> std::io::Result<HalfRun> {
     use tokio::io::AsyncBufReadExt as _;
 
+    let Some((program, args)) = argv.split_first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an empty command line",
+        ));
+    };
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -1658,6 +1669,34 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
+    }
+
+    /// The user half runs [`user_args`] as it stands — `/bin/sh <script> …` —
+    /// and its lines and exit come back. The first field cell ran
+    /// `/bin/sh /bin/sh <script>`, and dash read its own binary as a script.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_user_half_runs_its_own_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("install.sh");
+        std::fs::write(&script, "echo \"==> user steps: $*\"\nexit 3\n").unwrap();
+        let (channel, seen) = collector();
+        let cancel = AtomicBool::new(false);
+        let run = run_half(
+            &user_args(&script, Scope::PerUser),
+            Half::User,
+            &channel,
+            Duration::from_secs(30),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run.status, Some(3), "the script's own exit: {run:?}");
+        let seen = seen.lock().unwrap().join("\n");
+        assert!(
+            seen.contains("==> user steps: --user-steps --role daemon"),
+            "{seen}"
+        );
     }
 
     /// F1 — a cancel AFTER the half printed its first line (it runs as root

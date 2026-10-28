@@ -158,6 +158,15 @@ pre {
 .step[hidden] {
   display: none;
 }
+/* The same trap for every element the SPA toggles with `hidden` (FR-129 B1):
+   a role card is a `label.radio`, `display: flex`, so a hidden card stayed on
+   screen. On Linux and macOS the released wizard showed the Windows daemon
+   cards it cannot install, and the server's `wizard_unix_daemon` switch hid
+   nothing — measured in a field cell, the DOM saying "hidden" over a card in
+   plain view. `[hidden]` now wins over every author `display`. */
+[hidden] {
+  display: none !important;
+}
 
 .card {
   background: var(--bg-elevated);

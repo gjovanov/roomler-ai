@@ -513,7 +513,6 @@ async fn run_install_inner(
     );
     let user_args = ud::user_args(&scratch.script, scope);
     let run = match ud::run_half(
-        Tool::Sh.program(),
         &user_args,
         Half::User,
         on_event,
