@@ -3084,9 +3084,11 @@ async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
     .await
     .unwrap();
     assert_eq!(flow.end, std::net::SocketAddr::from(([127, 0, 0, 1], 4000)));
-    // The session's own account, exactly, for net_forward; this daemon for a
-    // connect's flow; each checked before the vault was asked.
+    // The session's own account, exactly, for net_forward; this daemon (at
+    // this session and fence, P8-2b-4) for a connect's flow; each checked
+    // before the vault was asked.
     let account = format!("{:?}", Admits::Account(me()));
+    let daemon = format!("{:?}", Admits::Daemon(session, fence));
     let said = egress.said();
     assert_eq!(said.len(), 4, "{said:?}");
     assert_eq!(said[0], format!("admits {account}"), "{said:?}");
@@ -3094,9 +3096,9 @@ async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
         said[1].starts_with("open Static") && said[1].ends_with(&account),
         "{said:?}"
     );
-    assert_eq!(said[2], "admits Daemon", "{said:?}");
+    assert_eq!(said[2], format!("admits {daemon}"), "{said:?}");
     assert!(
-        said[3].starts_with("open Static") && said[3].ends_with("Daemon"),
+        said[3].starts_with("open Static") && said[3].ends_with(&daemon),
         "{said:?}"
     );
     assert_eq!(vault.nets.lock().unwrap().len(), 2, "one grant a flow");
@@ -3145,7 +3147,10 @@ async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
     );
     assert_eq!(
         refusing.said(),
-        [format!("admits {account}"), "admits Daemon".to_string()],
+        [
+            format!("admits {account}"),
+            format!("admits {:?}", Admits::Daemon(session, fence))
+        ],
         "only the admits were asked: no flow opened"
     );
 }

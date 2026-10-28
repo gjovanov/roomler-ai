@@ -2793,7 +2793,7 @@ sequenceDiagram
 |---|---|
 | the sandbox | Claude Code's own, on every session of a device whose owner turns on `hive_egress` (decision 28): `sandbox.enabled`; `failIfUnavailable`, so a host without bubblewrap and socat refuses the start rather than run unsandboxed; `allowUnsandboxedCommands: false`, so no command retries outside it, which also makes the sandbox admin-required, and a repository's `.claude/settings.json` cannot loosen it; `network.httpProxyPort` and `socksProxyPort`, the session's proxy; no `excludedCommands`. `SettingsSpec` has carried the ports since P0 (`crates/hive-node/src/launch.rs:401`); the daemon sets them from P3b-1b-2, where the owner turns on `hive_egress` (`agents/roomlerd/src/hive/supervisor.rs:4995`) |
 | ⚠️ its filesystem layer | on. As designed, its writes widened to the account's home (`filesystem.allowWrite`); decision 31 (P3b-1b-2) narrows them to the working directory, temp and the session's own cache, since a write anywhere in the home can plant what runs outside the sandbox later. Its protected paths, which no `allowWrite` opens, are what keep a session from loosening its own sandbox: the session's user settings in `CLAUDE_CONFIG_DIR` (`~<account>/.roomler/hive/<session>/claude`) and a repository's `.claude` files stay write-denied to its commands. With `filesystem.disabled` a command could write those user settings, which an admin-required sandbox still honours |
-| the egress proxy | in the daemon, one per session: an HTTP CONNECT front and a SOCKS5 front on loopback, each connection served only to the session's account (P3-7-3b's `session_admit`, `agents/roomlerd/src/hive/vault_connect.rs:2547`). It dials from this device, never through a tunnel exit, resolves mesh names as the daemon does, and ends with the run |
+| the egress proxy | in the daemon, one per session: an HTTP CONNECT front and a SOCKS5 front on loopback, each connection served only to the session's account (P3-7-3b's `session_admit`, `agents/roomlerd/src/hive/vault_connect.rs:2548`). It dials from this device, never through a tunnel exit, resolves mesh names as the daemon does, and ends with the run |
 | its allowlist | decision 27: Cedar's `net:egress`, the session the principal and a `Host` the resource, its one spelling and the port, default deny with nothing seeded (P3b-1a, `docs/vault.md` §24). The proxy asks over `rc:vault.egress` the first time a run's command dials a host, and keeps the answer, an allow or a denial, for the run. ⚠️ An empty allowlist refuses everything; it never means unrestricted |
 | a placeholder | one per lease in mode `placeholder`: `rph_` and 32 base32 characters, 160 bits from the OS CSPRNG, made by the daemon when the lease arrives and known to nobody else. The lease is asked as any is (`rc:vault.lease`), its audience the origin the value goes to, spelled as `proxy` mode's HTTP engine spells it (`https://api.github.com`). Until P3b-2 the vault released no value in this mode; P3b-2 adds it to `LEASE_MODES` (`crates/modules/vault/src/lease.rs:94`). Of the seeded guardrails (`crates/modules/vault/src/policy.rs:128`), `dynamic-only-short-lived` already refuses it for a dynamic secret and `windows-proxy-only` on Windows (decision 30); `prod-never-materializes` does not, since nothing materializes. The tool `vault_placeholder {handle, audience}` answers the assignments to set (`GH_TOKEN=rph_…`), as `vault_connect` answers `env` |
 | TLS termination | only on a connection to an audience host of a placeholder the session holds, and only when the name the client gives (CONNECT, SNI) and the name the upstream proves agree. Every other connection is passed through and never decrypted. The upstream's TLS is verified as `proxy` mode verifies it (`docs/vault.md` §19). A per-session CA (ECDSA P-256), its key in daemon memory only and new at every start, signs one leaf per host, kept for the run |
@@ -3959,7 +3959,7 @@ and the harness went on.
 
    Until a part has moved, a fault in it still reaches the daemon.
 6. **P4-6-1b-2's flow admits the worker.** `daemon_admit` admits the daemon's own process on
-   Windows ([`daemon_admit`](../../agents/roomlerd/src/hive/vault_connect.rs#L2571)). Once the
+   Windows ([`daemon_admit`](../../agents/roomlerd/src/hive/vault_connect.rs#L2619)). Once the
    proxies run in a worker, the flow's listener (the daemon's, by point 2) admits that worker's pid
    too. Unix is unchanged: the worker is the daemon's account.
 
@@ -3981,7 +3981,7 @@ sequenceDiagram
 ```
 
 **P8-1a, as built** (the seam's first trait:
-[`SessionEgress`](../../agents/roomlerd/src/hive/net_tools.rs#L364), with
+[`SessionEgress`](../../agents/roomlerd/src/hive/net_tools.rs#L366), with
 [`Admits`](../../agents/roomlerd/src/hive/net_tools.rs#L352)).
 Every call hive makes on the tunnel hub's session flows now goes through it:
 - `net_socks` and `net_forward` (`net_tools::call`);
@@ -3989,7 +3989,7 @@ Every call hive makes on the tunnel hub's session flows now goes through it:
 - a run's flow places, and its end (`drop_run`).
 
 The run's `net` is an `Arc<dyn SessionEgress>`, and the daemon's is the hub itself
-([`seam`](../../agents/roomlerd/src/hive/net_tools.rs#L401)). The trait sits at the end of its
+([`seam`](../../agents/roomlerd/src/hive/net_tools.rs#L403)). The trait sits at the end of its
 file, and the supervisor and the toolbelt keep their line counts, so no doc anchor into the code
 moved (the shifter, run against P8-0's head, finds none to shift).
 
@@ -4380,6 +4380,51 @@ ignored (0 failed), full lib suite 2347 passed (0 failed); Linux/WSL `hive::` un
 passed, 1 ignored (0 failed) — the same count P8-2b-1 recorded, confirming the cross-platform
 rewiring left the Unix path untouched in behavior.
 
+**P8-2b-4, as built** (`agents/roomlerd/src/hive/vault_connect.rs`, `net_tools.rs`,
+`vault_connect/tests.rs`, `toolbelt/tests.rs`). P8-2b's last piece: P4-6-1b-2's flow — the one a
+connect's proxy dials its upstream through — now admits the session's own worker too, not only
+the daemon's own process (P8-0's point 6, closed). `Admits::Daemon` carries the run's `session`
+and `fence` now, not a bare unit variant: `net_tools::admit_of` and `daemon_flow`'s two
+constructions thread them through, and `vault_connect::daemon_admit` reads
+`worker::pid_of(session, fence)` fresh on every connection — never cached at the hook's own
+build, before a worker existed, restarted or ended (P8-0's point 2) — so whichever one is up
+right now is the one asked. Unix is unchanged, exactly as point 6 said it would be: a worker
+there already runs as the daemon's own account, so the existing single-identity check admits it
+for free.
+
+| Piece | As built |
+|---|---|
+| `Admits::Daemon` | now `Daemon(ObjectId, u64)`, the run it is for; nothing about `Admits::Account` or the rest of the type changes |
+| the comparison | `held_by_daemon_or_worker(pid, daemon, worker)`, `pub(crate)` so a test can drive it directly: `pid == daemon \|\| worker == Some(pid)`. Windows-only — Unix's single check already covers the worker |
+| the live hook | `daemon_admit`'s Windows body (`admit_daemon_or_live`) reads `own()` once (the daemon's own pid never changes across its run) and `worker::pid_of(session, fence)` fresh inside the closure, on every connection |
+| the now-dead paths | `admit_only` and Windows's `held_by_own` — Windows's only production caller of either until this step — are test-only there from here (`#[cfg(any(test, not(windows)))]` / `#[cfg(all(windows, test))]`); Unix still uses both in production, unchanged |
+
+⚠️ The Step table's own one-line summary of P8-2b (below) also names "the console user's
+session" — not separate work this step left undone: point 4 already settled that a worker runs
+as the daemon's own identity, Windows included, never the console user's, so there was nothing
+to build for it here. Found on the way, not before.
+
+Found on the way: a different test, `hive::toolbelt::tests::the_hub_is_reached_through_its_seam_which_says_who_it_admits`,
+asserted `Admits::Daemon`'s old unit-variant `Debug` string (`"admits Daemon"`) as a literal
+constant, twice; both now build the expected string from the real `Admits::Daemon(session,
+fence)` value instead, so a future field on the enum breaks this test loudly again rather than
+going stale and passing on the wrong thing.
+
+Tests: a new unit test, `held_by_daemon_or_worker`'s four branches (the daemon's own pid admits;
+the worker's does too, independent of the daemon's; the daemon's, independent of the worker's;
+a pid that is neither does not) — fabricated pids, no socket needed, since the comparison itself
+reads none; the existing `a_connects_flow_admits_this_daemon_alone` updated to pass a session and
+fence (unregistered, so the common no-worker-up case, unchanged in behavior); both platforms' CI
+clippy line clean (`--features overlay-l3,ssh-server,hive,vault --tests -D warnings`); Windows
+`hive::` 266 passed, 2 ignored (0 failed), full lib suite 2378 passed (0 failed) — the +31 over
+P8-2b-3's own count is master's own movement since that step, not this one's; Linux/WSL `hive::`
+unchanged at 607 passed, 1 ignored (0 failed), the exact count P8-2b-1 and P8-2b-3 both recorded.
+`cargo fmt --all -- --check` clean on both platforms; `scripts/anchor-range-audit.sh` 0 new
+faults.
+
+P8-2b closes here: the Job object, the handle list, sockets by `WSADuplicateSocketW`, and
+P4-6-1b-2's flow admitting the worker are all built; P8-2c is next.
+
 Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
 has the vault.
 
@@ -4651,7 +4696,8 @@ has the vault.
 | P8-2a-7 | a worker's memory, bounded (§3i "P8-2a-7, as built"), Linux: where the daemon's unit delegates a cgroup with the memory controller (asked of systemd, never guessed: as root a cgroup write succeeds without delegation), each worker in `hive-worker-<n>` below the unit's, `memory.max` 512 MiB and `memory.swap.max` 0, joined by the child itself between fork and exec; the daemon moved into a leaf of its own as the first worker starts; an OOM kill read from `memory.events` and logged; delegated and not made, no worker runs; decision 66 as recommended. 4 new tests (a unit delegates memory only with the controller named; the daemon's cgroup its v2 line, the unit's above its leaf; bounded only where the unit delegates memory, never on a guess, and an error where it does on cgroup v1 alone; an OOM kill read from `memory.events`) and one run in a real delegated cgroup, which CI has not (the daemon's processes in their leaf, the worker in its own cgroup at 512 MiB with no swap, the cgroup gone at its end; `#[ignore]`d in CI); 9 negative controls, each caught at its own assertion, four of them in the delegated cgroup | device `hive_worker = false` (default); no `Delegate=` (the packaged units) | **merged** #2983 `76e8b1eb3` |
 | P8-2b-1 | the worker on Windows (§3i "P8-2b-1, as built"), its process and its channel: a pipe of its own, its DACL the daemon's account alone, its client end the one handle the worker inherits (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, beside `NUL`), found by `ROOMLERD_HIVE_WORKER_CHANNEL`; started suspended into a job of its own (`KILL_ON_JOB_CLOSE`, 512 MiB a process) as the daemon's identity, then resumed; the same supervisor, handshake, heartbeat, restarts and log as on Unix; no endpoint served there yet (P8-2b-3). 3 new tests on Windows (a worker's pipe has its two ends alone, one instance, a frame either way; the daemon keeps a worker up over its pipe; a worker starts into a job of its own, in it before it runs, the job ending what is in it, 512 MiB a process, and ended at once at its end) and the real `roomlerd.exe` started as the daemon starts it (its pipe found, `ready` with its own pid at this build's version, each beat answered, its end at `bye`; `#[ignore]`d in CI, which builds no binary for a lib test); the Unix suite unchanged (607); 6 negative controls on Windows, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2984 `aee65c269` |
 | P8-2b-2 | a Windows worker's crash keeps nothing of its memory (§3i "P8-2b-2, as built"): `SEM_NOGPFAULTERRORBOX` set in `worker_main` before the channel (`no_crash_dump`), so WER writes no dump, no Application Error event and no upload for the worker, on every fault path and thread; a worker that cannot set it does not run (exit 3). Measured as SYSTEM with a full `LocalDumps` (§8): `WerSetFlags(NOHEAP)`, a top-level filter and the job's `DIE_ON_UNHANDLED_EXCEPTION` each leak on some path (a fail-fast — Rust's `abort`, so every OOM at the bound — skips the filter and the flag); only the own-process mode held on every one. With it, nothing on the box records a worker's crash, so the daemon reads the exit code and names the fault (`InJob::ended`), ending the job with a code that never reads as one. 1 new unit test on Windows (the guard arms the bit, keeps the others; 2 negative controls, each caught at its own assertion) and the real worker's `ready` proving it armed the mode before serving; the config matrix (the probe as SYSTEM under machine-wide `LocalDumps` and `AeDebug`) green on a throwaway Windows host (§8). Decision 67 (the pagefile) posed. The daemon's own dumps are #2977 | device `hive_worker = false` (default) | **merged** #3008 `652002500` |
-| P8-2b-3 | credential endpoints cross to a Windows worker too (§3i "P8-2b-3, as built"): a listener rides inside `Call::Serve`'s own frame as its `WSAPROTOCOL_INFOW` (no fd-4 channel there), duplicated fresh at every hand-over and `rehand`; the daemon's own kept copy likewise duplicated, independent of the original place; `At::Loopback`'s `peer` now the per-OS `Peer` (a SID on Windows), `At` no longer `Copy`; `Egress`/`Decide`/`Bound`/`Valued`/`Leaf` stay `#[cfg(unix)]` as wire variants (egress's own step is next). 2 new unit tests (protocol info round-trips across a real pid, a `rehand`-shaped second duplicate of the one source; the wrong length refused) and a real end-to-end one, a real `roomlerd.exe` handed a real listener's protocol info over the wire, answering `Done`, with a connection from this process accepted on the same address once this test's own copy is dropped; both platforms' CI clippy line clean; Windows `hive::` 265 passed (1 ignored), full suite 2347 passed; Linux/WSL `hive::` unchanged at 607 passed (1 ignored), same as P8-2b-1's count. ⚠️ Not yet built: P4-6-1b-2's through-another-device flow still admits the daemon's own pid alone on Windows (P8-0's point 6) | device `hive_worker = false` (default) | **in review** |
+| P8-2b-3 | credential endpoints cross to a Windows worker too (§3i "P8-2b-3, as built"): a listener rides inside `Call::Serve`'s own frame as its `WSAPROTOCOL_INFOW` (no fd-4 channel there), duplicated fresh at every hand-over and `rehand`; the daemon's own kept copy likewise duplicated, independent of the original place; `At::Loopback`'s `peer` now the per-OS `Peer` (a SID on Windows), `At` no longer `Copy`; `Egress`/`Decide`/`Bound`/`Valued`/`Leaf` stay `#[cfg(unix)]` as wire variants (egress's own step is next). 2 new unit tests (protocol info round-trips across a real pid, a `rehand`-shaped second duplicate of the one source; the wrong length refused) and a real end-to-end one, a real `roomlerd.exe` handed a real listener's protocol info over the wire, answering `Done`, with a connection from this process accepted on the same address once this test's own copy is dropped; both platforms' CI clippy line clean; Windows `hive::` 265 passed (1 ignored), full suite 2347 passed; Linux/WSL `hive::` unchanged at 607 passed (1 ignored), same as P8-2b-1's count. ⚠️ Not yet built: P4-6-1b-2's through-another-device flow still admits the daemon's own pid alone on Windows (P8-0's point 6) | device `hive_worker = false` (default) | **merged** #3057 `51123d591` |
+| P8-2b-4 | P8-2b's last piece: P4-6-1b-2's through-another-device flow now admits the session's own worker too (§3i "P8-2b-4, as built"), closing the gap P8-2b-3 flagged. `Admits::Daemon` carries `(ObjectId, u64)` — the run — now, threaded through `net_tools::admit_of` and `daemon_flow`'s two constructions; `vault_connect::daemon_admit`'s Windows body reads `worker::pid_of(session, fence)` fresh on every connection, never cached at the hook's own build; the comparison itself, `held_by_daemon_or_worker`, is `pub(crate)` so a test drives it with fabricated pids, no socket needed. Unix unchanged (P8-0's point 6): a worker there already runs as the daemon's own account. Found on the way: a different test's literal `Admits::Daemon` debug-string assertions (`hive::toolbelt::tests`) now build their expectation from the real value instead of a stale constant. 1 new unit test (the comparison's four branches) and the existing admit test updated for the new signature; both platforms' CI clippy line clean; Windows `hive::` 266 passed (2 ignored), full suite 2378 passed; Linux/WSL `hive::` unchanged at 607 passed (1 ignored), the exact count P8-2b-1 and P8-2b-3 both recorded. P8-2b closes here | device `hive_worker = false` (default) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
