@@ -213,7 +213,7 @@ flowchart LR
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
-| P7 | Docs and the final field table | — | — |
+| P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own |
 
 P0 decides the rest. If convert + copy + upload turn out to be a small share of the encode stage on a backend,
 that backend's phase is not built, and the reason is recorded here.
@@ -479,7 +479,9 @@ flowchart LR
   field-verified like AC3, or deferred with the measurement that deferred them.
 - [ ] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
-  Linked from `docs/README.md`.
+  Linked from `docs/README.md`. *(P2's half written 2026-10-28: `encoders.md` § GPU-resident frames, with the
+  input reasons and the configuration rows; `remote-control.md` §5.1f, with both arms' frame paths and the field
+  numbers; both index rows. Ticked when the last cell is in them, as FR-108's AC8 is.)*
 
 ## 7. Open decisions
 
@@ -518,6 +520,7 @@ flowchart LR
 | 2026-10-28 | FFmpeg 9.0.1 CLI, `hevc_nvenc` with the agent's options (`-preset p4 -tune ll -rc vbr -cq 22 -bf 0 -rc-lookahead 0 -delay 0 -split_encode_mode forced`), an idle RTX 5090 Laptop GPU | **NVENC's own upload, measured for P3**: the same 8 frames looped 1200 times, once from system memory (NVENC uploads each, the production path) and once from CUDA memory (uploaded once by `hwupload_cuda`). Four runs; the CUDA path is steady and the system-memory path varies, so the upload is given as min–median. **2560×1600 NV12: 1.8–2.6 ms a frame** (system memory 4.04–5.04 ms, CUDA 2.25–2.43), 4:4:4 1.7–3.4 ms; **1920×1080 NV12: 0.7–1.1 ms**, 4:4:4 0.7–1.5 ms. These are throughput numbers. The agent's `submit` is latency-bound (8.8 ms at 2560×1600 HEVC in §9.1), so there the upload is about a fifth of it. With the 1.3 ms conversion and WGC's 6 ms readback, P3 would take about 3 ms off the encode stage, plus the readback off the capture thread. Script: `nvenc-split.sh` (FR-118 tools) |
 | 2026-10-28 | CI, the `Recorder tests (FR-85)` job's L0 cells: 6 master runs before C0 (`9aab8f703` to `c2ccd5e17`) and 8 runs with it (C0's PR run, then master `384443de3` to `e9f99cecf`) | **AC2's L0 half: C0 is invisible.** On both sides the runs fall into three runner speed classes: clean p50 ≈ 6, ≈ 9 and ≈ 12 ms, with `delay100` sitting 100.5–101.5 ms above clean in every run. So a pooled median moves with the class the runs happened to draw, and 6 of the 8 runs with C0 drew the slowest. Within a class, C0 moves clean's p50 by at most 0.5 ms: 5.9 and 6.0 → 6.5; 9.0 and 9.2 → 9.4; 11.8 and 12.2 → 11.7–12.7. Every cell keeps its frame rate (clean 60.2, `gate_slot` 25.2, `gate_lgcy` 24.5 fps). `lossy` and `gate50` vary with their loss and hold, as before. Tools: `l0-collect.sh` and `l0-summary.awk` (FR-118 tools) |
 | 2026-10-28 | agent 0.4.181, CORPLAP-3: `av1_qsv` at 1920×1200 on the SystemContext DXGI arm, a direct path, the viewer decoding AV1 in hardware | **The first field run of the GPU input**: sessions with the switch off, on, off, on, then one with the cell denied (§9.2). With the switch on, the probe's `gpu` child proved `av1_qsv` and `h264_qsv` on the Intel adapter in 765 ms, and every heartbeat read `input_path=gpu`. Capture + encode fell from 14.5 to 12.2 ms per frame, and the worker's CPU from 52 to 34 % of a core at the same encoded rate. The desktop's flat regions decoded identically, and no decode error reached the viewer. With the switch off: no `gpu` child, and `switch_off`. With `av1_qsv:gpu` denied: the child tried only `h264_qsv`, and the session read `denied` |
+| 2026-10-28 | agent 0.4.181, CORPLAP-3 on the soak (`zero_copy` on), a person's own session, 09:24:49–09:29:41Z | **The GPU input across a lock-screen transition.** All 145 heartbeats read `input_path=gpu`: 2 380 frames captured, 6 283 encoded, 40 IDRs, capture 1.49 ms and encode 11.54 ms (heartbeat means). The session crossed a desktop transition. The DXGI arm reported `AccessLost` three times and kept its device across the rebuilds ("kept the device across the rebuild", 7 times; §5.4). It then went through the GDI fallback for the lock screen, whose frames in memory the encoder uploaded into its QSV pool (`avg_upload_ms` 2.3 in that window). It climbed back to DXGI on a new device, and the encoder moved to it ("the capture's device changed under the encoder — reopened", still `gpu`). The viewer's uploaded logs carry no decode-error or keyframe line |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -594,7 +597,8 @@ the session (`Get-Process`, before and after).
   the two paths, so a denied cell costs no more than the switch off.
 - **Not covered by this run.** The host is 1920×1200, so AC4 needs another host. Its panel is on the Intel
   adapter, so AC5's `adapter_mismatch` needs a hybrid host. The sessions ran 3–6 min, not 20. No lock or unlock
-  happened with the switch on, so the kept device (§5.4) is unexercised.
+  happened with the switch on, so the kept device (§5.4) was unexercised here. The soak's first session did
+  exercise it at 09:24Z, with a lock-screen transition and a capture back on a new device (§9, the next row).
 - **Left on for a soak.** `zero_copy` stays on for CORPLAP-3 from 04:52Z (the restart's probe proved both forms
   again). To turn it off on the device: `roomler config set zero_copy false`, then `roomler restart`.
 
