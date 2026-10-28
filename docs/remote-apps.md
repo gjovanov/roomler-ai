@@ -313,13 +313,13 @@ restart changes it. That is why P6 added a fourth value:
   `compute_caps` advertised `list` on a device whose owner had set
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
-  `caps_cache.rs:277`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:1929`; a test locks
+  `caps_cache.rs:289`). `apps` is now assigned in `detect()`, in the daemon,
+  and the child's struct carries none (`apps_caps`, `caps.rs:2229`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:1027`; `files_caps` `:1918`), which a
+  seam (`with_config_lists`, `caps.rs:1305`; `files_caps` `:2218`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
@@ -461,7 +461,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2985`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2999`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.

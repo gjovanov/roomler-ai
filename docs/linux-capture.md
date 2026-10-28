@@ -2025,7 +2025,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2962`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2976`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -2060,11 +2060,11 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 
 The encoder-capability cache is keyed on **build × hardware × knobs**, and the
 knob half is a SHA-256 over **every** `ROOMLERD_*` variable the daemon can see
-(`agents/roomlerd/src/encode/caps_cache.rs:24-27`, `:185-205`; the reasoning
+(`agents/roomlerd/src/encode/caps_cache.rs:24-27`, `:197-217`; the reasoning
 is in [`encoders.md`](encoders.md#the-probe-lifecycle)). So a capture flag
 that has nothing to do with encoding still changes the key, the single-entry
 cache misses (`a ROOMLERD_* knob changed`), and the next start runs the full
-probe in a child process bounded at 60 s per phase (`encode/caps.rs:207`).
+probe in a child process bounded at 60 s per phase (`encode/caps.rs:212`).
 Restoring the old knob set afterwards is a **second** miss, because the cache
 now holds the new key.
 
