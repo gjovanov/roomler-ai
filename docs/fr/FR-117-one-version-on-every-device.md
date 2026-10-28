@@ -78,7 +78,7 @@ flowchart TD
     the daemon (#2055).
   - **Install:** the host's own package manager, so it stays the source of truth. `apt-get install -y` (then
     `dpkg --install`) for a `.deb`; `dnf`, `zypper` or `yum` for an `.rpm`, in `install.sh`'s order
-    (`desktop_rpm_tool`, `scripts/install.sh:793`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
+    (`desktop_rpm_tool`, `scripts/install.sh:885`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through
@@ -88,7 +88,7 @@ flowchart TD
     after a sync, so the dashboard's skew clears at the next heartbeat.
 - **When:** at the owner's start, and again on a 4 h tick, so a failed sync no longer waits for the next restart.
 - **Windows: the same retry.** `refresh_if_stale` runs once, at the start of whichever process owns the refresh (#1686:
-  the SCM host, `win_service/mod.rs:479`, or the worker, `app.rs:3879`). It now runs on the same 4 h tick in that
+  the SCM host, `win_service/mod.rs:479`, or the worker, `app.rs:3994`). It now runs on the same 4 h tick in that
   process. It costs one file read when the version marker matches.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` on both platforms gives back today's behaviour.
 
