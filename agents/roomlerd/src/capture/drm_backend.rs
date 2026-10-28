@@ -1314,7 +1314,7 @@ fn grab(
         height: scaled.height,
         stride: scaled.stride,
         pixel_format: PixelFormat::Bgra,
-        data: scaled.data,
+        data: scaled.data.into(),
         monotonic_us: now_us(),
         monitor: 0,
         // DRM reports nothing about WHICH pixels changed: a buffer check says

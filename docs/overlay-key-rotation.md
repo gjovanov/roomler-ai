@@ -61,7 +61,7 @@ rotation closes.
 
 ## The order — `POST /api/tenant/{tid}/agent/{aid}/overlay-key/rotate`
 
-Owned by the **network** module (`crates/modules/network/src/lib.rs:415`, handler
+Owned by the **network** module (`crates/modules/network/src/lib.rs:444-447`, handler
 `crates/modules/network/src/routes/overlay_key.rs:118-250`). It touches no key. In
 order:
 
@@ -170,7 +170,7 @@ the grid can always show the device's current key.
 | record | lives in | written by | what it is |
 |---|---|---|---|
 | the **order** | `agents.key_rotation` (`KeyRotationRequest`, `models.rs:1860`) | the route | what was asked, when, by whom — and `public_key_before`, the key held at that moment |
-| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:3455`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | the route, one call site, both arms | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:731-738`) |
+| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:3455`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | the route, one call site, both arms | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:784-792`) |
 | the **claim** | `agents.key_rotation_report` (`KeyRotationReport`, `models.rs:1911`) | `rc:agent.key_rotated` ingest (`agent_socket.rs:175` → `agent_arms.rs:81-125`) | the device's account; `reported_at` is server-stamped, `detail` re-clamped on receipt |
 | the **proof** | `agents.overlay_identity` (`OverlayIdentity`, `models.rs:1942`) | the overlay join | the public key and epoch the device actually presented, and when |
 
@@ -306,7 +306,7 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:657`, `:688`, `:702`, test `:5756`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:2131-2135` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:657`, `:688`, `:702`, test `:5756`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:2176-2180` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3231`, `:972`; owner `network` (`:2410`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1860`, `:1886`, `:1911`, `:1942`, `:3443`, `:6053`, `:6068` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
@@ -315,7 +315,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:543-566`; `crates/services/src/dao/agent.rs:945` |
 | the conditional report write | `crates/services/src/dao/agent.rs:999-1029` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-676`, `:1452-1460` |
-| audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:731-738` |
+| audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:784-792` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6199-6341`, `:3088-3130`, `:3132-3153`, `:1178-1202` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1628`, `:1629-1631`; `config_surface.rs:1096-1069` |

@@ -22,7 +22,11 @@ path = "src/lib.rs"
 # surface, not a leftover. See wix/main.wxs `AgentExeAlias` +
 # release-agent.yml Copy-Item.
 name = "roomlerd"
-path = "src/main.rs"
+# FR-123 P2: the bin is one call into the lib's `app` module (the former
+# `src/main.rs`, renamed to `src/app.rs`), so the daemon compiles as one
+# unit. There is no `src/main.rs` on purpose: with the old path gone, git
+# pairs the rename and carries an in-flight edit onto `app.rs`.
+path = "src/bin/roomlerd.rs"
 
 [[example]]
 # FR-52 — the device half of a cross-implementation OPAQUE login, for proving a
@@ -590,6 +594,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",        # GetModuleHandleW — the FR-16 L4 `probe-target` window's class registration
     "Win32_System_Console",              # CreatePseudoConsole/Resize/Close + COORD — ConPTY interactive shells (SSH P4b)
     "Win32_System_JobObjects",           # CreateJobObjectW + KILL_ON_JOB_CLOSE — Windows has no process group, so a job IS the killpg equivalent (SSH P4b)
+    "Win32_System_Diagnostics_Debug",    # SetErrorMode/GetErrorMode + SEM_NOGPFAULTERRORBOX — FR-90 P8-2b-2: a hive worker suppresses every WER crash dump of its own memory (the lease values it holds), measured the one mechanism that holds on every fault path and thread
     "Win32_System_IO",                   # OVERLAPPED, which ReadFile's signature references
     "Win32_UI_Shell",                    # ShellExecuteExW for UAC-elevated msiexec (rc.18 self-update fix); SHGetKnownFolderPath (FR-84 D6)
     "Win32_System_Com",                  # CoTaskMemFree — frees SHGetKnownFolderPath's buffer (FR-84 D6: the SCM host reads the console user's config)

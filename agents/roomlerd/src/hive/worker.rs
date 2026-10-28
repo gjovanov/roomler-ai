@@ -218,6 +218,15 @@ fn is_worker(
 /// daemon before it ran a step.
 #[cfg(windows)]
 pub async fn worker_main() -> i32 {
+    // FR-90 P8-2b-2 — before anything else, and before the channel: a crash
+    // must keep nothing of this worker's memory, which holds the values of the
+    // endpoints it serves. A worker that cannot ensure that does not run, as a
+    // Unix worker that cannot set its limits does not (P8-2a-3). Its stderr is
+    // NUL, so this refusal shows only as exit code 3, which the daemon names.
+    if let Err(e) = win::no_crash_dump() {
+        crate::logging::say_on_stderr(format_args!("roomlerd hive-worker: {e}"));
+        return 3;
+    }
     let (layer, lines) = log::layer();
     log::install(layer);
     let Some(pipe) = win::inherited_channel() else {

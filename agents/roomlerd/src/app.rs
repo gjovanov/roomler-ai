@@ -1198,7 +1198,7 @@ fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
 /// `main` RETURNING to end the process would not. Nothing does: the daemon's
 /// clean shutdown is a `process::exit` after its drain.
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     // The embedded CLI must still short-circuit before any of this — and it
     // must NOT hand the main thread to AppKit, since a CLI call has to be able
     // to return an exit code.
@@ -1219,9 +1219,9 @@ fn main() -> Result<()> {
         .name("roomlerd-main".into())
         .spawn(move || {
             let res = rt.block_on(daemon_main());
-            // FR-97 P0e — drop the runtime (cancelling every task, as the
+            // FR-97 P0e — shut the runtime down (cancelling every task, as the
             // non-AppKit `main` does) before purging, so nothing re-pins.
-            drop_runtime_timed(rt);
+            shut_down_runtime(rt);
             purge_after_daemon();
             if let Err(e) = res {
                 tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
@@ -1240,48 +1240,51 @@ fn main() -> Result<()> {
     // the Dock and the app switcher — the bundle already sets `LSUIElement`,
     // and this makes it true for a non-bundled dev run too.
     //
-    // ⚠️ `roomlerd::`, NOT `crate::`. This file is a SEPARATE crate root from
-    // the lib, so a `cfg`-gated path here that reads like an intra-crate one
-    // compiles nowhere — and, being macOS-only, nowhere is exactly where it
-    // would have been noticed. Same trap as rc.454's `tcc` block; the `--bins`
-    // in the macOS CI job exists for it and caught this on the first push.
+    // `roomlerd::` is this lib's own name (`extern crate self as roomlerd`
+    // in lib.rs). This file was the bin's crate root until FR-123 P2 made it
+    // the lib's `app` module, and it keeps the spelling it had so an edit in
+    // flight across that move still applies and compiles. The `--bins` check
+    // in the macOS CI job (rc.454's `tcc` trap) still covers this arm.
     roomlerd::indicator::mac::run_main_loop();
 }
 
-/// #2718 — drop the daemon's runtime, saying so when that took seconds.
-/// Dropping a runtime waits for every `spawn_blocking` task to RETURN. One
-/// still blocked (a child process it waits on, a pipe it reads) holds the
-/// process past a service host's stop budget without a word: on an update the
-/// outgoing worker went silent for 8 s after its teardown and was terminated.
-/// A drop that never returns shows as `shutdown: clean stop recorded; the
-/// runtime is dropped next` with nothing after it.
-fn drop_runtime_timed(rt: tokio::runtime::Runtime) {
-    let dropping = std::time::Instant::now();
-    drop(rt);
-    let elapsed_ms = dropping.elapsed().as_millis() as u64;
-    if elapsed_ms >= 1_000 {
+/// #2718 — let the daemon's runtime go within
+/// [`roomlerd::runtime_exit::SHUTDOWN_BUDGET`]. An unbounded drop waited for
+/// every `spawn_blocking` task to RETURN, and an exec's read on a pipe a
+/// process it started still held never did: the worker overran a service
+/// stop's 8 s budget into a terminate, and hung its own restart until the
+/// watchdog forced `exit(2)` (`runtime_exit`'s module docs have both
+/// measurements). Says so when something blocked was left behind.
+fn shut_down_runtime(rt: tokio::runtime::Runtime) {
+    let budget = roomlerd::runtime_exit::SHUTDOWN_BUDGET;
+    let took = roomlerd::runtime_exit::shut_down(rt, budget);
+    let elapsed_ms = took.as_millis() as u64;
+    if took >= budget {
         tracing::warn!(
             elapsed_ms,
-            "the runtime took seconds to drop: a blocking task held the exit (#2718)"
+            "runtime shut down at its budget: a blocking task was left behind (#2718)"
         );
+    } else if elapsed_ms >= 1_000 {
+        tracing::info!(elapsed_ms, "runtime shut down");
     }
 }
 
-/// Exactly what `#[tokio::main]` expanded to — a multi-thread runtime with
-/// every driver enabled, `block_on` the daemon, drop the runtime — spelled out
-/// for one reason: FR-84 D3's requested restart must pick its exit code only
-/// AFTER the runtime is gone, so its teardown is the one every other clean
-/// exit (an auto-update, a SIGTERM) already gets. Nothing else changes.
+/// What `#[tokio::main]` expanded to — a multi-thread runtime with every
+/// driver enabled, `block_on` the daemon — spelled out for two reasons. FR-84
+/// D3's requested restart must pick its exit code only AFTER the runtime is
+/// gone, so its teardown is the one every other clean exit (an auto-update, a
+/// SIGTERM) already gets. And the runtime is shut down within a budget rather
+/// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed building the Runtime");
     let res = rt.block_on(daemon_main());
-    // Dropping the runtime cancels every task still running and waits for
-    // every blocking task to RETURN.
-    drop_runtime_timed(rt);
+    // Cancels every task still running and waits, within a budget, for the
+    // blocking work (#2718).
+    shut_down_runtime(rt);
     // FR-97 P0e — the runtime is gone.
     purge_after_daemon();
     if res.is_ok() {
@@ -4497,6 +4500,8 @@ async fn run_cmd(
         supervised,
         worker_channels,
         shutdown_rx.clone(),
+        // #2987 — a worker whose daemon is gone stops through this door.
+        shutdown_tx.clone(),
     ));
     #[cfg(not(unix))]
     let _ = supervised;
@@ -5797,7 +5802,7 @@ async fn encoder_smoke_cmd(
             height: h,
             stride: w * 4,
             pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (i as u64) * 33_333,
             monitor: 0,
             damage: roomlerd::capture::Damage::Unknown,
@@ -5922,7 +5927,7 @@ async fn encoder_reconfigure_sweep_cmd(
             height: h,
             stride: w * 4,
             pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (n as u64) * 33_333,
             monitor: 0,
             damage: roomlerd::capture::Damage::Unknown,
@@ -6365,7 +6370,7 @@ async fn capture_smoke_cmd(
         let mut out = Vec::with_capacity(w * h * 3 + 32);
         out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
         for y in 0..h {
-            let row = &frame.data[y * stride..y * stride + w * 4];
+            let row = &frame.cpu()[y * stride..y * stride + w * 4];
             for x in 0..w {
                 // BGRA in memory -> RGB on the wire.
                 out.push(row[x * 4 + 2]);

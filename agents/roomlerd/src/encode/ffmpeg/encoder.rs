@@ -689,6 +689,24 @@ pub struct FfmpegEncoder {
     /// FR-77 P4 — the VAAPI frame pool of a `*_vaapi` encoder (`None` for
     /// every other backend); replaced together with the encoder on a rebuild.
     hw: Option<hwframes::Frames>,
+    /// FR-118 P2-2 — a QSV encoder opened on a capture device takes GPU frames
+    /// through this pool (`None` = CPU frames, today's path); replaced
+    /// together with the encoder on a rebuild.
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    gpu: Option<super::gpu_input::QsvGpuInput>,
+    /// FR-118 P2-2 — a capture device this encoder could not take GPU frames
+    /// from (a reopen on it was refused), so it is not tried on every frame.
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    refused_device: Option<super::gpu_hint::GpuDevice>,
+    /// FR-118 P2-2 — the input form this encoder opened in, and for CPU frames
+    /// why.
+    input: super::gpu_hint::InputForm,
 
     /// Target fps this session runs at — threaded from the DC pump's
     /// `target_fps` (Phase B). Reused on the QSV/AMF bitrate REBUILD so the
@@ -751,6 +769,20 @@ pub struct FfmpegEncoder {
     /// screen (constant frame rate), and a repeated frame must not repeat a
     /// timestamp. `false` for every live encoder.
     counter_pts: bool,
+}
+
+/// What `build_encoder` opened: the codec, the frame pool of a VAAPI / D3D12 /
+/// Vulkan encoder, and (FR-118 P2-2) the GPU input of a QSV one, with the
+/// input form it opened in.
+struct Opened {
+    encoder: codec::encoder::Video,
+    hw: Option<hwframes::Frames>,
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    gpu: Option<super::gpu_input::QsvGpuInput>,
+    input: super::gpu_hint::InputForm,
 }
 
 /// FR-85 P1b — what turns an FFmpeg open into a RECORDING encoder.
@@ -878,6 +910,8 @@ pub struct RateStats {
     pub idr_count: u64,
     /// FR-118 P0 — the encode stage, split.
     pub stage: StageTimes,
+    /// FR-118 P2-2 — GPU frames or CPU frames, and why.
+    pub input: super::gpu_hint::InputForm,
 }
 
 /// FR-118 P0 — where `encode_sync`'s time goes, cumulative for one encoder.
@@ -1375,14 +1409,14 @@ impl FfmpegEncoder {
     fn new_vp9_qsv_probe(width: u32, height: u32, low_power: bool, gop: i32) -> Result<Self> {
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
         let cq = ffmpeg_cq();
-        let (encoder, hw) = Self::build_encoder(
+        let opened = Self::build_encoder(
             "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false, false, None,
         )?;
         Ok(Self {
             encoder_name: "vp9_qsv",
             width,
             height,
-            encoder,
+            encoder: opened.encoder,
             frame_count: 0,
             force_keyframe: false,
             plane_y: Vec::new(),
@@ -1391,7 +1425,18 @@ impl FfmpegEncoder {
             chroma444: false,
             packed444: false,
             frame_pool: Vec::new(),
-            hw,
+            hw: opened.hw,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            gpu: opened.gpu,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            refused_device: None,
+            input: opened.input,
             fps: 30,
             cq,
             maxrate_bps: 3_000_000,
@@ -1455,7 +1500,7 @@ impl FfmpegEncoder {
                 height: H,
                 stride: W * 4,
                 pixel_format: PixelFormat::Bgra,
-                data,
+                data: data.into(),
                 monotonic_us: i as u64 * 33_333,
                 monitor: 0,
                 damage: crate::capture::Damage::Unknown,
@@ -1620,7 +1665,7 @@ impl FfmpegEncoder {
                 constrained,
                 recording.map(|r| r.gop),
             ) {
-                Ok((encoder, hw)) => {
+                Ok(opened) => {
                     tracing::info!(
                         encoder = name,
                         width,
@@ -1631,13 +1676,15 @@ impl FfmpegEncoder {
                         maxrate_bps,
                         chroma444,
                         recording = recording.is_some(),
+                        input = opened.input.path(),
+                        input_reason = opened.input.reason,
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
                     return Ok(Self {
                         encoder_name: name,
                         width,
                         height,
-                        encoder,
+                        encoder: opened.encoder,
                         frame_count: 0,
                         force_keyframe: false,
                         plane_y: Vec::new(),
@@ -1646,7 +1693,18 @@ impl FfmpegEncoder {
                         chroma444,
                         packed444: chroma444 && packed444_name(name),
                         frame_pool: Vec::new(),
-                        hw,
+                        hw: opened.hw,
+                        #[cfg(all(
+                            target_os = "windows",
+                            any(feature = "mf-encoder", feature = "wgc-capture")
+                        ))]
+                        gpu: opened.gpu,
+                        #[cfg(all(
+                            target_os = "windows",
+                            any(feature = "mf-encoder", feature = "wgc-capture")
+                        ))]
+                        refused_device: None,
+                        input: opened.input,
                         fps,
                         cq,
                         maxrate_bps,
@@ -1696,7 +1754,7 @@ impl FfmpegEncoder {
         chroma444: bool,
         constrained: bool,
         gop_override: Option<i32>,
-    ) -> Result<(codec::encoder::Video, Option<hwframes::Frames>)> {
+    ) -> Result<Opened> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
 
@@ -1714,188 +1772,269 @@ impl FfmpegEncoder {
         // `VK_KHR_video_encode_queue`, the RTX did). So the whole
         // configure-and-open below runs once per candidate device until one
         // succeeds, and the winner is remembered for the next open.
-        let open_with = |hw_frames: Option<hwframes::Frames>| -> Result<(
+        // FR-118 P2-2 — `gpu_frames`: a QSV GPU input's frame pool, which the
+        // encoder then takes frames from (`AV_PIX_FMT_QSV`).
+        type Inputs = (
+            Option<hwframes::Frames>,
+            Option<*mut ffmpeg_next::ffi::AVBufferRef>,
+        );
+        let open_with = |(hw_frames, gpu_frames): Inputs| -> Result<(
             codec::encoder::Video,
             Option<hwframes::Frames>,
         )> {
-        // rc.86 — configure an unopened encoder. Factored into a closure
-        // so we can rebuild it for the fallback path (open_*_with consumes
-        // the encoder, so a failed open can't be retried on the same one).
-        //
-        // rc.89 fix: the UNOPENED encoder is `encoder::video::Video`,
-        // which is a DIFFERENT type from `codec::encoder::Video` (the
-        // OPENED encoder this fn returns). `open_as*` converts unopened →
-        // opened. The closure must therefore declare the unopened type;
-        // annotating it as the opened type was the rc.86 CI E0308.
-        let configure = || -> Result<ffmpeg_next::encoder::video::Video> {
-            let ctx = codec::Context::new_with_codec(codec);
-            let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
-            enc.set_width(width);
-            enc.set_height(height);
-            if let Some(frames) = &hw_frames {
-                // FR-77 P4 / FR-78 P1 — the encoder sees the kind's hardware
-                // surfaces (VAAPI / D3D12 / Vulkan); the pool's sw_format
-                // carries the real layout. A fresh ref per open attempt: a
-                // rejected context frees the one it was given. The pixel
-                // format goes in raw — ffmpeg-next's `Pixel` enum has no
-                // D3D12 variant.
-                let kind = hwframes::HwKind::of(name).expect("hw_frames exist only for a kind");
-                // SAFETY: `enc` is an unopened, exclusively owned context;
-                // `new_ref` hands over a reference FFmpeg unrefs on free.
-                unsafe {
-                    (*enc.as_mut_ptr()).pix_fmt = kind.pixel();
-                    (*enc.as_mut_ptr()).hw_frames_ctx = frames.new_ref();
-                }
-            } else {
-                // P7 — HEVC Rext 4:4:4 takes planar yuv444p; everything else
-                // stays on the HW-native NV12 4:2:0. FR-77 P3b — QSV takes
-                // the packed VUYX 4:4:4 instead (`chroma444_pixel`).
-                enc.set_format(if chroma444 {
-                    chroma444_pixel(name)
+            // rc.86 — configure an unopened encoder. Factored into a closure
+            // so we can rebuild it for the fallback path (open_*_with consumes
+            // the encoder, so a failed open can't be retried on the same one).
+            //
+            // rc.89 fix: the UNOPENED encoder is `encoder::video::Video`,
+            // which is a DIFFERENT type from `codec::encoder::Video` (the
+            // OPENED encoder this fn returns). `open_as*` converts unopened →
+            // opened. The closure must therefore declare the unopened type;
+            // annotating it as the opened type was the rc.86 CI E0308.
+            let configure = || -> Result<ffmpeg_next::encoder::video::Video> {
+                let ctx = codec::Context::new_with_codec(codec);
+                let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
+                enc.set_width(width);
+                enc.set_height(height);
+                if let Some(frames) = &hw_frames {
+                    // FR-77 P4 / FR-78 P1 — the encoder sees the kind's hardware
+                    // surfaces (VAAPI / D3D12 / Vulkan); the pool's sw_format
+                    // carries the real layout. A fresh ref per open attempt: a
+                    // rejected context frees the one it was given. The pixel
+                    // format goes in raw — ffmpeg-next's `Pixel` enum has no
+                    // D3D12 variant.
+                    let kind = hwframes::HwKind::of(name).expect("hw_frames exist only for a kind");
+                    // SAFETY: `enc` is an unopened, exclusively owned context;
+                    // `new_ref` hands over a reference FFmpeg unrefs on free.
+                    unsafe {
+                        (*enc.as_mut_ptr()).pix_fmt = kind.pixel();
+                        (*enc.as_mut_ptr()).hw_frames_ctx = frames.new_ref();
+                    }
+                } else if let Some(pool) = gpu_frames {
+                    // FR-118 P2-2 — QSV takes the GPU input's pool frames. A fresh
+                    // reference per open attempt, as above.
+                    // SAFETY: an unopened, exclusively owned context; `pool` is a
+                    // live frames context the GPU input owns for the whole open.
+                    unsafe {
+                        (*enc.as_mut_ptr()).pix_fmt =
+                            ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_QSV;
+                        (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg_next::ffi::av_buffer_ref(pool);
+                    }
                 } else {
-                    format::Pixel::NV12
-                });
-            }
-            // For NVENC constant-quality VBR we set bit_rate=0 so `cq`
-            // drives quality and `maxrate` is the only ceiling (idle ≈ 0).
-            // QSV/AMF keep `maxrate` as the VBR anchor since their
-            // quality modes are less reliable about honouring b:v=0.
-            let target_bps = if name.contains("nvenc") {
-                0
-            } else {
-                maxrate_bps
-            };
-            enc.set_bit_rate(target_bps);
-            // Time base: 1/1_000_000 (µs). Pts is set per frame from
-            // `monotonic_us` itself (`live_pts`), FR-119 P2a.
-            enc.set_time_base((1, TIME_BASE_DEN));
-            enc.set_frame_rate(Some((fps, 1)));
-            // rc.219 — vp9_qsv defaults to the short natural-key GOP
-            // (runtime forcing historically ignored). P4 — the caller now
-            // threads the PROBED per-host value (`vp9_qsv_runtime_config`):
-            // hosts whose vp9_qsv measurably honours runtime forced IDRs
-            // get KEYFRAME_INTERVAL (on-demand-only keys) instead.
-            // FR-85 P1b — a recording keeps a real GOP: every fragment of its
-            // MP4 starts on a keyframe, and an editor cut decodes at most one
-            // GOP. `None` (every live open) is exactly the old rule.
-            let gop = if let Some(g) = gop_override {
-                g
-            } else if name == "vp9_qsv" {
-                qsv_gop
-            } else {
-                KEYFRAME_INTERVAL
-            };
-            enc.set_gop(gop as u32);
-            enc.set_max_b_frames(0); // low-latency: no B-frames
-            Ok(enc)
-        };
-
-        // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
-        // driver rejects any single private option, the WHOLE dict is
-        // dropped. So the low-latency knobs (`delay`/`async_depth`/…) get
-        // their own tier:
-        //   0. throughput + quality + low-latency (FR-119 P2b-10: only when
-        //      `throughput_options` has something, NVENC above 60 fps),
-        //   1. quality + low-latency,
-        //   2. quality ALONE (keeps `forced-idr` etc. if only a lowlat knob
-        //      was rejected — a full revert to defaults would lose
-        //      `forced-idr` → the NVENC black-screen IDR bug),
-        //   3. plain defaults (blurry-but-working beats a black screen).
-        let opened = 'open: {
-            if !throughput.is_empty() {
-                let mut full = dict_from_pairs(&base);
-                for (k, v) in lowlat.iter().chain(throughput.iter()) {
-                    full.set(k.as_str(), v.as_str());
+                    // P7 — HEVC Rext 4:4:4 takes planar yuv444p; everything else
+                    // stays on the HW-native NV12 4:2:0. FR-77 P3b — QSV takes
+                    // the packed VUYX 4:4:4 instead (`chroma444_pixel`).
+                    enc.set_format(if chroma444 {
+                        chroma444_pixel(name)
+                    } else {
+                        format::Pixel::NV12
+                    });
                 }
-                let throughput_summary = throughput
+                // For NVENC constant-quality VBR we set bit_rate=0 so `cq`
+                // drives quality and `maxrate` is the only ceiling (idle ≈ 0).
+                // QSV/AMF keep `maxrate` as the VBR anchor since their
+                // quality modes are less reliable about honouring b:v=0.
+                let target_bps = if name.contains("nvenc") {
+                    0
+                } else {
+                    maxrate_bps
+                };
+                enc.set_bit_rate(target_bps);
+                // Time base: 1/1_000_000 (µs). Pts is set per frame from
+                // `monotonic_us` itself (`live_pts`), FR-119 P2a.
+                enc.set_time_base((1, TIME_BASE_DEN));
+                enc.set_frame_rate(Some((fps, 1)));
+                // rc.219 — vp9_qsv defaults to the short natural-key GOP
+                // (runtime forcing historically ignored). P4 — the caller now
+                // threads the PROBED per-host value (`vp9_qsv_runtime_config`):
+                // hosts whose vp9_qsv measurably honours runtime forced IDRs
+                // get KEYFRAME_INTERVAL (on-demand-only keys) instead.
+                // FR-85 P1b — a recording keeps a real GOP: every fragment of its
+                // MP4 starts on a keyframe, and an editor cut decodes at most one
+                // GOP. `None` (every live open) is exactly the old rule.
+                let gop = if let Some(g) = gop_override {
+                    g
+                } else if name == "vp9_qsv" {
+                    qsv_gop
+                } else {
+                    KEYFRAME_INTERVAL
+                };
+                enc.set_gop(gop as u32);
+                enc.set_max_b_frames(0); // low-latency: no B-frames
+                Ok(enc)
+            };
+
+            // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
+            // driver rejects any single private option, the WHOLE dict is
+            // dropped. So the low-latency knobs (`delay`/`async_depth`/…) get
+            // their own tier:
+            //   0. throughput + quality + low-latency (FR-119 P2b-10: only when
+            //      `throughput_options` has something, NVENC above 60 fps),
+            //   1. quality + low-latency,
+            //   2. quality ALONE (keeps `forced-idr` etc. if only a lowlat knob
+            //      was rejected — a full revert to defaults would lose
+            //      `forced-idr` → the NVENC black-screen IDR bug),
+            //   3. plain defaults (blurry-but-working beats a black screen).
+            let opened = 'open: {
+                if !throughput.is_empty() {
+                    let mut full = dict_from_pairs(&base);
+                    for (k, v) in lowlat.iter().chain(throughput.iter()) {
+                        full.set(k.as_str(), v.as_str());
+                    }
+                    let throughput_summary = throughput
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let enc = configure()?;
+                    match enc.open_as_with(codec, full) {
+                        Ok(encoder) => {
+                            tracing::info!(
+                                encoder = name,
+                                options = %format!("{opt_summary} {throughput_summary}"),
+                                "ffmpeg encoder opened with throughput + quality + low-latency options"
+                            );
+                            break 'open encoder;
+                        }
+                        Err(open_err) => {
+                            tracing::warn!(
+                                encoder = name,
+                                %open_err,
+                                rejected = throughput_summary,
+                                "ffmpeg open rejected the throughput knobs — retrying without them"
+                            );
+                        }
+                    }
+                }
+                if !lowlat.is_empty() {
+                    let mut full = dict_from_pairs(&base);
+                    for (k, v) in &lowlat {
+                        full.set(k.as_str(), v.as_str());
+                    }
+                    let enc = configure()?;
+                    match enc.open_as_with(codec, full) {
+                        Ok(encoder) => {
+                            tracing::info!(
+                                encoder = name,
+                                options = opt_summary,
+                                "ffmpeg encoder opened with quality + low-latency options"
+                            );
+                            break 'open encoder;
+                        }
+                        Err(open_err) => {
+                            tracing::warn!(
+                                encoder = name,
+                                %open_err,
+                                "ffmpeg open rejected the low-latency knobs — retrying with quality options only"
+                            );
+                        }
+                    }
+                }
+
+                let base_summary = base
                     .iter()
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(" ");
                 let enc = configure()?;
-                match enc.open_as_with(codec, full) {
+                match enc.open_as_with(codec, dict_from_pairs(&base)) {
                     Ok(encoder) => {
                         tracing::info!(
                             encoder = name,
-                            options = %format!("{opt_summary} {throughput_summary}"),
-                            "ffmpeg encoder opened with throughput + quality + low-latency options"
+                            options = base_summary,
+                            "ffmpeg encoder opened with quality options"
                         );
-                        break 'open encoder;
+                        encoder
                     }
                     Err(open_err) => {
                         tracing::warn!(
                             encoder = name,
                             %open_err,
-                            rejected = throughput_summary,
-                            "ffmpeg open rejected the throughput knobs — retrying without them"
+                            attempted_options = base_summary,
+                            "ffmpeg open_as_with rejected the quality options — retrying with encoder defaults"
                         );
+                        let enc2 = configure()?;
+                        enc2.open_as(codec)
+                            .with_context(|| format!("open_as({}) fallback failed", name))?
                     }
                 }
-            }
-            if !lowlat.is_empty() {
-                let mut full = dict_from_pairs(&base);
-                for (k, v) in &lowlat {
-                    full.set(k.as_str(), v.as_str());
-                }
-                let enc = configure()?;
-                match enc.open_as_with(codec, full) {
-                    Ok(encoder) => {
-                        tracing::info!(
-                            encoder = name,
-                            options = opt_summary,
-                            "ffmpeg encoder opened with quality + low-latency options"
-                        );
-                        break 'open encoder;
-                    }
-                    Err(open_err) => {
-                        tracing::warn!(
-                            encoder = name,
-                            %open_err,
-                            "ffmpeg open rejected the low-latency knobs — retrying with quality options only"
-                        );
-                    }
-                }
-            }
-
-            let base_summary = base
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let enc = configure()?;
-            match enc.open_as_with(codec, dict_from_pairs(&base)) {
-                Ok(encoder) => {
-                    tracing::info!(
-                        encoder = name,
-                        options = base_summary,
-                        "ffmpeg encoder opened with quality options"
-                    );
-                    encoder
-                }
-                Err(open_err) => {
-                    tracing::warn!(
-                        encoder = name,
-                        %open_err,
-                        attempted_options = base_summary,
-                        "ffmpeg open_as_with rejected the quality options — retrying with encoder defaults"
-                    );
-                    let enc2 = configure()?;
-                    enc2.open_as(codec)
-                        .with_context(|| format!("open_as({}) fallback failed", name))?
-                }
-            }
-        };
-        Ok((opened, hw_frames))
+            };
+            Ok((opened, hw_frames))
         };
 
-        match hwframes::HwKind::of(name) {
-            Some(kind) => hwframes::open_on_some_device(kind, |dev| {
+        let cpu_form = |input: super::gpu_hint::InputForm| {
+            move |(encoder, hw): (codec::encoder::Video, Option<hwframes::Frames>)| Opened {
+                encoder,
+                hw,
+                #[cfg(all(
+                    target_os = "windows",
+                    any(feature = "mf-encoder", feature = "wgc-capture")
+                ))]
+                gpu: None,
+                input,
+            }
+        };
+        let no_gpu_cell = super::gpu_hint::InputForm::cpu("no_gpu_cell");
+        if let Some(kind) = hwframes::HwKind::of(name) {
+            return hwframes::open_on_some_device(kind, |dev| {
                 let frames =
                     hwframes::Frames::new(dev, kind, kind.sw_format(chroma444), width, height)?;
-                open_with(Some(frames))
-            }),
-            None => open_with(None),
+                open_with((Some(frames), None))
+            })
+            .map(cpu_form(no_gpu_cell));
         }
+        // FR-118 P2-2 — a QSV cell opened while the pump names a capture device
+        // (`gpu_hint::opening_on`) takes GPU frames from a pool on it. Every
+        // gate is read here, at the open (`gpu_input::plan`); a refusal, or a
+        // codec that will not open on the pool, opens today's CPU form and the
+        // heartbeat says why.
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        let input = match super::gpu_input::plan(name, chroma444, width, height) {
+            Ok(pool) => match open_with((None, Some(pool.frames_raw()))) {
+                Ok((encoder, hw)) => {
+                    tracing::info!(
+                        encoder = name,
+                        width,
+                        height,
+                        "FR-118: the encoder takes GPU frames from the capture device"
+                    );
+                    return Ok(Opened {
+                        encoder,
+                        hw,
+                        gpu: Some(pool),
+                        input: super::gpu_hint::InputForm::GPU,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        encoder = name,
+                        %e,
+                        "FR-118: the encoder did not open on the GPU input — CPU frames"
+                    );
+                    super::gpu_hint::InputForm::cpu("open_failed")
+                }
+            },
+            Err(refused) => {
+                if let Some(detail) = &refused.detail {
+                    tracing::warn!(
+                        encoder = name,
+                        reason = refused.reason,
+                        detail = detail.as_str(),
+                        "FR-118: no GPU input for this encoder — CPU frames"
+                    );
+                }
+                super::gpu_hint::InputForm::cpu(refused.reason)
+            }
+        };
+        #[cfg(not(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        )))]
+        let input = no_gpu_cell;
+        open_with((None, None)).map(cpu_form(input))
     }
 
     /// The layout of the frames this encoder takes: NV12 for 4:2:0, planar
@@ -2179,8 +2318,8 @@ pub(crate) fn with_av1_temporal_delimiter(data: Vec<u8>) -> Vec<u8> {
 /// P3 (2026-08-27) — the parameters a BACKGROUND maxrate rebuild needs,
 /// captured from the live encoder so the blocking open can run off the
 /// pump task (`spawn_blocking`) while the current encoder keeps
-/// producing frames.
-#[derive(Debug, Clone, Copy)]
+/// producing frames. Not `Copy` since FR-118 P2-2: it carries a capture device.
+#[derive(Debug, Clone)]
 pub struct RebuildSpec {
     name: &'static str,
     width: u32,
@@ -2190,6 +2329,9 @@ pub struct RebuildSpec {
     cq: u32,
     chroma444: bool,
     constrained: bool,
+    /// FR-118 P2-2 — the capture device the live encoder takes GPU frames
+    /// from, so the replacement opens on it too (`None` = CPU frames).
+    gpu_device: Option<super::gpu_hint::GpuDevice>,
 }
 
 /// P3 — a background-opened replacement encoder plus the parameters it
@@ -2200,6 +2342,12 @@ pub struct RebuiltEncoder {
     spec: RebuildSpec,
     inner: codec::encoder::Video,
     hw: Option<hwframes::Frames>,
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    gpu: Option<super::gpu_input::QsvGpuInput>,
+    input: super::gpu_hint::InputForm,
 }
 
 impl RebuiltEncoder {
@@ -2253,6 +2401,7 @@ impl FfmpegEncoder {
             swaps: self.swaps,
             idr_count: self.idr_count,
             stage: self.stage,
+            input: self.input,
         }
     }
 
@@ -2280,6 +2429,7 @@ impl FfmpegEncoder {
             cq: self.cq,
             chroma444: self.chroma444,
             constrained: self.constrained,
+            gpu_device: self.gpu_device(),
         })
     }
 
@@ -2303,6 +2453,7 @@ impl FfmpegEncoder {
             cq: self.cq,
             chroma444: self.chroma444,
             constrained: self.constrained,
+            gpu_device: self.gpu_device(),
         }
     }
 
@@ -2314,22 +2465,94 @@ impl FfmpegEncoder {
     /// with).
     pub(crate) fn open_rebuilt(spec: RebuildSpec) -> Result<RebuiltEncoder> {
         let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
-        let (inner, hw) = Self::build_encoder(
-            spec.name,
-            spec.width,
-            spec.height,
-            spec.fps,
-            spec.maxrate_bps,
-            spec.cq,
-            qsv_low_power,
-            qsv_gop,
-            spec.chroma444,
-            spec.constrained,
-            // The background swap serves the live pump only; a recording
-            // encoder is never rebuilt this way.
-            None,
-        )?;
-        Ok(RebuiltEncoder { spec, inner, hw })
+        // FR-118 P2-2 — on the device the live encoder takes GPU frames from.
+        let opened = super::gpu_hint::opening_on(spec.gpu_device.clone(), || {
+            Self::build_encoder(
+                spec.name,
+                spec.width,
+                spec.height,
+                spec.fps,
+                spec.maxrate_bps,
+                spec.cq,
+                qsv_low_power,
+                qsv_gop,
+                spec.chroma444,
+                spec.constrained,
+                // The background swap serves the live pump only; a recording
+                // encoder is never rebuilt this way.
+                None,
+            )
+        })?;
+        Ok(RebuiltEncoder {
+            spec,
+            inner: opened.encoder,
+            hw: opened.hw,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            gpu: opened.gpu,
+            input: opened.input,
+        })
+    }
+
+    /// Open a replacement of this encoder at `maxrate_bps`, the same backend,
+    /// dims, rate and chroma; FR-118 P2-2 — on `device` when it takes GPU
+    /// frames from one. BLOCKING, like every open. The P4 vp9_qsv gop and
+    /// low_power are re-resolved (a process-stable OnceLock, so the original
+    /// config).
+    fn reopen(
+        &self,
+        maxrate_bps: usize,
+        device: Option<super::gpu_hint::GpuDevice>,
+    ) -> Result<Opened> {
+        let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
+        super::gpu_hint::opening_on(device, || {
+            Self::build_encoder(
+                self.encoder_name,
+                self.width,
+                self.height,
+                self.fps,
+                maxrate_bps,
+                self.cq,
+                qsv_low_power,
+                qsv_gop,
+                self.chroma444,
+                self.constrained,
+                self.gop_override,
+            )
+        })
+    }
+
+    /// Put `opened` in place of the current encoder: a fresh GOP whose first
+    /// frame is an IDR, as every rebuild.
+    fn adopt_opened(&mut self, opened: Opened) {
+        self.encoder = opened.encoder;
+        self.hw = opened.hw;
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        {
+            self.gpu = opened.gpu;
+        }
+        self.input = opened.input;
+        self.frame_count = 0;
+        self.force_keyframe = true;
+    }
+
+    /// FR-118 P2-2 — the capture device this encoder takes GPU frames from.
+    fn gpu_device(&self) -> Option<super::gpu_hint::GpuDevice> {
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        return self.gpu.as_ref().map(|g| g.device().clone());
+        #[cfg(not(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        )))]
+        None
     }
 
     /// P3 — adopt a background-opened encoder between frames. Refuses
@@ -2352,6 +2575,14 @@ impl FfmpegEncoder {
         }
         self.encoder = rebuilt.inner;
         self.hw = rebuilt.hw;
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        {
+            self.gpu = rebuilt.gpu;
+        }
+        self.input = rebuilt.input;
         self.width = spec.width;
         self.height = spec.height;
         // FR-119 P2b — and the frame rate it was opened at, which every later
@@ -2383,6 +2614,19 @@ impl FfmpegEncoder {
             ));
         }
 
+        // FR-118 P2-2 — follow the capture's device, then take the frame
+        // through the GPU input when this encoder has one.
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        {
+            self.follow_capture_device(frame);
+            if self.gpu.is_some() {
+                return self.encode_through_gpu_input(frame);
+            }
+        }
+
         // FR-118 P0 — each step timed apart (`StageTimes`). A frame that fails
         // part-way is not counted: it is not a frame the stage carried.
         let t0 = std::time::Instant::now();
@@ -2412,6 +2656,128 @@ impl FfmpegEncoder {
         let sent = self.encoder.send_frame(hw_frame.as_ref().unwrap_or(&av));
         self.give_back(av);
         sent.map_err(|e| anyhow!("ffmpeg send_frame failed: {}", e))?;
+        let t3 = std::time::Instant::now();
+
+        self.force_keyframe = false;
+        self.frame_count += 1;
+
+        let packets = self.drain_packets()?;
+        let t4 = std::time::Instant::now();
+        let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
+        self.stage.frames += 1;
+        self.stage.convert_us += us(t0, t1);
+        self.stage.upload_us += us(t1, t2);
+        self.stage.submit_us += us(t2, t3);
+        self.stage.drain_us += us(t3, t4);
+        Ok(packets)
+    }
+
+    /// FR-118 P2-2 — reopen on the device a GPU frame came from, when this
+    /// encoder should take GPU frames from it and does not: the capture rebuilt
+    /// its device (`moved`), or the encoder opened on a frame in memory (the
+    /// first-frame prime, a GDI fallback) and GPU frames arrive now (`late`).
+    /// BLOCKING when it reopens (a QSV open is 0.6–0.9 s on Iris Xe), so a
+    /// device a reopen was refused on is never tried again.
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    fn follow_capture_device(&mut self, frame: &Frame) {
+        use windows::core::Interface;
+        let crate::capture::FrameData::Gpu(gpu) = &frame.data else {
+            return;
+        };
+        let device = gpu.device();
+        let moved = self
+            .gpu
+            .as_ref()
+            .is_some_and(|pool| !pool.same_device(device));
+        let late = self.gpu.is_none() && self.input.reason == "cpu_frames";
+        let refused = self
+            .refused_device
+            .as_ref()
+            .is_some_and(|d| d.as_raw() == device.as_raw());
+        if !(moved || late) || refused {
+            return;
+        }
+        match self.reopen(self.maxrate_bps, Some(device.clone())) {
+            Ok(opened) => {
+                let takes_gpu = opened.gpu.is_some();
+                tracing::info!(
+                    encoder = self.encoder_name,
+                    moved,
+                    input = opened.input.path(),
+                    input_reason = opened.input.reason,
+                    "FR-118: the capture's device changed under the encoder — reopened"
+                );
+                if takes_gpu || self.gpu.is_some() {
+                    // GPU frames from the new device; or the GPU input is lost
+                    // to the move and the CPU form replaces it, so the form
+                    // the heartbeat reports stays true.
+                    self.adopt_opened(opened);
+                    self.rebuilds += 1;
+                } else {
+                    // Still CPU frames: keep the encoder that runs, and its
+                    // reason becomes the refusal's.
+                    self.input = opened.input;
+                }
+                if !takes_gpu {
+                    self.refused_device = Some(device.clone());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    encoder = self.encoder_name,
+                    %e,
+                    "FR-118: reopening on the capture's device failed — keeping the encoder"
+                );
+                self.refused_device = Some(device.clone());
+            }
+        }
+    }
+
+    /// FR-118 P2-2 — `encode_sync` through the GPU input. A GPU frame of the
+    /// pool's device is converted on the GPU and goes to the encoder without
+    /// touching CPU memory. Any other frame (in memory, or on another device,
+    /// read back by `cpu()`) takes today's conversion and the pool's upload.
+    /// Stages as on the CPU path: `convert` is the GPU conversion's submission
+    /// (or the CPU conversion), `upload` the pool upload (zero for a GPU frame).
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    fn encode_through_gpu_input(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
+        let t0 = std::time::Instant::now();
+        let on_pool_device = match (&frame.data, &self.gpu) {
+            (crate::capture::FrameData::Gpu(gpu), Some(pool)) => pool.same_device(gpu.device()),
+            _ => false,
+        };
+        let (mut qsv, t1) = if on_pool_device {
+            let (crate::capture::FrameData::Gpu(gpu), Some(pool)) =
+                (&frame.data, self.gpu.as_mut())
+            else {
+                return Err(anyhow!("the GPU input went away mid-frame"));
+            };
+            (pool.convert_gpu_frame(gpu)?, std::time::Instant::now())
+        } else {
+            let mut av = self.take_frame()?;
+            if let Err(e) = self.convert_into(frame, &mut av) {
+                self.give_back(av);
+                return Err(e);
+            }
+            let t1 = std::time::Instant::now();
+            let uploaded = match self.gpu.as_ref() {
+                Some(pool) => pool.upload(&av),
+                None => Err(anyhow!("the GPU input went away mid-frame")),
+            };
+            self.give_back(av);
+            (uploaded?, t1)
+        };
+        self.stamp_frame(&mut qsv, frame.monotonic_us);
+        let t2 = std::time::Instant::now();
+        self.encoder
+            .send_frame(&qsv)
+            .map_err(|e| anyhow!("ffmpeg send_frame failed: {}", e))?;
         let t3 = std::time::Instant::now();
 
         self.force_keyframe = false;
@@ -2552,26 +2918,10 @@ impl VideoEncoder for FfmpegEncoder {
                 // rate limits bound how often the bucket — and thus this
                 // rebuild — changes. P4 — re-resolve the vp9_qsv gop/low_power
                 // (process-stable OnceLock, reproduces the original config).
-                let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
-                match Self::build_encoder(
-                    self.encoder_name,
-                    self.width,
-                    self.height,
-                    self.fps,
-                    target,
-                    self.cq,
-                    qsv_low_power,
-                    qsv_gop,
-                    self.chroma444,
-                    self.constrained,
-                    self.gop_override,
-                ) {
-                    Ok((enc, hw)) => {
-                        self.encoder = enc;
-                        self.hw = hw;
+                match self.reopen(target, self.gpu_device()) {
+                    Ok(opened) => {
+                        self.adopt_opened(opened);
                         self.maxrate_bps = target;
-                        self.frame_count = 0;
-                        self.force_keyframe = true;
                         self.rebuilds += 1;
                         tracing::info!(
                             encoder = self.encoder_name,
@@ -2752,10 +3102,10 @@ fn convert_bgra_planes<const N: usize>(
     let what = dst_format.pixel_format;
     // The bands below slice the source by rows; a short buffer is an error,
     // never a panic on an encoder thread.
-    if stride < w * 4 || frame.data.len() < stride * h {
+    if stride < w * 4 || frame.cpu().len() < stride * h {
         return Err(anyhow!(
             "BGRA frame of {} bytes, stride {stride}, cannot hold {w}x{h}",
-            frame.data.len()
+            frame.cpu().len()
         ));
     }
     if bands <= 1 {
@@ -2765,7 +3115,7 @@ fn convert_bgra_planes<const N: usize>(
             h as u32,
             &src_format,
             Some(&[stride]),
-            &[&frame.data],
+            &[frame.cpu()],
             dst_format,
             Some(&strides),
             &mut planes,
@@ -2791,7 +3141,7 @@ fn convert_bgra_planes<const N: usize>(
             bh as u32,
             &src_format,
             Some(&[stride]),
-            &[&frame.data[r0 * stride..]],
+            &[&frame.cpu()[r0 * stride..]],
             dst_format,
             Some(&strides),
             &mut band,
@@ -3597,7 +3947,7 @@ mod tests {
             height: h as u32,
             stride: (w * 4) as u32,
             pixel_format: PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
@@ -3617,7 +3967,7 @@ mod tests {
                 h as u32,
                 &src_format,
                 Some(&[w * 4]),
-                &[&frame.data],
+                &[frame.cpu()],
                 dst_format,
                 Some(&strides),
                 &mut slices,
@@ -3786,7 +4136,7 @@ mod tests {
                 height: h,
                 stride: stride as u32,
                 pixel_format: PixelFormat::Bgra,
-                data: frames[n % frames.len()].clone(),
+                data: frames[n % frames.len()].clone().into(),
                 monotonic_us: n as u64 * period_us,
                 monitor: 0,
                 damage: crate::capture::Damage::Unknown,

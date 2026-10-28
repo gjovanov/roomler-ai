@@ -275,6 +275,14 @@ Implementation notes that keep the child honest:
   EPIPE elsewhere). `println!` panicked there, and the panic hook filed an agent
   crash on every update a stop met a probe. A closed pipe now means "the parent
   is gone": the child exits `3` (`EXIT_PARENT_GONE`) and records nothing.
+- The child **ends with the worker** (#2717). On Windows it joins a
+  `KILL_ON_JOB_CLOSE` job that the parent holds while it waits
+  (`child::tie_to_this_process`). A worker can die mid-probe: terminated by its
+  service host, crashed, or leaving at its 3 s runtime-shutdown budget without
+  waiting the probe out (#2718). Untied, it would leave an orphaned
+  `roomlerd.exe caps-probe` holding the binary an update is replacing, and a
+  child hung in a driver would run on with nobody enforcing the 60 s bound.
+  Under systemd, the unit's control-group stop already reaches the child.
 - The child's **stderr is inherited on purpose**: its per-codec probe lines are
   the record of *which* codec died, and they belong in the daemon log directly
   above the verdict.

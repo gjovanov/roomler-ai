@@ -72,9 +72,11 @@ and max, and how many windows reached 50 fps.
   `av1_nvenc` takes 10–11 ms. The CPU work is the same for both, so at most ~11 ms of the 22 is conversion and
   copies. The rest is HEVC NVENC itself on that GPU, and a GPU-resident frame would not fix it. Recorded so that
   P2's result is not read as a promise for every encoder.
-- **The capture readback is off the pump's clock.** WGC reads back on its own worker thread (§2.1), so its
-  cost shows up as frame age (latency) and CPU load, not as pump time. `avg_capture_ms` also includes the wait
-  for a frame on an event-driven backend. P0 measures the readback itself, on the capture thread.
+- **The capture readback is off the pump's clock on WGC, and on it on the DXGI arm.** WGC reads back on its own
+  worker thread (§2.1), so its cost shows up as frame age (latency) and CPU load, not as pump time. The DXGI arm
+  reads back on its capture thread while the pump waits, so there it is pump time, inside `avg_capture_ms`, which
+  also includes the wait for a frame on an event-driven backend. P0 measures WGC's readback on the capture
+  thread, and P0b the DXGI arm's.
 
 ## 4. Design
 
@@ -128,19 +130,27 @@ is read back, which is exactly today's path.
 - **Scale and convert on the GPU.** One D3D11 `VideoProcessorBlt` from the BGRA capture texture into an NV12
   texture at the encode box. The output colour space is **BT.601, limited range**: the matrix the CPU path uses
   today (`encode/color.rs:16`). A host that flips paths must not change colour. The DXGI arm already builds a
-  VideoProcessor for its Phase B scale (`dxgi_direct.rs:203`–`326`); this generalises it to NV12 output and gives
-  it to WGC.
+  VideoProcessor for its Phase B scale (`dxgi_direct.rs:203`–`326`); this generalises it to NV12 output on that
+  arm (P2), then gives it to WGC (P3).
 - **One device, shared.** `HwKind::D3d11va` wraps the **capture's** `ID3D11Device` with
   `av_hwdevice_ctx_alloc` (never `_create`, which would open a second device), then
   `AVD3D11VADeviceContext.device` and `av_hwdevice_ctx_init`. The capture worker and the encoder thread (FR-70
   M1) then use one immediate context from two threads. That needs `ID3D10Multithread::SetMultithreadProtected`,
   or FFmpeg's lock callbacks shared with the capture thread. P2 picks one and proves it under load.
 - **Never hand over the capture pool's own surface.** `CopyResource` into a texture from the encoder's frame pool,
-  then release the WGC frame. Holding WGC's surface past `FrameArrived` stalls the capture.
+  then release the WGC frame. Holding WGC's surface past `FrameArrived` stalls the capture. On the DXGI arm the
+  `VideoProcessorBlt` writes straight into the encoder's texture, and the duplication frame is released before
+  the next acquire, as it is today.
+- **The encoder follows the capture device.** The DXGI arm rebuilds its device after an `AccessLost` (a lock, an
+  unlock, a UAC prompt, a mode change: `reset()` runs `primary()` again), and the lock screen is the reason this
+  arm exists. So a GPU frame carries its device, and the encoder rebuilds its hardware frames context when the
+  device changes, at the cost of the keyframe any rebuild costs. Until it has, frames take the CPU path.
 - **Per backend:** NVENC takes `AV_PIX_FMT_D3D11` frames on its own adapter. QSV takes a device and frames
   **derived** from the D3D11VA ones (`av_hwdevice_ctx_create_derived`, `av_hwframe_ctx_create_derived`). AMF
-  takes `AV_PIX_FMT_D3D11` frames. The first cell is QSV (§5): the panel and the encoder share the Intel adapter
-  on the fleet's QSV laptops, and that is where the measured cost is largest.
+  takes `AV_PIX_FMT_D3D11` frames. The first cell is QSV on the DXGI arm (§5). The panel and the encoder share the
+  Intel adapter on the fleet's QSV hosts, every one of them captures through that arm (§9, 2026-10-27), and the
+  arm's device is on the output's adapter by construction, so the adapter rule holds there without open
+  decision 1. That is also where the measured cost is largest.
 
 ### 4.4 macOS
 
@@ -196,11 +206,11 @@ flowchart LR
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from WGC's capture thread (the DXGI arm is split with P4). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1), ships with the next agent release; the fleet read is AC1 |
-| P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | — |
-| P2 | **Windows, WGC → QSV, the first cell.** The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | — |
-| P3 | NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
-| P4 | The SystemContext DXGI arm (the lock screen and UAC) | the same | — |
+| P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b rides the next agent release; the fleet read is AC1 |
+| P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
+| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4); P2-3 and the field test next |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
+| P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
 | P7 | Docs and the final field table | — | — |
@@ -219,29 +229,153 @@ what the pump does.
 | `avg_upload_ms` | the hardware-frame upload: VAAPI, D3D12 and Vulkan; zero for every other encoder | the same |
 | `avg_submit_ms` | `send_frame`, where NVENC, QSV and AMF upload a software frame themselves | the same |
 | `avg_drain_ms` | receiving the packets | the same |
-| `avg_readback_ms` | WGC's copy of the capture surface into CPU memory, on its capture thread. This is off the pump's clock, so `avg_capture_ms` never contained it | the `FrameArrived` handler, `agents/roomlerd/src/capture/wgc_backend.rs` |
+| `avg_readback_ms` | the capture thread's copy of the capture surface into CPU memory. WGC's runs off the pump's clock, so `avg_capture_ms` never contained it. The DXGI arm's (P0b) runs while the pump waits for the reply, so there it is a part of `avg_capture_ms` | WGC: the `FrameArrived` handler, `agents/roomlerd/src/capture/wgc_backend.rs`. DXGI: `read_acquired`, `agents/roomlerd/src/system_context/dxgi_direct.rs` |
 
 - **The four parts add up to the encode stage** (`avg_encode_ms` also includes the hop to FR-70's encoder
   thread). They are cumulative per encoder (`StageTimes`, carried by `rate_stats()`) and reported per frame
   over each heartbeat window. A background swap keeps the encoder struct, so it keeps counting. An inline
   re-open builds a new encoder, and each encoder carries its own id, so a window never diffs two encoders'
   totals.
-- **The DXGI arm is not split here.** Its readback runs while the pump waits for the worker's reply, so it is
-  already inside `avg_capture_ms`, together with the acquire wait. It is split with P4. Every other backend
-  reports `avg_readback_ms = 0`: scrap copies on the pump's clock, and the synthetic source has nothing to
-  read back.
+- **P0 left the DXGI arm out; P0b (2026-10-27) adds it.** Its readback runs while the pump waits for the
+  worker's reply, so it was already inside `avg_capture_ms`, together with the acquire wait, and P0 deferred it.
+  Then the first fleet read showed that every QSV host captures through this arm (§9), so their readback read
+  `0`: not measured, not free. Now `read_acquired` times the whole copy (the staging copy, the `Map` and the row
+  copy, or the VideoProcessor scale and its smaller readback), the capture thread adds it to the capture's
+  totals, and `SystemContextCapture` reports them through the same `readback_totals`. The scrap-wrapped DXGI
+  backend copies inside scrap and is not measured, and GDI reads nothing back from a GPU. Every other backend
+  reports `avg_readback_ms = 0`: scrap copies on the pump's clock, and the synthetic source has nothing to read
+  back.
 - **Tests:** five. They cover the window rule (the per-frame difference, an empty window, a new encoder
   starting its own window even after it has counted more frames, distinct ids) and the readback window
   (including a reopened capturer).
 - **Negative controls:** run together, each fails exactly its target, 2 failed / 3 passed. In NC1 the window
   ignores the encoder id: `left: None, right: Some([12.0, 1.0, 2.0, 0.5])`. In NC2 the readback window loses its
   reopen rule and panics on the u64 underflow the rule prevents.
+- **P0b's test:** `readback_totals_count_only_measured_frames`. A frame whose backend did not time its readback
+  is not counted, so the scrap-wrapped backend's frames cannot dilute the average with zeros. Its negative
+  control counts every frame and fails it: `left: (1, 0), right: (0, 0)`. The agent's lib suite is 2375 with the
+  Windows hardware features.
+
+### 5.2 P1 — C0, the contract, as built (2026-10-27)
+
+`Frame.data` is now a `FrameData` (`agents/roomlerd/src/capture/mod.rs`), and every consumer reads the pixels
+through `Frame::cpu()`. Only `FrameData::Cpu` exists, so nothing changes at run time.
+
+| Piece | What it is |
+|---|---|
+| `FrameData::Cpu(Vec<u8>)` | the one variant today. The GPU forms of §4.1 arrive with their cells, each as a variant |
+| `Frame::cpu() -> &[u8]` | the bytes, laid out as `pixel_format` with `stride` per row. On a GPU frame it will read them back once and keep them |
+| `Frame::cpu_mut() -> &mut Vec<u8>` | the bytes to change in place: the recorder draws its pointer into a frame, and tests paint one |
+| `From<Vec<u8>> for FrameData` | so a backend that captures into memory builds a frame with `data: bytes.into()` |
+
+- **Every accessor destructures without a wildcard** (`let FrameData::Cpu(bytes) = …`). A new variant
+  therefore fails to compile until each accessor handles it, so a GPU frame can never be read as an empty or
+  stale CPU buffer by accident.
+- **Where it changed:** 21 files. Every capture backend that builds a frame (WGC, the SystemContext pump,
+  scrap, DRM, the portal, the synthetic source), the resample, every encoder's input (FFmpeg, libvpx,
+  openh264, Media Foundation), the encoder thread, the recorder and its pointer layer, the idle detector, the
+  lock overlay, and two integration tests. All the edits are the same two shapes: `data: bytes.into()` where a
+  frame is built, and `frame.cpu()` / `frame.cpu_mut()` where one is read. Nineteen of the files are
+  line-neutral.
+- **Tests:** a new one, `a_cpu_frame_reads_back_the_bytes_it_was_built_with`. The bytes a frame is built with
+  come back unchanged, a `cpu_mut` write lands in place, and a clone carries the same bytes. The agent's lib
+  suite (2374 with the Windows hardware features) and the recorder and export integration tests pass unchanged.
+- **Negative control:** a `cpu()` that drops the first byte fails 11 tests, the new one and 10 of the
+  recorder's pointer tests, which draw through these accessors.
+- **AC2's GPU half** (a GPU frame's `cpu()` equals today's readback, on a Windows CI device) waits for the
+  first GPU variant (P2). Its L0 half reads the `l4_latency` cells on this change's CI run against master's.
+
+### 5.3 P2-1 — the GPU frame, as built (2026-10-28)
+
+The DXGI arm can now deliver a frame that stays on the GPU. Nothing takes it as a texture yet (that is P2-2),
+so every consumer reads it back through `Frame::cpu()`: with the switch on, the readback moves from the
+capture thread to whichever consumer asks first, and nothing else changes.
+
+| Piece | What it is | Where |
+|---|---|---|
+| `FrameData::Gpu(GpuFrame)` | a BGRA8 texture on the capture's D3D11 device. Cheap to clone: the clones share the texture and its one readback | `agents/roomlerd/src/capture/gpu_frame.rs` |
+| `GpuFrame::cpu()` | the bytes, read back on the first call (a staging copy, `Map` and a row copy, as every Windows backend reads back today) and kept. A readback that fails yields a black frame of the right size, never a short buffer, because every consumer trusts the frame's dims | the same |
+| `Frame::cpu_mut()` on a GPU frame | turns it into a CPU frame first: a consumer that changes pixels (the recorder's pointer) needs them in memory | `agents/roomlerd/src/capture/mod.rs` |
+| `TexturePool` | the textures a backend copies its frames into, on its device. A texture goes back when the last clone of its frame is dropped; a pool keeps at most 6. Making one turns the device's multithread protection on (the switch FFmpeg's D3D11VA device turns on too), because frames are read back on other threads while the capture thread keeps using the immediate context; a device that refuses it keeps CPU frames | `agents/roomlerd/src/capture/gpu_frame.rs` |
+| the DXGI arm's GPU frame | `try_gpu_frame` → `gpu_frame`: one `CopyResource` from the duplication surface into a pool texture (native), or the Phase B VideoProcessor scale and a copy of its output (a smaller box). It runs before the CPU paths. An FP16 desktop and a rotated output keep their CPU paths (the LUT, the raw copy), and a failure is contained like a VP failure: CPU frames until `VP_RETRY_AFTER`, never a `BackendBail`. The backend's label reads `dxgi-direct-gpu` while it delivers GPU frames | `agents/roomlerd/src/system_context/dxgi_direct.rs` |
+| the switch | `ROOMLERD_ZERO_COPY` (config `zero_copy`): `1`/`true`/`yes`/`on` turn it on, anything else leaves it off. Read once when the backend opens, so a capture rebuilt after a desktop switch reads it again | `gpu_frame::zero_copy_enabled` |
+
+- **What the heartbeat shows with the switch on:** `avg_readback_ms` falls to about 0, because the capture
+  thread reads nothing back, and the readback reappears in the stage of whichever consumer reads the frame
+  first: the encoder's `avg_convert_ms`, whose conversion reads the bytes. That shift is P2-1's field signal
+  that frames are travelling on the GPU.
+- **The duplication surface is released right after the copy is queued**, without waiting for the copy, as
+  Microsoft's Desktop Duplication sample does; the copy is ordered before the next frame's by the device. The
+  CPU paths still wait (their `Map` does). A torn or stale picture with the switch on would point here first.
+- **Tests:** five, in the Windows recorder lane (`capture::gpu_frame`), four of them on a WARP device so CI
+  needs no GPU. A GPU frame's `cpu()` is the bytes its texture holds (an odd width, so the staging rows are
+  padded), and its clones share the one readback; `cpu_mut()` turns it into a CPU frame; a texture returns to
+  its pool, and one of the old dims is not kept after the pool moves on; a frame reads back on another
+  thread, with the device's multithread protection on; and the switch's parsing. The lib suite is 2380 with
+  the Windows hardware features.
+- **Negative controls**, run together, each failing its own tests: a readback that copies row 0 for every row
+  fails the two readback tests (the bytes repeat after the first row); a frame that never returns its texture
+  fails the pool test (`left: 0, right: 1`); a pool that skips multithread protection fails the threads test.
+- **AC2's GPU half is met in CI** by the first test: a GPU frame's `cpu()` returns exactly the bytes its
+  texture holds, which is what today's readback returns. Its L0 half (the `l4_latency` cells of C0's CI run
+  against master's, §5.2) is still to be read, so the box stays open until it is.
+
+### 5.4 P2-2 — QSV takes the GPU frame, as built (2026-10-28)
+
+A QSV encoder opened while the pump encodes a GPU frame takes GPU frames: the frame becomes NV12 on the GPU,
+in a frame pool on the capture's own device, and reaches `send_frame` without touching CPU memory. Any other
+case opens today's CPU form, and the heartbeat says which form and why.
+
+```mermaid
+flowchart LR
+  F[GpuFrame<br/>BGRA, capture device] -->|VideoProcessorBlt<br/>BT.601 limited| N[NV12 texture<br/>Converter's own]
+  N -->|CopySubresourceRegion| P[QSV pool slice<br/>decoder-target array]
+  P -->|AV_PIX_FMT_QSV| E[hevc_qsv / av1_qsv / h264_qsv]
+  C[CPU frame] -->|dcv BGRA→NV12| S[NV12 in memory]
+  S -->|av_hwframe_transfer_data| P
+```
+
+| Piece | What it is | Where |
+|---|---|---|
+| `gpu_input::Converter` | one D3D11 VideoProcessor, BGRA in, NV12 out, BT.601 studio range (`ID3D11VideoContext1` colour spaces, or the older bit fields), driver enhancements off | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
+| `gpu_input::QsvGpuInput` | a D3D11VA device context wrapping the capture's device (`av_hwdevice_ctx_alloc`, never `_create`), a QSV device derived from it, and a 12-frame QSV pool made on that device as **decoder-target**: FFmpeg 9.0.1 builds a fixed D3D11 pool as one array texture and maps a decoder-target surface to (texture, slice), the transcode path; a render-target surface it tags `MFX_INFINITE` over the same array texture, which this code does not rely on. A GPU frame is converted, then copied into a pool frame's slice; a CPU frame is uploaded by FFmpeg. The converter writes into a texture of the slices' 16-aligned size (`qsv_init_child_ctx` aligns them), with the picture top-left, so the copy is a whole subresource. A slice of another size, from an FFmpeg that aligns differently, falls back to copying the picture's box, checked and logged on the first frame | the same |
+| `gpu_input::plan` | the gates, read at every open: the switch, the capture device the pump named, the cell (`hevc_qsv`, `av1_qsv`, `h264_qsv` at 4:2:0; `vp9_qsv` waits for its own probes to be measured), `zero_copy_deny` (`name:gpu` entries, the `encoder_cells_deny` shape), then the pool, which fails on an adapter without QSV | the same |
+| `gpu_hint` | how the capture device reaches the open: the pump names the frame's device around its one `codec.open` (`opening_on`, a thread-local scope inside its `spawn_blocking`, no `.await` within), and a background rebuild names the device its `RebuildSpec` carries. `InputForm` is the form and reason | `agents/roomlerd/src/encode/ffmpeg/gpu_hint.rs` |
+| the encoder | `build_encoder` tries the GPU form first for a QSV cell and falls back to the CPU form on any refusal or failed open. `encode_sync` takes the GPU input's path when there is one. A rate rebuild, synchronous or in the background, opens on the same device. When a GPU frame comes from another device, or when the encoder opened on a CPU frame (`cpu_frames`, such as the first-frame prime), it reopens once on that device; a device it was refused on is not tried again | `agents/roomlerd/src/encode/ffmpeg/encoder.rs` |
+| the DXGI arm keeps its device | with the switch on, `reset` keeps the D3D11 device and its texture pool across an `AccessLost` when the device is alive and still on the primary output's adapter (`Kept::fits`, the adapter LUID). Without that, each lock, unlock and cap lift would make a new device, and the encoder would reopen (0.6–0.9 s for QSV) and send a keyframe each time. The duplication is still rebuilt from scratch | `agents/roomlerd/src/system_context/dxgi_direct.rs` |
+| the heartbeat | `input_path` (`gpu` / `cpu`) and `input_reason`: `switch_off`, `cpu_frames`, `no_gpu_cell`, `denied`, `adapter_mismatch`, `open_failed` | `agents/roomlerd/src/peer.rs` |
+
+- **On the GPU path the stages read differently.** `avg_convert_ms` is the CPU time it takes to submit the GPU
+  conversion and the copy, `avg_upload_ms` is about zero, and `avg_submit_ms` is QSV without its own copy and
+  upload of the frame.
+- **Colour**, checked against the CPU path's dcv conversion on flat patches at 64×32, and at 72×36 inside an
+  80×48 texture: max |GPU − CPU| Y 0 / UV 0 on an AMD Radeon 610M, Y 1 / UV 0 on an NVIDIA RTX 5090 Laptop GPU.
+  Intel's VideoProcessor is AC3's field check. WARP has no video processor, so this comparison cannot run in CI.
+- **Chroma at a horizontal colour edge can differ.** Where two colours meet inside a 2×2 chroma block (an edge
+  on an odd row), the AMD processor takes one row's chroma where dcv averages the two: 56 code values at a blue
+  bar over grey, on that one chroma row only, while every flat row matched exactly. This is chroma siting, not
+  a misplaced picture, and it stays in the chroma of one sample row at an edge. AC3's ±2 is on flat colour for
+  this reason. Measure Intel's behaviour at an edge in the field too.
+- **Tests:** five. The colour comparison runs on every adapter that has a video processor, at both sizes. The pool opens
+  where QSV runs, and elsewhere fails with `adapter_mismatch` and leaves nothing behind (shown on the AMD and
+  NVIDIA adapters). `plan` reads its gates in order (on WARP). The `gpu_hint` scope restores what was there,
+  and a denylist entry must be exact. The lib suite is 2385 with the Windows hardware features.
+  - **Where they run:** the two `gpu_hint` tests also run in the Linux FFmpeg lane. The three Windows ones run
+    locally only, because no Windows CI lane builds FFmpeg (`ci.yml` keeps the media half out of the Windows
+    test lane on purpose).
+- **Negative controls**, run together, each fail their own test:
+  - a BT.709 output colour space fails the colour test, at max |GPU − CPU| Y 28 / UV 12 on the Radeon;
+  - a `plan` that skips the denylist fails the gate test (`left: "open_failed"`, `right: "denied"`);
+  - a denylist that also matches a bare name fails the exact-entry test.
+- **Not yet:** the probe's GPU-input open (P2-3, so AC6's probe half is still owed), `input_path` on
+  `rc:video-info`, and any run on a QSV host. With the switch OFF (the default), every path is today's.
 
 ## 6. Acceptance criteria
 
 - [ ] **AC1 — the split, measured.** P0 has shipped, and a fleet week is read per encoder × geometry into the
   §9 log: the share of the encode stage that is conversion, copy and upload, against submission and drain, and
-  the capture thread's readback. This is the red record for AC3 and AC4.
+  the capture thread's readback. On the QSV hosts that readback is the DXGI arm's, so its half is read once P0b
+  has shipped. This is the red record for AC3 and AC4.
 - [ ] **AC2 — C0 is invisible.** `Frame::cpu()` on a GPU frame returns the bytes today's readback returns:
   tested on a Windows CI device (WARP is enough), and on the synthetic source. L0's cells read the same within
   their spread, with only `Cpu` produced.
@@ -257,7 +391,7 @@ what the pump does.
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
 - [ ] **AC6 — the gate holds at every entry point.** With the switch off, or the cell denied, neither the probe
   nor a session opens the GPU-input form. Tested at both entry points.
-- [ ] **AC7 — every further cell, or its reason.** NVENC, AMF, the DXGI arm, VideoToolbox and VAAPI are each
+- [ ] **AC7 — every further cell, or its reason.** NVENC, AMF, the WGC arm, VideoToolbox and VAAPI are each
   field-verified like AC3, or deferred with the measurement that deferred them.
 - [ ] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
@@ -289,6 +423,43 @@ what the pump does.
 | Date | Build | Cell | Result |
 |---|---|---|---|
 | 2026-10-21 | fleet, agents 0.4.135–0.4.148 | every FFmpeg DC session for 7 days: 142 538 heartbeats, 11 hosts | **The red record, before P0.** §2.2's table. The 2880×1800 `hevc_qsv` laptop peaked at 29.4 fps against 60. At 1080p, QSV's encode stage takes 10.6 ms. `hevc_nvenc` takes 22 ms where `av1_nvenc` takes 10–11 ms on the same host, so that host's cap is not a copy |
+| 2026-10-27 | fleet, agents 0.4.150–0.4.180, 10-21 16:55Z → 10-27 23:35Z | every FFmpeg DC heartbeat with P0's fields: 26 encoder × geometry groups of ≥ 10 windows | **An interim split, not AC1** (AC1 reads a full week). §9.1's table. On QSV, conversion is 16–35 % of the encode stage and `send_frame` 60–83 %. **Every QSV host captures through the SystemContext DXGI arm**: all 8 logged `capture: backend=system-context` (197 selections) and none `backend=wgc`, so their readback reads `0` because P0 never timed that arm. Two changes follow: P0b times it, and P2 moves from WGC to the DXGI arm |
+| 2026-10-28 | FFmpeg 9.0.1 CLI, `hevc_nvenc` with the agent's options (`-preset p4 -tune ll -rc vbr -cq 22 -bf 0 -rc-lookahead 0 -delay 0 -split_encode_mode forced`), an idle RTX 5090 Laptop GPU | **NVENC's own upload, measured for P3**: the same 8 frames looped 1200 times, once from system memory (NVENC uploads each, the production path) and once from CUDA memory (uploaded once by `hwupload_cuda`). Four runs; the CUDA path is steady and the system-memory path varies, so the upload is given as min–median. **2560×1600 NV12: 1.8–2.6 ms a frame** (system memory 4.04–5.04 ms, CUDA 2.25–2.43), 4:4:4 1.7–3.4 ms; **1920×1080 NV12: 0.7–1.1 ms**, 4:4:4 0.7–1.5 ms. These are throughput numbers. The agent's `submit` is latency-bound (8.8 ms at 2560×1600 HEVC in §9.1), so there the upload is about a fifth of it. With the 1.3 ms conversion and WGC's 6 ms readback, P3 would take about 3 ms off the encode stage, plus the readback off the capture thread. Script: `nvenc-split.sh` (FR-118 tools) |
+
+### 9.1 The interim split (2026-10-27)
+
+Medians of each heartbeat's per-frame average, in milliseconds, over the groups with the most windows. The
+medians of the parts need not add up to the median of the whole. "Readback" is the capture thread's copy (§5.1).
+"—" means it was not measured on that host's arm: the SystemContext DXGI arm before P0b, or scrap, which copies
+on the pump's clock, inside `avg_capture_ms`.
+
+| Encoder | Geometry | Windows (hosts) | Encode | Convert | Upload | Submit | Drain | Readback |
+|---|---|---|---|---|---|---|---|---|
+| `hevc_qsv` | 1366×768 | 121 640 (2) | 7.6 | 2.7 | 0 | 4.8 | 0.1 | — |
+| `hevc_qsv` | 1920×1080 | 91 456 (3) | 7.4 | 1.4 | 0 | 4.8 | 0.1 | — |
+| `hevc_qsv` | 1920×1200 | 1 297 (1) | 10.5 | 3.7 | 0 | 6.3 | 0.1 | — |
+| `av1_qsv` | 1920×1200 | 2 683 (1) | 13.1 | 2.7 | 0 | 10.1 | 0.1 | — |
+| `av1_qsv` | 2880×1800 | 1 071 (1) | 19.6 | 3.1 | 0 | 16.3 | 0.1 | — |
+| `vp9_qsv` | 1920×1080 | 8 218 (1) | 23.7 | 4.7 | 0 | 17.9 | 0.1 | — |
+| `hevc_videotoolbox` | 3024×1964 | 33 712 (1) | 6.0 | 4.7 | 0 | 1.3 | 0 | — |
+| `av1_nvenc` | 1920×1080 | 2 514 (1) | 6.9 | 0.7 | 0 | 6.2 | 0 | — |
+| `hevc_nvenc` | 1920×1200 | 1 699 (2) | 20.7 | 4.4 | 0 | 15.6 | 0 | — |
+| `hevc_nvenc` | 2560×1600 | 824 (1) | 10.4 | 1.3 | 0 | 8.8 | 0 | 5.7 (WGC) |
+| `av1_nvenc` | 2560×1600 | 787 (1) | 5.6 | 1.1 | 0 | 4.3 | 0 | 6.1 (WGC) |
+| `hevc_vaapi` | 1600×900 | 259 (1) | 4.1 | 0.7 | 0.5 | 2.9 | 0 | — |
+
+- **On QSV, `send_frame` is most of the stage, and it is two things.** It holds QSV's own upload of the
+  system-memory frame and, with one frame in flight, the wait for the hardware encode. The heartbeat cannot
+  separate them. P2's switch can: the same host, the same content, with the upload and without it (AC3).
+- **The CPU conversion is the smaller part on QSV and NVENC** (0.7–4.7 ms). On VideoToolbox it is the larger
+  part, 70–87 % of the stage across the Mac's geometries, and VideoToolbox converts BGRA itself. Per frame,
+  P5's case is the strongest, though the Mac already makes 120 fps ([FR-119](FR-119-high-refresh-streaming.md)
+  AC4).
+- **WGC's readback on the one WGC host is as long as a whole AV1 encode stage** at 2560×1600 (6.1 ms against
+  5.6), on the capture thread: latency and CPU, not pump time.
+- **§2.2's 2880×1800 laptop now encodes AV1.** Its encode stage is 19.6 ms, which alone allows ~51 fps, and its
+  capture averages 6.7 ms with the DXGI readback inside it. P0b separates the two, and AC4 is read against
+  both.
 
 ## 10. Related
 

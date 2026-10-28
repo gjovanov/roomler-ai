@@ -493,6 +493,12 @@ jobs:
       # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
       # an attribute have one spelling, and a person's change to one fact
       # keeps every other fact's provenance.
+      # `roomler-ai-mod-conference` (FR-127 P1) with its first unit tests: a
+      # viewer's view keeps `None` (a legacy client, everything flows) apart
+      # from `Some(empty)` (a view client showing nothing), an older report
+      # is dropped, and the plan reads only the viewer's own pause flag. It
+      # links the mediasoup worker, which this job already builds for the
+      # api crate's unit tests above (the api crate depends on it).
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -503,6 +509,7 @@ jobs:
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
           -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
           -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
+          -p roomler-ai-mod-conference
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above
@@ -1639,11 +1646,14 @@ jobs:
       # `scrap-capture` bring them in. The units: a recording's WGC session
       # draws the pointer and the live one does not (unless
       # ROOMLERD_WGC_CURSOR=1), and the pointer's placement.
+      # FR-118 P2-1 — and the GPU frame (`capture::gpu_frame`): a texture on a
+      # WARP device reads back the bytes it holds, once, on any thread, and
+      # goes back to its pool. The same features compile it.
       - name: The recorder's pointer — Windows capture compiles, lints, and its units pass
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
-          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::gpu_frame
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2771`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:343`, wired at `main.rs:3873`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:3876`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -412,17 +412,17 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:964`](../agents/roomlerd/src/encode/caps.rs#L964)), applied in
-`detect()` ([`caps.rs:666`](../agents/roomlerd/src/encode/caps.rs#L666))
+([`caps.rs:1009`](../agents/roomlerd/src/encode/caps.rs#L1009)), applied in
+`detect()` ([`caps.rs:711`](../agents/roomlerd/src/encode/caps.rs#L711))
 after the config lists, over plain `HostFacts`
-([`caps.rs:678`](../agents/roomlerd/src/encode/caps.rs#L678)), so it runs and
+([`caps.rs:723`](../agents/roomlerd/src/encode/caps.rs#L723)), so it runs and
 is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3428`](../agents/roomlerd/src/signaling.rs#L3428)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:945`](../agents/roomlerd/src/encode/caps.rs#L945)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:990`](../agents/roomlerd/src/encode/caps.rs#L990)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -465,7 +465,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:827`](../agents/roomlerd/src/encode/caps.rs#L827)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:872`](../agents/roomlerd/src/encode/caps.rs#L872)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | since FR-97 P2a: ScreenCaptureKit's mix of every app, this process's own excluded ([`audio/sck.rs`](../agents/roomlerd/src/audio/sck.rs)), in a process with a window-server session. On a supervised Mac that is the GUI worker, and the root's row carries the worker's offer (`DelegateHost::effective_audio`); the root decides a delegated session's audio by it. 48 kHz stereo float, 20 ms buffers: Opus's own frame, nothing resampled. It hears the apps with the output muted | the root half itself: `no-session`; the kill switch `ROOMLERD_SCK_AUDIO=0` (forwarded to the worker): `switched-off` on the hello, `switched_off` from a capture; ScreenCaptureKit's own refusal (the Screen Recording grant): `backend_error` with its words |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -556,7 +556,7 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:13021`](../agents/roomlerd/src/peer.rs#L13021)) sends it
+The pump ([`peer.rs:13026`](../agents/roomlerd/src/peer.rs#L13026)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
@@ -596,7 +596,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10048`](../agents/roomlerd/src/peer.rs#L10048)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10053`](../agents/roomlerd/src/peer.rs#L10053)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1477`](../ui/src/composables/useRemoteControl.ts#L1477) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:670`](../agents/roomlerd/src/power.rs#L670)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
@@ -720,6 +720,110 @@ H.264 is the safe default — every browser decodes it. AV1 only if the controll
 - `goog-remb` / TWCC feedback drives target bitrate; reasonable bounds: 600 kbps (idle) → 25 Mbps (4K motion).
 - **Variable framerate, idle skip**: when nothing on screen changes (the capturer's per-frame `Damage`, `capture/mod.rs`: WGC's dirty regions, DXGI's no-new-frame, XDamage on X11; `scrap` on macOS reports none, so there every frame counts as changed), the encoder emits a 1 fps keepalive instead of a full 60 fps stream. This is the single biggest battery and bandwidth win.
 - IDR on demand: the controller sends `{"t":"keyframe"}` over the control DC if it detects decode errors after a packet loss spike; agent issues an immediate keyframe.
+
+### 5.4 Above 60 fps: the viewer asks, the host proves it (FR-119)
+
+A viewer on a high-refresh screen can ask for 120 or 144 fps. The host grants a
+rate only where the path is direct, its screen refreshes that fast, nothing
+denies the rate, the host has shown it can sustain it, and the pipe covers the
+higher ceiling. All of it is per session and per rate class, and an agent
+without the switch behaves exactly as before. Spec and field log:
+[FR-119](fr/FR-119-high-refresh-streaming.md).
+
+**The switch and the wire.** `fps_high` in the config (or `ROOMLERD_FPS_HIGH`),
+default off. With it on, the hello's `AgentCaps.video` carries `fps-high` and
+`fps-retry` ([`caps.rs:1335`](../agents/roomlerd/src/encode/caps.rs#L1335)).
+Without them the viewer never offers above 60 and never sends `rc:fps`.
+
+| Message | Direction | Fields |
+|---|---|---|
+| `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
+| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5341`](../agents/roomlerd/src/peer.rs#L5341)) |
+
+**The grant** ([`frame_rate.rs:286`](../agents/roomlerd/src/encode/frame_rate.rs#L286)).
+It runs in the FFmpeg data-channel pump
+([`peer.rs:8215`](../agents/roomlerd/src/peer.rs#L8215)) whenever the ask, the
+base rate, the transport or the class moves, and once a second for the pipe's
+belief. Each rate is checked in the order a viewer can see and act on
+([`frame_rate.rs:229`](../agents/roomlerd/src/encode/frame_rate.rs#L229)):
+
+| `fps_reason` | When | Steps down? |
+|---|---|---|
+| `constrained` | the session is relayed: above 60 there waits for FR-17 stage C, FR-63 and FR-70 M3 | no: a relay refuses every rate above its cap |
+| `refresh` | the captured screen refreshes slower than the rate | yes |
+| `denied` | `fps_deny` names this encoder at this rate | yes |
+| `unproven` | this rate class's last trial failed, within the hour | yes |
+| `pipe` | the session's pipe push-back is below the ceiling at this rate | yes |
+
+A refused ask **steps down one rate at a time** (P2b-18): the highest offered
+rate below the ask that nothing refuses runs instead, and the viewer is still
+told why the ask was refused, as "120 fps (144 fps not granted: …)". The pump
+checks each of those rates against its own deny entry and its own ceiling
+([`peer.rs:8277`](../agents/roomlerd/src/peer.rs#L8277)).
+
+```mermaid
+flowchart TD
+    A["rc:fps 144"] --> G144{"144 refused?<br/>constrained · refresh · denied ·<br/>unproven · pipe"}
+    G144 -->|no| P144{"144 proven?"}
+    P144 -->|yes| R144["run 144"]
+    P144 -->|no verdict| T144["run 144 as a trial"]
+    T144 -->|Proven| R144
+    T144 -->|Failed| G120
+    G144 -->|yes| G120{"120 refused?"}
+    G120 -->|no| P120{"120 proven?"}
+    P120 -->|yes| R120["run 120<br/>fps_asked 144 + fps_reason"]
+    P120 -->|no verdict| T120["run 120 as a trial"]
+    T120 -->|Proven| R120
+    T120 -->|Failed| R60["run at the cap, 60"]
+    G120 -->|yes| R60
+```
+
+**The rate class and its trial.** A class is the capture backend, the screen's
+refresh rate, the encoder, the geometry's long-edge bucket and the rate
+([`frame_rate.rs:94`](../agents/roomlerd/src/encode/frame_rate.rs#L94)). A class
+with no verdict runs as a trial. It is `Proven` once 10 s of moving content
+reached 90 % of the rate with the p99 inter-frame time under two periods. It is
+`Failed` only when the encoder itself was the limit: its p90 time per frame at
+90 % of a period, while it spaced the frames
+([`frame_rate.rs:435`](../agents/roomlerd/src/encode/frame_rate.rs#L435)).
+Content slower than the rate concludes nothing, and a frame the pump drops for
+the viewer or the link breaks the stretch, so a viewer that cannot decode the
+rate yields no verdict at all. Verdicts persist in `fps-class-cache.json`, keyed
+on the build, the hardware and the knobs: `Proven` holds a week and `Failed` an
+hour ([`fps_class_cache.rs:34`](../agents/roomlerd/src/encode/fps_class_cache.rs#L34),
+[`fps_class_cache.rs:40`](../agents/roomlerd/src/encode/fps_class_cache.rs#L40)).
+A new agent release starts with an empty cache.
+
+**Try again** ([`frame_rate.rs:556`](../agents/roomlerd/src/encode/frame_rate.rs#L556)).
+The picker offers "Try N fps again" for an `unproven` refusal from an agent that
+advertises `fps-retry` ([`ui.md`](ui.md)). The retry forgets the session's
+failed verdicts from the ask down to the cap, so the step-down is walked again
+from the top. A proven rate stays proven.
+
+**What holds the rate up on Windows.** Above 60, the WGC capture session's
+`MinUpdateInterval` is lowered from Windows' 16 ms default
+([`gate.rs:115`](../agents/roomlerd/src/capture/gate.rs#L115)), without which
+every Windows session ran at about 58 fps. An NVENC session holds the GPU clock
+pin, graphics and memory, from the moment the grant wants the rate
+([`gpu_clock.rs:506`](../agents/roomlerd/src/gpu_clock.rs#L506),
+[`peer.rs:8315`](../agents/roomlerd/src/peer.rs#L8315)). Under an encoder-only
+load the driver otherwise drops the memory clock, and NVENC's time per frame
+doubles.
+
+⚠️ **A trial proves the host, not the delivery.** Its 10 s show the host can
+capture and encode the rate. Whether the viewer receives it is read at the
+viewer, from the arrival of every frame (FR-119 §8.1).
+
+⚠️ **The refusal line is a live session's answer.** With no session open, the
+picker shows its default hint, never a stale refusal.
+
+| Cell (FR-119 §8) | Result |
+|---|---|
+| The MacBook (VideoToolbox, ProMotion) → Edge, direct, 120 | proven at 119.7 fps; every 60 s window at the viewer 119.8–120.1 fps |
+| neo16 (RTX 5090) → the MacBook, HEVC 4:4:4 2560×1600, 120 | proven at 112.4 fps with the clock pin |
+| neo16, AV1 2560×1600, 144 | proven at 141.4 fps |
+| neo16, HEVC 4:4:4 2560×1600, 144 | encoder-bound: 101–131 fps over six trials. Since P2b-18 the session steps down to 120, proven at 117.0 fps (2026-10-27), where before it fell to 60 |
+| neo16, AV1 scaled to 1704×1066, 144 | 44–61 fps: the pump's CPU resample takes 14.7 ms a frame, so a scaled session cannot reach 144 there until FR-118's GPU scale |
 
 ## 6. Input injection
 
@@ -2047,8 +2151,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13357`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13335`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4082`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13366`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13362`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13340`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4082`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13371`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:597`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:318`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:756`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:410`, #2326) |
@@ -2310,7 +2414,7 @@ the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
 (`crates/modules/fleet/src/agent_log.rs:170`, mounted at
-`crates/modules/fleet/src/lib.rs:370`) had existed since rc.58 without a caller.
+`crates/modules/fleet/src/lib.rs:471`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
@@ -2907,7 +3011,7 @@ to-activate, so the browser never sees a bait-and-switch.
   because an X server buffers what a client does not read. Our own writes
   change the owner too, and the content hashes swallow them as before.
   `AgentCaps.unavailable["clipboard-image-events"]` goes away where the
-  gate opens (`agents/roomlerd/src/encode/caps.rs:790`). ⚠️ Not under
+  gate opens (`agents/roomlerd/src/encode/caps.rs:835`). ⚠️ Not under
   Wayland: the clipboard is the compositor's there, and Xwayland's copy
   of it is unmeasured. A broken gate connection drops back to text
   polling with images unwatched. Kill switch
@@ -2923,7 +3027,7 @@ to-activate, so the browser never sees a bait-and-switch.
   the gate skips cannot ask. The count is read inside an autorelease pool of
   its own (`clipboard.rs:797`), because the clipboard worker is not the main
   thread. `unavailable["clipboard-image-events"]` goes away wherever the
-  switch is on (`agents/roomlerd/src/encode/caps.rs:797`), without asking this
+  switch is on (`agents/roomlerd/src/encode/caps.rs:842`), without asking this
   process's own pasteboard (`clipboard.rs:807`): on a supervised Mac the root
   daemon says the hello, while a delegated session's clipboard runs in the GUI
   worker. A root daemon outside the console session cannot reach the
@@ -3082,7 +3186,7 @@ The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
 (`agents/roomlerd/src/peer.rs:1550`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:10648`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:10653`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
@@ -3144,7 +3248,7 @@ the compositor's, and no protocol the desktops share reads or sets it.
 Xwayland's XKB group is a copy of what the compositor sends, and locking it
 does not reach the compositor. A system install reaches the screen through DRM
 and has no X connection (FR-113). Both leave `layout` out of the hello
-(`agents/roomlerd/src/encode/caps.rs:1005`), with no reason in `unavailable`:
+(`agents/roomlerd/src/encode/caps.rs:1050`), with no reason in `unavailable`:
 there is no control to grey, so the chip does not appear, as before P3e.
 
 ### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)

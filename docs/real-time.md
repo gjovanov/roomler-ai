@@ -38,10 +38,12 @@ JSON messages, `{"type": "...", ...}`.
 
 | Type | Purpose |
 |---|---|
-| `media:join` / `media:leave` | Enter/exit a room call (mediasoup) |
+| `media:join` / `media:leave` | Enter/exit a room call (mediasoup). FR-127 P1: a join may carry `caps: ["view"]` — this client will report what it renders, [below](#a-meeting-receives-what-is-visible-fr-127-p1) |
 | `media:produce` / `media:consume` | Publish / subscribe a track |
 | `media:connect_transport` | DTLS-connect a transport |
 | `media:producer_close` | Stop publishing |
+| `media:producer_pause` | FR-30 — the OWNER paused or resumed one of their producers (camera off, mic muted); the room is told as `media:producer_paused` |
+| `media:view` | FR-127 P1 — the viewer's WHOLE rendered set, `{ room_id, seq, video: [{ producer_id, w, h }] }`: the server resumes those video consumers and pauses the viewer's others; no reply |
 | `media:play_audio` / `media:stop_audio` | Bot/audio playback control |
 | `presence:update` | Presence state |
 | `hive:view.open` / `offer` / `ice` / `renew` / `close` | FR-90 — read an agent session over a viewer peer (module `hive`) |
@@ -74,6 +76,174 @@ read, so two pods warn and end a meeting once
 pod that started the call and died with it on a rolling deploy. The design, its guards
 and its one known gap are in
 [FR-115 *Meetings, as built*](fr/FR-115-pricing-reshape.md#meetings-as-built-p5).
+
+### A meeting receives what is visible (FR-127 P1)
+
+One room is one mediasoup router on one worker thread, and every participant's every
+video stream used to be forwarded to every other participant whether or not a tile showed
+it — which is the N×(N−1) that FR-115 O4 measured running out at about 20 cameras.
+[FR-127](fr/FR-127-meeting-room-scales-past-one-worker.md) lifts that in three levers; P1
+is the first: **the viewer says what it renders, and the server forwards only that.**
+Audio always flows, and the microphone is produced with Opus DTX so a silent participant
+costs the worker about one packet every 400 ms instead of fifty a second.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer (browser)
+    participant S as Owner pod (ws_media.rs → room_manager.rs)
+    participant W as mediasoup worker
+
+    V->>S: media:join {room_id, caps: ["view"]}
+    S-->>V: media:transport_created {…, meeting: {view, audio_dtx, simulcast: null}}
+    S-->>V: media:new_producer (one per producer already in the room)
+    V->>S: media:consume (one per producer)
+    S->>W: Consumer created paused for video the view does not name, resumed for audio
+    Note over V: the layout mounts its tiles and each remote tile reports it is on screen
+    V->>S: media:view {room_id, seq, video: [{producer_id, w, h} …]} (the whole set, debounced 100 ms)
+    S->>W: resume the named video consumers, pause the rest, audio untouched
+    W-->>V: a key frame per resumed consumer (the worker requests it on resume)
+```
+
+**The wire** — two additive fields, both ignored by a server or a client that predates them:
+
+| Message | Change | Where |
+|---|---|---|
+| `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:313` |
+| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:459`, `meeting_levers` at `:735` |
+| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:196`, the handler at `:752`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
+
+It is dispatched where `media:consume` is — through the C-4 placement gate — so a viewer
+whose socket is on the other pod reaches the owner's participant state over `media.cmd`
+like every other command, and one connection's `join` → `view` → `consume` order holds end
+to end because the WS loop awaits each message in turn.
+
+**Three states, never collapsed.** A participant's view is `Option<ViewState>`
+(`media/room_manager.rs:56`, the pure half in `media/view.rs:38`):
+
+| `ParticipantMedia.view` | Who | Video consumers | Audio consumers |
+|---|---|---|---|
+| `None` | a legacy client — no `caps` on its join, or the lever off | all resumed, as before P1; a `media:view` from it is ignored (`room_manager.rs:685`), never read as "show nothing" | resumed |
+| `Some(empty)` | a view client that renders nothing yet (just joined, navigated to the mini view, its grid empty) | all paused | resumed |
+| `Some(set)` | a view client showing `set` | the named ones resumed, every other paused | resumed |
+
+The decision is pure and unit-tested (`view::wants`, `view.rs:68`; `view::plan`,
+`view.rs:97`): a consumer is created with `ConsumerOptions.paused = !wanted`
+(`room_manager.rs:589` — ⚠️ mediasoup 0.20.0 creates consumers *resumed* by default,
+whatever the old comment there said), and a report that names a producer before its
+consumer exists is kept and honoured at the consume.
+
+**No map guard across a worker round trip (P1.1).** Every async method of the room
+manager reads under its DashMap guards, drops them, awaits the worker, and takes a guard
+again only to record the result — the pattern FR-30's `set_producer_paused` set. A guard
+held across an `.await` does not park the task that holds it; it parks the **thread** of
+every task that wants the same shard, and a production pod's 2 CPUs give tokio 2 worker
+threads:
+
+```mermaid
+sequenceDiagram
+    participant A as task A (consume)
+    participant W as mediasoup worker
+    participant B as tasks B, C (consume)
+    participant RT as tokio's 2 threads
+    A->>A: takes the participant's entry
+    A->>W: consume, then await
+    B->>RT: scan the same map, PARK both threads
+    W-->>A: answered, A is ready to run
+    Note over A,RT: no thread is left to poll A, so the entry is never released<br/>and /health stops answering until the liveness probe kills the pod
+```
+
+P1 first shipped with `consume` holding the participant's entry across both of its round
+trips, and on 2026-10-27 a field run's joins froze a production pod that way twice before
+it was rolled back. Two nets now catch it, and neither catches everything:
+
+- **A build error for the common shape.** The root `clippy.toml` lists dashmap's guard
+  types for `clippy::await_holding_invalid_type`, which CI's `-D warnings` denies. A guard
+  dropped with `drop()` still counts, because a value that was borrowed stays in the future
+  until its scope ends, so a guard lives in a block that ends before the await
+  (`connect_transport`, `room_manager.rs:359`). ⚠️ The lint matches the type of the value
+  held, so it sees a bare guard but **not** one inside an `Option` (a `map.get(k)` kept
+  unwrapped), a `Result`, a tuple, a struct or an iterator adapter. The review measured
+  it: `consume` holding an `Option<RefMut>` across its awaits passed clippy. Read what the
+  await needs into owned values first, and `rooms_ref()` is crate-private so every caller
+  is behind the same gate.
+- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1492`). A burst of
+  joins, publishes, consumes and view reports in one room, behind a watchdog: on the old
+  code both threads park in dashmap's lock and the test fails at 60 s, and the review's
+  `Option<RefMut>` variant froze it too. Fixed, the conference unit suite finishes in under
+  2 s. Three more tests hold a participant's turn from the outside, so dropping the turn
+  or its identity check fails them deterministically, and a 50-round race of two room
+  creators checks `create_room`.
+
+What the held guards used to serialise as a side effect, three pieces now hold explicitly:
+
+| Piece | Rule | Where |
+|---|---|---|
+| the participant's `ops` turn | an async mutex that `consume` and `apply_view` hold from decision to record, so a report cannot land between a new consumer's `wanted` and its push into `consumers`; a waiter yields its thread | `room_manager.rs:67`, taken at `:538` and `:665` |
+| "the same participant" | a record step re-reads the participant and compares its `ops` to the one it started with: a participant that left meanwhile, or left and joined again on the same connection, gets nothing recorded, and the new producer or consumer is dropped, which closes it | `room_manager.rs:488`, `:618` |
+| one room per id | two joins that both found no room each build a router, and the first to insert keeps the room; an `insert` would have replaced a room that may already hold the first joiner's transports | `create_room`, `room_manager.rs:243` |
+
+**Two pauses, two flags.** FR-30's owner pause is `Producer::pause()`, which the worker
+mirrors into every consumer's `producer_paused` and which `media:consumer_created` and the
+`media:producer_paused` event carry. The viewer's pause is `Consumer::pause()`, the
+consumer's own `paused`. Nothing in P1 reads or writes the owner's flag, and the planner's
+input (`view::ConsumerLine`, `view.rs:80`) has no field for it, so the two cannot be
+confused: a viewer hiding a tile changes nothing another viewer sees, and an owner's pause
+reaches every viewer whatever their view says. Locked against a real worker by
+`crates/tests/src/conference_view_tests.rs:439`.
+
+**What "visible" is.** Each remote `VideoTile` runs an `IntersectionObserver` on its root
+(`ui/src/components/conference/VideoTile.vue:507`), which applies the clip of every
+scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
+unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
+key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
+call page hands it to the store (`ConferenceView.vue:427`), and the store keeps the tiles on
+screen, maps stream keys to the video producers it consumes
+(`ui/src/stores/conference.ts:428`) and sends one `media:view` at most every 100 ms
+(`:672-734`) — and again every 15 s while in the call and when the tab returns to the
+foreground, so a report the socket dropped or a forward the owner pod never got heals
+within the period (`seq` keeps the re-send idempotent, and the server plans nothing for a
+report that changes nothing). A tile never reports for the local stream: nothing is received
+for it. The cap is declared on the join only where an `IntersectionObserver` exists: a
+declared viewer that never reported would have every camera paused.
+
+| Layout | Rendered | In the view |
+|---|---|---|
+| tiled | `primary`, at most `tiledMaxTiles` (`useConferenceLayout.ts:306`), no scrolling | exactly the rendered remote tiles |
+| spotlight | the big tile, a 120 px filmstrip that scrolls sideways | the big tile plus the strip tiles inside the strip's viewport |
+| sidebar | the big tile, a 280 px column that scrolls | the same rule |
+| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows |
+
+A tile scrolled into view plays within a second: one debounce, one round trip, and the
+worker requests a key frame the moment a consumer resumes (`SimpleConsumer::UserOnResumed`
+in mediasoup-sys 0.10.0). FR-124's black-picture detector needs three black samples, about
+3 s, so a resumed tile paints long before it could be judged. Its sampler keeps running on a
+paused tile too — safely: `sampleLuma` answers `null` until the element has a frame
+(`ui/src/utils/blackPicture.ts:82`), and once a tile has painted, pausing its consumer
+leaves the last frame on screen, which is not black unless the camera was. A tile in
+picture-in-picture reports itself visible even when its strip has scrolled it out, so the
+floating window keeps playing.
+
+**Opus DTX.** When `meeting.audio_dtx` is true the microphone producer is created with
+`codecOptions: { opusDtx: true }` (`ui/src/stores/conference.ts:371`); Chrome then sends
+about one packet every 400 ms while the microphone hears silence, and the SFU forwards
+exactly what it gets. FR-127's P0 arithmetic is why: fifty people unmuted and quiet cost
+more packets than one worker carries without it.
+
+**Switches** — `[meetings]` in `crates/config/src/settings.rs`, env `ROOMLER__MEETINGS__*`:
+
+| Setting | Default | Off means |
+|---|---|---|
+| `visible_tiles` (`:387`) | on | the server ignores `caps` and every `media:view`, every consumer is resumed at creation, and the client is told `meeting.view = false`, so it stops reporting — today's shape, exactly |
+| `audio_dtx` (`:394`) | on | `meeting.audio_dtx = false`, the client produces as before |
+| `view_max` (`:399`) | 49 (the UI's own grid maximum) | a load guard, not a policy: a longer report is truncated in the order sent |
+
+**Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
+consumers held back by their viewers' views, never the owner's FR-30 pause
+(`crates/api/src/cluster/metrics.rs:86`, from `MediaGauges::video_paused_total`,
+`crates/modules/conference/src/lib.rs:109`) — and each row of `media_rooms_detail` its
+`video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
+`view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
+two that follow it (simulcast, a room piped across workers), are in the FR's §3.0.
 
 The viewer peer's signalling (`hive:view.*`, FR-90) is a view grant and the SDP
 and ICE of a **data-only** WebRTC peer between the browser and the device that

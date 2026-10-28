@@ -220,7 +220,7 @@ v0.2 also put the node side in a second binary, `hived`, supervised by `roomlerd
 doubles the signing, updater and installer couplings on every platform and contradicts
 "one daemon per machine". The node side is a cargo feature of `roomlerd`. Its
 user-level half is `roomlerd hive-host`, re-exec'd as the user the way `portal-helper`
-and `record` already are (`agents/roomlerd/src/main.rs:203,346`), so it ships, signs
+and `record` already are (`agents/roomlerd/src/app.rs:203,346`), so it ships, signs
 and updates with the daemon.
 
 ### 3.2 Who runs as what
@@ -1151,7 +1151,7 @@ the request, comes from the replica (§5.2), because that step is where an injec
 would show.
 
 `vault_audit` records every decision, allow and deny, with the same 90-day TTL and
-indexes as the other audit collections (`crates/modules/network/src/lib.rs:738-785`).
+indexes as the other audit collections (`crates/modules/network/src/lib.rs:771-840`).
 The server's decision and the device's report of use stay in separate collections, as
 `ssh_audit` and `ssh_activity` do. Dynamic secrets are preferred everywhere;
 `secret:read` on a prod path needs a second approver.

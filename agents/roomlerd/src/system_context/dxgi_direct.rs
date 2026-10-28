@@ -92,12 +92,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter,
-    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource,
 };
 use windows::core::Interface;
 
 use super::dxgi_dup::{BackendBail, DxgiCapture, DxgiFrame};
-use crate::capture::{Damage, DirtyRect};
+use crate::capture::gpu_frame::{self, TexturePool};
+use crate::capture::{Damage, DirtyRect, FrameData};
 use crate::fp16;
 
 /// Phase B — kill switch for the GPU scale-before-readback path.
@@ -193,12 +195,57 @@ pub struct DxgiDirectBackend {
     /// The intermediate native-size RENDER_TARGET texture for the
     /// `vp_input_needs_copy` route (lazy).
     vp_mid_tex: Option<ID3D11Texture2D>,
+    /// FR-118 P2 — `ROOMLERD_ZERO_COPY`, read once when this backend opens:
+    /// a frame is copied into a texture of [`Self::gpu_pool`] and delivered on
+    /// the GPU, and read back only if a consumer asks for its bytes.
+    zero_copy: bool,
+    /// FR-118 P2 — the textures GPU frames are copied into, on this backend's
+    /// device. Built with the first GPU frame.
+    gpu_pool: Option<TexturePool>,
+    /// FR-118 P2 — the GPU frame path failed: CPU frames, like a switched-off
+    /// host, until [`VP_RETRY_AFTER`] has passed. Contained like a VP failure,
+    /// never a [`BackendBail`].
+    gpu_failed_at: Option<std::time::Instant>,
 }
 
 /// Retry cadence for a failed VideoProcessor path — long enough that a
 /// persistently broken driver costs one attempt a minute, short enough
 /// that a transient (device reset mid-session) recovers.
 const VP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// FR-118 P2-2 — what `reset` keeps across a rebuild while GPU frames are on:
+/// the device, its immediate context, and the texture pool GPU frames are
+/// copied into.
+struct Kept {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    gpu_pool: Option<TexturePool>,
+}
+
+impl Kept {
+    /// The device is still the one to keep: alive (no driver reset removed
+    /// it), and on the adapter that owns the primary output now. Anything the
+    /// check cannot read is a no.
+    fn fits(&self, adapter: &IDXGIAdapter1) -> bool {
+        // SAFETY: plain COM queries on live objects.
+        unsafe {
+            if self.device.GetDeviceRemovedReason().is_err() {
+                return false;
+            }
+            let Ok(dxgi) = self.device.cast::<IDXGIDevice>() else {
+                return false;
+            };
+            let (Ok(ours), Ok(theirs)) = (
+                dxgi.GetAdapter().and_then(|a| a.GetDesc()),
+                adapter.GetDesc1(),
+            ) else {
+                return false;
+            };
+            ours.AdapterLuid.LowPart == theirs.AdapterLuid.LowPart
+                && ours.AdapterLuid.HighPart == theirs.AdapterLuid.HighPart
+        }
+    }
+}
 
 /// Phase B — cached D3D11 VideoProcessor objects for one
 /// (input dims → output dims) pair. See the plan's D3D11 recipe; every
@@ -364,6 +411,13 @@ impl DxgiDirectBackend {
     /// FP16 surfaces as BGRA8 (field WINHOST-F: purple 2×-zoomed
     /// flicker on every recomposited frame).
     pub fn primary() -> Result<Self, BackendBail> {
+        Self::open(None)
+    }
+
+    /// [`Self::primary`], reusing `keep`'s device (and its texture pool) when
+    /// the primary output is still on that device's adapter and the device is
+    /// alive (FR-118 P2-2, see `reset`). Anything else makes a new device.
+    fn open(keep: Option<Kept>) -> Result<Self, BackendBail> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(map_dxgi_err)?;
 
@@ -379,7 +433,19 @@ impl DxgiDirectBackend {
             // E_INVALIDARG cross-adapter / E_ACCESSDENIED on the secure desktop),
             // and try_build_dxgi logs the whole error before falling back to
             // scrap — so the message is self-disambiguating without per-step logs.
-            let (device, context) = create_device_on(&adapter).map_err(map_dxgi_err)?;
+            let (device, context, gpu_pool) = match keep.filter(|k| k.fits(&adapter)) {
+                Some(k) => {
+                    tracing::info!(
+                        adapter = %adapter_name,
+                        "DXGI-direct: FR-118 kept the device across the rebuild (GPU frames stay on it)"
+                    );
+                    (k.device, k.context, k.gpu_pool)
+                }
+                None => {
+                    let (device, context) = create_device_on(&adapter).map_err(map_dxgi_err)?;
+                    (device, context, None)
+                }
+            };
 
             // Desktop Duplication lives on IDXGIOutput1.
             let output1: IDXGIOutput1 = output.cast().map_err(map_dxgi_err)?;
@@ -457,6 +523,9 @@ impl DxgiDirectBackend {
                 vp_failed_at: None,
                 vp_input_needs_copy: false,
                 vp_mid_tex: None,
+                zero_copy: gpu_frame::zero_copy_enabled(),
+                gpu_pool,
+                gpu_failed_at: None,
             })
         }
     }
@@ -625,6 +694,39 @@ impl DxgiDirectBackend {
     /// surface as a [`BackendBail`] — a VP quirk must not cost this
     /// healthy backend its DXGI seat.
     fn try_gpu_scaled(&mut self, src: &ID3D11Texture2D) -> Option<DxgiFrame> {
+        let (tw, th) = self.scale_box(src)?;
+        match self.vp_blt_and_read(src, tw, th) {
+            Ok(bytes) => Some(DxgiFrame {
+                data: bytes.into(),
+                width: tw,
+                height: th,
+                stride: tw * 4,
+                // Stamped (and scaled) by frame() while the dup frame is
+                // still held — same flow as the native path.
+                damage: Damage::Unknown,
+                source: Some((self.width, self.height)),
+                // Timed by read_acquired, which owns the whole readback.
+                readback_us: None,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    retry_s = VP_RETRY_AFTER.as_secs(),
+                    "DXGI-direct: GPU scale failed — delivering native (CPU resample fallback)"
+                );
+                self.vp = None;
+                self.vp_failed_at = Some(std::time::Instant::now());
+                None
+            }
+        }
+    }
+
+    /// Phase B — the box this frame is scaled to before delivery, with the
+    /// VideoProcessor for it built. `None` = deliver native: the cap is absent
+    /// or not a shrink, the output is rotated, the desktop is FP16, or the
+    /// processor is unavailable (a failure is contained and retried after
+    /// [`VP_RETRY_AFTER`], like every VP failure).
+    fn scale_box(&mut self, src: &ID3D11Texture2D) -> Option<(u32, u32)> {
         if !gpu_scale_enabled() {
             return None;
         }
@@ -671,41 +773,148 @@ impl DxgiDirectBackend {
                 }
             }
         }
-        match self.vp_blt_and_read(src, tw, th) {
-            Ok(bytes) => Some(DxgiFrame {
-                bytes,
-                width: tw,
-                height: th,
-                stride: tw * 4,
-                // Stamped (and scaled) by frame() while the dup frame is
-                // still held — same flow as the native path.
-                damage: Damage::Unknown,
-                source: Some((self.width, self.height)),
-            }),
+        Some((tw, th))
+    }
+
+    /// FR-118 P2 — with the switch on, copy this frame into a texture of the GPU
+    /// pool (through the VideoProcessor when the pump asked for a smaller box)
+    /// and deliver it on the GPU. `None` = this frame takes the CPU path: the
+    /// switch is off, the desktop is FP16 or rotated (the LUT and raw-copy
+    /// paths), or the GPU path failed and its retry has not come round. Like
+    /// every VP failure, nothing here may surface as a [`BackendBail`].
+    fn try_gpu_frame(&mut self, src: &ID3D11Texture2D) -> Option<DxgiFrame> {
+        if !self.zero_copy || !self.rects_trustworthy {
+            return None;
+        }
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: valid texture + out-param.
+        unsafe { src.GetDesc(&mut desc) };
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return None;
+        }
+        if let Some(when) = self.gpu_failed_at {
+            if when.elapsed() < VP_RETRY_AFTER {
+                return None;
+            }
+            self.gpu_failed_at = None;
+        }
+        match self.gpu_frame(src, desc.Width, desc.Height) {
+            Ok(f) => Some(f),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     retry_s = VP_RETRY_AFTER.as_secs(),
-                    "DXGI-direct: GPU scale failed — delivering native (CPU resample fallback)"
+                    "DXGI-direct: FR-118 GPU frame failed — CPU frames until the retry"
                 );
-                self.vp = None;
-                self.vp_failed_at = Some(std::time::Instant::now());
+                self.gpu_failed_at = Some(std::time::Instant::now());
                 None
             }
         }
     }
 
-    /// The per-frame VP work: input view (direct on the dup surface, or
-    /// through the intermediate copy once a driver rejects the direct
-    /// view) → Blt → copy to the SMALL staging → packed readback. String
-    /// errors only — the caller owns containment.
+    /// The GPU frame itself: a pool texture of the delivered box, filled by
+    /// one GPU copy (native) or by the VideoProcessor's scale and a copy of
+    /// its output (a smaller box). Nothing is read back here.
+    fn gpu_frame(
+        &mut self,
+        src: &ID3D11Texture2D,
+        native_w: u32,
+        native_h: u32,
+    ) -> Result<DxgiFrame, String> {
+        // The acquired texture's own dims are the truth after a mode change,
+        // as `ensure_staging` takes them on the CPU path.
+        self.width = native_w;
+        self.height = native_h;
+        if self.gpu_pool.is_none() {
+            let pool = TexturePool::new(&self.device).map_err(|e| e.to_string())?;
+            tracing::info!(
+                width = native_w,
+                height = native_h,
+                "DXGI-direct: FR-118 zero-copy ON — frames stay on the GPU, read back only if a consumer asks"
+            );
+            self.gpu_pool = Some(pool);
+        }
+        let scaled = self.scale_box(src);
+        let (w, h) = scaled.unwrap_or((native_w, native_h));
+        let pool = self.gpu_pool.as_ref().ok_or("no texture pool")?;
+        let texture = pool.take(w, h).map_err(|e| e.to_string())?;
+        match scaled {
+            Some(_) => {
+                let out = self.vp_blt(src)?;
+                // SAFETY: two BGRA8 textures of the scaled box on this device.
+                unsafe { self.context.CopyResource(&texture, &out) };
+            }
+            // SAFETY: two BGRA8 textures of the native dims on this device.
+            None => unsafe { self.context.CopyResource(&texture, src) },
+        }
+        let pool = self.gpu_pool.as_ref().ok_or("no texture pool")?;
+        Ok(DxgiFrame {
+            data: FrameData::Gpu(pool.frame(texture, w, h)),
+            width: w,
+            height: h,
+            stride: w * 4,
+            // Stamped (and scaled) by frame(), as on the CPU paths.
+            damage: Damage::Unknown,
+            source: scaled.map(|_| (native_w, native_h)),
+            readback_us: None,
+        })
+    }
+
+    /// The per-frame VP work, read back into CPU memory: [`Self::vp_blt`],
+    /// then a copy to the SMALL staging and a packed readback. String errors
+    /// only — the caller owns containment.
     fn vp_blt_and_read(
         &mut self,
         src: &ID3D11Texture2D,
         tw: u32,
         th: u32,
     ) -> Result<Vec<u8>, String> {
-        let (vdev, vctx, venum, vp, out_view, out_tex, small_staging) = {
+        let out_tex = self.vp_blt(src)?;
+        let small_staging = self
+            .vp
+            .as_ref()
+            .ok_or("vp state missing")?
+            .small_staging
+            .clone();
+        // SAFETY: dim/format-matched DEFAULT → STAGING copy.
+        unsafe { self.context.CopyResource(&small_staging, &out_tex) };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: staging texture with CPU read; out-param valid. The Map
+        // is what forces GPU completion before ReleaseFrame — same
+        // discipline as the native readback, now over ~3.5× fewer bytes.
+        unsafe {
+            self.context
+                .Map(&small_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        }
+        .map_err(|e| format!("Map(small staging): {e}"))?;
+        let w = tw as usize;
+        let h = th as usize;
+        let stride = w * 4;
+        let mut bytes = vec![0u8; stride * h];
+        // SAFETY: mapped region holds RowPitch*h bytes; per-row copy is
+        // bounded by min(stride, RowPitch) on both sides.
+        unsafe {
+            let src_ptr = mapped.pData as *const u8;
+            let row_pitch = mapped.RowPitch as usize;
+            let copy_w = stride.min(row_pitch);
+            for y in 0..h {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(y * row_pitch),
+                    bytes.as_mut_ptr().add(y * stride),
+                    copy_w,
+                );
+            }
+            self.context.Unmap(&small_staging, 0);
+        }
+        Ok(bytes)
+    }
+
+    /// The per-frame VP work on the GPU: input view (direct on the dup
+    /// surface, or through the intermediate copy once a driver rejects the
+    /// direct view) → Blt into the processor's output texture, which comes
+    /// back. String errors only — the caller owns containment.
+    fn vp_blt(&mut self, src: &ID3D11Texture2D) -> Result<ID3D11Texture2D, String> {
+        let (vdev, vctx, venum, vp, out_view, out_tex) = {
             let s = self.vp.as_ref().ok_or("vp state missing")?;
             (
                 s.vdev.clone(),
@@ -714,7 +923,6 @@ impl DxgiDirectBackend {
                 s.vp.clone(),
                 s.out_view.clone(),
                 s.out_tex.clone(),
-                s.small_staging.clone(),
             )
         };
         let iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -786,37 +994,7 @@ impl DxgiDirectBackend {
         // SAFETY: reclaiming the ref we placed above, exactly once.
         unsafe { std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface) };
         blt.map_err(|e| format!("VideoProcessorBlt: {e}"))?;
-        // SAFETY: dim/format-matched DEFAULT → STAGING copy.
-        unsafe { self.context.CopyResource(&small_staging, &out_tex) };
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // SAFETY: staging texture with CPU read; out-param valid. The Map
-        // is what forces GPU completion before ReleaseFrame — same
-        // discipline as the native readback, now over ~3.5× fewer bytes.
-        unsafe {
-            self.context
-                .Map(&small_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        }
-        .map_err(|e| format!("Map(small staging): {e}"))?;
-        let w = tw as usize;
-        let h = th as usize;
-        let stride = w * 4;
-        let mut bytes = vec![0u8; stride * h];
-        // SAFETY: mapped region holds RowPitch*h bytes; per-row copy is
-        // bounded by min(stride, RowPitch) on both sides.
-        unsafe {
-            let src_ptr = mapped.pData as *const u8;
-            let row_pitch = mapped.RowPitch as usize;
-            let copy_w = stride.min(row_pitch);
-            for y in 0..h {
-                std::ptr::copy_nonoverlapping(
-                    src_ptr.add(y * row_pitch),
-                    bytes.as_mut_ptr().add(y * stride),
-                    copy_w,
-                );
-            }
-            self.context.Unmap(&small_staging, 0);
-        }
-        Ok(bytes)
+        Ok(out_tex)
     }
 
     /// Lazy native-size RENDER_TARGET texture for the intermediate-copy
@@ -859,6 +1037,8 @@ impl DxgiDirectBackend {
     /// read out a tightly-packed BGRA8 buffer. Called between
     /// AcquireNextFrame and ReleaseFrame.
     fn read_acquired(&mut self, resource: Option<IDXGIResource>) -> Result<DxgiFrame, BackendBail> {
+        // FR-118 P0 — the whole readback is timed, a GPU scale's included.
+        let started = std::time::Instant::now();
         let resource = resource.ok_or_else(|| {
             BackendBail::HardError(io::Error::other(
                 "DXGI-direct: AcquireNextFrame returned a null resource",
@@ -866,11 +1046,18 @@ impl DxgiDirectBackend {
         })?;
         let src: ID3D11Texture2D = resource.cast().map_err(map_dxgi_err)?;
 
+        // FR-118 P2 — with the switch on, the frame stays on the GPU: nothing
+        // is read back here, so it reports no readback time.
+        if let Some(f) = self.try_gpu_frame(&src) {
+            return Ok(f);
+        }
+
         // Phase B — GPU scale-before-readback when the pump asked for a
         // smaller box and the path is available. Any refusal or failure
         // falls through to the native readback below unchanged.
         if let Some(f) = self.try_gpu_scaled(&src) {
-            return Ok(f);
+            let readback_us = Some(started.elapsed().as_micros() as u64);
+            return Ok(DxgiFrame { readback_us, ..f });
         }
 
         self.ensure_staging(&src)?;
@@ -942,12 +1129,13 @@ impl DxgiDirectBackend {
         }
 
         Ok(DxgiFrame {
-            bytes,
+            data: bytes.into(),
             width: self.width,
             height: self.height,
             stride: stride as u32,
             damage: Damage::Unknown,
             source: None,
+            readback_us: Some(started.elapsed().as_micros() as u64),
         })
     }
 }
@@ -1039,7 +1227,18 @@ impl DxgiCapture for DxgiDirectBackend {
         // display config may have changed across the AccessLost (resolution
         // swap during a lock screen), so re-deriving from scratch is the
         // safe move — same as the scrap backend's reset().
-        *self = Self::primary()?;
+        //
+        // FR-118 P2-2 — except the device, while GPU frames are on and the
+        // primary output is still on its adapter: the encoder takes GPU
+        // frames from this device, and a new one would cost it a reopen (a
+        // QSV open is 0.6–0.9 s) and a keyframe after every lock, unlock and
+        // cap lift. The duplication is still rebuilt from scratch.
+        let keep = self.zero_copy.then(|| Kept {
+            device: self.device.clone(),
+            context: self.context.clone(),
+            gpu_pool: self.gpu_pool.take(),
+        });
+        *self = Self::open(keep)?;
         Ok(())
     }
 
@@ -1053,6 +1252,9 @@ impl DxgiCapture for DxgiDirectBackend {
         // convert — the observable half of the rc.207 ACM/HDR fix.
         if self.staging_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT {
             "dxgi-direct-fp16"
+        } else if self.gpu_pool.is_some() && self.gpu_failed_at.is_none() {
+            // FR-118 P2 — the frames are on the GPU.
+            "dxgi-direct-gpu"
         } else {
             "dxgi-direct"
         }

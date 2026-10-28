@@ -62,7 +62,10 @@ itself on the affected run's page. Baseline when the program started: releases t
   report the release version from `--version`. Where it cannot run before packaging,
   it must at least contain the version string: the macOS binary links
   `@rpath/libavcodec…`, which only the `.app` resolves. Kill switch: repository
-  variable `SEED_REUSE_SAME_TREE=off`.
+  variable `SEED_REUSE_SAME_TREE=off`. ⚠️ Reuse is only as good as each build script's
+  declared inputs: a watched path that does not exist counts as changed (wave 30's
+  `capabilities`), and so does a path-crate build script with no `rerun-if` line at
+  all (wave 29's `scrap`). `cargo build -v` prints each unit's `Dirty` reason.
 - **PR CI** (`ci.yml`): Swatinem, keyed on the environment and the lockfile. A member
   crate's `Cargo.toml` edit or a third-party `Cargo.lock` change rotates a family's key,
   and the next run restores the previous generation as a prefix match. A version bump
@@ -120,6 +123,8 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 27 | 10-24 | **PR CI's two long poles.** The integration suite runs as four shards, not three. FR-90 P1i's Windows agent-session tests move out of `windows-overlay-clippy` into a parallel `windows-agent-sessions` job with its own seed family | #2844 |
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
+| 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
+| 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources | #3024, #3030 |
 
 ## Acceptance criteria
 
@@ -158,8 +163,8 @@ itself on the affected run's page. Baseline when the program started: releases t
       and bun, with no superseded or PR-ref entries. That leaves ~2.5 GiB for a rotation of
       the largest family (`ci-unit`, 2.1 GiB). Saves land with no budget warning, and the six
       moved families republished from master to the `seed-cache` release (log)
-- [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
-      **not met.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
+- [x] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
+      **not met until wave 29.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
       waves 18 and 19, whose agent code is 0.4.114's) took **14.9 min**: Windows MSI
       13.9, macOS `.pkg` 10.4, Linux x86_64 9.9, aarch64 7.4. Over the 12 tags 0.4.102–
       0.4.115 the MSI job ran 9.2–14.9 min and is the steady long pole. Of its 13.9 min,
@@ -172,6 +177,11 @@ itself on the affected run's page. Baseline when the program started: releases t
       was about 7 min. It still took **17.0 min** on the clock, because its jobs waited up
       to 10 min for a runner (the account runs at most 20 jobs at once). Still unmet: the
       box is ticked when a tag lands under 10 min on the clock.
+      **Met on agent-v0.4.174** (2026-10-26, run 40287645036): 07:44:29 → 07:51:43Z,
+      **7.2 min** on the clock. All 8 build jobs reused rehearsal 40267019868's build (same
+      SHA `ff3290048`, no release dispatch between them), and the four daemon jobs
+      reported `roomlerd 0.4.174`. The longest jobs were the Windows companion (4.2 min)
+      and the MSI (4.0); wave 30 takes the companions' remaining compile out.
 
 ## Open decisions / residual levers (all trade-offs, not waste)
 
@@ -848,3 +858,150 @@ itself on the affected run's page. Baseline when the program started: releases t
   - ⚠️ The companions still recompile `roomler-desktop`. Tauri regenerates its gitignored
     `gen/schemas/` (#2894), so its build script reruns on a fresh checkout. Carrying
     `agents/*/gen/` in the seed is the open fix.
+- 2026-10-26, later: **0.4.174 lands in 7.2 min, and the companions' recompile is explained
+  and fixed (wave 30).**
+  - agent-v0.4.174 (tag run 40287645036) ran 07:44:29 → 07:51:43Z: **7.2 min** on the clock,
+    so the ≤10 min criterion is met.
+    - All 8 build jobs reused rehearsal 40267019868's build. It ran at the same SHA
+      `ff3290048`, 3.7 h earlier, with no release dispatch between them.
+    - Daemon jobs: MSI 4.0 min, `.pkg` 3.1, `.deb` 1.6 and 1.5. The longest jobs were the
+      companions: Windows 4.2, aarch64 4.0.
+  - **Correction to the previous entry: `gen/schemas/` was not the cause.**
+    - Probe 40299709033 ran three Windows jobs, restoring seeds but never saving one, and
+      rebuilt with `-v` after a reuse.
+    - In all three variants it printed `Dirty roomler-desktop v0.4.174: the file
+      'agents\roomler-desktop\capabilities' is missing`. The variants were: nothing
+      restored; `gen/` restored with its mtimes; `gen/` restored and marked old.
+    - `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` unless the app
+      sets a capabilities pattern (tauri-build 2.6.2, `acl::build`). The directory had never
+      existed. So every build of `roomler-desktop` re-ran its build script and recompiled it:
+      local, CI, rehearsal or reused tag.
+  - With `agents/roomler-desktop/capabilities/README.md` in place (probe 40301394043), the
+    reused rebuild took **0.9 s** in all three variants, with nothing compiled, against
+    157–251 s before. A normal build still passes. The capability set is unchanged and
+    empty: the parser loads only `*.json`/`*.toml` files.
+- 2026-10-26, midday: **agent-v0.4.175, cut by roomler-ai-df.** Rehearsal 40308879884 and tag
+  run 40312190685 were both at `027206d82`, with no dispatch between them.
+  - Reuse held in every job, as reported by df: MSI 5.3 min, `.pkg` 6.6, `.deb` aarch64
+    1.6. The Linux x86_64 build step took 4 s.
+  - The run was created at 11:03:40, but its jobs only started at 11:09:59, after 6 min
+    waiting for runners.
+  - ⚠️ In attempt 1, the Linux x86_64 job **hung 23+ min in "Install system build deps
+    (cached apt)"** (`awalsh128/cache-apt-pkgs-action`), from 11:11:16. The same step took
+    37 s in the rehearsal and 37 s on the re-run. It had no limit of its own, so only the
+    job's 60 min would have ended it.
+  - df cancelled it at 11:34:47 and re-ran the failed jobs (attempt 2: 11:36:55–11:38:54).
+    The release published at 11:39:58, **36.3 min** after the tag, against 7.2 min for
+    0.4.174.
+  - Wave 30 bounds both cached-apt steps (8 min + `continue-on-error`) into the existing
+    fallback. A hang now costs at most ~8 min plus a direct apt-get, and never the job.
+- 2026-10-27: **wave 30 field-verified on agent-v0.4.179** (cut by the stardesk session, with
+  #2940 on board, on one SHA for rehearsal and tag).
+  - Tag run 40554147480: the tag was pushed at 17:49:08Z and the release published at
+    17:58:18Z, **9 min 10 s** from tag to publish. That is under the ≤10 min target for the
+    second time, after 0.4.174.
+  - None of the four companion jobs has a `Compiling roomler-desktop` line: Windows EXE
+    5 min, Linux x86_64 1 min, aarch64 1 min, macOS 3 min. On 0.4.174's tag they had spent
+    114–149 s on it. ⚠️ **Wrong, corrected in the next entry:** the Windows EXE and macOS
+    jobs did compile it (4 min 03 s, 2 min 26 s). This grep could not match a colour-coded line.
+  - Both cached-apt steps finished well inside their new bound: 7 s for the daemon .deb
+    and 6 s for the companion .deb. The aarch64 jobs use the uncached step (22 s and 43 s).
+  - All 8 build jobs carry the reuse notice. The four daemon jobs printed `reused build
+    reports 'roomlerd 0.4.179' (want 0.4.179): OK`. The MSI's ProductVersion reads 0.4.179,
+    and its G ROX LTD Authenticode signature is valid.
+  - Tags in between, all with the reuse held, as their cutters reported:
+    - 0.4.176 (2e) lost its first MSI attempt at "Sign MSIs": `azure/login` could not fetch
+      the OIDC token. A re-run of the failed jobs published it.
+    - 0.4.178 (df) took 15.0 min from tag to publish, before wave 30: MSI 6.8 min,
+      companion EXE 5.8.
+  - Next on this lane is FR-123 P2 (#2999, merged as `ae5ca6f6e`): the daemon compiles as
+    one unit, measured −14 % on Windows and −30 % on macOS on the rehearsal's critical
+    path. Its field check is 0.4.180's rehearsal.
+- 2026-10-27, evening: **agent-v0.4.180 (cut by roomler-ai-2e) published 5 min 28 s after its
+  tag, the fastest yet. Also a correction to the 0.4.179 entry.**
+  - Rehearsal 40574588069 and tag run 40577974956 both ran at `9aab8f703`, the first release
+    with FR-123 P2. The run was created at 20:25:51Z and the release published at
+    20:31:19Z.
+    - All 8 build jobs carry the reuse notice. The four daemon jobs compiled nothing and
+      printed `reused build reports 'roomlerd 0.4.180' (want 0.4.180): OK`.
+    - Three jobs ended together at 20:30:11Z, so they share the critical path:
+      - the Windows companion EXE: signing 62 s, then its post step 40 s;
+      - the MSI: payload signing 47 s, MSI signing 34 s;
+      - the `.pkg`, which waited 119 s for the macOS companion.
+  - **Correction to the 0.4.179 entry: two of the four companion jobs did compile
+    `roomler-desktop`.** The Windows EXE took 4 min 03 s and the macOS companion 2 min 26 s;
+    the two Linux jobs compiled nothing.
+    - That check grepped the raw logs. Cargo writes `Compiling\x1b[0m roomler-desktop`, and
+      the colour reset between the words means a plain grep for `Compiling roomler-desktop`
+      can never match: it counted 0 whatever happened. The cutter's check for 0.4.180 had
+      the same blind spot.
+    - With colours stripped: on 0.4.180's tag run only the macOS companion compiled it
+      (2 min 30 s). The reseed after it (40578859007) did the same (142 s). No Linux
+      companion compiled it on either run, nor did 0.4.180's Windows one.
+    - ⚠️ Prove a "none" count with a positive control: run the same grep on a log where the
+      answer must be at least 1, such as the rehearsal's.
+  - **Why the macOS companion recompiles is not yet known.** Probe branch
+    `exp/fr6-w31-companion-probe` restores the seed read-only and rebuilds with `-v` and
+    cargo's fingerprint log. It never stamps or saves a seed.
+    - Runs: v1 40583704652, v2 40584382028, v3 40585289155, v4 40586307513,
+      v5 40587490912.
+    - v1: the reseed's seed, rebuilt as a tag run does on another runner, was fresh (4.4 s).
+    - v2 to v4 each did a rehearsal-style build, then a tag-style rebuild on the same
+      runner. All were fresh (0.9–1.5 s), including:
+      - with the gitignored `gen/` removed, as a fresh checkout has it;
+      - with the seed's own `tar --zstd` round trip in between.
+    - v5 had the field's exact shape: a rehearsal-style build on runner A, the target
+      packed with `tar --zstd`, restored on runner B, then rebuilt as a tag run does. It was
+      fresh too (5.3 s, 0 of the dep-info's 48 inputs newer than its reference).
+    - Measured on the way:
+      - macOS bsdtar 3.5.3 stores mtimes to the whole second, cargo's reference included
+        (`…387.712610` → `…387.000000`). Windows' bsdtar 3.8.9 does the same to a 72- and a
+        167-character path, so no input can overtake its reference in the round trip.
+      - None of the tauri `OUT_DIR` inputs in the companion's dep-info is missing after a
+        restore.
+    - So the trigger lives in something only the real release jobs carry: their
+      environment (`SEED_REUSE_SAME_TREE`, `ROOMLER_SEED_REUSED_TREE`, the rehearsal branch
+      against the tag ref), or the steps around the build (stamp, artifact upload, seed
+      save). The way to read it is cargo's own answer in a real job:
+      `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the companion build steps, a
+      log-only change. It is not on today's critical path: the Windows companion and the
+      MSI ended at the same second as the `.pkg`.
+  - The reseed's MSI job compiled from scratch: 586 crates, 21 min 38 s. Its restored seed
+    held 3,042 MB, over the 3,000 MB cap, and was dropped whole by design. A reseed absorbs
+    that cold build, so the next rehearsal starts from a fresh seed.
+  - FR-123's reading of the same rehearsal is in its spec, §8.1: −19 % and −12 % of the
+    daemon's compile on the two Linux lanes. The MSI build step took 542 s, the fastest of
+    the 40 release runs since 10-24.
+- 2026-10-28: **wave 31 (#3024), the operator's go: the four companion build steps log
+  cargo's fingerprint decisions.**
+  - The reseed its merge dispatches builds a new tree, so it recompiles our crates by design.
+    Its companion logs are the positive control: each dirty unit must print its reason.
+  - The first reused same-tree run after it names the macOS companion's reason: the next tag
+    run, or the reseed after a release. Its read goes here.
+- 2026-10-28, night: **the reason, read off cargo, and the fix (#3030).**
+  - R1, reseed 40602653917 (a new tree), was the positive control. Its macOS companion printed
+    22 fingerprint lines, each a source with both mtimes.
+  - R2, 40605173133, ran the same tree on a branch pinned to R1's commit. It was **fresh**
+    (5.50 s). A reseed's seed reuses cleanly; something only a release's rehearsal does
+    leaves the trap. The rehearsal is the one that builds a new version, so every one of
+    our units gets a new hash and compiles for the first time.
+  - Probe v6, 40605635409, bumped `roomler-desktop` alone to 0.4.999, so its build is a
+    first build. The rebuild on the same runner was dirty:
+    `stale: changed …/out/tauri-codegen-assets/8068…ba4.js (vs) …/dep-bin-roomler-desktop`,
+    `1793145568.351986499 < 1793145569.649334416`.
+    - The asset was written 1.3 s after the compile started, by tauri's `generate_context!`.
+      It writes the file during the compile, only when missing, and lists it as an input.
+    - Restored from the tar on another runner, the rebuild was dirty the same way (`568 <
+      569`, the tar keeping whole seconds). It recompiled in 2 min 22 s, the field's figure.
+    - That explains every reading: the macOS companion every release; the Windows one on
+      0.4.179 and not on 0.4.180, depending on whether the write crossed a second; and the
+      once-only recompile, because the file then exists and is never rewritten.
+  - The fix: on a same-tree reuse, `seed-tree-reuse` marks every file under
+    `target/*/build/*/out/` and `target/*/*/build/*/out/` old, as it does the sources. A
+    build script that does rerun rewrites its OUT_DIR, which is new again.
+  - Probe v7, 40607295709, applied the fix verbatim after a first build. All three were
+    fresh: macOS on the same runner 1.98 s, macOS on another runner 4.87 s, Windows 0.68 s.
+  - Field proof owed, on the next release's tag run:
+    - no `Compiling roomler-desktop` in any companion job (strip colours first);
+    - no `fingerprint dirty` line in their logs.
+    Then the `CARGO_LOG` lines come out of the four steps.
