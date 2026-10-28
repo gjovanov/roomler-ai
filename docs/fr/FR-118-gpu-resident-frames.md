@@ -209,7 +209,7 @@ flowchart LR
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b rides the next agent release; the fleet read is AC1 |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
-| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | — |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter; not built yet |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
@@ -451,17 +451,23 @@ flowchart LR
   WARP device (§5.3, run 40617907270). The synthetic source reads through `Frame::cpu()` in every L0 cell, and
   `a_cpu_frame_reads_back_the_bytes_it_was_built_with` covers the CPU frame (§5.2). The L0 half: 14 CI runs, the
   same within each runner class (§9, the 2026-10-28 CI row).
-- [ ] **AC3 — the first cell, in the field.** On a QSV host whose panel is on the Intel adapter, 20-minute
-  sessions with the switch on and off, back to back, on the same content. Pass if all of these hold: the encode
-  stage per frame falls by at least the conversion + copy + upload share P0 measured on that host, minus the GPU
-  conversion's own time; process CPU falls; zero viewer decode errors, and no rise in keyframe requests; a test
-  pattern decodes to within ±2 code values of the CPU path in every plane. The off-session is the red run.
+- [x] **AC3 — the first cell, in the field.** On a QSV host whose panel is on the Intel adapter, 20-minute
+  sessions with the switch on and off, back to back, on the same content. Pass if all of these hold: capture +
+  encode per frame falls; the worker's CPU per encoded frame falls; zero viewer decode errors, and no rise in
+  keyframe requests; a test pattern decodes to within ±2 code values of the CPU path in every plane. The
+  off-session is the red run. *(Reworded 2026-10-28 by open decision 5. The first wording read the encode stage
+  alone against the share P0 measured, but on the DXGI arm the readback the GPU input removes sits in the capture
+  stage.)*
   *(First field run, 2026-10-28, §9.2: CORPLAP-3, `av1_qsv` 1920×1200, sessions off/on/off/on. Measured: capture +
   encode 14.5 → 12.2 ms per frame and the worker's CPU 52 → 34 % of a core at the same encoded rate; no decode
   error in the viewer; idle-settle keyframes on both paths at the same rate; the desktop's flat regions decode
   identically. Not met as written: the encode stage alone **rose** 1.4 ms, because the readback it removes sits in
   the capture stage on this arm, and `send_frame` now waits for the GPU's conversion (open decision 5). Owed: the
   20-minute pairs and the test pattern; the sessions ran 3–6 min on live desktop content.)*
+  **Met 2026-10-28** (§9.3): CORPLAP-3, `av1_qsv` 1920×1200, 20-minute legs on, off, on, on AC3's test pattern
+  at 60 fps. Capture + encode 14.70 → 12.30 / 12.33 ms; the worker's CPU 15.9 → 10.6 / 10.9 ms per encoded frame
+  at the same bytes; no decode error; resyncs at the same rate with the switch on and off (2 in 36 min, 1 in
+  19), one swap episode per leg on both paths; every patch of the pattern identical on both paths.
 - [ ] **AC4 — the slow laptop.** A host at ≥ 2560×1600 on QSV reaches a peak of **≥ 50 fps** with the switch on;
   §2.2's 2880×1800 laptop peaked at 29.4 over 590 windows. If P0 shows the hardware encode itself is the bound
   there, this AC records the measured bound instead, and why. *(The first field host is 1920×1200, so it cannot
@@ -487,7 +493,12 @@ flowchart LR
 
 1. **Which adapter WGC's device uses.** The default adapter (today), or the encoder's adapter, letting the OS
    copy across on a hybrid laptop. Recommended: keep the default until P3 measures the encoder's-adapter variant
-   on a hybrid laptop against the readback.
+   on a hybrid laptop against the readback. **Decided by the operator, 2026-10-28:** measure the cross-adapter
+   capture first, and take the AMF route (encode on the panel's iGPU instead) only if it is poor. **Measured the
+   same day on neo16 (§9.4): it is not poor.** With WGC's device on the RTX 5090 and the panel on the Radeon, the
+   OS's copy across costs 0.3–0.6 ms at the median, no frame rate and no CPU in the process or in DWM, while the
+   frame lands where NVENC can take it without the readback (3.7 ms on the Radeon device), the CPU conversion and
+   the upload. So P3 gives WGC's device the encoder's adapter whenever the encoder is a GPU cell on another one.
 2. **The default.** Recommended: OFF for one release, then ON per cell after a clean fleet week of that cell
    (decode errors, keyframe requests, `input_path` reasons), never globally.
 3. **Colour.** Recommended: BT.601 limited range on the GPU path, matching today's CPU path, so the switch never
@@ -501,7 +512,7 @@ flowchart LR
    while capture + encode falls (14.5 → 12.2 ms) and process CPU falls (52 → 34 % of a core). The clause's "minus
    the GPU conversion's own time" cannot be read either: no heartbeat times the GPU's work. Recommended: read AC3
    on capture + encode per frame and on process CPU, which is what the GPU input saves, and drop the share
-   arithmetic.
+   arithmetic. **Decided by the operator, 2026-10-28: as recommended.** AC3 is reworded.
 
 ## 8. Out of scope
 
@@ -521,6 +532,8 @@ flowchart LR
 | 2026-10-28 | CI, the `Recorder tests (FR-85)` job's L0 cells: 6 master runs before C0 (`9aab8f703` to `c2ccd5e17`) and 8 runs with it (C0's PR run, then master `384443de3` to `e9f99cecf`) | **AC2's L0 half: C0 is invisible.** On both sides the runs fall into three runner speed classes: clean p50 ≈ 6, ≈ 9 and ≈ 12 ms, with `delay100` sitting 100.5–101.5 ms above clean in every run. So a pooled median moves with the class the runs happened to draw, and 6 of the 8 runs with C0 drew the slowest. Within a class, C0 moves clean's p50 by at most 0.5 ms: 5.9 and 6.0 → 6.5; 9.0 and 9.2 → 9.4; 11.8 and 12.2 → 11.7–12.7. Every cell keeps its frame rate (clean 60.2, `gate_slot` 25.2, `gate_lgcy` 24.5 fps). `lossy` and `gate50` vary with their loss and hold, as before. Tools: `l0-collect.sh` and `l0-summary.awk` (FR-118 tools) |
 | 2026-10-28 | agent 0.4.181, CORPLAP-3: `av1_qsv` at 1920×1200 on the SystemContext DXGI arm, a direct path, the viewer decoding AV1 in hardware | **The first field run of the GPU input**: sessions with the switch off, on, off, on, then one with the cell denied (§9.2). With the switch on, the probe's `gpu` child proved `av1_qsv` and `h264_qsv` on the Intel adapter in 765 ms, and every heartbeat read `input_path=gpu`. Capture + encode fell from 14.5 to 12.2 ms per frame, and the worker's CPU from 52 to 34 % of a core at the same encoded rate. The desktop's flat regions decoded identically, and no decode error reached the viewer. With the switch off: no `gpu` child, and `switch_off`. With `av1_qsv:gpu` denied: the child tried only `h264_qsv`, and the session read `denied` |
 | 2026-10-28 | agent 0.4.181, CORPLAP-3 on the soak (`zero_copy` on), a person's own session, 09:24:49–09:29:41Z | **The GPU input across a lock-screen transition.** All 145 heartbeats read `input_path=gpu`: 2 380 frames captured, 6 283 encoded, 40 IDRs, capture 1.49 ms and encode 11.54 ms (heartbeat means). The session crossed a desktop transition. The DXGI arm reported `AccessLost` three times and kept its device across the rebuilds ("kept the device across the rebuild", 7 times; §5.4). It then went through the GDI fallback for the lock screen, whose frames in memory the encoder uploaded into its QSV pool (`avg_upload_ms` 2.3 in that window). It climbed back to DXGI on a new device, and the encoder moved to it ("the capture's device changed under the encoder — reopened", still `gpu`). The viewer's uploaded logs carry no decode-error or keyframe line |
+| 2026-10-28 | agent 0.4.181, CORPLAP-3: `av1_qsv` 1920×1200 on the SystemContext DXGI arm, direct, AC3's test pattern full screen at 60 fps; the viewer on neo16 | **AC3's 20-minute pairs** (§9.3), on, off, on, back to back. Capture + encode 14.70 → 12.30 and 12.33 ms; the worker's CPU 15.9 → 10.6 and 10.9 ms per encoded frame at the same bytes. Every patch of the pattern decoded identically on both paths; no decode error; resyncs at one rate on both paths, and one swap episode per leg. **AC3 met.** Two pre-existing defects surfaced and were filed: saturated colours decode as BT.709 on both paths (#3049), and a recovered direct session stays at the ladder's 25 M top (#3050) |
+| 2026-10-28 | neo16: panel on the Radeon 610M, RTX 5090 with no outputs; harness `wgcx` (FR-118 tools), 2560×1600, a 60 Hz source, 30-second cells, twice | **Open decision 1, measured for P3** (§9.4). WGC with its device on the RTX 5090 keeps the frame rate (55–56 fps on both adapters) and arrives 0.3–0.6 ms later at the median, with no CPU cost in the process or in DWM. A copy into a GPU pool there takes 0.27 ms, against today's 3.7 ms readback on the Radeon device. **Resolved: WGC's device goes on the encoder's adapter.** The AMF route is not needed on this host |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -601,6 +614,86 @@ the session (`Get-Process`, before and after).
   exercise it at 09:24Z, with a lock-screen transition and a capture back on a new device (§9, the next row).
 - **Left on for a soak.** `zero_copy` stays on for CORPLAP-3 from 04:52Z (the restart's probe proved both forms
   again). To turn it off on the device: `roomler config set zero_copy false`, then `roomler restart`.
+
+### 9.3 AC3's pairs (2026-10-28)
+
+CORPLAP-3 in the afternoon, agent 0.4.181: `av1_qsv` at 1920×1200 on the SystemContext DXGI arm, a direct path,
+the viewer in Chromium on neo16 decoding AV1 in hardware (§9.2's chain). The content was AC3's test pattern, full
+screen in Edge: eight 75 % bars, a five-step grey wedge, and a bar an eighth of the screen wide moving 9 px a frame
+across a dark field. Every frame changes, so the encoder ran at its 60 fps target throughout. The pattern reached
+the host through the viewer's file transfer. Typing it had lost Shift (#3047), and the transfer landed in a folder
+the signed-in user cannot open (#3048), so it was copied out over `roomler exec`. The switch was flipped as in
+§9.2, three legs back to back: on (the soak's session), off, on. Stage times are medians of the 2-second
+heartbeats. Worker CPU is `Get-Process` before and after each leg.
+
+| Leg (UTC) | Switch | Input | Heartbeats | Encoded fps | Capture | Readback | Encode | Convert | `send_frame` | Capture + encode | Worker CPU (per encoded frame) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ON1 14:05:58–14:25:15 | on | `gpu` | 576 | 59.99 | 0.44 | 0 | 11.87 | 0.46 | 11.31 | 12.30 | 63 % of a core (10.6 ms) |
+| OFF 14:28:07–14:48:07 | off | `cpu`, `switch_off` | 597 | 59.95 | 4.45 | 4.06 | 10.24 | 0.65 | 9.43 | 14.70 | 95 % (15.9 ms) |
+| ON2 14:49:48–15:09:48 | on | `gpu` | 598 | 60.04 | 0.43 | 0 | 11.91 | 0.46 | 11.34 | 12.33 | 65 % (10.9 ms) |
+
+- **Capture + encode** falls 2.4 ms (14.70 → 12.30 and 12.33, −16 %), split as in §9.2. The 4.06 ms readback
+  leaves the capture stage, and `send_frame` rises 1.9 ms waiting for the GPU's conversion and copy.
+- **The worker's CPU per encoded frame** falls by a third (15.9 → 10.6 and 10.9 ms), at the same frame rate and
+  the same bytes: 3.13, 3.12 and 3.13 MB/s in the legs' 25 M windows (next bullet).
+- **Two rate regimes, and why they are not the switch.** Each leg had one congestion episode (a decrease, a swap,
+  the climb back). Before it, the encoder ran at the 34.56 M it opened at (4.3 MB/s on the wire); after it, at
+  25 M for the rest of the leg (3.1 MB/s), while `target_bps` read 34.56 M again. The bitrate ladder stops at
+  25 M, so a recovered session never gets back above it (#3050). The switch does not move this: ON2's two regimes
+  give capture + encode 12.41 and 12.27 ms. Both comparisons above are read in the 25 M windows.
+- **Colour.** All 13 patches of the pattern (16×16 means, σ 0) decode to the same RGB on both paths. The difference
+  is 0 in every channel, so within ±2 in every plane. Both paths shift the saturated bars the same way (green
+  191 → 161, red 191/0/0 → 208/18/0, greys exact): the frames are BT.601, the bitstream does not say so, and the
+  viewer decodes them as BT.709. That predates FR-118 and is #3049.
+- **Decode errors: none.** A decode error tears the DC path down and the viewer falls back. The session stayed on
+  the DC path through all three legs, and the viewer's console carries no decode-error line.
+- **Keyframes.** Every IDR in the three legs is a rate swap (QSV reopens to change rate, and a replacement starts
+  on an IDR) or a viewer resync (the viewer's decode backlog shed frames and asked for a keyframe):
+
+  | Leg | Swaps | Resyncs | Resyncs in the steady window |
+  |---|---|---|---|
+  | ON1 | 2: at 14:07:18 a congestion decrease (34.56 → 19.3 M) while a canvas sample ran in the viewer's tab, and at 14:08:24 the climb back | 3: 14:07:18, 14:13:01, 14:22:50 | 2 in 16.4 min |
+  | OFF | 1: at 14:28:24 the climb back from the session's opening decrease | 1: 14:46:26 | 1 in 19.2 min |
+  | ON2 | 2: at 14:57:36 a congestion decrease, and at 14:58:36 the climb back | 0 | 0 in 20 min |
+
+  Resyncs: 2 in 36 minutes with the switch on, 1 in 19 with it off, so the same rate. Swaps: one congestion episode
+  per leg on both paths. No rise.
+- **What disturbed the viewer.** neo16, which runs the viewer, is a shared workstation. A local build loaded it at
+  14:25:24–36, and the viewer re-armed its keyframe gate six times in those 12 s, so ON1's window ends at 14:25:15.
+  This session ran no build and no GPU work on neo16 during OFF and ON2.
+
+**AC3 met.** `zero_copy` is back on for CORPLAP-3 from 14:48:25Z (the operator's choice, 2026-10-28), and the
+restart's probe proved `av1_qsv` and `h264_qsv` again in 818 ms.
+
+### 9.4 WGC across adapters, for P3 (2026-10-28)
+
+Open decision 1, measured on neo16: the panel (2560×1600, 240 Hz) on the Radeon 610M, the RTX 5090 Laptop GPU with
+no outputs. A standalone harness (`wgcx`, FR-118 tools) captures the primary monitor through Windows.Graphics.Capture
+with its D3D11 device on a chosen adapter, as `wgc_backend.rs` does on the default one. It drives a small
+topmost window that repaints at 60 Hz as the source, and times each frame: `SystemRelativeTime` (the compositor's
+QPC time) to `FrameArrived`, a `CopyResource` into a DEFAULT texture on the same device timed to GPU completion
+(what P3 does to hand the frame to the encoder's pool), and today's readback (staging, `Map`, rows into memory).
+The cells ran 30 s each, alternating the adapters, twice, in a window where the RTX 5090 ran nothing else (it
+idled in P8, 180–345 MHz).
+
+| WGC's device | Frames / s | `FrameArrived` after present, p50 / p95 | Copy into a GPU pool, p50 / p95 | Readback, p50 / p95 |
+|---|---|---|---|---|
+| Radeon 610M: the panel's adapter, today's default | 55.2–55.8 | 1.8–2.1 / 15.6–16.7 ms | 0.85–1.67 / 2.4–3.2 ms | 3.7 / 5.5–5.7 ms |
+| RTX 5090: the encoder's adapter, the OS copies across | 55.2–56.3 | 2.1–2.8 / 17.5–18.4 ms | 0.26–0.27 / 0.85–1.16 ms | 5.8 / 7.6–8.4 ms |
+
+- **The copy across is cheap.** The same frame rate, 0.3–0.6 ms later at the median and up to 2 ms at p95. The
+  harness's own CPU per frame was 0.10–0.32 ms on both devices, and DWM's CPU did not move either (27–35 % of a
+  core on both, sampled with `typeperf` through two more pairs). The cost sits in a copy engine, not on a CPU.
+- **What it buys.** On the RTX 5090 the frame is where NVENC reads it. Copying it into the encoder's pool takes
+  0.27 ms, and the readback (3.7 ms on the Radeon device), the CPU's BGRA → NV12 conversion and NVENC's own upload
+  (1.8–2.6 ms at this size, §9's NVENC row) all go.
+- **The readback is not what to compare against on its own.** Reading back on the RTX 5090 is slower (5.8 ms)
+  than on the Radeon, because the frame first crossed to it. That is the path P3 removes, not the one it takes.
+- **Not covered.** An idle dGPU in P8; under an encode its clocks rise, which can only shorten the copy. A 60 Hz
+  source; a 120 or 144 fps cell (FR-119) reads the p95 again. One hybrid laptop: a MUX in dGPU mode puts the panel
+  on the encoder's adapter, and then there is nothing to cross.
+
+**Decision 1 resolved:** P3 gives WGC's device the encoder's adapter. The AMF route is not needed on this host.
 
 ## 10. Related
 
