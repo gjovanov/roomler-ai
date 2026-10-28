@@ -1306,6 +1306,16 @@ jobs:
       - name: cargo check the desktop companion
         run: cargo check -p roomler-desktop
 
+      # FR-129 B1 — the setup wizard installs the daemon on macOS now (the
+      # `osascript` half, `agents/roomler-setup/src/unix_daemon.rs`), and its
+      # macOS arms compiled NOWHERE before a `setup-v*` tag: release-setup.yml
+      # is the wizard's only macOS build, and it runs after the agent release
+      # it follows (FR-84 S1), so a macOS-only error there would leave
+      # `/api/setup/macos` serving the previous wizard. Check only, `--bins` for
+      # main.rs's window guard.
+      - name: cargo check the setup wizard (the macOS daemon install)
+        run: cargo check -p roomler-setup --lib --bins
+
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
         # someone's Mac, with launchctl's famously unhelpful diagnostics.
