@@ -240,7 +240,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
-| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1744` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1793` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1515`, `peer.rs:1557`, `peer.rs:1483` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
@@ -258,7 +258,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | Server | Agent | Result |
 |---|---|---|
-| Older (no field) | New | Absent reads **off** (`signaling.rs:3424`, `serde(default)`) |
+| Older (no field) | New | Absent reads **off** (`signaling.rs:3449`, `serde(default)`) |
 | New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
 | Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
 
@@ -270,20 +270,53 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 The loopback relay the Hub appends is the viewer's OWN device's: a TURN server its agent hosts on loopback and on its
 overlay address. The viewer learns of it one of two ways, chosen per connect by `localRelayPlan`
-(`ui/src/composables/useRemoteControl.ts:3849`):
+(`ui/src/composables/useRemoteControl.ts:3956`):
 
 | | how | needs |
 |---|---|---|
-| **named** (FR-121) | Settings → "This browser runs on" names one of the person's own devices that advertise `local-relay`; the request carries `local_relay_from`, and the Hub answers on `rc:session.created` with the relay it holds from that device's `rc:agent.local_relay` report, which the viewer adds with `setConfiguration` before its offer | nothing from the browser: no request to 127.0.0.1 |
-| **probed** (before FR-121) | while no device is named, `fetch http://127.0.0.1:47989/rc-local-turn` (and the fallback band); a descriptor that names one of the person's own devices fills the choice in, so the next connect is named (someone else's device keeps the probe: its relay would be refused as `not_your_device`) | Chrome's per-origin local-network permission, which a managed browser may forbid |
+| **named** (FR-121) | Settings → "This browser runs on" names the person's own devices that advertise `local-relay`, one or more; the request carries `local_relay_from` (and `local_relay_from_also` for the rest), and the Hub answers on `rc:session.created` with the relay it holds from each device's `rc:agent.local_relay` report (`local_relay`, then `local_relay_also`), which the viewer adds with `setConfiguration` before its offer | nothing from the browser: no request to 127.0.0.1 |
+| **probed** (before FR-121) | while no device is named, `fetch http://127.0.0.1:<port>/rc-local-turn` on every port of the band at once (`probeLocalRelays`, `ui/src/composables/useRemoteControl.ts:3832`); every descriptor that names one of the person's own devices fills the choice in, so the next connect is named (someone else's device keeps the probe: its relay would be refused as `not_your_device`) | Chrome's per-origin local-network permission, which a managed browser may forbid |
+
+```mermaid
+flowchart TD
+    C["connect, relay assist on"] --> T{"This browser runs on"}
+    T -- "None of my devices" --> N["no local relay"]
+    T -- "Not set" --> P["probe every port at once"]
+    T -- "my devices" --> F["name them: local_relay_from, then _also"]
+    P --> O{"any of my own devices answered?"}
+    O -- yes --> PR["pair with every one of them"]
+    O -- no --> K["probe again next time"]
+    PR --> D["send what answered: local_relay, then _also"]
+    K --> D
+    F --> H["the Hub resolves each device on its own"]
+    D --> X["the target gets turn:overlay of each relay"]
+    H --> X
+```
 
 Chrome gates only the second. A public page's WebRTC reaches a TURN server on 127.0.0.1 without the permission
 (FR-121 P0, measured on Chrome 155). The Hub hands a named device's relay over only to its owner, for a target in the
 same organization whose `rc_overlay` is on, and otherwise answers `local_relay_refused`: `not_your_device`,
 `other_network`, `device_offline`, `rc_overlay_off` or `same_device` (`resolve_local_relay`,
-`crates/modules/fleet/src/hub.rs:3329`). The report lives in the Hub's memory with the agent's connection
-(`set_agent_local_relay`, `:3310`) and is never stored. ⚠️ It carries a live credential, minted by the device and
-re-minted every 30 minutes, so nothing logs it.
+`crates/modules/fleet/src/hub.rs:3386`). The report lives in the Hub's memory with the agent's connection
+(`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3367`) and is never stored. ⚠️ It carries a live
+credential, minted by the device and re-minted every 30 minutes, so nothing logs it.
+
+**More than one agent on one computer (FR-121 P3b, #2774).** Windows and WSL under mirrored networking share
+loopback, each agent with its own relay on its own probe port, and their overlay paths to a target can differ
+completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP, and a relay reached over
+DERP carries no media. So the viewer takes every answer, not the first: it names every own device, the Hub resolves
+each on its own (`named_devices`, `crates/modules/fleet/src/hub.rs:125`) and hands the target every `turn:` with the
+offer (`:2275`), at most `LOCAL_RELAYS_MAX` (4), and ICE keeps the path that works. A refusal is told only when no named
+device got a relay, and then it is the first one's.
+
+> ⚠️ Chrome ranks its relay candidates by the order of its TURN servers, so among relays that all work, the first in
+> port order wins, not the fastest. Port order is the agents' start order. Whether a slow relay can win that way is
+> FR-121's open decision 4, measured by its AC9.
+
+A browser paired with one device before P3b holds whichever agent answered first. On its next connect it looks once
+more for the others, but only where Chrome says the loopback permission is already granted (`loopback-network`, or
+`local-network-access` before Chrome split it), so the look never costs a prompt (`loopbackProbeIsSilent`,
+`ui/src/composables/useRemoteControl.ts:4000`).
 
 ## 5. Capture & encode pipeline
 
@@ -562,7 +595,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5499`](../agents/roomlerd/src/peer.rs#L5499); the viewer parses it
 at [`useRemoteControl.ts:1620`](../ui/src/composables/useRemoteControl.ts#L1620)
 and puts it on the toggle's title
-([`RemoteControl.vue:3671`](../ui/src/views/remote/RemoteControl.vue#L3671)).
+([`RemoteControl.vue:3679`](../ui/src/views/remote/RemoteControl.vue#L3679)).
 
 | `code` | Means |
 |---|---|
@@ -1045,7 +1078,7 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12020`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12210`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
@@ -1088,7 +1121,7 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14200`, pure)
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14390`, pure)
 and carried out by `applyKeyRoute` (`:14269`): a key whose target is the soft
 keyboard's textarea (`isSoftKeyboardTarget`, `:14010` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
@@ -1156,21 +1189,21 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3390`), registered at mount (`:5618`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:11766`), registered later by
+(`RemoteControl.vue:3398`), registered at mount (`:5630`), and the deferred
+Ctrl+V's `onPaste` (`useRemoteControl.ts:11956`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:14409`) returns nothing for a paste already consumed,
+(`useRemoteControl.ts:14599`) returns nothing for a paste already consumed,
 and `routeDeferredPaste` (`:14362`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
 upload (`:11778`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
-into the drawer's directory as well (`RemoteControl.vue:5558`).
+into the drawer's directory as well (`RemoteControl.vue:5570`).
 
 ```mermaid
 flowchart TD
@@ -1504,7 +1537,7 @@ live viewer to the consent page, and the device hung its session up.
 
 The mapping is `ConsentMode::asks`
 ([`models.rs:1535`](../crates/remote_control/src/models.rs#L1535)), sent at
-[`hub.rs:1868`](../crates/modules/fleet/src/hub.rs#L1868). A duplicate request
+[`hub.rs:1918`](../crates/modules/fleet/src/hub.rs#L1918). A duplicate request
 coalesced onto a live session gets the same value (`:1571`).
 
 The viewer words two things for the person actually asked:
@@ -1867,7 +1900,7 @@ session goes without it, with a reason:
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
   on 0.4.132 (FR-101 AC4).
-- The hub decides in [`feature_grant`, `hub.rs:527`](../crates/modules/fleet/src/hub.rs#L527). The
+- The hub decides in [`feature_grant`, `hub.rs:571`](../crates/modules/fleet/src/hub.rs#L571). The
   viewer reads `features_refused` into words naming whose decision it was
   ([`useSessionFeatures.ts:53`](../ui/src/composables/useSessionFeatures.ts#L53)). A reason it does
   not know still greys the control, so a newer server's refusal is never ignored.
@@ -1973,7 +2006,7 @@ machine is a new identity until a person says otherwise.
 **The other direction: the device judges the browser (P1c).** The daemon judges the browser behind every in-org
 offer as it notes it ([`judge_offer`, `peer_auth.rs:220`](../agents/roomlerd/src/peer_auth.rs#L220)),
 and the hub records the verdict on the session's `session_started` audit row
-([`forward_answer`, `hub.rs:2204`](../crates/modules/fleet/src/hub.rs#L2204)). Nothing is refused
+([`forward_answer`, `hub.rs:2255`](../crates/modules/fleet/src/hub.rs#L2255)). Nothing is refused
 before FR-100 P3; the record is what the fleet's audit week is counted over.
 
 | Verdict | Means | The device |
@@ -2210,9 +2243,9 @@ sequenceDiagram
 | Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13480`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13458`). An offer with no `m=video` is answered without the track |
 | Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4082`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13489`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
-| Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:597`), on both ends' `rc:terminate` and in the `session_ended` audit row |
+| Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:641`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:318`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:756`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:410`, #2326) |
-| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4816`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
+| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4897`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
 arrives, so the person at the device approved a session that then cannot start.
@@ -2356,7 +2389,7 @@ flowchart LR
 | `session_created` | **one server hop**: the request reached a live hub | `rc:session.created` | `remote_audit` `consent_prompted` | ✅ |
 | `ready` | a human, on a Prompt-mode device | `rc:ready` | `remote_audit` `consent_granted` | ✅ |
 | `offer_sent` | the browser building its offer | after `setLocalDescription` | — | ✅ |
-| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:1832`, `crates/remote_control/src/audit.rs:152`) | ✅ |
+| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:1882`, `crates/remote_control/src/audit.rs:152`) | ✅ |
 | `pc_connected` | ICE + DTLS | `RTCPeerConnection` `connected` | — | ✅ |
 | `dc_open` | SCTP — the `video-bytes` DataChannel | DC `open` | — | ✅ |
 | `first_frame` | the decode worker's first output frame | worker `first-frame` | — | ✅ |
@@ -2371,7 +2404,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8704`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8882`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2412,7 +2445,7 @@ sequenceDiagram
     participant R as Redis presence
     participant O as Owner pod
     V->>P: rc:session.request
-    P->>P: Hub::create_session (hub.rs:699)
+    P->>P: Hub::create_session (hub.rs:743)
     alt the agent is registered on this pod
         P-->>V: rc:session.created
     else AgentOffline here
@@ -2474,7 +2507,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4550`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4747`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -2507,7 +2540,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4208`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4405`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
 
@@ -3129,10 +3162,10 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:12428`](../ui/src/composables/useRemoteControl.ts#L12428),
-  `createUploadQueue` at `useRemoteControl.ts:14441`). The transfer shows
+  ([`useRemoteControl.ts:12618`](../ui/src/composables/useRemoteControl.ts#L12618),
+  `createUploadQueue` at `useRemoteControl.ts:14631`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:12678`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:12868`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
@@ -3141,10 +3174,10 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:14476`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:14666`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:14499`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:14689`), not "Uploaded".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in

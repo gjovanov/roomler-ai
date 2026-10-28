@@ -132,9 +132,19 @@ import {
   parseLocalRelayDescriptor,
   localRelayIceServer,
   localRelayPlan,
-  withLocalRelay,
-  readStoredThisDevice,
-  deviceToPairFromProbe,
+  withLocalRelays,
+  parseStoredThisDevices,
+  readStoredThisDevices,
+  persistThisDevices,
+  devicesToPairFromProbe,
+  distinctLocalRelays,
+  probeLocalRelays,
+  handedLocalRelays,
+  localRelayRequestFields,
+  loopbackProbeIsSilent,
+  thisDevicesFromPick,
+  type LocalRelayDescriptor,
+  LOCAL_RELAYS_MAX,
   LOCAL_RELAY_PROBE_PORT,
   LOCAL_RELAY_PROBE_PORTS,
   clipboardBridgeUrl,
@@ -4648,73 +4658,276 @@ describe('parseLocalRelayDescriptor (Phase 2 loopback-TURN corp-relay)', () => {
   })
 })
 
-describe('FR-121 — the relay of the device this browser runs on', () => {
+describe('FR-121 — the relays of the devices this browser runs on', () => {
   const target = '507f1f77bcf86cd799439099'
   const mine = '507f1f77bcf86cd799439012'
-  const plan = (thisDevice: string | null, enabled = true, external = false) =>
-    localRelayPlan({ enabled, external, thisDevice, target })
+  // FR-121 P3b (#2774) — the field case: the same computer's WSL agent.
+  const wsl = '507f1f77bcf86cd799439013'
+  const theirs = '507f1f77bcf86cd799439077'
+  const relay = (turn_port: number, agent_id?: string): LocalRelayDescriptor => ({
+    turn_port,
+    overlay_ip: `100.64.0.${turn_port - 47980}`,
+    username: '1700000600:uid',
+    credential: 'abc',
+    ...(agent_id ? { agent_id } : {}),
+  })
+  const plan = (
+    thisDevices: string[] | 'none' | null,
+    enabled = true,
+    external = false,
+  ) => localRelayPlan({ enabled, external, thisDevices, target })
 
-  it('names a known device instead of probing, and probes only while none is known', () => {
-    expect(plan(mine)).toEqual({ kind: 'from', device: mine })
+  it('names the known devices instead of probing, and probes only while none is known', () => {
+    expect(plan([mine])).toEqual({ kind: 'from', devices: [mine] })
+    expect(plan([mine, wsl])).toEqual({ kind: 'from', devices: [mine, wsl] })
     expect(plan(null)).toEqual({ kind: 'probe' })
   })
 
   it('does neither when switched off, external, none of my devices, or viewing itself', () => {
-    expect(plan(mine, false)).toEqual({ kind: 'none' })
+    expect(plan([mine], false)).toEqual({ kind: 'none' })
     expect(plan(null, false)).toEqual({ kind: 'none' })
-    expect(plan(mine, true, true)).toEqual({ kind: 'none' })
+    expect(plan([mine], true, true)).toEqual({ kind: 'none' })
     expect(plan('none')).toEqual({ kind: 'none' })
-    expect(plan(target)).toEqual({ kind: 'none' })
+    expect(plan([target])).toEqual({ kind: 'none' })
   })
 
-  it('adds the handed-over relay first and keeps every other setting', () => {
+  it('P3b — leaves the device being viewed out, and still names the others', () => {
+    expect(plan([target, wsl])).toEqual({ kind: 'from', devices: [wsl] })
+  })
+
+  it('adds the handed-over relays first, in order, and keeps every other setting', () => {
     const cfg: RTCConfiguration = {
       iceServers: [{ urls: ['stun:stun.example:3478'] }],
       bundlePolicy: 'max-bundle',
     }
-    const out = withLocalRelay(cfg, {
-      turn_port: 47990,
-      overlay_ip: '100.64.0.5',
-      username: '1700000600:uid',
-      credential: 'abc',
-    })
+    const out = withLocalRelays(cfg, [relay(47990), relay(47991)])
     expect(out.bundlePolicy).toBe('max-bundle')
+    expect(out.iceServers?.map((s) => s.urls)).toEqual([
+      ['turn:127.0.0.1:47990'],
+      ['turn:127.0.0.1:47991'],
+      ['stun:stun.example:3478'],
+    ])
     expect(out.iceServers?.[0]).toEqual({
       urls: ['turn:127.0.0.1:47990'],
       username: '1700000600:uid',
       credential: 'abc',
     })
-    expect(out.iceServers?.[1]).toEqual({ urls: ['stun:stun.example:3478'] })
     expect(cfg.iceServers).toHaveLength(1)
   })
 
-  it('a probe pairs an unanswered browser with its own device only', () => {
-    const owns = (id: string) => id === mine
-    expect(deviceToPairFromProbe(mine, null, owns)).toBe(mine)
+  it('a probe pairs an unanswered browser with every own device it found, in probe order', () => {
+    const owns = (id: string) => id === mine || id === wsl
+    const pair = (probed: LocalRelayDescriptor[], thisDevices: string[] | 'none' | null = null) =>
+      devicesToPairFromProbe({ thisDevices, legacy: false, probed, ownsDevice: owns })
+    // P3b — both agents of this computer, not the first to answer
+    expect(pair([relay(47989, wsl), relay(47990, mine)])).toEqual([wsl, mine])
+    // someone else's beside mine: only mine
+    expect(pair([relay(47989, theirs), relay(47990, mine)])).toEqual([mine])
     // someone else's machine: keep probing instead of a refusal forever
-    expect(deviceToPairFromProbe(target, null, owns)).toBeNull()
-    // already answered (a device, or none): a probe never overrides it
-    expect(deviceToPairFromProbe(mine, target, owns)).toBeNull()
-    expect(deviceToPairFromProbe(mine, 'none', owns)).toBeNull()
+    expect(pair([relay(47989, theirs)])).toBeNull()
+    // already answered (devices, or none): a probe never overrides it
+    expect(pair([relay(47989, wsl)], [mine])).toBeNull()
+    expect(pair([relay(47989, mine)], 'none')).toBeNull()
     // an old agent's descriptor names no device; no ownership oracle, no pair
-    expect(deviceToPairFromProbe(undefined, null, owns)).toBeNull()
-    expect(deviceToPairFromProbe(mine, null, undefined)).toBeNull()
+    expect(pair([relay(47989)])).toBeNull()
+    expect(
+      devicesToPairFromProbe({
+        thisDevices: null,
+        legacy: false,
+        probed: [relay(47989, mine)],
+        ownsDevice: undefined,
+      }),
+    ).toBeNull()
   })
 
-  it('remembers only an agent id or none', () => {
-    const key = 'roomler-rc-this-device'
+  it('P3b — a device stored before P3b widens to every own device found, and keeps itself', () => {
+    const owns = (id: string) => id === mine || id === wsl
+    const repair = (probed: LocalRelayDescriptor[]) =>
+      devicesToPairFromProbe({ thisDevices: [wsl], legacy: true, probed, ownsDevice: owns })
+    // the field case: paired with the WSL agent; the Windows one answers first
+    expect(repair([relay(47989, mine), relay(47990, wsl)])).toEqual([mine, wsl])
+    // its own agent restarting right now: still paired with it
+    expect(repair([relay(47989, mine)])).toEqual([mine, wsl])
+    // nothing of the person's own answered: left as it is
+    expect(repair([relay(47989, theirs)])).toBeNull()
+    expect(repair([])).toBeNull()
+  })
+
+  it('reads the list, or else the one device stored before P3b (marked legacy)', () => {
+    expect(parseStoredThisDevices(null, null)).toEqual({ devices: null, legacy: false })
+    expect(parseStoredThisDevices(null, mine)).toEqual({ devices: [mine], legacy: true })
+    expect(parseStoredThisDevices(null, 'none')).toEqual({ devices: 'none', legacy: false })
+    expect(parseStoredThisDevices(null, 'something else')).toEqual({
+      devices: null,
+      legacy: false,
+    })
+    expect(parseStoredThisDevices(`${mine},${wsl}`, mine)).toEqual({
+      devices: [mine, wsl],
+      legacy: false,
+    })
+    expect(parseStoredThisDevices('none', mine)).toEqual({ devices: 'none', legacy: false })
+    // each id once, nothing that is not one, at most LOCAL_RELAYS_MAX
+    expect(parseStoredThisDevices(`${mine},${mine},evil,${wsl}`, null).devices).toEqual([
+      mine,
+      wsl,
+    ])
+    const many = Array.from({ length: 6 }, (_, i) => `507f1f77bcf86cd79943901${i}`)
+    expect(parseStoredThisDevices(many.join(','), null).devices).toEqual(
+      many.slice(0, LOCAL_RELAYS_MAX),
+    )
+    // a list that holds nothing usable falls back to the single key
+    expect(parseStoredThisDevices('garbage', mine)).toEqual({ devices: [mine], legacy: true })
+  })
+
+  it('stores the list, and the first device where an older bundle reads it', () => {
+    const list = 'roomler-rc-this-devices'
+    const single = 'roomler-rc-this-device'
     try {
-      localStorage.removeItem(key)
-      expect(readStoredThisDevice()).toBeNull()
-      localStorage.setItem(key, mine)
-      expect(readStoredThisDevice()).toBe(mine)
-      localStorage.setItem(key, 'none')
-      expect(readStoredThisDevice()).toBe('none')
-      localStorage.setItem(key, 'something else')
-      expect(readStoredThisDevice()).toBeNull()
+      persistThisDevices([mine, wsl])
+      expect(localStorage.getItem(list)).toBe(`${mine},${wsl}`)
+      expect(localStorage.getItem(single)).toBe(mine)
+      expect(readStoredThisDevices()).toEqual({ devices: [mine, wsl], legacy: false })
+      persistThisDevices('none')
+      expect([localStorage.getItem(list), localStorage.getItem(single)]).toEqual([
+        'none',
+        'none',
+      ])
+      persistThisDevices([])
+      expect([localStorage.getItem(list), localStorage.getItem(single)]).toEqual([null, null])
+      expect(readStoredThisDevices()).toEqual({ devices: null, legacy: false })
+      // what a browser paired before P3b holds
+      localStorage.setItem(single, wsl)
+      expect(readStoredThisDevices()).toEqual({ devices: [wsl], legacy: true })
     } finally {
-      localStorage.removeItem(key)
+      localStorage.removeItem(list)
+      localStorage.removeItem(single)
     }
+  })
+
+  it('P3b — the picker: not set or none just picked wins, else the devices picked', () => {
+    expect(thisDevicesFromPick([], [mine])).toEqual([mine])
+    expect(thisDevicesFromPick([mine], [mine, wsl])).toEqual([mine, wsl])
+    expect(thisDevicesFromPick([mine, wsl], [wsl])).toEqual([wsl])
+    expect(thisDevicesFromPick([mine], [])).toBeNull()
+    expect(thisDevicesFromPick(['none'], ['none', mine])).toEqual([mine])
+    expect(thisDevicesFromPick([mine], [mine, 'none'])).toBe('none')
+    expect(thisDevicesFromPick([mine], [mine, ''])).toBeNull()
+  })
+})
+
+describe('FR-121 P3b (#2774) — every relay on this computer, not the first to answer', () => {
+  const relay = (turn_port: number, overlay_ip = '100.64.0.2'): LocalRelayDescriptor => ({
+    turn_port,
+    overlay_ip,
+    username: 'u',
+    credential: 'c',
+  })
+
+  it('keeps each relay once, in port order, at most LOCAL_RELAYS_MAX', () => {
+    expect(
+      distinctLocalRelays([
+        null,
+        relay(47989),
+        relay(47990, '100.64.0.33'),
+        relay(47989),
+        null,
+        relay(47991, '100.64.0.4'),
+        relay(47992, '100.64.0.5'),
+        relay(47993, '100.64.0.6'),
+      ]).map((d) => d.turn_port),
+    ).toEqual([47989, 47990, 47991, 47992])
+  })
+
+  it('probes every port at once and returns every answer in port order', async () => {
+    const asked: string[] = []
+    const answers: Record<number, LocalRelayDescriptor> = {
+      47990: { ...relay(47990, '100.64.0.33'), agent_id: '507f1f77bcf86cd799439013' },
+      47989: { ...relay(47989), agent_id: '507f1f77bcf86cd799439012' },
+    }
+    const pending: Array<() => void> = []
+    const fakeFetch = ((url: string) => {
+      asked.push(url)
+      const port = Number(new URL(url).port)
+      return new Promise((resolve, reject) => {
+        // Nothing answers until every port has been asked: a probe that
+        // waited for one port before the next would never finish here.
+        pending.push(() =>
+          answers[port]
+            ? resolve({ ok: true, json: async () => answers[port] })
+            : reject(new TypeError('connection refused')),
+        )
+        if (pending.length === LOCAL_RELAY_PROBE_PORTS.length) pending.forEach((go) => go())
+      })
+    }) as unknown as typeof fetch
+    const found = await probeLocalRelays(fakeFetch)
+    expect(asked).toHaveLength(LOCAL_RELAY_PROBE_PORTS.length)
+    expect(found.map((d) => [d.turn_port, d.agent_id])).toEqual([
+      [47989, '507f1f77bcf86cd799439012'],
+      [47990, '507f1f77bcf86cd799439013'],
+    ])
+  })
+
+  it('a probe with nothing on any port finds nothing', async () => {
+    const refuse = (() => Promise.reject(new TypeError('refused'))) as unknown as typeof fetch
+    expect(await probeLocalRelays(refuse)).toEqual([])
+  })
+
+  it('reads the handed-over relays: local_relay, then local_relay_also, untrusted', () => {
+    const a = relay(47989)
+    const b = relay(47990, '100.64.0.33')
+    expect(handedLocalRelays({ local_relay: a, local_relay_also: [b, { evil: 1 }] })).toEqual([
+      a,
+      b,
+    ])
+    expect(handedLocalRelays({ local_relay: a, local_relay_also: 'not a list' })).toEqual([a])
+    expect(handedLocalRelays({})).toEqual([])
+    // an older server sends the first alone
+    expect(handedLocalRelays({ local_relay: a })).toEqual([a])
+  })
+
+  it('asks with the first of each list where an older server reads it, the rest beside', () => {
+    const a = relay(47989)
+    const b = relay(47990, '100.64.0.33')
+    const [mine, wsl] = ['507f1f77bcf86cd799439012', '507f1f77bcf86cd799439013']
+    expect(localRelayRequestFields([a, b], [mine])).toEqual({
+      local_relay: a,
+      local_relay_also: [b],
+    })
+    expect(localRelayRequestFields([a], [])).toEqual({ local_relay: a })
+    expect(localRelayRequestFields([], [mine, wsl])).toEqual({
+      local_relay_from: mine,
+      local_relay_from_also: [wsl],
+    })
+    expect(localRelayRequestFields([], [mine])).toEqual({ local_relay_from: mine })
+    expect(localRelayRequestFields([], [])).toEqual({})
+  })
+
+  it('looks again only where the permission is already granted, and never guesses', async () => {
+    const answering =
+      (states: Record<string, PermissionState>) =>
+      (name: string): Promise<PermissionState> =>
+        name in states ? Promise.resolve(states[name]) : Promise.reject(new TypeError(name))
+    // Chrome 156, as measured: loopback has its own permission
+    expect(
+      await loopbackProbeIsSilent(
+        answering({ 'loopback-network': 'granted', 'local-network-access': 'granted' }),
+      ),
+    ).toBe(true)
+    // the loopback permission decides, not the older umbrella one
+    expect(
+      await loopbackProbeIsSilent(
+        answering({ 'loopback-network': 'prompt', 'local-network-access': 'granted' }),
+      ),
+    ).toBe(false)
+    // before the split
+    expect(await loopbackProbeIsSilent(answering({ 'local-network-access': 'granted' }))).toBe(
+      true,
+    )
+    expect(await loopbackProbeIsSilent(answering({ 'local-network-access': 'denied' }))).toBe(
+      false,
+    )
+    // a browser that knows neither name: no look
+    expect(await loopbackProbeIsSilent(answering({}))).toBe(false)
   })
 })
 

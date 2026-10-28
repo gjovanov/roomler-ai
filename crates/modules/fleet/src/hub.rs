@@ -35,8 +35,8 @@ use roomler_ai_remote_control::models::{
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
 use roomler_ai_remote_control::signaling::{
-    AgentCloseReason, ClientMsg, IceServer, LIMIT_NO_COMMON_CODEC, LocalRelayDescriptor,
-    LocalRelayRefusal, Role, ServerMsg,
+    AgentCloseReason, ClientMsg, IceServer, LIMIT_NO_COMMON_CODEC, LOCAL_RELAYS_MAX,
+    LocalRelayDescriptor, LocalRelayRefusal, Role, ServerMsg,
 };
 use roomler_ai_remote_control::turn_creds::{
     self, RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
@@ -79,16 +79,60 @@ fn is_overlay_relay_ip(ip: &str) -> bool {
 /// FR-121 — what `rc:session.created` tells a browser about its own device's
 /// relay: the descriptor when the request named the device and the session
 /// holds one, the refusal when it was refused, nothing when it did not ask.
+/// P3b (#2774) — with several named, the first relay held, the rest as
+/// `local_relay_also`, and the refusal only when none is held.
 fn local_relay_reply(
     answer: Option<std::result::Result<(), LocalRelayRefusal>>,
-    held: Option<LocalRelayDescriptor>,
-) -> (Option<LocalRelayDescriptor>, Option<String>) {
-    match (answer, held) {
-        (None, _) => (None, None),
-        (Some(_), Some(relay)) => (Some(relay), None),
-        (Some(Err(why)), None) => (None, Some(why.wire().to_string())),
-        (Some(Ok(())), None) => (None, None),
+    held: &[LocalRelayDescriptor],
+) -> (
+    Option<LocalRelayDescriptor>,
+    Vec<LocalRelayDescriptor>,
+    Option<String>,
+) {
+    match (answer, held.split_first()) {
+        (None, _) => (None, Vec::new(), None),
+        (Some(_), Some((first, rest))) => (Some(first.clone()), rest.to_vec(), None),
+        (Some(Err(why)), None) => (None, Vec::new(), Some(why.wire().to_string())),
+        (Some(Ok(())), None) => (None, Vec::new(), None),
     }
+}
+
+/// FR-121 P3b (#2774) — the relays one session keeps: the first of each
+/// `turn:` address, and at most [`LOCAL_RELAYS_MAX`]. Each one is another
+/// TURN allocation for the target's agent, and a probed list is whatever the
+/// browser sent.
+fn bounded_relays(
+    relays: impl IntoIterator<Item = LocalRelayDescriptor>,
+) -> Vec<LocalRelayDescriptor> {
+    let mut kept: Vec<LocalRelayDescriptor> = Vec::new();
+    for relay in relays {
+        if kept.len() == LOCAL_RELAYS_MAX {
+            break;
+        }
+        let seen = kept
+            .iter()
+            .any(|k| k.overlay_ip == relay.overlay_ip && k.turn_port == relay.turn_port);
+        if !seen {
+            kept.push(relay);
+        }
+    }
+    kept
+}
+
+/// FR-121 P3b (#2774) — the devices a request names, each once, in order, at
+/// most [`LOCAL_RELAYS_MAX`]: `local_relay_from`, then
+/// `local_relay_from_also`.
+fn named_devices(first: ObjectId, also: Vec<ObjectId>) -> Vec<ObjectId> {
+    let mut named = vec![first];
+    for device in also {
+        if named.len() == LOCAL_RELAYS_MAX {
+            break;
+        }
+        if !named.contains(&device) {
+            named.push(device);
+        }
+    }
+    named
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1404,7 +1448,7 @@ impl Hub {
             audio_enabled,
             consent_mode,
             override_reason,
-            local_relay,
+            local_relay.into_iter().collect(),
             false,
             input_mode,
             tenant_name,
@@ -1439,10 +1483,12 @@ impl Hub {
         audio_enabled: bool,
         consent_mode: ConsentMode,
         override_reason: Option<String>,
-        local_relay: Option<LocalRelayDescriptor>,
+        // FR-121 P3b (#2774) — every relay of the browser's computer, the
+        // first first; empty when it has none.
+        local_relays: Vec<LocalRelayDescriptor>,
         // #1882 — the device's `AccessPolicy.rc_overlay`, resolved by the
         // authz gate. Rides `ServerMsg::Request`, and gates whether
-        // `forward_offer` hands the agent `local_relay` at all.
+        // `forward_offer` hands the agent `local_relays` at all.
         rc_overlay: bool,
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         // Multi-org — display name of the requesting org, for the host's
@@ -1478,9 +1524,11 @@ impl Hub {
         // (a refusal, or a coalesced duplicate that returned another id).
         slot: Option<Lease>,
         // FR-121 — `Some` when the request named the browser's own device
-        // (`local_relay_from`): `Ok` when `local_relay` is that device's
+        // (`local_relay_from`): `Ok` when `local_relays` holds that device's
         // reported relay, `Err` with why not. `rc:session.created` echoes the
         // relay, or the refusal, to the browser; `None` sends neither.
+        // P3b (#2774) — with several named, `Ok` when any of them got one,
+        // and otherwise the first one's refusal.
         local_relay_answer: Option<std::result::Result<(), LocalRelayRefusal>>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
@@ -1554,7 +1602,7 @@ impl Hub {
                     s.features_refused.clone(),
                     s.idle_secs,
                     s.consent_mode,
-                    s.local_relay.clone(),
+                    s.local_relays.clone(),
                 )
             })
         });
@@ -1566,14 +1614,14 @@ impl Hub {
             existing_features_refused,
             existing_idle_secs,
             existing_consent_mode,
-            existing_local_relay,
+            existing_local_relays,
         )) = existing
         {
-            // FR-121 — a retry that named its device gets the relay the live
+            // FR-121 — a retry that named its device gets the relays the live
             // session holds (the first `rc:session.created` may be the one the
             // retry lost), or this request's refusal.
-            let (echo_relay, echo_refused) =
-                local_relay_reply(local_relay_answer, existing_local_relay);
+            let (echo_relay, echo_also, echo_refused) =
+                local_relay_reply(local_relay_answer, &existing_local_relays);
             info!(
                 "coalescing duplicate rc:session.request from controller {} to agent {} onto live \
                  session {} (same connection; no second consent prompt)",
@@ -1609,6 +1657,7 @@ impl Hub {
                 consent_asks: existing_consent_mode.asks(),
                 local_relay: echo_relay,
                 local_relay_refused: echo_refused,
+                local_relay_also: echo_also,
             });
             return Ok(existing_id);
         }
@@ -1799,8 +1848,9 @@ impl Hub {
         // relay it reaches over the overlay. Validated at use, not here.
         // FR-121 — and, when the request named the browser's device, the
         // same descriptor goes back to the browser on `rc:session.created`.
-        let (echo_relay, echo_refused) = local_relay_reply(local_relay_answer, local_relay.clone());
-        live.local_relay = local_relay;
+        let (echo_relay, echo_also, echo_refused) =
+            local_relay_reply(local_relay_answer, &local_relays);
+        live.local_relays = local_relays;
         live.rc_overlay = rc_overlay;
         // FR-27 — `deliver_consent` needs the mode to know whether a host-side
         // timeout ends the session or hands over to the owner's emailed link.
@@ -1868,6 +1918,7 @@ impl Hub {
             consent_asks: consent_mode.asks(),
             local_relay: echo_relay,
             local_relay_refused: echo_refused,
+            local_relay_also: echo_also,
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -2184,14 +2235,14 @@ impl Hub {
         // device signs its answer against. The hub never reads it.
         peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthOffer>,
     ) -> Result<()> {
-        let (agent_id, local_relay, rc_overlay, region, org) =
+        let (agent_id, local_relays, rc_overlay, region, org) =
             self.with_session(session_id, |s| {
                 // Also what stands the negotiating reaper down: once an offer
                 // exists, the ICE layer owns liveness.
                 s.admit_offer()?;
                 Ok((
                     s.agent_id,
-                    s.local_relay.clone(),
+                    s.local_relays.clone(),
                     s.rc_overlay,
                     s.relay_region.clone(),
                     s.tenant_id,
@@ -2215,7 +2266,13 @@ impl Hub {
         // The relay IS an overlay path (the agent reaches it over the mesh), so
         // with the device's `rc_overlay` off it would be a candidate the agent
         // only discards; withholding it here also covers agents too old to.
-        if let Some(lr) = local_relay {
+        //
+        // FR-121 P3b (#2774) — every relay of the browser's computer, in the
+        // request's order: two agents on one computer can reach the target by
+        // different paths (a WSL agent on DERP, the Windows one direct), and
+        // nothing here knows which. ICE does: each becomes a candidate pair, and
+        // the one that works is the one it keeps.
+        for lr in local_relays {
             if !rc_overlay {
                 info!(
                     session = %session_id.to_hex(),
@@ -3904,6 +3961,10 @@ impl Hub {
                     // FR-121 — or the browser's own device, whose reported
                     // relay this hub holds.
                     local_relay_from,
+                    // FR-121 P3b (#2774) — and the rest of each, when the
+                    // browser's computer runs more than one agent.
+                    local_relay_also,
+                    local_relay_from_also,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -3919,23 +3980,43 @@ impl Hub {
                 let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;
                 // FR-121 — a probed descriptor is the browser's own evidence
                 // and wins; otherwise the device it named, resolved here.
-                let (local_relay, local_relay_answer) = match (local_relay, local_relay_from) {
-                    (Some(probed), _) => (Some(probed), None),
+                // P3b (#2774) — every one of each: each named device is
+                // resolved on its own, and the answer is `Ok` when any of them
+                // got a relay, else the first one's refusal.
+                let (local_relays, local_relay_answer) = match (local_relay, local_relay_from) {
+                    (Some(probed), _) => (
+                        bounded_relays(std::iter::once(probed).chain(local_relay_also)),
+                        None,
+                    ),
                     (None, Some(from)) => {
-                        match self.resolve_local_relay(from, agent_id, user_id, ctx.rc_overlay) {
-                            Ok(relay) => (Some(relay), Some(Ok(()))),
-                            Err(why) => {
-                                info!(
-                                    agent = %agent_id.to_hex(),
-                                    from = %from.to_hex(),
-                                    reason = why.wire(),
-                                    "loopback-TURN: the browser's own device's relay not handed out"
-                                );
-                                (None, Some(Err(why)))
+                        let mut relays = Vec::new();
+                        let mut first_refusal = None;
+                        for device in named_devices(from, local_relay_from_also) {
+                            match self.resolve_local_relay(
+                                device,
+                                agent_id,
+                                user_id,
+                                ctx.rc_overlay,
+                            ) {
+                                Ok(relay) => relays.push(relay),
+                                Err(why) => {
+                                    info!(
+                                        agent = %agent_id.to_hex(),
+                                        from = %device.to_hex(),
+                                        reason = why.wire(),
+                                        "loopback-TURN: the browser's own device's relay not handed out"
+                                    );
+                                    first_refusal.get_or_insert(why);
+                                }
                             }
                         }
+                        let answer = match first_refusal {
+                            Some(why) if relays.is_empty() => Err(why),
+                            _ => Ok(()),
+                        };
+                        (bounded_relays(relays), Some(answer))
                     }
-                    (None, None) => (None, None),
+                    (None, None) => (Vec::new(), None),
                 };
                 self.create_session_full(
                     agent_id,
@@ -3950,7 +4031,7 @@ impl Hub {
                     audio_enabled,
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
-                    local_relay,
+                    local_relays,
                     ctx.rc_overlay,
                     ctx.input_mode,
                     ctx.tenant_name.clone(),
@@ -4290,7 +4371,7 @@ mod tests {
             false,
             ConsentMode::Prompt,
             None,
-            None,
+            Vec::new(),
             false, // rc_overlay
             None,
             None,
@@ -4681,7 +4762,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
+                Vec::new(),
                 false,
                 None,
                 None,
@@ -4761,7 +4842,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
+                Vec::new(),
                 false,
                 None,
                 None,
@@ -5411,7 +5492,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
+                Vec::new(),
                 false, // rc_overlay
                 None,
                 None,
@@ -5520,7 +5601,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
+                Vec::new(),
                 false, // rc_overlay
                 None,
                 None,
@@ -5595,7 +5676,7 @@ mod tests {
                     false,
                     mode,
                     None,
-                    None,
+                    Vec::new(),
                     false, // rc_overlay
                     None,
                     None,
@@ -5764,7 +5845,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 override_reason.map(str::to_string),
-                None,
+                Vec::new(),
                 false, // rc_overlay
                 None,
                 None,
@@ -6107,7 +6188,7 @@ mod tests {
                 true, // audio_enabled
                 ConsentMode::Prompt,
                 None,
-                None,
+                Vec::new(),
                 false, // rc_overlay
                 None,
                 None,
@@ -6187,7 +6268,7 @@ mod tests {
             true,
             ConsentMode::Prompt,
             None,
-            None,
+            Vec::new(),
             false,
             None,
             None,
@@ -6630,7 +6711,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
+                Vec::new(),
                 false,
                 None,
                 None,
@@ -6842,13 +6923,13 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                Some(LocalRelayDescriptor {
+                vec![LocalRelayDescriptor {
                     turn_port: 47989,
                     overlay_ip: overlay_ip.into(),
                     username: "1700000600:uid".into(),
                     credential: "abcd1234".into(),
                     agent_id: None,
-                }),
+                }],
                 rc_overlay,
                 None,
                 None, // tenant_name
@@ -7068,6 +7149,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: Some(from),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: Vec::new(),
         };
 
         hub.dispatch(&ctx_for(Role::Controller, Some(me), None), request(mine))
@@ -7118,6 +7201,276 @@ mod tests {
             }
             other => panic!("expected rc:session.created, got {other:?}"),
         }
+    }
+
+    fn relay_at(overlay_ip: &str, port: u16) -> LocalRelayDescriptor {
+        LocalRelayDescriptor {
+            overlay_ip: overlay_ip.into(),
+            ..reported_relay(port)
+        }
+    }
+
+    /// The `turn:` URLs the target's agent was handed with its offer.
+    fn offered_turn_urls(agent_rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<String> {
+        let mut turn_urls = Vec::new();
+        while let Ok(msg) = agent_rx.try_recv() {
+            if let ServerMsg::SdpOffer { ice_servers, .. } = msg {
+                turn_urls.extend(
+                    ice_servers
+                        .iter()
+                        .flat_map(|s| s.urls.iter().cloned())
+                        .filter(|u| u.starts_with("turn:")),
+                );
+            }
+        }
+        turn_urls
+    }
+
+    /// FR-121 P3b (#2774) — a browser on a computer that runs two agents (the
+    /// field case: Windows and WSL) names both. Each is resolved on its own,
+    /// the browser gets every relay back (the first as `local_relay`, the rest
+    /// as `local_relay_also`), the target's agent gets every `turn:` with its
+    /// offer, in order, and a duplicate or an offline device costs nothing.
+    /// A retry on the same connection gets the same relays.
+    #[tokio::test]
+    async fn every_named_device_s_relay_reaches_the_browser_and_the_target() {
+        let hub = test_hub().await;
+        let (org, me, colleague) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (target, windows, wsl, gone) = (
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        );
+        let (_a, _c, mut agent_rx) =
+            hub.register_agent(target, org, colleague, OsKind::Linux, 3, false, false);
+        let _w = hub.register_agent(windows, org, me, OsKind::Windows, 3, false, false);
+        let _l = hub.register_agent(wsl, org, me, OsKind::Linux, 3, false, false);
+        hub.set_agent_local_relay(windows, Some(relay_at("100.64.0.2", 47989)));
+        hub.set_agent_local_relay(wsl, Some(relay_at("100.64.0.33", 47990)));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(me),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: true,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let request = || ClientMsg::SessionRequest {
+            agent_id: target,
+            permissions: Permissions::default(),
+            browser_caps: Vec::new(),
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: Some(windows),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: vec![wsl, windows, gone],
+        };
+        let created = |msg: ServerMsg| match msg {
+            ServerMsg::SessionCreated {
+                session_id,
+                local_relay,
+                local_relay_also,
+                local_relay_refused,
+                ..
+            } => (
+                session_id,
+                local_relay.map(|r| r.turn_port),
+                local_relay_also
+                    .iter()
+                    .map(|r| r.turn_port)
+                    .collect::<Vec<_>>(),
+                local_relay_refused,
+            ),
+            other => panic!("expected rc:session.created, got {other:?}"),
+        };
+
+        hub.dispatch(&ctx, request()).unwrap();
+        let (sid, first, also, refused) = created(ctl_rx.try_recv().expect("created"));
+        assert_eq!(first, Some(47989), "the first named device's relay");
+        assert_eq!(also, vec![47990], "then the other one, once");
+        assert_eq!(refused, None, "an offline extra is no refusal");
+
+        // A retry on the same connection is coalesced onto the live session
+        // and told the same relays.
+        hub.dispatch(&ctx, request()).unwrap();
+        let (again, first, also, refused) = created(ctl_rx.try_recv().expect("coalesced"));
+        assert_eq!(again, sid);
+        assert_eq!((first, also, refused), (Some(47989), vec![47990], None));
+
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        assert_eq!(
+            offered_turn_urls(&mut agent_rx),
+            vec![
+                "turn:100.64.0.2:47989".to_string(),
+                "turn:100.64.0.33:47990".to_string(),
+            ],
+            "the target gets every relay, in the request's order"
+        );
+    }
+
+    /// FR-121 P3b (#2774) — with several named, a refusal is told only when
+    /// none of them got a relay, and it is the first one's: one device of
+    /// someone else's (or offline) beside one of the requester's own still
+    /// hands over the own one.
+    #[tokio::test]
+    async fn a_refusal_is_told_only_when_no_named_device_got_a_relay() {
+        let hub = test_hub().await;
+        let (org, me, colleague) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (target, mine, theirs, gone) = (
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        );
+        let _t = hub.register_agent(target, org, colleague, OsKind::Linux, 3, false, false);
+        let _m = hub.register_agent(mine, org, me, OsKind::Linux, 3, false, false);
+        let _o = hub.register_agent(theirs, org, colleague, OsKind::Linux, 3, false, false);
+        hub.set_agent_local_relay(mine, Some(relay_at("100.64.0.2", 47989)));
+        hub.set_agent_local_relay(theirs, Some(relay_at("100.64.0.3", 47990)));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(me),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: true,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let request = |from: ObjectId, also: Vec<ObjectId>| ClientMsg::SessionRequest {
+            agent_id: target,
+            permissions: Permissions::default(),
+            browser_caps: Vec::new(),
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: Some(from),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: also,
+        };
+        let answer = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| match ctl_rx.try_recv() {
+            Ok(ServerMsg::SessionCreated {
+                session_id,
+                local_relay,
+                local_relay_also,
+                local_relay_refused,
+                ..
+            }) => (
+                session_id,
+                local_relay.map(|r| r.turn_port),
+                local_relay_also.len(),
+                local_relay_refused,
+            ),
+            other => panic!("expected rc:session.created, got {other:?}"),
+        };
+
+        // Someone else's first, then mine: mine is handed over, no refusal.
+        hub.dispatch(&ctx, request(theirs, vec![mine])).unwrap();
+        let (sid, first, also, refused) = answer(&mut ctl_rx);
+        assert_eq!((first, also, refused), (Some(47989), 0, None));
+        hub.terminate(sid, EndReason::ControllerHangup).ok();
+        while ctl_rx.try_recv().is_ok() {}
+
+        // Nothing handed over: the first one's reason, not the last one's.
+        hub.dispatch(&ctx, request(gone, vec![theirs])).unwrap();
+        let (_, first, also, refused) = answer(&mut ctl_rx);
+        assert_eq!(
+            (first, also, refused.as_deref()),
+            (None, 0, Some("device_offline"))
+        );
+    }
+
+    /// FR-121 P3b (#2774) — a probed list is whatever the browser sent, so the
+    /// hub keeps one relay per `turn:` address and at most
+    /// `LOCAL_RELAYS_MAX` of them, in order; the named list stops at the same
+    /// number. Each is one more TURN allocation for the target's agent.
+    #[test]
+    fn a_session_carries_at_most_local_relays_max_relays_each_once() {
+        let probed: Vec<LocalRelayDescriptor> = [
+            ("100.64.0.2", 47989),
+            ("100.64.0.33", 47990),
+            ("100.64.0.2", 47989),
+            ("100.64.0.4", 47991),
+            ("100.64.0.5", 47992),
+            ("100.64.0.6", 47993),
+        ]
+        .iter()
+        .map(|&(ip, port)| relay_at(ip, port))
+        .collect();
+        let kept: Vec<(String, u16)> = bounded_relays(probed)
+            .into_iter()
+            .map(|r| (r.overlay_ip, r.turn_port))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("100.64.0.2".to_string(), 47989),
+                ("100.64.0.33".to_string(), 47990),
+                ("100.64.0.4".to_string(), 47991),
+                ("100.64.0.5".to_string(), 47992),
+            ]
+        );
+
+        let ids: Vec<ObjectId> = (0..6).map(|_| ObjectId::new()).collect();
+        let named = named_devices(ids[0], vec![ids[1], ids[0], ids[2], ids[3], ids[4], ids[5]]);
+        assert_eq!(named, ids[..4].to_vec(), "each once, the first four");
+    }
+
+    /// FR-121 P3b (#2774) — what `rc:session.created` says: nothing when the
+    /// request named no device, the first relay held and the rest beside it,
+    /// and the refusal only when none is held.
+    #[test]
+    fn local_relay_reply_tells_the_first_relay_the_rest_and_a_refusal_only_alone() {
+        let (a, b) = (
+            relay_at("100.64.0.2", 47989),
+            relay_at("100.64.0.33", 47990),
+        );
+        let held = [a.clone(), b.clone()];
+        assert_eq!(local_relay_reply(None, &held), (None, vec![], None));
+        assert_eq!(
+            local_relay_reply(Some(Ok(())), &held),
+            (Some(a.clone()), vec![b], None)
+        );
+        assert_eq!(
+            local_relay_reply(Some(Ok(())), &held[..1]),
+            (Some(a), vec![], None)
+        );
+        assert_eq!(
+            local_relay_reply(Some(Err(LocalRelayRefusal::DeviceOffline)), &[]),
+            (None, vec![], Some("device_offline".to_string()))
+        );
+        assert_eq!(local_relay_reply(Some(Ok(())), &[]), (None, vec![], None));
     }
 
     /// Consent granted, and the controller told so: the one state in which

@@ -2025,6 +2025,23 @@ pub enum ClientMsg {
             with = "option_oid_hex"
         )]
         local_relay_from: Option<ObjectId>,
+        /// FR-121 P3b (#2774) — the further relays the probe found, in probe
+        /// order, after `local_relay`. One computer can run several enrolled
+        /// agents (Windows and WSL, a container), each with its own relay and
+        /// its own overlay path to the target, so the first to answer is no
+        /// better than the rest: the Hub hands the target every one, and ICE
+        /// keeps the path that works. Read only beside a `local_relay`, at most
+        /// [`LOCAL_RELAYS_MAX`] in all. Absent from older viewers; an older
+        /// server ignores it and hands over the first alone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        local_relay_also: Vec<LocalRelayDescriptor>,
+        /// FR-121 P3b (#2774) — the further devices of the requester's own that
+        /// this browser runs on, after `local_relay_from`, each resolved as
+        /// that one is. Read only beside a `local_relay_from`, at most
+        /// [`LOCAL_RELAYS_MAX`] in all. Absent from older viewers; an older
+        /// server ignores it and hands over the first device's relay alone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "vec_oid_hex")]
+        local_relay_from_also: Vec<ObjectId>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -3313,15 +3330,23 @@ pub enum ServerMsg {
         /// FR-121 — the answer to the request's `local_relay_from`: the
         /// browser's own device's relay, which the viewer adds as
         /// `turn:127.0.0.1:{turn_port}` before its offer. Sent only to a
-        /// request that named its device; absent otherwise.
+        /// request that named its device; absent otherwise. With several
+        /// named (P3b), the first one that got a relay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_relay: Option<LocalRelayDescriptor>,
         /// FR-121 — why `local_relay_from` got no relay: `not_your_device`,
         /// `other_network`, `device_offline`, `rc_overlay_off` or
         /// `same_device` ([`LocalRelayRefusal`]). The viewer shows an unknown
-        /// word as it came.
+        /// word as it came. With several named (P3b), sent only when none got
+        /// a relay, and it is the first one's reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_relay_refused: Option<String>,
+        /// FR-121 P3b (#2774) — the further relays handed over, after
+        /// `local_relay`, when the request named several devices
+        /// (`local_relay_from_also`). The viewer adds each as it adds that one.
+        /// Absent otherwise; an older viewer never names more than one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        local_relay_also: Vec<LocalRelayDescriptor>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -5506,6 +5531,17 @@ pub struct LocalRelayDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
+
+/// FR-121 P3b (#2774) — the most relays one session carries: `local_relay` (or
+/// the device `local_relay_from` names) and the `_also` lists together. A
+/// probe finds one per enrolled agent on the browser's computer, and every one
+/// is a TURN allocation the target's agent makes, so the Hub keeps the first
+/// this many and drops the rest. Two is the case in the field (Windows and
+/// WSL); a container or a second test agent makes three.
+///
+/// ⚠️ The viewer stops at the same number (`LOCAL_RELAYS_MAX` in
+/// `useRemoteControl.ts`).
+pub const LOCAL_RELAYS_MAX: usize = 4;
 
 /// FR-121 — why a request's `local_relay_from` got no relay, the words
 /// `rc:session.created`'s `local_relay_refused` carries.
@@ -9260,6 +9296,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: from,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&request(Some(device))).unwrap();
         assert!(
@@ -9287,6 +9325,7 @@ mod tests {
             consent_asks: None,
             local_relay,
             local_relay_refused,
+            local_relay_also: vec![],
         };
         let s = serde_json::to_string(&created(Some(relay), None)).unwrap();
         assert!(
@@ -9328,6 +9367,92 @@ mod tests {
         );
     }
 
+    /// FR-121 P3b (#2774) — the further relays and devices ride beside the
+    /// single fields, a device as raw hex, and only when there are any: an
+    /// older viewer's frame parses with both lists empty, and an older reader
+    /// never sees a key it does not know unless there is something in it.
+    #[test]
+    fn several_local_relays_are_additive_on_the_wire() {
+        let target = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
+        let mine = ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap();
+        let wsl = ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap();
+        let relay = |port: u16| LocalRelayDescriptor {
+            turn_port: port,
+            overlay_ip: "100.64.0.7".into(),
+            username: "u".into(),
+            credential: "c".into(),
+            agent_id: None,
+        };
+        let request =
+            |also: Vec<LocalRelayDescriptor>, from_also: Vec<ObjectId>| ClientMsg::SessionRequest {
+                agent_id: target,
+                permissions: Permissions::VIEW,
+                browser_caps: vec![],
+                preferred_transport: None,
+                chroma_pref: None,
+                chunk_framing: None,
+                audio_enabled: false,
+                override_reason: None,
+                local_relay: Some(relay(47989)),
+                local_relay_from: Some(mine),
+                local_relay_also: also,
+                local_relay_from_also: from_also,
+            };
+
+        let s = serde_json::to_string(&request(vec![relay(47990)], vec![wsl])).unwrap();
+        assert!(
+            s.contains(r#""local_relay_also":[{"turn_port":47990"#),
+            "{s}"
+        );
+        assert!(
+            s.contains(r#""local_relay_from_also":["507f1f77bcf86cd799439014"]"#),
+            "{s}"
+        );
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::SessionRequest {
+                local_relay_also,
+                local_relay_from_also,
+                ..
+            } => {
+                assert_eq!(local_relay_also, vec![relay(47990)]);
+                assert_eq!(local_relay_from_also, vec![wsl]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let s = serde_json::to_string(&request(vec![], vec![])).unwrap();
+        assert!(!s.contains("_also"), "an empty list is never written: {s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::SessionRequest {
+                local_relay_also,
+                local_relay_from_also,
+                ..
+            } => assert!(local_relay_also.is_empty() && local_relay_from_also.is_empty()),
+            other => panic!("{other:?}"),
+        }
+
+        let created = |also: Vec<LocalRelayDescriptor>| ServerMsg::SessionCreated {
+            session_id: target,
+            agent_id: target,
+            permissions: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: None,
+            idle_secs: None,
+            consent_asks: None,
+            local_relay: Some(relay(47989)),
+            local_relay_refused: None,
+            local_relay_also: also,
+        };
+        let s = serde_json::to_string(&created(vec![relay(47990)])).unwrap();
+        assert!(
+            s.contains(r#""local_relay_also":[{"turn_port":47990"#),
+            "{s}"
+        );
+        let s = serde_json::to_string(&created(vec![])).unwrap();
+        assert!(!s.contains("local_relay_also"), "{s}");
+    }
+
     #[test]
     fn object_ids_serialise_as_raw_hex_on_wire() {
         // Lock-in: no `$oid` wrapping anywhere in the WS protocol envelope.
@@ -9345,6 +9470,7 @@ mod tests {
             consent_asks: None,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -9365,6 +9491,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -9389,6 +9517,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
@@ -9417,6 +9547,8 @@ mod tests {
                 agent_id: None,
             }),
             local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&req_lr).unwrap();
         assert!(
@@ -9554,6 +9686,7 @@ mod tests {
             consent_asks: None,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let none = serde_json::to_string(&mk(None)).unwrap();
         assert!(!none.contains("features_refused"), "{none}");
@@ -9626,6 +9759,7 @@ mod tests {
             consent_asks: None,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("idle_secs"), "{none}");
@@ -9679,6 +9813,7 @@ mod tests {
             consent_asks,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("consent_asks"), "{none}");

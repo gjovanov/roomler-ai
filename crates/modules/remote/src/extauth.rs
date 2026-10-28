@@ -1065,7 +1065,7 @@ pub async fn handle_session(
         // No break-glass from outside the org, and no relay descriptor (F4):
         // the frame cannot carry either, and neither is invented here.
         None,
-        None,
+        Vec::new(),
         // #1882 — never the org's overlay: an outsider is not on its mesh, and
         // F4 already keeps every overlay relay off this session.
         false,
