@@ -290,7 +290,7 @@ pub(crate) async fn daemon_flow(
     ttl_secs: u32,
 ) -> Result<DaemonFlow, String> {
     let place = Place::hold((session, fence))?;
-    egress.admits(&Admits::Daemon)?;
+    egress.admits(&Admits::Daemon(session, fence))?;
     let grant = vault
         .net(NetAsk {
             session_id: session,
@@ -310,7 +310,7 @@ pub(crate) async fn daemon_flow(
             Target::Static { host, port },
             grant.tunnel_ref(),
             grant.until,
-            Admits::Daemon,
+            Admits::Daemon(session, fence),
         )
         .await?;
     if !place.fill(egress, &flow) {
@@ -352,9 +352,11 @@ pub(crate) fn drop_run(session: ObjectId, fence: u64) -> usize {
 pub(crate) enum Admits {
     /// The session's account alone: `net_socks`'s and `net_forward`'s.
     Account(PeerId),
-    /// This daemon alone: a connect's flow through another device, which a
-    /// proxy dials (P4-6-1b-2).
-    Daemon,
+    /// This daemon alone — or, once one runs, the run's own worker too
+    /// (P8-2b-4): a connect's flow through another device, which a proxy
+    /// dials (P4-6-1b-2). The run named here, since which worker counts
+    /// changes as it restarts.
+    Daemon(ObjectId, u64),
 }
 
 /// FR-90 P8-1a — the tunnel hub's session flows, as hive asks for them: the
@@ -393,7 +395,7 @@ fn admitted(egress: &Arc<dyn SessionEgress>, who: Admits) -> Result<Admits, Stri
 fn admit_of(who: Admits) -> Result<tunnel_core::flow_listener::Admit, String> {
     match who {
         Admits::Account(peer) => super::vault_connect::session_admit(peer),
-        Admits::Daemon => super::vault_connect::daemon_admit(),
+        Admits::Daemon(session, fence) => super::vault_connect::daemon_admit(session, fence),
     }
 }
 
