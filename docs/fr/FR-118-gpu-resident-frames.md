@@ -211,8 +211,8 @@ flowchart LR
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
 | P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7), field-verified on 0.4.186 the same day (§9.8, AC5). AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
-| P5 | macOS: IOSurface → VideoToolbox | the same | — |
-| P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
+| P5 | macOS: IOSurface → VideoToolbox | the same | **next** (open decision 6, 2026-10-29): VideoToolbox's CPU conversion is 70–87 % of its encode stage (§9.5) |
+| P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | **deferred** (open decision 6, 2026-10-29): VAAPI's conversion and upload are 1.2 ms of a 4.1 ms stage, on the one 1600×900 virtual desktop that runs it (§9.5) |
 | P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own |
 
 P0 decides the rest. If convert + copy + upload turn out to be a small share of the encode stage on a backend,
@@ -572,7 +572,9 @@ the wrong reason stayed for the rest of the session.
 - [ ] **AC4 — the slow laptop.** A host at ≥ 2560×1600 on QSV reaches a peak of **≥ 50 fps** with the switch on;
   §2.2's 2880×1800 laptop peaked at 29.4 over 590 windows. If P0 shows the hardware encode itself is the bound
   there, this AC records the measured bound instead, and why. *(The first field host is 1920×1200, so it cannot
-  answer this; §2.2's host is not available for test sessions.)*
+  answer this; §2.2's host is not available for test sessions.)* *(2026-10-29, open decision 7: the run goes on
+  §2.2's laptop after all, in a window its owner agrees to. It is switch-on and switch-off legs like AC3's, and its
+  red record is §9.5: an encode stage of 19.1 ms, 16.4 ms of it in `send_frame`, and a 7.3 ms readback.)*
 - [x] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
   *(The first field host captures on its Intel adapter, so it has no mismatch to show. P3 adds NVENC's half of the
@@ -607,7 +609,9 @@ the wrong reason stayed for the rest of the session.
   encode 18.26 → 5.14 and 5.23 ms a frame; the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame; the pattern
   identical on both paths; no decode error; no keyframes beyond those the host's other load caused. On this arm
   AC3's "capture + encode" reads as readback + encode, because WGC reads back off the pump's clock. Still owed:
-  VideoToolbox and VAAPI, neither built.)*
+  VideoToolbox and VAAPI, neither built.)* *(2026-10-29, open decision 6: VideoToolbox (P5) is built next and
+  verified like AC3. VAAPI (P6) is deferred with its measurement: its conversion and upload are 0.7 + 0.5 ms of a
+  4.1 ms encode stage, on the one 1600×900 virtual desktop that runs it (§9.5).)*
 - [~] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
   Linked from `docs/README.md`. *(P2's half written 2026-10-28: `encoders.md` § GPU-resident frames, with the
@@ -643,6 +647,13 @@ the wrong reason stayed for the rest of the session.
    the GPU conversion's own time" cannot be read either: no heartbeat times the GPU's work. Recommended: read AC3
    on capture + encode per frame and on process CPU, which is what the GPU input saves, and drop the share
    arithmetic. **Decided by the operator, 2026-10-28: as recommended.** AC3 is reworded.
+6. **VideoToolbox (P5) and VAAPI (P6): build or defer** (raised by AC1's week, §9.5). VideoToolbox's CPU
+   conversion is 70–87 % of its encode stage, the largest share any backend can still remove. VAAPI's conversion
+   and upload are 1.2 ms of a 4.1 ms stage, on one 1600×900 virtual desktop. Recommended: build P5 now and defer
+   P6 with that measurement. **Decided by the operator, 2026-10-29: as recommended.**
+7. **AC4's host** (raised 2026-10-29). The only QSV host at ≥ 2560×1600 in a full fleet week is §2.2's laptop,
+   which was not a test host. The options: move AC4 to a follow-up issue, keep it open, or run it on that laptop
+   in a window its owner agrees to. **Decided by the operator, 2026-10-29: the window.**
 
 ## 8. Out of scope
 
