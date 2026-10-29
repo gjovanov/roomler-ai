@@ -539,6 +539,132 @@ flowchart TB
      resolution away from its enrolled config. A test reads the packaged unit and fails when
      a required `%h/` folder is not one the wizard makes, or is made after the user half.
 
+   **Decided by B2** (the macOS root half from the GUI; the PR is the "B2" row below):
+
+   ```mermaid
+   sequenceDiagram
+       autonumber
+       participant P as Person
+       participant W as Wizard (the person's process)
+       participant S as Server
+       participant R as Root shell (osascript)
+       P->>W: the daemon role, "Join the overlay network" ticked (the macOS default)
+       W->>S: POST /api/pair/start with halves 2
+       S-->>W: one approval, two ordinary single-use tokens
+       W->>S: enroll the root half: token 2, a machine id from the hardware
+       W->>W: its config, 0600, in the 0700 scratch directory
+       W->>R: ONE administrator prompt: --privileged-steps --config-from FILE
+       R->>R: the marker, the .pkg, place_system_config (adopt-enrollment on a reinstall), kickstart
+       W->>S: enroll the person's half: token 1, folded into their config
+       W->>W: --user-steps: the LaunchAgent kickstart
+   ```
+
+   - **Which installs add the root half.** The macOS daemon role with **"Join the overlay
+     network"** ticked, which is now the box's macOS default (`role::wants_root_half`, mirrored
+     by the SPA's `wantsRootHalf`). On macOS the box *is* the root half: the mesh needs root
+     for its utun, so the root half is the only way onto it, and unticking the box installs
+     B1's per-user half alone. The box no longer writes `overlay_enabled` into the person's
+     half: the overlay's two keys (`overlay_enabled`, `overlay_advertised_routes`) are the root
+     half's, and every other Advanced key stays the person's half's, as B1 left them
+     (`orchestrator_unix::device_options`, `root_half_options`). A box rather than always,
+     because a person who wants screen sharing alone must not get a root daemon, nor spend a
+     second device on the plan — the terminal path has the same choice (`--daemon-token` or
+     not).
+   - **One approval, two tokens.** The pairing starts with `halves: 2` (`cmd_pair_start`'s
+     `rootHalf`), the session remembers its halves (`PairStore`), and the install takes the
+     first token for the person's half and the second for the root half
+     (`PairStore::tokens_for`). An install whose halves are not the pairing's is refused, never
+     half-served — the SPA cancels the pairing whenever the person goes back to where the box
+     is — and so are fewer tokens than halves and the same token twice. The approver sees one
+     device on `/pair`, with A2's note that a Mac joins as two entries; the wizard's approval
+     card names both devices (`<name>` and `<name>-daemon`). **The device cap counts each
+     half:** each token is its own `POST /api/agent/enroll` and a new row
+     (`the_device_cap_counts_each_of_a_macs_two_halves`). The cap refuses before the
+     single-use claim, so a half refused at the cap keeps its token for the Retry once a slot
+     is free, and the wizard names the cause (a Mac is two devices).
+   - **The paste takes a second token.** On macOS with the root half wanted, the paste box
+     shows a second field, "Second token, for the private network": required then, peeked
+     like the first, and never the first token again (`commands::resolve_install_tokens`; the
+     SPA holds Install until both pass). Not root-half-by-pairing-only, because the paste is
+     the kill-switch fallback (A, item 9) and the MSP and offline-mint path, and a fallback
+     that installs every Mac without its mesh is no fallback for the network pillar; the admin
+     UI's macOS instructions already teach a second token (`--daemon-token`); and it costs one
+     field. Unticking the box keeps B1's one-token paste.
+   - **The root half's enrollment** is B1's system scope's, step for step: in the wizard's
+     process, before the prompt, into a 0600 file in the 0700 scratch directory
+     (`orchestrator_unix::enroll_root_half`, `enroll_step::enroll_fresh_as`); `--config-from`
+     hands it to the privileged half, which on macOS also requests the root half (the marker
+     before the `.pkg`); `place_system_config` places it root:wheel 0600, or folds it into an
+     existing `/etc/roomler/config.toml` through `roomlerd adopt-enrollment`; the token never
+     reaches argv. Its name is `<name>-daemon` and its install trace `{method: wizard, scope:
+     system}`, as the terminal names its root half. A half that reports success is checked
+     against the placement (`placement_problem`): the script skips the root half with only a
+     warning when the package installed no LaunchDaemon, and a config whose token is spent is
+     kept for a Retry, never shredded unplaced.
+   - **The root half's machine id comes from the hardware** (`machine::root_half_machine_id`):
+     SHA-256 of a tag (`roomler/macos-root-half/v1`) and the `IOPlatformUUID` — System
+     Information's "Hardware UUID", which any user reads with `ioreg -rd1 -c
+     IOPlatformExpertDevice` — and, on a **virtual** Mac (`kern.hv_vmm_present` is 1, or the
+     model is a hypervisor's), the VM's permanent `en0` address (`networksetup -getmacaddress
+     en0`). Stable across reinstalls: neither the host name nor the network enters it. Never
+     the person's half's: that one hashes the host name and the person's config path, this one
+     a tag no other id carries — two devices, as FR-43 needs. Never two Macs': a logic board's
+     UUID is its own. **A tart clone** was measured (the log): two clones of the lab's golden
+     report the same `IOPlatformUUID`, serial, VZ machine identifier and host name, and
+     different MACs, because tart regenerates the MAC of a clone whose original is on the host.
+     A UUID-only id, like the host-name one, would put every clone on one device row (B0's
+     finding for the per-user half); with the MAC a clone is a new device, and the fold retires
+     the key the original's row holds (F3). A clone that keeps both the identifier and the MAC
+     is the same machine from inside, and `tart set --random-serial --random-mac` gives it its
+     own. When a fact cannot be read, the root half enrolls under a **one-time** id and the
+     person is told (`machine::resolve_root_half_machine_id`) — never the host-name id, which a
+     clone shares. Not "the root half hands back its own id": the enroll has to happen before
+     the privileged half (a failed placement then leaves an enrolled file, not a burnt token),
+     when root's config cannot be read without a second prompt, and on a cloned VM the id that
+     config holds is the original's — two machines, one device. The cost: a Mac whose root half
+     was first enrolled from a terminal (`--daemon-token`, the host-name id) gets one new row at
+     its first wizard reinstall, which `adopt-enrollment`'s previous-row warning names (it now
+     names this cause as well).
+   - **The overlay, and the keys.** The root half's config is made from its own fresh
+     enrollment and nothing else (`orchestrator_unix::root_half_config`): the overlay on — the
+     reason the half exists, what `--overlay` writes on a terminal — and no WireGuard key, which
+     the root daemon mints at its first start (and `adopt-enrollment` keeps the root half's own
+     on a reinstall that finds its row). Nothing copies one half's config into the other's, so
+     the two never hold one key and `wg_key_taken_by_other` cannot arise between them; the
+     person's half keeps its overlay off.
+   - **Cancel, Retry and the late-start watch, over two enrollments.** The kept state
+     (`unix_daemon::KeptEnrollment`) carries the root half's device beside the person's, and is
+     matched by the halves too. A cancel at the prompt keeps the root half's unplaced config
+     (its token spent), and the Retry places it without enrolling again; a cancel after the
+     start — the root shell waited out, the late-start watch as B1 built it — keeps the placed
+     root half, and the Retry skips the privileged half and enrolls the person's half with its
+     own token, still unspent; a refused person's enroll (the plan's cap, say) keeps the root
+     half the same way. Neither token is posted twice. One window was closed on the way, B1's
+     too: a cancel at the very start of the root-owned enroll dropped the kept scratch, and with
+     it a config whose token was spent; it is kept again now.
+   - **The terminal path keeps A4's refusal** (`--pair --daemon-token`). For one `roomlerd enroll
+     --pair` to take both tokens, the console user's process would enroll the root half and
+     hand its config across the `sudo` boundary through a file the script places: a credential
+     handoff the terminal has no Retry for (the script's stage directory dies with it, so a
+     failed `sudo` burns the second token and leaves its row behind), and a root-half enroll
+     from a process that cannot read root's config, deriving an id where today's terminal root
+     enroll reuses the one in that config. The two-run flow keeps every invariant at the price
+     of a second approval; one approval for both halves is the wizard's.
+   - **Where A1's server can be reached from a Mac cell.** Production has no pairing server (the
+     promote hold), so `halves: 2` end to end on a Mac needs A1's server from master somewhere
+     the cell reaches. The enroll promotes any non-loopback `http://` to `https://`
+     (`server_url::secure`), so the server must look like `http://127.0.0.1:<port>` inside the
+     cell, or carry real TLS. The cell sits behind tart's NAT on the operator's Mac: it reaches
+     the internet and the Mac host, and nothing of the mesh. A dev stack on the dev box or on
+     the lab host would need an inbound port opened to the internet, or a forward through
+     `roomler ssh`, whose `direct-tcpip` reads the target device's default-deny `forward_acl` —
+     not B2's to change on the operator's devices. Two ways work and were not built for B2: the
+     dev stack inside the cell (a macOS build of `roomler-ai-api` with the fleet and network
+     modules, MongoDB and Redis beside it), or a Linux tart VM next to the cell with the Mac
+     host forwarding the cell's loopback to it over plain `ssh -R`. The wizard's side of
+     `halves: 2` is A1's contract, held by A1's integration test
+     (`two_halves_deliver_two_tokens_for_a_macos_daemon_only`) and the store's own tests.
+
 2. **Elevation through the desktop's own prompt:** `pkexec` (polkit) on Linux, which is present
    in any GNOME or KDE session, and `osascript … with administrator privileges` on macOS — one
    native password dialog per install. With no polkit agent (rare on a desktop), the wizard
@@ -669,7 +795,7 @@ subject plain text: the machine name is the installer's own text.
 | B0 | spike: the privileged/user split of `install.sh` under `pkexec` (Ubuntu GNOME, Fedora KDE vmtest cells) and `osascript` admin (macOS cell); the seam recorded in this spec | — | **merged** — [#3039](https://github.com/gjovanov/roomler-ai/pull/3039) (`ef6e3ed01`, 2026-10-28): `--privileged-steps` / `--user-steps` / `--config-from`, proven under `pkexec` on Ubuntu 24.04 GNOME-Wayland (per-user, `--system`) and Fedora 44 KDE Plasma 6 Wayland (per-user, tarball + `.rpm`); the terminal path re-run on all three and on macOS (per-user, and the root half through `--daemon-token`); **owed: the macOS native-prompt half** (no display driver in the harness's macOS lane) |
 | B1 | wizard: daemon roles on Linux (per-user, system) and macOS (per-user) through the embedded `install.sh` steps; the companion placed as the terminal places it; #2338 folded in | `wizard_unix_daemon` absent/false on the setup endpoint → Windows-only cards | draft PR [#3063](https://github.com/gjovanov/roomler-ai/pull/3063). Field (log rows below): Ubuntu GNOME per-user and system, each with a remote-desktop session through the production viewer; Fedora KDE per-user (red, a fix, green); #2338 kept on Linux (per-user, system) and on Windows (red on `setup-v0.4.182`, green on B1); F1, F2 and F5 on the per-user cell, with `pkexec`'s 126/127 measured; F3 (a renamed host) and F4 (a zeroed root config) on the system cell. The orchestrator's second review (another organization: R1, U2, F3b, in the decisions above) is unit-tested, not field-run. **Owed:** the macOS GUI half (the recipe is in its row), and after the roll that carries `org_join::heal_org_keys`, a field read of a keyless org joining its mesh |
 | B1-s | server: `GET /api/setup/features` → `{"pairing", "wizard_unix_daemon", "wizard_pairing"}`, public. `pairing` is the server's fact (A1's switch, for the wizard); the two `[setup]` switches are the operator's assertions about the **released** wizard, each default **off** until its field run — `wizard_unix_daemon` (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`; AC11) and `wizard_pairing` (`ROOMLER__SETUP__WIZARD_PAIRING`; A3 against this server). The enrollment dialog, the landing page and the static `/` (`home.js`) show the Linux and macOS wizard only on `wizard_unix_daemon`, and the install lead says "sign in from your browser" only on `pairing && wizard_pairing` — never on the server's fact alone, or a server promoted before the first `setup-v*` carrying A3 would promise a flow the download cannot do | the settings; absent/false, a 404 (an older server) and a 503 (fleet unmounted) all read as false | PR [#3044](https://github.com/gjovanov/roomler-ai/pull/3044) |
-| B2 | macOS root half from the GUI (two tokens from one approval), or FR-43's single enrollment if it lands first | B1's switch | — |
+| B2 | macOS root half from the GUI: the daemon role with "Join the overlay network" ticked (the macOS default now) adds the root half — one approval, two tokens (`halves: 2`), or two pasted tokens; the root half enrolled in-process under a machine id from the hardware, placed and folded by B1's `--config-from` / `adopt-enrollment`; Cancel, Retry and the late-start watch over two enrollments; the terminal's refusal kept (the decisions under "Decided by B2") | B1's switch (`wizard_unix_daemon`); untick the box for the per-user half alone | PR [#3077](https://github.com/gjovanov/roomler-ai/pull/3077) (the "B2" rows of the log). Unit-tested (the hardware id against two measured tart clones' facts; the halves, the tokens, the Retry state), the SPA driven in jsdom (27 checks, red on master's SPA), the device cap per half in an integration test. **Owed:** the macOS GUI run — the log says what stood in the way and the recipe |
 | D | docs, vmtest cells (wizard × OS × daemon; pairing end to end), field log | — | `docs/device-pairing.md` merged ([#3051](https://github.com/gjovanov/roomler-ai/pull/3051)); its §13, terminal pairing, follows A4. Owed: the vmtest matrix and the acceptance criteria |
 
 ## Acceptance criteria
@@ -746,7 +872,7 @@ All seven open decisions were resolved as the spec recommended
 | A4-5 | **the tunnel role does not pair from the scripts** (`--role tunnel --pair` and `-Role tunnel-client -Pair` are refused, naming `--token` and the wizard) | the `roomler` CLI's enroll is its own code (`agents/roomler-cli`) and has no `--pair` yet; a script cannot pair on its behalf without holding the token itself, which is the thing `--pair` exists to avoid. A CLI `--pair` is a follow-up. |
 | A4-6 | **`--pair-org` matches the approved slug byte for byte** — no case folding, no trimming of the server's value, no Unicode normalisation; only the person's own value is trimmed | the server takes a slug as sent (`crates/api/src/routes/tenant.rs:60-68` passes it straight to the DAO; only `ui/src/composables/useValidation.ts:10` constrains it) under the binary-collated unique index of `crates/db/src/indexes.rs:132`, so `ACME`, `acme ` and a Cyrillic `аcme` are three orgs anyone can create beside `acme`. The first A4 draft trimmed and case-folded the server's slug, which let `ACME` through with no question asked: the flag that was the guard would have been the bypass. |
 | A4-7 | **server-sent text is escaped on the terminal, and a lookalike handle is flagged** | the org's name and slug and the approver's name and username are typed by whoever made the org and the account. Printed raw, an ANSI sequence (cursor up, clear line) in an org's name can repaint the `Join …?` line with another org's; a bidi override can reorder it. Escaping controls and invisible characters keeps every byte visible, and the warnings catch what escaping cannot (a slug in capitals, a Cyrillic letter). On Windows the question goes out through `WriteConsoleW`, so the `«»` and a non-ASCII name are not garbled by the console's code page. |
-| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:950-962`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
+| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1049-1061`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
 | A4-9 | **the existing config is read after the pairing, not before it** | the first draft read it before the wait and merged into that copy after: a running daemon's own writes in between (token renewal, remote configuration, the companion's settings) would be saved over. Reading after makes the paired enroll's read-to-save window the `--token` one, and every line of it the `--token` code. |
 | A4-10 | **`install.sh` gives the paired enroll `/dev/null` as stdin** | under `curl … \| sh` the shell's stdin is the rest of the script. Nothing reads it today — the daemon asks on `/dev/tty`, and sudo 1.9.15 passed a piped script through untouched by default and with `log_input` or `log_stdin` set (the log below) — so this is a belt, kept because the cost of being wrong is an install that silently stops halfway. |
 
@@ -790,3 +916,5 @@ All seven open decisions were resolved as the spec recommended
 | 2026-10-28 | B1 at `63ce0acd2`, then `ac4c1db87` (the wizard's Linux build sha256 `554f1271…`); Fedora 44 KDE Plasma 6 Wayland, a throwaway clone of the lab's KDE guest (`wlab-b1kde-170415`, user `wlab`); agent 0.4.182, released during the run | **Fedora per-user, the tarball path: red, then green.** The wizard itself needs WebKitGTK 4.1, which this KDE image did not have (the harness installed `webkit2gtk4.1`, and `webkitgtk6.0` for its WebKitWebDriver; worth a line on the download page). The released wizard here showed the same three Windows cards on screen. B1 at `63ce0acd2`: one `polkit-kde` prompt; the half took the tarball path and the companion `.rpm`; Done. The daemon **never started**: `roomler.service` restarted every 5 s with `226/NAMESPACE` ("Failed to set up mount namespacing: /home/wlab/.local/share/roomler: No such file or directory"). The packaged unit requires that folder in `ReadWritePaths=`, and `roomlerd enroll` makes it, but the wizard's in-process enroll did not. Fedora's user manager applies the sandbox; Ubuntu's skips it. `mkdir ~/.local/share/roomler` on the cell started the unit within one restart, online. Fixed in `ac4c1db87` (the wizard makes the unit's folders; see the decision above). Green: the same cell, reset to a fresh person's state (unit off, config and data folders removed, the row deleted), with the fixed wizard. Done; `roomler.service` active as wlab with **0 restarts and no NAMESPACE line since the install began**; roomlerd 0.4.182; `roomler-desktop-0.4.182` running; the helper enabled; the WireGuard key minted; **online**, overlay `100.65.x` with the anchor in `peers`. Evidence: `~/b1/runs/fed/`. |
 | 2026-10-28 | B1 at `63ce0acd2`, the wizard's Windows build (debug, with the static CRT the release uses; sha256 `62ddcf4e…`) against the released `setup-v0.4.182` (`f4fa903f…`, fetched from `/api/setup/windows`); a kept win11 vmtest cell from the lane's golden (`vmtest-w-b1-2338-173909`); the wizard walked over WebView2's debugging port as the lane's `wizard` method does (the token in a 0600 file mounted into the walker); the per-user daemon role, production as the server | **#2338 on Windows, red first, then green (issue #2338's own recipe).** A fresh per-user install with the released wizard (Done, the agent-v0.4.182 MSI, enrolled). Then the operator's edits, made while the daemon ran: `overlay_enabled = true`, `lock_on_end = "always"`, a soft-disabled `[[tunnel_routes]]` entry. **Red:** a reinstall with the released wizard and a fresh token reached Done and wrote a fresh config. `lock_on_end` went back to `"never"`, `overlay_enabled` back to `false`, and the route was gone. The same edits again, then **green:** a reinstall with the B1 wizard and a fresh token reached Done, and the config read the same as before it, key for key (secret-shaped values compared as present or absent). The three edits were kept, on the same row (one row for the name throughout). A harness fault on the way was repaired before the red run: the second launch's unzip met the still-open first wizard, and the edit step then ran twice, so its duplicate route was removed. **Harness finding:** the lane's win11 golden has an expired account password (`PasswordLastSet` 2026-09-02, Windows' 42-day maximum, so expired 2026-10-14). Its autologon stops at "Your password has expired and must be changed". Every console-session cell (`attended`, the `wizard` method) then has no desktop, and a GUI launch fails without saying why. This cell was set `PasswordNeverExpires` over SSH and rebooted; the golden needs the same at bake time. Also, as B0 found for macOS, every win11 clone enrolls under one hostname-derived machine id, so a standard enroll lands on one shared row (`6a97e322…`, created at the golden's bake). It was deleted by id afterwards, as the lane's own wizard cell does. Evidence: `~/b1/runs/win/`. |
 | 2026-10-28 | B1 | **macOS: owed.** The `cfg(target_os = "macos")` arms are compile-checked on every PR now: `cargo check -p roomler-setup --lib --bins` in CI's `macos-overlay-check` job (this branch adds the step). The GUI half was not run. The lane's tart cells are headless (B0's row), and this harness drives no display on macOS. The recipe stands as B0 wrote it, with the wizard in place of the hand-run halves: a tart cell started with `--vnc`; the wizard launched in the console user's session (`launchctl asuser <uid> open …`); the SecurityAgent password typed over VNC; then the per-user LaunchAgent, the companion and the device online. Then a Cancel after the password, which must wait the root shell out (the 5-second late-start watch). Never on the operator's own Mac. |
+| 2026-10-28 | B2; two throwaway clones of the lab's macOS golden (macOS 15.7.7), booted one after the other on the lab's tart host, read over SSH, deleted by name | **What tells two clones apart, for the root half's machine id.** The two clones report the same `IOPlatformUUID`, the same serial, the same VZ machine identifier (the `ecid` in the VM's `config.json`) and the same host name; `kern.hv_vmm_present` is 1 and `hw.model` is `VirtualMac2,1` on both. Only the MAC differs, and in each clone it is one value in `config.json`, `networksetup -getmacaddress en0` and `ifconfig en0`. An id from the platform UUID alone would put every clone of a VM on one device row, so on a virtual Mac the root half's id hashes the `en0` address too (`machine::root_half_machine_id`). The values were compared programmatically from the run's raw output and are not recorded here. |
+| 2026-10-28 | B2, branch `fr-129-b2-macos-root-half`; a third clone of the same golden, started with Virtualization.framework's VNC server (`tart run --no-graphics --vnc-experimental`) | **The macOS GUI run: not done, owed.** The cell came up with VNC and SSH. Its first frame was black until a key event woke the display (then 2048×1536 with content), and one VNC session ended with the connection refused (after a restart of the cell the client held). The B2 wizard built inside the cell (a debug binary). The run itself did not happen: the wizard started in the console user's session with `launchctl asuser`, two vmtest-org tokens pasted, the administrator password typed into SecurityAgent over VNC. The implementing agent stopped at its usage limit at 22:11Z, and the cell was deleted on 2026-10-29. **Owed, with the released wizards rather than a build in the cell:** red on `setup-v0.4.186` (B1: no root half), green on the first `setup-v*` that carries B2. The runs are a fresh install (both halves online, the overlay up on the root half), a reinstall (the same rows, the same keys) and a Cancel after the password (the root shell waited out). B0's `osascript` half is proven by the same runs. |

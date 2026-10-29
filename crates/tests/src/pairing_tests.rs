@@ -941,6 +941,73 @@ async fn the_device_cap_refuses_a_paired_token_like_a_pasted_one() {
     );
 }
 
+/// FR-129 B2: the plan's device cap counts each of a Mac's two halves. One
+/// approval delivers two tokens, but each enroll is a device of its own: with
+/// one slot left, the first half takes it and the second is refused at the
+/// cap — before its single-use claim, so the same token enrolls once a slot is
+/// free (the wizard's Retry reuses the half already made and posts this one
+/// again).
+#[tokio::test]
+async fn the_device_cap_counts_each_of_a_macs_two_halves() {
+    let app = app_fast().await;
+    let org = app.seed_tenant("pair14").await;
+    // Free.max_devices == 100: seed 99, one slot left.
+    let tid = ObjectId::parse_str(&org.tenant_id).unwrap();
+    let now = bson::DateTime::now();
+    let docs: Vec<Document> = (0..99)
+        .map(|i| {
+            doc! {
+                "tenant_id": tid,
+                "machine_id": format!("pair14-seed-{i}"),
+                "name": format!("seed-{i}"),
+                "created_at": now,
+                "updated_at": now,
+                "deleted_at": Bson::Null,
+            }
+        })
+        .collect();
+    app.db
+        .collection::<Document>("agents")
+        .insert_many(docs)
+        .await
+        .expect("agent seed");
+
+    let mut body = start_body("daemon", "macos");
+    body["halves"] = json!(2);
+    let tokens = pair_as_admin(&app, &org, &body).await;
+    assert_eq!(tokens.len(), 2);
+
+    // The root half first, as the wizard enrolls it: the last slot.
+    let (status, root) = enroll_agent(&app, &tokens[1], "pair14-root-half").await;
+    assert_eq!(status, 200, "{root}");
+    // The person's half: a second device, refused at the cap.
+    let (status, refused) = enroll_agent(&app, &tokens[0], "pair14-user-half").await;
+    assert_eq!(status, 403, "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Device limit"),
+        "{refused}"
+    );
+
+    // A slot freed (a device removed): the refused token was never claimed,
+    // so it enrolls now — and is spent after that.
+    app.db
+        .collection::<Document>("agents")
+        .update_one(
+            doc! { "tenant_id": tid, "machine_id": "pair14-seed-0" },
+            doc! { "$set": { "deleted_at": bson::DateTime::now() } },
+        )
+        .await
+        .expect("free a slot");
+    let (status, user) = enroll_agent(&app, &tokens[0], "pair14-user-half").await;
+    assert_eq!(status, 200, "{user}");
+    assert_ne!(root["agent_id"], user["agent_id"], "two devices");
+    let (status, again) = enroll_agent(&app, &tokens[0], "pair14-user-half").await;
+    assert_eq!(status, 401, "spent now: {again}");
+}
+
 /// AC9: an archived org refuses a paired token exactly as it refuses a
 /// pasted one.
 #[tokio::test]

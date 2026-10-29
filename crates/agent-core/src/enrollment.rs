@@ -795,13 +795,17 @@ pub fn describe_previous_row(previous: &PreviousRow, new_agent_id: &str) -> Stri
     } else {
         format!("the organization enrolled as \"{}\"", previous.org_label)
     };
+    // FR-129 B2: a Mac's root half takes its fingerprint from the hardware,
+    // so for it the cause is a clone, or a root half first enrolled under the
+    // host-name fingerprint (from a terminal) and now under the hardware's.
     format!(
         "this machine was enrolled in {org} as device {old}, and the server has now enrolled it \
-         as a NEW device, {new}: the machine's fingerprint changed since then (it is derived \
-         from the host name — a renamed computer, or a VM cloned together with its config). The \
-         new device gets a private-network key of its own, and the device {old} stays in the \
-         Devices list, offline. If it was this machine before the change, remove it there; if it \
-         is the machine this one was cloned from, leave it.",
+         as a NEW device, {new}: the machine's fingerprint changed since then (a renamed \
+         computer, a VM cloned together with its config, or a Mac's private-network half that \
+         now takes its fingerprint from the hardware instead of the host name). The new device \
+         gets a private-network key of its own, and the device {old} stays in the Devices list, \
+         offline. If it was this machine before the change, remove it there; if it is the \
+         machine this one was cloned from, leave it.",
         old = previous.agent_id,
         new = new_agent_id,
     )

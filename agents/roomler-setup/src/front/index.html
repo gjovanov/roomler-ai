@@ -250,6 +250,23 @@
                     placeholder="eyJhbGc..."></textarea>
           <small class="muted">Stored only in memory, used once. Never persisted to disk.</small>
         </label>
+        <!-- FR-129 B2: a Mac's private network is a second device — the root
+             half, a root service that owns the mesh's interface — with an
+             enrollment token of its own. Shown only for the macOS daemon role
+             with "Join the overlay network" ticked (app.js wantsRootHalf);
+             a pairing delivers both tokens from one approval instead. -->
+        <div id="root-token-wrap" hidden>
+          <label class="field">
+            <span>Second token, for the private network</span>
+            <textarea id="root-token-input" rows="3" autocomplete="off" spellcheck="false"
+                      placeholder="eyJhbGc..."></textarea>
+            <small class="muted">On a Mac the private network runs in a second, root
+            service, enrolled as its own device with its own token — mint a second one in
+            Admin → Agents. Or untick the overlay network under Advanced options to install
+            screen sharing only.</small>
+          </label>
+          <p id="root-token-status" class="muted" hidden></p>
+        </div>
 
         <div id="token-info" class="info" hidden>
           <p><strong>Issuer:</strong> <span id="token-issuer">–</span></p>
@@ -364,6 +381,9 @@
           <dd id="done-principal-id" class="code"></dd>
           <dt>Tenant ID</dt>
           <dd id="done-tenant-id" class="code"></dd>
+          <!-- FR-129 B2: a Mac's root half, its own device. -->
+          <dt id="done-root-half-label" hidden>Private network (root half) ID</dt>
+          <dd id="done-root-half-id" class="code" hidden></dd>
           <dt>Role</dt>
           <dd id="done-role"></dd>
           <dt id="done-flavour-label" hidden>Mode</dt>
