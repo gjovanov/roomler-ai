@@ -734,7 +734,115 @@ flowchart LR
   Vulkan — **rebuilds** the encoder on a coarsened ladder. D3D12 and Vulkan are
   measured (FR-78 P2, the A0 ladder on the dev box): every rung forced an IDR,
   42–77 ms per apply. `encoder-smoke --reconfigure-sweep --name <encoder>` is
-  the read for any host.
+  the read for any host. The per-backend cost table, the counters and the sweep's
+  verdict are the next section.
+
+### A rate move, per backend (FR-62)
+
+What a rate move costs decided the shape of the rate-control code: nine of its
+heuristics exist only to ration that cost
+([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
+AIMD target to `FfmpegEncoder::set_bitrate`
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:2946`), which snaps it to the
+ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
+and returns when the rung is the one already running. Only a rung crossing reaches
+the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
+
+```mermaid
+flowchart TD
+    T["AIMD target_bps"] --> C["coarsen_bitrate<br/>nearest ladder rung"]
+    C -->|"same rung as the running maxrate"| N["no-op"]
+    C -->|"rung crossed"| M{"RateReconfig<br/>resolved at open"}
+    M -->|"NVENC: InPlaceVbr"| V["write rc_max_rate + rc_buffer_size<br/>FFmpeg reconfigures on the next send_frame<br/>0.004 ms, no IDR with patch 0001"]
+    M -->|"QSV with the flag ON: InPlaceCbr"| Q["write bit_rate + rc_max_rate + rc_buffer_size<br/>MFXVideoENCODE_Reset answers −14 on Iris Xe<br/>the encoder is unusable after it"]
+    M -->|"QSV flag OFF, AMF, VideoToolbox, VAAPI, D3D12, Vulkan: Rebuild"| R["reopen at the new maxrate<br/>a fresh IDR plus the open's cost"]
+    R -->|"bg_rebuild on a direct path, bg_rebuild_constrained on a relay"| S["off-thread swap, adopted at quiet on a relay<br/>counted as swaps"]
+    R -->|"inline"| I["blocks the pump for the open<br/>counted as rebuilds"]
+```
+
+Measured with the sweep described below (20 rate changes 6 M → 200 k → 6 M at
+1280×800, 30 frames a rung, `set_ms` the apply alone):
+
+| Backend (host) | Arm | Rate-caused IDRs | Apply | Read |
+|---|---|---|---|---|
+| `hevc_nvenc` (RTX 5090 Laptop) | in place, unpatched FFmpeg | **20/20** | 0.001–0.008 ms | 0.4.50, 2026-09-02 (#1242) |
+| `hevc_nvenc` (the same GPU) | in place, patch 0001 | **0/20**, default and constrained HRD windows alike | 0.004 ms | a patched 0.4.51 build, 2026-09-02; re-read on the released **0.4.187**, 2026-10-29 |
+| `hevc_qsv` (Iris Xe) | rebuild, flag OFF | 20/20 | 340–390 ms above 1.5 M, **1.3–2.2 s at or below 1 M** | 0.4.51, 2026-09-02 |
+| `hevc_qsv` (Iris Xe) | in place, flag ON | — | `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM`, both `low_power` modes, with and without the buffer write | 0.4.51 and 0.4.62 |
+| `hevc_amf` (Radeon 610M) | rebuild | **20/20** | **41–55 ms** | **0.4.187, 2026-10-29** — the 0.4.187 harness filed every one as periodic (below); the corrected harness reads `total_rate_idr: 20`, `pass: false` |
+| `hevc_d3d12va`, `hevc_vulkan` (the dev box) | rebuild | 20/20 | 42–77 ms | FR-78 P2 |
+| `*_vaapi` | rebuild, by construction | — | unmeasured | — |
+| `hevc_videotoolbox` | rebuild | unmeasured | unmeasured | A3's open decision: patch 0002, or a rebuild at settle |
+
+So the two rebuild families are not one: QSV's rebuild is a multi-second stall at
+the rates a slow link runs, while AMF, D3D12 and Vulkan rebuild in 40–80 ms and pay
+only the IDR. The rationing a backend needs follows from its row, which is why A4
+retires heuristics per backend rather than deleting them.
+
+⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
+direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
+`target_bps` 34 → 65 Mbps in eight AIMD steps while `rate_moves` stayed 0: every step
+coarsened to the top rung and `set_bitrate` returned. The encoder's maxrate is the
+rung, never the target.
+
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9797-9830`):
+
+| Field | Meaning |
+|---|---|
+| `inplace_rate` | `supports_dynamic_bitrate()`: the backend applies in place (NVENC always, QSV only with the flag) |
+| `rate_moves` | in-place writes |
+| `rebuilds` | synchronous reopens, the inline arm |
+| `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
+| `dims_swaps` | reopens for a resolution change (FR-70 M2) |
+| `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:836`) to isolate the rate-caused ones |
+| `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
+
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6127`):
+
+```
+roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
+roomlerd encoder-smoke --reconfigure-sweep --name hevc_amf --codec hevc --json   # a backend the cascade outranks
+```
+
+Per rung it prints `set_ms`, `rate_idr`, `periodic_idr`, `mean_bytes`, the
+bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
+`trailing_mean`; `--json` emits one `ROOMLER_A0_JSON:{…}` line. Two rules the first
+reads taught it:
+
+- **The rate change is charged with the keyframe on the rung's first output frame**
+  (`sweep_attribute_idrs`, `app.rs:6388`), not on frame 0. AMF answers the frame that
+  fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
+  "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
+  for a backend that rebuilds on every move.
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6417`). Every
+  backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
+  CBR (`select_rc_mode` takes the CBR branch because the session opens with
+  `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
+  (≤ 2×): a quality-driven backend sits under its cap on compressible content, so the
+  RTX read printed `pass: false` on a 0.985 ratio deviation with 0/20 IDRs and a
+  0.004 ms apply. The JSON names the basis (`"basis":"idr+apply"` or
+  `"idr+apply+tracking"`).
+
+**The patch and its gate.** `.github/ffmpeg-patches/0001-nvenc-no-idr-on-bitrate-reconfig.patch`
+drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s bitrate-only reconfigure.
+`vendor-ffmpeg-windows.yml` applies it to the Windows and both Linux assets and
+writes `ROOMLER-PATCHES.txt` (sha256 per patch) into each; `release-agent.yml`
+refuses to tag when an asset's manifest differs from the committed patches
+(`.github/workflows/release-agent.yml:449-471`, `:1167` for arm64). The pump reads
+one const, `NVENC_RECONFIG_FORCES_IDR` (`encoder.rs:893`), so the binary and the
+FFmpeg it links cannot disagree. The macOS builder carries no patch today.
+
+**Switches, and when each retires:**
+
+| Switch | Default | What it does | Retires when |
+|---|---|---|---|
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:325`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:338`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:354`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
+| `bg_rebuild_constrained` (`:498`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
+
+**Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
+VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
+rationing, QSV keeps `coarsen_bitrate`, and AMF, D3D12 and Vulkan keep it for the IDR.
 
 ## Software encoders: the clock and 60 fps (FR-112)
 
