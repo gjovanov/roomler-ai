@@ -3533,10 +3533,13 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
                 "config unreadable — RECOVERED from the previous good copy; \
                  the live file was likely truncated by an unclean shutdown"
             );
-            // Reinstate it as the live file so the next save has a base.
-            if let Err(e) = save(path, &cfg) {
+            // Reinstate it as the live file so the next save has a base. The
+            // keys this build does not know are the copy's to keep (#2078):
+            // the live file, which a save reads them from, parses as nothing.
+            if let Err(e) = save_with_base(path, &prev, &cfg) {
                 tracing::warn!(error = %format!("{e:#}"), "could not reinstate recovered config");
             }
+            note_unknown_keys(path);
             Ok(cfg)
         }
         Err(prev_err) => {
@@ -3798,26 +3801,41 @@ fn dotted(steps: &[KeyStep]) -> String {
         .join(".")
 }
 
-/// The keys that name an entry of an array of tables: a route's `id`, an org's
-/// `tenant_id`, else a `label`. The first one the entry on disk has decides.
-const ENTRY_IDENTITY: [&str; 3] = ["id", "tenant_id", "label"];
+/// The key that names an entry of the array of tables `array`: an org's
+/// `tenant_id`, a route's `id`. THIS build's, per array — never a key read off
+/// the entry on disk, which a newer build wrote: an `id` it added to an org's
+/// entry looks like an identity and no org this build writes carries one, so
+/// keying on it finds nothing, and every key on the entry is lost — the old
+/// behaviour, in exactly the array the merge exists for. `tenant_id` and not
+/// `label` for an org: `promote_org_to_primary` puts the demoted primary under
+/// the promoted org's label. A route's `id` may be empty (`#[serde(default)]`);
+/// two such routes are told apart by nothing, and [`same_entry`] finds neither.
+/// An array not named here (`forward_acl.allowlist`) has no identity, and a
+/// key inside one of its entries is dropped, with the WARN. A test holds every
+/// array of tables this build writes to naming its identity, or its lack of one.
+fn entry_identity(array: &str) -> Option<&'static str> {
+    match array {
+        "orgs" => Some("tenant_id"),
+        "tunnel_routes" => Some("id"),
+        _ => None,
+    }
+}
 
-/// Where `entry`, from the file being replaced, sits in `out` now: found by its
-/// identity, never by its position. A save that adds or removes an org moves
-/// the entries, and promoting one puts the demoted primary at the promoted
-/// org's index (`promote_org_to_primary`), so the same index can hold another
-/// org with the array's length unchanged. A key copied onto another org would
-/// be worse than a key lost. `None` when the entry has no identity, or not
-/// exactly one entry in `out` carries it.
-fn same_entry(entry: &toml::Table, out: &[toml::Value]) -> Option<usize> {
-    let key = ENTRY_IDENTITY
-        .iter()
-        .find(|k| entry.get(**k).is_some_and(toml::Value::is_str))?;
-    let want = entry.get(*key)?;
+/// Where `entry`, from the file being replaced, sits in `out` now — the array
+/// `array` as the save writes it: found by its identity, never by its
+/// position. A save that adds or removes an org moves the entries, and
+/// promoting one puts the demoted primary at the promoted org's index
+/// (`promote_org_to_primary`), so the same index can hold another org with the
+/// array's length unchanged. A key copied onto another org would be worse than
+/// a key lost. `None` when the array has no identity, the entry does not carry
+/// it, or not exactly one entry in `out` carries the same.
+fn same_entry(array: &str, entry: &toml::Table, out: &[toml::Value]) -> Option<usize> {
+    let key = entry_identity(array)?;
+    let want = entry.get(key).filter(|v| v.is_str())?;
     let mut hits = out
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.get(*key) == Some(want));
+        .filter(|(_, v)| v.get(key) == Some(want));
     let (i, _) = hits.next()?;
     hits.next().is_none().then_some(i)
 }
@@ -3845,7 +3863,7 @@ fn copy_key(disk: &toml::Table, out: &mut toml::Table, steps: &[KeyStep]) -> boo
             let Some(toml::Value::Table(entry)) = d.get(*n) else {
                 return false;
             };
-            let Some(i) = same_entry(entry, o) else {
+            let Some(i) = same_entry(k, entry, o) else {
                 return false;
             };
             match o.get_mut(i) {
@@ -3894,21 +3912,48 @@ fn merge_unknown_keys(
     Ok((merged, lost))
 }
 
-/// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key the file
-/// being replaced holds that this build does not model. Before this, every
+/// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
+/// holds that this build does not model. `base` is the file being replaced:
+/// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
+/// the live file it then writes over parses as nothing. Before this, every
 /// save erased them: a key set ahead of the update that knows it was gone by
 /// the old daemon's stop, and a rollback erased every newer key for good.
 ///
-/// A file with no such key is written exactly as before, byte for byte, and
+/// A base with no such key is written exactly as before, byte for byte, and
 /// any failure to keep them saves `cfg` alone and says so: the worst case is
 /// the old behaviour. Comments are still lost; that needs an in-place editor.
-fn serialise_for(path: &PathBuf, cfg: &AgentConfig) -> Result<String> {
+fn serialise_for(
+    path: &std::path::Path,
+    base: &std::path::Path,
+    cfg: &AgentConfig,
+) -> Result<String> {
     let plain = toml::to_string_pretty(cfg).context("serialising config")?;
-    // No file yet, unreadable, or not a config: nothing to keep.
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Ok(plain);
+    let raw = match std::fs::read_to_string(base) {
+        Ok(raw) => raw,
+        // No file yet: a first save, nothing to keep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                base = %base.display(),
+                error = %e,
+                "the config being replaced could not be read: keys this build does not know \
+                 in it, if any, are NOT kept through this save"
+            );
+            return Ok(plain);
+        }
     };
+    // Said with a fixed string: a parse error quotes the line it stopped at,
+    // and the file holds the agent token and the overlay keys. A live file
+    // that does not parse is what `load` recovers from `.prev`, and a save
+    // over it keeps the copy's keys only when its caller names the copy.
     let Ok(unknown) = unknown_keys(&raw) else {
+        tracing::warn!(
+            path = %path.display(),
+            base = %base.display(),
+            "the config being replaced does not parse: keys this build does not know in it, \
+             if any, are NOT kept through this save"
+        );
         return Ok(plain);
     };
     if unknown.is_empty() {
@@ -3919,6 +3964,7 @@ fn serialise_for(path: &PathBuf, cfg: &AgentConfig) -> Result<String> {
             if !lost.is_empty() {
                 tracing::warn!(
                     path = %path.display(),
+                    base = %base.display(),
                     keys = %lost.join(", "),
                     "config keys this build does not know were NOT kept through this save: \
                      the org, route or table that held them is not in it"
@@ -3930,6 +3976,7 @@ fn serialise_for(path: &PathBuf, cfg: &AgentConfig) -> Result<String> {
             let keys: Vec<String> = unknown.iter().map(|s| dotted(s)).collect();
             tracing::warn!(
                 path = %path.display(),
+                base = %base.display(),
                 keys = %keys.join(", "),
                 why,
                 "config keys this build does not know were NOT kept through this save"
@@ -3974,11 +4021,19 @@ fn note_unknown_keys(path: &PathBuf) {
 }
 
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
+    save_with_base(path, path, cfg)
+}
+
+/// [`save`], keeping the keys this build does not know of `base` rather than
+/// of the file at `path` (#2078): [`load`]'s recovery reinstates the `.prev`
+/// copy it loaded over a live file that does not parse, and the keys to keep
+/// are the copy's.
+fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
-    let serialised = serialise_for(path, cfg)?;
+    let serialised = serialise_for(path, base, cfg)?;
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -4473,6 +4528,361 @@ machine_name = "devbox"
             merge_unknown_keys(&raw, &plain, &wrong).unwrap_err(),
             "the merged text changed a key this build knows"
         );
+    }
+
+    /// A declared route for the save tests; `id` is the identity an entry is
+    /// found by, and may be empty.
+    fn route_fixture(id: &str, local: u16) -> roomler_localapi::RouteDescriptor {
+        roomler_localapi::RouteDescriptor {
+            id: id.to_string(),
+            kind: roomler_localapi::FlowKind::Forward,
+            node: "aid".into(),
+            local,
+            remote: Some("127.0.0.1:80".into()),
+            transport: String::new(),
+            enabled: true,
+            org: None,
+        }
+    }
+
+    /// Writes `key = value` into entry `i` of the array of tables `array` in
+    /// the file at `path`, as a newer build would.
+    fn write_entry_key(
+        path: &std::path::Path,
+        array: &str,
+        i: usize,
+        key: &str,
+        value: toml::Value,
+    ) {
+        let mut table = saved_table(path);
+        table
+            .get_mut(array)
+            .and_then(|v| v.as_array_mut())
+            .and_then(|entries| entries.get_mut(i))
+            .and_then(|entry| entry.as_table_mut())
+            .unwrap()
+            .insert(key.into(), value);
+        std::fs::write(path, toml::to_string_pretty(&table).unwrap()).unwrap();
+    }
+
+    /// Everything this thread logs while the guard lives, as text.
+    fn captured() -> (Captured, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let cap = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(cap.clone())
+                .with_ansi(false),
+        );
+        let guard = tracing::subscriber::set_default(subscriber);
+        (cap, guard)
+    }
+
+    /// #2078 — the identity an entry is found by is THIS build's (an org's
+    /// `tenant_id`), never read off the entry on disk. A newer build added an
+    /// `id` to the org's entry: read off the entry, that was the identity, no
+    /// org this build writes has one, and the entry was found nowhere — so
+    /// both `id` and the key beside it were lost at the first save, with a
+    /// WARN, in exactly the array the merge exists for.
+    #[test]
+    fn an_identity_key_this_build_does_not_know_does_not_lose_the_entrys_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        save(&path, &cfg).unwrap();
+        write_entry_key(
+            &path,
+            "orgs",
+            0,
+            "id",
+            toml::Value::String("org-row-id".into()),
+        );
+        write_entry_key(
+            &path,
+            "orgs",
+            0,
+            "org_key_from_a_newer_build",
+            toml::Value::Integer(7),
+        );
+        assert_eq!(
+            unknown_names(&path),
+            ["orgs.0.id", "orgs.0.org_key_from_a_newer_build"]
+        );
+
+        let (cap, _guard) = captured();
+        save(&path, &load(&path).unwrap()).unwrap();
+        let orgs = saved_table(&path)["orgs"].as_array().unwrap().clone();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0]["tenant_id"].as_str(), Some("tid-acme"));
+        assert_eq!(
+            orgs[0].get("id").and_then(toml::Value::as_str),
+            Some("org-row-id"),
+            "{orgs:?}"
+        );
+        assert_eq!(
+            orgs[0]
+                .get("org_key_from_a_newer_build")
+                .and_then(toml::Value::as_integer),
+            Some(7),
+            "{orgs:?}"
+        );
+        let log = cap.text();
+        assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #2078 — a recovery from `.prev` keeps the copy's keys this build does
+    /// not know. `load` reinstates the copy over a live file that does not
+    /// parse, and the keys to keep are the copy's: read off the live file,
+    /// the base every other save reads, there was nothing to parse, so the
+    /// recovered host was written without them and nothing said so — at the
+    /// one save that follows the event a `.prev` exists for.
+    #[test]
+    fn a_recovery_from_prev_keeps_the_keys_this_build_does_not_know() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        std::fs::write(
+            &path,
+            format!("a_key_from_a_newer_build = true\n{}", minimal_toml()),
+        )
+        .unwrap();
+        // Rotates the hand-written file into .prev, and keeps its key.
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"]
+        );
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+
+        // An unclean shutdown: the live file is the right length and all NUL.
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+
+        let (cap, _guard) = captured();
+        let healed = load(&path).expect("recovers from .prev");
+        assert_eq!(healed.agent_token, "tok");
+        let table = saved_table(&path);
+        assert_eq!(
+            table
+                .get("a_key_from_a_newer_build")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "the reinstated file lost the copy's key: {table:?}"
+        );
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+        let log = cap.text();
+        assert!(log.contains("RECOVERED"), "{log}");
+        assert!(
+            log.contains("kept in the file through every save"),
+            "a recovered config's unknown keys are named, as every load's are; got: {log}"
+        );
+        assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #2078 — a key a newer build wrote into a route's entry follows THAT
+    /// route, found by its `id`, through a save that reorders them.
+    #[test]
+    fn a_route_entrys_unknown_key_follows_its_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.tunnel_routes = vec![route_fixture("r1", 18080), route_fixture("r2", 18081)];
+        save(&path, &cfg).unwrap();
+        for (i, port) in [(0usize, 18080i64), (1, 18081)] {
+            write_entry_key(
+                &path,
+                "tunnel_routes",
+                i,
+                "route_key_from_a_newer_build",
+                toml::Value::Integer(port),
+            );
+        }
+        assert_eq!(
+            unknown_names(&path),
+            [
+                "tunnel_routes.0.route_key_from_a_newer_build",
+                "tunnel_routes.1.route_key_from_a_newer_build"
+            ]
+        );
+
+        let mut moved = load(&path).unwrap();
+        moved.tunnel_routes.reverse();
+        save(&path, &moved).unwrap();
+        let routes = saved_table(&path)["tunnel_routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes[0]["id"].as_str(), Some("r2"));
+        assert_eq!(
+            routes[0]["route_key_from_a_newer_build"].as_integer(),
+            Some(18081)
+        );
+        assert_eq!(routes[1]["id"].as_str(), Some("r1"));
+        assert_eq!(
+            routes[1]["route_key_from_a_newer_build"].as_integer(),
+            Some(18080)
+        );
+    }
+
+    /// #2078 — a route's `id` can be empty (`#[serde(default)]`): two such
+    /// routes are told apart by nothing, so a key on either is dropped, with
+    /// the WARN naming it, and never copied onto the other.
+    #[test]
+    fn routes_without_an_id_are_ambiguous_and_their_keys_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.tunnel_routes = vec![route_fixture("", 18080), route_fixture("", 18081)];
+        save(&path, &cfg).unwrap();
+        for (i, port) in [(0usize, 18080i64), (1, 18081)] {
+            write_entry_key(
+                &path,
+                "tunnel_routes",
+                i,
+                "route_key_from_a_newer_build",
+                toml::Value::Integer(port),
+            );
+        }
+
+        let (cap, _guard) = captured();
+        let mut moved = load(&path).unwrap();
+        moved.tunnel_routes.reverse();
+        save(&path, &moved).unwrap();
+        let routes = saved_table(&path)["tunnel_routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0]["local"].as_integer(), Some(18081));
+        for route in &routes {
+            assert!(
+                route.get("route_key_from_a_newer_build").is_none(),
+                "a key landed on a route it may not belong to: {routes:?}"
+            );
+        }
+        let log = cap.text();
+        assert!(log.contains("NOT kept"), "{log}");
+        assert!(
+            log.contains("tunnel_routes.0.route_key_from_a_newer_build")
+                && log.contains("tunnel_routes.1.route_key_from_a_newer_build"),
+            "{log}"
+        );
+    }
+
+    /// #2078 — every kind of value TOML can hold is kept as written through
+    /// two saves: a datetime, a float, an inline table, a mixed array, a
+    /// quoted key, a whole `[[array]]` of tables and an empty table. Two
+    /// saves, because the field defect showed at the NEXT start.
+    #[test]
+    fn every_kind_of_value_survives_two_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "when = 2026-10-28T10:00:00Z\nratio = 0.5\nextra = {{ a = 1, b = \"two\" }}\n\
+             \"a.quoted.key\" = true\nmixed = [1, \"a\"]\n{}\n\
+             [[things_from_a_newer_build]]\nname = \"x\"\n\n\
+             [[things_from_a_newer_build]]\nname = \"y\"\n\n\
+             [an_empty_table_from_a_newer_build]\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let want = [
+            "a.quoted.key",
+            "an_empty_table_from_a_newer_build",
+            "extra",
+            "mixed",
+            "ratio",
+            "things_from_a_newer_build",
+            "when",
+        ];
+        assert_eq!(unknown_names(&path), want);
+        let check = |table: toml::Table| {
+            assert_eq!(
+                table["when"]
+                    .as_datetime()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("2026-10-28T10:00:00Z")
+            );
+            assert_eq!(table["ratio"].as_float(), Some(0.5));
+            assert_eq!(table["extra"]["a"].as_integer(), Some(1));
+            assert_eq!(table["extra"]["b"].as_str(), Some("two"));
+            assert_eq!(table["a.quoted.key"].as_bool(), Some(true));
+            assert_eq!(table["mixed"][0].as_integer(), Some(1));
+            assert_eq!(table["mixed"][1].as_str(), Some("a"));
+            let things = table["things_from_a_newer_build"].as_array().unwrap();
+            assert_eq!(things.len(), 2);
+            assert_eq!(things[1]["name"].as_str(), Some("y"));
+            assert_eq!(
+                table["an_empty_table_from_a_newer_build"]
+                    .as_table()
+                    .map(|t| t.len()),
+                Some(0)
+            );
+        };
+
+        let mut cfg = load(&path).unwrap();
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        check(saved_table(&path));
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        save(&path, &back).unwrap();
+        check(saved_table(&path));
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+    }
+
+    /// Every array of tables this build writes either names the key its
+    /// entries are found by (`entry_identity`) or is listed here as having
+    /// none — a key inside an entry of such an array is dropped, with the
+    /// WARN, at every save. A new `Vec<SomeTable>` field has to choose.
+    #[test]
+    fn every_array_of_tables_this_build_writes_names_its_identity() {
+        const NO_IDENTITY: [&str; 1] = ["forward_acl.allowlist"];
+        let raw = format!(
+            "{}\n[[forward_acl.allowlist]]\n\
+             host_pattern = {{ kind = \"exact\", value = \"db.intranet\" }}\n\
+             port_range = {{ low = 5432, high = 5432 }}\n",
+            minimal_toml()
+        );
+        let mut cfg: AgentConfig = toml::from_str(&raw).expect("a rule parses");
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        cfg.tunnel_routes = vec![route_fixture("r1", 18080)];
+        let written: toml::Table = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+
+        fn arrays_of_tables(prefix: &str, table: &toml::Table, found: &mut Vec<(String, String)>) {
+            for (key, value) in table {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match value {
+                    toml::Value::Array(items) if items.iter().any(toml::Value::is_table) => {
+                        found.push((path, key.clone()));
+                    }
+                    toml::Value::Table(inner) => arrays_of_tables(&path, inner, found),
+                    _ => {}
+                }
+            }
+        }
+        let mut found = Vec::new();
+        arrays_of_tables("", &written, &mut found);
+        let paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        for want in ["orgs", "tunnel_routes", "forward_acl.allowlist"] {
+            assert!(
+                paths.contains(&want),
+                "{want} is not written as an array of tables: {paths:?}"
+            );
+        }
+        for (path, key) in &found {
+            assert!(
+                entry_identity(key).is_some() || NO_IDENTITY.contains(&path.as_str()),
+                "[[{path}]] names no identity for its entries (entry_identity) and is not \
+                 listed as having none"
+            );
+        }
     }
 
     #[test]
