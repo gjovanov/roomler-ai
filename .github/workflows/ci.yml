@@ -1646,6 +1646,14 @@ jobs:
       - name: The installer's SystemContext record — unit tests (#1727)
         if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- win_service::system_context_attempt --nocapture
+      # #3073 — a SystemContext host's first healthy run hardens the
+      # machine-global dir. Proven here on a real directory someone else owns
+      # (the elevated runner hands it to SYSTEM): with the owner taken first,
+      # SYSTEM keeps full control. The other lane that runs `roomler-node-core`
+      # is Linux, where the test does not exist.
+      - name: The machine-global hardening keeps SYSTEM in (#3073)
+        if: ${{ !cancelled() }}
+        run: cargo test -p roomler-node-core --lib -- config::tests::harden --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
