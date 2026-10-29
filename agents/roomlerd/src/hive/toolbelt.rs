@@ -934,6 +934,12 @@ pub(crate) fn open(
     #[cfg(not(worker_calls))]
     let handed: Option<(Arc<Pending>, u64)> = None;
     if let Some((pending, endpoint)) = handed {
+        // `endpoint` is read only by the `handed` field below, which is
+        // itself compiled out where `worker_calls` is off (the `vault`
+        // feature, independent of `unix`) — without this, that
+        // configuration sees the binding as unused.
+        #[cfg(not(all(unix, worker_calls)))]
+        let _ = endpoint;
         return Ok(Toolbelt {
             socket,
             pending,
