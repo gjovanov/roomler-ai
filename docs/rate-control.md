@@ -636,6 +636,86 @@ the twelfth of the kill switches FR-70 exists to delete, guarding nothing.
 ⚠️ The VP9-444 pump and the RTP pump run no shadow (M3b decides whether the
 software pump reads the same plan; the RTP pump has no governor).
 
+## The shadow rate controller (FR-63 B1)
+
+Everything above is eight estimators of one quantity — the pipe's rate —
+composed with "the lower of" rules (the occupancy AIMD, the blocked-send
+goodput, the FR-35 learner and pair memory, FR-59's floor relief / arrival clamp
+/ drain / seed contradiction / remembered-rate opener, the FR-15 age loop). FR-63
+([`fr/FR-63-one-delay-based-rate-controller.md`](fr/FR-63-one-delay-based-rate-controller.md))
+replaces them with **one** delay-based controller, `encode::ratectl::Controller`
+(`agents/roomlerd/src/encode/ratectl.rs`), and does it the way the rate-control
+plan requires — **shadow-first**. B1 (`agent-v0.4.187`+) builds the controller
+and runs it beside the live governor, emitting what it *would* decide into six
+`shadow_*` heartbeat fields. It drives nothing; B2 flips it live on a fleet-log
+flip criterion, B3 deletes the eight.
+
+⚠️ **Containment is the whole safety property of this phase.** The governor owns
+the controller as `shadow: Option<ratectl::Controller>` (`governor.rs`), fed only
+through its methods at the five live positions and read only by the `shadow_*`
+accessors. No live decision is a function of anything it computes, and
+`governor::tests::the_shadow_never_moves_the_live_decision` proves it: two
+governors identical but for `ratectl` (Off vs Shadow), driven through the same
+frames and windows, must produce byte-identical `applied_bps`, relieved floor,
+pipe-state tally, link stats, goodput samples and viewer age — and a red-run that
+lets the shadow write a live field fails it.
+
+```mermaid
+flowchart TB
+    OPEN["open: constrained floor 200 k<br/>(NOT the 1.5 M flat pin)<br/>or 0.85 × remembered, a 10 s soft cap"] --> SU["Startup<br/>×1.08/window &lt; 50% ceiling,<br/>additive above"]
+    SU -->|"full channel · hard stall ·<br/>2 windows: age level ≥ 70 ms /<br/>loss ≥ 2% / goodput &lt; 0.9×target"| OU["OverUse<br/>target = 0.85 × measured<br/>(≥ 0.5× last, ≥ floor)"]
+    OU --> HO["Hold<br/>holds while the age LEVEL is elevated<br/>(not the derivative)"]
+    HO -->|"2 clean windows"| UU["UnderUse<br/>climb again"]
+    UU -->|"settles / reaches ceiling"| NO["Normal"]
+    NO -->|"congestion"| OU
+    UU -->|"congestion"| OU
+    HO -->|"deep level + constrained"| PA["+1 bounded pause<br/>(never on direct;<br/>counted only, in shadow)"]
+    PA --> HO
+    OUT["output → apply_deadband<br/>(decrease ≤ 1/500 ms,<br/>increase ≤ 1/2 s, |Δ| ≥ 5%)<br/>→ shadow_target_bps"]
+    SU -.-> OUT
+    OU -.-> OUT
+    UU -.-> OUT
+```
+
+`measured` is the viewer's arrival rate on a constrained path, `min(goodput, rx)`
+on a direct one; an `fps == 0` window (a DERP stall) is no evidence. The path
+floor is **200 kbps constrained** — the controller's thesis is that the
+governor's flat 1.5 M `area_min_bitrate_bps` is a pin, not evidence — and the
+governor's area floor on a direct path.
+
+The controller is fed at the five positions the governor already instruments,
+from locals the live loops computed, with no hot-path signature change:
+
+| position | call | signal |
+|---|---|---|
+| `pre_encode_tick` (per frame) | `set_domain` + `observe_frame` | the resolved floor/ceiling and the send-channel occupancy (the AIMD's own signal) |
+| `on_backpressure_skip` | `on_budget_skip` | the byte-budget gate tripped — a congestion sample, NOT a blocked send |
+| `on_send_overflow` | `on_overflow` | a send-channel overflow |
+| `note_send_stall` | `on_stall` | a blocked send (hard ≥ 1 s halves; softer is rate-limited) |
+| `tick_viewer_window` | `fold_window` | the window's age / arrival rate / queue growth / goodput / fps |
+
+The heartbeat (both DC pumps) carries, in SHADOW:
+
+| field | meaning |
+|---|---|
+| `shadow_target_bps` | what the controller would be targeting |
+| `shadow_state` | `startup` / `normal` / `overuse` / `hold` / `underuse`, or `off` when `ROOMLERD_RATECTL=off` |
+| `shadow_measured_bps` | the controller's own pipe estimate |
+| `shadow_disagree_pct` | `(shadow − live) / live` — **negative = the shadow asked for less**, the safe direction, and the quantity the flip criterion counts |
+| `shadow_pauses` | bounded pauses it would have ordered (constrained only; it cannot pause anything in B1) |
+| `shadow_reason` | why its target last moved |
+
+A `RateLaw` adapter (`sim::tests::RatectlLaw`) runs the controller on the same
+B0 cells as the shipped laws, so its numbers are the baseline B2 must beat: on
+the recorded 213 kbps cell its peak commitment is under half arm A's 2.55 M, it
+never leaves `[floor, ceiling]`, and it never pauses on a direct cell.
+
+⚠️ **B1 is the code, not the verdict.** Whether the shadow agrees with the live
+governor closely enough to flip (AC2) is a release plus a week of `agent_logs`
+read per `PathClass` — a field read, not a test. The config-surface tribool
+`ratectl = shadow|live|off` and the `live` apply seam are **B2**; B1 is env-only
+(`ROOMLERD_RATECTL`), so a B1 fleet cannot be made to let the shadow steer.
+
 ## Config / env reference
 
 All keys live in the agent config (`roomler config set …`) with
@@ -659,6 +739,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `ROOMLERD_SW_FPS_60` | on (Linux), off (Windows, macOS) | FR-112 P2 — software encoders target 60, paced down to what they sustain, never below 30; `0` = 30 and the old base everywhere, `1` opts Windows or macOS in ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
 | `ROOMLERD_ENCODER_CLOCK` | on | FR-112 P1 — the encoding and capture threads ask for their clock (a Linux `uclamp_min`); `0` = the scheduler's default ([`encoders.md`](encoders.md#software-encoders-the-clock-and-60-fps-fr-112)) |
 | `ROOMLERD_SW_PACE_UP_MARGIN` | 2.5 | Env only. FR-112 P2d: how far (fps) a software encoder's estimate must clear a higher step before its pace moves up to it (0–10). `0` = 0.4.142's pace, which steps up as soon as the estimate quantises higher ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
+| `ROOMLERD_RATECTL` | shadow | Env only (B1). FR-63 B1 — whether the shadow rate controller runs beside the governor; `off` stops it, any other value is `shadow`. It drives NOTHING — its only output is the `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). The config-surface tribool and the `live` value are B2 |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
@@ -694,6 +775,7 @@ behaviour is described under the validity gate at the top of this page.
 | 0.4.98 | FR-79 V3b — `encode::pipe::Pipe`, ONE belief split into a demonstrated FLOOR and a pushed-back CAPACITY, in SHADOW (`pipe_belief`, `pipe_belief_n` in the heartbeat; no consumer). | Three symptoms on three hosts and two carriers, one defect: no trustworthy, always-available estimate of what the path carries. |
 | 0.4.99 | FR-79 V3b-1 + V3b-2 — no single `believed_bps()` (`capacity_bps` for "am I over?", `ceiling_anchor_bps` for "what may the ceiling be?"); the floor is retired by evidence, not by time. | An idle relay session read 1.8 M from deliveries alone with nothing wrong; a host that had demonstrated 8.4 M read 12.8 kbps on a still screen hours later. |
 | 0.4.100 | FR-79 V3b-3 — a capacity sample is also a delivery, so it raises the floor and survives its own expiry. | A 13.16 M capacity expired after one TTL and the anchor fell to a 4.05 M content floor while the target ran to the 34.56 M constant. |
+| 0.4.187 | FR-63 B1 — the ONE delay-based controller (`encode::ratectl`) runs in SHADOW beside the governor, emitting six `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). It drives nothing; a containment test holds the line. | Eight estimators of one quantity glued with "the lower of" rules. Shadow-first per the rate-control plan: a release of `shadow_*` logs against the flip criterion (AC2) decides B2's flip, so the controller is never the fleet's own first trial. |
 
 ## The measured-rate closed loop
 
