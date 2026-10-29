@@ -368,8 +368,8 @@ was refused as a `secret mismatch` every 30 s.
 
 | | as built |
 |---|---|
-| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:646`, `:530`, `:347`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:405`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). |
-| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:815`, `:457`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:651`, `:530`, `:347`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:405`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:820`, `:457`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
 | **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:475`). |
 
 An adversarial review before the merge found three edges, all fixed in the same PR:

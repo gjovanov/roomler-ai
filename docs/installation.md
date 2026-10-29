@@ -820,8 +820,8 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:646`, `:530`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:815`, `:457`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:651`, `:530`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:820`, `:457`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
 | **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:475`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
@@ -865,6 +865,61 @@ the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
 back to the version that is running (`crates/agent-core/src/config.rs:2659`).
+
+### No pipe can stall the supervisor (#3080)
+
+macOS has no `pipe2`, so Rust's std makes a pipe there with `pipe()` and marks
+each end close-on-exec in two later calls. A child that another thread spawns
+inside that window inherits both ends without the flag. A short-lived child
+closes them when it exits. A long-lived one holds the write end for as long as
+it lives, and the pipe's reader waits for an end-of-file that does not come.
+Linux is not exposed: its `pipe2(O_CLOEXEC)` is atomic.
+
+On 2026-10-29, at the 0.4.184 install on the operator's MacBook, netstate's
+`route -n monitor` was spawned inside the window of the reap's `/bin/ps`: their
+pids are consecutive. `ps` exited and `route` kept the pipe's write end. The
+reap's `Command::output()` waited on a runtime worker, before the supervisor's
+first poll, so the Mac got no GUI worker: no capture and no input until a
+restart. The reap has run at every start since 0.4.181 (#3014). The hang
+showed once in two starts.
+
+```mermaid
+sequenceDiagram
+  participant S as supervisor - the reap
+  participant N as netstate - another thread
+  participant P as /bin/ps
+  participant R as route -n monitor
+  S->>S: pipe() for the stdout of ps - not yet close-on-exec
+  N->>R: spawn - R inherits both ends of that pipe
+  S->>S: mark both ends close-on-exec - too late for R
+  S->>P: spawn with the pipe as stdout
+  P-->>S: the rows, then exit
+  Note over S,R: R still holds the write end - end-of-file never comes
+  Note over S: before the fix - output() blocks for good
+  Note over S: since the fix - ps has exited, so the reap drains what is buffered and goes on
+```
+
+| Side of the race | Since #3080 | Where |
+|---|---|---|
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:878`, `:827`; `crates/tunnel-core/src/child.rs:61` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:191`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:617` |
+| **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
+
+⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
+`route -n monitor` child by its PID, after checking that its parent PID is the
+daemon's, never by pattern. The supervisor carries on within milliseconds, and
+netstate respawns its monitor by itself (#1867). Restarting the daemon
+(`sudo launchctl kickstart -k system/com.roomler.daemon`) works too, but it
+rolls the race again: check that `state action=` follows `supervisor ON` in the
+log.
+
+⚠️ **The sweep is for long-lived children only.** It costs a `fork` where std
+would use `posix_spawn`, and up to 65,536 `fcntl` calls in the child. The other
+long-lived macOS children, such as the recorder's own `posix_spawn`, SSH shells
+and long `exec` sessions, are not swept yet (#3082). Until they are, one narrow
+window stays open: the `fork` path waits on an exec-error pipe of its own, made
+the same non-atomic way, so an unswept long-lived child spawned inside that
+window would hold the swept spawn until it exits.
 
 ### Paths, logs, limits
 
