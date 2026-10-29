@@ -60,6 +60,12 @@ ui/e2e/video/output/
 # would exist only on the machine that wrote it. That is exactly how the
 # sanitisation skill above was lost once already.
 !.claude/hooks/
+# .claude/rules/ holds the pillar invariants that used to sit in CLAUDE.md, as
+# path-scoped rules: each loads when Claude reads or edits a file its `paths:`
+# globs match, instead of on every prompt. Public for the same reason as the two
+# skills above -- they name no host and no IP, and a rule a contributor's agent
+# never loads is not a rule.
+!.claude/rules/
 # The FR-backlog autopilot: the orchestration skill and the worker agent it
 # dispatches. Same argument a third time -- an orchestrator that lives only on
 # the machine that wrote it is one session away from being rebuilt from scratch.
