@@ -1758,7 +1758,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-118 - keep a captured frame on the GPU until the encoder takes it: the SystemContext DXGI capture delivers GPU frames, and a QSV encoder (hevc_qsv, av1_qsv, h264_qsv) whose GPU-input form the capability probe proved takes them without a CPU copy. Windows only. Built-in default: off. Env: ROOMLERD_ZERO_COPY. Restart required.",
+        description: "FR-118 - keep a captured frame on the GPU until the encoder takes it, without a CPU copy, once the capability probe has proven that encoder's GPU-input form: the SystemContext DXGI capture's frames go to QSV (hevc_qsv, av1_qsv, h264_qsv), the WGC capture's to NVENC (hevc_nvenc, av1_nvenc, h264_nvenc), and on macOS the display stream's to VideoToolbox (hevc_videotoolbox, h264_videotoolbox). Built-in default: off. Env: ROOMLERD_ZERO_COPY. Restart required.",
     },
     KeyMeta {
         key: "zero_copy_deny",

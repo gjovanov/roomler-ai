@@ -253,7 +253,7 @@ the grid honest for a device that has not yet updated to it — a 0.4.25 device 
 | key | where | default | effect |
 |---|---|---|---|
 | `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:980-868`, `config_surface.rs:1096-1069`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
-| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1928`, `:2053-2055`) | `0` | bumped per rotation; presented on every join, shown in the grid |
+| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1930`, `:2055-2057`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 
 ⚠️ **A kill switch, not a gate.** Unlike `exec_enabled` and `ssh_enabled`, this one
@@ -306,7 +306,7 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:657`, `:688`, `:702`, test `:5834`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:2509-2513` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:657`, `:688`, `:702`, test `:5834`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:2667-2671` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3248`, `:972`; owner `network` (`:2427`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1860`, `:1886`, `:1911`, `:1942`, `:3443`, `:6053`, `:6068` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
@@ -318,7 +318,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:784-792` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6209-6341`, `:3088-3130`, `:3132-3153`, `:1178-1202` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1642`, `:1643-1645`; `config_surface.rs:1096-1069` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1644`, `:1645-1647`; `config_surface.rs:1096-1069` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1287-1314`, `:2098-2199`; `ui/src/stores/agents.ts:948-902` |
 
 ## Not built
