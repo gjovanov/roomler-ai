@@ -29,6 +29,17 @@
  *
  * Env (all required; spec skips otherwise): E2E_BASE_URL, E2E_API_URL,
  * E2E_VMTEST_TENANT_ID, E2E_VMTEST_EMAIL, E2E_VMTEST_PASSWORD, E2E_AGENT_NAME.
+ *
+ * Optional, for a session that must land on ONE encoder cell (FR-122: "a
+ * probe proves an open, only a session proves a cell"):
+ *   E2E_RC_CODEC            the codec picker's value for this agent (`h264`,
+ *                           `hevc`, `h264-444`, …), seeded as the per-agent
+ *                           override the picker itself stores, so the session
+ *                           requests that cell instead of the Auto pick.
+ *   E2E_RC_EXPECT_ENCODER   the encoder the agent must report in
+ *                           `rc:video-info`, read off the viewer's codec pill
+ *                           (`H.264 4:2:0 HW (h264_nvenc)` → `h264_nvenc`).
+ * Unset, the spec behaves as before; the pill is logged either way.
  */
 import { test, expect, type Page } from '@playwright/test'
 
@@ -38,6 +49,12 @@ const TENANT_ID = process.env.E2E_VMTEST_TENANT_ID || ''
 const EMAIL = process.env.E2E_VMTEST_EMAIL || ''
 const PASSWORD = process.env.E2E_VMTEST_PASSWORD || ''
 const AGENT_NAME = process.env.E2E_AGENT_NAME || ''
+const RC_CODEC = process.env.E2E_RC_CODEC || ''
+const EXPECT_ENCODER = process.env.E2E_RC_EXPECT_ENCODER || ''
+/** The picker's per-agent override key (`CODEC_STORAGE_PREFIX` in
+ *  useRemoteControl.ts). Spelled out, not imported: an e2e spec must not pull
+ *  the app's module graph into the Playwright runner. */
+const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
 
 /** The named agent's id once it reports online. Polls up to ~2 min — the VM
  *  enrolled moments before this spec started. Exact-name match only. */
@@ -284,6 +301,30 @@ async function proveContent(page: Page): Promise<void> {
   ).toBe(true)
 }
 
+/** The codec pill names the encoder the agent reported in `rc:video-info`
+ *  (`H.264 4:2:0 HW (h264_nvenc) · relay · dec SW`). Logged on every run; with
+ *  E2E_RC_EXPECT_ENCODER set, the session must be on that encoder. Polls,
+ *  because video-info can land after the first frames. */
+async function reportCodec(page: Page): Promise<void> {
+  const isCodec = (t: string) => /\b(H\.264|H\.265|VP9|AV1)\b/.test(t)
+  let label = ''
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const pills = await page.locator('.stats-pill').allInnerTexts().catch(() => [] as string[])
+    label = pills.find(isCodec) ?? ''
+    if (label && (!EXPECT_ENCODER || label.includes(`(${EXPECT_ENCODER})`))) break
+    await page.waitForTimeout(1_000)
+  }
+  console.log(
+    `[vmtest-remote] codec: ${label || '(no codec pill)'}${RC_CODEC ? ` (asked for ${RC_CODEC})` : ''}`,
+  )
+  if (EXPECT_ENCODER) {
+    expect(label, `the session is not on ${EXPECT_ENCODER} (pill: "${label}")`).toContain(
+      `(${EXPECT_ENCODER})`,
+    )
+  }
+}
+
 test.describe('vmtest remote-desktop check (named agent)', () => {
   test.skip(
     !API_URL || !BASE_URL || !TENANT_ID || !EMAIL || !PASSWORD || !AGENT_NAME,
@@ -315,6 +356,20 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
 
     const agentId = await findNamedOnlineAgent(token)
     expect(agentId, `agent "${AGENT_NAME}" never reported online in tenant ${TENANT_ID}`).toBeTruthy()
+    if (RC_CODEC) {
+      // The same per-agent override an explicit pick in the codec picker stores,
+      // so connect() requests that cell (`codecConnectAction` → apply-stored).
+      await context.addInitScript(
+        ([key, value]) => {
+          try {
+            window.localStorage.setItem(key, value)
+          } catch {
+            /* storage blocked: the session falls back to Auto, and the pill says so */
+          }
+        },
+        [CODEC_STORAGE_PREFIX + agentId, RC_CODEC] as [string, string],
+      )
+    }
 
     const consoleErrors: string[] = []
     page.on('console', (msg) => {
@@ -345,6 +400,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       console.warn('[vmtest-remote] FR-61 hooks absent -- using the surface pixel-change fallback')
       await proveStreamLive(page)
       await proveContent(page)
+      await reportCodec(page)
       return
     }
 
@@ -378,6 +434,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       )
       await proveStreamLive(page)
       await proveContent(page)
+      await reportCodec(page)
       return
     }
 
@@ -393,6 +450,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       `stream froze (framesDecoded ${s0.frames} → ${s1.frames}, fps ${s0.fps} → ${s1.fps})`,
     ).toBe(true)
     await proveContent(page)
+    await reportCodec(page)
 
     if (consoleErrors.length > 0) {
       console.warn(`[vmtest-remote] ${consoleErrors.length} console errors:`)
