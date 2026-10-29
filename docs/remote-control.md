@@ -365,6 +365,12 @@ same organization whose `rc_overlay` is on, or `auto` on an agent that decides i
 (`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3441`) and is never stored. ⚠️ It carries a live
 credential, minted by the device and re-minted every 30 minutes, so nothing logs it.
 
+> ⚠️ **On Chrome 156, a TURN server on 127.0.0.1 is no path from roomler.ai** (measured on neo16, 2026-10-29). There
+> is no candidate and no error. Yet example.com reaches the same server, and roomler.ai reaches it on the device's
+> overlay address (FR-121 §3.7). A named device's relay is handed over and the target allocates on it, but the browser
+> gathers nothing from `turn:127.0.0.1:<port>` (`localRelayIceServer`, `ui/src/composables/useRemoteControl.ts:4168`),
+> and the session rides the far TURN. Which address to hand the browser is FR-121's open decision 5.
+
 **More than one agent on one computer (FR-121 P3b, #2774).** Windows and WSL under mirrored networking share
 loopback, each agent with its own relay on its own probe port, and their overlay paths to a target can differ
 completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP, and a relay reached over
@@ -376,7 +382,14 @@ is told only when no named device got a relay, and then it is the first one's.
 
 > ⚠️ Chrome ranks its relay candidates by the order of its TURN servers, so among relays that all work, the first in
 > port order wins, not the fastest. Port order is the agents' start order. Whether a slow relay can win that way is
-> FR-121's open decision 4, measured by its AC9.
+> FR-121's open decision 4, measured by its AC9. On neo16 on 2026-10-29 it decided nothing: the WSL relay gave the
+> browser no candidate at all (FR-121 §3.7).
+
+> ⚠️ **The two directions can ride different pairs.** The agent keeps the first pair nominated. It follows a later
+> nomination only to a non-overlay pair of higher priority, or away from a pair gone silent
+> (`should_follow_renomination`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:56`). Through a local relay,
+> the video rides the relay's pair, but Chrome may send its own packets on another: on 2026-10-29 it sent input and
+> the data channel's acks on the far TURN (FR-121 §3.7).
 
 A browser paired with one device before P3b holds whichever agent answered first. On a later connect it looks once
 more for the others, but only where Chrome says the loopback permission is already granted (`loopback-network`, or
