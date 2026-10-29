@@ -4737,15 +4737,19 @@ export const VP9_444_DC_LABEL = 'video-bytes'
  * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
  * whose encoder was idle at 8-12 ms/frame.
  *
- * `maxRetransmits: 0` rather than a bounded retransmit is deliberate and
- * is coupled to the RECEIVER. Stage A's assembler treats a chunk-index
- * jump as an unrecoverable gap: it drops the frame and asks for an IDR.
- * That is exactly right when a lost chunk never arrives, and WRONG the
- * moment retransmits are allowed — a chunk that arrives one RTT late
- * would be discarded as a gap, converting a recoverable frame into a
- * lost one plus a keyframe request. Testing 1-2 retransmits (stage C)
- * therefore requires a reorder buffer in the worker first; it is not a
- * number that can be turned up on its own.
+ * `maxRetransmits: 0` rather than a bounded retransmit was chosen for
+ * stage B because it was coupled to the RECEIVER of the day. Stage A's
+ * assembler treated a chunk-index jump as an unrecoverable gap: it
+ * dropped the frame and asked for an IDR. That is exactly right when a
+ * lost chunk never arrives, and WRONG the moment retransmits are allowed
+ * — a chunk that arrives one RTT late would be discarded as a gap,
+ * converting a recoverable frame into a lost one plus a keyframe request.
+ * Stage C's reorder buffer (FR-59 P7, #1169, `rc-chunk-framing.ts`)
+ * removed that coupling: a late chunk lands in its slot while its frame
+ * is still open. The number is still 0 because 1-2 (or the
+ * `maxPacketLifeTime` deadline FR-17 prefers) has not been MEASURED on a
+ * relay-locked pair — it is now a measurement that can be run, not a
+ * number that can be turned up without one.
  *
  * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
  * byte sequence whose reassembly depends entirely on arrival order, so
