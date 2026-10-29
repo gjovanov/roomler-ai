@@ -38,7 +38,7 @@ The code agrees, line by line (master `5d4f8d8df`):
 - **The `.deb` ladder asks a person.** A non-root daemon tries `pkexec apt-get install`, then `sudo -n`
   (`updater.rs:1771-1785`). On a desktop with a polkit agent that is a password prompt in front of whoever is
   at the screen, every 4 h. Without one, it is `sudo -n`, which works only where sudo needs no password.
-- **The installer already admits it.** `install.sh:371` prints *"a per-user daemon cannot install its own
+- **The installer already admits it.** `install.sh:371` (at master `271fa798b`) prints *"a per-user daemon cannot install its own
   updates (writing /usr needs root, whichever format). Re-run with --system for unattended self-update."*
   `README.Debian:19,46-48` says the same.
 - **The docs promise otherwise:**
@@ -202,7 +202,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 ### 3.5 The installers (P3, as built)
 
-`install.sh` turns the helper on for a per-user install and off for `--system` (`scripts/install.sh:418-503`, called
+`install.sh` turns the helper on for a per-user install and off for `--system` (`scripts/install.sh:528-604`, called
 at `:452` and `:461-469`):
 
 | install | the helper | the daemon |
