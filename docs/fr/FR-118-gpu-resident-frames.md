@@ -209,7 +209,7 @@ flowchart LR
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b in 0.4.181. The fleet read is AC1, done 2026-10-28 (§9.5) |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
-| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. AMF not built: the measurement found no need for it |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7). AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
@@ -512,6 +512,29 @@ flowchart LR
 - **Not yet:** AMF; and a QSV host that captures through WGC (the fleet's QSV hosts all capture through the
   DXGI arm, §9).
 
+### 5.7 #3071 — an adopted replacement keeps the refusal's reason, as built (2026-10-29)
+
+§9.6 found the heartbeat naming the wrong reason. A replacement encoder opens from the encoder's own device, which is
+none while the encoder runs CPU frames. So it reports `cpu_frames` even when the encoder runs CPU frames because the
+capture's device was refused. Two replacements do this: FR-119's frame-rate replacement, spawned at session start
+before the device follow, and a rebuild-bound encoder's rate rebuild. The follow never retries a refused device, so
+the wrong reason stayed for the rest of the session.
+
+| Piece | What it is | Where |
+|---|---|---|
+| the rule | `adopted_input(current, device_refused, opened)` returns the opened form. The exception: a device was refused, both forms are CPU, and the opened one says `cpu_frames`. Then the current form, with the refusal's reason, stays | `encode/ffmpeg/gpu_hint.rs:130` |
+| both adopt paths | `FfmpegEncoder::adopt_input`, called by `adopt_opened` (the background swap) and `adopt_rebuilt` (the synchronous rate rebuild) | `encode/ffmpeg/encoder.rs:2550`, `:2542`, `:2605` |
+
+- **Tests** (`gpu_hint`, on every platform's lane): `a_replacement_opened_without_the_device_keeps_the_refusal_s_reason`
+  replays neo16's sequence (`adapter_mismatch`, then a `cpu_frames` replacement) and a rate rebuild that fails its
+  own open. `an_opened_encoder_s_own_form_wins_otherwise` covers no refusal, the opened encoder's own refusal, and
+  GPU frames. The Windows `encode::ffmpeg` suite passes on neo16's two GPUs (51 tests).
+- **Negative control:** `adopted_input` returning `opened` fails exactly the first test
+  (`left: cpu_frames, right: adapter_mismatch`).
+- **Not fixed here** (#3071's case A): on a host whose encoder takes the capture's device, the same early replacement
+  drops the GPU pool and costs a second blocking reopen at session start. The field has not shown it: CORPLAP-3's
+  sessions open straight onto a GPU frame at the native size, with no frame-rate swap at start.
+
 ## 6. Acceptance criteria
 
 - [x] **AC1 — the split, measured.** P0 has shipped, and a fleet week is read per encoder × geometry into the
@@ -559,7 +582,9 @@ flowchart LR
   the Radeon was paired with NVENC on the RTX 5090. The refusal logged `reason=adapter_mismatch` and the reopen
   `input=cpu input_reason=adapter_mismatch`, and the GPU path was never taken. But the heartbeat read
   `input_reason=cpu_frames`: a background replacement opened before the refusal was adopted after it and
-  overwrote the reason (#3071). The box stays open until the heartbeat carries the reason.)*
+  overwrote the reason (#3071). The box stays open until the heartbeat carries the reason.)* *(2026-10-29,
+  §5.7: #3071's fix keeps the refusal's reason through an adoption. The field half reads once a release carries
+  it: the same neo16 session shape, its heartbeat at `input_reason=adapter_mismatch`.)*
 - [x] **AC6 — the gate holds at every entry point.** With the switch off, or the cell denied, neither the probe
   nor a session opens the GPU-input form. Tested at both entry points. **Met 2026-10-28.** Both halves are
   unit-tested at both entry points (P2-3, §5.5), and both were seen in the field on agent 0.4.181 (§9.2). With the
