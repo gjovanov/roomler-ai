@@ -36,7 +36,11 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
+# #2078 — a save keeps the keys this build does not model: `serde_ignored`
+# names them, and `preserve_order` keeps the merged file in the struct's own
+# order instead of sorting it.
+serde_ignored = "0.1.14"
+toml = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
