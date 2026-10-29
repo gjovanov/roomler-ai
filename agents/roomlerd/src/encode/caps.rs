@@ -658,10 +658,46 @@ mod child {
             }
             names
         }
-        #[cfg(not(all(
-            target_os = "windows",
+        // FR-118 P5 — VideoToolbox's 4:2:0 cells, under the same switch and the
+        // same two denylists `vt_input::plan` reads at every open.
+        #[cfg(all(
+            target_os = "macos",
             feature = "ffmpeg-encoder",
-            any(feature = "mf-encoder", feature = "wgc-capture")
+            feature = "scrap-capture"
+        ))]
+        {
+            if !crate::capture::zero_copy_enabled() {
+                return Vec::new();
+            }
+            let cells_deny = crate::encode::cells::denied_cells();
+            let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
+            let mut names: Vec<String> = Vec::new();
+            for cell in caps.typed_cells() {
+                if !matches!(cell.backend, VideoBackend::VideoToolbox) {
+                    continue;
+                }
+                let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
+                if crate::encode::ffmpeg::vt_input::gpu_cell(&name, false)
+                    && !crate::encode::cells::cell_denied(&cells_deny, &name, ChromaFormat::Yuv420)
+                    && !crate::encode::ffmpeg::gpu_hint::is_denied(&gpu_deny, &name)
+                    && !names.contains(&name)
+                {
+                    names.push(name);
+                }
+            }
+            names
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "windows",
+                feature = "ffmpeg-encoder",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ),
+            all(
+                target_os = "macos",
+                feature = "ffmpeg-encoder",
+                feature = "scrap-capture"
+            )
         )))]
         {
             let _ = caps;
@@ -967,12 +1003,117 @@ fn probe_gpu_frame(
     })
 }
 
-#[cfg(not(all(
-    target_os = "windows",
-    feature = "system-context",
-    feature = "mf-encoder",
+/// FR-118 P5 — VideoToolbox's GPU form, proven in the `gpu` child: each cell
+/// opened in that form and fed IOSurface frames until it hands back a packet.
+/// VideoToolbox encodes asynchronously, so the first frames may come back
+/// empty; up to `GPU_PROBE_FRAMES` are fed before the form is called unproven.
+#[cfg(all(
+    target_os = "macos",
     feature = "scrap-capture",
     feature = "ffmpeg-encoder"
+))]
+fn probe_gpu(names: &[String]) -> Vec<String> {
+    use crate::encode::ffmpeg::FfmpegEncoder;
+    const GPU_PROBE_FRAMES: u64 = 10;
+    let mut proven = Vec::new();
+    if !crate::encode::ffmpeg::available() {
+        return proven;
+    }
+    for name in names {
+        let Some(name) = FfmpegEncoder::static_name(name) else {
+            continue;
+        };
+        child::emit(&format!("{}{name}:gpu", child::PROGRESS));
+        let t = std::time::Instant::now();
+        let encoded = FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false)
+            .and_then(|mut encoder| {
+                let input = encoder.rate_stats().input;
+                if !input.gpu {
+                    anyhow::bail!("it opened on CPU frames ({})", input.reason);
+                }
+                let mut bytes = 0usize;
+                for i in 0..GPU_PROBE_FRAMES {
+                    let frame = probe_iosurface_frame(i)?;
+                    bytes += encoder
+                        .encode_sync(&frame)?
+                        .iter()
+                        .map(|p| p.data.len())
+                        .sum::<usize>();
+                    if bytes > 0 {
+                        break;
+                    }
+                }
+                if bytes == 0 {
+                    anyhow::bail!("{GPU_PROBE_FRAMES} IOSurface frames encoded to nothing");
+                }
+                Ok(bytes)
+            });
+        match encoded {
+            Ok(bytes) => {
+                tracing::info!(
+                    encoder = name,
+                    bytes,
+                    elapsed_ms = t.elapsed().as_millis(),
+                    "caps probe: GPU-input form proven"
+                );
+                proven.push(name.to_string());
+            }
+            Err(e) => tracing::info!(
+                encoder = name,
+                %e,
+                elapsed_ms = t.elapsed().as_millis(),
+                "caps probe: GPU-input form not proven — sessions take CPU frames"
+            ),
+        }
+    }
+    proven
+}
+
+/// FR-118 P5 — a probe frame on an IOSurface: a gradient that moves with
+/// `index`, so consecutive frames differ.
+#[cfg(all(
+    target_os = "macos",
+    feature = "scrap-capture",
+    feature = "ffmpeg-encoder"
+))]
+fn probe_iosurface_frame(index: u64) -> anyhow::Result<crate::capture::Frame> {
+    use crate::capture::{Damage, Frame, FrameData, PixelFormat};
+    let (w, h) = (PROBE_WIDTH, PROBE_HEIGHT);
+    let surface = crate::capture::iosurface_frame::new_bgra(w, h, |x, y, c| {
+        let v = ((x + y + index as u32 * 16) & 0xff) as u8;
+        match c {
+            0 => v,
+            1 => v.wrapping_mul(3),
+            2 => 255 - v,
+            _ => 0xff,
+        }
+    })?;
+    Ok(Frame {
+        width: w,
+        height: h,
+        stride: surface.stride(),
+        pixel_format: PixelFormat::Bgra,
+        data: FrameData::IoSurface(surface),
+        monotonic_us: index * 16_667,
+        monitor: 0,
+        damage: Damage::Unknown,
+        source: None,
+    })
+}
+
+#[cfg(not(any(
+    all(
+        target_os = "windows",
+        feature = "system-context",
+        feature = "mf-encoder",
+        feature = "scrap-capture",
+        feature = "ffmpeg-encoder"
+    ),
+    all(
+        target_os = "macos",
+        feature = "scrap-capture",
+        feature = "ffmpeg-encoder"
+    )
 )))]
 fn probe_gpu(_names: &[String]) -> Vec<String> {
     Vec::new()
@@ -1556,10 +1697,27 @@ fn install_gpu_input(proven: Vec<String>) {
     crate::encode::ffmpeg::gpu_input::install_proven(proven);
 }
 
-#[cfg(not(all(
-    target_os = "windows",
+/// FR-118 P5 — VideoToolbox's GPU forms the probe proved.
+#[cfg(all(
+    target_os = "macos",
     feature = "ffmpeg-encoder",
-    any(feature = "mf-encoder", feature = "wgc-capture")
+    feature = "scrap-capture"
+))]
+fn install_gpu_input(proven: Vec<String>) {
+    crate::encode::ffmpeg::vt_input::install_proven(proven);
+}
+
+#[cfg(not(any(
+    all(
+        target_os = "windows",
+        feature = "ffmpeg-encoder",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ),
+    all(
+        target_os = "macos",
+        feature = "ffmpeg-encoder",
+        feature = "scrap-capture"
+    )
 )))]
 fn install_gpu_input(_proven: Vec<String>) {}
 
@@ -3962,6 +4120,51 @@ mod tests {
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu,hevc_nvenc:gpu") };
         assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv"]);
+    }
+
+    /// FR-118 P5, AC6's probe half on macOS — the GPU-input phase tries
+    /// VideoToolbox's 4:2:0 HEVC and H.264 cells, nothing with the switch off,
+    /// and no cell either denylist names (the session's half is `vt_input`'s
+    /// `plan_reads_every_gate_at_the_open`).
+    #[cfg(all(
+        target_os = "macos",
+        feature = "ffmpeg-encoder",
+        feature = "scrap-capture"
+    ))]
+    #[test]
+    fn the_gpu_phase_tries_only_videotoolbox_cells_a_session_may_open() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cells = Saved::cleared("ENCODER_CELLS_DENY");
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let cell = |codec, backend| VideoCell::new(codec, backend, &[ChromaFormat::Yuv420], true);
+        let caps = AgentCaps {
+            video_cells: vec![
+                cell(VideoCodec::Hevc, VideoBackend::VideoToolbox),
+                cell(VideoCodec::H264, VideoBackend::VideoToolbox),
+                cell(VideoCodec::Av1, VideoBackend::VideoToolbox),
+            ],
+            ..AgentCaps::default()
+        };
+        assert!(child::candidates_gpu(&caps).is_empty(), "the switch is off");
+        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+        unsafe { set("ZERO_COPY", "1") };
+        assert_eq!(
+            child::candidates_gpu(&caps),
+            vec!["hevc_videotoolbox", "h264_videotoolbox"],
+            "AV1 opens on no shipped Mac"
+        );
+        // SAFETY: as above.
+        unsafe { set("ZERO_COPY_DENY", "hevc_videotoolbox:gpu") };
+        assert_eq!(child::candidates_gpu(&caps), vec!["h264_videotoolbox"]);
+        // SAFETY: as above.
+        unsafe { set("ZERO_COPY_DENY", "none") };
+        // SAFETY: as above.
+        unsafe { set("ENCODER_CELLS_DENY", "h264_videotoolbox:yuv420") };
+        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_videotoolbox"]);
     }
 
     /// FR-118 P3 — the GPU phase proves NVENC's GPU-input forms on an NVIDIA

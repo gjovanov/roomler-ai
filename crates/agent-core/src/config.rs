@@ -1602,10 +1602,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub fps_deny: Option<String>,
     /// FR-118 — keep a captured frame on the GPU until the encoder takes it
-    /// (`ROOMLERD_ZERO_COPY`): the SystemContext DXGI arm delivers GPU frames,
-    /// and a QSV encoder whose GPU-input form the capability probe proved takes
-    /// them without a CPU copy. Built-in: off. Read when a capture or an
-    /// encoder opens and by the probe, so a change needs a restart.
+    /// (`ROOMLERD_ZERO_COPY`): the SystemContext DXGI arm's frames go to QSV,
+    /// the WGC arm's to NVENC, and on macOS the display stream's IOSurfaces to
+    /// VideoToolbox, each without a CPU copy once the capability probe has
+    /// proven that encoder's GPU-input form. Built-in: off. Read when a capture
+    /// or an encoder opens and by the probe, so a change needs a restart. On a
+    /// supervised Mac the root's value binds the GUI worker.
     #[serde(default)]
     pub zero_copy: Option<bool>,
     /// FR-118 — GPU-input cells this device must not open, comma-separated

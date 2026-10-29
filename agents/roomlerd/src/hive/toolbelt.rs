@@ -1954,9 +1954,16 @@ pub fn relay_args() -> Option<PathBuf> {
     Some(PathBuf::from(socket))
 }
 
-/// Pipe this process's stdin and stdout to the session's toolbelt until
-/// either side ends. The relay is bytes only: every message is read, bounded
-/// and answered by the daemon.
+/// Pipe this process's stdin and stdout to the session's toolbelt for the
+/// whole run (P8-0's point 1). Claude Code starts this once a session and
+/// never again, so it must never see it exit for a worker's sake: a dropped
+/// connection answers whatever was waiting with a JSON-RPC error and
+/// reconnects, with backoff, until the daemon hands a fresh worker the same
+/// listener — replaying the run's own `initialize` and
+/// `notifications/initialized` so the new worker starts where the old one
+/// left off. The one failure this does NOT absorb is the very first dial:
+/// nothing has run yet for anything to reconnect to, so that one is fatal,
+/// exactly as before P8.
 pub async fn relay(socket: &Path) -> anyhow::Result<()> {
     relay_io(socket, tokio::io::stdin(), tokio::io::stdout()).await
 }
@@ -1998,30 +2005,256 @@ pub(crate) async fn connect(
     }
 }
 
+/// How long a line that arrives while the relay is reconnecting waits before
+/// it, too, is answered the restarted error (P8-0's point 1). Several lines
+/// in the same window share it rather than each getting its own fresh 10 s:
+/// Claude Code sends one tool call at a time and waits for its answer
+/// (measured — see [`APPROVAL_TIMEOUT`]'s own note), so this only matters
+/// for the rare notification that arrives mid-reconnect.
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(10);
+/// Between dial attempts while reconnecting — quick enough that several fit
+/// inside [`RECONNECT_GIVE_UP`], slow enough not to hot-loop a socket the
+/// daemon is still rebinding for a restarting worker.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// JSON-RPC's own reserved range for an implementation-defined server error
+/// starts here; this one means "ask again, nothing is wrong with the call
+/// itself."
+const RESTARTED: i64 = -32000;
+
+type ToolbeltRead = Box<dyn AsyncRead + Unpin + Send>;
+type ToolbeltWrite = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// The run's own `initialize` and `notifications/initialized`, kept
+/// verbatim so a fresh worker is replayed byte for byte (P8-0's point 1).
+#[derive(Default)]
+struct Handshake {
+    initialize: Option<Vec<u8>>,
+    initialized: Option<Vec<u8>>,
+}
+
+impl Handshake {
+    /// The first of each, never a later one of the same name — there should
+    /// be only one per run, and a second mid-run is not this relay's to
+    /// interpret.
+    fn remember(&mut self, v: &Value, raw: &[u8]) {
+        match v.get("method").and_then(Value::as_str) {
+            Some("initialize") if self.initialize.is_none() => {
+                self.initialize = Some(raw.to_vec());
+            }
+            Some("notifications/initialized") if self.initialized.is_none() => {
+                self.initialized = Some(raw.to_vec());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `v`'s id where `v` is a REQUEST (a method and a non-null id) — a
+/// notification or a response has nothing for a failure to answer later.
+fn request_id(v: &Value) -> Option<Value> {
+    v.get("method")?;
+    v.get("id").filter(|i| !i.is_null()).cloned()
+}
+
+/// Drop `v`'s id from `inflight` where `v` is a response to one of them.
+fn forget_inflight(inflight: &mut Vec<Value>, v: &Value) {
+    let Some(id) = v.get("id").filter(|i| !i.is_null()) else {
+        return;
+    };
+    inflight.retain(|w| w != id);
+}
+
+/// Answer every one of `ids` the way the harness sees a tool call whose
+/// worker died mid-flight: a JSON-RPC error it and the model can read,
+/// never a transport failure (P8-0's point 1).
+async fn fail_inflight(
+    output: &mut (impl AsyncWrite + Unpin),
+    ids: Vec<Value>,
+) -> std::io::Result<()> {
+    for id in ids {
+        let line = error(&id, RESTARTED, "the session's tools restarted: call again");
+        output.write_all(line.as_bytes()).await?;
+        output.write_all(b"\n").await?;
+    }
+    output.flush().await
+}
+
+/// The same answer for whatever queued up while reconnecting and ran out of
+/// patience; a notification among them gets none — nothing was ever going
+/// to answer it.
+async fn fail_queue(
+    output: &mut (impl AsyncWrite + Unpin),
+    queue: Vec<(Vec<u8>, Option<Value>)>,
+) -> std::io::Result<()> {
+    let ids = queue
+        .into_iter()
+        .filter_map(|(_, parsed)| parsed.and_then(|v| request_id(&v)))
+        .collect();
+    fail_inflight(output, ids).await
+}
+
+/// Bring a freshly dialed worker up to where the harness already believes
+/// the run is: `initialize`, whose answer is swallowed (the harness already
+/// has its first run's), then `notifications/initialized`. Either is
+/// skipped where the drop happened before the harness ever sent it.
+async fn replay(
+    hs: &Handshake,
+    lines: &mut LineReader<BufReader<ToolbeltRead>>,
+    wr: &mut ToolbeltWrite,
+) -> std::io::Result<()> {
+    if let Some(init) = &hs.initialize {
+        wr.write_all(init).await?;
+        wr.write_all(b"\n").await?;
+        lines.next_line().await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no reply to the replayed initialize",
+            )
+        })?;
+    }
+    if let Some(ready) = &hs.initialized {
+        wr.write_all(ready).await?;
+        wr.write_all(b"\n").await?;
+    }
+    Ok(())
+}
+
+/// Dial `socket` once and replay `hs` onto it. `Err` here is [`reconnect`]'s
+/// to retry — never this function's.
+async fn dial_and_replay(
+    socket: &Path,
+    hs: &Handshake,
+) -> std::io::Result<(LineReader<BufReader<ToolbeltRead>>, ToolbeltWrite)> {
+    let (rd, wr) = connect(socket).await?;
+    let mut lines = LineReader::new(BufReader::new(Box::new(rd) as ToolbeltRead), MAX_MESSAGE);
+    let mut wr: ToolbeltWrite = Box::new(wr);
+    replay(hs, &mut lines, &mut wr).await?;
+    Ok((lines, wr))
+}
+
+/// Redial `socket` with backoff, queueing whatever the harness sends
+/// meanwhile. A line already in flight when the connection dropped was
+/// failed before this was called ([`fail_inflight`]); a line that arrives
+/// HERE, while reconnecting, is queued and gets at most
+/// [`RECONNECT_GIVE_UP`] before it is failed the same way — but dialing
+/// itself never gives up, so the harness never sees this server die
+/// (P8-0's point 1).
+#[allow(clippy::too_many_arguments)]
+async fn reconnect(
+    socket: &Path,
+    hs: &Handshake,
+    stdin: &mut LineReader<BufReader<impl AsyncRead + Unpin>>,
+    output: &mut (impl AsyncWrite + Unpin),
+    queue: &mut Vec<(Vec<u8>, Option<Value>)>,
+    toolbelt_lines: &mut LineReader<BufReader<ToolbeltRead>>,
+    toolbelt_wr: &mut ToolbeltWrite,
+    inflight: &mut Vec<Value>,
+) -> anyhow::Result<()> {
+    let mut window = Box::pin(tokio::time::sleep(RECONNECT_GIVE_UP));
+    loop {
+        let mut attempt = Box::pin(dial_and_replay(socket, hs));
+        loop {
+            tokio::select! {
+                dialed = &mut attempt => {
+                    let Ok((lines, wr)) = dialed else { break };
+                    *toolbelt_lines = lines;
+                    *toolbelt_wr = wr;
+                    for (line, parsed) in queue.drain(..) {
+                        toolbelt_wr.write_all(&line).await?;
+                        toolbelt_wr.write_all(b"\n").await?;
+                        if let Some(id) = parsed.as_ref().and_then(request_id) {
+                            inflight.push(id);
+                        }
+                    }
+                    return Ok(());
+                }
+                got = stdin.next_line() => {
+                    let Some(line) = got? else {
+                        fail_queue(output, std::mem::take(queue)).await?;
+                        return Ok(());
+                    };
+                    if !line.is_empty() {
+                        let parsed = serde_json::from_slice::<Value>(&line).ok();
+                        queue.push((line, parsed));
+                    }
+                }
+                () = &mut window => {
+                    fail_queue(output, std::mem::take(queue)).await?;
+                    window = Box::pin(tokio::time::sleep(RECONNECT_GIVE_UP));
+                }
+            }
+        }
+        tokio::time::sleep(RECONNECT_BACKOFF).await;
+    }
+}
+
 async fn relay_io(
     socket: &Path,
-    mut input: impl AsyncRead + Unpin,
+    input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    let (mut rd, mut wr) = connect(socket).await.with_context(|| {
+    let (rd, wr) = connect(socket).await.with_context(|| {
         format!(
             "the session's toolbelt at {} is unreachable",
             socket.display()
         )
     })?;
-    let up = async {
-        let _ = tokio::io::copy(&mut input, &mut wr).await;
-        let _ = wr.shutdown().await;
-    };
-    let down = async {
-        let _ = tokio::io::copy(&mut rd, &mut output).await;
-        let _ = output.flush().await;
-    };
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
+    let mut toolbelt_lines =
+        LineReader::new(BufReader::new(Box::new(rd) as ToolbeltRead), MAX_MESSAGE);
+    let mut toolbelt_wr: ToolbeltWrite = Box::new(wr);
+    let mut stdin = LineReader::new(BufReader::new(input), MAX_MESSAGE);
+    let mut hs = Handshake::default();
+    let mut inflight: Vec<Value> = Vec::new();
+
+    loop {
+        tokio::select! {
+            got = stdin.next_line() => {
+                let Some(line) = got? else { return Ok(()) };
+                if line.is_empty() {
+                    continue;
+                }
+                let parsed = serde_json::from_slice::<Value>(&line).ok();
+                if let Some(v) = &parsed {
+                    hs.remember(v, &line);
+                }
+                let sent = toolbelt_wr.write_all(&line).await.is_ok()
+                    && toolbelt_wr.write_all(b"\n").await.is_ok();
+                if sent {
+                    if let Some(id) = parsed.as_ref().and_then(request_id) {
+                        inflight.push(id);
+                    }
+                } else {
+                    fail_inflight(&mut output, std::mem::take(&mut inflight)).await?;
+                    let mut queue = vec![(line, parsed)];
+                    reconnect(
+                        socket, &hs, &mut stdin, &mut output, &mut queue,
+                        &mut toolbelt_lines, &mut toolbelt_wr, &mut inflight,
+                    ).await?;
+                }
+            }
+            line = toolbelt_lines.next_line() => {
+                match line {
+                    Ok(Some(line)) if !line.is_empty() => {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+                            forget_inflight(&mut inflight, &v);
+                        }
+                        output.write_all(&line).await?;
+                        output.write_all(b"\n").await?;
+                        output.flush().await?;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        fail_inflight(&mut output, std::mem::take(&mut inflight)).await?;
+                        let mut queue = Vec::new();
+                        reconnect(
+                            socket, &hs, &mut stdin, &mut output, &mut queue,
+                            &mut toolbelt_lines, &mut toolbelt_wr, &mut inflight,
+                        ).await?;
+                    }
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

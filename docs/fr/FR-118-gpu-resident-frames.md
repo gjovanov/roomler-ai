@@ -209,11 +209,11 @@ flowchart LR
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b in 0.4.181. The fleet read is AC1, done 2026-10-28 (§9.5) |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
-| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7). AMF not built: the measurement found no need for it |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7), field-verified on 0.4.186 the same day (§9.8, AC5). AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
-| P5 | macOS: IOSurface → VideoToolbox | the same | — |
-| P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
-| P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own |
+| P5 | macOS: IOSurface → VideoToolbox | the same; on a supervised Mac the root's values reach the GUI worker | **built 2026-10-29** (§5.8), chosen by open decision 6 the same day: VideoToolbox's CPU conversion is 70–87 % of its encode stage (§9.5). The display stream's IOSurface reaches `hevc_videotoolbox` and `h264_videotoolbox` as a CVPixelBuffer over the same memory, marked BT.601, because VideoToolbox converts an unmarked buffer with BT.709. Unreleased; its field run is AC7's |
+| P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | **deferred** (open decision 6, 2026-10-29): VAAPI's conversion and upload are 1.2 ms of a 4.1 ms stage, on the one 1600×900 virtual desktop that runs it (§9.5) |
+| P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own. **P5's half written** 2026-10-29: the VideoToolbox rows in both docs |
 
 P0 decides the rest. If convert + copy + upload turn out to be a small share of the encode stage on a backend,
 that backend's phase is not built, and the reason is recorded here.
@@ -535,6 +535,80 @@ the wrong reason stayed for the rest of the session.
   drops the GPU pool and costs a second blocking reopen at session start. The field has not shown it: CORPLAP-3's
   sessions open straight onto a GPU frame at the native size, with no frame-rate swap at start.
 
+### 5.8 P5 — VideoToolbox takes the IOSurface, as built (2026-10-29)
+
+AC1's week put VideoToolbox's CPU conversion at 70–87 % of its encode stage (§9.5). With CPU frames, the scrap arm
+copies each IOSurface the display stream delivers, the encoder converts the BGRA to NV12 on the CPU, and FFmpeg copies
+that into a CVPixelBuffer for VideoToolbox. P5 keeps the surface. The capture hands it on with its use count, the
+encoder wraps it in a CVPixelBuffer over the same memory (`CVPixelBufferCreateWithIOSurface`, no copy), and
+VideoToolbox converts the BGRA on the GPU. It reuses P2's switch, denylist, `gpu` probe phase and `unproven` gate. An
+IOSurface is not bound to a device the way a D3D11 texture is, so there is no adapter rule.
+
+```mermaid
+flowchart LR
+  subgraph probe["caps::detect (switch on)"]
+    C[candidates_gpu<br/>hevc_videotoolbox · h264_videotoolbox] --> G["child gpu<br/>each opened in its GPU form,<br/>fed IOSurface frames until a packet"]
+    G -->|proven| P["vt_input: the proven list"]
+  end
+  S["CGDisplayStream<br/>BGRA IOSurface, a queue of 3"] -->|"Frame::into_surface<br/>(the use count moves with it)"| F[IoSurfaceFrame]
+  F -->|"CVPixelBufferCreateWithIOSurface<br/>+ the BT.601 matrix attached"| B[CVPixelBuffer<br/>over the same memory]
+  M["a frame in memory<br/>(the 2× CPU downscale)"] -->|"one copy into a pool buffer"| B
+  B -->|"AV_PIX_FMT_VIDEOTOOLBOX, data[3]"| E["hevc_videotoolbox · h264_videotoolbox<br/>VideoToolbox converts the BGRA"]
+  F -.->|"cpu(): only when a consumer asks"| R[read back once]
+```
+
+| Piece | What it is | Where |
+|---|---|---|
+| the capture's surface | with the switch on, the scrap arm hands on the display stream's IOSurface instead of copying it (`whole_frame`). scrap's `Frame::into_surface` gives the caller the frame's retain and use count, which the frame's own `Drop` would have returned. The 2× CPU downscale keeps its copy | `capture/scrap_backend.rs:137`, `:532`; `crates/vendored/scrap/src/quartz/frame.rs:54` |
+| `IoSurfaceFrame` | `FrameData::IoSurface`: the surface and its use count, shared by every clone and returned (use count, then retain) when the last clone goes. A consumer that needs bytes reads it back once, under the surface's read-only lock | `capture/iosurface_frame.rs:82`, `:59`, `:158`; `capture/mod.rs:220` |
+| `VtInput` | one per encoder. An IOSurface frame becomes a CVPixelBuffer over the same surface. A frame in memory is copied once into a buffer from an IOSurface-backed BGRA pool. Either reaches FFmpeg as `AV_PIX_FMT_VIDEOTOOLBOX` with the buffer in `data[3]`, and the frame's release lets the buffer and the surface go when FFmpeg is done with them | `encode/ffmpeg/vt_input.rs:233`, `:252`, `:272`, `:391` |
+| the colour | `wrap` attaches the BT.601 matrix (`kCVImageBufferYCbCrMatrix_ITU_R_601_4`) to every buffer, so VideoToolbox converts as the CPU path does (below) | `encode/ffmpeg/vt_input.rs:341` |
+| the open | `vt_input::plan` reads the gates at every open, in AC6's order: `switch_off`, `no_gpu_cell`, `denied`, `unproven`. The GPU form opens as `AV_PIX_FMT_VIDEOTOOLBOX` with no `hw_frames_ctx` and `sw_pix_fmt` BGRA; FFmpeg 9.0.1's `videotoolboxenc.c` reads `sw_pix_fmt` only for its profile and alpha choices (checked in the source). A failed open falls back to CPU frames (`open_failed`) | `encode/ffmpeg/vt_input.rs:146`; `encode/ffmpeg/encoder.rs:2064`, `:1840` |
+| the encode | `encode_through_vt`: the wrap counts as the stage's conversion, and there is no upload | `encode/ffmpeg/encoder.rs:2906` |
+| the cells | `hevc_videotoolbox` and `h264_videotoolbox` at 4:2:0 | `encode/ffmpeg/vt_input.rs:96` |
+| the probe | `candidates_gpu` takes the VideoToolbox cells, minus both denylists. `probe_gpu` opens each in its GPU form and feeds it IOSurface frames it makes itself (`new_bgra`), at most 10, until a packet comes out | `encode/caps.rs:680`, `:1015`, `:1079`; `capture/iosurface_frame.rs:226` |
+| the supervised Mac | the GUI worker captures, runs its own probe and opens the session's encoders, so the root's `zero_copy` and `zero_copy_deny` are forwarded to it at spawn, as `encoder_cells_deny` is. Before P5 neither was: a root-side `zero_copy_deny` would have bound nothing the worker opened | `macos_supervisor.rs:322` |
+
+- **Colour: every buffer is marked BT.601** (open decision 3). VideoToolbox converts an unmarked BGRA buffer with
+  BT.709. On the MacBook, 75 % green decoded at Y 133 where the CPU path's BT.601 gives 112, and the worst plane
+  differed by 21 code values (§9, 2026-10-29). Setting the session's `colorspace` and `color_range` tags the stream
+  BT.601 and still converts with BT.709 (worst 21 again). Attaching the BT.601 matrix to each buffer changes the
+  conversion: every plane of the eight test bars then decodes within 2 code values of the CPU path, AC3's bound. Both
+  streams stay untagged, as before (#3049).
+- **Surfaces in flight.** CGDisplayStream draws into a queue of 3 surfaces (scrap's `queue_length`) and does not
+  reuse one while its use count is held, which is why scrap holds one per frame. The CPU path holds a surface only
+  while it copies it. The GPU path holds it until VideoToolbox has encoded it and FFmpeg lets the buffer go, and the
+  pump keeps its last frame for the idle keepalive. So §4.4's "never outlive one frame period" does not hold: on a
+  still screen the keepalive's frame keeps one surface, leaving the stream two. With VideoToolbox done with each
+  frame before the next arrives, the GPU path holds two of the three between frames. The field run reads the frame
+  rate on both legs; a deeper queue under the switch is the remedy if the switch-on leg loses frames.
+- **`input_path=gpu` on a Mac** means VideoToolbox converts the BGRA. It holds for a frame in memory too: the 2× CPU
+  downscale's output, or a frame the pump substitutes, is copied once into a pool buffer, where the CPU form converted
+  it to NV12 on the CPU. So `cpu_frames` and `adapter_mismatch` never appear on a Mac.
+- **Tests** (macOS, run on the MacBook: Apple M5 Pro, macOS 27.0.1. No CI lane builds FFmpeg for macOS):
+  - `capture::iosurface_frame`: `an_iosurface_frame_reads_back_the_bytes_its_surface_holds`,
+    `a_frame_holds_the_surface_until_its_last_clone_goes`, `cpu_mut_turns_an_iosurface_frame_into_a_cpu_frame`.
+  - `encode::ffmpeg::vt_input`: `plan_reads_every_gate_at_the_open`;
+    `a_surface_frame_holds_its_surface_until_the_encoder_lets_go`;
+    `videotoolbox_encodes_iosurface_and_memory_frames_in_its_gpu_form` (HEVC and H.264 at 480×270, both kinds of
+    frame); `the_gpu_form_encodes_the_bars_as_the_cpu_form_does` (the colour, above).
+  - `the_gpu_phase_tries_only_videotoolbox_cells_a_session_may_open`, `the_zero_copy_switch_is_off_unless_it_says_on`,
+    and `the_worker_inherits_the_roots_session_knobs_and_nothing_else` with the two new keys. With the rest of
+    `macos_supervisor::`, 37 tests pass.
+  - The whole `encode::` suite with `scrap-capture` and `ffmpeg-encoder`: 529 pass. The one failure,
+    `caps_always_report_permission_state`, fails the same way on master when run over SSH, where there is no GUI
+    session (`no-gui-session` is not on its list).
+  - Clippy on the release feature set without `audio` (its libopus build needs cmake, which that Mac lacks) flags
+    nothing in P5's files. CI's macOS `scrap-capture` checks pass, and the config crate's suite passes on Windows.
+- **Negative controls**, all four in one run, each failing only its own tests: without the BT.601 mark the colour test
+  fails (worst 21.0); a `Held` that never returns its use count fails the three hold tests (`left: 1, right: 0`);
+  `plan` without the `unproven` gate fails the gate test (`left: "gpu", right: "unproven"`); the candidates without
+  the cell filter fail the phase test (`av1_videotoolbox` joins them). The readback test and the encode test pass
+  under all four.
+- **Not yet:** the release, and AC7's field run: a Mac with the switch on and off, 20-minute legs on AC3's pattern,
+  read on capture + encode per frame, the worker's CPU per encoded frame, the frame rate, decode errors and the
+  pattern's colour.
+
 ## 6. Acceptance criteria
 
 - [x] **AC1 — the split, measured.** P0 has shipped, and a fleet week is read per encoder × geometry into the
@@ -572,8 +646,10 @@ the wrong reason stayed for the rest of the session.
 - [ ] **AC4 — the slow laptop.** A host at ≥ 2560×1600 on QSV reaches a peak of **≥ 50 fps** with the switch on;
   §2.2's 2880×1800 laptop peaked at 29.4 over 590 windows. If P0 shows the hardware encode itself is the bound
   there, this AC records the measured bound instead, and why. *(The first field host is 1920×1200, so it cannot
-  answer this; §2.2's host is not available for test sessions.)*
-- [ ] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
+  answer this; §2.2's host is not available for test sessions.)* *(2026-10-29, open decision 7: the run goes on
+  §2.2's laptop after all, in a window its owner agrees to. It is switch-on and switch-off legs like AC3's, and its
+  red record is §9.5: an encode stage of 19.1 ms, 16.4 ms of it in `send_frame`, and a 7.3 ms readback.)*
+- [x] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
   *(The first field host captures on its Intel adapter, so it has no mismatch to show. P3 adds NVENC's half of the
   rule, unit-tested on neo16's Radeon (§5.6). On a hybrid host P3 moves WGC's device to the NVIDIA adapter, so
@@ -584,7 +660,11 @@ the wrong reason stayed for the rest of the session.
   `input_reason=cpu_frames`: a background replacement opened before the refusal was adopted after it and
   overwrote the reason (#3071). The box stays open until the heartbeat carries the reason.)* *(2026-10-29,
   §5.7: #3071's fix keeps the refusal's reason through an adoption. The field half reads once a release carries
-  it: the same neo16 session shape, its heartbeat at `input_reason=adapter_mismatch`.)*
+  it: the same neo16 session shape, its heartbeat at `input_reason=adapter_mismatch`.)* **Met 2026-10-29** (§9.8):
+  neo16 on agent 0.4.186, the session shape of §9.6 (the DXGI arm on the Radeon, `av1_nvenc` on the RTX 5090,
+  1916×1198, 144 fps asked). NVENC refused the frames (`adapter_mismatch`), the device follow reopened on CPU
+  frames, and FR-119's frame-rate replacement was adopted, as on 0.4.183. All 10 heartbeats read
+  `input_path=cpu input_reason=adapter_mismatch`, where every 0.4.183 heartbeat read `cpu_frames`.
 - [x] **AC6 — the gate holds at every entry point.** With the switch off, or the cell denied, neither the probe
   nor a session opens the GPU-input form. Tested at both entry points. **Met 2026-10-28.** Both halves are
   unit-tested at both entry points (P2-3, §5.5), and both were seen in the field on agent 0.4.181 (§9.2). With the
@@ -603,12 +683,24 @@ the wrong reason stayed for the rest of the session.
   encode 18.26 → 5.14 and 5.23 ms a frame; the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame; the pattern
   identical on both paths; no decode error; no keyframes beyond those the host's other load caused. On this arm
   AC3's "capture + encode" reads as readback + encode, because WGC reads back off the pump's clock. Still owed:
-  VideoToolbox and VAAPI, neither built.)*
-- [ ] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
+  VideoToolbox and VAAPI, neither built.)* *(2026-10-29, open decision 6: VideoToolbox (P5) is built next and
+  verified like AC3. VAAPI (P6) is deferred with its measurement: its conversion and upload are 0.7 + 0.5 ms of a
+  4.1 ms encode stage, on the one 1600×900 virtual desktop that runs it (§9.5).)* *(2026-10-29, §5.8: **VideoToolbox
+  (P5) is built.** The display stream's IOSurface reaches `hevc_videotoolbox` and `h264_videotoolbox` with no CPU copy
+  and no CPU conversion, and on the MacBook the test bars decode within 2 code values of the CPU path. Its field run
+  is owed, on a release that carries it.)*
+- [~] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
   Linked from `docs/README.md`. *(P2's half written 2026-10-28: `encoders.md` § GPU-resident frames, with the
   input reasons and the configuration rows; `remote-control.md` §5.1f, with both arms' frame paths and the field
   numbers; both index rows. Ticked when the last cell is in them, as FR-108's AC8 is.)*
+  *(2026-10-29, #3099: **met for every built cell.** `encoders.md`'s GPU-input section no longer calls P3
+  "unreleased": QSV (0.4.181, §9.3) and NVENC on the WGC arm (0.4.183, §9.7) read as field-verified and released,
+  with AMF's deferral reason (§9.4) kept, and `remote-control.md` §5.1f and the two `docs/README.md` rows already
+  carry both arms with the measured numbers. **Not met:** the VideoToolbox and VAAPI rows, which follow their
+  cells — AC7's unbuilt remainder. So `[~]`, not `[x]`.)* *(2026-10-29, P5: the VideoToolbox rows are written,
+  in `encoders.md`'s GPU-input section and its configuration rows and in `remote-control.md` §5.1f, without field
+  numbers until AC7's run on a Mac.)*
 
 ## 7. Open decisions
 
@@ -634,6 +726,13 @@ the wrong reason stayed for the rest of the session.
    the GPU conversion's own time" cannot be read either: no heartbeat times the GPU's work. Recommended: read AC3
    on capture + encode per frame and on process CPU, which is what the GPU input saves, and drop the share
    arithmetic. **Decided by the operator, 2026-10-28: as recommended.** AC3 is reworded.
+6. **VideoToolbox (P5) and VAAPI (P6): build or defer** (raised by AC1's week, §9.5). VideoToolbox's CPU
+   conversion is 70–87 % of its encode stage, the largest share any backend can still remove. VAAPI's conversion
+   and upload are 1.2 ms of a 4.1 ms stage, on one 1600×900 virtual desktop. Recommended: build P5 now and defer
+   P6 with that measurement. **Decided by the operator, 2026-10-29: as recommended.**
+7. **AC4's host** (raised 2026-10-29). The only QSV host at ≥ 2560×1600 in a full fleet week is §2.2's laptop,
+   which was not a test host. The options: move AC4 to a follow-up issue, keep it open, or run it on that laptop
+   in a window its owner agrees to. **Decided by the operator, 2026-10-29: the window.**
 
 ## 8. Out of scope
 
@@ -658,6 +757,8 @@ the wrong reason stayed for the rest of the session.
 | 2026-10-28 | fleet, agents 0.4.150–0.4.182, 2026-10-21 20:14Z → 2026-10-28 20:14Z | every FFmpeg DC heartbeat on the CPU path: 27 encoder × geometry groups of ≥ 10 windows, and the readback over the windows that measured one | **AC1, the red record** (§9.5). Conversion and copy are 15–35 % of the encode stage on QSV, with `send_frame` and the drain 60–83 %. On NVENC they are 10–23 % against 75–89 %. On VideoToolbox the conversion is 70–87 %. WGC's readback is 5.7–6.1 ms at 2560×1600 over the week. The DXGI arm's (P0b, 0.4.181–0.4.182, 16 hours) is 3.4–4.1 ms at 1080p and 1200p and 7.3 ms on §2.2's 2880×1800 laptop. **AC1 met** |
 | 2026-10-28 | agent 0.4.183, neo16: `zero_copy` on, the SystemContext DXGI arm on the Radeon 610M, `av1_nvenc` on the RTX 5090; a local-pair session 21:11:06–21:14:00Z | **P3's first field contact** (§9.6). The probe's `gpu` child proved `hevc_nvenc`, `av1_nvenc` and `h264_nvenc` in 357 ms. The capture was not WGC: the service has run the SystemContext swap since 08:25Z, so the DXGI arm captured on the panel's adapter, and NVENC refused its frames with `adapter_mismatch`. The session ran on CPU frames, read back inside the encoder's conversion. The heartbeat's reason read `cpu_frames`, a race (#3071). The WGC arm's run needs a user-context capture |
 | 2026-10-29 | agents 0.4.183 (ON1) and 0.4.184 (OFF, ON2), neo16 with its SystemContext swap off for the run: WGC on the RTX 5090, `av1_nvenc` at 2560×1600 and 60 fps, a local pair, AC3's test pattern | **AC7's NVENC cell and the WGC arm, like AC3** (§9.7): 20-minute legs on, off, on. Readback + encode 18.26 → 5.14 and 5.23 ms a frame, `send_frame` 11.05 → 5.05 and 5.13 ms; the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame; the pattern identical on both paths; no decode error; every keyframe but one at an outside load spike on the host |
+| 2026-10-29 | agent 0.4.186, neo16 back on SystemContext with `zero_copy` on: the DXGI arm on the Radeon 610M, `av1_nvenc` on the RTX 5090; a local-pair session at 10:17Z | **AC5's field half** (§9.8). The session repeated §9.6: the refusal (`adapter_mismatch`), the follow's reopen, FR-119's replacement adopted. Every heartbeat read `input_reason=adapter_mismatch`, against `cpu_frames` on 0.4.183. #3071's fix (§5.7) held in the field |
+| 2026-10-29 | the P5 branch on the MacBook (Apple M5 Pro, macOS 27.0.1): `h264_videotoolbox` at 480×270, 20 frames per form, decoded by FFmpeg 9.0.1's H.264 decoder | **VideoToolbox's colour on the GPU form, measured for P5** (§5.8). Eight flat bars (black, white, grey, and 75 % red, green, blue, yellow, cyan) encoded by the CPU form and the GPU form, decoded, and compared per plane over a block inside each bar. An unmarked BGRA buffer converts with BT.709: worst plane 21 code values (75 % green Y 133 against 112). The session's `colorspace` / `color_range` tag the stream (`SMPTE170M`, limited range) and still convert with BT.709: worst 21. The BT.601 matrix attached to each buffer: worst 2.0 (75 % green U 74 against 72; white Y 234 against 235). A lab measurement, not field verification |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -992,6 +1093,29 @@ after each leg, over the frames encoded in between.
 
 **AC7's NVENC cell and the WGC arm: verified like AC3.** neo16 is back on SystemContext + `zero_copy` from
 01:19:42Z, where NVENC takes CPU frames again (`adapter_mismatch`, §9.6).
+
+### 9.8 AC5: the heartbeat names the adapter rule (2026-10-29)
+
+The red run is §9.6, agent 0.4.183 (2026-10-28 21:11Z). The green run is the same host and session shape on agent
+0.4.186, which carries #3071's fix (§5.7).
+
+| | 0.4.183, 2026-10-28 21:11Z (red) | 0.4.186, 2026-10-29 10:17Z (green) |
+|---|---|---|
+| capture | the DXGI arm, bound to the Radeon 610M | the same |
+| encode geometry | `av1_nvenc`, 1916×1198 | the same; 144 fps asked |
+| the refusal | `no GPU input for this encoder`, `reason=adapter_mismatch` | the same: `the capture device is on vendor 0x1002, not NVIDIA's` |
+| the follow's reopen | `input=cpu input_reason=adapter_mismatch` | the same |
+| FR-119's replacement | adopted (`FR-70 M2: dims swap adopted`) | adopted, 60 → 144 fps |
+| **heartbeats** | every one `input_reason=cpu_frames` | **all 10 `input_reason=adapter_mismatch`** |
+
+- **The rule held in both runs**: the GPU path was never taken. What changed is that the adopted replacement no
+  longer overwrites the refusal's reason, so the heartbeat names the cause.
+- **A red run on 0.4.185 was not possible.** The daemon restart before it ran the updater, which installed 0.4.186
+  at once (published 25 minutes earlier). Restarting a daemon after a release publishes updates it within seconds.
+- **The session needed neo16's device key back first.** The 0.4.184 restart of 01:19Z made SystemContext read the
+  machine-global config, whose directory had no `peer-auth\`, so the daemon minted new device keys. Every browser
+  that knew neo16 then refused its answer (`key-changed`, #3096). With the operator's agreement, neo16's original key
+  was restored into the machine-global directory before this run.
 
 ## 10. Related
 

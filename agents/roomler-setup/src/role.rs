@@ -12,11 +12,15 @@
 //!   (`ENABLE_SYSTEM_CONTEXT=1` WiX CA → SCM Environment write + service
 //!   restart). Linux (FR-129 B1): the root `roomlerd.service`, the TUN
 //!   overlay, config at `/etc/roomler/config.toml` — the terminal path's
-//!   `--system`. Not offered on macOS (the root half is B2).
+//!   `--system`. Not offered on macOS, where the root daemon is the root
+//!   half below, a second device beside the person's, never a role alone.
 //! - [`Role::DaemonUser`] — "be accessed, this user only". Windows: perUser
 //!   MSI (Scheduled-Task autostart under the installing user; no UAC). Linux
 //!   (B1): the systemd user unit, the overlay through the userspace netstack.
-//!   macOS (B1): the LaunchAgent, screen sharing.
+//!   macOS (B1): the LaunchAgent, screen sharing; and (B2) the ROOT HALF
+//!   beside it when the private-network box is ticked ([`wants_root_half`]):
+//!   the root LaunchDaemon that owns the overlay's utun, enrolled as its own
+//!   device from the same approval (`halves: 2`).
 //! - [`Role::DaemonMachine`] — "be accessed, attended": plain perMachine MSI
 //!   (SCM service, no SystemContext; UAC once during install). Windows-only.
 //! - [`Role::TunnelClient`] — "reach others only": the roomler tunnel CLI,
@@ -91,7 +95,8 @@ impl Scope {
 
 /// The daemon roles this OS implements, in card order. Windows keeps its
 /// three; Linux offers the system and the per-user daemon; macOS the
-/// per-user one (the root half is B2); anything else none.
+/// per-user one, which brings the root half with it ([`wants_root_half`]);
+/// anything else none.
 pub fn daemon_roles(os: HostOs) -> &'static [Role] {
     match os {
         HostOs::Windows => &[Role::DaemonSystem, Role::DaemonMachine, Role::DaemonUser],
@@ -113,6 +118,31 @@ pub fn scope_for(os: HostOs, role: Role) -> Option<Scope> {
         }
         _ => None,
     }
+}
+
+/// FR-129 B2 — does this install add the macOS root half (the root
+/// LaunchDaemon that owns the overlay's utun)? On macOS the daemon role is
+/// the per-user half, and the "Join the overlay network" box asks for the
+/// root half beside it: the mesh needs root, and the root half is a device of
+/// its own (FR-43: the hub keys sessions on `agent_id`). Nowhere else: on
+/// Linux the box is the daemon's own `overlay_enabled`, on Windows the MSI's.
+pub fn wants_root_half(os: HostOs, role: Role, overlay_box: Option<bool>) -> bool {
+    os == HostOs::Macos && role == Role::DaemonUser && overlay_box == Some(true)
+}
+
+/// FR-129 B2 — how many enrollments one approval covers: two when the
+/// install adds the macOS root half ([`wants_root_half`]), else one. The
+/// server accepts `halves: 2` for a macOS daemon only and then mints two
+/// ordinary single-use tokens (operator decision 7).
+pub fn pair_halves(root_half: bool) -> u8 {
+    if root_half { 2 } else { 1 }
+}
+
+/// FR-129 B2 — the root half's device name: the person's name for the Mac
+/// with `-daemon`, as the terminal path names it (`install.sh`'s
+/// `$NAME-daemon`), so a Mac installed either way shows the same two rows.
+pub fn root_half_name(device_name: &str) -> String {
+    format!("{device_name}-daemon")
 }
 
 /// Operator-selected role. Serialises kebab-case (`"daemon-system"` /
@@ -303,7 +333,7 @@ mod tests {
         assert_eq!(
             scope_for(HostOs::Macos, Role::DaemonSystem),
             None,
-            "the root half is B2"
+            "the macOS root daemon is the per-user role's root half, not a role"
         );
         for role in [
             Role::DaemonSystem,
@@ -326,6 +356,42 @@ mod tests {
             _ => "other",
         };
         assert_eq!(HostOs::current().wire(), expected);
+    }
+
+    /// FR-129 B2 — the root half is the macOS daemon role's, asked for by the
+    /// private-network box, and nothing else's: one approval then covers two
+    /// enrollments, and only then.
+    #[test]
+    fn only_a_macos_daemon_with_the_box_ticked_adds_the_root_half() {
+        assert!(wants_root_half(HostOs::Macos, Role::DaemonUser, Some(true)));
+        assert!(!wants_root_half(
+            HostOs::Macos,
+            Role::DaemonUser,
+            Some(false)
+        ));
+        assert!(
+            !wants_root_half(HostOs::Macos, Role::DaemonUser, None),
+            "an older SPA sends nothing"
+        );
+        for os in [HostOs::Linux, HostOs::Windows, HostOs::Other] {
+            for role in [
+                Role::DaemonSystem,
+                Role::DaemonUser,
+                Role::DaemonMachine,
+                Role::TunnelClient,
+            ] {
+                assert!(!wants_root_half(os, role, Some(true)), "{os:?} {role:?}");
+            }
+        }
+        for role in [Role::DaemonSystem, Role::DaemonMachine, Role::TunnelClient] {
+            assert!(
+                !wants_root_half(HostOs::Macos, role, Some(true)),
+                "{role:?}"
+            );
+        }
+        assert_eq!(pair_halves(true), 2);
+        assert_eq!(pair_halves(false), 1);
+        assert_eq!(root_half_name("studio-mac"), "studio-mac-daemon");
     }
 
     #[test]

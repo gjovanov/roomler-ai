@@ -1316,6 +1316,14 @@ jobs:
       - name: cargo check the setup wizard (the macOS daemon install)
         run: cargo check -p roomler-setup --lib --bins
 
+      # FR-129 B2 — the macOS root half's machine id comes from the hardware
+      # (`crates/agent-core/src/machine.rs`): `ioreg`'s IOPlatformUUID, and on
+      # a virtual Mac the VM's own en0 address. The parsers are tested on
+      # every lane against a Mac's output; only a Mac runs the real commands,
+      # and this runner is itself a VM, so it reads the virtual-Mac branch.
+      - name: cargo test the root half's machine id on a real Mac (FR-129 B2)
+        run: cargo test -p roomler-node-core --lib -- machine::tests --nocapture
+
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
         # someone's Mac, with launchctl's famously unhelpful diagnostics.
