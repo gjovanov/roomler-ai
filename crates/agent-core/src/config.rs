@@ -3842,8 +3842,8 @@ fn dotted(steps: &[KeyStep]) -> String {
 /// keying on it finds nothing, and every key on the entry is lost — the old
 /// behaviour, in exactly the array the merge exists for. `tenant_id` and not
 /// `label` for an org: `promote_org_to_primary` puts the demoted primary under
-/// the promoted org's label. A route's `id` may be empty (`#[serde(default)]`);
-/// two such routes are told apart by nothing, and [`same_entry`] finds neither.
+/// the promoted org's label. A route's `id` may be empty (`#[serde(default)]`),
+/// and an empty one is no identity: [`same_entry`] finds nothing by it.
 /// An array not named here (`forward_acl.allowlist`) has no identity, and a
 /// key inside one of its entries is dropped, with the WARN. A test holds every
 /// array of tables this build writes to naming its identity, or its lack of one.
@@ -3861,15 +3861,18 @@ fn entry_identity(array: &str) -> Option<&'static str> {
 /// promoting one puts the demoted primary at the promoted org's index
 /// (`promote_org_to_primary`), so the same index can hold another org with the
 /// array's length unchanged. A key copied onto another org would be worse than
-/// a key lost. `None` when the array has no identity, the entry does not carry
-/// it, or not exactly one entry in `out` carries the same.
+/// a key lost. `None` when the array has no identity, the entry's is absent
+/// or empty, or not exactly one entry in `out` carries the same.
 fn same_entry(array: &str, entry: &toml::Table, out: &[toml::Value]) -> Option<usize> {
     let key = entry_identity(array)?;
-    let want = entry.get(key).filter(|v| v.is_str())?;
+    let want = entry
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|s| !s.is_empty())?;
     let mut hits = out
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.get(key) == Some(want));
+        .filter(|(_, v)| v.get(key).and_then(toml::Value::as_str) == Some(want));
     let (i, _) = hits.next()?;
     hits.next().is_none().then_some(i)
 }
@@ -4599,17 +4602,38 @@ machine_name = "devbox"
         std::fs::write(path, toml::to_string_pretty(&table).unwrap()).unwrap();
     }
 
+    /// What a capturing test holds: its scoped subscriber, and a SECOND
+    /// registered dispatcher, never one alone. With exactly one registered,
+    /// tracing-core rebuilds a callsite's interest from the default of
+    /// whichever thread reaches it first (`Rebuilder::JustOne`) and caches it
+    /// for every thread: a parallel test with no subscriber of its own makes
+    /// it `never`, and the capture misses that line for good, though this
+    /// thread emitted it. Measured in CI on two of the save tests. With two,
+    /// every registered dispatcher is asked, as `pairing_terminal`'s and the
+    /// hive tests' captures hold. The scope ends first, then the second.
+    struct CaptureGuard {
+        _scoped: tracing::dispatcher::DefaultGuard,
+        _second: tracing::Dispatch,
+    }
+
     /// Everything this thread logs while the guard lives, as text.
-    fn captured() -> (Captured, tracing::subscriber::DefaultGuard) {
+    fn captured() -> (Captured, CaptureGuard) {
         use tracing_subscriber::layer::SubscriberExt;
+        let second = tracing::Dispatch::new(tracing_subscriber::registry());
         let cap = Captured::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_writer(cap.clone())
                 .with_ansi(false),
         );
-        let guard = tracing::subscriber::set_default(subscriber);
-        (cap, guard)
+        let scoped = tracing::subscriber::set_default(subscriber);
+        (
+            cap,
+            CaptureGuard {
+                _scoped: scoped,
+                _second: second,
+            },
+        )
     }
 
     /// #2078 — the identity an entry is found by is THIS build's (an org's
@@ -4759,11 +4783,11 @@ machine_name = "devbox"
         );
     }
 
-    /// #2078 — a route's `id` can be empty (`#[serde(default)]`): two such
-    /// routes are told apart by nothing, so a key on either is dropped, with
-    /// the WARN naming it, and never copied onto the other.
+    /// #2078 — a route's `id` can be empty (`#[serde(default)]`), and an empty
+    /// id is no identity: two such routes, reordered, each lose their key,
+    /// with the WARN naming both, and neither key lands on the other route.
     #[test]
-    fn routes_without_an_id_are_ambiguous_and_their_keys_are_dropped() {
+    fn routes_without_an_id_have_no_identity_and_their_keys_are_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut cfg = fixture();
@@ -4800,6 +4824,55 @@ machine_name = "devbox"
         assert!(
             log.contains("tunnel_routes.0.route_key_from_a_newer_build")
                 && log.contains("tunnel_routes.1.route_key_from_a_newer_build"),
+            "{log}"
+        );
+    }
+
+    /// #2078 — an empty route `id` is no identity even when exactly one route
+    /// has it: a 1:1 pair of empty ids is not a match. Its key is dropped, with
+    /// the WARN naming that key alone, while the key on the route beside it,
+    /// found by its `id`, is kept.
+    #[test]
+    fn a_route_with_an_empty_id_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.tunnel_routes = vec![route_fixture("", 18080), route_fixture("r1", 18081)];
+        save(&path, &cfg).unwrap();
+        for (i, port) in [(0usize, 18080i64), (1, 18081)] {
+            write_entry_key(
+                &path,
+                "tunnel_routes",
+                i,
+                "route_key_from_a_newer_build",
+                toml::Value::Integer(port),
+            );
+        }
+
+        let (cap, _guard) = captured();
+        // Same order, same index: the one pairing an empty id could match.
+        save(&path, &load(&path).unwrap()).unwrap();
+        let routes = saved_table(&path)["tunnel_routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes[0]["id"].as_str(), Some(""));
+        assert!(
+            routes[0].get("route_key_from_a_newer_build").is_none(),
+            "an empty id matched a route: {routes:?}"
+        );
+        assert_eq!(
+            routes[1]["route_key_from_a_newer_build"].as_integer(),
+            Some(18081)
+        );
+        let log = cap.text();
+        let lost = log
+            .lines()
+            .find(|l| l.contains("NOT kept"))
+            .unwrap_or_default();
+        assert!(
+            lost.contains("tunnel_routes.0.route_key_from_a_newer_build")
+                && !lost.contains("tunnel_routes.1."),
             "{log}"
         );
     }
@@ -4903,13 +4976,14 @@ machine_name = "devbox"
         }
         let mut found = Vec::new();
         arrays_of_tables("", &written, &mut found);
-        let paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
-        for want in ["orgs", "tunnel_routes", "forward_acl.allowlist"] {
-            assert!(
-                paths.contains(&want),
-                "{want} is not written as an array of tables: {paths:?}"
-            );
-        }
+        let mut paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["forward_acl.allowlist", "orgs", "tunnel_routes"],
+            "the arrays of tables this build writes changed: give the new one an identity in \
+             entry_identity or list it in NO_IDENTITY, and add it here"
+        );
         for (path, key) in &found {
             assert!(
                 entry_identity(key).is_some() || NO_IDENTITY.contains(&path.as_str()),
@@ -5808,15 +5882,7 @@ tenant_id = "tid2"
     /// BOOLEAN while telling every healthy host to re-enroll.
     #[test]
     fn a_probe_is_silent_but_load_still_demands_re_enrollment() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let cap = Captured::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(cap.clone())
-                .with_ansi(false),
-        );
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (cap, _guard) = captured();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("config.toml");

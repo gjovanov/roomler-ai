@@ -221,7 +221,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2609`, `:2631`), at the clean-run promotion
 (`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4057`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4060`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -233,13 +233,13 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:3959`):
+ignores (`serialise_for`, `:3962`):
 
 | In the file being replaced | After the save |
 |---|---|
 | a key this build does not know, top level or a whole table | kept where it was |
 | a key it does not know inside a table it knows (`[forward_acl]`) | kept inside that table |
-| a key it does not know inside an `[[orgs]]` or `[[tunnel_routes]]` entry | kept on that entry wherever the save moved it, found by the org's `tenant_id` or the route's `id` — this build's own key for that array, never one read off the entry; **dropped, with a WARN naming it,** once that entry is gone, or once two entries share the identity (two routes with an empty `id`) |
+| a key it does not know inside an `[[orgs]]` or `[[tunnel_routes]]` entry | kept on that entry wherever the save moved it, found by the org's `tenant_id` or the route's `id` — this build's own key for that array, never one read off the entry; **dropped, with a WARN naming it,** once that entry is gone, or when it has no identity (a route with an empty `id`) |
 | a key this build knows and the save cleared | stays cleared: only ignored keys are copied |
 | nothing it does not know | written exactly as before, byte for byte |
 | comments | lost, as before; keeping them needs an in-place editor |
@@ -273,8 +273,8 @@ exactly the array the merge exists for. Positions move: removing an org shifts t
 after it, and promoting an org puts the demoted primary at the promoted org's index, under
 the promoted org's label, with the array's length unchanged (`promote_org_to_primary`).
 Matched by position, or by label, a key would land on another org, which is worse than
-losing it. A route's `id` may be empty; two such routes are told apart by nothing, so a
-key on either is dropped, never copied onto the other. An array with no identity
+losing it. A route's `id` may be empty, and an empty id is no identity: a key on such a
+route is dropped, never copied onto another, even with one such route. An array with no identity
 (`[[forward_acl.allowlist]]`) drops the keys inside its entries at every save, with the
 WARN; a test holds every array of tables this build writes to naming its identity, or its
 lack of one.
@@ -287,16 +287,16 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:3943`), so the merge can only
+serialise to exactly what the struct alone would have written (`:3946`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4027`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4030`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
 `load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
-live file that does not parse, and names the copy as the base (`save_with_base`, `:4065`):
+live file that does not parse, and names the copy as the base (`save_with_base`, `:4068`):
 the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
 other save reads the file it replaces, and one over a file that does not parse says so —
 WARN *"the config being replaced does not parse: keys this build does not know in it, if
