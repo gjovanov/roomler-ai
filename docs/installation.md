@@ -183,7 +183,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3507`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3548`) |
+| `config::load` (`crates/agent-core/src/config.rs:3507`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3551`) |
 | `config::read_if_present` (`:3490`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -221,7 +221,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2609`, `:2631`), at the clean-run promotion
 (`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:3976`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4023`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -233,13 +233,13 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:3905`):
+ignores (`serialise_for`, `:3925`):
 
 | In the file being replaced | After the save |
 |---|---|
 | a key this build does not know, top level or a whole table | kept where it was |
 | a key it does not know inside a table it knows (`[forward_acl]`) | kept inside that table |
-| a key it does not know inside an `[[orgs]]` or `[[tunnel_routes]]` entry | kept on that entry wherever the save moved it, found by the org's `tenant_id` or the route's `id`; **dropped, with a WARN naming it,** once that entry is gone |
+| a key it does not know inside an `[[orgs]]` or `[[tunnel_routes]]` entry | kept on that entry wherever the save moved it, found by the org's `tenant_id` or the route's `id` — this build's own key for that array, never one read off the entry; **dropped, with a WARN naming it,** once that entry is gone, or once two entries share the identity (two routes with an empty `id`) |
 | a key this build knows and the save cleared | stays cleared: only ignored keys are copied |
 | nothing it does not know | written exactly as before, byte for byte |
 | comments | lost, as before; keeping them needs an in-place editor |
@@ -247,8 +247,9 @@ ignores (`serialise_for`, `:3905`):
 ```mermaid
 flowchart TD
     S["save(cfg)"] --> P["plain = cfg serialised"]
-    P --> R{"the file on disk parses<br/>as a config?"}
-    R -->|"no file, or no"| W["write plain"]
+    P --> R{"the base parses as a config?<br/>(the file being replaced, or on a<br/>recovery the .prev copy that loaded)"}
+    R -->|"no file"| W["write plain"]
+    R -->|"there, and no"| WP["write plain<br/>WARN: it does not parse"]
     R -->|"yes"| U{"keys this build<br/>ignores in it?"}
     U -->|"none"| W
     U -->|"some"| M["copy each into plain's table,<br/>where it was"]
@@ -258,23 +259,48 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3762`).
+keys (`unknown_keys`, `:3765`). A key this build knows is written as this build read it: a
+value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
+`audit` (`:2780`) — is rewritten to that reading, for instance after a rollback. Only the keys
+the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3812`): a route's `id`, an org's `tenant_id`, else a `label` (`ENTRY_IDENTITY`, `:3803`).
-Positions move: removing an org shifts the ones after it, and promoting an org puts the
-demoted primary at the promoted org's index, under the promoted org's label, with the
-array's length unchanged (`promote_org_to_primary`). Matched by position, or by label, a
-key would land on another org, which is worse than losing it.
+`:3832`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:3816`), never one read off the entry on disk. A newer build's
+entry can carry a key that looks like an identity (an `id` on an org) which no entry this
+build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
+exactly the array the merge exists for. Positions move: removing an org shifts the ones
+after it, and promoting an org puts the demoted primary at the promoted org's index, under
+the promoted org's label, with the array's length unchanged (`promote_org_to_primary`).
+Matched by position, or by label, a key would land on another org, which is worse than
+losing it. A route's `id` may be empty; two such routes are told apart by nothing, so a
+key on either is dropped, never copied onto the other. An array with no identity
+(`[[forward_acl.allowlist]]`) drops the keys inside its entries at every save, with the
+WARN; a test holds every array of tables this build writes to naming its identity, or its
+lack of one.
+
+⚠️ **A key at the top level stays at the top level when the primary identity changes.**
+`promote_org_to_primary` and `enroll --replace` swap the identity the file's scalar keys
+describe, and a key this build does not know beside them stays beside them. A newer build
+may scope such a key to the org and would have moved it with the demoted one; this build
+keeps it with the new primary, as `preserve_operator_config` keeps every operator setting
+with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:3891`), so the merge can only
+serialise to exactly what the struct alone would have written (`:3909`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:3946`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:3993`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
+
+`load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
+live file that does not parse, and names the copy as the base (`save_with_base`, `:4031`):
+the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
+other save reads the file it replaces, and one over a file that does not parse says so —
+WARN *"the config being replaced does not parse: keys this build does not know in it, if
+any, are NOT kept through this save"*, a fixed string, never the parser's.
 
 ⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
 TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
