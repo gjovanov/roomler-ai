@@ -3465,26 +3465,49 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// new exposure. Closing the remaining pre-planted-CONTENT hole (verify
 /// the file's OWNER at SystemContext load) is tracked for the Track-A
 /// config unification.
+///
+/// ⚠️ #3073 — the OWNER goes first ([`HARDEN_STEPS`]), and nothing else runs
+/// unless it took. Once `/inheritance:r` has removed every ACE, only the
+/// owner keeps WRITE_DAC. A directory that a user-mode process created (the
+/// desktop companion, an earlier per-user install) therefore came out sealed
+/// against SYSTEM itself: the grant failed `Access is denied`, and every
+/// later daemon start ran with no log, no crash records and no
+/// machine-global config. With Administrators as the owner, SYSTEM (a
+/// member) keeps WRITE_DAC through every later step. A grant that still
+/// fails puts inheritance back, so the save never leaves the directory with
+/// less access than it found.
 #[cfg(windows)]
 fn harden_machine_global_dir(dir: &std::path::Path) {
     let d = dir.display().to_string();
-    let steps: [&[&str]; 3] = [
-        &["/inheritance:r"],
-        &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
-        &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
-    ];
-    for args in steps {
+    for (i, args) in HARDEN_STEPS.iter().enumerate() {
         match std::process::Command::new("icacls")
             .arg(&d)
-            .args(args)
+            .args(*args)
             .output()
         {
             Ok(o) if o.status.success() => {}
-            Ok(o) => tracing::warn!(
-                dir = %d, ?args,
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "config: machine-global dir ACL hardening step failed"
-            ),
+            Ok(o) => {
+                tracing::warn!(
+                    dir = %d, ?args,
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "config: machine-global dir ACL hardening step failed"
+                );
+                match i {
+                    // Never strip inheritance from a directory we could not
+                    // take ownership of.
+                    0 => return,
+                    // Inheritance is gone but the grant did not land: put it
+                    // back rather than leave the directory sealed.
+                    2 => {
+                        let _ = std::process::Command::new("icacls")
+                            .arg(&d)
+                            .arg("/inheritance:e")
+                            .output();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             Err(e) => {
                 tracing::warn!(dir = %d, %e, "config: icacls spawn failed; dir ACL unhardened");
                 return;
@@ -3492,6 +3515,17 @@ fn harden_machine_global_dir(dir: &std::path::Path) {
         }
     }
 }
+
+/// The `icacls` steps of [`harden_machine_global_dir`], in order (#3073):
+/// take ownership for Administrators, drop inheritance, grant SYSTEM and
+/// Administrators, then remove Users and Authenticated Users down the tree.
+#[cfg(any(windows, test))]
+const HARDEN_STEPS: [&[&str]; 4] = [
+    &["/setowner", "*S-1-5-32-544"],
+    &["/inheritance:r"],
+    &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+    &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
+];
 
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
@@ -5055,6 +5089,86 @@ tenant_id = "tid2"
             read_merge_base(&path)
                 .into_config()
                 .is_some_and(|c| c.overlay_enabled)
+        );
+    }
+
+    /// #3073 — ownership comes before anything that can remove access: once
+    /// `/inheritance:r` has run, only the owner keeps WRITE_DAC.
+    #[test]
+    fn harden_takes_ownership_before_it_drops_inheritance() {
+        assert_eq!(HARDEN_STEPS[0], &["/setowner", "*S-1-5-32-544"][..]);
+        let drops = HARDEN_STEPS
+            .iter()
+            .position(|s| s.contains(&"/inheritance:r"))
+            .expect("inheritance is dropped");
+        assert!(drops > 0, "never before the owner is Administrators");
+    }
+
+    /// The DACL of `path` in SDDL, through `icacls /save` (a UTF-16 file: the
+    /// object's name, then its descriptor). `None` when it cannot be read.
+    #[cfg(windows)]
+    fn dacl_of(path: &std::path::Path) -> Option<String> {
+        let out = tempfile::NamedTempFile::new().ok()?;
+        let saved = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/save")
+            .arg(out.path())
+            .output()
+            .ok()?;
+        if !saved.status.success() {
+            return None;
+        }
+        let bytes = std::fs::read(out.path()).ok()?;
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16_lossy(&wide);
+        text.lines()
+            .nth(1)
+            .map(|l| l.trim().trim_start_matches('\u{feff}').to_string())
+    }
+
+    /// #3073 — hardening a directory someone else owns keeps SYSTEM in. The
+    /// field case was SYSTEM hardening a directory the signed-in user owned.
+    /// Here an administrator hardens one SYSTEM owns: the same shape, a
+    /// caller that is not the owner. Before the owner went first, step 1
+    /// emptied the DACL, the grant failed `Access is denied`, and the
+    /// directory came out `D:PAI`, open to nobody.
+    #[cfg(windows)]
+    #[test]
+    fn hardening_a_directory_someone_else_owns_keeps_system_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "x").unwrap();
+        // Hand it to SYSTEM. That takes an elevated token (SeRestorePrivilege);
+        // a plain one cannot set the case up, so the test says so and stops.
+        let handed = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/setowner", "*S-1-5-18"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !handed {
+            // The CI lane runs elevated on purpose; there, skipping would
+            // pass without proving anything.
+            assert!(
+                std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
+                "this lane must run elevated for #3073's case to be set up"
+            );
+            eprintln!(
+                "skipped: this token cannot hand a directory to SYSTEM; run elevated to cover #3073"
+            );
+            return;
+        }
+        harden_machine_global_dir(dir.path());
+        let dacl = dacl_of(dir.path()).expect("the hardened directory is still readable");
+        assert!(dacl.starts_with("D:P"), "protected: {dacl}");
+        assert!(
+            dacl.contains("(A;OICI;FA;;;SY)"),
+            "SYSTEM keeps full control: {dacl}"
+        );
+        assert!(
+            dacl.contains("(A;OICI;FA;;;BA)"),
+            "Administrators keep full control: {dacl}"
         );
     }
 }
