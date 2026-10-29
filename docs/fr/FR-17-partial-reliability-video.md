@@ -1,7 +1,8 @@
 # FR-17: Video rides a reliable + ordered DataChannel
 
 Status: **stages A + B shipped; stage C's reorder buffer shipped as FR-59 P7 (#1169,
-2026-09-01), its measurement open** (2026-10-29; proposed 2026-08-27). Stage B was
+2026-09-01) and its gap signal repaired in #3112 (2026-10-29), its measurement open**
+(2026-10-29; proposed 2026-08-27). Stage B was
 field-measured twice on 2026-08-28/29 with no benefit — on the strict stage-A receiver
 that #1169 replaced, so those runs do not yet say what unordered delivery buys on the
 receiver that exists now (field log). Tracking issue: `FR-17` (#799). Sibling of FR-16
@@ -180,38 +181,59 @@ What #1169 built, in the one shared module (`ui/src/workers/rc-chunk-framing.ts`
 
 - A frame assembles into SLOTS keyed by `chunk_idx`, in any order, and is emitted whole
   the moment every announced slot is filled (`partials: Map<frame_seq, PartialFrame>`,
-  `rc-chunk-framing.ts:86`; `finish`, `:278`). Reordering within a frame is invisible; a
+  `rc-chunk-framing.ts:100`; `finish`, `:299`). Reordering within a frame is invisible; a
   retransmit that lands while its frame is still open is just that.
-- A frame still incomplete when a NEWER one completes is abandoned (`:286-291`): holding
+- A frame still incomplete when a NEWER one completes is abandoned (`:308-314`): holding
   it would re-introduce the head-of-line wait, and the codec's delta chain is broken past
   it regardless.
-- At most `MAX_PARTIAL_FRAMES = 3` frames are held (`:69`; eviction at `:223`), so a lossy
+- At most `MAX_PARTIAL_FRAMES = 3` frames are held (`:83`; eviction at `:238`), so a lossy
   link is not a memory leak with a slow fuse.
 - The straggler rule now includes `back == 0`, a late chunk of the frame JUST completed
-  (`isStraggler`, `:162`). Stage A needed `back > 0` because a live frame and `lastSeq`
+  (`isStraggler`, `:177`). Stage A needed `back > 0` because a live frame and `lastSeq`
   shared one variable; with per-frame partials, equality can only mean "already gone",
   and without the change a re-delivered chunk of a delivered frame started assembling it
   again. Found while generalising the assembler — FR-59's fifth unplanned finding.
 - 10 tests under unordered delivery (`ui/src/__tests__/workers/rcChunkFraming.spec.ts:96`):
   any-order assembly, two interleaved frames, an overtaken frame, the straggler and
   duplicate-slot rules, the partial bound, a `u32` wrap, a sender counter restart, and a
-  `chunk_count` that changes mid-frame.
+  `chunk_count` that changes mid-frame — 12 since #3112, plus two that pin the flag/counter
+  rule below (`:286`).
 
-⚠️ **Open defect, found 2026-10-29 while verifying this credit — recorded, not fixed
-here.** The overtaken-frame abandonment counts the gap (`st.gaps++`, `:289`) but the
-completion path returns `gap: false` (`:258`), while the eviction path for the same
-situation returns `gap: true` (`:238`). Both workers reset the byte assembler and request
-the resync IDR only on the flag (`rc-hevc-worker.ts:462-471`,
-`rc-vp9-444-worker.ts:444-453`), so the newer frame is submitted to the decoder as a
-delta against a reference that never arrived — the case the backlog gate's own comment
-names as "decode-error against the missing reference and tear the path down to
-`<video>`" (`rc-hevc-worker.ts:739-744`). The test "abandons a frame a NEWER completed
-one has overtaken, and says so" (`rcChunkFraming.spec.ts:124`) asserts the counter, not
-the flag. Unreachable while the channel is ordered (a frame cannot be overtaken);
-reachable with the opt-in on, under loss — and under `maxRetransmits: 0` a lost chunk
-never arrives, so this IS the common loss case. Fix shape: `finish` returns whether it
-abandoned anything and the completion path propagates it, with the test asserting
-`r.gap`. A behaviour change on the unordered path, so it belongs in its own PR.
+⚠️ **Defect found 2026-10-29 while verifying this credit — repaired in #3112 the same
+day.** The overtaken-frame abandonment counted the gap (`st.gaps++`, `:311`) but the
+completion path returned `gap: false` (the `finish` call at `:274`, with an unconditional
+`false` written at the call site), while the eviction path for the same situation
+returned `gap: true` (`:252`); a `chunk_count` collision (`:263-264`) did the same. Both
+workers reset the byte assembler and request the resync IDR only on the flag
+(`rc-hevc-worker.ts:462-471`, `rc-vp9-444-worker.ts:444-453`), so the newer frame was
+submitted to the decoder as a delta against a reference that never arrived — the case the
+backlog gate's own comment names as "decode-error against the missing reference and tear
+the path down to `<video>`" (`rc-hevc-worker.ts:739-744`). The test "abandons a frame a
+NEWER completed one has overtaken, and says so" (`rcChunkFraming.spec.ts:124`) asserted
+the counter, not the flag, and stayed green for eight weeks. Unreachable while the channel
+is ordered (a frame cannot be overtaken); reachable with the opt-in on, under loss — and
+under `maxRetransmits: 0` a lost chunk never arrives, so this WAS the common loss case.
+
+The repair is one rule rather than a flipped boolean: **`gap` is true on exactly the
+messages that make `gaps` grow, on every path.** `finish` returns a `ChunkFramingResult`
+whose `gap` says whether it abandoned anything (`:299-316`); the completion path returns
+it as is (`:274`), the eviction path ORs its own `true` onto it (`:252`), the collision
+path says `true` (`:264`). The flag stays once per MESSAGE while the counter says how many
+frames died. Nothing changes on the ordered default (a test over an in-order stream of
+mixed chunk counts pins it), and the forced-IDR rate stays bounded where it was — the
+worker's 250 ms debounce and the agent's 500 ms `MIN_KF_GAP` on `rc:keyframe`
+(`agents/roomlerd/src/peer.rs:10723`), at most 2/s per session — now reachable under
+heavy loss instead of never. Unit evidence, red then green: master's spec was 15/15 green
+against the defective module; the new spec failed 4 of 19 against it (the overtaken-frame
+test, completion on the last chunk, the collision, and the seeded property at
+`rcChunkFraming.spec.ts:287`), and passes 19/19 after. **Not a field result**: the field
+read — a chunk-framing session with the opt-in on, under loss, `chunkGaps` against the
+`frame-rejected chunk-gap` warnings and the agent's `keyframe_requests`, before and after —
+is owed, and the field log names its prerequisite (the two counters are posted by the
+workers and read by nothing on the main thread). Left out deliberately: suppressing the request
+when the overtaking frame is itself a keyframe (redundant, and inside the clamp); correct
+only if every backend's key flag means a chain reset, so it waits on a field read saying
+the redundant IDR matters.
 
 ⚠️ **What a retransmit can and cannot buy on this receiver** (reasoning, not a
 measurement — it says which cells to run first, not what they will show). A retransmitted
@@ -242,8 +264,9 @@ criterion for the flip: an airport-class session with the opt-in ON showing
 in the worker's stats (`rc-hevc-worker.ts:357`, `rc-vp9-444-worker.ts:333`). Stragglers
 rising with steady fps is the transport working; gaps rising is real loss costing an IDR
 each. The flip cannot be scoped to constrained paths (the deviation recorded under B), so
-it is a fleet-wide decision — and it should wait on the defect above, which would make a
-flagged session under loss show gaps climbing without the IDR that is supposed to follow.
+it is a fleet-wide decision — and it should wait on the field read of #3112's repair
+(above): before it, a flagged session under loss showed gaps climbing without the IDR that
+is supposed to follow, which is exactly what this criterion would have read as real loss.
 
 **Open in this stage**: the retransmit budget (1–2, or the `maxPacketLifeTime` deadline)
 measured per pair, and the stage-B re-run on the new receiver — both on the relay-locked
@@ -298,3 +321,4 @@ what makes the reassembler independent of that assumption.
 | 2026-08-29 | 0.4.15 | **Controlled A/B**, browser-driven deterministic drag, 60 s per condition, bitrate 965 kbps → 2.8 Mbps: ORDERED (1359 s, 671 heartbeats) age p50 50 / p99 86 ms, `send_wait` p99 0.82 ms; UNORDERED (132 s) p50 69 / p99 105 ms, `send_wait` p99 274 ms. Unordered worse on every measure; **stage B recorded as a dead hypothesis, opt-in stays default OFF.** Neither condition reproduced the failure state (the path was healthy throughout), and the receiver in both rounds was the strict stage-A assembler — see 2026-09-01. Same session: a pod roll freezes every relay-carried RC session (`/derp` WS closed → carrier rebuild → video DC delivery gap → decode stall; 2436 ms measured on an idle session); #857 and #861 fixed alongside. |
 | 2026-09-01 | — | **Stage C's reorder buffer merged** as FR-59 P7 (#1169, `8b8d35116`): the shared assembler fills slots in any order, abandons a frame a newer one has overtaken, holds at most 3 partials. Viewer-side only — the agent and the 8-byte wire prefix are unchanged, so it is live on every viewer served since and inert while the channel is ordered. The default stays ordered. **Not a field result**: no session has run on this receiver with the opt-in on, and the 08-28/29 verdicts above were taken on the receiver it replaced. |
 | 2026-10-29 | — | Docs correction: this spec still read stage C as blocked on a reorder buffer eight weeks after #1169 shipped one; FR-59's spec had credited it since 2026-09-01. Verifying the credit at the surface found that an overtaken frame's abandonment is counted but not signalled, so no resync IDR is requested for it (stage C, "open defect"). Acceptance criteria unchanged — none is met by the buffer alone; the four open ones still need the relay-locked CORPLAP-1 ↔ CORPLAP-3 pair. |
+| 2026-10-29 | — | **Gap signal repaired** (#3112, stacked on #3109). `rc-chunk-framing.ts` raised `gap` on an abandonment by eviction only; an abandonment made as the overtaking frame COMPLETED, and a `chunk_count` collision, were counted and not flagged, so under the opt-in a lost chunk's frame was written off with no resync IDR asked for. Now `gap` is true on exactly the messages that make `gaps` grow. Unit evidence red → green: master's spec 15/15 against the defective module (it asserted the counter only); the new spec 4 of 19 red against it; 19/19 after; the ordered default pinned unchanged. **Not a field result** — the field read (opt-in on, under loss, `chunkGaps` against the `frame-rejected chunk-gap` warnings and the agent's `keyframe_requests`, before and after) is owed, and has a prerequisite found on the way: both workers post `chunkGaps` and `chunkStragglers` in their `stats` message (`rc-hevc-worker.ts:357`, `rc-vp9-444-worker.ts:333`) but nothing on the main thread reads them — no HUD field, nothing in `rc:decodestat` — so a silently abandoned frame leaves no trace a production session can show. Surfacing the two counters is what makes this read, and the default-flip criterion above, possible. Production's served worker bundles carry the defect's pattern (five `gap:!1` / two `gap:!0` sites in each of `rc-hevc-worker-BCZOierV.js` and `rc-vp9-444-worker-QGGpyaRB.js`; this build four / three). |
