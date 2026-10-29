@@ -3754,7 +3754,9 @@ const localRelayRefusedText = computed<string | null>(() => {
     not_your_device: 'that device is not yours',
     other_network: 'that device is in another organization',
     device_offline: 'that device is offline, or reports no relay',
-    rc_overlay_off: 'this device does not let remote desktop use the mesh (rc_overlay)',
+    // FR-128 — also `auto` on an agent too old to decide it, which reads as off.
+    rc_overlay_off:
+      'this device does not let remote desktop use the mesh (rc_overlay off, or auto on an agent that predates it)',
     same_device: 'you are viewing the device this browser runs on',
   }
   return `The local relay was not used: ${reasons[why] ?? why}.`
