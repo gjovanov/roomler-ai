@@ -604,11 +604,16 @@ the wrong reason stayed for the rest of the session.
   identical on both paths; no decode error; no keyframes beyond those the host's other load caused. On this arm
   AC3's "capture + encode" reads as readback + encode, because WGC reads back off the pump's clock. Still owed:
   VideoToolbox and VAAPI, neither built.)*
-- [ ] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
+- [~] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
   Linked from `docs/README.md`. *(P2's half written 2026-10-28: `encoders.md` § GPU-resident frames, with the
   input reasons and the configuration rows; `remote-control.md` §5.1f, with both arms' frame paths and the field
   numbers; both index rows. Ticked when the last cell is in them, as FR-108's AC8 is.)*
+  *(2026-10-29, #3099: **met for every built cell.** `encoders.md`'s GPU-input section no longer calls P3
+  "unreleased": QSV (0.4.181, §9.3) and NVENC on the WGC arm (0.4.183, §9.7) read as field-verified and released,
+  with AMF's deferral reason (§9.4) kept, and `remote-control.md` §5.1f and the two `docs/README.md` rows already
+  carry both arms with the measured numbers. **Not met:** the VideoToolbox and VAAPI rows, which follow their
+  cells — AC7's unbuilt remainder. So `[~]`, not `[x]`.)*
 
 ## 7. Open decisions
 
