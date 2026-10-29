@@ -22,7 +22,7 @@ flowchart TB
     LGUI -->|"GUI (FR-129 B1)"| LWIZ["roomler-setup wizard<br/>per-user or system daemon →<br/>the embedded install.sh halves,<br/>one pkexec prompt"]
     LGUI -->|terminal| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
     OS1 -->|macOS| MGUI{"GUI or terminal?"}
-    MGUI -->|"GUI (FR-129 B1)"| MWIZ["roomler-setup wizard<br/>per-user daemon → install.sh halves,<br/>one osascript admin prompt<br/>(the root half: B2)"]
+    MGUI -->|"GUI (FR-129 B1, B2)"| MWIZ["roomler-setup wizard<br/>per-user daemon + the root half<br/>(the overlay box) → install.sh halves,<br/>one osascript admin prompt"]
     MGUI -->|terminal| PKG["install.sh --role daemon (.pkg, arm64)"]
     LWIZ -.->|"only when the server says<br/>wizard_unix_daemon: true"| LGUI
     MWIZ -.->|"same switch"| MGUI
@@ -171,7 +171,9 @@ Enrollment successful. Agent id: …
   `install.ps1 -Role … -Pair [-PairOrg SLUG]`. The tunnel role still takes
   `--token` (the `roomler` CLI has no `--pair` yet). The macOS root half is a
   second enrollment, paired afterwards as root — the install prints the two
-  commands (the macOS section below); one approval for both halves is FR-129 B2.
+  commands (the macOS section below). One approval for both halves is the
+  wizard's (FR-129 B2); the terminal keeps two runs, because one would hand a
+  credential across the `sudo` boundary with no Retry.
 
 ### "The host must be re-enrolled" — when to believe it
 
@@ -715,10 +717,21 @@ they grow, and its exit status to a third. A cancel closes the dialog while it
 is up; once the password is accepted, killing `osascript` would no longer stop
 the root shell — `installer -pkg` would run on — so the wizard waits it out
 and says so instead. The card appears only when the server's `wizard_unix_daemon`
-switch is on, like the Linux cards. The root half (the overlay) is **B2**: the
-seam is in place — the pairing's `halves: 2`, two tokens, `--config-from` on
-macOS requests the root half and folds into an existing `/etc/roomler/config.toml`
-through `roomlerd adopt-enrollment` — but the wizard does not run it yet. The
+switch is on, like the Linux cards.
+
+**The root half from the wizard (FR-129 B2).** With "Join the overlay network"
+ticked, which is the macOS default, the wizard adds the root half beside the
+person's: the root LaunchDaemon that owns the overlay's utun, enrolled as a
+device of its own named `<name>-daemon`. One approval delivers both tokens (the
+pairing's `halves: 2`). On the paste path the box asks for a second token, and
+each half counts as a device on the plan. The root half enrolls in the wizard's
+process, before the one administrator dialog, into a 0600 file. `--config-from`
+hands that file to the privileged half, which places it at
+`/etc/roomler/config.toml`, or folds it into the config already there through
+`roomlerd adopt-enrollment`. Its machine id comes from the hardware: the
+platform UUID, and on a virtual Mac its `en0` address too, since a cloned VM
+keeps the original's UUID. So a reinstall finds its row however the network has
+renamed the Mac. Unticked, the wizard installs the per-user half alone. The
 two privacy grants below remain the person's; the Done page says so.
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
