@@ -1,8 +1,10 @@
 # FR-6: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
 
-**Status:** shipped + field-verified through 2026-08-26 (retroactive FR per the CLAUDE.md
-standing rule — the program ran 2026-07-13 → 2026-08-26 across ~20 PRs). Tracking issue:
-`FR-6` (#773) in gjovanov/roomler-ai/issues.
+**Status:** every acceptance criterion field-verified and ticked, through wave 32 (2026-10-29),
+and documented in [`docs/build-caches.md`](../build-caches.md). What is left is runner queueing,
+not compiling (Open decisions). First shipped and field-verified 2026-08-26 (retroactive FR per
+the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across ~20 PRs). Tracking
+issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -183,6 +185,10 @@ itself on the affected run's page. Baseline when the program started: releases t
       SHA `ff3290048`, no release dispatch between them), and the four daemon jobs
       reported `roomlerd 0.4.174`. The longest jobs were the Windows companion (4.2 min)
       and the MSI (4.0); wave 30 takes the companions' remaining compile out.
+- [x] **Docs** — [`docs/build-caches.md`](../build-caches.md) describes what this FR built, in
+      house style: the seed store, a release's five runs, same-tree reuse and its traps, the
+      accretion GC and its caps, the merge freeze, and the log lines a run is read by. It has
+      a row in `docs/README.md`'s index (2026-10-29).
 
 ## Open decisions / residual levers (all trade-offs, not waste)
 
