@@ -610,6 +610,11 @@ mod imp {
             );
             cmd.arg("/usr/bin/env").args(&forward);
         }
+        // #3080 — the chain lives as long as the worker, so it must not keep a
+        // pipe it inherited from a spawn on another thread (macOS has no
+        // `pipe2`): that pipe's reader would never see EOF. It keeps its
+        // stdio, the lifeline on stdin, and nothing else.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
         let mut child = cmd
             .arg(exe)
             .arg("run")
@@ -816,7 +821,12 @@ mod imp {
         let Some(exe) = exe.to_str() else {
             return 0;
         };
-        let stale = find_processes(&worker_command(exe));
+        // #3080 — `ps` blocks, so it runs on the blocking pool, never on a
+        // runtime worker.
+        let command = worker_command(exe);
+        let stale = tokio::task::spawn_blocking(move || find_processes(&command))
+            .await
+            .unwrap_or_default();
         for &(pid, uid) in &stale {
             tracing::warn!(
                 pid,
@@ -842,17 +852,31 @@ mod imp {
         }
     }
 
+    /// #3080 — how long `ps` may take. It answers in well under a second; past
+    /// this the reap is skipped, exactly as when `ps` fails.
+    const PS_DEADLINE: Duration = Duration::from_secs(10);
+
     /// `ps` once, read through [`stale_workers`]. If `ps` fails, nothing is
     /// found, which leaves things as they were before #2987.
     fn find_processes(command: &str) -> Vec<(u32, u32)> {
         // One `-o` per column: BSD `ps` lets only the LAST keyword of an `-o`
         // carry `=`, and `pid=,uid=` would make `,uid=` pid's header.
-        let out = Command::new("/bin/ps")
-            .args(["-axww", "-o", "pid=", "-o", "uid=", "-o", "command="])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
-        match out {
+        let mut ps = Command::new("/bin/ps");
+        ps.args(["-axww", "-o", "pid=", "-o", "uid=", "-o", "command="]);
+        find_processes_via(&mut ps, command)
+    }
+
+    /// The read half of [`find_processes`], with the `ps` to run given, so a
+    /// test can hand it one whose pipe another process holds.
+    ///
+    /// #3080 — read until `ps` EXITS, not until EOF, within [`PS_DEADLINE`].
+    /// macOS has no `pipe2`, so a long-lived child spawned on another thread
+    /// while `ps`'s pipe was new keeps a copy of its write end. Field, 0.4.184:
+    /// `route -n monitor` did, `Command::output()` waited on a runtime worker
+    /// for an EOF that never came, and the supervisor never reached its loop.
+    /// The Mac had no GUI worker, so no capture or input, until a restart.
+    fn find_processes_via(ps: &mut Command, command: &str) -> Vec<(u32, u32)> {
+        match tunnel_core::child::output_bounded(ps, PS_DEADLINE) {
             Ok(out) if out.status.success() => stale_workers(
                 &String::from_utf8_lossy(&out.stdout),
                 command,
@@ -868,7 +892,8 @@ mod imp {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "macOS supervisor: could not run `ps`; not looking for a stale GUI worker"
+                    "macOS supervisor: could not run `ps`, or it did not exit in time; not \
+                     looking for a stale GUI worker"
                 );
                 Vec::new()
             }
@@ -1202,6 +1227,124 @@ mod imp {
                 find_processes(&command).is_empty(),
                 "still running after stop_processes"
             );
+        }
+
+        /// A file the shell below writes its background holder's pid to.
+        fn pid_file(tag: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            std::env::temp_dir().join(format!(
+                "roomler-3080-{tag}-{}-{nanos}.pid",
+                std::process::id()
+            ))
+        }
+
+        /// #3080's end state: the shell prints one row shaped like `ps`
+        /// output and exits, while the `sleep` it started in the background
+        /// still holds the write end of its stdout, as `route -n monitor`
+        /// held the real `ps`'s.
+        fn pinned_ps(pid_file: &std::path::Path, row: &str) -> Command {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c")
+                .arg(format!("sleep 30 & echo $! > \"$PIDFILE\"; echo '{row}'"))
+                .env("PIDFILE", pid_file);
+            c
+        }
+
+        /// End the holder [`pinned_ps`] started.
+        fn end_holder(pid_file: &std::path::Path) {
+            for _ in 0..250 {
+                if let Some(pid) = std::fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+                {
+                    // SAFETY: one signal to the `sleep` this test started.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    let _ = std::fs::remove_file(pid_file);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the holder never wrote its pid to {}", pid_file.display());
+        }
+
+        /// #3080 — the reap answers as soon as `ps` exits, while another
+        /// process still holds `ps`'s pipe.
+        #[test]
+        fn the_reap_answers_once_ps_exits_though_its_pipe_is_held() {
+            let pid_file = pid_file("ps");
+            let command = worker_command("/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd");
+            let started = Instant::now();
+            let found = find_processes_via(
+                &mut pinned_ps(&pid_file, &format!("  4242   501 {command}")),
+                &command,
+            );
+            let took = started.elapsed();
+            end_holder(&pid_file);
+            assert_eq!(found, vec![(4242, 501)]);
+            assert!(
+                took < Duration::from_secs(5),
+                "waited {took:?} on the holder"
+            );
+        }
+
+        /// The positive control on a Mac: `Command::output()`, the read
+        /// `find_processes` made before #3080, waits as long as the holder
+        /// lives.
+        #[test]
+        fn before_3080_the_reap_waited_as_long_as_the_holder_lived() {
+            let pid_file = pid_file("std");
+            let mut cmd = pinned_ps(&pid_file, "  4242   501 x");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let _ = tx.send(cmd.output());
+            });
+            let early = rx.recv_timeout(Duration::from_millis(1500));
+            end_holder(&pid_file);
+            assert!(
+                early.is_err(),
+                "output() returned while the holder lived: {early:?}"
+            );
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("output() returns once the holder is gone")
+                .expect("ran");
+            reader.join().unwrap();
+        }
+
+        /// Whether the program a child execs still has descriptor 9 open, when
+        /// the child got 9 the way the race hands one over: a copy made after
+        /// the fork, open and without close-on-exec. (`tunnel_core::child`'s
+        /// own tests run in a Linux lane; the macOS lane runs this module's.)
+        fn fd9_after_exec(sweep: bool) -> String {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg("if true 2>/dev/null >&9; then echo open; else echo closed; fi");
+            // SAFETY: `dup2` only, which is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::dup2(2, 9) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            if sweep {
+                tunnel_core::child::inherit_only_stdio(&mut cmd);
+            }
+            let out =
+                tunnel_core::child::output_bounded(&mut cmd, Duration::from_secs(10)).expect("ran");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        }
+
+        /// #3080 — the other side of the race, on a Mac: without the sweep the
+        /// program keeps the descriptor (the positive control), with it the
+        /// program keeps only its stdio. The worker chain and the route monitor
+        /// are spawned with the sweep.
+        #[test]
+        fn a_long_lived_child_keeps_only_its_stdio() {
+            assert_eq!(fd9_after_exec(false), "open");
+            assert_eq!(fd9_after_exec(true), "closed");
         }
     }
 }
