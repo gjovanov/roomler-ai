@@ -127,6 +127,31 @@ pub async fn enroll_folded(
     fold(existing, fresh)
 }
 
+/// FR-129 B2 — enroll `device_name` with a machine id the caller chose, into
+/// no existing config: the macOS root half, whose id comes from the hardware
+/// (`machine::root_half_machine_id`) because the person cannot read the one
+/// root's config holds. The fold into that config happens as root, in the
+/// privileged half (`roomlerd adopt-enrollment`), exactly as for a Linux
+/// system scope.
+pub async fn enroll_fresh_as(
+    server: &str,
+    token: &str,
+    device_name: &str,
+    machine_id: &str,
+    install: InstallInfo,
+) -> anyhow::Result<Enrolled> {
+    tracing::info!(%machine_id, "enrolling with the machine fingerprint the caller chose");
+    let fresh = roomlerd::enrollment::enroll(EnrollInputs {
+        server_url: server,
+        enrollment_token: token,
+        machine_id,
+        machine_name: device_name,
+        install: Some(install),
+    })
+    .await?;
+    fold(None, fresh)
+}
+
 /// The fold itself, without the network: `apply_enrollment`, then the
 /// previous row's key retired when the server made another row (F3).
 fn fold(existing: Option<AgentConfig>, fresh: AgentConfig) -> anyhow::Result<Enrolled> {
