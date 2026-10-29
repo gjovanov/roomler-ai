@@ -134,7 +134,7 @@ one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where t
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
-(`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
+(`crates/modules/remote/src/controller.rs:799`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`).
 
 ⚠️ Found while documenting P5, after P1 and P3 had merged. Without the flag, P1's
@@ -190,10 +190,10 @@ a live session is **never** ended by the fence (`business-model.md` §6 rule 4).
 like the device cap: no org is over it today.
 
 **As built (P3).** The authz gate reads the cap from the device's org
-(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:652`) and hands it to the hub
+(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1670`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1702`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
