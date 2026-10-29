@@ -1968,6 +1968,8 @@ impl Hub {
             tenant_name,
             // #1882 — may this session's ICE use the overlay (default off).
             rc_overlay,
+            // FR-128 — the `auto` policy and its hints; none until P2 sends them.
+            rc_overlay_auto: None,
             // FR-101 P2 — the org's policy, for an agent that names `ask`
             // features on its prompt and enforces the rest. Left off the
             // frame when it restricts nothing, as before the field.

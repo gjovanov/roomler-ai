@@ -2455,6 +2455,12 @@ fn rpc_caps() -> Vec<String> {
     if crate::rc_local_turn::enabled() {
         caps.push(RpcCap::LocalRelay);
     }
+    // FR-128 — it decides `rc_overlay = auto` for each session, while that is
+    // switched on. The hub sends `auto` only to a device that says this, so a
+    // device with the decision switched off reads the policy as `off`.
+    if crate::rc_overlay::auto_enabled() {
+        caps.push(RpcCap::RcOverlayAuto);
+    }
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise

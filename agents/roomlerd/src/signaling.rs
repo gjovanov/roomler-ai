@@ -3354,6 +3354,8 @@ async fn handle_server_msg(
             input_mode,
             tenant_name,
             rc_overlay,
+            // FR-128 — the device's policy is `auto`; decided per session.
+            rc_overlay_auto,
             // FR-101 P2b — the org's policy; applied below with the device's
             // own floor, once the consent mode is resolved.
             session_policy,
@@ -3366,8 +3368,11 @@ async fn handle_server_msg(
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a
-            // delegated session's worker gets this same value.
-            let rc_overlay = crate::rc_overlay::RcOverlay::resolve(rc_overlay);
+            // delegated session's worker gets this same value. FR-128: an
+            // `auto` policy rides along with its hints, and the session decides
+            // at its offer, in whichever process builds the peer.
+            let rc_overlay =
+                crate::rc_overlay::RcOverlay::resolve_mode(rc_overlay, rc_overlay_auto.as_ref());
             // FR-52 P4 — a controller from OUTSIDE the organization. Admitted
             // by THIS device or not at all: bound to a login it verified, under
             // its own ceiling and its own consent mode, never the server's. A
@@ -4066,6 +4071,11 @@ async fn handle_server_msg(
                     None,
                 )
             });
+            // FR-128 — an `auto` session decides HERE, at its offer, in the
+            // process that builds the peer (a delegated GUI worker runs this
+            // handler too): one LocalAPI lookup, bounded at 400 ms. The peer
+            // then sees a plain on/off, filtered exactly as ever.
+            let rc_overlay = rc_overlay.decide(session_id).await;
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after

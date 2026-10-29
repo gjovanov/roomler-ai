@@ -1275,6 +1275,15 @@ pub enum RpcCap {
     /// (`ROOMLERD_LOCAL_TURN`, default on); a device with no overlay yet
     /// still advertises it and reports `None`.
     LocalRelay,
+    /// FR-128 — this device decides `rc_overlay = auto` for each session at
+    /// the offer (`Request.rc_overlay_auto`): the overlay when its mesh link
+    /// to the viewer's own device is direct, and not otherwise. The hub sends
+    /// `auto`, and hands out the viewer's relay under it, only to a
+    /// connection advertising this; to any other the policy reads as `off`,
+    /// which is D1's answer for an older agent. Advertised while the decision
+    /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
+    /// of another verb, nor another of it.
+    RcOverlayAuto,
 }
 
 impl RpcCap {
@@ -1328,11 +1337,12 @@ impl RpcCap {
             Self::KnowhowTools => "knowhow-tools",
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
+            Self::RcOverlayAuto => "rc-overlay-auto",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 42] = [
+    pub const ALL: [RpcCap; 43] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1375,6 +1385,7 @@ impl RpcCap {
         Self::KnowhowTools,
         Self::KnowhowProbe,
         Self::LocalRelay,
+        Self::RcOverlayAuto,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -7648,6 +7659,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
+        assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
