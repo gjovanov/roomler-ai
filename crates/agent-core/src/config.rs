@@ -3466,16 +3466,24 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// the file's OWNER at SystemContext load) is tracked for the Track-A
 /// config unification.
 ///
-/// ⚠️ #3073 — the OWNER goes first ([`HARDEN_STEPS`]), and nothing else runs
-/// unless it took. Once `/inheritance:r` has removed every ACE, only the
-/// owner keeps WRITE_DAC. A directory that a user-mode process created (the
-/// desktop companion, an earlier per-user install) therefore came out sealed
-/// against SYSTEM itself: the grant failed `Access is denied`, and every
-/// later daemon start ran with no log, no crash records and no
-/// machine-global config. With Administrators as the owner, SYSTEM (a
-/// member) keeps WRITE_DAC through every later step. A grant that still
-/// fails puts inheritance back, so the save never leaves the directory with
-/// less access than it found.
+/// ⚠️ #3073 — the OWNER goes first and the GRANT second ([`HARDEN_STEPS`]),
+/// and nothing that removes access runs unless both took. The daemon never
+/// enables the privileges that override a DACL, so once inherited ACEs are
+/// gone, SYSTEM reaches an object only through an ACE of its own or by
+/// owning it. Whatever a user-mode process created (the desktop companion,
+/// an earlier per-user install) belongs to that user:
+/// - with inheritance dropped first, the directory itself came out sealed
+///   against SYSTEM: the grant failed `Access is denied`, and every later
+///   daemon start ran with no log, no crash records and no machine-global
+///   config. Administrators as the owner fixed the directory;
+/// - but each CHILD the user owned still came out with an empty DACL
+///   (0.4.185, measured: `crashes`, `service-logs`, `config.toml.prev`). The
+///   grant reaches a child only by inheritance, and inheritance can rewrite
+///   only a child SYSTEM can still write. Granted first, the explicit
+///   SYSTEM and Administrators ACEs are already on every child when the
+///   inherited ones go.
+///
+/// A child keeps its owner: only the directory is taken for Administrators.
 #[cfg(windows)]
 fn harden_machine_global_dir(dir: &std::path::Path) {
     let d = dir.display().to_string();
@@ -3492,20 +3500,12 @@ fn harden_machine_global_dir(dir: &std::path::Path) {
                     stderr = %String::from_utf8_lossy(&o.stderr).trim(),
                     "config: machine-global dir ACL hardening step failed"
                 );
-                match i {
-                    // Never strip inheritance from a directory we could not
-                    // take ownership of.
-                    0 => return,
-                    // Inheritance is gone but the grant did not land: put it
-                    // back rather than leave the directory sealed.
-                    2 => {
-                        let _ = std::process::Command::new("icacls")
-                            .arg(&d)
-                            .arg("/inheritance:e")
-                            .output();
-                        return;
-                    }
-                    _ => {}
+                // Steps 0 and 1, the owner and the grant: never strip
+                // inheritance unless both took. Inheritance is still intact
+                // at either point, so stopping leaves the directory as open
+                // as it was.
+                if i < 2 {
+                    return;
                 }
             }
             Err(e) => {
@@ -3517,13 +3517,13 @@ fn harden_machine_global_dir(dir: &std::path::Path) {
 }
 
 /// The `icacls` steps of [`harden_machine_global_dir`], in order (#3073):
-/// take ownership for Administrators, drop inheritance, grant SYSTEM and
-/// Administrators, then remove Users and Authenticated Users down the tree.
+/// take ownership for Administrators, grant SYSTEM and Administrators, drop
+/// inheritance, then remove Users and Authenticated Users down the tree.
 #[cfg(any(windows, test))]
 const HARDEN_STEPS: [&[&str]; 4] = [
     &["/setowner", "*S-1-5-32-544"],
-    &["/inheritance:r"],
     &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+    &["/inheritance:r"],
     &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
 ];
 
@@ -6015,16 +6015,28 @@ tenant_id = "tid2"
         );
     }
 
-    /// #3073 — ownership comes before anything that can remove access: once
-    /// `/inheritance:r` has run, only the owner keeps WRITE_DAC.
+    /// #3073 — ownership and the grant come before anything that can remove
+    /// access: once `/inheritance:r` has run, SYSTEM keeps the directory by
+    /// owning it, and a child it does not own only through an ACE the
+    /// directory already hands down.
     #[test]
-    fn harden_takes_ownership_before_it_drops_inheritance() {
+    fn harden_takes_ownership_and_grants_before_it_drops_inheritance() {
         assert_eq!(HARDEN_STEPS[0], &["/setowner", "*S-1-5-32-544"][..]);
-        let drops = HARDEN_STEPS
-            .iter()
-            .position(|s| s.contains(&"/inheritance:r"))
-            .expect("inheritance is dropped");
-        assert!(drops > 0, "never before the owner is Administrators");
+        let step = |flag: &str| {
+            HARDEN_STEPS
+                .iter()
+                .position(|s| s.contains(&flag))
+                .unwrap_or_else(|| panic!("{flag} is a step"))
+        };
+        assert_eq!(
+            step("/grant:r"),
+            1,
+            "harden_machine_global_dir stops on a failed step 0 or 1"
+        );
+        assert!(
+            step("/inheritance:r") > step("/grant:r"),
+            "never before SYSTEM and Administrators hold ACEs of their own"
+        );
     }
 
     /// The DACL of `path` in SDDL, through `icacls /save` (a UTF-16 file: the
@@ -6052,22 +6064,101 @@ tenant_id = "tid2"
             .map(|l| l.trim().trim_start_matches('\u{feff}').to_string())
     }
 
-    /// #3073 — hardening a directory someone else owns keeps SYSTEM in. The
-    /// field case was SYSTEM hardening a directory the signed-in user owned.
-    /// Here an administrator hardens one SYSTEM owns: the same shape, a
-    /// caller that is not the owner. Before the owner went first, step 1
-    /// emptied the DACL, the grant failed `Access is denied`, and the
-    /// directory came out `D:PAI`, open to nobody.
+    /// #3073 — put this process where the daemon is: SeBackup, SeRestore and
+    /// SeTakeOwnership held but DISABLED, as in a service's SYSTEM token. A
+    /// Cygwin or OpenSSH shell hands its children a token with them enabled,
+    /// and then the inheritance an `icacls` call sets off rewrites children
+    /// the daemon cannot reach: 0.4.185's order passed from such a shell.
+    /// Every `icacls` the test spawns afterwards inherits the result; one that
+    /// needs a privilege (`/setowner`) still enables it for itself.
+    #[cfg(windows)]
+    fn disable_dacl_override_privileges() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: this process's pseudo-handle; `token` is written on success.
+        let opened =
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) };
+        assert_ne!(
+            opened,
+            0,
+            "OpenProcessToken: {}",
+            std::io::Error::last_os_error()
+        );
+        for name in [
+            "SeBackupPrivilege",
+            "SeRestorePrivilege",
+            "SeTakeOwnershipPrivilege",
+        ] {
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let mut luid = LUID {
+                LowPart: 0,
+                HighPart: 0,
+            };
+            // SAFETY: a NUL-terminated name, and a LUID to write.
+            let found =
+                unsafe { LookupPrivilegeValueW(std::ptr::null(), wide.as_ptr(), &mut luid) };
+            assert_ne!(found, 0, "{name}: {}", std::io::Error::last_os_error());
+            // Attributes 0: disabled, still held. A token that does not hold
+            // the privilege reports ERROR_NOT_ALL_ASSIGNED, and is already
+            // where the test wants it.
+            let state = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: 0,
+                }],
+            };
+            // SAFETY: a token opened for TOKEN_ADJUST_PRIVILEGES, one entry,
+            // and no previous state asked for.
+            let adjusted = unsafe {
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &state,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(adjusted, 0, "{name}: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(token) };
+    }
+
+    /// #3073 — hardening a tree someone else owns keeps SYSTEM in, on the
+    /// directory and on every child. The field case was SYSTEM hardening a
+    /// tree the signed-in user owned. Here an administrator hardens one
+    /// SYSTEM owns: the same shape, a caller that owns none of it.
+    /// - Before the owner went first, step 1 emptied the DACL, the grant
+    ///   failed `Access is denied`, and the directory came out `D:PAI`, open
+    ///   to nobody.
+    /// - With the owner first but inheritance dropped before the grant
+    ///   (0.4.185), the directory came out right and each child came out with
+    ///   an empty DACL: inheritance could no longer rewrite them.
+    ///
+    /// The hardening runs with the override privileges disabled, as the
+    /// daemon's does; otherwise the second case passes from a Cygwin shell.
     #[cfg(windows)]
     #[test]
-    fn hardening_a_directory_someone_else_owns_keeps_system_in() {
+    fn hardening_a_tree_someone_else_owns_keeps_system_in() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.toml"), "x").unwrap();
-        // Hand it to SYSTEM. That takes an elevated token (SeRestorePrivilege);
-        // a plain one cannot set the case up, so the test says so and stops.
+        let crashes = dir.path().join("crashes");
+        std::fs::create_dir(&crashes).unwrap();
+        std::fs::write(crashes.join("a.json"), "x").unwrap();
+        // Hand the tree to SYSTEM. That takes an elevated token
+        // (SeRestorePrivilege); a plain one cannot set the case up, so the
+        // test says so and stops.
         let handed = std::process::Command::new("icacls")
             .arg(dir.path())
-            .args(["/setowner", "*S-1-5-18"])
+            .args(["/setowner", "*S-1-5-18", "/T"])
             .output()
             .is_ok_and(|o| o.status.success());
         if !handed {
@@ -6082,6 +6173,7 @@ tenant_id = "tid2"
             );
             return;
         }
+        disable_dacl_override_privileges();
         harden_machine_global_dir(dir.path());
         let dacl = dacl_of(dir.path()).expect("the hardened directory is still readable");
         assert!(dacl.starts_with("D:P"), "protected: {dacl}");
@@ -6093,5 +6185,14 @@ tenant_id = "tid2"
             dacl.contains("(A;OICI;FA;;;BA)"),
             "Administrators keep full control: {dacl}"
         );
+        // The children SYSTEM owns inherit both ACEs, so neither is sealed.
+        for (child, inherited) in [(&crashes, "OICIID"), (&crashes.join("a.json"), "ID")] {
+            let dacl =
+                dacl_of(child).unwrap_or_else(|| panic!("{} is still readable", child.display()));
+            for sid in ["SY", "BA"] {
+                let ace = format!("(A;{inherited};FA;;;{sid})");
+                assert!(dacl.contains(&ace), "{}: {ace} in {dacl}", child.display());
+            }
+        }
     }
 }
