@@ -136,7 +136,7 @@ onward). `valid` is the gate's `None`; `stall_is_ours` is V5's exception, below.
 | the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1352` |
 | FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1368`, `:1377` |
 | FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1038`, `:1171`, `:1285` |
-| pair-memory write-back (V2 + V4) | the session's belief, else the opener's measurement | nothing measured ⇒ nothing written | `peer.rs:1604` |
+| pair-memory write-back (V2 + V4) | the session's belief, else the opener's measurement | nothing measured ⇒ nothing written | `peer.rs:2098` |
 
 ### V5 — a rejected window is not a measurement, but a stall is still push-back
 
@@ -206,13 +206,13 @@ pass:
 flowchart TB
     WIN["viewer window (1 s)<br/>governor.rs:1388 → on_window"] --> G{"all five gates?"}
     G --> P["PINNED — AIMD target ≥ 90 % of the ceiling<br/>(it wants more)"]
-    G --> CAR["CARRIED — the window delivered ≥ 70 % of the ceiling<br/>(you cannot measure capacity you are not using)"]
+    G --> CAR["CARRIED — the window WROTE ≥ 70 % of the ceiling to the<br/>data channel (you cannot measure capacity you are not using)"]
     G --> CL["CLEAN — no decrease and no stall in the last 10 s"]
     G --> AGE["AGE — viewer paint age ≤ 2× its learned floor<br/>(when the viewer reports it)"]
     G --> SP["SPACED — ≥ 5 s since the last step"]
     P & CAR & CL & AGE & SP --> STEP["step up: ceiling += max(ceiling/16, 150 kbps),<br/>capped at hi — logs 'the pair carried the ceiling'"]
     G -- any fails --> HOLD["hold"]
-    DEC["a DECREASE (full channel · overflow ·<br/>stall · age excess)"] --> PULL["the learned ceiling follows it down to the<br/>post-decrease target, never below the nominal"]
+    DEC["an AIMD DECREASE (full channel · overflow ·<br/>stall · age excess — AimdController::decreases)"] --> PULL["the learned ceiling follows it down to the<br/>post-decrease target, never below the nominal"]
     HS["a send blocked ≥ 1 s (HARD_STALL)"] --> MD["×0.5 at the window boundary, not the ×0.85<br/>ladder (the 7.9 s P0 stall took three ×0.85 over 4 s)"]
     MEAS["a held goodput measurement < ceiling / 2<br/>(CONTRADICTION_FACTOR)"] --> AB["ABANDON the learned ceiling back to the nominal<br/>(FR-59 P6 — a relay-keyed fast day carried onto a slow one)"]
 ```
@@ -228,25 +228,73 @@ flowchart TB
 | hard stall | `HARD_STALL` 1 s ⇒ ×0.5, applied at the window boundary (FR-79: only there is it known the block was the pipe, not a pass the runtime stalled under) | `ceiling_learn.rs:64`, `governor.rs:1188` |
 | contradiction | learned > 2 × a held measurement ⇒ abandon to the nominal, exactly once | `ceiling_learn.rs:172`, `:79` |
 
+Two things the gates measure that read differently from their names, both found
+in the 2026-10-27/28 field reads below:
+
+- **CARRIED counts bytes the send task WROTE to the data channel in the window**
+  (`governor.rs:1004`, the send task's running byte total over the elapsed
+  window), not bytes the pipe delivered, and `on_window` runs on **every**
+  constrained window — it does not read the FR-79 verdict (`governor.rs:1388`).
+  So an opening burst the socket absorbs is "carried": on 2026-10-28 07:57:43 the
+  first step landed 0.36 s *before* the opener grace ended, inside a 697 KB
+  opener that had blocked a send for 164 ms — the very `Opening` window V4
+  refuses as write-back evidence. The exposure is one step (+1/16) per session,
+  capped by `hi`; the later steps need windows that really carry.
+- **DECREASE means an AIMD decrease** — `AimdController::decreases` ticking
+  (`aimd.rs:245`, `:259`; read at `governor.rs:889`). The FR-59 P3 viewer bound
+  (`governor.rs:765`: the ceiling capped at 90 % of the viewer's reported arrival
+  rate while its queue grows) lowers the AIMD's ceiling through `set_ceiling`,
+  which clamps `desired` **without** counting a decrease (`aimd.rs:188`). The
+  learner neither follows that bound down nor restarts its 10 s clean window on
+  it — by the P3 ordering's own argument ("a live report that the receiver is
+  falling behind outranks" the learner), but a reader of the heartbeat sees
+  `target_bps` fall ×0.9 while `learned_ceiling_bps` holds.
+
 The session's **stable rate** — the highest target that held 10 s
 (`STABLE_HOLD`) with no decrease — is what the pair memory persists
 (`ceiling_learn.rs:66`; next section), so the next session opens at 85 % of what
 the pair proved and the learner climbs from that floor instead of the constant.
+⚠️ "Held" is a hold of the AIMD *target*, not a delivery: on an idle session the
+target sits at the opener's seed for the whole session, so `stable_bps()` is
+that seed — see the write-back rows below for what that does to the memory.
 Kill switches: `relay_ceiling_learn` (tribool, default on; off ⇒ `hi` = 0 ⇒ the
 plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
-(`config_surface.rs:1236`; `mod.rs:844`). Direct sessions never touch the
-learner (`governor.rs:543` gates on `constrained`).
+(`crates/agent-core/src/config_surface.rs:1236`, `:1348`; `mod.rs:844`). Direct
+sessions never touch the learner (`governor.rs:543` gates on `constrained`).
 
-> **Field, 0.4.179, `CORPLAP-2` over `relay:derp/tcp` (2026-10-27).** A carrying
-> session opened seeded at 0.85 × a 4.75 M memory (`opener_maxrate_bps`
-> = 4,038,075 vs the 2.55 M a cold pair gets) and the learner stepped the ceiling
-> 4.04 → 4.29 → 4.56 → 4.84 → 5.15 M across ~70 s of motion, each step logged
-> `the pair carried the ceiling`. Over the whole session `send_wait_max` stayed
-> 0.06–0.50 ms (one 52 ms blip at a step), viewer paint age ran 55–130 ms, and
-> the ceiling never approached `hi` (8 M). The pair settles at its **sustainable**
-> ~5 M, so the opener is ~1.6× the cold one — crisper, but short of the 2.5× the
-> burst-rate measurement suggested; that gap is the learner correctly refusing an
-> unsustainable cap, not a regression.
+> **Field, `CORPLAP-2` over `relay:derp/tcp`, 2026-10-27/28 — agent 0.4.177,
+> 0.4.178 and 0.4.181** (the FR-35 surface is byte-identical from
+> `agent-v0.4.177` through `agent-v0.4.185` and master; the host took 0.4.178 at
+> 13:41Z and 0.4.179 at 18:01Z on 10-27, so no read here ran 0.4.179). Seven
+> sessions on the pair `100.65.4.2|relay:derp/tcp` (AV1 NVENC, 1920×1200, DERP
+> rtt 106–258 ms), read from the host's own log and `rate_memory.json`:
+>
+> - **Seeding (P2):** every session opened at 0.85 × the remembered rate —
+>   `seed_bps` 4,750,677 ⇒ `opener_maxrate_bps` 4,038,075; 4,759,961 ⇒
+>   4,045,966; 4,402,963 ⇒ 3,742,518 (×5) — against the 2.55 M a cold pair gets.
+> - **Growth (P1):** the 10-27 09:23 session (79 s) stepped 4.04 → 4.29 → 4.56 →
+>   4.84 M in its first 15 s while the 2 s heartbeats carried 6.2 / 6.3 / 4.4 /
+>   7.6 Mbps, sat at 4.84 M through 45 s of an idle desktop (0.28–0.35 Mbps at
+>   18 fps — not carried, no step), and stepped to 5.15 M at 09:24:34.8 on a
+>   6.4 Mbps window. The 10-28 16:46:31 session (90 s) stepped 3.74 → 3.98 → 4.22
+>   → 4.49 M during 12 s of motion (3.1–7.4 Mbps windows), then nothing for 60 s
+>   of idle. Of the four 11–19 s sessions, three stepped once and the 07:57 one
+>   three times (to 4.49 M on 4.7–7.3 Mbps windows); the idle 15:27 session never
+>   stepped.
+> - **Health** (the four sessions read heartbeat by heartbeat: 09:23 and 15:27
+>   on 10-27, 07:57 and 16:46:31 on 10-28): `send_stalls=0` in every one;
+>   `send_wait_max_ms` 0.04–2.1 except the heartbeat holding an opener burst
+>   (52.4 ms on 09:23:26, 163.9 ms on 10-28 07:57:43) — never near `HARD_STALL`.
+>   Viewer paint age p50 66–68 / p95 103–117 ms over a 45–50 ms floor, the maxima
+>   (438, 775 ms) inside a session's first ten seconds. The ceiling never passed
+>   5,146,238 (`hi` = 8 M) in any of the seven.
+> - **What held the opener at ~1.5×, not 2.5×:** the memory sat at 4.40–4.76 M
+>   while the pipe carried 6–7.6 Mbps windows with sub-ms send waits. The
+>   write-back rows below show why: a session that *proved* 4.84 M stable moved
+>   the memory +0.2 % (`ALPHA_UP` 0.10 of the gap), the next idle session moved
+>   it −7.5 % (its own seed written back as evidence). Nothing in these reads
+>   measured a sustainable limit; the memory's level is the write-back's
+>   dynamics, not the pipe's. (FR-35 AC1 is open on exactly this.)
 
 ### The write-back and the seed (V2 + V4) — the pair memory
 
@@ -274,11 +322,12 @@ flowchart LR
 
 | piece | rule | anchor |
 |---|---|---|
-| the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:1566` |
-| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:7544` (`opener_measured_bps`) |
-| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:1615` |
+| the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:2041` |
+| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9055` (`opener_measured_bps`) |
+| the evidence | first choice `RateGovernor::stable_bps()` — the highest AIMD target that held 10 s with no decrease, when above the nominal; then `pipe_bps` (the belief the gate accepted); else 0 = nothing. ⚠️ The first is a hold of the *target*, not a measurement: an idle session holds the opener's seed for its whole length and writes 0.85 × the memory back as evidence (field rows below) | `peer.rs:8963`; `governor.rs:570` |
+| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:2098` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days never seeds and is pruned on the next write | `rate_memory.rs:185`, `:22` |
-| the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:1604` |
+| the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:2107` |
 
 Field reads of the write-back so far (key `100.65.4.2\|relay:derp/tcp` unless noted):
 
@@ -288,11 +337,25 @@ Field reads of the write-back so far (key `100.65.4.2\|relay:derp/tcp` unless no
 | 2026-09-08 22:14–22:17 | CORPLAP-1 · 0.4.95 | `None → kept 2,264,993`, twice (`100.65.0.5`) | a session that measured nothing wrote nothing; the old rule would have written 3,825,000 from an absorbed burst (AC8, first half) |
 | 2026-09-10 08:39:41 | CORPLAP-2 · 0.4.97 | `Some(3187500) → 3210512` from a seed of 3,233,525 | the entry moved **down** — `damp` exactly; the max rule would have kept 3,233,525. Marginal (0.7 %), but a direction the old rule could not take |
 | 2026-09-10 14:03:44 | CORPLAP-1 · 0.4.97 | `Some(8000000) → 6318171` from 6,131,302 | the entry moved **up**, damped, after a session that measured the relay at 11.5–17.0 M — one ×0.10 step toward the learner's 8 M cap |
+| 2026-10-27 09:24:41 | CORPLAP-2 · 0.4.177 | `Some(4843519) → 4759961` from 4,750,677 | the learner's stable rate (4.84 M held 57 s, windows carrying 6–7.6 Mbps) moved the entry **+0.2 %** — `ALPHA_UP` of a 93 kbps gap |
+| 2026-10-27 15:29:46 | CORPLAP-2 · 0.4.178 | `Some(4045966) → 4402963` from 4,759,961 | **the P2b decay, in V4 form**: a 130 s session on an idle desktop (0.16–0.25 Mbps at 18 fps, a 405-byte opener) never stepped and never decreased, so `stable_bps()` was its own `opener_maxrate_bps` — 0.85 × the memory — and `damp` took half the gap: **−7.5 % for having measured nothing**. Ten such sessions halve the memory; one proving session restores a tenth of its gap |
+| 2026-10-27 16:31 · 10-28 07:58, 12:38, 16:46 | CORPLAP-2 · 0.4.178 / 0.4.181 | `None → kept 4402963`, four times | sessions of 11–19 s: nothing held 10 s, nothing written — not the value, not the timestamp (as designed) |
+| 2026-10-28 16:48:01 | CORPLAP-2 · 0.4.181 | `Some(4489010) → 4411567` from 4,402,963 | the 90 s session's stable rate (4.49 M after three steps) moved the entry **+0.2 %**; the file now holds `100.65.4.2\|relay:derp/tcp` = 4,411,567 at `at_unix` 1793206081 |
 
 ⚠️ An entry written before V2 is keyed by the bare address, never matches
 again and ages out. An entry that ages out is *replaced* by the next session's
 first evidence, not damped toward it — the damping only ever acts inside the
 7-day window.
+
+⚠️ The 2026-10-27 15:29 row is the open question FR-35 AC1 now turns on. V4
+dropped `had_decrease` because "the gate can tell a measurement from a
+non-measurement" — but `stable_bps()` is not gated: a target that nothing pushed
+is a hold, not a measurement, and on the connect-look-leave sessions this fleet
+actually has it writes the opener's own seed back as evidence. The asymmetry
+that protects against a flooded opener (believe a drop fast) then compounds it:
+the pair that carried 6–7.6 Mbps windows is remembered at 4.4 M. A fix belongs
+with the governor (`peer.rs:8963`: require the hold to have been *carried*, or
+route the first-choice evidence through the gate); nothing here is changed yet.
 
 ### V3b — ONE belief about the path (SHADOW since `agent-v0.4.98`)
 
