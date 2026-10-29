@@ -84,10 +84,10 @@ pub mod rate_memory;
 /// FR-63 B1 — ONE delay-based rate controller, run in SHADOW beside the
 /// governor (pure; no clock, no I/O). Replaces eight estimators of one
 /// quantity; shadow-first, so it drives nothing until B2's flip criterion.
-#[cfg_attr(
-    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
-    allow(dead_code)
-)]
+/// No `dead_code` allowance, deliberately: the governor constructs and feeds it
+/// on EVERY build, so nothing in it is legitimately dead — and an allowance here
+/// once hid an unused test helper from the default lane while the
+/// `ffmpeg-encoder` lane (no `-A dead_code`) caught it (PR #3102's first CI run).
 pub mod ratectl;
 /// FR-63 B0 — the deterministic rate-law simulator. TEST-ONLY: it ships zero
 /// bytes, and it exists so the cells the field cannot summon (a genuinely thin

@@ -380,6 +380,10 @@ impl Controller {
         if w.frames_rx == 0 {
             if immediate_congestion && self.state != State::OverUse {
                 self.enter_hold();
+            } else if !immediate_congestion {
+                // Nothing painted and nothing pushed back: the window says
+                // nothing about the rate, and the heartbeat should say so.
+                self.reason = Reason::NoEvidence;
             }
             return;
         }
@@ -647,10 +651,6 @@ mod tests {
             frames_rx: 30,
             frames_lost: 0,
         }
-    }
-
-    fn constrained(c: &mut Controller, floor: u32, ceiling: u32) {
-        c.set_domain(floor, ceiling, true);
     }
 
     #[test]
