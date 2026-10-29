@@ -2,8 +2,9 @@
 
 **Status**: **every AC met except AC2**, which is deliberately deferred and is
 the operator's call to build or drop (see "Is AC2 worth its cost?"). The P1 tail
-(AC3, AC4, AC9's emitted WARN) is in review on `ap-1272-fr68-p1-tail`, each test
-shown RED on the shipped behaviour and GREEN on the fix (field log 2026-10-29);
+(AC3, AC4, AC9's emitted WARN) is in review as
+[#3097](https://github.com/gjovanov/roomler-ai/pull/3097), each test shown RED on
+the shipped behaviour and GREEN on the fix (field log 2026-10-29);
 AC6 was re-read 2026-10-29 on two two-org hosts running the released 0.4.185.
 · **Owner**: overlay/networking ·
 **Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272)
@@ -572,7 +573,7 @@ CORPLAP-3 (single-org, AnyConnect) carries the known foreign war's history
 there (+5, with `pulled` +1), which is route churn on that laptop, not a sibling
 war, and not this FR's.
 
-### 2026-10-29 — the P1 tail's tests, RED on the shipped behaviour and GREEN on the fix
+### 2026-10-29 — the P1 tail's tests, RED on the shipped behaviour and GREEN on the fix (#3097)
 
 `origin/master` (`12e7bf0d7`) was merged into the branch first (`8b9c4667b`, a
 clean merge; `composition_tests::composition_matches_baseline` passes on the
