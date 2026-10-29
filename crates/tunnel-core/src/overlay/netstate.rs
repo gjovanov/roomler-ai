@@ -906,6 +906,11 @@ fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     })
 }
 
+/// #3080 — `route -n get` answers in milliseconds. This bounds the read that
+/// waits for it.
+#[cfg(target_os = "macos")]
+const ROUTE_GET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(target_os = "macos")]
 fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     // `route -n get` — the BSD twin of `ip route get`; multi-line
@@ -917,7 +922,9 @@ fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     } else {
         cmd.args(["-n", "get", dest.as_str()]);
     }
-    let out = cmd.output().ok()?;
+    // #3080 — read until `route` exits, not until EOF: a long-lived child
+    // spawned on another thread may hold this pipe too.
+    let out = crate::child::output_bounded(&mut cmd, ROUTE_GET_DEADLINE).ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let (mut ifname, mut gw) = (None, None);
     for line in text.lines() {
@@ -1196,13 +1203,19 @@ mod backend {
         }
 
         fn start(make: fn() -> tokio::process::Command) -> Option<tokio::process::Child> {
-            make()
-                .stdin(Stdio::null())
+            let mut cmd = make();
+            cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .ok()
+                .kill_on_drop(true);
+            // #3080 — the monitor lives as long as the daemon, so a pipe it
+            // inherits from a spawn on another thread (macOS has no `pipe2`)
+            // stays open that long, and that pipe's reader never sees EOF.
+            // Field, 0.4.184: it held the GUI-worker supervisor's `ps` pipe,
+            // and the Mac had no capture or input until a restart.
+            #[cfg(target_os = "macos")]
+            crate::child::inherit_only_stdio_async(&mut cmd);
+            cmd.spawn().ok()
         }
 
         /// #1867 — run the monitor child and RESPAWN it whenever it exits.
